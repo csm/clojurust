@@ -17,7 +17,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 2 — Reader
 
-- [ ] Lexer: tokenize all Clojure lexical forms (symbols, keywords, numbers, strings, characters, booleans, nil)
+- [x] Lexer: tokenize all Clojure lexical forms (symbols, keywords, numbers, strings, characters, booleans, nil)
 - [ ] Reader: parse tokens into `Form` AST nodes
   - [ ] List `(...)`, vector `[...]`, map `{...}`, set `#{...}`
   - [ ] Quote `'`, quasiquote `` ` ``, unquote `~`, unquote-splicing `~@`
@@ -25,10 +25,10 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
   - [ ] Anonymous function `#(...)`, regex literal `#"..."`
   - [ ] Symbolic values `##Inf`, `##-Inf`, `##NaN`
   - [ ] Tagged literals `#tag value`
-- [ ] Numeric literals: long, double, ratio (`3/4`), arbitrary-precision `N`/`M` suffixes, radix literals (`2r1010`, `16rFF`)
-- [ ] String escape sequences and multiline strings
-- [ ] Character literals (`\a`, `\newline`, `\u0041`, etc.)
-- [ ] Line/column source-location tracking on all forms
+- [x] Numeric literals: long, double, ratio (`3/4`), arbitrary-precision `N`/`M` suffixes, radix literals (`2r1010`, `16rFF`)
+- [x] String escape sequences and multiline strings
+- [x] Character literals (`\a`, `\newline`, `\u0041`, etc.)
+- [x] Line/column source-location tracking on all forms
 - [ ] Reader conditionals (`.cljc` / `.cljx`)
   - [ ] `#?(:cljx ... :clj ... :cljs ... :default ...)` splicing and non-splicing forms
   - [ ] Platform key `:cljx` selects Rust-dialect branch
