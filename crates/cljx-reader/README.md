@@ -1,10 +1,9 @@
 # cljx-reader
 
-Lexer (tokenizer) and, in later phases, parser for the clojurust language.
-Turns raw source text into a stream of `(Token, Span)` pairs that the evaluator
-and compiler consume.
+Lexer (tokenizer) and recursive-descent parser for the clojurust language.
+Turns raw source text into a `Form` AST that the evaluator and compiler consume.
 
-**Phase:** 2 (Lexer) — lexer fully implemented; parser (`Form` AST) planned for Phase 3.
+**Phase:** 2 — lexer and parser fully implemented.
 
 ---
 
@@ -12,9 +11,11 @@ and compiler consume.
 
 ```
 src/
-  lib.rs      — module declarations and re-exports of Lexer + Token
+  lib.rs      — module declarations and re-exports
   token.rs    — Token enum: one variant per Clojure lexical form
   lexer.rs    — Lexer struct: byte-oriented, UTF-8-safe tokenizer
+  form.rs     — Form struct + FormKind enum: the reader AST
+  parser.rs   — Parser struct: recursive-descent parser + Iterator impl
 ```
 
 ---
@@ -75,6 +76,9 @@ impl Lexer {
     /// Returns `Ok((Token::Eof, _))` at end of input.
     /// Returns `Err(CljxError::ReadError { … })` on invalid input.
     pub fn next_token(&mut self) -> CljxResult<(Token, Span)>
+
+    pub fn source(&self) -> &Arc<String>
+    pub fn file(&self) -> &Arc<String>
 }
 
 impl Iterator for Lexer {
@@ -99,18 +103,126 @@ impl Iterator for Lexer {
 - Radix literals: `NNrDIGITS` where `NN` is 2–36. Overflow of `i64` yields
   `BigInt`.
 
-#### Error construction
+---
 
-On any lex error the lexer produces a `CljxError::ReadError` containing the
-offending `Span` and the full source text, which miette uses to render a
-pointed diagnostic in the terminal.
+### `form::Form` / `form::FormKind`
+
+The reader AST. Every `Form` carries a `Span` for diagnostics.
+
+`PartialEq` on `Form` ignores spans — equality tests compare only `FormKind`.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct Form {
+    pub kind: FormKind,
+    pub span: Span,
+}
+
+impl Form {
+    pub fn new(kind: FormKind, span: Span) -> Self
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormKind {
+    // Atoms
+    Nil,
+    Bool(bool),
+    Int(i64),
+    BigInt(String),
+    Float(f64),
+    BigDecimal(String),
+    Ratio(String),
+    Char(char),
+    Str(String),
+    Regex(String),
+    Symbolic(f64),        // ##Inf→INFINITY  ##-Inf→NEG_INFINITY  ##NaN→NAN
+
+    // Identifiers
+    Symbol(String),
+    Keyword(String),
+    AutoKeyword(String),
+
+    // Collections
+    List(Vec<Form>),
+    Vector(Vec<Form>),
+    Map(Vec<Form>),       // flat key/value pairs; length always even
+    Set(Vec<Form>),
+
+    // Wrapping reader macros
+    Quote(Box<Form>),
+    SyntaxQuote(Box<Form>),
+    Unquote(Box<Form>),
+    UnquoteSplice(Box<Form>),
+    Deref(Box<Form>),
+    Var(Box<Form>),                      // #'symbol
+    Meta(Box<Form>, Box<Form>),          // raw meta-form, annotated-form
+
+    // Dispatch forms
+    AnonFn(Vec<Form>),                   // #(...)
+    TaggedLiteral(String, Box<Form>),    // #tag form
+
+    // Reader conditionals — all branches kept; evaluator filters by :cljx
+    // clauses is flat: [keyword, form, keyword, form, …]
+    ReaderCond { splicing: bool, clauses: Vec<Form> },
+}
+```
+
+---
+
+### `parser::Parser`
+
+A recursive-descent parser that consumes `(Token, Span)` pairs from a `Lexer`
+and produces `Form` nodes.
+
+```rust
+pub struct Parser { /* private */ }
+
+impl Parser {
+    /// Create a parser for `source` text labelled with `file`.
+    pub fn new(source: String, file: String) -> Self
+
+    /// Return the next form (skipping `#_` discards).
+    /// Returns `Ok(None)` at EOF.
+    pub fn parse_one(&mut self) -> CljxResult<Option<Form>>
+
+    /// Parse all forms until EOF.
+    pub fn parse_all(&mut self) -> CljxResult<Vec<Form>>
+}
+
+impl Iterator for Parser {
+    type Item = CljxResult<Form>;
+    // Yields None at EOF, Err on parse error.
+}
+```
+
+#### `#_` discard semantics
+
+`#_` consumes itself plus the next form and produces nothing. Discards can be
+chained: `[#_ #_ 1 2 3]` → `[2, 3]` (outer `#_` discards the `#_ 1` group,
+leaving `2` and `3`).
+
+#### Reader conditionals
+
+All branches of `#?(…)` and `#?@(…)` are parsed and stored as
+`FormKind::ReaderCond { splicing, clauses }` with a flat `clauses` vec.  The
+evaluator is responsible for filtering by `:cljx`.
+
+---
+
+## Error construction
+
+On any read or parse error the crate produces a `CljxError::ReadError`
+containing the offending `Span` and the full source text, which miette uses to
+render a pointed diagnostic in the terminal.
 
 ---
 
 ## Re-exports from `lib.rs`
 
 ```rust
+pub use form::{Form, FormKind};
 pub use lexer::Lexer;
+pub use parser::Parser;
 pub use token::Token;
 ```
 

@@ -68,6 +68,16 @@ impl Lexer {
         }
     }
 
+    // ── Public getters ────────────────────────────────────────────────────
+
+    pub fn source(&self) -> &Arc<String> {
+        &self.source
+    }
+
+    pub fn file(&self) -> &Arc<String> {
+        &self.file
+    }
+
     // ── Low-level helpers ─────────────────────────────────────────────────
 
     fn peek(&self) -> Option<char> {
