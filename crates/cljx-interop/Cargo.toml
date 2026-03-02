@@ -1,0 +1,9 @@
+[package]
+name = "cljx-interop"
+version = "0.1.0"
+edition = "2024"
+description = "Rust<->Clojure FFI, type marshalling, and NativeObject support"
+
+[dependencies]
+cljx-types = { workspace = true }
+cljx-gc    = { workspace = true }

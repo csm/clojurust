@@ -1,0 +1,9 @@
+[package]
+name = "cljx-reader"
+version = "0.1.0"
+edition = "2024"
+description = "Lexer and parser producing Form AST nodes for clojurust"
+
+[dependencies]
+cljx-types = { workspace = true }
+miette     = { workspace = true }

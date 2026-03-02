@@ -1,0 +1,8 @@
+[package]
+name = "cljx-gc"
+version = "0.1.0"
+edition = "2024"
+description = "Tracing garbage collector for clojurust"
+
+[dependencies]
+cljx-types = { workspace = true }

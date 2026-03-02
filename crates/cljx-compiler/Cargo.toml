@@ -1,0 +1,10 @@
+[package]
+name = "cljx-compiler"
+version = "0.1.0"
+edition = "2024"
+description = "JIT (Cranelift) and AOT compiler backend for clojurust"
+
+[dependencies]
+cljx-types = { workspace = true }
+cljx-gc    = { workspace = true }
+cljx-eval  = { workspace = true }

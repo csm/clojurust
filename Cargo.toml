@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/cljx-types",
+    "crates/cljx-gc",
+    "crates/cljx-reader",
+    "crates/cljx-eval",
+    "crates/cljx-runtime",
+    "crates/cljx-compiler",
+    "crates/cljx-interop",
+    "crates/cljx",
+]
+resolver = "2"
+
+[workspace.dependencies]
+cljx-types    = { path = "crates/cljx-types" }
+cljx-gc       = { path = "crates/cljx-gc" }
+cljx-reader   = { path = "crates/cljx-reader" }
+cljx-eval     = { path = "crates/cljx-eval" }
+cljx-runtime  = { path = "crates/cljx-runtime" }
+cljx-compiler = { path = "crates/cljx-compiler" }
+cljx-interop  = { path = "crates/cljx-interop" }
+
+miette    = { version = "7", features = ["fancy"] }
+thiserror = "2"
+clap      = { version = "4", features = ["derive"] }

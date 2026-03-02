@@ -1,0 +1,10 @@
+[package]
+name = "cljx-eval"
+version = "0.1.0"
+edition = "2024"
+description = "Tree-walking interpreter and macro expander for clojurust"
+
+[dependencies]
+cljx-types  = { workspace = true }
+cljx-gc     = { workspace = true }
+cljx-reader = { workspace = true }

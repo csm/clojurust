@@ -1,0 +1,9 @@
+[package]
+name = "cljx-types"
+version = "0.1.0"
+edition = "2024"
+description = "Core types, source spans, and diagnostics for clojurust"
+
+[dependencies]
+miette    = { workspace = true }
+thiserror = { workspace = true }
