@@ -2,6 +2,7 @@
 members = [
     "crates/cljx-types",
     "crates/cljx-gc",
+    "crates/cljx-value",
     "crates/cljx-reader",
     "crates/cljx-eval",
     "crates/cljx-runtime",
@@ -14,12 +15,17 @@ resolver = "2"
 [workspace.dependencies]
 cljx-types    = { path = "crates/cljx-types" }
 cljx-gc       = { path = "crates/cljx-gc" }
+cljx-value    = { path = "crates/cljx-value" }
 cljx-reader   = { path = "crates/cljx-reader" }
 cljx-eval     = { path = "crates/cljx-eval" }
 cljx-runtime  = { path = "crates/cljx-runtime" }
 cljx-compiler = { path = "crates/cljx-compiler" }
 cljx-interop  = { path = "crates/cljx-interop" }
 
-miette    = { version = "7", features = ["fancy"] }
-thiserror = "2"
-clap      = { version = "4", features = ["derive"] }
+miette       = { version = "7", features = ["fancy"] }
+thiserror    = "2"
+clap         = { version = "4", features = ["derive"] }
+num-bigint   = "0.4"
+num-rational = "0.4"
+num-traits   = "0.2"
+bigdecimal   = "0.4"

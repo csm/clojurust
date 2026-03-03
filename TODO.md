@@ -38,18 +38,18 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 3 — Core Data Types & Persistent Collections
 
-- [ ] `Value` enum: Nil, Bool, Long, Double, BigInt, BigDecimal, Ratio, Char, String, Symbol, Keyword, List, Vector, HashMap, HashSet, Fn, Macro, Var, Atom, Ref, Agent, Namespace, NativeFunction, …
-- [ ] Persistent (immutable, structurally shared) collections
-  - [ ] PersistentList (linked list with O(1) cons)
-  - [ ] PersistentVector (HAMT/RRB-tree)
-  - [ ] PersistentHashMap (HAMT)
-  - [ ] PersistentHashSet (backed by PersistentHashMap)
-  - [ ] PersistentArrayMap (small maps, ≤8 entries)
-  - [ ] PersistentQueue
+- [x] `Value` enum: Nil, Bool, Long, Double, BigInt, BigDecimal, Ratio, Char, String, Symbol, Keyword, List, Vector, HashMap, HashSet, Fn, Macro, Var, Atom, Ref, Agent, Namespace, NativeFunction, …
+- [x] Persistent (immutable, structurally shared) collections
+  - [x] PersistentList (linked list with O(1) cons)
+  - [x] PersistentVector (32-way trie + tail buffer)
+  - [x] PersistentHashMap (32-way HAMT)
+  - [x] PersistentHashSet (backed by PersistentHashMap)
+  - [x] PersistentArrayMap (small maps, ≤8 entries)
+  - [x] PersistentQueue (front-list + rear-vector)
 - [ ] Metadata support on collections, symbols, and vars (`with-meta`, `meta`)
 - [ ] Seq abstraction over all collections + lazy sequences
 - [ ] Transient collections for efficient batch mutations
-- [ ] Equality and hashing consistent with Clojure semantics
+- [x] Equality and hashing consistent with Clojure semantics
 
 ---
 

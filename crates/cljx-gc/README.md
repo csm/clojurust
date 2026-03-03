@@ -1,9 +1,12 @@
 # cljx-gc
 
-Tracing garbage collector for clojurust. All Clojure runtime values are managed
-by this GC; Rust code holds the root set.
+Garbage collector for clojurust. All Clojure runtime values are managed by
+this GC; Rust code holds the root set.
 
-**Phase:** 8 — stub only, not yet implemented.
+**Phase:** 8 — real GC not yet implemented. This crate currently provides a
+`GcPtr<T>` shim backed by `Arc<T>` so that `cljx-value` and all other crates
+can depend on the planned API today. Phase 8 will replace the internals without
+changing the public interface.
 
 ---
 
@@ -11,37 +14,52 @@ by this GC; Rust code holds the root set.
 
 ```
 src/
-  lib.rs    — doc-comment stub describing planned implementation
+  lib.rs    — GcPtr<T> Arc shim, Trace marker trait
 ```
 
 ---
 
-## Planned public API (Phase 8)
+## Public API
+
+### `Trace`
+
+Marker trait for types that can be stored in a `GcPtr`.  Phase 8 will add a
+real visitor method; for now the default no-op implementation satisfies the
+bound.
 
 ```rust
-/// GC-managed smart pointer. Opaque to Rust's borrow checker;
-/// all lifetime tracking is handled by the collector.
-pub struct GcPtr<T> { /* private */ }
-
-impl<T> GcPtr<T> {
-    /// Allocate a new GC-managed value.
-    pub fn new(value: T) -> Self
-
-    /// Obtain a temporary reference valid until the next safepoint.
-    pub fn get(&self) -> &T
+pub trait Trace: Send + Sync {
+    fn trace(&self) {}
 }
 ```
 
-Planned features:
-- Mark-and-sweep with generational promotion
-- Write barriers for pointer stores
-- Weak references and finalization hooks
-- Safepoint integration with the eval loop and JIT frames
+### `GcPtr<T>`
+
+A GC-managed smart pointer.  Currently wraps `Arc<T>`; Phase 8 replaces the
+internals with a real GC handle.
+
+```rust
+pub struct GcPtr<T: ?Sized> { /* Arc<T> */ }
+
+impl<T> GcPtr<T> {
+    pub fn new(value: T) -> Self   // Phase 8 will add T: Trace bound
+}
+
+impl<T: ?Sized> GcPtr<T> {
+    pub fn get(&self) -> &T
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool
+}
+
+impl<T: ?Sized> Clone for GcPtr<T> { … }
+impl<T: ?Sized + Debug> Debug for GcPtr<T> { … }
+```
 
 ---
 
-## Dependencies
+## Planned Phase 8 additions
 
-| Crate | Role |
-|-------|------|
-| `cljx-types` (workspace) | `CljxError`, `CljxResult` |
+- Mark-and-sweep GC with generational promotion
+- Write barriers for pointer stores into `GcPtr` fields
+- Weak references (`WeakGcPtr<T>`) and finalization hooks
+- Safepoint integration with the eval loop and JIT frames
+- `GcVisitor` trait used by `Trace::trace` implementations

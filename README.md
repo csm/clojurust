@@ -2,8 +2,9 @@
 
 A Rust-hosted dialect of the Clojure programming language.
 
-> **Early work in progress.** Only the lexer and parser are implemented.
-> Everything else is a stub. Expect breaking changes at every layer.
+> **Early work in progress.** The lexer, parser, and core data types are
+> implemented. The evaluator and everything above it is a stub. Expect breaking
+> changes at every layer.
 
 ---
 
@@ -30,7 +31,7 @@ Planned capabilities:
 |-------|-------------|--------|
 | 1 | Project infrastructure | complete |
 | 2 | Lexer + parser (`Form` AST) | complete |
-| 3 | Core data types & persistent collections | not started |
+| 3 | Core data types & persistent collections | mostly complete |
 | 4 | Evaluator & special forms | not started |
 | 5 | Core standard library | not started |
 | 6 | Protocols & multimethods | not started |
@@ -54,7 +55,8 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 | [`cljx-eval`](crates/cljx-eval) | Tree-walking interpreter; special forms; namespace/environment | stub |
 | [`cljx-runtime`](crates/cljx-runtime) | Core standard library (`clojure.core` equivalent); concurrency primitives | stub |
 | [`cljx-compiler`](crates/cljx-compiler) | IR lowering; JIT (Cranelift) and AOT code generation | stub |
-| [`cljx-gc`](crates/cljx-gc) | Tracing garbage collector; safepoints; write barriers; `GcPtr<T>` | stub |
+| [`cljx-value`](crates/cljx-value) | `Value` enum; persistent collections (HAMT, list, vector, set, queue); Clojure-compatible hashing | complete |
+| [`cljx-gc`](crates/cljx-gc) | Tracing garbage collector; safepoints; write barriers; `GcPtr<T>` (Arc shim until Phase 8) | stub |
 | [`cljx-interop`](crates/cljx-interop) | Rust ↔ Clojure FFI; `#[cljx::export]` proc-macro; type marshalling | stub |
 | [`cljx`](crates/cljx) | `cljx` CLI binary: `run`, `repl`, `compile`, `eval` subcommands | scaffold |
 

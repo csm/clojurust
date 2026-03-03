@@ -1,0 +1,14 @@
+[package]
+name = "cljx-value"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime Value type and persistent collections for clojurust"
+
+[dependencies]
+cljx-types   = { workspace = true }
+cljx-gc      = { workspace = true }
+num-bigint   = { workspace = true }
+num-rational = { workspace = true }
+num-traits   = { workspace = true }
+bigdecimal   = { workspace = true }
+thiserror    = { workspace = true }
