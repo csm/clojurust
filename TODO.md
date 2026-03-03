@@ -55,21 +55,25 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 4 — Evaluator & Special Forms
 
-- [ ] Environment: lexical scopes + namespace-level vars
-- [ ] Namespace system (`ns`, `in-ns`, `require`, `use`, `alias`, `refer`)
-- [ ] Special forms
-  - [ ] `def`, `defn`, `defmacro`
-  - [ ] `let`, `letfn`, `loop`/`recur`
-  - [ ] `fn` (multiple arities, rest args, destructuring)
-  - [ ] `if`, `do`, `quote`, `var`
-  - [ ] `try`/`catch`/`finally`, `throw`
-  - [ ] `set!` for mutable vars / atoms
-  - [ ] `monitor-enter`/`monitor-exit` (or Rust mutex equivalent)
-  - [ ] `new` / interop forms (see Rust Interop phase)
-- [ ] Destructuring in `let`, `fn`, `loop` (sequential, associative, nested)
-- [ ] Tail-call optimization via `recur`
-- [ ] Macro expansion pipeline (`macroexpand-1`, `macroexpand`, `macroexpand-all`)
-- [ ] Syntax-quote with symbol resolution and gensyms
+- [x] Environment: lexical scopes + namespace-level vars
+- [x] Namespace system (basic `ns`; full `require`/`use`/`alias`/`refer` deferred to Phase 5)
+- [x] Special forms
+  - [x] `def`, `defn`, `defmacro`, `defonce`
+  - [x] `let`/`let*`, `loop`/`loop*`, `recur`
+  - [x] `fn`/`fn*` (multiple arities, rest args, sequential destructuring)
+  - [x] `if`, `do`, `and`, `or`, `quote`, `var`
+  - [x] `try`/`catch`/`finally`, `throw`
+  - [x] `set!` for mutable vars
+  - [ ] `letfn` — Phase 5
+  - [ ] `monitor-enter`/`monitor-exit` — Phase 7
+  - [ ] `new` / interop forms — Phase 9
+- [x] Sequential destructuring in `let`, `fn`, `loop` (`:as` alias, `& rest`)
+- [ ] Associative / nested destructuring — Phase 5
+- [x] Tail-call optimization via `recur` (trampoline in `loop*` and `fn*`)
+- [x] Macro expansion pipeline (`macroexpand-1`, `macroexpand`)
+- [x] Syntax-quote with symbol resolution and gensyms
+- [x] Native built-in functions (arithmetic, comparison, predicates, collections, I/O, atoms)
+- [x] Bootstrap HOFs (`map`, `filter`, `reduce`, `comp`, `partial`, `when`, `cond`, `->`…) defined in Clojure
 
 ---
 
@@ -124,6 +128,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] GC integration with Rust's ownership: `GcPtr<T>` smart pointer that is opaque to Rust's borrow checker
 - [ ] Finalization hooks (for resource cleanup)
 - [ ] Tuning knobs: heap size, GC trigger threshold
+- [ ] Perceus-style in-place mutation: when `Arc::strong_count() == 1` on a persistent collection, mutate in place rather than copy — makes "persistent" operations free for linear-use values (see Lean 4 / Koka)
 
 ---
 
@@ -138,6 +143,8 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Safety restrictions: document which Rust APIs are safe to call from GC-managed code
 - [ ] `cljx.rust` namespace with intrinsics (`rust/cast`, `rust/ptr`, `rust/unsafe`, etc.)
 - [ ] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime
+- [ ] RAII resource management: `with-open` and similar resource scopes lower to Rust `Drop` rather than GC finalizers, giving deterministic cleanup with no GC involvement
+- [ ] (Stretch) `#rust` typed sublanguage: functions annotated `#rust` receive Rust-typed arguments with lifetime bounds enforced at the interop boundary, bypassing `Value` boxing entirely for those call sites
 
 ---
 
@@ -152,6 +159,9 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Deoptimization path back to interpreter when assumptions are violated
 - [ ] JIT compilation threshold (invocation count trigger)
 - [ ] Integration with GC: patch compiled code roots, handle safepoints in native frames
+- [ ] Primitive unboxing: where type feedback confirms a value is always `i64` or `f64`, emit raw arithmetic on machine registers — no `Value` boxing, no GC allocation
+- [ ] Escape analysis: values that do not escape their defining scope (not returned, not captured, not stored) may be stack-allocated rather than heap-allocated through the GC
+- [ ] Call-site monomorphization: generate type-specialized copies of hot functions when call-site type profiles are stable (e.g. `(map inc xs)` where `xs` is always `Vec<i64>`)
 
 ---
 
@@ -165,6 +175,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Cross-compilation support (target triples via `--target`)
 - [ ] Source maps / debug info (DWARF) for compiled binaries
 - [ ] `ns` `:gen-class` equivalent for emitting native shared libraries
+- [ ] Whole-program escape analysis: with full call graph visibility, identify values that never escape their function or thread and lower them to stack allocation or Rust-owned heap allocation outside the GC
 
 ---
 

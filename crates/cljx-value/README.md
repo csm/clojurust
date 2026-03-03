@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn body/arities, Namespace interns) — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
-  types.rs                       — Phase 4/7 stubs: Var, Atom, Namespace, NativeFn, CljxFn
+  types.rs                       — Var, Atom, Namespace (with interns/refers/aliases), NativeFn, CljxFn (multi-arity with body)
   value.rs                       — Value enum, MapValue, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -123,3 +123,39 @@ threshold, or `AssocResult::Promote(Vec<(Value, Value)>)` when the map is full.
 All collections implement `PartialEq`, `Debug`, `Clone`, and `cljx_gc::Trace`.
 `PersistentList`, `PersistentVector`, and `PersistentHashSet` implement
 `std::iter::FromIterator<Value>`.
+
+### `CljxFn` / `CljxFnArity` (Phase 4)
+
+```rust
+// Requires cljx-reader (for Vec<Form> body).
+pub struct CljxFnArity {
+    pub params: Vec<Arc<str>>,        // positional param names
+    pub rest_param: Option<Arc<str>>, // name after & (if any)
+    pub body: Vec<Form>,              // forms in this arity's body
+}
+
+pub struct CljxFn {
+    pub name: Option<Arc<str>>,
+    pub arities: Vec<CljxFnArity>,
+    pub closed_over_names: Vec<Arc<str>>,
+    pub closed_over_vals: Vec<Value>,
+    pub is_macro: bool,
+}
+```
+
+### `Namespace` (Phase 4)
+
+```rust
+pub struct Namespace {
+    pub name: Arc<str>,
+    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,  // own vars
+    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,   // imported names
+    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,    // ns alias → ns name
+}
+```
+
+### Dependencies (Phase 4 addition)
+
+`cljx-value` now depends on `cljx-reader` so that `CljxFnArity::body` can store
+`Vec<Form>` (unevaluated source bodies for interpreter evaluation and closure
+capture).

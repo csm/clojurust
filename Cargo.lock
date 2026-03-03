@@ -190,9 +190,15 @@ dependencies = [
 name = "cljx-eval"
 version = "0.1.0"
 dependencies = [
+ "bigdecimal",
  "cljx-gc",
  "cljx-reader",
  "cljx-types",
+ "cljx-value",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "thiserror",
 ]
 
 [[package]]
@@ -241,6 +247,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "cljx-gc",
+ "cljx-reader",
  "cljx-types",
  "num-bigint",
  "num-rational",

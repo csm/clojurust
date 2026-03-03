@@ -1,19 +1,18 @@
 //! Stub types for Phase 4/7 that are referenced by the Value enum.
-//! These will be fleshed out in their respective phases.
 
 #![allow(unused)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cljx_gc::GcPtr;
+use cljx_reader::Form;
 
 use crate::Value;
-use crate::collections::hash_map::PersistentHashMap;
 
 // ── Var ───────────────────────────────────────────────────────────────────────
 
 /// A Clojure var — a namespace-interned mutable root binding.
-/// Phase 4 will add namespace resolution, metadata, and dynamic binding.
 #[derive(Debug)]
 pub struct Var {
     pub namespace: Arc<str>,
@@ -50,7 +49,6 @@ impl cljx_gc::Trace for Var {}
 // ── Atom ──────────────────────────────────────────────────────────────────────
 
 /// A Clojure atom — a thread-safe mutable reference.
-/// Phase 7 will add swap!, reset!, add-watch.
 #[derive(Debug)]
 pub struct Atom {
     pub value: Mutex<Value>,
@@ -78,15 +76,26 @@ impl cljx_gc::Trace for Atom {}
 
 // ── Namespace ─────────────────────────────────────────────────────────────────
 
-/// A Clojure namespace. Phase 4 will add intern tables and aliasing.
+/// A Clojure namespace with intern table, refers, and aliases.
 #[derive(Debug)]
 pub struct Namespace {
     pub name: Arc<str>,
+    /// Vars interned directly in this namespace.
+    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    /// Vars referred from other namespaces (e.g. clojure.core).
+    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    /// Namespace aliases: short-name → full namespace name.
+    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,
 }
 
 impl Namespace {
     pub fn new(name: impl Into<Arc<str>>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            interns: Mutex::new(HashMap::new()),
+            refers: Mutex::new(HashMap::new()),
+            aliases: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -122,30 +131,48 @@ impl NativeFn {
 
 impl cljx_gc::Trace for NativeFn {}
 
+// ── CljxFnArity ───────────────────────────────────────────────────────────────
+
+/// One arity branch of a Clojure function.
+#[derive(Debug, Clone)]
+pub struct CljxFnArity {
+    /// Simple parameter names (no `&`).
+    pub params: Vec<Arc<str>>,
+    /// The name after `&`, if any.
+    pub rest_param: Option<Arc<str>>,
+    /// The body forms for this arity.
+    pub body: Vec<Form>,
+}
+
 // ── CljxFn ────────────────────────────────────────────────────────────────────
 
-/// An interpreted Clojure closure. Phase 4 will add the body (Form AST).
-#[derive(Debug)]
+/// An interpreted Clojure closure with captured environment.
+#[derive(Debug, Clone)]
 pub struct CljxFn {
     pub name: Option<Arc<str>>,
-    pub params: Vec<crate::symbol::Symbol>,
-    pub is_variadic: bool,
-    /// Captured environment values, in declaration order.
-    pub closed_over: Vec<Value>,
+    pub arities: Vec<CljxFnArity>,
+    /// Names of closed-over bindings (parallel to `closed_over_vals`).
+    pub closed_over_names: Vec<Arc<str>>,
+    /// Values of closed-over bindings (parallel to `closed_over_names`).
+    pub closed_over_vals: Vec<Value>,
+    /// True if this function was defined with `defmacro`.
+    pub is_macro: bool,
 }
 
 impl CljxFn {
     pub fn new(
         name: Option<Arc<str>>,
-        params: Vec<crate::symbol::Symbol>,
-        is_variadic: bool,
-        closed_over: Vec<Value>,
+        arities: Vec<CljxFnArity>,
+        closed_over_names: Vec<Arc<str>>,
+        closed_over_vals: Vec<Value>,
+        is_macro: bool,
     ) -> Self {
         Self {
             name,
-            params,
-            is_variadic,
-            closed_over,
+            arities,
+            closed_over_names,
+            closed_over_vals,
+            is_macro,
         }
     }
 }

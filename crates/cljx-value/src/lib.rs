@@ -14,5 +14,5 @@ pub use error::{ValueError, ValueResult};
 pub use hash::ClojureHash;
 pub use keyword::Keyword;
 pub use symbol::Symbol;
-pub use types::{Arity, Atom, CljxFn, Namespace, NativeFn, NativeFnPtr, Var};
+pub use types::{Arity, Atom, CljxFn, CljxFnArity, Namespace, NativeFn, NativeFnPtr, Var};
 pub use value::{MapValue, Value};
