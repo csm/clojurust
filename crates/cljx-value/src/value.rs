@@ -14,7 +14,7 @@ use crate::hash::{
 };
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
-use crate::types::{Atom, CljxFn, Namespace, NativeFn, Var};
+use crate::types::{Atom, CljxCons, CljxFn, LazySeq, Namespace, NativeFn, Var};
 
 /// The central runtime type: every Clojure value is a `Value`.
 ///
@@ -56,6 +56,12 @@ pub enum Value {
 
     // ── Other ─────────────────────────────────────────────────────────────────
     Namespace(GcPtr<Namespace>),
+
+    // ── Lazy sequences ────────────────────────────────────────────────────────
+    /// A deferred sequence cell — realized at most once.
+    LazySeq(GcPtr<LazySeq>),
+    /// A realized cons cell whose tail may itself be lazy.
+    Cons(GcPtr<CljxCons>),
 }
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
@@ -134,6 +140,13 @@ impl MapValue {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        // Realize lazy sequences before comparing.
+        if let Value::LazySeq(ls) = self {
+            return ls.get().realize() == *other;
+        }
+        if let Value::LazySeq(ls) = other {
+            return *self == ls.get().realize();
+        }
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -159,6 +172,8 @@ impl PartialEq for Value {
             (Value::List(_), Value::Vector(_)) | (Value::Vector(_), Value::List(_)) => {
                 seq_equal(self, other)
             }
+            // Cons cells: compare element by element.
+            (Value::Cons(_), _) | (_, Value::Cons(_)) => seq_equal(self, other),
             _ => false,
         }
     }
@@ -190,6 +205,29 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
     match v {
         Value::List(l) => l.get().iter().cloned().collect(),
         Value::Vector(v) => v.get().iter().cloned().collect(),
+        Value::LazySeq(ls) => value_to_seq_vec(&ls.get().realize()),
+        Value::Cons(c) => {
+            let mut result = vec![c.get().head.clone()];
+            let mut tail = c.get().tail.clone();
+            loop {
+                match tail {
+                    Value::Nil => break,
+                    Value::List(l) => {
+                        result.extend(l.get().iter().cloned());
+                        break;
+                    }
+                    Value::Cons(next_c) => {
+                        result.push(next_c.get().head.clone());
+                        tail = next_c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        tail = ls.get().realize();
+                    }
+                    _ => break,
+                }
+            }
+            result
+        }
         _ => vec![],
     }
 }
@@ -273,6 +311,15 @@ impl ClojureHash for Value {
             Value::Macro(f) => f.get() as *const _ as u32,
             Value::BigDecimal(d) => hash_string(&d.get().to_string()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
+            Value::LazySeq(ls) => ls.get().realize().clojure_hash(),
+            Value::Cons(_) => {
+                // Hash like an ordered sequence.
+                let mut h: u32 = 1;
+                for v in value_to_seq_vec(self) {
+                    h = hash_combine_ordered(h, v.clojure_hash());
+                }
+                h
+            }
         }
     }
 }
@@ -414,6 +461,38 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
             write!(f, ")")
         }
+        Value::LazySeq(ls) => pr_str(&ls.get().realize(), f, readably),
+        Value::Cons(c) => {
+            write!(f, "(")?;
+            pr_str(&c.get().head, f, readably)?;
+            let mut tail = c.get().tail.clone();
+            loop {
+                match tail {
+                    Value::Nil => break,
+                    Value::List(l) => {
+                        for item in l.get().iter() {
+                            write!(f, " ")?;
+                            pr_str(item, f, readably)?;
+                        }
+                        break;
+                    }
+                    Value::Cons(next_c) => {
+                        write!(f, " ")?;
+                        pr_str(&next_c.get().head, f, readably)?;
+                        tail = next_c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        tail = ls.get().realize();
+                    }
+                    other => {
+                        write!(f, " . ")?;
+                        pr_str(&other, f, readably)?;
+                        break;
+                    }
+                }
+            }
+            write!(f, ")")
+        }
         Value::NativeFunction(nf) => write!(f, "#<NativeFn {}>", nf.get().name),
         Value::Fn(fun) => match &fun.get().name {
             Some(n) => write!(f, "#<Fn {n}>"),
@@ -455,6 +534,8 @@ impl Value {
             Value::Var(_) => "var",
             Value::Atom(_) => "atom",
             Value::Namespace(_) => "namespace",
+            Value::LazySeq(_) => "lazyseq",
+            Value::Cons(_) => "cons",
         }
     }
 
@@ -473,16 +554,25 @@ impl Value {
         Value::Keyword(GcPtr::new(k))
     }
 
-    /// True for sequential collections (list and vector).
+    /// True for sequential collections (list, vector, lazy seq, cons).
     pub fn is_sequential(&self) -> bool {
-        matches!(self, Value::List(_) | Value::Vector(_))
+        matches!(
+            self,
+            Value::List(_) | Value::Vector(_) | Value::LazySeq(_) | Value::Cons(_)
+        )
     }
 
     /// True for any collection.
     pub fn is_coll(&self) -> bool {
         matches!(
             self,
-            Value::List(_) | Value::Vector(_) | Value::Map(_) | Value::Set(_) | Value::Queue(_)
+            Value::List(_)
+                | Value::Vector(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::Queue(_)
+                | Value::LazySeq(_)
+                | Value::Cons(_)
         )
     }
 }

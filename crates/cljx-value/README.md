@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn body/arities, Namespace interns) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
-  types.rs                       — Var, Atom, Namespace (with interns/refers/aliases), NativeFn, CljxFn (multi-arity with body)
+  types.rs                       — Var, Atom, Namespace (with interns/refers/aliases), NativeFn, CljxFn, Thunk, LazySeq, CljxCons
   value.rs                       — Value enum, MapValue, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -67,7 +67,10 @@ pub enum Value {
     Map(MapValue),
     Set(GcPtr<PersistentHashSet>),
     Queue(GcPtr<PersistentQueue>),
-    // Runtime objects (Phase 4/7 stubs)
+    // Lazy sequences (Phase 5)
+    LazySeq(GcPtr<LazySeq>),   // deferred sequence; forced at most once
+    Cons(GcPtr<CljxCons>),     // cons cell with lazy-capable tail
+    // Runtime objects
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
     Namespace(GcPtr<Namespace>),
@@ -154,8 +157,33 @@ pub struct Namespace {
 }
 ```
 
-### Dependencies (Phase 4 addition)
+### `Thunk` / `LazySeq` / `CljxCons` (Phase 5)
 
-`cljx-value` now depends on `cljx-reader` so that `CljxFnArity::body` can store
+```rust
+pub trait Thunk: Send + Sync + std::fmt::Debug {
+    fn force(&self) -> Value;
+}
+
+pub struct LazySeq {
+    pub state: Mutex<LazySeqState>,  // Pending(Box<dyn Thunk>) | Forced(Value)
+}
+impl LazySeq {
+    pub fn new(thunk: Box<dyn Thunk>) -> Self
+    pub fn realize(&self) -> Value   // forces once, caches result
+}
+
+pub struct CljxCons {
+    pub head: Value,
+    pub tail: Value,   // may be LazySeq, Cons, List, or Nil
+}
+```
+
+`Thunk` implementations live in `cljx-eval` (e.g. `ClosureThunk`) so that
+`cljx-value` stays free of evaluator dependencies while `LazySeq` can still
+call back through the trait object.
+
+### Dependencies
+
+`cljx-value` depends on `cljx-reader` so that `CljxFnArity::body` can store
 `Vec<Form>` (unevaluated source bodies for interpreter evaluation and closure
 capture).

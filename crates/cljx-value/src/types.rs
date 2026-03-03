@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::{Arc, Mutex};
 
 use cljx_gc::GcPtr;
@@ -178,3 +179,69 @@ impl CljxFn {
 }
 
 impl cljx_gc::Trace for CljxFn {}
+
+// ── Thunk / LazySeq ───────────────────────────────────────────────────────────
+
+/// A deferred computation that produces a `Value` when forced.
+pub trait Thunk: Send + Sync + std::fmt::Debug {
+    fn force(&self) -> Value;
+}
+
+/// Internal state of a lazy sequence cell.
+pub enum LazySeqState {
+    /// Thunk not yet evaluated.
+    Pending(Box<dyn Thunk>),
+    /// Result cached after first force.
+    Forced(Value),
+}
+
+/// A lazy sequence that forces its thunk exactly once and caches the result.
+pub struct LazySeq {
+    pub state: Mutex<LazySeqState>,
+}
+
+impl LazySeq {
+    pub fn new(thunk: Box<dyn Thunk>) -> Self {
+        Self {
+            state: Mutex::new(LazySeqState::Pending(thunk)),
+        }
+    }
+
+    /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
+    pub fn realize(&self) -> Value {
+        let mut guard = self.state.lock().unwrap();
+        if let LazySeqState::Forced(v) = &*guard {
+            return v.clone();
+        }
+        // Replace the pending state with a temporary Forced(Nil), then force the thunk.
+        let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
+        let LazySeqState::Pending(thunk) = prev else {
+            unreachable!("state was not Pending")
+        };
+        let result = thunk.force();
+        *guard = LazySeqState::Forced(result.clone());
+        result
+    }
+}
+
+impl std::fmt::Debug for LazySeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LazySeq(...)")
+    }
+}
+
+impl cljx_gc::Trace for LazySeq {}
+
+// ── CljxCons ──────────────────────────────────────────────────────────────────
+
+/// A lazy cons cell: head element + tail (may be a `LazySeq`, `List`, or `Nil`).
+///
+/// Used when `cons` is called with a `LazySeq` or `Cons` tail, enabling lazy
+/// sequences without eagerly realizing them.
+#[derive(Debug, Clone)]
+pub struct CljxCons {
+    pub head: Value,
+    pub tail: Value,
+}
+
+impl cljx_gc::Trace for CljxCons {}

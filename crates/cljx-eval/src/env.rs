@@ -49,6 +49,12 @@ pub struct GlobalEnv {
     pub namespaces: RwLock<HashMap<Arc<str>, GcPtr<Namespace>>>,
 }
 
+impl std::fmt::Debug for GlobalEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GlobalEnv {{ ... }}")
+    }
+}
+
 impl GlobalEnv {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {

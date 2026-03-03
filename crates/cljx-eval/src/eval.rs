@@ -787,4 +787,114 @@ mod tests {
         assert_eq!(eval_str("(or false nil 42)").unwrap(), long(42));
         assert_eq!(eval_str("(or false nil)").unwrap(), Value::Nil);
     }
+
+    // ── Phase 5: Lazy sequences ───────────────────────────────────────────
+
+    #[test]
+    fn test_lazy_range() {
+        assert_eq!(
+            eval_str("(= (into [] (take 5 (range))) [0 1 2 3 4])").unwrap(),
+            bool_v(true)
+        );
+    }
+
+    #[test]
+    fn test_lazy_range_bounded() {
+        assert_eq!(
+            eval_str("(= (into [] (range 3)) [0 1 2])").unwrap(),
+            bool_v(true)
+        );
+    }
+
+    #[test]
+    fn test_lazy_iterate() {
+        assert_eq!(
+            eval_str("(= (into [] (take 3 (iterate inc 0))) [0 1 2])").unwrap(),
+            bool_v(true)
+        );
+    }
+
+    #[test]
+    fn test_lazy_repeat() {
+        assert_eq!(
+            eval_str("(= (into [] (take 3 (repeat :x))) [:x :x :x])").unwrap(),
+            bool_v(true)
+        );
+    }
+
+    #[test]
+    fn test_lazy_cycle() {
+        assert_eq!(
+            eval_str("(= (into [] (take 5 (cycle [1 2]))) [1 2 1 2 1])").unwrap(),
+            bool_v(true)
+        );
+    }
+
+    // ── Phase 5: Associative destructuring ───────────────────────────────
+
+    #[test]
+    fn test_assoc_destructure() {
+        assert_eq!(
+            eval_str("(let [{:keys [a b]} {:a 1 :b 2}] (+ a b))").unwrap(),
+            long(3)
+        );
+    }
+
+    #[test]
+    fn test_assoc_destructure_or() {
+        assert_eq!(
+            eval_str("(let [{:keys [a b] :or {b 99}} {:a 1}] b)").unwrap(),
+            long(99)
+        );
+    }
+
+    // ── Phase 5: letfn ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_letfn() {
+        assert_eq!(
+            eval_str("(letfn [(fact [n] (if (= n 0) 1 (* n (fact (dec n)))))] (fact 5))").unwrap(),
+            long(120)
+        );
+    }
+
+    // ── Phase 5: namespace ops ────────────────────────────────────────────
+
+    #[test]
+    fn test_in_ns() {
+        let (_, mut env) = make_env();
+        eval_src("(in-ns 'mytest)", &mut env).unwrap();
+        assert_eq!(env.current_ns.as_ref(), "mytest");
+        eval_src("(in-ns 'user)", &mut env).unwrap();
+        assert_eq!(env.current_ns.as_ref(), "user");
+    }
+
+    // ── Phase 5: spit / slurp ─────────────────────────────────────────────
+
+    #[test]
+    fn test_spit_slurp() {
+        let path = std::env::temp_dir().join("cljx_test_spit_slurp.txt");
+        let path_str = path.to_str().unwrap();
+        let src = format!(
+            r#"(do (spit "{}" "hello clojurust") (slurp "{}"))"#,
+            path_str, path_str
+        );
+        let result = eval_str(&src).unwrap();
+        if let Value::Str(s) = result {
+            assert_eq!(s.get().as_str(), "hello clojurust");
+        } else {
+            panic!("expected string result from slurp");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── Phase 5: update-in ───────────────────────────────────────────────
+
+    #[test]
+    fn test_update_in() {
+        assert_eq!(
+            eval_str("(= (update-in {:a {:b 1}} [:a :b] inc) {:a {:b 2}})").unwrap(),
+            bool_v(true)
+        );
+    }
 }

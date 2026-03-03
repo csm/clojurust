@@ -64,11 +64,11 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
   - [x] `if`, `do`, `and`, `or`, `quote`, `var`
   - [x] `try`/`catch`/`finally`, `throw`
   - [x] `set!` for mutable vars
-  - [ ] `letfn` — Phase 5
+  - [x] `letfn`
   - [ ] `monitor-enter`/`monitor-exit` — Phase 7
   - [ ] `new` / interop forms — Phase 9
 - [x] Sequential destructuring in `let`, `fn`, `loop` (`:as` alias, `& rest`)
-- [ ] Associative / nested destructuring — Phase 5
+- [x] Associative / nested destructuring (`{:keys [a b]}`, `:strs`, `:syms`, `:as`, `:or`)
 - [x] Tail-call optimization via `recur` (trampoline in `loop*` and `fn*`)
 - [x] Macro expansion pipeline (`macroexpand-1`, `macroexpand`)
 - [x] Syntax-quote with symbol resolution and gensyms
@@ -79,18 +79,20 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 5 — Core Standard Library (`clojure.core` equivalent)
 
-- [ ] Arithmetic: `+`, `-`, `*`, `/`, `mod`, `rem`, `quot`, `inc`, `dec`, `max`, `min`, `abs`
-- [ ] Comparison: `=`, `not=`, `<`, `>`, `<=`, `>=`, `identical?`, `nil?`, `zero?`, `pos?`, `neg?`
-- [ ] Type predicates: `number?`, `string?`, `keyword?`, `symbol?`, `fn?`, `seq?`, `map?`, `vector?`, `set?`, `coll?`
-- [ ] Collection ops: `conj`, `assoc`, `dissoc`, `get`, `get-in`, `assoc-in`, `update`, `update-in`, `merge`, `into`, `empty`
-- [ ] Seq ops: `first`, `rest`, `next`, `cons`, `seq`, `count`, `nth`, `last`, `butlast`, `reverse`, `concat`
-- [ ] Higher-order: `map`, `filter`, `reduce`, `keep`, `remove`, `mapcat`, `take`, `drop`, `take-while`, `drop-while`, `partition`, `partition-all`, `group-by`, `sort`, `sort-by`
-- [ ] Lazy sequences: `lazy-seq`, `range`, `repeat`, `iterate`, `cycle`, `take`, `drop`
-- [ ] String functions (`clojure.string`): `join`, `split`, `trim`, `upper-case`, `lower-case`, `replace`, `starts-with?`, `ends-with?`
-- [ ] I/O: `print`, `println`, `prn`, `pr`, `pr-str`, `str`, `read-string`, `slurp`, `spit`
+- [x] Arithmetic: `+`, `-`, `*`, `/`, `mod`, `rem`, `quot`, `inc`, `dec`, `max`, `min`, `abs`
+- [x] Comparison: `=`, `not=`, `<`, `>`, `<=`, `>=`, `identical?`, `nil?`, `zero?`, `pos?`, `neg?`
+- [x] Type predicates: `number?`, `string?`, `keyword?`, `symbol?`, `fn?`, `seq?`, `map?`, `vector?`, `set?`, `coll?`
+- [x] Collection ops: `conj`, `assoc`, `dissoc`, `get`, `get-in`, `assoc-in`, `update`, `update-in`, `merge`, `into`, `empty`
+- [x] Seq ops: `first`, `rest`, `next`, `cons`, `seq`, `count`, `nth`, `last`, `butlast`, `reverse`, `concat`
+- [x] Higher-order: `map`, `filter`, `reduce`, `keep`, `remove`, `mapcat`, `take`, `drop`, `take-while`, `drop-while`, `partition`, `partition-all`, `group-by`, `sort`, `sort-by`
+- [x] Lazy sequences: `lazy-seq`, `range`, `repeat`, `iterate`, `cycle`, `repeatedly` (via `Thunk`/`LazySeq` + `Value::Cons`)
+- [x] String functions: `join`, `split`, `trim`, `upper-case`, `lower-case`, `replace`, `starts-with?`, `ends-with?`
+- [x] I/O: `print`, `println`, `prn`, `pr`, `pr-str`, `str`, `read-string`, `slurp`, `spit`
 - [ ] Math: `Math/abs`, `Math/pow`, `Math/sqrt`, `Math/floor`, `Math/ceil`, `Math/round`, trig functions
-- [ ] Miscellaneous: `apply`, `comp`, `partial`, `juxt`, `memoize`, `constantly`, `identity`, `not`, `complement`, `gensym`, `type`, `class`, `hash`
-- [ ] Core macros: `when`, `when-not`, `when-let`, `if-let`, `if-not`, `cond`, `condp`, `case`, `and`, `or`, `->`, `->>`, `as->`, `doto`, `dotimes`, `doseq`, `for`, `with-meta`, `vary-meta`
+- [x] Miscellaneous: `apply`, `comp`, `partial`, `juxt`, `memoize`, `constantly`, `identity`, `not`, `complement`, `gensym`, `type`, `class`, `hash`
+- [x] Core macros: `when`, `when-not`, `if-not`, `cond`, `and`, `or`, `->`, `->>`, `as->`, `doto`, `dotimes`, `doseq`, `for`
+- [ ] `when-let`, `if-let`, `condp`, `case` macros
+- [x] Namespace ops: `in-ns`, `alias`, `refer` (basic); `ns` with `:require`/`:refer-clojure`
 
 ---
 

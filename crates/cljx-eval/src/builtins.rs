@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use cljx_gc::GcPtr;
 use cljx_value::{
-    Arity, Atom, Keyword, MapValue, NativeFn, PersistentHashSet, PersistentList, PersistentVector,
-    Symbol, Value, ValueError, ValueResult,
+    Arity, Atom, CljxCons, Keyword, MapValue, NativeFn, PersistentHashSet, PersistentList,
+    PersistentVector, Symbol, Value, ValueError, ValueResult,
 };
 
 use crate::env::GlobalEnv;
@@ -125,8 +125,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("pr-str", Arity::Variadic { min: 0 }, builtin_pr_str),
         ("str", Arity::Variadic { min: 0 }, builtin_str),
         ("read-string", Arity::Fixed(1), builtin_read_string),
-        ("spit", Arity::Fixed(2), builtin_spit_stub),
-        ("slurp", Arity::Fixed(1), builtin_slurp_stub),
+        ("spit", Arity::Fixed(2), builtin_spit),
+        ("slurp", Arity::Fixed(1), builtin_slurp),
         // Misc
         ("gensym", Arity::Variadic { min: 0 }, builtin_gensym),
         ("type", Arity::Fixed(1), builtin_type),
@@ -149,6 +149,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("char", Arity::Fixed(1), builtin_char_fn),
         ("apply", Arity::Variadic { min: 2 }, builtin_apply_sentinel),
         ("swap!", Arity::Variadic { min: 2 }, builtin_swap_sentinel),
+        (
+            "make-lazy-seq",
+            Arity::Fixed(1),
+            builtin_make_lazy_seq_sentinel,
+        ),
         ("format", Arity::Variadic { min: 1 }, builtin_format),
         ("re-find", Arity::Fixed(2), builtin_re_find_stub),
         ("re-seq", Arity::Fixed(2), builtin_re_seq_stub),
@@ -460,24 +465,36 @@ pub const BOOTSTRAP_SOURCE: &str = r#"
 (defn into [to from]
   (reduce conj to from))
 
-(defmacro lazy-seq [& body] (cons 'do body))
+(defmacro lazy-seq [& body]
+  (list 'make-lazy-seq (list 'fn [] (cons 'do body))))
 
 (defn iterate [f x]
-  (loop [v x acc []]
-    (if (< (count acc) 1000)
-      (recur (f v) (conj acc v))
-      (seq acc))))
+  (lazy-seq (cons x (iterate f (f x)))))
 
-(defn repeatedly [n f]
-  (loop [i 0 acc []]
-    (if (< i n)
-      (recur (inc i) (conj acc (f)))
-      (seq acc))))
+(defn repeat
+  ([x] (lazy-seq (cons x (repeat x))))
+  ([n x] (take n (repeat x))))
+
+(defn repeatedly
+  ([f] (lazy-seq (cons (f) (repeatedly f))))
+  ([n f] (take n (repeatedly f))))
+
+(defn range
+  ([] (range 0 9223372036854775807 1))
+  ([end] (range 0 end 1))
+  ([start end] (range start end 1))
+  ([start end step]
+   (lazy-seq
+     (when (if (pos? step) (< start end) (> start end))
+       (cons start (range (+ start step) end step))))))
 
 (defn cycle [coll]
-  (let [v (vec coll)
-        n (count v)]
-    (map (fn [i] (nth v (mod i n))) (range (* n 3)))))
+  (letfn [(c [s]
+            (lazy-seq
+              (if (seq s)
+                (cons (first s) (c (rest s)))
+                (c coll))))]
+    (when (seq coll) (c coll))))
 
 (defn counted? [x] (or (vector? x) (map? x) (set? x) (string? x)))
 (defn reversible? [x] (vector? x))
@@ -640,6 +657,34 @@ pub const BOOTSTRAP_SOURCE: &str = r#"
 fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
     match v {
         Value::Nil => Ok(vec![]),
+        Value::LazySeq(ls) => value_to_seq(&ls.get().realize()),
+        Value::Cons(c) => {
+            let mut result = vec![c.get().head.clone()];
+            let mut tail = c.get().tail.clone();
+            loop {
+                match tail {
+                    Value::Nil => break,
+                    Value::List(l) => {
+                        result.extend(l.get().iter().cloned());
+                        break;
+                    }
+                    Value::Cons(next_c) => {
+                        result.push(next_c.get().head.clone());
+                        tail = next_c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        tail = ls.get().realize();
+                    }
+                    other => {
+                        return Err(ValueError::WrongType {
+                            expected: "seq",
+                            got: other.type_name().to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(result)
+        }
         Value::List(l) => Ok(l.get().iter().cloned().collect()),
         Value::Vector(v) => Ok(v.get().iter().cloned().collect()),
         Value::Set(s) => Ok(s.get().iter().collect()),
@@ -1077,7 +1122,10 @@ fn builtin_fn_q(args: &[Value]) -> ValueResult<Value> {
     )))
 }
 fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0], Value::List(_))))
+    Ok(Value::Bool(matches!(
+        args[0],
+        Value::List(_) | Value::Cons(_)
+    )))
 }
 fn builtin_map_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::Map(_))))
@@ -1315,6 +1363,14 @@ fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_count(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::LazySeq(_) | Value::Cons(_) => {
+            // Realize and count elements (linear time).
+            let items = value_to_seq(&args[0])?;
+            return Ok(Value::Long(items.len() as i64));
+        }
+        _ => {}
+    }
     let n = match &args[0] {
         Value::Nil => 0,
         Value::List(l) => l.get().count(),
@@ -1334,6 +1390,12 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::LazySeq(ls) => {
+            // Realize the lazy seq then apply seq to the result.
+            let realized = ls.get().realize();
+            builtin_seq(&[realized])
+        }
+        Value::Cons(_) => Ok(args[0].clone()), // cons is always non-empty
         Value::Nil => Ok(Value::Nil),
         Value::List(l) => {
             if l.get().is_empty() {
@@ -1389,6 +1451,8 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::LazySeq(ls) => builtin_first(&[ls.get().realize()]),
+        Value::Cons(c) => Ok(c.get().head.clone()),
         Value::Nil => Ok(Value::Nil),
         Value::List(l) => Ok(l.get().first().cloned().unwrap_or(Value::Nil)),
         Value::Vector(v) => Ok(v.get().nth(0).cloned().unwrap_or(Value::Nil)),
@@ -1410,6 +1474,14 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::LazySeq(ls) => builtin_rest(&[ls.get().realize()]),
+        Value::Cons(c) => {
+            // Return the tail directly; it may be another LazySeq, Cons, List, or Nil.
+            match &c.get().tail {
+                Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::empty()))),
+                tail => Ok(tail.clone()),
+            }
+        }
         Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::empty()))),
         Value::List(l) => {
             // rest() returns Arc<PersistentList>; clone the pointed-to list.
@@ -1424,34 +1496,47 @@ fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_next(args: &[Value]) -> ValueResult<Value> {
+    // next = (seq (rest x)) — returns nil for empty, seq otherwise.
     let rest = builtin_rest(args)?;
-    match rest {
-        Value::List(l) if l.get().is_empty() => Ok(Value::Nil),
-        other => Ok(other),
-    }
+    builtin_seq(&[rest])
 }
 
 fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
     let head = args[0].clone();
-    let tail = match &args[1] {
-        Value::Nil => PersistentList::empty(),
-        Value::List(l) => (*l.get()).clone(),
-        Value::Vector(v) => PersistentList::from_iter(v.get().iter().cloned()),
-        v => {
-            return Err(ValueError::WrongType {
-                expected: "seq",
-                got: v.type_name().to_string(),
-            });
+    match &args[1] {
+        // Lazy tails produce a CljxCons to preserve laziness.
+        Value::LazySeq(_) | Value::Cons(_) => Ok(Value::Cons(GcPtr::new(CljxCons {
+            head,
+            tail: args[1].clone(),
+        }))),
+        Value::Nil => {
+            let new_list = PersistentList::cons(head, std::sync::Arc::new(PersistentList::empty()));
+            Ok(Value::List(GcPtr::new(new_list)))
         }
-    };
-    let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
-    Ok(Value::List(GcPtr::new(new_list)))
+        Value::List(l) => {
+            let new_list = PersistentList::cons(head, std::sync::Arc::new((*l.get()).clone()));
+            Ok(Value::List(GcPtr::new(new_list)))
+        }
+        Value::Vector(v) => {
+            let tail = PersistentList::from_iter(v.get().iter().cloned());
+            let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
+            Ok(Value::List(GcPtr::new(new_list)))
+        }
+        v => Err(ValueError::WrongType {
+            expected: "seq",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
     let idx = numeric_as_i64(&args[1])? as usize;
     let default = args.get(2).cloned();
     match &args[0] {
+        Value::LazySeq(_) | Value::Cons(_) => {
+            let items = value_to_seq(&args[0])?;
+            Ok(items.into_iter().nth(idx).or(default).unwrap_or(Value::Nil))
+        }
         Value::List(l) => Ok(l
             .get()
             .iter()
@@ -1984,11 +2069,43 @@ fn builtin_read_string(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn builtin_spit_stub(_args: &[Value]) -> ValueResult<Value> {
+fn builtin_spit(args: &[Value]) -> ValueResult<Value> {
+    let path = match &args[0] {
+        Value::Str(s) => s.get().clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "string",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let content = match &args[1] {
+        Value::Str(s) => s.get().clone(),
+        v => v.to_string(),
+    };
+    std::fs::write(&path, &content).map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::Nil)
 }
-fn builtin_slurp_stub(_args: &[Value]) -> ValueResult<Value> {
-    Err(ValueError::Other("slurp not yet implemented".into()))
+
+fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
+    let path = match &args[0] {
+        Value::Str(s) => s.get().clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "string",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
+    Ok(Value::string(content))
+}
+
+fn builtin_make_lazy_seq_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    // Actual work is done in apply.rs handle_make_lazy_seq.
+    Err(ValueError::Other(
+        "make-lazy-seq must be called from eval context".into(),
+    ))
 }
 
 // ── Misc ──────────────────────────────────────────────────────────────────────

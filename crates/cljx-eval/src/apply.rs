@@ -4,12 +4,29 @@ use std::sync::Arc;
 
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
-use cljx_value::{Arity, CljxFn, CljxFnArity, PersistentList, Value};
+use cljx_value::{Arity, CljxFn, CljxFnArity, LazySeq, PersistentList, Thunk, Value};
 
 use crate::destructure::value_to_seq_vec;
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
 use crate::eval::eval;
+
+// ── ClosureThunk ──────────────────────────────────────────────────────────────
+
+/// A Thunk that calls a zero-arg Clojure closure when forced.
+#[derive(Debug)]
+struct ClosureThunk {
+    f: CljxFn,
+    globals: std::sync::Arc<crate::env::GlobalEnv>,
+    ns: std::sync::Arc<str>,
+}
+
+impl Thunk for ClosureThunk {
+    fn force(&self) -> Value {
+        let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
+        call_cljx_fn(&self.f, vec![], &mut env).unwrap_or(Value::Nil)
+    }
+}
 
 /// Evaluate a call expression `(func-form arg1 arg2 ...)`.
 ///
@@ -35,6 +52,9 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
         }
         if nf.get().name.as_ref() == "swap!" {
             return handle_swap_call(arg_forms, env);
+        }
+        if nf.get().name.as_ref() == "make-lazy-seq" {
+            return handle_make_lazy_seq(arg_forms, env);
         }
     }
 
@@ -235,6 +255,33 @@ fn handle_apply_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let spread = value_to_seq_vec(&last);
     evaled.extend(spread);
     apply_value(&f, evaled, env)
+}
+
+/// Handle `(make-lazy-seq f)` — wraps a zero-arg fn in a lazy sequence.
+pub fn handle_make_lazy_seq(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "make-lazy-seq".into(),
+            expected: "1".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let f_val = eval(&arg_forms[0], env)?;
+    let f = match f_val {
+        Value::Fn(f) => f.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "make-lazy-seq requires a fn, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let thunk = ClosureThunk {
+        f,
+        globals: env.globals.clone(),
+        ns: env.current_ns.clone(),
+    };
+    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
 }
 
 /// Handle `(swap! atom f & args)`.

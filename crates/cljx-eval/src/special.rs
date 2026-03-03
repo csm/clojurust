@@ -15,6 +15,7 @@ use cljx_value::{CljxFn, CljxFnArity, Value};
 pub const SPECIAL_FORMS: &[&str] = &[
     "def", "fn*", "fn", "if", "do", "let*", "let", "loop*", "loop", "recur", "quote", "var",
     "set!", "throw", "try", "defn", "defmacro", "defonce", "and", "or", ".", "ns", "require",
+    "letfn", "in-ns", "alias",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -40,6 +41,9 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "." => Err(EvalError::Runtime("interop not yet implemented".into())),
         "ns" => eval_ns(args, env),
         "require" => Ok(Value::Nil), // stub
+        "letfn" => eval_letfn(args, env),
+        "in-ns" => eval_in_ns(args, env),
+        "alias" => eval_alias(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -572,6 +576,102 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
     env.globals.get_or_create_ns(name);
     env.current_ns = Arc::from(name);
     Ok(Value::Nil)
+}
+
+// ── letfn ─────────────────────────────────────────────────────────────────────
+
+fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
+    // (letfn [(f [params] body...) ...] body...)
+    let bindings = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Vector(v)) => v.clone(),
+        _ => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
+    };
+
+    env.push_frame();
+
+    for binding in &bindings {
+        if let FormKind::List(parts) = &binding.kind {
+            if parts.is_empty() {
+                continue;
+            }
+            // parts[0] = name, parts[1] = params, parts[2..] = body
+            // Reuse eval_fn: it expects (optional-name params body...)
+            // We pass parts directly since parts[0] is the function name symbol.
+            let fn_val = match eval_fn(parts, env) {
+                Ok(v) => v,
+                Err(e) => {
+                    env.pop_frame();
+                    return Err(e);
+                }
+            };
+            let name = match &parts[0].kind {
+                FormKind::Symbol(s) => s.clone(),
+                _ => {
+                    env.pop_frame();
+                    return Err(EvalError::Runtime(
+                        "letfn binding name must be a symbol".into(),
+                    ));
+                }
+            };
+            env.bind(Arc::from(name.as_str()), fn_val);
+        }
+    }
+
+    let body = &args[1..];
+    let result = eval_body(body, env);
+    env.pop_frame();
+    result
+}
+
+// ── in-ns ─────────────────────────────────────────────────────────────────────
+
+fn eval_in_ns(args: &[Form], env: &mut Env) -> EvalResult {
+    // (in-ns 'foo.bar)
+    if args.is_empty() {
+        return Err(EvalError::Runtime("in-ns requires a namespace name".into()));
+    }
+    let ns_val = eval(&args[0], env)?;
+    let ns_name = extract_ns_name(&ns_val)?;
+    env.globals.get_or_create_ns(&ns_name);
+    env.current_ns = Arc::from(ns_name.as_str());
+    Ok(Value::Nil)
+}
+
+// ── alias ─────────────────────────────────────────────────────────────────────
+
+fn eval_alias(args: &[Form], env: &mut Env) -> EvalResult {
+    // (alias 'short 'some.long.ns)
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(
+            "alias requires alias-sym and namespace-sym".into(),
+        ));
+    }
+    let alias_val = eval(&args[0], env)?;
+    let ns_val = eval(&args[1], env)?;
+
+    let alias_name = extract_ns_name(&alias_val)?;
+    let full_ns = extract_ns_name(&ns_val)?;
+
+    let ns_ptr = env.globals.get_or_create_ns(&env.current_ns);
+    let mut aliases = ns_ptr.get().aliases.lock().unwrap();
+    aliases.insert(Arc::from(alias_name.as_str()), Arc::from(full_ns.as_str()));
+    Ok(Value::Nil)
+}
+
+/// Extract a namespace-name string from a Value::Symbol, Value::Str, or Value::Keyword.
+fn extract_ns_name(v: &Value) -> EvalResult<String> {
+    match v {
+        Value::Symbol(s) => {
+            // Use the full name (e.g. "clojure.core").
+            Ok(s.get().name.as_ref().to_string())
+        }
+        Value::Str(s) => Ok(s.get().clone()),
+        Value::Keyword(k) => Ok(k.get().name.as_ref().to_string()),
+        other => Err(EvalError::Runtime(format!(
+            "expected a symbol or string for namespace name, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
