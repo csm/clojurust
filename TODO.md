@@ -92,6 +92,10 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] Miscellaneous: `apply`, `comp`, `partial`, `juxt`, `memoize`, `constantly`, `identity`, `not`, `complement`, `gensym`, `type`, `class`, `hash`
 - [x] Core macros: `when`, `when-not`, `if-let`, `when-let`, `if-not`, `cond`, `condp`, `case`, `and`, `or`, `->`, `->>`, `as->`, `doto`, `dotimes`, `doseq`, `for`
 - [x] Namespace ops: `in-ns`, `alias`, `refer` (basic); `ns` with `:require`/`:refer-clojure`
+- [x] `require` — file-based namespace loading with `:as` alias and `:refer [...]`/`:refer :all`
+- [x] `load-file` — evaluate a source file by absolute path
+- [x] Source-path management — `--src-path DIR` CLI flag; `standard_env_with_paths`
+- [x] Alias resolution in qualified symbol lookup (`fb/foo` resolves via ns aliases)
 
 ---
 
@@ -191,12 +195,12 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 12 — REPL & Tooling
 
-- [ ] Interactive REPL (`cljx repl`): read–eval–print loop with readline support
+- [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)
 - [ ] nREPL-compatible server for editor integration
-- [ ] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
-- [ ] `cljx eval '<expr>'` — evaluate expression from command line
+- [x] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
+- [x] `cljx eval '<expr>'` — evaluate expression from command line
 - [ ] Project / build system (`cljx.edn` project descriptor, dependency resolution)
-- [ ] Classpath / source-path management
+- [x] Source-path management (`--src-path DIR` on `run`/`repl`; namespace→file resolution)
 - [ ] `cljx test` — discover and run test namespaces (`clojure.test` compatible)
 - [ ] Source formatting tool (`cljx fmt`)
 - [ ] Documentation generator

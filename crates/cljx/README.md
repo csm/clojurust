@@ -23,17 +23,21 @@ src/
 cljx <SUBCOMMAND>
 
 Subcommands:
-  run      <file>              Interpret a .cljrs or .cljc source file
-  repl                         Start an interactive REPL
-  compile  <file> -o <out>     AOT-compile a source file to a native binary
-  eval     <expr>              Evaluate a single Clojure expression and print the result
+  run      <file> [--src-path DIR]...   Interpret a .cljrs or .cljc source file
+  repl     [--src-path DIR]...          Start an interactive REPL
+  compile  <file> -o <out>              AOT-compile a source file to a native binary
+  eval     <expr>                       Evaluate a single Clojure expression and print the result
 ```
+
+`--src-path` may be repeated to add multiple source directories searched by
+`require` when resolving namespace names to files.
 
 ### Examples
 
 ```bash
 cljx run hello.cljrs
-cljx repl
+cljx run main.cljrs --src-path src --src-path lib
+cljx repl --src-path src
 cljx compile app.cljrs -o app
 cljx eval '(+ 1 2)'
 ```

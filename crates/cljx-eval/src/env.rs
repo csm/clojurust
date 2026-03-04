@@ -1,10 +1,28 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use cljx_gc::GcPtr;
 use cljx_value::{CljxFn, Namespace, Value, Var};
+
+// ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
+
+/// How symbols should be referred into the requiring namespace.
+#[derive(Debug, Clone)]
+pub enum RequireRefer {
+    None,
+    All,
+    Named(Vec<Arc<str>>),
+}
+
+/// A parsed `require` specification.
+#[derive(Debug, Clone)]
+pub struct RequireSpec {
+    pub ns: Arc<str>,
+    pub alias: Option<Arc<str>>,
+    pub refer: RequireRefer,
+}
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
@@ -47,6 +65,12 @@ impl Frame {
 /// The global mutable store of all namespaces.
 pub struct GlobalEnv {
     pub namespaces: RwLock<HashMap<Arc<str>, GcPtr<Namespace>>>,
+    /// Directories to search when resolving namespace names to files.
+    pub source_paths: RwLock<Vec<std::path::PathBuf>>,
+    /// Namespaces that have been fully loaded from a file (idempotent guard).
+    pub loaded: Mutex<HashSet<Arc<str>>>,
+    /// Namespaces currently being loaded (cycle detection).
+    pub loading: Mutex<HashSet<Arc<str>>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -59,7 +83,33 @@ impl GlobalEnv {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             namespaces: RwLock::new(HashMap::new()),
+            source_paths: RwLock::new(Vec::new()),
+            loaded: Mutex::new(HashSet::new()),
+            loading: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Replace the source path list.
+    pub fn set_source_paths(&self, paths: Vec<std::path::PathBuf>) {
+        *self.source_paths.write().unwrap() = paths;
+    }
+
+    /// Mark a namespace as fully loaded from a file.
+    pub fn mark_loaded(&self, ns: &str) {
+        self.loaded.lock().unwrap().insert(Arc::from(ns));
+    }
+
+    /// True if the namespace has already been loaded from a file.
+    pub fn is_loaded(&self, ns: &str) -> bool {
+        self.loaded.lock().unwrap().contains(ns)
+    }
+
+    /// Resolve a short alias to a full namespace name in `current_ns`.
+    pub fn resolve_alias(&self, current_ns: &str, alias: &str) -> Option<Arc<str>> {
+        let map = self.namespaces.read().unwrap();
+        let ns = map.get(current_ns)?;
+        let aliases = ns.get().aliases.lock().unwrap();
+        aliases.get(alias).cloned()
     }
 
     /// Return the namespace with this name, creating it if it doesn't exist.
@@ -165,6 +215,35 @@ impl GlobalEnv {
                 .entry(name.clone())
                 .or_insert_with(|| var.clone());
         }
+    }
+
+    /// Copy selected interns from `src_ns` into `dst_ns` as refers.
+    pub fn refer_named(&self, dst_ns: &str, src_ns: &str, names: &[Arc<str>]) {
+        let map = self.namespaces.read().unwrap();
+        let src = match map.get(src_ns) {
+            Some(ns) => ns.clone(),
+            None => return,
+        };
+        let dst = match map.get(dst_ns) {
+            Some(ns) => ns.clone(),
+            None => return,
+        };
+        let src_interns = src.get().interns.lock().unwrap();
+        let mut dst_refers = dst.get().refers.lock().unwrap();
+        for name in names {
+            if let Some(var) = src_interns.get(name) {
+                dst_refers
+                    .entry(name.clone())
+                    .or_insert_with(|| var.clone());
+            }
+        }
+    }
+
+    /// Register `alias` → `full_ns` in `current_ns`'s alias table.
+    pub fn add_alias(&self, current_ns: &str, alias: &str, full_ns: &str) {
+        let ns_ptr = self.get_or_create_ns(current_ns);
+        let mut aliases = ns_ptr.get().aliases.lock().unwrap();
+        aliases.insert(Arc::from(alias), Arc::from(full_ns));
     }
 }
 

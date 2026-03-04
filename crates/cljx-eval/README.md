@@ -3,7 +3,7 @@
 Tree-walking interpreter for clojurust.  Evaluates `Form` AST nodes produced
 by `cljx-reader` within a namespace-aware lexical environment.
 
-**Phase:** 5–7 + defrecord/reify/built-in protocols — implemented.
+**Phase:** 5–8 + defrecord/reify/built-in protocols + source-path management/require — implemented.
 
 ---
 
@@ -20,12 +20,13 @@ full `clojure.core` bootstrap.
 
 ```
 src/
-  lib.rs          — module declarations, re-exports, standard_env()
+  lib.rs          — module declarations, re-exports, standard_env(), standard_env_with_paths()
   error.rs        — EvalError enum, EvalResult<T> alias
-  env.rs          — Frame, GlobalEnv (namespace registry), Env (lexical scope)
+  env.rs          — Frame, GlobalEnv (namespace registry + source paths + loaded set), Env (lexical scope), RequireSpec, RequireRefer
   eval.rs         — top-level eval dispatcher, form_to_value, inline tests
   apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, handle_make_delay, handle_send, handle_vswap, type_tag_of, resolve_type_tag
   special.rs      — all special form handlers, SPECIAL_FORMS list
+  loader.rs       — load_ns: resolves namespace names to files, evaluates them, applies alias/refer
   macros.rs       — macroexpand_1, macroexpand, value_to_form
   destructure.rs  — sequential + associative destructuring (bind_pattern, bind_sequential, bind_associative)
   syntax_quote.rs — syntax-quote expander with gensym counter
@@ -45,14 +46,29 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult;
 /// that refers everything from clojure.core.
 pub fn standard_env() -> Arc<GlobalEnv>;
 
-pub struct GlobalEnv { /* namespace registry */ }
+/// Like standard_env() but also configures the source search paths.
+pub fn standard_env_with_paths(source_paths: Vec<PathBuf>) -> Arc<GlobalEnv>;
+
+/// Load a namespace from source and wire alias/refer into current_ns.
+pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) -> Result<(), String>;
+
+pub enum RequireRefer { None, All, Named(Vec<Arc<str>>) }
+pub struct RequireSpec { pub ns: Arc<str>, pub alias: Option<Arc<str>>, pub refer: RequireRefer }
+
+pub struct GlobalEnv { /* namespace registry + source_paths + loaded/loading sets */ }
 impl GlobalEnv {
     pub fn new() -> Arc<Self>
+    pub fn set_source_paths(&self, paths: Vec<PathBuf>)
+    pub fn mark_loaded(&self, ns: &str)
+    pub fn is_loaded(&self, ns: &str) -> bool
+    pub fn resolve_alias(&self, current_ns: &str, alias: &str) -> Option<Arc<str>>
     pub fn get_or_create_ns(&self, name: &str) -> GcPtr<Namespace>
     pub fn intern(&self, ns: &str, name: Arc<str>, val: Value) -> GcPtr<Var>
     pub fn lookup_var(&self, ns: &str, name: &str) -> Option<GcPtr<Var>>
     pub fn lookup_in_ns(&self, ns: &str, name: &str) -> Option<Value>
     pub fn refer_all(&self, target_ns: &str, source_ns: &str)
+    pub fn refer_named(&self, target_ns: &str, source_ns: &str, names: &[Arc<str>])
+    pub fn add_alias(&self, current_ns: &str, alias: &str, full_ns: &str)
 }
 
 pub struct Env { /* frames + current_ns + globals */ }
@@ -96,7 +112,9 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `var` | Return `Value::Var` for a namespace var |
 | `set!` | Mutate a var's root binding |
 | `throw` / `try` / `catch` / `finally` | Exception handling |
-| `ns` | Switch current namespace with optional `:require`/`:refer-clojure` |
+| `ns` | Switch current namespace; processes `:require` clauses; auto-refers `clojure.core` |
+| `require` | Load and wire namespaces; supports `:as` alias and `:refer [...]`/`:refer :all` |
+| `load-file` | Evaluate a `.cljrs`/`.cljc` file by absolute path |
 | `in-ns` | Switch to (or create) a namespace by quoted symbol |
 | `alias` | Add a namespace alias to the current namespace |
 | `.` | Stub — interop not yet implemented |
@@ -216,5 +234,4 @@ Higher-order functions that need to call back into the evaluator are defined in
 - `.` interop, `new` — Phase 9
 - `ref` / STM (`dosync`, `alter`, `commute`, `ensure`) — deferred
 - `locking` macro — deferred
-- Full `require` with file loading — Phase 12
 - `derive` / full `isa?` hierarchy — deferred

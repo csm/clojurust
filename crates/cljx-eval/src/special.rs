@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use crate::destructure::bind_pattern;
-use crate::env::Env;
+use crate::env::{Env, RequireRefer, RequireSpec};
 use crate::error::{EvalError, EvalResult};
 use crate::eval::{eval, eval_body, form_to_value, is_special_form};
+use crate::loader::load_ns;
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
@@ -50,6 +51,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "future",
     "defrecord",
     "reify",
+    "load-file",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -74,7 +76,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "or" => eval_or(args, env),
         "." => Err(EvalError::Runtime("interop not yet implemented".into())),
         "ns" => eval_ns(args, env),
-        "require" => Ok(Value::Nil), // stub
+        "require" => eval_require(args, env),
         "letfn" => eval_letfn(args, env),
         "in-ns" => eval_in_ns(args, env),
         "alias" => eval_alias(args, env),
@@ -86,6 +88,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "future" => eval_future(args, env),
         "defrecord" => eval_defrecord(args, env),
         "reify" => eval_reify(args, env),
+        "load-file" => eval_load_file(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -611,13 +614,212 @@ fn eval_or(args: &[Form], env: &mut Env) -> EvalResult {
     Ok(Value::Nil)
 }
 
+// ── require ───────────────────────────────────────────────────────────────────
+
+fn eval_require(args: &[Form], env: &mut Env) -> EvalResult {
+    for arg in args {
+        let val = eval(arg, env)?;
+        let spec = parse_require_spec_val(val).map_err(EvalError::Runtime)?;
+        load_ns(env.globals.clone(), &spec, &env.current_ns).map_err(EvalError::Runtime)?;
+    }
+    Ok(Value::Nil)
+}
+
+/// Parse a `RequireSpec` from an already-evaluated `Value`.
+/// Accepts: `'some.ns`, `['some.ns :as alias]`, `['some.ns :refer [syms]]`,
+/// `['some.ns :refer :all]`.
+fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
+    match val {
+        Value::Symbol(s) => Ok(RequireSpec {
+            ns: s.get().name.clone(),
+            alias: None,
+            refer: RequireRefer::None,
+        }),
+        Value::Vector(v) => {
+            let items: Vec<Value> = v.get().iter().cloned().collect();
+            if items.is_empty() {
+                return Err("require spec vector must not be empty".into());
+            }
+            let ns = match &items[0] {
+                Value::Symbol(s) => s.get().name.clone(),
+                other => {
+                    return Err(format!(
+                        "require spec: first element must be a symbol, got {}",
+                        other.type_name()
+                    ));
+                }
+            };
+            let mut alias = None;
+            let mut refer = RequireRefer::None;
+            let mut i = 1;
+            while i < items.len() {
+                match &items[i] {
+                    Value::Keyword(k) if k.get().name.as_ref() == "as" => {
+                        i += 1;
+                        alias = Some(match items.get(i) {
+                            Some(Value::Symbol(s)) => s.get().name.clone(),
+                            _ => return Err("require :as expects a symbol".into()),
+                        });
+                    }
+                    Value::Keyword(k) if k.get().name.as_ref() == "refer" => {
+                        i += 1;
+                        refer = match items.get(i) {
+                            Some(Value::Keyword(k2)) if k2.get().name.as_ref() == "all" => {
+                                RequireRefer::All
+                            }
+                            Some(Value::Vector(rv)) => {
+                                let names: Vec<Arc<str>> = rv
+                                    .get()
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Symbol(s) => Ok(s.get().name.clone()),
+                                        other => Err(format!(
+                                            "require :refer expects symbols, got {}",
+                                            other.type_name()
+                                        )),
+                                    })
+                                    .collect::<Result<_, _>>()?;
+                                RequireRefer::Named(names)
+                            }
+                            _ => {
+                                return Err(
+                                    "require :refer expects :all or a vector of symbols".into()
+                                );
+                            }
+                        };
+                    }
+                    other => {
+                        return Err(format!(
+                            "require spec: unexpected option {}",
+                            other.type_name()
+                        ));
+                    }
+                }
+                i += 1;
+            }
+            Ok(RequireSpec { ns, alias, refer })
+        }
+        other => Err(format!(
+            "require expects a symbol or vector, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Parse a `RequireSpec` from a raw `Form` (unevaluated, used in `ns` macro).
+fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
+    match &form.kind {
+        FormKind::Symbol(s) => Ok(RequireSpec {
+            ns: Arc::from(s.as_str()),
+            alias: None,
+            refer: RequireRefer::None,
+        }),
+        FormKind::Vector(items) => {
+            if items.is_empty() {
+                return Err("require spec vector must not be empty".into());
+            }
+            let ns = match &items[0].kind {
+                FormKind::Symbol(s) => Arc::from(s.as_str()),
+                _ => return Err("require spec: first element must be a symbol".into()),
+            };
+            let mut alias = None;
+            let mut refer = RequireRefer::None;
+            let mut i = 1;
+            while i < items.len() {
+                match &items[i].kind {
+                    FormKind::Keyword(k) if k == "as" => {
+                        i += 1;
+                        alias = Some(match items.get(i).map(|f| &f.kind) {
+                            Some(FormKind::Symbol(s)) => Arc::from(s.as_str()),
+                            _ => return Err("require :as expects a symbol".into()),
+                        });
+                    }
+                    FormKind::Keyword(k) if k == "refer" => {
+                        i += 1;
+                        refer = match items.get(i).map(|f| &f.kind) {
+                            Some(FormKind::Keyword(k2)) if k2 == "all" => RequireRefer::All,
+                            Some(FormKind::Vector(rv)) => {
+                                let names: Vec<Arc<str>> = rv
+                                    .iter()
+                                    .map(|f| match &f.kind {
+                                        FormKind::Symbol(s) => Ok(Arc::from(s.as_str())),
+                                        _ => Err("require :refer expects symbols".to_string()),
+                                    })
+                                    .collect::<Result<_, _>>()?;
+                                RequireRefer::Named(names)
+                            }
+                            _ => return Err("require :refer expects :all or a vector".into()),
+                        };
+                    }
+                    _ => return Err(format!("require spec: unexpected form at position {i}")),
+                }
+                i += 1;
+            }
+            Ok(RequireSpec { ns, alias, refer })
+        }
+        _ => Err("require spec must be a symbol or vector".into()),
+    }
+}
+
 // ── ns ────────────────────────────────────────────────────────────────────────
 
 fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
     let name = require_sym(args, 0, "ns")?;
     env.globals.get_or_create_ns(name);
     env.current_ns = Arc::from(name);
+    // Auto-refer clojure.core (Clojure default behaviour).
+    if name != "clojure.core" {
+        env.globals.refer_all(name, "clojure.core");
+    }
+
+    for clause in &args[1..] {
+        if let FormKind::List(items) = &clause.kind {
+            match items.first().map(|f| &f.kind) {
+                Some(FormKind::Keyword(k)) if k == "require" => {
+                    for spec_form in &items[1..] {
+                        let spec =
+                            parse_require_spec_form(spec_form).map_err(EvalError::Runtime)?;
+                        load_ns(env.globals.clone(), &spec, name).map_err(EvalError::Runtime)?;
+                    }
+                }
+                // Other clauses (:refer-clojure, :use, :import) — skip for now.
+                _ => {}
+            }
+        }
+    }
+
     Ok(Value::Nil)
+}
+
+// ── load-file ─────────────────────────────────────────────────────────────────
+
+fn eval_load_file(args: &[Form], env: &mut Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Runtime(
+            "load-file requires a path argument".into(),
+        ));
+    }
+    let path_val = eval(&args[0], env)?;
+    let path = match &path_val {
+        Value::Str(s) => s.get().clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "load-file: expected string, got {}",
+                v.type_name()
+            )));
+        }
+    };
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| EvalError::Runtime(format!("load-file: {e}")))?;
+    let mut parser = cljx_reader::Parser::new(src, path.clone());
+    let forms = parser
+        .parse_all()
+        .map_err(|e| EvalError::Runtime(format!("load-file parse error: {e}")))?;
+    let mut result = Value::Nil;
+    for form in forms {
+        result = eval(&form, env)?;
+    }
+    Ok(result)
 }
 
 // ── letfn ─────────────────────────────────────────────────────────────────────

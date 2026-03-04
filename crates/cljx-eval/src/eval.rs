@@ -1,5 +1,7 @@
 //! Top-level `eval` dispatcher and form-to-value conversion.
 
+use std::sync::Arc;
+
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
@@ -143,10 +145,15 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
     // Namespace-qualified: `ns/name`
     if s.contains('/') && !s.starts_with('/') {
         let sym = Symbol::parse(s);
-        if let Some(ns) = &sym.namespace {
+        if let Some(ns_part) = &sym.namespace {
+            // Resolve alias first, fall back to literal namespace name.
+            let resolved: Arc<str> = env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
             return env
                 .globals
-                .lookup_in_ns(ns, &sym.name)
+                .lookup_in_ns(&resolved, &sym.name)
                 .ok_or_else(|| EvalError::UnboundSymbol(s.to_string()));
         }
     }
@@ -1338,5 +1345,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.to_string(), "\"Hello, World!\"");
+    }
+
+    // ── require / load-file ───────────────────────────────────────────────
+
+    fn temp_ns_dir(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cljx_test_{test_name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_env_with_paths(paths: Vec<std::path::PathBuf>) -> (Arc<GlobalEnv>, Env) {
+        use crate::standard_env_with_paths;
+        let globals = standard_env_with_paths(paths);
+        let env = Env::new(globals.clone(), "user");
+        (globals, env)
+    }
+
+    #[test]
+    fn test_require_as() {
+        let dir = temp_ns_dir("require_as");
+        std::fs::write(
+            dir.join("mylib.cljrs"),
+            "(ns mylib) (defn greet [n] (str \"hello \" n))",
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src("(require '[mylib :as ml]) (ml/greet \"world\")", &mut env).unwrap();
+        assert_eq!(result.to_string(), "\"hello world\"");
+    }
+
+    #[test]
+    fn test_require_refer() {
+        let dir = temp_ns_dir("require_refer");
+        std::fs::write(
+            dir.join("myutil.cljrs"),
+            "(ns myutil) (defn twice [x] (* 2 x))",
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src("(require '[myutil :refer [twice]]) (twice 21)", &mut env).unwrap();
+        assert_eq!(result, Value::Long(42));
+    }
+
+    #[test]
+    fn test_require_refer_all() {
+        let dir = temp_ns_dir("require_refer_all");
+        std::fs::write(
+            dir.join("mymath.cljrs"),
+            "(ns mymath) (defn square [x] (* x x))",
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src("(require '[mymath :refer :all]) (square 7)", &mut env).unwrap();
+        assert_eq!(result, Value::Long(49));
+    }
+
+    #[test]
+    fn test_ns_require_clause() {
+        let dir = temp_ns_dir("ns_require");
+        std::fs::write(
+            dir.join("greeter.cljrs"),
+            "(ns greeter) (defn hi [n] (str \"Hi \" n))",
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src(
+            "(ns myapp (:require [greeter :as g])) (g/hi \"Alice\")",
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "\"Hi Alice\"");
+    }
+
+    #[test]
+    fn test_require_idempotent() {
+        let dir = temp_ns_dir("require_idempotent");
+        // File has a side effect tracked via an atom
+        std::fs::write(
+            dir.join("counter.cljrs"),
+            "(ns counter) (def loaded-count (atom 0)) (swap! loaded-count inc)",
+        )
+        .unwrap();
+        let (globals, mut env) = make_env_with_paths(vec![dir]);
+        eval_src("(require 'counter)", &mut env).unwrap();
+        eval_src("(require 'counter)", &mut env).unwrap();
+        // The atom should have been incremented only once.
+        let count = globals.lookup_in_ns("counter", "loaded-count").unwrap();
+        if let Value::Atom(a) = count {
+            assert_eq!(a.get().deref(), Value::Long(1));
+        } else {
+            panic!("expected atom");
+        }
+    }
+
+    #[test]
+    fn test_require_not_found() {
+        let (_, mut env) = make_env_with_paths(vec![]);
+        let err = eval_src("(require 'nonexistent.ns)", &mut env).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("nonexistent.ns"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_require_circular() {
+        let dir = temp_ns_dir("require_circular");
+        // a requires b, b requires a
+        std::fs::write(dir.join("cira.cljrs"), "(ns cira (:require [cirb]))").unwrap();
+        std::fs::write(dir.join("cirb.cljrs"), "(ns cirb (:require [cira]))").unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let err = eval_src("(require 'cira)", &mut env).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("circular"),
+            "expected circular error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_file() {
+        let dir = temp_ns_dir("load_file");
+        let path = dir.join("script.cljrs");
+        std::fs::write(&path, "(+ 1 2)").unwrap();
+        let (_, mut env) = make_env_with_paths(vec![]);
+        let result = eval_src(&format!("(load-file \"{}\")", path.display()), &mut env).unwrap();
+        assert_eq!(result, Value::Long(3));
     }
 }

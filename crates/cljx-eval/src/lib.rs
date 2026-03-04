@@ -18,6 +18,7 @@ pub mod destructure;
 pub mod env;
 pub mod error;
 pub mod eval;
+pub mod loader;
 pub mod macros;
 pub mod special;
 pub mod syntax_quote;
@@ -25,6 +26,7 @@ pub mod syntax_quote;
 pub use env::{Env, GlobalEnv};
 pub use error::{EvalError, EvalResult};
 pub use eval::eval;
+pub use loader::load_ns;
 
 use std::sync::Arc;
 
@@ -62,5 +64,12 @@ pub fn standard_env() -> Arc<GlobalEnv> {
     // Re-refer clojure.core after bootstrap defines HOFs.
     globals.refer_all("user", "clojure.core");
 
+    globals
+}
+
+/// Create a `GlobalEnv` with built-ins, bootstrap HOFs, and configured source paths.
+pub fn standard_env_with_paths(source_paths: Vec<std::path::PathBuf>) -> Arc<GlobalEnv> {
+    let globals = standard_env();
+    globals.set_source_paths(source_paths);
     globals
 }

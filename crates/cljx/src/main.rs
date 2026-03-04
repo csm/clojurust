@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
 
-use cljx_eval::{Env, EvalError, eval, standard_env};
+use cljx_eval::{Env, EvalError, eval, standard_env, standard_env_with_paths};
 use cljx_value::Value;
 
 /// clojurust — a Rust-hosted dialect of the Clojure programming language.
@@ -21,9 +21,16 @@ enum Commands {
     Run {
         /// Path to the source file.
         file: PathBuf,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
     },
     /// Start an interactive REPL.
-    Repl,
+    Repl {
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
+    },
     /// AOT-compile a source file to a native binary.
     Compile {
         /// Path to the source file.
@@ -55,14 +62,14 @@ fn main() -> miette::Result<()> {
 
 fn run(cli: Cli) -> miette::Result<()> {
     match cli.command {
-        Commands::Run { file } => {
+        Commands::Run { file, src_paths } => {
             let src = std::fs::read_to_string(&file)
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
-            run_source(&src, &filename)?;
+            run_source(&src, &filename, src_paths)?;
         }
-        Commands::Repl => {
-            run_repl();
+        Commands::Repl { src_paths } => {
+            run_repl(src_paths);
         }
         Commands::Compile { file, out } => {
             eprintln!(
@@ -91,8 +98,10 @@ fn eval_source(src: &str, filename: &str) -> miette::Result<Value> {
 }
 
 /// Run a source file: evaluate all top-level forms, print nothing on success.
-fn run_source(src: &str, filename: &str) -> miette::Result<()> {
-    eval_source(src, filename)?;
+fn run_source(src: &str, filename: &str, src_paths: Vec<PathBuf>) -> miette::Result<()> {
+    let globals = standard_env_with_paths(src_paths);
+    let mut env = Env::new(globals, "user");
+    eval_in(&mut env, src, filename)?;
     Ok(())
 }
 
@@ -128,11 +137,11 @@ fn format_eval_error(e: EvalError) -> miette::Report {
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
 
-fn run_repl() {
+fn run_repl(src_paths: Vec<PathBuf>) {
     println!("clojurust REPL (type :quit to exit)");
     println!();
 
-    let globals = standard_env();
+    let globals = standard_env_with_paths(src_paths);
     let mut env = Env::new(globals, "user");
 
     let stdin = io::stdin();
