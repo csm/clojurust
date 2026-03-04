@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cljx_gc::GcPtr;
 use cljx_value::{
     Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value, ValueError,
-    ValueResult, Volatile,
+    NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value,
+    ValueError, ValueResult, Volatile,
 };
 
 use crate::env::GlobalEnv;
@@ -285,6 +285,14 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
         ("isa?", Arity::Fixed(2), builtin_isa_q),
+        // Records / reify
+        (
+            "make-type-instance",
+            Arity::Fixed(2),
+            builtin_make_type_instance,
+        ),
+        ("record?", Arity::Fixed(1), builtin_record_q),
+        ("instance?", Arity::Fixed(2), builtin_instance_q),
     ];
 
     for (name, arity, func) in fns {
@@ -912,6 +920,17 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
             "assoc requires map followed by key-value pairs".into(),
         ));
     }
+    // assoc on a TypeInstance: update field(s), return new TypeInstance.
+    if let Value::TypeInstance(ti) = &args[0] {
+        let mut fields = ti.get().fields.clone();
+        for pair in args[1..].chunks(2) {
+            fields = fields.assoc(pair[0].clone(), pair[1].clone());
+        }
+        return Ok(Value::TypeInstance(GcPtr::new(cljx_value::TypeInstance {
+            type_tag: ti.get().type_tag.clone(),
+            fields,
+        })));
+    }
     let mut result = match &args[0] {
         Value::Nil => MapValue::empty(),
         Value::Map(m) => m.clone(),
@@ -967,6 +986,7 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Nil => Ok(default),
         Value::Map(m) => Ok(m.get(&args[1]).unwrap_or(default)),
+        Value::TypeInstance(ti) => Ok(ti.get().fields.get(&args[1]).unwrap_or(default)),
         Value::Vector(v) => {
             if let Value::Long(idx) = &args[1] {
                 Ok(v.get().nth(*idx as usize).cloned().unwrap_or(default))
@@ -1030,6 +1050,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
         Value::Map(m) => m.count(),
         Value::Set(s) => s.get().count(),
         Value::Str(s) => s.get().chars().count(),
+        Value::TypeInstance(ti) => ti.get().fields.count(),
         _ => {
             return Err(ValueError::WrongType {
                 expected: "collection",
@@ -1840,7 +1861,8 @@ fn builtin_make_lazy_seq_sentinel(_args: &[Value]) -> ValueResult<Value> {
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
-static GENSYM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GENSYM_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn builtin_gensym(args: &[Value]) -> ValueResult<Value> {
     let prefix = match args.first() {
@@ -2856,4 +2878,55 @@ fn builtin_make_delay_sentinel(_args: &[Value]) -> ValueResult<Value> {
     Err(ValueError::Other(
         "make-delay must be invoked through the evaluator".into(),
     ))
+}
+
+// ── Records / reify ──────────────────────────────────────────────────────────
+
+/// `(make-type-instance type-tag-str fields-map)` — low-level constructor.
+/// Used by `defrecord` constructors and `reify` implementations.
+fn builtin_make_type_instance(args: &[Value]) -> ValueResult<Value> {
+    let type_tag = match &args[0] {
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "string or symbol",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let fields = match &args[1] {
+        Value::Map(m) => m.clone(),
+        Value::Nil => MapValue::empty(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "map",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
+        type_tag,
+        fields,
+    })))
+}
+
+/// `(record? x)` — true if x is a TypeInstance.
+fn builtin_record_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::TypeInstance(_))))
+}
+
+/// `(instance? TypeName x)` — true if x is a TypeInstance with the given type tag.
+/// TypeName may be a Symbol or String.
+fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
+    let expected_tag = match &args[0] {
+        Value::Symbol(s) => s.get().name.clone(),
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        _ => return Ok(Value::Bool(false)),
+    };
+    let result = match &args[1] {
+        Value::TypeInstance(ti) => ti.get().type_tag == expected_tag,
+        _ => false,
+    };
+    Ok(Value::Bool(result))
 }

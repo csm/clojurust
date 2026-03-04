@@ -3,7 +3,7 @@
 Tree-walking interpreter for clojurust.  Evaluates `Form` AST nodes produced
 by `cljx-reader` within a namespace-aware lexical environment.
 
-**Phase:** 5–7 — implemented.
+**Phase:** 5–7 + defrecord/reify/built-in protocols — implemented.
 
 ---
 
@@ -106,6 +106,8 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `defmulti` | Define a multimethod with a dispatch function |
 | `defmethod` | Add an implementation for one dispatch value |
 | `future` | Evaluate body on a new thread; return `Value::Future` |
+| `defrecord` | Define a named record type; generates `->Name`/`map->Name` constructors; supports inline protocol impls |
+| `reify` | Create an anonymous protocol-implementing instance with a gensym'd type tag |
 
 ---
 
@@ -152,6 +154,8 @@ All built-ins have signature `fn(&[Value]) -> ValueResult<Value>`.
 **Protocols:** `satisfies?` `extends?`
 
 **Multimethods:** `prefer-method` `remove-method` `methods` `isa?`
+
+**Records/reify:** `make-type-instance` `record?` `instance?`
 
 ---
 
@@ -208,8 +212,9 @@ Higher-order functions that need to call back into the evaluator are defined in
 
 ## Deferred to later phases
 
-- `when-let` / `if-let` / `condp` / `case` macros
+- `deftype` — blocked by `.` interop (field access via `(.field obj)`); Phase 9
 - `.` interop, `new` — Phase 9
 - `ref` / STM (`dosync`, `alter`, `commute`, `ensure`) — deferred
 - `locking` macro — deferred
 - Full `require` with file loading — Phase 12
+- `derive` / full `isa?` hierarchy — deferred

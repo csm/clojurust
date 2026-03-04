@@ -1252,4 +1252,91 @@ mod tests {
         assert!(s.contains("boom"), "got: {s}");
         assert!(s.contains("99"), "got: {s}");
     }
+
+    #[test]
+    fn test_defrecord_basic() {
+        // Constructor and field access via keyword.
+        let result = eval_str(
+            r#"
+            (defrecord Point [x y])
+            (let [p (->Point 3 4)]
+              [(:x p) (:y p)])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "[3 4]");
+    }
+
+    #[test]
+    fn test_defrecord_map_constructor() {
+        let result = eval_str(
+            r#"
+            (defrecord Color [r g b])
+            (let [c (map->Color {:r 255 :g 128 :b 0})]
+              [(:r c) (:g c) (:b c)])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "[255 128 0]");
+    }
+
+    #[test]
+    fn test_defrecord_assoc() {
+        // assoc on a record returns a new record of the same type.
+        let result = eval_str(
+            r#"
+            (defrecord Pt [x y])
+            (let [p (->Pt 1 2)
+                  q (assoc p :x 99)]
+              [(:x q) (:y q) (record? q)])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "[99 2 true]");
+    }
+
+    #[test]
+    fn test_defrecord_with_protocol() {
+        let result = eval_str(
+            r#"
+            (defprotocol IShape
+              (area [this]))
+            (defrecord Circle [radius]
+              IShape
+              (area [this] (* 3 (:radius this) (:radius this))))
+            (let [c (->Circle 5)]
+              (area c))
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, cljx_value::Value::Long(75));
+    }
+
+    #[test]
+    fn test_instance_q() {
+        let result = eval_str(
+            r#"
+            (defrecord Dog [name])
+            (let [d (->Dog "Rex")]
+              [(instance? Dog d) (instance? Dog 42)])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "[true false]");
+    }
+
+    #[test]
+    fn test_reify_basic() {
+        let result = eval_str(
+            r#"
+            (defprotocol IGreet
+              (greet [this name]))
+            (let [greeter (reify IGreet
+                            (greet [this name] (str "Hello, " name "!")))]
+              (greet greeter "World"))
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result.to_string(), "\"Hello, World!\"");
+    }
 }

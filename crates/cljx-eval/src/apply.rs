@@ -98,6 +98,7 @@ pub fn type_tag_of(val: &Value) -> Arc<str> {
         Value::Promise(_) => Arc::from("Promise"),
         Value::Future(_) => Arc::from("Future"),
         Value::Agent(_) => Arc::from("Agent"),
+        Value::TypeInstance(ti) => ti.get().type_tag.clone(),
         _ => Arc::from("Object"),
     }
 }
@@ -159,12 +160,14 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             apply_value(&impl_fn, args, env)
         }
         Value::Keyword(_kw) => {
-            // (kw map) → map.get(kw)
+            // (kw map-or-record) → map.get(kw)
+            let default = || args.get(1).cloned().unwrap_or(Value::Nil);
             match args.first() {
-                Some(Value::Map(m)) => Ok(m
-                    .get(callee)
-                    .unwrap_or(args.get(1).cloned().unwrap_or(Value::Nil))),
-                Some(Value::Nil) => Ok(args.get(1).cloned().unwrap_or(Value::Nil)),
+                Some(Value::Map(m)) => Ok(m.get(callee).unwrap_or_else(default)),
+                Some(Value::TypeInstance(ti)) => {
+                    Ok(ti.get().fields.get(callee).unwrap_or_else(default))
+                }
+                Some(Value::Nil) => Ok(default()),
                 _ => Ok(Value::Nil),
             }
         }

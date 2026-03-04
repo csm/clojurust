@@ -103,9 +103,11 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] `defmulti` / `defmethod` — arbitrary dispatch multimethods
 - [x] `prefer-method`, `remove-method`, `methods`, `satisfies?`, `extends?`, `isa?` (equality stub), `type`
 - [ ] Inline protocol dispatch cache — Phase 10 JIT optimization
-- [ ] Built-in protocols (`ISeq`, `ICounted`, etc.) — requires `deftype`/`defrecord` (Phase 7+)
+- [x] Built-in protocols (`ICounted`, `ILookup`, `ISeqable`) — defined in bootstrap.cljx; extended for List, Vector, Map, Set, String
 - [ ] `derive` / full `isa?` hierarchy
-- [ ] `deftype`, `defrecord`, `reify`
+- [x] `defrecord` — backed by `TypeInstance` (type_tag + MapValue fields); generates `->Name` and `map->Name` constructors; supports inline protocol impls
+- [x] `reify` — creates a unique-tagged `TypeInstance`; supports inline protocol impls
+- [ ] `deftype` — blocked by `.` interop (field access via `(.field obj)` not yet implemented; Phase 9); mutable fields require `set!`-on-field semantic that needs interop dot special form; low priority until Phase 9
 
 ---
 
@@ -118,6 +120,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] `promise` — `deliver` / `deref` with blocking and timeout
 - [x] `delay` — lazy one-time computation (`force`, `realized?`)
 - [x] `volatile!` — non-atomic mutable cell (`vreset!`, `vswap!`, `volatile?`)
+- [x] `compare-and-set!` — CAS on Atom
 - [ ] `locking` macro over Rust `Mutex` — **deferred**
 
 ---

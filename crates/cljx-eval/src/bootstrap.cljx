@@ -437,3 +437,27 @@
 (defn future? [x] (= (type x) 'Future))
 (defn delay? [x] (= (type x) 'Delay))
 (defn promise? [x] (= (type x) 'Promise))
+
+;; ── Phase 6 (built-in protocols): ICounted, ILookup, ISeqable ────────────────
+
+(defprotocol ICounted
+  (-count [coll]))
+
+(defprotocol ILookup
+  (-lookup [coll k] [-lookup [coll k not-found]]))
+
+(defprotocol ISeqable
+  (-seq [coll]))
+
+(extend-protocol ICounted
+  List    (-count [c] (count c))
+  Vector  (-count [c] (count c))
+  Map     (-count [c] (count c))
+  Set     (-count [c] (count c))
+  String  (-count [c] (count c)))
+
+(extend-protocol ISeqable
+  List    (-seq [c] (seq c))
+  Vector  (-seq [c] (seq c))
+  Map     (-seq [c] (seq c))
+  Set     (-seq [c] (seq c)))

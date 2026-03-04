@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) — implemented.
 
 ---
 
@@ -25,7 +25,7 @@ src/
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
-  value.rs                       — Value enum, MapValue, pr_str, PartialEq, ClojureHash, std::hash::Hash
+  value.rs                       — Value enum, MapValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
     array_map.rs                 — PersistentArrayMap (≤8 entries, linear scan)
@@ -86,6 +86,9 @@ pub enum Value {
     Promise(GcPtr<CljxPromise>),
     Future(GcPtr<CljxFuture>),
     Agent(GcPtr<Agent>),
+
+    // Records / reify (Phase 6-ext)
+    TypeInstance(GcPtr<TypeInstance>),
 }
 
 pub enum MapValue {
@@ -191,6 +194,19 @@ pub struct CljxCons {
 `Thunk` implementations live in `cljx-eval` (e.g. `ClosureThunk`) so that
 `cljx-value` stays free of evaluator dependencies while `LazySeq` can still
 call back through the trait object.
+
+### `TypeInstance` (Phase 6-ext — defrecord/reify)
+
+```rust
+pub struct TypeInstance {
+    pub type_tag: Arc<str>,  // record name (defrecord) or gensym (reify)
+    pub fields: MapValue,    // keyword → value
+}
+```
+
+Used by `defrecord` (named type_tag, generates `->Name`/`map->Name` constructors) and
+`reify` (gensym'd type_tag, no constructors).  Supports keyword field access `(:field rec)`,
+`get`, `assoc` (returns new TypeInstance), and `count`.
 
 ### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
 

@@ -10,8 +10,8 @@ use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
 use cljx_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
-    Value,
+    CljxFn, CljxFnArity, CljxFuture, FutureState, MapValue, MultiFn, Protocol, ProtocolFn,
+    ProtocolMethod, TypeInstance, Value,
 };
 
 /// The set of names that trigger special-form dispatch.
@@ -48,6 +48,8 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "defmulti",
     "defmethod",
     "future",
+    "defrecord",
+    "reify",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -82,6 +84,8 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "defmulti" => eval_defmulti(args, env),
         "defmethod" => eval_defmethod(args, env),
         "future" => eval_future(args, env),
+        "defrecord" => eval_defrecord(args, env),
+        "reify" => eval_reify(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -1056,6 +1060,181 @@ fn eval_future(args: &[Form], env: &mut Env) -> EvalResult {
     });
 
     Ok(Value::Future(future_ptr))
+}
+
+// ── defrecord ─────────────────────────────────────────────────────────────────
+
+fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
+    // (defrecord TypeName [field1 field2 ...] Proto1 (method [this] body) ...)
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(
+            "defrecord requires a name and field vector".into(),
+        ));
+    }
+    let type_name = require_sym(args, 0, "defrecord")?;
+    let type_tag: Arc<str> = Arc::from(type_name);
+
+    // Parse field names from the vector.
+    let field_names: Vec<Arc<str>> = match &args[1].kind {
+        FormKind::Vector(fields) => fields
+            .iter()
+            .map(|f| match &f.kind {
+                FormKind::Symbol(s) => Ok(Arc::from(s.as_str())),
+                _ => Err(EvalError::Runtime(
+                    "defrecord field names must be symbols".into(),
+                )),
+            })
+            .collect::<EvalResult<_>>()?,
+        _ => {
+            return Err(EvalError::Runtime(
+                "defrecord requires a field vector as second arg".into(),
+            ));
+        }
+    };
+
+    // Register protocol implementations (same as extend-type inner logic).
+    register_impls_for_tag(&type_tag, &args[2..], env)?;
+
+    // Generate constructors in clojure.core.
+    // ->TypeName: positional constructor
+    // map->TypeName: map constructor
+    let ns = env.current_ns.clone();
+    let globals = env.globals.clone();
+    let field_names_clone = field_names.clone();
+    let type_tag2 = type_tag.clone();
+
+    // Build `->TypeName` as a native-Clojure fn: (fn [f1 f2 ...] (make-type-instance "T" {:f1 f1 :f2 f2 ...}))
+    {
+        let params: Vec<Arc<str>> = field_names.clone();
+        let rest_param = None;
+        // Build body forms manually: (make-type-instance "TypeName" {:field1 field1 ...})
+        use cljx_reader::form::FormKind as FK;
+        let dummy_span =
+            cljx_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
+        let make_form = |kind: FK| Form {
+            kind,
+            span: dummy_span.clone(),
+        };
+        let mut kv_forms: Vec<Form> = Vec::new();
+        for f in &field_names {
+            kv_forms.push(make_form(FK::Keyword(f.as_ref().to_string())));
+            kv_forms.push(make_form(FK::Symbol(f.as_ref().to_string())));
+        }
+        let map_form = make_form(FK::Map(kv_forms));
+        let body = vec![make_form(FK::List(vec![
+            make_form(FK::Symbol("make-type-instance".into())),
+            make_form(FK::Str(type_tag.as_ref().to_string())),
+            map_form,
+        ]))];
+        let arity = CljxFnArity {
+            params,
+            rest_param,
+            body,
+        };
+        let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
+        let ctor = CljxFn::new(Some(fn_name.clone()), vec![arity], vec![], vec![], false);
+        globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
+    }
+
+    // Build `map->TypeName`: (fn [m] (make-type-instance "TypeName" m))
+    {
+        use cljx_reader::form::FormKind as FK;
+        let dummy_span =
+            cljx_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
+        let make_form = |kind: FK| Form {
+            kind,
+            span: dummy_span.clone(),
+        };
+        let m_sym: Arc<str> = Arc::from("m__");
+        let body = vec![make_form(FK::List(vec![
+            make_form(FK::Symbol("make-type-instance".into())),
+            make_form(FK::Str(type_tag2.as_ref().to_string())),
+            make_form(FK::Symbol(m_sym.as_ref().to_string())),
+        ]))];
+        let arity = CljxFnArity {
+            params: vec![m_sym],
+            rest_param: None,
+            body,
+        };
+        let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
+        let ctor = CljxFn::new(Some(fn_name.clone()), vec![arity], vec![], vec![], false);
+        globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
+    }
+
+    // Intern the type name as a Symbol value so `(instance? TypeName x)` works.
+    let _ = field_names_clone;
+    let type_sym = cljx_value::Symbol::simple(type_name);
+    globals.intern(
+        &ns,
+        Arc::from(type_name),
+        Value::Symbol(GcPtr::new(type_sym)),
+    );
+    Ok(Value::Nil)
+}
+
+// ── reify ─────────────────────────────────────────────────────────────────────
+
+fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
+    // (reify Proto1 (method [this] body) ...)
+    // Generate a unique type tag for this instance.
+    let n = crate::builtins::GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
+
+    // Register protocol implementations.
+    register_impls_for_tag(&type_tag, args, env)?;
+
+    // Return an empty TypeInstance with the unique tag.
+    Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
+        type_tag,
+        fields: MapValue::empty(),
+    })))
+}
+
+// ── register_impls_for_tag ────────────────────────────────────────────────────
+
+/// Parse `Proto (method [params] body) ...` segments and register them under `type_tag`.
+/// Shared by `defrecord` and `reify`.
+fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) -> EvalResult<()> {
+    let mut current_proto: Option<GcPtr<cljx_value::Protocol>> = None;
+
+    for form in forms {
+        match &form.kind {
+            FormKind::Symbol(s) => {
+                let val = env.globals.lookup_in_ns(&env.current_ns, s);
+                match val {
+                    Some(Value::Protocol(p)) => {
+                        current_proto = Some(p);
+                    }
+                    _ => {
+                        return Err(EvalError::Runtime(format!(
+                            "reify/defrecord: {} is not a protocol",
+                            s
+                        )));
+                    }
+                }
+            }
+            FormKind::List(parts) => {
+                let proto = current_proto.as_ref().ok_or_else(|| {
+                    EvalError::Runtime("reify/defrecord: method impl before protocol name".into())
+                })?;
+                if parts.is_empty() {
+                    continue;
+                }
+                let method_name = match &parts[0].kind {
+                    FormKind::Symbol(s) => Arc::from(s.as_str()),
+                    _ => continue,
+                };
+                let fn_val = build_impl_fn(parts, env)?;
+                let mut impls = proto.get().impls.lock().unwrap();
+                impls
+                    .entry(type_tag.clone())
+                    .or_default()
+                    .insert(method_name, fn_val);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

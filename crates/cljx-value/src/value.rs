@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -77,6 +78,9 @@ pub enum Value {
     Promise(GcPtr<CljxPromise>),
     Future(GcPtr<CljxFuture>),
     Agent(GcPtr<Agent>),
+
+    // ── Records / reify instances ─────────────────────────────────────────────
+    TypeInstance(GcPtr<TypeInstance>),
 }
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
@@ -214,6 +218,10 @@ impl PartialEq for Value {
             }
             (Value::Agent(a), Value::Agent(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            // Record equality: same tag and same fields.
+            (Value::TypeInstance(a), Value::TypeInstance(b)) => {
+                a.get().type_tag == b.get().type_tag && maps_equal(&a.get().fields, &b.get().fields)
             }
             _ => false,
         }
@@ -370,6 +378,18 @@ impl ClojureHash for Value {
             Value::Promise(p) => p.get() as *const _ as u32,
             Value::Future(fu) => fu.get() as *const _ as u32,
             Value::Agent(a) => a.get() as *const _ as u32,
+            // Record hash: combine type tag hash with fields hash.
+            Value::TypeInstance(ti) => {
+                let tag_hash = hash_string(&ti.get().type_tag);
+                let mut fields_hash: u32 = 0;
+                ti.get().fields.for_each(|k, v| {
+                    fields_hash = hash_combine_unordered(
+                        fields_hash,
+                        hash_combine_ordered(k.clojure_hash(), v.clojure_hash()),
+                    );
+                });
+                hash_combine_ordered(tag_hash, fields_hash)
+            }
         }
     }
 }
@@ -570,6 +590,21 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Promise(_) => write!(f, "#<Promise>"),
         Value::Future(_) => write!(f, "#<Future>"),
         Value::Agent(_) => write!(f, "#<Agent>"),
+        Value::TypeInstance(ti) => {
+            let ti = ti.get();
+            write!(f, "#{}{{", ti.type_tag)?;
+            let mut first = true;
+            ti.fields.for_each(|k, v| {
+                if !first {
+                    let _ = write!(f, ", ");
+                }
+                let _ = pr_str(k, f, readably);
+                let _ = write!(f, " ");
+                let _ = pr_str(v, f, readably);
+                first = false;
+            });
+            write!(f, "}}")
+        }
     }
 }
 
@@ -611,6 +646,7 @@ impl Value {
             Value::Promise(_) => "promise",
             Value::Future(_) => "future",
             Value::Agent(_) => "agent",
+            Value::TypeInstance(_) => "record",
         }
     }
 
@@ -654,6 +690,18 @@ impl Value {
 
 impl cljx_gc::Trace for Value {}
 impl cljx_gc::Trace for MapValue {}
+
+// ── TypeInstance ──────────────────────────────────────────────────────────────
+
+/// A record or reify instance.  `type_tag` identifies the concrete type;
+/// `fields` holds the key/value pairs (keyword → value).
+#[derive(Clone, Debug)]
+pub struct TypeInstance {
+    pub type_tag: Arc<str>,
+    pub fields: MapValue,
+}
+
+impl cljx_gc::Trace for TypeInstance {}
 
 #[cfg(test)]
 mod tests {
