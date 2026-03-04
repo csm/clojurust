@@ -4,7 +4,8 @@ use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
 use cljx_value::{
-    Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value,
+    FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
+    Value,
 };
 
 use crate::apply::eval_call;
@@ -80,17 +81,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         )),
         FormKind::Deref(inner) => {
             let v = eval(inner, env)?;
-            match v {
-                Value::Atom(a) => Ok(a.get().deref()),
-                Value::Var(var) => var
-                    .get()
-                    .deref()
-                    .ok_or_else(|| EvalError::Runtime("unbound var".into())),
-                _ => Err(EvalError::Runtime(format!(
-                    "cannot deref {}",
-                    v.type_name()
-                ))),
-            }
+            deref_value(v)
         }
         FormKind::Var(inner) => {
             if let FormKind::Symbol(s) = &inner.kind {
@@ -170,6 +161,40 @@ pub fn is_special_form(s: &str) -> bool {
 }
 
 // ── eval_body ─────────────────────────────────────────────────────────────────
+
+/// Dereference a value: used by `@x` reader macro and the `deref` builtin.
+pub fn deref_value(v: Value) -> EvalResult {
+    match v {
+        Value::Atom(a) => Ok(a.get().deref()),
+        Value::Var(var) => var
+            .get()
+            .deref()
+            .ok_or_else(|| EvalError::Runtime("unbound var".into())),
+        Value::Volatile(vol) => Ok(vol.get().deref()),
+        Value::Delay(d) => Ok(d.get().force()),
+        Value::Agent(a) => Ok(a.get().get_state()),
+        Value::Promise(p) => Ok(p.get().deref_blocking()),
+        Value::Future(f) => {
+            let mut guard = f.get().state.lock().unwrap();
+            loop {
+                match &*guard {
+                    FutureState::Done(v) => return Ok(v.clone()),
+                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                    FutureState::Cancelled => {
+                        return Err(EvalError::Runtime("future was cancelled".into()));
+                    }
+                    FutureState::Running => {
+                        guard = f.get().cond.wait(guard).unwrap();
+                    }
+                }
+            }
+        }
+        other => Err(EvalError::Runtime(format!(
+            "cannot deref {}",
+            other.type_name()
+        ))),
+    }
+}
 
 /// Evaluate a sequence of forms and return the value of the last one.
 pub fn eval_body(forms: &[Form], env: &mut Env) -> EvalResult {
@@ -1103,5 +1128,128 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("No method"), "got: {msg}");
+    }
+
+    // ── Phase 7: Concurrency primitives ──────────────────────────────────────
+
+    #[test]
+    fn test_compare_and_set() {
+        let result = eval_str(
+            r#"
+            (let [a (atom 10)]
+              [(compare-and-set! a 10 20)   ; succeeds: 10 == 10
+               (compare-and-set! a 10 30)   ; fails:    20 != 10
+               @a])
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains("true"), "got: {s}");
+        assert!(s.contains("false"), "got: {s}");
+        assert!(s.contains("20"), "got: {s}");
+    }
+
+    #[test]
+    fn test_volatile() {
+        let result = eval_str(
+            r#"
+            (let [v (volatile! 1)]
+              (vreset! v 2)
+              (vswap! v + 10)
+              @v)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(12));
+    }
+
+    #[test]
+    fn test_delay() {
+        // Body should not be evaluated until forced.
+        let result = eval_str(
+            r#"
+            (let [calls (atom 0)
+                  d (delay (swap! calls inc) 42)]
+              [@calls (force d) @calls (force d) @calls])
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        // calls starts at 0, force evaluates body once (returns 42), second force uses cache
+        // s = [0 42 1 42 1]
+        assert!(s.starts_with("[0 42 1 42 1]"), "got: {s}");
+    }
+
+    #[test]
+    fn test_realized() {
+        let result = eval_str(
+            r#"
+            (let [d (delay 99)]
+              [(realized? d) (force d) (realized? d)])
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.starts_with("[false 99 true]"), "got: {s}");
+    }
+
+    #[test]
+    fn test_promise() {
+        let result = eval_str(
+            r#"
+            (let [p (promise)]
+              (deliver p 42)
+              (deliver p 99)  ; second deliver is ignored
+              @p)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(42));
+    }
+
+    #[test]
+    fn test_future() {
+        let result = eval_str(
+            r#"
+            (let [f (future (+ 1 2))]
+              @f)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(3));
+    }
+
+    #[test]
+    fn test_agent_send() {
+        let result = eval_str(
+            r#"
+            (let [a (agent 0)]
+              (send a + 1)
+              (send a + 2)
+              (await a)
+              @a)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(3));
+    }
+
+    #[test]
+    fn test_agent_error_restart() {
+        let result = eval_str(
+            r#"
+            (let [a (agent 10)]
+              (send a (fn [_] (throw (ex-info "boom" {}))))
+              (await a)
+              (let [err (agent-error a)]
+                (restart-agent a 99)
+                [err @a]))
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        // err should be a string containing "boom", @a should be 99
+        assert!(s.contains("boom"), "got: {s}");
+        assert!(s.contains("99"), "got: {s}");
     }
 }

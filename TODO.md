@@ -109,16 +109,16 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ---
 
-## Phase 7 — Concurrency Primitives
+## Phase 7 — Concurrency Primitives ✓
 
-- [ ] `atom` — compare-and-swap with `swap!`, `reset!`, `compare-and-set!`
-- [ ] `ref` + software transactional memory (`dosync`, `alter`, `ref-set`, `commute`, `ensure`)
-- [ ] `agent` — async update queue (`send`, `send-off`, `await`)
-- [ ] `future` — thread-pool backed async computation
-- [ ] `promise` — `deliver` / `deref` with blocking
-- [ ] `delay` — lazy one-time computation
-- [ ] `volatile!` — non-atomic mutable cell for single-thread perf
-- [ ] `locking` macro over Rust `Mutex`
+- [x] `atom` — compare-and-swap with `swap!`, `reset!`, `compare-and-set!`
+- [ ] `ref` + software transactional memory (`dosync`, `alter`, `ref-set`, `commute`, `ensure`) — **deferred**
+- [x] `agent` — async update queue (`send`, `send-off`, `await`, `agent-error`, `restart-agent`)
+- [x] `future` — thread-pool backed async computation (`future-done?`, `future-cancelled?`, `future-cancel`)
+- [x] `promise` — `deliver` / `deref` with blocking and timeout
+- [x] `delay` — lazy one-time computation (`force`, `realized?`)
+- [x] `volatile!` — non-atomic mutable cell (`vreset!`, `vswap!`, `volatile?`)
+- [ ] `locking` macro over Rust `Mutex` — **deferred**
 
 ---
 

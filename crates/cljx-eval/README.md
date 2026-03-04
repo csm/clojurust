@@ -3,7 +3,7 @@
 Tree-walking interpreter for clojurust.  Evaluates `Form` AST nodes produced
 by `cljx-reader` within a namespace-aware lexical environment.
 
-**Phase:** 5–6 — implemented.
+**Phase:** 5–7 — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   error.rs        — EvalError enum, EvalResult<T> alias
   env.rs          — Frame, GlobalEnv (namespace registry), Env (lexical scope)
   eval.rs         — top-level eval dispatcher, form_to_value, inline tests
-  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, type_tag_of, resolve_type_tag
+  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, handle_make_delay, handle_send, handle_vswap, type_tag_of, resolve_type_tag
   special.rs      — all special form handlers, SPECIAL_FORMS list
   macros.rs       — macroexpand_1, macroexpand, value_to_form
   destructure.rs  — sequential + associative destructuring (bind_pattern, bind_sequential, bind_associative)
@@ -105,6 +105,7 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `extend-protocol` | Protocol-first sugar for `extend-type` |
 | `defmulti` | Define a multimethod with a dispatch function |
 | `defmethod` | Add an implementation for one dispatch value |
+| `future` | Evaluate body on a new thread; return `Value::Future` |
 
 ---
 
@@ -131,7 +132,17 @@ All built-ins have signature `fn(&[Value]) -> ValueResult<Value>`.
 **Lazy sequences (bootstrap):** `lazy-seq` (macro) `range` `iterate` `repeat`
 `repeatedly` `cycle`
 
-**Atoms:** `atom` `deref` `reset!` `swap!`
+**Atoms:** `atom` `deref` `reset!` `swap!` `compare-and-set!`
+
+**Volatiles:** `volatile!` `vreset!` `vswap!` `volatile?`
+
+**Delays:** `delay` (macro) `force` `realized?`
+
+**Promises:** `promise` `deliver`
+
+**Futures:** `future` (special form) `future-done?` `future-cancelled?` `future-cancel`
+
+**Agents:** `agent` `send` `send-off` `await` `agent-error` `restart-agent`
 
 **I/O:** `print` `println` `prn` `pr` `pr-str` `str` `read-string` `slurp` `spit`
 
@@ -199,5 +210,6 @@ Higher-order functions that need to call back into the evaluator are defined in
 
 - `when-let` / `if-let` / `condp` / `case` macros
 - `.` interop, `new` — Phase 9
-- `monitor-enter` / `monitor-exit` — Phase 7
+- `ref` / STM (`dosync`, `alter`, `commute`, `ensure`) — deferred
+- `locking` macro — deferred
 - Full `require` with file loading — Phase 12

@@ -15,7 +15,8 @@ use crate::hash::{
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
 use crate::types::{
-    Atom, CljxCons, CljxFn, LazySeq, MultiFn, Namespace, NativeFn, Protocol, ProtocolFn, Var,
+    Agent, Atom, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn, Namespace,
+    NativeFn, Protocol, ProtocolFn, Var, Volatile,
 };
 
 /// The central runtime type: every Clojure value is a `Value`.
@@ -69,6 +70,13 @@ pub enum Value {
     Protocol(GcPtr<Protocol>),
     ProtocolFn(GcPtr<ProtocolFn>),
     MultiFn(GcPtr<MultiFn>),
+
+    // ── Concurrency primitives ────────────────────────────────────────────────
+    Volatile(GcPtr<Volatile>),
+    Delay(GcPtr<Delay>),
+    Promise(GcPtr<CljxPromise>),
+    Future(GcPtr<CljxFuture>),
+    Agent(GcPtr<Agent>),
 }
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
@@ -189,6 +197,22 @@ impl PartialEq for Value {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }
             (Value::MultiFn(a), Value::MultiFn(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            // Pointer equality for concurrency primitives.
+            (Value::Volatile(a), Value::Volatile(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Delay(a), Value::Delay(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Promise(a), Value::Promise(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Future(a), Value::Future(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Agent(a), Value::Agent(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }
             _ => false,
@@ -340,6 +364,12 @@ impl ClojureHash for Value {
                 }
                 h
             }
+            // Pointer identity for concurrency primitives.
+            Value::Volatile(v) => v.get() as *const _ as u32,
+            Value::Delay(d) => d.get() as *const _ as u32,
+            Value::Promise(p) => p.get() as *const _ as u32,
+            Value::Future(fu) => fu.get() as *const _ as u32,
+            Value::Agent(a) => a.get() as *const _ as u32,
         }
     }
 }
@@ -535,6 +565,11 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             )
         }
         Value::MultiFn(mf) => write!(f, "#<MultiFn {}>", mf.get().name),
+        Value::Volatile(_) => write!(f, "#<Volatile>"),
+        Value::Delay(_) => write!(f, "#<Delay>"),
+        Value::Promise(_) => write!(f, "#<Promise>"),
+        Value::Future(_) => write!(f, "#<Future>"),
+        Value::Agent(_) => write!(f, "#<Agent>"),
     }
 }
 
@@ -571,6 +606,11 @@ impl Value {
             Value::LazySeq(_) => "lazyseq",
             Value::Cons(_) => "cons",
             Value::Protocol(_) => "protocol",
+            Value::Volatile(_) => "volatile",
+            Value::Delay(_) => "delay",
+            Value::Promise(_) => "promise",
+            Value::Future(_) => "future",
+            Value::Agent(_) => "agent",
         }
     }
 

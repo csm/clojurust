@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
@@ -325,3 +325,230 @@ pub struct CljxCons {
 }
 
 impl cljx_gc::Trace for CljxCons {}
+
+// ── Volatile ──────────────────────────────────────────────────────────────────
+
+/// Non-atomic mutable cell (single-thread performance, no CAS).
+pub struct Volatile {
+    pub value: Mutex<Value>,
+}
+
+impl Volatile {
+    pub fn new(v: Value) -> Self {
+        Self {
+            value: Mutex::new(v),
+        }
+    }
+
+    pub fn deref(&self) -> Value {
+        self.value.lock().unwrap().clone()
+    }
+
+    pub fn reset(&self, v: Value) -> Value {
+        *self.value.lock().unwrap() = v.clone();
+        v
+    }
+}
+
+impl std::fmt::Debug for Volatile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Volatile")
+    }
+}
+
+impl cljx_gc::Trace for Volatile {}
+
+// ── Delay ─────────────────────────────────────────────────────────────────────
+
+/// Internal state of a delay cell.
+pub enum DelayState {
+    Pending(Box<dyn Thunk>),
+    Forced(Value),
+}
+
+/// A lazy one-time computation (forced at most once, result cached).
+pub struct Delay {
+    pub state: Mutex<DelayState>,
+}
+
+impl Delay {
+    pub fn new(thunk: Box<dyn Thunk>) -> Self {
+        Self {
+            state: Mutex::new(DelayState::Pending(thunk)),
+        }
+    }
+
+    /// Force the delay and cache the result.
+    pub fn force(&self) -> Value {
+        let mut guard = self.state.lock().unwrap();
+        if let DelayState::Forced(v) = &*guard {
+            return v.clone();
+        }
+        let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
+        let DelayState::Pending(thunk) = prev else {
+            unreachable!("state was not Pending")
+        };
+        let result = thunk.force();
+        *guard = DelayState::Forced(result.clone());
+        result
+    }
+
+    /// True if the delay has already been forced.
+    pub fn is_realized(&self) -> bool {
+        matches!(&*self.state.lock().unwrap(), DelayState::Forced(_))
+    }
+}
+
+impl std::fmt::Debug for Delay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Delay")
+    }
+}
+
+impl cljx_gc::Trace for Delay {}
+
+// ── CljxPromise ───────────────────────────────────────────────────────────────
+
+/// A one-shot rendezvous (promise).
+pub struct CljxPromise {
+    pub value: Mutex<Option<Value>>,
+    pub cond: Condvar,
+}
+
+impl CljxPromise {
+    pub fn new() -> Self {
+        Self {
+            value: Mutex::new(None),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Deliver a value (no-op if already delivered).
+    pub fn deliver(&self, v: Value) {
+        let mut guard = self.value.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(v);
+            self.cond.notify_all();
+        }
+    }
+
+    /// Block until a value is available, then return it.
+    pub fn deref_blocking(&self) -> Value {
+        let mut guard = self.value.lock().unwrap();
+        while guard.is_none() {
+            guard = self.cond.wait(guard).unwrap();
+        }
+        guard.as_ref().unwrap().clone()
+    }
+
+    /// True if already delivered.
+    pub fn is_realized(&self) -> bool {
+        self.value.lock().unwrap().is_some()
+    }
+}
+
+impl Default for CljxPromise {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for CljxPromise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Promise")
+    }
+}
+
+impl cljx_gc::Trace for CljxPromise {}
+
+// ── CljxFuture ────────────────────────────────────────────────────────────────
+
+/// Thread-pool future state.
+pub enum FutureState {
+    Running,
+    Done(Value),
+    Failed(String),
+    Cancelled,
+}
+
+/// A future value computed asynchronously on another thread.
+pub struct CljxFuture {
+    pub state: Mutex<FutureState>,
+    pub cond: Condvar,
+}
+
+impl CljxFuture {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(FutureState::Running),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// True if done, failed, or cancelled (not still running).
+    pub fn is_done(&self) -> bool {
+        !matches!(&*self.state.lock().unwrap(), FutureState::Running)
+    }
+
+    /// True if explicitly cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+    }
+}
+
+impl Default for CljxFuture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for CljxFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Future")
+    }
+}
+
+impl cljx_gc::Trace for CljxFuture {}
+
+// ── Agent ─────────────────────────────────────────────────────────────────────
+
+/// A Clojure agent action: takes the current state, returns the new state.
+pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
+
+/// Messages sent to an agent's worker thread.
+pub enum AgentMsg {
+    Update(AgentFn),
+    Shutdown,
+}
+
+/// A Clojure agent — asynchronous state update queue.
+pub struct Agent {
+    /// Current state, shared between the Value::Agent handle and the worker thread.
+    pub state: Arc<Mutex<Value>>,
+    /// Last error, shared similarly.
+    pub error: Arc<Mutex<Option<String>>>,
+    /// Channel to send actions to the worker thread.
+    pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
+}
+
+impl Agent {
+    pub fn get_state(&self) -> Value {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn get_error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
+    pub fn clear_error(&self) {
+        *self.error.lock().unwrap() = None;
+    }
+}
+
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Agent")
+    }
+}
+
+impl cljx_gc::Trace for Agent {}

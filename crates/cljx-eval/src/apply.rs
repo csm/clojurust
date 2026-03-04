@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
-use cljx_value::{Arity, CljxFn, CljxFnArity, LazySeq, PersistentList, Thunk, Value};
+use cljx_value::{
+    AgentFn, AgentMsg, Arity, CljxFn, CljxFnArity, Delay, LazySeq, PersistentList, Thunk, Value,
+};
 
 use crate::destructure::value_to_seq_vec;
 use crate::env::Env;
@@ -47,14 +49,14 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // Special case: `apply` native fn — spread last arg.
     if let Value::NativeFunction(nf) = &callee {
-        if nf.get().name.as_ref() == "apply" {
-            return handle_apply_call(arg_forms, env);
-        }
-        if nf.get().name.as_ref() == "swap!" {
-            return handle_swap_call(arg_forms, env);
-        }
-        if nf.get().name.as_ref() == "make-lazy-seq" {
-            return handle_make_lazy_seq(arg_forms, env);
+        match nf.get().name.as_ref() {
+            "apply" => return handle_apply_call(arg_forms, env),
+            "swap!" => return handle_swap_call(arg_forms, env),
+            "make-lazy-seq" => return handle_make_lazy_seq(arg_forms, env),
+            "make-delay" => return handle_make_delay(arg_forms, env),
+            "vswap!" => return handle_vswap(arg_forms, env),
+            "send" | "send-off" => return handle_send(arg_forms, env),
+            _ => {}
         }
     }
 
@@ -91,6 +93,11 @@ pub fn type_tag_of(val: &Value) -> Arc<str> {
         Value::Atom(_) => Arc::from("Atom"),
         Value::Var(_) => Arc::from("Var"),
         Value::Protocol(_) => Arc::from("Protocol"),
+        Value::Volatile(_) => Arc::from("Volatile"),
+        Value::Delay(_) => Arc::from("Delay"),
+        Value::Promise(_) => Arc::from("Promise"),
+        Value::Future(_) => Arc::from("Future"),
+        Value::Agent(_) => Arc::from("Agent"),
         _ => Arc::from("Object"),
     }
 }
@@ -358,6 +365,106 @@ pub fn handle_make_lazy_seq(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         ns: env.current_ns.clone(),
     };
     Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
+}
+
+/// Handle `(make-delay f)` — wraps a zero-arg fn in a Delay.
+fn handle_make_delay(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "make-delay".into(),
+            expected: "1".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let f_val = eval(&arg_forms[0], env)?;
+    let f = match f_val {
+        Value::Fn(f) => f.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "make-delay requires a fn, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let thunk = ClosureThunk {
+        f,
+        globals: env.globals.clone(),
+        ns: env.current_ns.clone(),
+    };
+    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+}
+
+/// Handle `(vswap! vol f & args)` — apply f to current volatile value and store.
+fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vswap!".into(),
+            expected: "2+".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let vol_val = eval(&arg_forms[0], env)?;
+    let f = eval(&arg_forms[1], env)?;
+    let extra: Vec<Value> = arg_forms[2..]
+        .iter()
+        .map(|a| eval(a, env))
+        .collect::<EvalResult<_>>()?;
+
+    match vol_val {
+        Value::Volatile(v) => {
+            let cur = v.get().deref();
+            let mut call_args = vec![cur];
+            call_args.extend(extra);
+            let new_val = apply_value(&f, call_args, env)?;
+            v.get().reset(new_val.clone());
+            Ok(new_val)
+        }
+        other => Err(EvalError::Runtime(format!(
+            "vswap!: expected volatile, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Handle `(send agent f & extra)` / `(send-off agent f & extra)`.
+fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "send".into(),
+            expected: "2+".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let agent_val = eval(&arg_forms[0], env)?;
+    let f = eval(&arg_forms[1], env)?;
+    let extra: Vec<Value> = arg_forms[2..]
+        .iter()
+        .map(|a| eval(a, env))
+        .collect::<EvalResult<_>>()?;
+    let globals = env.globals.clone();
+    let ns = env.current_ns.clone();
+
+    match &agent_val {
+        Value::Agent(a) => {
+            let agent_fn: AgentFn = Box::new(move |state| {
+                let mut call_args = vec![state];
+                call_args.extend(extra);
+                let mut call_env = Env::new(globals, &ns);
+                apply_value(&f, call_args, &mut call_env).map_err(|e| format!("{e}"))
+            });
+            a.get()
+                .sender
+                .lock()
+                .unwrap()
+                .send(AgentMsg::Update(agent_fn))
+                .map_err(|_| EvalError::Runtime("send: agent is shut down".into()))?;
+            Ok(agent_val.clone())
+        }
+        other => Err(EvalError::Runtime(format!(
+            "send: expected agent, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// Handle `(swap! atom f & args)`.

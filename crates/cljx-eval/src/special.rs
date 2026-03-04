@@ -9,7 +9,10 @@ use crate::eval::{eval, eval_body, form_to_value, is_special_form};
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
-use cljx_value::{CljxFn, CljxFnArity, MultiFn, Protocol, ProtocolFn, ProtocolMethod, Value};
+use cljx_value::{
+    CljxFn, CljxFnArity, CljxFuture, FutureState, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
+    Value,
+};
 
 /// The set of names that trigger special-form dispatch.
 pub const SPECIAL_FORMS: &[&str] = &[
@@ -44,6 +47,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "extend-protocol",
     "defmulti",
     "defmethod",
+    "future",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -77,6 +81,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "extend-protocol" => eval_extend_protocol(args, env),
         "defmulti" => eval_defmulti(args, env),
         "defmethod" => eval_defmethod(args, env),
+        "future" => eval_future(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -1027,6 +1032,30 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
     mf_ptr.get().methods.lock().unwrap().insert(key, fn_val);
 
     Ok(Value::MultiFn(mf_ptr))
+}
+
+// ── future ────────────────────────────────────────────────────────────────────
+
+fn eval_future(args: &[Form], env: &mut Env) -> EvalResult {
+    // Capture body forms and env state for the new thread.
+    let body_forms = args.to_vec();
+    let child_env = env.child();
+
+    let future_ptr = GcPtr::new(CljxFuture::new());
+    let future_clone = future_ptr.clone();
+
+    std::thread::spawn(move || {
+        let mut eval_env = child_env;
+        let result = crate::eval::eval_body(&body_forms, &mut eval_env);
+        let mut state = future_clone.get().state.lock().unwrap();
+        match result {
+            Ok(v) => *state = FutureState::Done(v),
+            Err(e) => *state = FutureState::Failed(format!("{e}")),
+        }
+        future_clone.get().cond.notify_all();
+    });
+
+    Ok(Value::Future(future_ptr))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

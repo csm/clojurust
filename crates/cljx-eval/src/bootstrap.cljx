@@ -428,3 +428,12 @@
       (seq acc))))
 
 (defn clojure-version [] "cljx-0.1.0")
+
+;; ── Phase 7: Concurrency primitives ──────────────────────────────────────────
+
+(defmacro delay [& body]
+  (list 'make-delay (list 'fn [] (cons 'do body))))
+
+(defn future? [x] (= (type x) 'Future))
+(defn delay? [x] (= (type x) 'Delay))
+(defn promise? [x] (= (type x) 'Promise))

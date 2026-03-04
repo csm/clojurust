@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
-  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn
+  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
   value.rs                       — Value enum, MapValue, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -80,6 +80,12 @@ pub enum Value {
     Protocol(GcPtr<Protocol>),
     ProtocolFn(GcPtr<ProtocolFn>),
     MultiFn(GcPtr<MultiFn>),
+    // Concurrency primitives (Phase 7)
+    Volatile(GcPtr<Volatile>),
+    Delay(GcPtr<Delay>),
+    Promise(GcPtr<CljxPromise>),
+    Future(GcPtr<CljxFuture>),
+    Agent(GcPtr<Agent>),
 }
 
 pub enum MapValue {
@@ -185,6 +191,31 @@ pub struct CljxCons {
 `Thunk` implementations live in `cljx-eval` (e.g. `ClosureThunk`) so that
 `cljx-value` stays free of evaluator dependencies while `LazySeq` can still
 call back through the trait object.
+
+### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
+
+```rust
+pub struct Volatile { pub value: Mutex<Value> }
+
+pub struct Delay { pub state: Mutex<DelayState> }  // Pending(Box<dyn Thunk>) | Forced(Value)
+
+pub struct CljxPromise {
+    pub value: Mutex<Option<Value>>,
+    pub cond: Condvar,
+}
+
+pub struct CljxFuture {
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(String) | Cancelled
+    pub cond: Condvar,
+}
+
+pub struct Agent {
+    pub state: Arc<Mutex<Value>>,
+    pub error: Arc<Mutex<Option<String>>>,
+    pub sender: Mutex<SyncSender<AgentMsg>>,
+}
+pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
+```
 
 ### `Protocol` / `ProtocolFn` / `MultiFn` (Phase 6)
 

@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use cljx_gc::GcPtr;
 use cljx_value::{
-    Arity, Atom, CljxCons, Keyword, MapValue, NativeFn, PersistentHashSet, PersistentList,
-    PersistentVector, Symbol, Value, ValueError, ValueResult,
+    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
+    NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value, ValueError,
+    ValueResult, Volatile,
 };
 
 use crate::env::GlobalEnv;
@@ -115,8 +116,36 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("map-vals", Arity::Fixed(2), builtin_map_vals_stub),
         // Atoms
         ("atom", Arity::Fixed(1), builtin_atom),
-        ("deref", Arity::Fixed(1), builtin_deref),
+        ("deref", Arity::Variadic { min: 1 }, builtin_deref),
         ("reset!", Arity::Fixed(2), builtin_reset_bang),
+        // Phase 7 — Concurrency primitives
+        ("compare-and-set!", Arity::Fixed(3), builtin_compare_and_set),
+        ("volatile!", Arity::Fixed(1), builtin_volatile),
+        ("vreset!", Arity::Fixed(2), builtin_vreset),
+        ("vswap!", Arity::Variadic { min: 2 }, builtin_vswap_sentinel),
+        ("volatile?", Arity::Fixed(1), builtin_volatile_q),
+        ("force", Arity::Fixed(1), builtin_force),
+        ("realized?", Arity::Fixed(1), builtin_realized_q),
+        ("promise", Arity::Fixed(0), builtin_promise),
+        ("deliver", Arity::Fixed(2), builtin_deliver),
+        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
+        (
+            "future-cancelled?",
+            Arity::Fixed(1),
+            builtin_future_cancelled_q,
+        ),
+        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
+        ("agent", Arity::Fixed(1), builtin_agent),
+        ("await", Arity::Variadic { min: 1 }, builtin_await),
+        ("agent-error", Arity::Fixed(1), builtin_agent_error),
+        ("restart-agent", Arity::Fixed(2), builtin_restart_agent),
+        ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
+        (
+            "send-off",
+            Arity::Variadic { min: 2 },
+            builtin_send_sentinel,
+        ),
+        ("make-delay", Arity::Fixed(1), builtin_make_delay_sentinel),
         // I/O
         ("print", Arity::Variadic { min: 0 }, builtin_print),
         ("println", Arity::Variadic { min: 0 }, builtin_println),
@@ -1587,11 +1616,89 @@ fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
+    let with_timeout = args.len() == 3;
     match &args[0] {
         Value::Atom(a) => Ok(a.get().deref()),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
+        Value::Delay(d) => Ok(d.get().force()),
+        Value::Agent(a) => Ok(a.get().get_state()),
+        Value::Promise(p) => {
+            if with_timeout {
+                let timeout_ms = match &args[1] {
+                    Value::Long(n) => *n as u64,
+                    v => {
+                        return Err(ValueError::WrongType {
+                            expected: "long (timeout-ms)",
+                            got: v.type_name().to_string(),
+                        });
+                    }
+                };
+                let timeout_val = args[2].clone();
+                let guard = p.get().value.lock().unwrap();
+                if guard.is_some() {
+                    return Ok(guard.as_ref().unwrap().clone());
+                }
+                let (guard, _) = p
+                    .get()
+                    .cond
+                    .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
+                    .unwrap();
+                Ok(guard.as_ref().cloned().unwrap_or(timeout_val))
+            } else {
+                Ok(p.get().deref_blocking())
+            }
+        }
+        Value::Future(f) => {
+            if with_timeout {
+                let timeout_ms = match &args[1] {
+                    Value::Long(n) => *n as u64,
+                    v => {
+                        return Err(ValueError::WrongType {
+                            expected: "long (timeout-ms)",
+                            got: v.type_name().to_string(),
+                        });
+                    }
+                };
+                let timeout_val = args[2].clone();
+                let guard = f.get().state.lock().unwrap();
+                match &*guard {
+                    FutureState::Done(v) => Ok(v.clone()),
+                    FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
+                    FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
+                    FutureState::Running => {
+                        let (guard, _) = f
+                            .get()
+                            .cond
+                            .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
+                            .unwrap();
+                        match &*guard {
+                            FutureState::Done(v) => Ok(v.clone()),
+                            FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
+                            FutureState::Cancelled => {
+                                Err(ValueError::Other("future was cancelled".into()))
+                            }
+                            FutureState::Running => Ok(timeout_val),
+                        }
+                    }
+                }
+            } else {
+                let mut guard = f.get().state.lock().unwrap();
+                loop {
+                    match &*guard {
+                        FutureState::Done(v) => return Ok(v.clone()),
+                        FutureState::Failed(e) => return Err(ValueError::Other(e.clone())),
+                        FutureState::Cancelled => {
+                            return Err(ValueError::Other("future was cancelled".into()));
+                        }
+                        FutureState::Running => {
+                            guard = f.get().cond.wait(guard).unwrap();
+                        }
+                    }
+                }
+            }
+        }
         v => Err(ValueError::WrongType {
-            expected: "atom or var",
+            expected: "atom, var, delay, promise, future, or agent",
             got: v.type_name().to_string(),
         }),
     }
@@ -2537,4 +2644,216 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
 fn builtin_isa_q(args: &[Value]) -> ValueResult<Value> {
     // Stub: equality only; full hierarchy deferred.
     Ok(Value::Bool(args[0] == args[1]))
+}
+
+// ── Phase 7 — Concurrency primitives ─────────────────────────────────────────
+
+fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Atom(a) => {
+            let mut guard = a.get().value.lock().unwrap();
+            if *guard == args[1] {
+                *guard = args[2].clone();
+                Ok(Value::Bool(true))
+            } else {
+                Ok(Value::Bool(false))
+            }
+        }
+        v => Err(ValueError::WrongType {
+            expected: "atom",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_volatile(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Volatile(GcPtr::new(Volatile::new(args[0].clone()))))
+}
+
+fn builtin_vreset(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Volatile(v) => Ok(v.get().reset(args[1].clone())),
+        v => Err(ValueError::WrongType {
+            expected: "volatile",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_vswap_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other(
+        "vswap! must be invoked through the evaluator".into(),
+    ))
+}
+
+fn builtin_volatile_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::Volatile(_))))
+}
+
+fn builtin_force(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Delay(d) => Ok(d.get().force()),
+        other => Ok(other.clone()), // non-delay passes through
+    }
+}
+
+fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
+    let realized = match &args[0] {
+        Value::Delay(d) => d.get().is_realized(),
+        Value::Promise(p) => p.get().is_realized(),
+        Value::Future(f) => f.get().is_done(),
+        Value::LazySeq(_) => false, // lazyseq is realized only after forcing
+        _ => true,                  // everything else is always "realized"
+    };
+    Ok(Value::Bool(realized))
+}
+
+fn builtin_promise(_args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Promise(GcPtr::new(CljxPromise::new())))
+}
+
+fn builtin_deliver(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Promise(p) => {
+            p.get().deliver(args[1].clone());
+            Ok(args[0].clone())
+        }
+        v => Err(ValueError::WrongType {
+            expected: "promise",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_future_done_q(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Future(f) => Ok(Value::Bool(f.get().is_done())),
+        v => Err(ValueError::WrongType {
+            expected: "future",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Future(f) => Ok(Value::Bool(f.get().is_cancelled())),
+        v => Err(ValueError::WrongType {
+            expected: "future",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Future(f) => {
+            let mut state = f.get().state.lock().unwrap();
+            if matches!(&*state, FutureState::Running) {
+                *state = FutureState::Cancelled;
+                f.get().cond.notify_all();
+            }
+            Ok(Value::Bool(true))
+        }
+        v => Err(ValueError::WrongType {
+            expected: "future",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
+    let init = args[0].clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AgentMsg>(1024);
+    let state_arc = Arc::new(std::sync::Mutex::new(init.clone()));
+    let error_arc: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let worker_state = state_arc.clone();
+    let worker_error = error_arc.clone();
+    std::thread::spawn(move || {
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                AgentMsg::Update(f) => {
+                    let cur = worker_state.lock().unwrap().clone();
+                    match f(cur) {
+                        Ok(next) => *worker_state.lock().unwrap() = next,
+                        Err(e) => *worker_error.lock().unwrap() = Some(e),
+                    }
+                }
+                AgentMsg::Shutdown => break,
+            }
+        }
+    });
+    Ok(Value::Agent(GcPtr::new(Agent {
+        state: state_arc,
+        error: error_arc,
+        sender: std::sync::Mutex::new(tx),
+    })))
+}
+
+fn builtin_await(args: &[Value]) -> ValueResult<Value> {
+    for agent_val in args {
+        match agent_val {
+            Value::Agent(a) => {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let sync_fn: AgentFn = Box::new(move |state| {
+                    let _ = tx.send(());
+                    Ok(state)
+                });
+                a.get()
+                    .sender
+                    .lock()
+                    .unwrap()
+                    .send(AgentMsg::Update(sync_fn))
+                    .map_err(|_| ValueError::Other("await: agent is shut down".into()))?;
+                rx.recv()
+                    .map_err(|_| ValueError::Other("await: agent thread died".into()))?;
+            }
+            v => {
+                return Err(ValueError::WrongType {
+                    expected: "agent",
+                    got: v.type_name().to_string(),
+                });
+            }
+        }
+    }
+    Ok(Value::Nil)
+}
+
+fn builtin_agent_error(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Agent(a) => match a.get().get_error() {
+            Some(e) => Ok(Value::string(e)),
+            None => Ok(Value::Nil),
+        },
+        v => Err(ValueError::WrongType {
+            expected: "agent",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_restart_agent(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Agent(a) => {
+            a.get().clear_error();
+            *a.get().state.lock().unwrap() = args[1].clone();
+            Ok(args[0].clone())
+        }
+        v => Err(ValueError::WrongType {
+            expected: "agent",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_send_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other(
+        "send/send-off must be invoked through the evaluator".into(),
+    ))
+}
+
+fn builtin_make_delay_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other(
+        "make-delay must be invoked through the evaluator".into(),
+    ))
 }
