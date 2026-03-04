@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Interpret a .cljx or .cljc source file.
+    /// Interpret a .cljrs or .cljc source file.
     Run {
         /// Path to the source file.
         file: PathBuf,

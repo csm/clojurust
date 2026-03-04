@@ -23,7 +23,7 @@ src/
 cljx <SUBCOMMAND>
 
 Subcommands:
-  run      <file>              Interpret a .cljx or .cljc source file
+  run      <file>              Interpret a .cljrs or .cljc source file
   repl                         Start an interactive REPL
   compile  <file> -o <out>     AOT-compile a source file to a native binary
   eval     <expr>              Evaluate a single Clojure expression and print the result
@@ -32,9 +32,9 @@ Subcommands:
 ### Examples
 
 ```bash
-cljx run hello.cljx
+cljx run hello.cljrs
 cljx repl
-cljx compile app.cljx -o app
+cljx compile app.cljrs -o app
 cljx eval '(+ 1 2)'
 ```
 

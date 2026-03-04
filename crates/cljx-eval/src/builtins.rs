@@ -310,7 +310,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
 }
 
 // Bootstrap Clojure source defining higher-order functions.
-pub const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.cljx");
+pub const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.cljrs");
 
 // ── Helper: value to sequence vector ─────────────────────────────────────────
 

@@ -760,11 +760,11 @@ mod tests {
     #[test]
     fn test_reader_cond() {
         assert_eq!(
-            parse1("#?(:cljx 1 :clj 2)").kind,
+            parse1("#?(:rust 1 :clj 2)").kind,
             FormKind::ReaderCond {
                 splicing: false,
                 clauses: vec![
-                    f(FormKind::Keyword("cljx".to_string())),
+                    f(FormKind::Keyword("rust".to_string())),
                     f(FormKind::Int(1)),
                     f(FormKind::Keyword("clj".to_string())),
                     f(FormKind::Int(2)),
@@ -776,11 +776,11 @@ mod tests {
     #[test]
     fn test_reader_cond_splice() {
         assert_eq!(
-            parse1("#?@(:cljx [1 2])").kind,
+            parse1("#?@(:rust [1 2])").kind,
             FormKind::ReaderCond {
                 splicing: true,
                 clauses: vec![
-                    f(FormKind::Keyword("cljx".to_string())),
+                    f(FormKind::Keyword("rust".to_string())),
                     f(FormKind::Vector(vec![
                         f(FormKind::Int(1)),
                         f(FormKind::Int(2)),

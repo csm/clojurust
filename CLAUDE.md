@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `clojurust` is a Rust-hosted dialect of the Clojure programming language. Goals:
 
-- **Interpreter**: read and execute `.cljx` (native extension) and `.cljc` (cross-platform) source files
-- **Reader conditionals**: `.cljc` files use `#?(:cljx ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:cljx`
+- **Interpreter**: read and execute `.cljrs` (native extension) and `.cljc` (cross-platform) source files
+- **Reader conditionals**: `.cljc` files use `#?(:rust ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:rust`
 - **Rust interop**: Clojure code can call into Rust functions with defined conventions and type-marshalling
 - **Garbage collector**: a tracing GC manages all Clojure values; Rust owns the GC root
 - **JIT compilation**: hot code is compiled to native code at runtime (Cranelift backend preferred)
@@ -50,7 +50,7 @@ cargo fmt
 
 Once the CLI exists:
 ```bash
-cljx run <file.cljx>       # interpret a source file
+cljx run <file.cljrs>      # interpret a source file
 cljx repl                   # start interactive REPL
 cljx compile <file> -o <bin> # AOT compile to binary
 cljx eval '<expr>'          # evaluate expression from shell
@@ -77,4 +77,4 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 - **Persistent collections are the default** — mutability only via `atom`/`ref`/`agent` or transients
 - **Rust interop is safe-by-default** — unsafe Rust APIs accessible only through an explicit `cljx.rust/unsafe` boundary
 - **JIT and interpreter share the same `Value` representation** — no separate boxed/unboxed split at the API boundary (specialization is internal to the JIT)
-- **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:cljx`
+- **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:rust`

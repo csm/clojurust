@@ -332,7 +332,7 @@ fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
     let mut default: Option<&Form> = None;
     while i + 1 < clauses.len() {
         match &clauses[i].kind {
-            FormKind::Keyword(k) if k == "cljx" => {
+            FormKind::Keyword(k) if k == "rust" => {
                 return eval(&clauses[i + 1], env);
             }
             FormKind::Keyword(k) if k == "default" => {
@@ -722,14 +722,14 @@ mod tests {
     // ── reader conditionals ───────────────────────────────────────────────
 
     #[test]
-    fn test_reader_cond_cljx() {
-        // :cljx branch selected.
-        assert_eq!(eval_str("#?(:cljx 1 :clj 2)").unwrap(), long(1));
+    fn test_reader_cond_rust() {
+        // :rust branch selected.
+        assert_eq!(eval_str("#?(:rust 1 :clj 2)").unwrap(), long(1));
     }
 
     #[test]
     fn test_reader_cond_default() {
-        // No :cljx; fall through to :default.
+        // No :rust; fall through to :default.
         assert_eq!(eval_str("#?(:clj 2 :default 99)").unwrap(), long(99));
     }
 

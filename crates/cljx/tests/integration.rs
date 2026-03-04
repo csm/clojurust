@@ -1,6 +1,6 @@
 //! Source-level integration tests.
 //!
-//! Fixture `.cljx` files live in `<workspace-root>/tests/fixtures/`.
+//! Fixture `.cljrs` files live in `<workspace-root>/tests/fixtures/`.
 //! Tests here are `#[ignore]`d until the reader and evaluator land in
 //! Phase 2 and Phase 4 respectively.
 
@@ -23,14 +23,14 @@ fn run_fixture_files() {
         .filter(|e| {
             e.path()
                 .extension()
-                .map(|x| x == "cljx" || x == "cljc")
+                .map(|x| x == "cljrs" || x == "cljc")
                 .unwrap_or(false)
         })
         .collect();
 
     assert!(
         !entries.is_empty(),
-        "no .cljx/.cljc fixture files found in {}",
+        "no .cljrs/.cljc fixture files found in {}",
         dir.display()
     );
 

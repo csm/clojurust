@@ -11,13 +11,13 @@ A Rust-hosted dialect of the Clojure programming language.
 ## What is this?
 
 clojurust is an interpreter and compiler for a Clojure dialect that runs
-natively on Rust. Source files use the `.cljx` extension (native) or `.cljc`
+natively on Rust. Source files use the `.cljrs` extension (native) or `.cljc`
 (cross-platform, with reader conditionals). The runtime platform key is
-`:cljx`.
+`:rust`.
 
 Planned capabilities:
 
-- **Interpret** `.cljx` and `.cljc` source files
+- **Interpret** `.cljrs` and `.cljc` source files
 - **Rust interop** — call Rust functions from Clojure with defined type marshalling
 - **Tracing GC** — all Clojure values managed by a garbage collector; Rust owns the root
 - **JIT compilation** — hot code compiled to native via Cranelift
@@ -91,6 +91,6 @@ crates/
   cljx-interop/         # FFI stub (Phase 9)
   cljx/                 # CLI binary (Phase 12)
 tests/
-  fixtures/             # .cljx / .cljc source files for integration tests
+  fixtures/             # .cljrs / .cljc source files for integration tests
 TODO.md                 # phased implementation roadmap
 ```

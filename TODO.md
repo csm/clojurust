@@ -1,6 +1,6 @@
 # clojurust TODO
 
-Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension is `.cljx`; also supports `.cljc` with reader conditional `:cljx`.
+Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension is `.cljrs`; also supports `.cljc` with reader conditional `:rust`.
 
 ---
 
@@ -29,10 +29,10 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] String escape sequences and multiline strings
 - [x] Character literals (`\a`, `\newline`, `\u0041`, etc.)
 - [x] Line/column source-location tracking on all forms
-- [x] Reader conditionals (`.cljc` / `.cljx`)
-  - [x] `#?(:cljx ... :clj ... :cljs ... :default ...)` splicing and non-splicing forms
-  - [x] Platform key `:cljx` selects Rust-dialect branch (evaluator filters; reader stores all branches)
-- [ ] File extension dispatch: treat `.cljx` as always-Rust-dialect, `.cljc` as cross-platform with conditionals
+- [x] Reader conditionals (`.cljc` / `.cljrs`)
+  - [x] `#?(:rust ... :clj ... :cljs ... :default ...)` splicing and non-splicing forms
+  - [x] Platform key `:rust` selects Rust-dialect branch (evaluator filters; reader stores all branches)
+- [ ] File extension dispatch: treat `.cljrs` as always-Rust-dialect, `.cljc` as cross-platform with conditionals
 
 ---
 
@@ -103,7 +103,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] `defmulti` / `defmethod` — arbitrary dispatch multimethods
 - [x] `prefer-method`, `remove-method`, `methods`, `satisfies?`, `extends?`, `isa?` (equality stub), `type`
 - [ ] Inline protocol dispatch cache — Phase 10 JIT optimization
-- [x] Built-in protocols (`ICounted`, `ILookup`, `ISeqable`) — defined in bootstrap.cljx; extended for List, Vector, Map, Set, String
+- [x] Built-in protocols (`ICounted`, `ILookup`, `ISeqable`) — defined in bootstrap.cljrs; extended for List, Vector, Map, Set, String
 - [ ] `derive` / full `isa?` hierarchy
 - [x] `defrecord` — backed by `TypeInstance` (type_tag + MapValue fields); generates `->Name` and `map->Name` constructors; supports inline protocol impls
 - [x] `reify` — creates a unique-tagged `TypeInstance`; supports inline protocol impls
@@ -193,7 +193,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 - [ ] Interactive REPL (`cljx repl`): read–eval–print loop with readline support
 - [ ] nREPL-compatible server for editor integration
-- [ ] `cljx run <file>` — execute a `.cljx` or `.cljc` source file
+- [ ] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
 - [ ] `cljx eval '<expr>'` — evaluate expression from command line
 - [ ] Project / build system (`cljx.edn` project descriptor, dependency resolution)
 - [ ] Classpath / source-path management
@@ -217,7 +217,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 - [ ] Define and document clojurust/Clojure compatibility surface (what is intentionally different)
 - [ ] Run a representative subset of `clojure.test` suite against clojurust
-- [ ] Reader compatibility: verify `.cljc` files with `:cljx` conditionals behave correctly alongside `:clj`/`:cljs`
+- [ ] Reader compatibility: verify `.cljc` files with `:rust` conditionals behave correctly alongside `:clj`/`:cljs`
 - [ ] Numeric tower parity with Clojure (promotion, overflow to BigInt, etc.)
 - [ ] `*clojure-version*` / `*cljx-version*` vars
 - [ ] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars
