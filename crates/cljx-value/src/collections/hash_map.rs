@@ -199,8 +199,20 @@ impl PartialEq for PersistentHashMap {
     }
 }
 
-impl cljx_gc::Trace for PersistentHashMap {}
-impl cljx_gc::Trace for KVPair {}
+impl cljx_gc::Trace for PersistentHashMap {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        if let Some(root) = &self.root {
+            visitor.visit(root);
+        }
+    }
+}
+impl cljx_gc::Trace for KVPair {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.0.trace(visitor);
+        self.1.trace(visitor);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -63,7 +63,19 @@ impl PersistentList {
     }
 }
 
-impl cljx_gc::Trace for PersistentList {}
+impl cljx_gc::Trace for PersistentList {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        match self {
+            PersistentList::Empty => {}
+            PersistentList::Cons { head, tail, .. } => {
+                head.trace(visitor);
+                // tail is Arc<PersistentList> — not a GcPtr, but we must trace
+                // through it to find any embedded GcPtrs.
+                tail.trace(visitor);
+            }
+        }
+    }
+}
 
 impl std::iter::FromIterator<Value> for PersistentList {
     fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {

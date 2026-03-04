@@ -12,7 +12,7 @@ pub const MAX_DEPTH: u32 = 6; // 0..=6 gives 7 levels × 5 bits = 35 ≥ 32
 /// `V` is either a `KVPair` (for hash maps) or a `Value` (for vector slots).
 /// All nodes are immutable; structural sharing is via `GcPtr` (Arc shim).
 #[derive(Debug, Clone)]
-pub enum Node<V: Clone + std::fmt::Debug + Trace> {
+pub enum Node<V: Clone + std::fmt::Debug + Trace + 'static> {
     /// A single value stored at a leaf.
     Leaf { hash: u32, value: V },
     /// A sparse internal node: up to 32 children, stored densely.
@@ -24,7 +24,24 @@ pub enum Node<V: Clone + std::fmt::Debug + Trace> {
     Collision { hash: u32, entries: Arc<Vec<V>> },
 }
 
-impl<V: Clone + std::fmt::Debug + Trace + 'static> Trace for Node<V> {}
+impl<V: Clone + std::fmt::Debug + Trace + 'static> Trace for Node<V> {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        match self {
+            Node::Leaf { value, .. } => value.trace(visitor),
+            Node::Collision { entries, .. } => {
+                for v in entries.iter() {
+                    v.trace(visitor);
+                }
+            }
+            Node::Branch { children, .. } => {
+                for child in children.iter() {
+                    visitor.visit(child);
+                }
+            }
+        }
+    }
+}
 
 impl<V: Clone + std::fmt::Debug + Trace + 'static> Node<V> {
     // ── Lookup ────────────────────────────────────────────────────────────────
@@ -296,7 +313,9 @@ mod tests {
     // Simple test entry: (hash, key_id, val)
     #[derive(Debug, Clone, PartialEq)]
     struct Entry(u32, u32, i32); // (hash, key, value)
-    impl cljx_gc::Trace for Entry {}
+    impl cljx_gc::Trace for Entry {
+        fn trace(&self, _: &mut cljx_gc::MarkVisitor) {}
+    }
 
     fn key_eq(key: u32) -> impl Fn(&Entry) -> bool {
         move |e: &Entry| e.1 == key

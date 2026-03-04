@@ -162,7 +162,13 @@ impl PartialEq for PersistentArrayMap {
     }
 }
 
-impl cljx_gc::Trace for PersistentArrayMap {}
+impl cljx_gc::Trace for PersistentArrayMap {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        for v in self.entries.iter() {
+            v.trace(visitor);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

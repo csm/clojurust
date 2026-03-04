@@ -53,7 +53,9 @@ impl std::fmt::Display for Symbol {
     }
 }
 
-impl cljx_gc::Trace for Symbol {}
+impl cljx_gc::Trace for Symbol {
+    fn trace(&self, _: &mut cljx_gc::MarkVisitor) {}
+}
 
 #[cfg(test)]
 mod tests {

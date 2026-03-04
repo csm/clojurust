@@ -688,8 +688,51 @@ impl Value {
     }
 }
 
-impl cljx_gc::Trace for Value {}
-impl cljx_gc::Trace for MapValue {}
+impl cljx_gc::Trace for Value {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        match self {
+            Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => {}
+            Value::BigInt(p) => visitor.visit(p),
+            Value::BigDecimal(p) => visitor.visit(p),
+            Value::Ratio(p) => visitor.visit(p),
+            Value::Str(p) => visitor.visit(p),
+            Value::Symbol(p) => visitor.visit(p),
+            Value::Keyword(p) => visitor.visit(p),
+            Value::List(p) => visitor.visit(p),
+            Value::Vector(p) => visitor.visit(p),
+            Value::Map(m) => m.trace(visitor),
+            Value::Set(p) => visitor.visit(p),
+            Value::Queue(p) => visitor.visit(p),
+            Value::NativeFunction(p) => visitor.visit(p),
+            Value::Fn(p) | Value::Macro(p) => visitor.visit(p),
+            Value::Var(p) => visitor.visit(p),
+            Value::Atom(p) => visitor.visit(p),
+            Value::Namespace(p) => visitor.visit(p),
+            Value::LazySeq(p) => visitor.visit(p),
+            Value::Cons(p) => visitor.visit(p),
+            Value::Protocol(p) => visitor.visit(p),
+            Value::ProtocolFn(p) => visitor.visit(p),
+            Value::MultiFn(p) => visitor.visit(p),
+            Value::Volatile(p) => visitor.visit(p),
+            Value::Delay(p) => visitor.visit(p),
+            Value::Promise(p) => visitor.visit(p),
+            Value::Future(p) => visitor.visit(p),
+            Value::Agent(p) => visitor.visit(p),
+            Value::TypeInstance(p) => visitor.visit(p),
+        }
+    }
+}
+
+impl cljx_gc::Trace for MapValue {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        match self {
+            MapValue::Array(p) => visitor.visit(p),
+            MapValue::Hash(p) => visitor.visit(p),
+        }
+    }
+}
 
 // ── TypeInstance ──────────────────────────────────────────────────────────────
 
@@ -701,7 +744,11 @@ pub struct TypeInstance {
     pub fields: MapValue,
 }
 
-impl cljx_gc::Trace for TypeInstance {}
+impl cljx_gc::Trace for TypeInstance {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.fields.trace(visitor);
+    }
+}
 
 #[cfg(test)]
 mod tests {

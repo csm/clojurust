@@ -206,7 +206,9 @@ dependencies = [
 name = "cljx-gc"
 version = "0.1.0"
 dependencies = [
- "cljx-types",
+ "bigdecimal",
+ "num-bigint",
+ "num-rational",
 ]
 
 [[package]]

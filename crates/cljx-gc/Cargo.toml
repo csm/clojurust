@@ -5,4 +5,6 @@ edition = "2024"
 description = "Tracing garbage collector for clojurust"
 
 [dependencies]
-cljx-types = { workspace = true }
+num-bigint   = { workspace = true }
+bigdecimal   = { workspace = true }
+num-rational = { workspace = true }

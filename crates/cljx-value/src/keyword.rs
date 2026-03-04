@@ -56,7 +56,9 @@ impl std::fmt::Display for Keyword {
     }
 }
 
-impl cljx_gc::Trace for Keyword {}
+impl cljx_gc::Trace for Keyword {
+    fn trace(&self, _: &mut cljx_gc::MarkVisitor) {}
+}
 
 #[cfg(test)]
 mod tests {

@@ -23,6 +23,12 @@ struct ClosureThunk {
     ns: std::sync::Arc<str>,
 }
 
+impl cljx_gc::Trace for ClosureThunk {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.f.trace(visitor);
+    }
+}
+
 impl Thunk for ClosureThunk {
     fn force(&self) -> Value {
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);

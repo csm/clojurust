@@ -37,7 +37,16 @@ impl Protocol {
     }
 }
 
-impl cljx_gc::Trace for Protocol {}
+impl cljx_gc::Trace for Protocol {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        let impls = self.impls.lock().unwrap();
+        for method_map in impls.values() {
+            for v in method_map.values() {
+                v.trace(visitor);
+            }
+        }
+    }
+}
 
 /// One method signature declared in a `defprotocol`.
 #[derive(Debug, Clone)]
@@ -47,7 +56,9 @@ pub struct ProtocolMethod {
     pub variadic: bool,
 }
 
-impl cljx_gc::Trace for ProtocolMethod {}
+impl cljx_gc::Trace for ProtocolMethod {
+    fn trace(&self, _: &mut cljx_gc::MarkVisitor) {}
+}
 
 // ── ProtocolFn ────────────────────────────────────────────────────────────────
 
@@ -60,7 +71,12 @@ pub struct ProtocolFn {
     pub variadic: bool,
 }
 
-impl cljx_gc::Trace for ProtocolFn {}
+impl cljx_gc::Trace for ProtocolFn {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        visitor.visit(&self.protocol);
+    }
+}
 
 // ── MultiFn ───────────────────────────────────────────────────────────────────
 
@@ -89,7 +105,15 @@ impl MultiFn {
     }
 }
 
-impl cljx_gc::Trace for MultiFn {}
+impl cljx_gc::Trace for MultiFn {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.dispatch_fn.trace(visitor);
+        let methods = self.methods.lock().unwrap();
+        for v in methods.values() {
+            v.trace(visitor);
+        }
+    }
+}
 
 // ── Var ───────────────────────────────────────────────────────────────────────
 
@@ -125,7 +149,13 @@ impl Var {
     }
 }
 
-impl cljx_gc::Trace for Var {}
+impl cljx_gc::Trace for Var {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        if let Some(v) = self.value.lock().unwrap().as_ref() {
+            v.trace(visitor);
+        }
+    }
+}
 
 // ── Atom ──────────────────────────────────────────────────────────────────────
 
@@ -153,7 +183,11 @@ impl Atom {
     }
 }
 
-impl cljx_gc::Trace for Atom {}
+impl cljx_gc::Trace for Atom {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.value.lock().unwrap().trace(visitor);
+    }
+}
 
 // ── Namespace ─────────────────────────────────────────────────────────────────
 
@@ -180,7 +214,23 @@ impl Namespace {
     }
 }
 
-impl cljx_gc::Trace for Namespace {}
+impl cljx_gc::Trace for Namespace {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        {
+            let interns = self.interns.lock().unwrap();
+            for var in interns.values() {
+                visitor.visit(var);
+            }
+        }
+        {
+            let refers = self.refers.lock().unwrap();
+            for var in refers.values() {
+                visitor.visit(var);
+            }
+        }
+    }
+}
 
 // ── NativeFn ──────────────────────────────────────────────────────────────────
 
@@ -210,7 +260,9 @@ impl NativeFn {
     }
 }
 
-impl cljx_gc::Trace for NativeFn {}
+impl cljx_gc::Trace for NativeFn {
+    fn trace(&self, _: &mut cljx_gc::MarkVisitor) {}
+}
 
 // ── CljxFnArity ───────────────────────────────────────────────────────────────
 
@@ -258,12 +310,18 @@ impl CljxFn {
     }
 }
 
-impl cljx_gc::Trace for CljxFn {}
+impl cljx_gc::Trace for CljxFn {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        for v in &self.closed_over_vals {
+            v.trace(visitor);
+        }
+    }
+}
 
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────
 
 /// A deferred computation that produces a `Value` when forced.
-pub trait Thunk: Send + Sync + std::fmt::Debug {
+pub trait Thunk: Send + Sync + std::fmt::Debug + cljx_gc::Trace {
     fn force(&self) -> Value;
 }
 
@@ -310,7 +368,15 @@ impl std::fmt::Debug for LazySeq {
     }
 }
 
-impl cljx_gc::Trace for LazySeq {}
+impl cljx_gc::Trace for LazySeq {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        let state = self.state.lock().unwrap();
+        match &*state {
+            LazySeqState::Pending(thunk) => thunk.trace(visitor),
+            LazySeqState::Forced(v) => v.trace(visitor),
+        }
+    }
+}
 
 // ── CljxCons ──────────────────────────────────────────────────────────────────
 
@@ -324,7 +390,12 @@ pub struct CljxCons {
     pub tail: Value,
 }
 
-impl cljx_gc::Trace for CljxCons {}
+impl cljx_gc::Trace for CljxCons {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.head.trace(visitor);
+        self.tail.trace(visitor);
+    }
+}
 
 // ── Volatile ──────────────────────────────────────────────────────────────────
 
@@ -356,7 +427,11 @@ impl std::fmt::Debug for Volatile {
     }
 }
 
-impl cljx_gc::Trace for Volatile {}
+impl cljx_gc::Trace for Volatile {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.value.lock().unwrap().trace(visitor);
+    }
+}
 
 // ── Delay ─────────────────────────────────────────────────────────────────────
 
@@ -405,7 +480,15 @@ impl std::fmt::Debug for Delay {
     }
 }
 
-impl cljx_gc::Trace for Delay {}
+impl cljx_gc::Trace for Delay {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        let state = self.state.lock().unwrap();
+        match &*state {
+            DelayState::Pending(thunk) => thunk.trace(visitor),
+            DelayState::Forced(v) => v.trace(visitor),
+        }
+    }
+}
 
 // ── CljxPromise ───────────────────────────────────────────────────────────────
 
@@ -459,7 +542,13 @@ impl std::fmt::Debug for CljxPromise {
     }
 }
 
-impl cljx_gc::Trace for CljxPromise {}
+impl cljx_gc::Trace for CljxPromise {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        if let Some(v) = self.value.lock().unwrap().as_ref() {
+            v.trace(visitor);
+        }
+    }
+}
 
 // ── CljxFuture ────────────────────────────────────────────────────────────────
 
@@ -508,7 +597,14 @@ impl std::fmt::Debug for CljxFuture {
     }
 }
 
-impl cljx_gc::Trace for CljxFuture {}
+impl cljx_gc::Trace for CljxFuture {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        let state = self.state.lock().unwrap();
+        if let FutureState::Done(v) = &*state {
+            v.trace(visitor);
+        }
+    }
+}
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
@@ -551,4 +647,9 @@ impl std::fmt::Debug for Agent {
     }
 }
 
-impl cljx_gc::Trace for Agent {}
+impl cljx_gc::Trace for Agent {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        // Trace through the Arc<Mutex<Value>> — the worker thread shares this Arc.
+        self.state.lock().unwrap().trace(visitor);
+    }
+}

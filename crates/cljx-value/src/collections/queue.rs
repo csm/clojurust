@@ -97,7 +97,14 @@ impl PartialEq for PersistentQueue {
     }
 }
 
-impl cljx_gc::Trace for PersistentQueue {}
+impl cljx_gc::Trace for PersistentQueue {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        // front: Arc<PersistentList> — trace through to find embedded GcPtrs
+        self.front.trace(visitor);
+        // rear: PersistentVector — trace normally
+        self.rear.trace(visitor);
+    }
+}
 
 #[cfg(test)]
 mod tests {

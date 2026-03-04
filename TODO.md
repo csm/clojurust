@@ -127,15 +127,18 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 8 — Garbage Collector
 
-- [ ] Evaluate GC strategies (tracing vs. reference counting vs. generational); document decision
-- [ ] Implement chosen GC (likely a simple mark-and-sweep first, then generational)
-- [ ] Safe-point mechanism: yield points in eval loop and compiled code
-- [ ] Write barriers for generational / incremental GC
-- [ ] Weak references (for caches, intern tables)
-- [ ] GC integration with Rust's ownership: `GcPtr<T>` smart pointer that is opaque to Rust's borrow checker
-- [ ] Finalization hooks (for resource cleanup)
-- [ ] Tuning knobs: heap size, GC trigger threshold
-- [ ] Perceus-style in-place mutation: when `Arc::strong_count() == 1` on a persistent collection, mutate in place rather than copy — makes "persistent" operations free for linear-use values (see Lean 4 / Koka)
+- [x] Evaluate GC strategies; document decision (non-moving stop-the-world mark-and-sweep chosen)
+- [x] Implement chosen GC: non-moving stop-the-world mark-and-sweep (`GcBox<T>` + intrusive linked list + `GcHeap::collect`)
+- [x] `GcVisitor` trait + real `Trace::trace` on all types in `cljx-value` and `cljx-eval` (Phase 8.1)
+- [x] Replace `Arc<T>` shim in `GcPtr` with `NonNull<GcBox<T>>` raw pointer; `clone` O(1), `drop` no-op (Phase 8.2)
+- [x] `MarkVisitor` with grey stack (handles cycles, avoids recursion stack overflow)
+- [x] `HEAP` global singleton; `GcHeap::count`/`total_allocated`/`total_freed` stats
+- [ ] Automatic collection trigger (threshold-based) — deferred
+- [ ] Safe-point mechanism: yield points in eval loop and compiled code — deferred to Phase 10 (JIT)
+- [ ] Write barriers for generational / incremental GC — deferred
+- [ ] Weak references (for caches, intern tables) — deferred
+- [ ] Finalization hooks (for resource cleanup) — deferred
+- [ ] Perceus-style in-place mutation: when ref count == 1, mutate in place — deferred (optimization)
 
 ---
 

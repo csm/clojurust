@@ -66,7 +66,11 @@ impl PartialEq for PersistentHashSet {
     }
 }
 
-impl cljx_gc::Trace for PersistentHashSet {}
+impl cljx_gc::Trace for PersistentHashSet {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        self.map.trace(visitor);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -18,7 +18,23 @@ enum VNode {
     Internal(Arc<Vec<GcPtr<VNode>>>),
 }
 
-impl cljx_gc::Trace for VNode {}
+impl cljx_gc::Trace for VNode {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        match self {
+            VNode::Leaf(vals) => {
+                for v in vals.iter() {
+                    v.trace(visitor);
+                }
+            }
+            VNode::Internal(children) => {
+                for child in children.iter() {
+                    visitor.visit(child);
+                }
+            }
+        }
+    }
+}
 
 // ── PersistentVector ──────────────────────────────────────────────────────────
 
@@ -373,7 +389,17 @@ impl PartialEq for PersistentVector {
     }
 }
 
-impl cljx_gc::Trace for PersistentVector {}
+impl cljx_gc::Trace for PersistentVector {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        use cljx_gc::GcVisitor as _;
+        if let Some(root) = &self.root {
+            visitor.visit(root);
+        }
+        for v in self.tail.iter() {
+            v.trace(visitor);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
