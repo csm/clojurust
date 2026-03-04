@@ -897,4 +897,55 @@ mod tests {
             bool_v(true)
         );
     }
+
+    // ── Phase 5: if-let / when-let ────────────────────────────────────────
+
+    #[test]
+    fn test_if_let_truthy() {
+        assert_eq!(eval_str("(if-let [x 42] x :nope)").unwrap(), long(42));
+    }
+
+    #[test]
+    fn test_if_let_falsy() {
+        assert_eq!(
+            eval_str("(if-let [x nil] x :nope)").unwrap(),
+            eval_str(":nope").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_when_let_truthy() {
+        assert_eq!(eval_str("(when-let [x 7] (* x 2))").unwrap(), long(14));
+    }
+
+    #[test]
+    fn test_when_let_falsy() {
+        assert_eq!(eval_str("(when-let [x nil] 99)").unwrap(), Value::Nil);
+    }
+
+    // ── Phase 5: math functions ───────────────────────────────────────────
+
+    #[test]
+    fn test_math_trig() {
+        // sin(0) = 0, cos(0) = 1
+        assert_eq!(eval_str("(Math/sin 0)").unwrap(), Value::Double(0.0));
+        assert_eq!(eval_str("(Math/cos 0)").unwrap(), Value::Double(1.0));
+    }
+
+    #[test]
+    fn test_math_constants() {
+        assert!(
+            matches!(eval_str("Math/PI").unwrap(), Value::Double(v) if (v - std::f64::consts::PI).abs() < 1e-10)
+        );
+        assert!(
+            matches!(eval_str("Math/E").unwrap(), Value::Double(v) if (v - std::f64::consts::E).abs() < 1e-10)
+        );
+    }
+
+    #[test]
+    fn test_math_log_exp() {
+        // exp(0) = 1, log(1) = 0
+        assert_eq!(eval_str("(Math/exp 0)").unwrap(), Value::Double(1.0));
+        assert_eq!(eval_str("(Math/log 1)").unwrap(), Value::Double(0.0));
+    }
 }

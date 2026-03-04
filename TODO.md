@@ -88,10 +88,9 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] Lazy sequences: `lazy-seq`, `range`, `repeat`, `iterate`, `cycle`, `repeatedly` (via `Thunk`/`LazySeq` + `Value::Cons`)
 - [x] String functions: `join`, `split`, `trim`, `upper-case`, `lower-case`, `replace`, `starts-with?`, `ends-with?`
 - [x] I/O: `print`, `println`, `prn`, `pr`, `pr-str`, `str`, `read-string`, `slurp`, `spit`
-- [ ] Math: `Math/abs`, `Math/pow`, `Math/sqrt`, `Math/floor`, `Math/ceil`, `Math/round`, trig functions
+- [x] Math: `Math/abs`, `Math/pow`, `Math/sqrt`, `Math/floor`, `Math/ceil`, `Math/round`, `Math/log`, `Math/log10`, `Math/exp`, `Math/sin`, `Math/cos`, `Math/tan`, `Math/asin`, `Math/acos`, `Math/atan`, `Math/atan2`, `Math/sinh`, `Math/cosh`, `Math/tanh`, `Math/hypot`, `Math/PI`, `Math/E`
 - [x] Miscellaneous: `apply`, `comp`, `partial`, `juxt`, `memoize`, `constantly`, `identity`, `not`, `complement`, `gensym`, `type`, `class`, `hash`
-- [x] Core macros: `when`, `when-not`, `if-not`, `cond`, `and`, `or`, `->`, `->>`, `as->`, `doto`, `dotimes`, `doseq`, `for`
-- [ ] `when-let`, `if-let`, `condp`, `case` macros
+- [x] Core macros: `when`, `when-not`, `if-let`, `when-let`, `if-not`, `cond`, `condp`, `case`, `and`, `or`, `->`, `->>`, `as->`, `doto`, `dotimes`, `doseq`, `for`
 - [x] Namespace ops: `in-ns`, `alias`, `refer` (basic); `ns` with `:require`/`:refer-clojure`
 
 ---

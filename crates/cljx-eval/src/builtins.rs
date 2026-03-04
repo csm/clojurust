@@ -227,12 +227,42 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("Math/round", Arity::Fixed(1), builtin_round),
         ("Math/sqrt", Arity::Fixed(1), builtin_sqrt),
         ("Math/pow", Arity::Fixed(2), builtin_pow),
+        ("Math/log", Arity::Fixed(1), builtin_log),
+        ("Math/log10", Arity::Fixed(1), builtin_log10),
+        ("Math/exp", Arity::Fixed(1), builtin_exp),
+        ("Math/sin", Arity::Fixed(1), builtin_sin),
+        ("Math/cos", Arity::Fixed(1), builtin_cos),
+        ("Math/tan", Arity::Fixed(1), builtin_tan),
+        ("Math/asin", Arity::Fixed(1), builtin_asin),
+        ("Math/acos", Arity::Fixed(1), builtin_acos),
+        ("Math/atan", Arity::Fixed(1), builtin_atan),
+        ("Math/atan2", Arity::Fixed(2), builtin_atan2),
+        ("Math/sinh", Arity::Fixed(1), builtin_sinh),
+        ("Math/cosh", Arity::Fixed(1), builtin_cosh),
+        ("Math/tanh", Arity::Fixed(1), builtin_tanh),
+        ("Math/hypot", Arity::Fixed(2), builtin_hypot),
+        ("log10", Arity::Fixed(1), builtin_log10),
+        ("sin", Arity::Fixed(1), builtin_sin),
+        ("cos", Arity::Fixed(1), builtin_cos),
+        ("tan", Arity::Fixed(1), builtin_tan),
+        ("asin", Arity::Fixed(1), builtin_asin),
+        ("acos", Arity::Fixed(1), builtin_acos),
+        ("atan", Arity::Fixed(1), builtin_atan),
+        ("atan2", Arity::Fixed(2), builtin_atan2),
     ];
 
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
         globals.intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(nf)));
     }
+
+    // Math constants.
+    globals.intern(
+        ns,
+        Arc::from("Math/PI"),
+        Value::Double(std::f64::consts::PI),
+    );
+    globals.intern(ns, Arc::from("Math/E"), Value::Double(std::f64::consts::E));
 }
 
 // Bootstrap Clojure source defining higher-order functions.
@@ -345,6 +375,20 @@ pub const BOOTSTRAP_SOURCE: &str = r#"
 
 (defmacro when-not [test & body]
   (list 'if test nil (cons 'do body)))
+
+(defmacro if-let
+  ([bindings then] (list 'if-let bindings then nil))
+  ([bindings then else]
+   (let [form (nth bindings 0)
+         tst  (nth bindings 1)
+         temp (gensym "if_let__")]
+     (list 'let (vector temp tst)
+           (list 'if temp
+                 (list 'let (vector form temp) then)
+                 else)))))
+
+(defmacro when-let [bindings & body]
+  (list 'if-let bindings (cons 'do body)))
 
 (defmacro cond [& clauses]
   (when (seq clauses)
@@ -2574,8 +2618,48 @@ fn builtin_pow(args: &[Value]) -> ValueResult<Value> {
 fn builtin_log(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Double(numeric_as_f64(&args[0])?.ln()))
 }
+fn builtin_log10(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.log10()))
+}
 fn builtin_exp(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Double(numeric_as_f64(&args[0])?.exp()))
+}
+fn builtin_sin(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.sin()))
+}
+fn builtin_cos(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.cos()))
+}
+fn builtin_tan(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.tan()))
+}
+fn builtin_asin(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.asin()))
+}
+fn builtin_acos(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.acos()))
+}
+fn builtin_atan(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.atan()))
+}
+fn builtin_atan2(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(
+        numeric_as_f64(&args[0])?.atan2(numeric_as_f64(&args[1])?),
+    ))
+}
+fn builtin_sinh(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.sinh()))
+}
+fn builtin_cosh(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.cosh()))
+}
+fn builtin_tanh(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(&args[0])?.tanh()))
+}
+fn builtin_hypot(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Double(
+        numeric_as_f64(&args[0])?.hypot(numeric_as_f64(&args[1])?),
+    ))
 }
 
 fn builtin_rand(args: &[Value]) -> ValueResult<Value> {
