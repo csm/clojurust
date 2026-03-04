@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
-  types.rs                       — Var, Atom, Namespace (with interns/refers/aliases), NativeFn, CljxFn, Thunk, LazySeq, CljxCons
+  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn
   value.rs                       — Value enum, MapValue, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -76,6 +76,10 @@ pub enum Value {
     Namespace(GcPtr<Namespace>),
     NativeFn(GcPtr<NativeFn>),
     CljxFn(GcPtr<CljxFn>),
+    // Protocols & Multimethods (Phase 6)
+    Protocol(GcPtr<Protocol>),
+    ProtocolFn(GcPtr<ProtocolFn>),
+    MultiFn(GcPtr<MultiFn>),
 }
 
 pub enum MapValue {
@@ -181,6 +185,39 @@ pub struct CljxCons {
 `Thunk` implementations live in `cljx-eval` (e.g. `ClosureThunk`) so that
 `cljx-value` stays free of evaluator dependencies while `LazySeq` can still
 call back through the trait object.
+
+### `Protocol` / `ProtocolFn` / `MultiFn` (Phase 6)
+
+```rust
+pub struct Protocol {
+    pub name: Arc<str>,
+    pub ns: Arc<str>,
+    pub methods: Vec<ProtocolMethod>,
+    /// type_tag → { method_name → impl fn }
+    pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+}
+
+pub struct ProtocolMethod {
+    pub name: Arc<str>,
+    pub min_arity: usize,
+    pub variadic: bool,
+}
+
+pub struct ProtocolFn {
+    pub protocol: GcPtr<Protocol>,
+    pub method_name: Arc<str>,
+    pub min_arity: usize,
+    pub variadic: bool,
+}
+
+pub struct MultiFn {
+    pub name: Arc<str>,
+    pub dispatch_fn: Value,
+    pub methods: Mutex<HashMap<String, Value>>,
+    pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    pub default_dispatch: String,  // normally ":default"
+}
+```
 
 ### Dependencies
 

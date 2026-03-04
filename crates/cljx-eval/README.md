@@ -3,7 +3,7 @@
 Tree-walking interpreter for clojurust.  Evaluates `Form` AST nodes produced
 by `cljx-reader` within a namespace-aware lexical environment.
 
-**Phase:** 5 — implemented.
+**Phase:** 5–6 — implemented.
 
 ---
 
@@ -24,7 +24,7 @@ src/
   error.rs        — EvalError enum, EvalResult<T> alias
   env.rs          — Frame, GlobalEnv (namespace registry), Env (lexical scope)
   eval.rs         — top-level eval dispatcher, form_to_value, inline tests
-  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq
+  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, type_tag_of, resolve_type_tag
   special.rs      — all special form handlers, SPECIAL_FORMS list
   macros.rs       — macroexpand_1, macroexpand, value_to_form
   destructure.rs  — sequential + associative destructuring (bind_pattern, bind_sequential, bind_associative)
@@ -100,6 +100,11 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `in-ns` | Switch to (or create) a namespace by quoted symbol |
 | `alias` | Add a namespace alias to the current namespace |
 | `.` | Stub — interop not yet implemented |
+| `defprotocol` | Define a protocol with named method signatures |
+| `extend-type` | Implement protocol methods for a type |
+| `extend-protocol` | Protocol-first sugar for `extend-type` |
+| `defmulti` | Define a multimethod with a dispatch function |
+| `defmethod` | Add an implementation for one dispatch value |
 
 ---
 
@@ -132,6 +137,10 @@ All built-ins have signature `fn(&[Value]) -> ValueResult<Value>`.
 
 **Misc:** `gensym` `type` `hash` `name` `namespace` `ex-info` `ex-data`
 `ex-message` `ex-cause`
+
+**Protocols:** `satisfies?` `extends?`
+
+**Multimethods:** `prefer-method` `remove-method` `methods` `isa?`
 
 ---
 

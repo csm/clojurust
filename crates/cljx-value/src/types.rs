@@ -11,6 +11,86 @@ use cljx_reader::Form;
 
 use crate::Value;
 
+// ── Protocol ──────────────────────────────────────────────────────────────────
+
+/// Inner map type for protocol implementations: method_name → impl fn.
+pub type MethodMap = HashMap<Arc<str>, Value>;
+
+/// A Clojure protocol — an interface-like construct with named methods.
+#[derive(Debug)]
+pub struct Protocol {
+    pub name: Arc<str>,
+    pub ns: Arc<str>,
+    pub methods: Vec<ProtocolMethod>,
+    /// type_tag → { method_name → impl fn }
+    pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+}
+
+impl Protocol {
+    pub fn new(name: Arc<str>, ns: Arc<str>, methods: Vec<ProtocolMethod>) -> Self {
+        Self {
+            name,
+            ns,
+            methods,
+            impls: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl cljx_gc::Trace for Protocol {}
+
+/// One method signature declared in a `defprotocol`.
+#[derive(Debug, Clone)]
+pub struct ProtocolMethod {
+    pub name: Arc<str>,
+    pub min_arity: usize,
+    pub variadic: bool,
+}
+
+impl cljx_gc::Trace for ProtocolMethod {}
+
+// ── ProtocolFn ────────────────────────────────────────────────────────────────
+
+/// Callable that dispatches a single protocol method on the type of `args[0]`.
+#[derive(Debug)]
+pub struct ProtocolFn {
+    pub protocol: GcPtr<Protocol>,
+    pub method_name: Arc<str>,
+    pub min_arity: usize,
+    pub variadic: bool,
+}
+
+impl cljx_gc::Trace for ProtocolFn {}
+
+// ── MultiFn ───────────────────────────────────────────────────────────────────
+
+/// A Clojure multimethod — arbitrary dispatch via a user-supplied function.
+#[derive(Debug)]
+pub struct MultiFn {
+    pub name: Arc<str>,
+    pub dispatch_fn: Value,
+    /// pr_str(dispatch-val) → implementation fn
+    pub methods: Mutex<HashMap<String, Value>>,
+    /// recorded preferences (for future derive/hierarchy)
+    pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    /// normally ":default"
+    pub default_dispatch: String,
+}
+
+impl MultiFn {
+    pub fn new(name: Arc<str>, dispatch_fn: Value, default_dispatch: String) -> Self {
+        Self {
+            name,
+            dispatch_fn,
+            methods: Mutex::new(HashMap::new()),
+            prefers: Mutex::new(HashMap::new()),
+            default_dispatch,
+        }
+    }
+}
+
+impl cljx_gc::Trace for MultiFn {}
+
 // ── Var ───────────────────────────────────────────────────────────────────────
 
 /// A Clojure var — a namespace-interned mutable root binding.

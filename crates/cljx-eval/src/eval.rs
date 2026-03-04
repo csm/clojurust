@@ -948,4 +948,160 @@ mod tests {
         assert_eq!(eval_str("(Math/exp 0)").unwrap(), Value::Double(1.0));
         assert_eq!(eval_str("(Math/log 1)").unwrap(), Value::Double(0.0));
     }
+
+    // ── Phase 6: Protocols & Multimethods ─────────────────────────────────
+
+    #[test]
+    fn test_defprotocol() {
+        // Defining a protocol creates a callable ProtocolFn that errors without impl.
+        let result = eval_str(
+            r#"
+            (defprotocol Greet
+              (greet [this]))
+            (greet "hello")
+            "#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("No implementation"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_extend_type() {
+        let result = eval_str(
+            r#"
+            (defprotocol Greet
+              (greet [this]))
+            (extend-type String
+              Greet
+              (greet [this] (str "Hello, " this "!")))
+            (greet "world")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::string("Hello, world!"));
+    }
+
+    #[test]
+    fn test_protocol_dispatch() {
+        let result = eval_str(
+            r#"
+            (defprotocol Describable
+              (describe [this]))
+            (extend-type String
+              Describable
+              (describe [this] (str "string:" this)))
+            (extend-type Long
+              Describable
+              (describe [this] (str "long:" this)))
+            [(describe "hi") (describe 42)]
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(result, Value::Vector(_)));
+        let s = format!("{}", result);
+        assert!(s.contains("string:hi"), "got: {s}");
+        assert!(s.contains("long:42"), "got: {s}");
+    }
+
+    #[test]
+    fn test_extend_protocol() {
+        let result = eval_str(
+            r#"
+            (defprotocol Showable
+              (show [this]))
+            (extend-protocol Showable
+              String
+              (show [this] (str "S:" this))
+              Long
+              (show [this] (str "L:" this)))
+            [(show "x") (show 7)]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains("S:x"), "got: {s}");
+        assert!(s.contains("L:7"), "got: {s}");
+    }
+
+    #[test]
+    fn test_satisfies() {
+        let result = eval_str(
+            r#"
+            (defprotocol Animal
+              (speak [this]))
+            (extend-type String
+              Animal
+              (speak [this] this))
+            [(satisfies? Animal "dog") (satisfies? Animal 42)]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains("true"), "got: {s}");
+        assert!(s.contains("false"), "got: {s}");
+    }
+
+    #[test]
+    fn test_defmulti_defmethod() {
+        // Note: fn param destructuring not yet supported; use explicit map lookups.
+        let result = eval_str(
+            r#"
+            (defmulti area :shape)
+            (defmethod area :circle [m] (* 3 (:r m) (:r m)))
+            (defmethod area :rectangle [m] (* (:w m) (:h m)))
+            [(area {:shape :circle :r 2}) (area {:shape :rectangle :w 3 :h 4})]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        // circle: 3*2*2=12, rectangle: 3*4=12
+        assert!(s.contains("12"), "got: {s}");
+    }
+
+    #[test]
+    fn test_default_dispatch() {
+        let result = eval_str(
+            r#"
+            (defmulti classify :kind)
+            (defmethod classify :default [x] :unknown)
+            (defmethod classify :cat [x] :meow)
+            [(classify {:kind :dog}) (classify {:kind :cat})]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains(":unknown"), "got: {s}");
+        assert!(s.contains(":meow"), "got: {s}");
+    }
+
+    #[test]
+    fn test_prefer_method() {
+        // prefer-method shouldn't error; just records preference
+        let result = eval_str(
+            r#"
+            (defmulti foo identity)
+            (defmethod foo :a [x] 1)
+            (prefer-method foo :a :b)
+            (foo :a)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(1));
+    }
+
+    #[test]
+    fn test_remove_method() {
+        let result = eval_str(
+            r#"
+            (defmulti bar identity)
+            (defmethod bar :x [_] 99)
+            (remove-method bar :x)
+            (bar :x)
+            "#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("No method"), "got: {msg}");
+    }
 }

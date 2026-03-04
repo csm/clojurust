@@ -249,6 +249,13 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("acos", Arity::Fixed(1), builtin_acos),
         ("atan", Arity::Fixed(1), builtin_atan),
         ("atan2", Arity::Fixed(2), builtin_atan2),
+        // Protocols & Multimethods
+        ("satisfies?", Arity::Fixed(2), builtin_satisfies_q),
+        ("extends?", Arity::Fixed(2), builtin_extends_q),
+        ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
+        ("remove-method", Arity::Fixed(2), builtin_remove_method),
+        ("methods", Arity::Fixed(1), builtin_methods),
+        ("isa?", Arity::Fixed(2), builtin_isa_q),
     ];
 
     for (name, arity, func) in fns {
@@ -2167,7 +2174,9 @@ fn builtin_gensym(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_type(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::keyword(Keyword::simple(args[0].type_name())))
+    use crate::apply::type_tag_of;
+    let tag = type_tag_of(&args[0]);
+    Ok(Value::symbol(Symbol::simple(tag.as_ref())))
 }
 
 fn builtin_hash(args: &[Value]) -> ValueResult<Value> {
@@ -2857,4 +2866,103 @@ fn builtin_re_seq_stub(_args: &[Value]) -> ValueResult<Value> {
 }
 fn builtin_re_matches_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
+}
+
+// ── Protocol & Multimethod builtins ───────────────────────────────────────────
+
+fn builtin_satisfies_q(args: &[Value]) -> ValueResult<Value> {
+    use crate::apply::type_tag_of;
+    let proto = match &args[0] {
+        Value::Protocol(p) => p.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "protocol",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let tag = type_tag_of(&args[1]);
+    let impls = proto.get().impls.lock().unwrap();
+    Ok(Value::Bool(impls.contains_key(tag.as_ref())))
+}
+
+fn builtin_extends_q(args: &[Value]) -> ValueResult<Value> {
+    use crate::apply::resolve_type_tag;
+    let proto = match &args[0] {
+        Value::Protocol(p) => p.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "protocol",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let type_tag = match &args[1] {
+        Value::Symbol(s) => resolve_type_tag(s.get().name.as_ref()),
+        Value::Str(s) => resolve_type_tag(s.get().as_str()),
+        Value::Keyword(k) => resolve_type_tag(k.get().name.as_ref()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "symbol or string",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let impls = proto.get().impls.lock().unwrap();
+    Ok(Value::Bool(impls.contains_key(type_tag.as_ref())))
+}
+
+fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
+    let mf = match &args[0] {
+        Value::MultiFn(m) => m.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "multimethod",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let preferred = format!("{}", args[1]);
+    let over = format!("{}", args[2]);
+    let mut prefers = mf.get().prefers.lock().unwrap();
+    prefers.entry(preferred).or_default().push(over);
+    Ok(Value::MultiFn(mf.clone()))
+}
+
+fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
+    let mf = match &args[0] {
+        Value::MultiFn(m) => m.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "multimethod",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let key = format!("{}", args[1]);
+    mf.get().methods.lock().unwrap().remove(&key);
+    Ok(Value::MultiFn(mf.clone()))
+}
+
+fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
+    let mf = match &args[0] {
+        Value::MultiFn(m) => m.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "multimethod",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let methods = mf.get().methods.lock().unwrap();
+    let mut m = cljx_value::MapValue::empty();
+    for (k, v) in methods.iter() {
+        m = m.assoc(Value::string(k.clone()), v.clone());
+    }
+    Ok(Value::Map(m))
+}
+
+fn builtin_isa_q(args: &[Value]) -> ValueResult<Value> {
+    // Stub: equality only; full hierarchy deferred.
+    Ok(Value::Bool(args[0] == args[1]))
 }

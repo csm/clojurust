@@ -9,13 +9,41 @@ use crate::eval::{eval, eval_body, form_to_value, is_special_form};
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
-use cljx_value::{CljxFn, CljxFnArity, Value};
+use cljx_value::{CljxFn, CljxFnArity, MultiFn, Protocol, ProtocolFn, ProtocolMethod, Value};
 
 /// The set of names that trigger special-form dispatch.
 pub const SPECIAL_FORMS: &[&str] = &[
-    "def", "fn*", "fn", "if", "do", "let*", "let", "loop*", "loop", "recur", "quote", "var",
-    "set!", "throw", "try", "defn", "defmacro", "defonce", "and", "or", ".", "ns", "require",
-    "letfn", "in-ns", "alias",
+    "def",
+    "fn*",
+    "fn",
+    "if",
+    "do",
+    "let*",
+    "let",
+    "loop*",
+    "loop",
+    "recur",
+    "quote",
+    "var",
+    "set!",
+    "throw",
+    "try",
+    "defn",
+    "defmacro",
+    "defonce",
+    "and",
+    "or",
+    ".",
+    "ns",
+    "require",
+    "letfn",
+    "in-ns",
+    "alias",
+    "defprotocol",
+    "extend-type",
+    "extend-protocol",
+    "defmulti",
+    "defmethod",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -44,6 +72,11 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "letfn" => eval_letfn(args, env),
         "in-ns" => eval_in_ns(args, env),
         "alias" => eval_alias(args, env),
+        "defprotocol" => eval_defprotocol(args, env),
+        "extend-type" => eval_extend_type(args, env),
+        "extend-protocol" => eval_extend_protocol(args, env),
+        "defmulti" => eval_defmulti(args, env),
+        "defmethod" => eval_defmethod(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -672,6 +705,328 @@ fn extract_ns_name(v: &Value) -> EvalResult<String> {
             other.type_name()
         ))),
     }
+}
+
+// ── defprotocol ───────────────────────────────────────────────────────────────
+
+fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
+    // (defprotocol Name "doc?" (method [this & args] "doc?") ...)
+    let name = require_sym(args, 0, "defprotocol")?;
+    let proto_name: Arc<str> = Arc::from(name);
+
+    // Skip optional docstring.
+    let methods_start = if args.len() > 1 && matches!(args[1].kind, FormKind::Str(_)) {
+        2
+    } else {
+        1
+    };
+
+    let mut methods: Vec<ProtocolMethod> = Vec::new();
+
+    for form in &args[methods_start..] {
+        // Each method spec is (method-name [params...] "doc"?)
+        let parts = match &form.kind {
+            FormKind::List(parts) => parts,
+            _ => continue, // skip unknown forms
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let method_name = match &parts[0].kind {
+            FormKind::Symbol(s) => Arc::from(s.as_str()),
+            _ => continue,
+        };
+        // Find the parameter vector (first vector in parts).
+        let (min_arity, variadic) = if let Some(params_form) =
+            parts.iter().find(|f| matches!(f.kind, FormKind::Vector(_)))
+        {
+            if let FormKind::Vector(param_forms) = &params_form.kind {
+                let variadic = param_forms
+                    .iter()
+                    .any(|p| matches!(&p.kind, FormKind::Symbol(s) if s == "&"));
+                let fixed: usize = param_forms
+                    .iter()
+                    .filter(|p| !matches!(&p.kind, FormKind::Symbol(s) if s == "&"))
+                    .count();
+                (fixed, variadic)
+            } else {
+                (1, false)
+            }
+        } else {
+            (1, false)
+        };
+        methods.push(ProtocolMethod {
+            name: method_name,
+            min_arity,
+            variadic,
+        });
+    }
+
+    let ns: Arc<str> = env.current_ns.clone();
+    let proto = Protocol::new(proto_name.clone(), ns, methods.clone());
+    let proto_ptr = GcPtr::new(proto);
+
+    // Intern the protocol itself.
+    let proto_var = env.globals.intern(
+        &env.current_ns,
+        proto_name.clone(),
+        Value::Protocol(proto_ptr.clone()),
+    );
+
+    // Create and intern a ProtocolFn for each method.
+    for method in &methods {
+        let pf = ProtocolFn {
+            protocol: proto_ptr.clone(),
+            method_name: method.name.clone(),
+            min_arity: method.min_arity,
+            variadic: method.variadic,
+        };
+        env.globals.intern(
+            &env.current_ns,
+            method.name.clone(),
+            Value::ProtocolFn(GcPtr::new(pf)),
+        );
+    }
+
+    Ok(Value::Var(proto_var))
+}
+
+// ── extend-type ───────────────────────────────────────────────────────────────
+
+fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
+    // (extend-type TypeSym Proto1 (m [this] body) ... Proto2 ...)
+    if args.is_empty() {
+        return Err(EvalError::Runtime(
+            "extend-type requires a type symbol".into(),
+        ));
+    }
+    let type_sym = match &args[0].kind {
+        FormKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::Runtime(
+                "extend-type: first arg must be a type symbol".into(),
+            ));
+        }
+    };
+    let type_tag = crate::apply::resolve_type_tag(&type_sym);
+
+    let mut current_proto: Option<GcPtr<cljx_value::Protocol>> = None;
+
+    for form in &args[1..] {
+        match &form.kind {
+            FormKind::Symbol(s) => {
+                // Look up protocol in env.
+                let val = env.globals.lookup_in_ns(&env.current_ns, s);
+                match val {
+                    Some(Value::Protocol(p)) => {
+                        current_proto = Some(p);
+                    }
+                    _ => {
+                        return Err(EvalError::Runtime(format!(
+                            "extend-type: {} is not a protocol",
+                            s
+                        )));
+                    }
+                }
+            }
+            FormKind::List(parts) => {
+                // (method-name [params] body...)
+                let proto = current_proto.as_ref().ok_or_else(|| {
+                    EvalError::Runtime("extend-type: method before protocol name".into())
+                })?;
+                if parts.is_empty() {
+                    continue;
+                }
+                let method_name = match &parts[0].kind {
+                    FormKind::Symbol(s) => Arc::from(s.as_str()),
+                    _ => continue,
+                };
+                let fn_val = build_impl_fn(parts, env)?;
+                let mut impls = proto.get().impls.lock().unwrap();
+                impls
+                    .entry(type_tag.clone())
+                    .or_default()
+                    .insert(method_name, fn_val);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Value::Nil)
+}
+
+// ── extend-protocol ───────────────────────────────────────────────────────────
+
+fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
+    // (extend-protocol Proto Type1 (m [this] body) ... Type2 ...)
+    if args.is_empty() {
+        return Err(EvalError::Runtime(
+            "extend-protocol requires a protocol".into(),
+        ));
+    }
+    let proto_sym = match &args[0].kind {
+        FormKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::Runtime(
+                "extend-protocol: first arg must be a protocol symbol".into(),
+            ));
+        }
+    };
+    let proto_val = env.globals.lookup_in_ns(&env.current_ns, &proto_sym);
+    let proto_ptr = match proto_val {
+        Some(Value::Protocol(p)) => p,
+        _ => {
+            return Err(EvalError::Runtime(format!(
+                "extend-protocol: {} is not a protocol",
+                proto_sym
+            )));
+        }
+    };
+
+    let mut current_type: Option<Arc<str>> = None;
+
+    for form in &args[1..] {
+        match &form.kind {
+            FormKind::Symbol(s) => {
+                current_type = Some(crate::apply::resolve_type_tag(s));
+            }
+            FormKind::List(parts) => {
+                let type_tag = current_type.as_ref().ok_or_else(|| {
+                    EvalError::Runtime("extend-protocol: method before type name".into())
+                })?;
+                if parts.is_empty() {
+                    continue;
+                }
+                let method_name = match &parts[0].kind {
+                    FormKind::Symbol(s) => Arc::from(s.as_str()),
+                    _ => continue,
+                };
+                let fn_val = build_impl_fn(parts, env)?;
+                let mut impls = proto_ptr.get().impls.lock().unwrap();
+                impls
+                    .entry(type_tag.clone())
+                    .or_default()
+                    .insert(method_name, fn_val);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Value::Nil)
+}
+
+/// Build a `CljxFn` from the tail of a method-impl list: `(name [params] body...)`.
+/// `parts[0]` is the method name symbol (ignored here — caller handles it).
+/// `parts[1]` is the params vector.
+/// `parts[2..]` is the body.
+fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
+    if parts.len() < 2 {
+        return Err(EvalError::Runtime(
+            "protocol method impl requires params and body".into(),
+        ));
+    }
+    // parts[1] should be the params vector.
+    let params_form = &parts[1];
+    let body = &parts[2..];
+    let arity = parse_arity(params_form, body)?;
+    let (closed_over_names, closed_over_vals) = env.all_local_bindings();
+    let fn_name = match &parts[0].kind {
+        FormKind::Symbol(s) => Some(Arc::from(s.as_str())),
+        _ => None,
+    };
+    let cljx_fn = CljxFn::new(
+        fn_name,
+        vec![arity],
+        closed_over_names,
+        closed_over_vals,
+        false,
+    );
+    Ok(Value::Fn(GcPtr::new(cljx_fn)))
+}
+
+// ── defmulti ──────────────────────────────────────────────────────────────────
+
+fn eval_defmulti(args: &[Form], env: &mut Env) -> EvalResult {
+    // (defmulti name dispatch-fn-form) or (defmulti name "doc" dispatch-fn :default val)
+    let name = require_sym(args, 0, "defmulti")?;
+    let name_arc: Arc<str> = Arc::from(name);
+
+    let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
+        2
+    } else {
+        1
+    };
+
+    if args.len() <= rest_start {
+        return Err(EvalError::Runtime(
+            "defmulti requires a dispatch function".into(),
+        ));
+    }
+
+    let dispatch_fn = eval(&args[rest_start], env)?;
+
+    // Parse optional :default val.
+    let mut default_dispatch = ":default".to_string();
+    let mut i = rest_start + 1;
+    while i + 1 < args.len() {
+        if let FormKind::Keyword(k) = &args[i].kind
+            && k == "default"
+        {
+            let dv = eval(&args[i + 1], env)?;
+            default_dispatch = format!("{}", dv);
+        }
+        i += 2;
+    }
+
+    let mfn = MultiFn::new(name_arc.clone(), dispatch_fn, default_dispatch);
+    let var = env
+        .globals
+        .intern(&env.current_ns, name_arc, Value::MultiFn(GcPtr::new(mfn)));
+    Ok(Value::Var(var))
+}
+
+// ── defmethod ─────────────────────────────────────────────────────────────────
+
+fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
+    // (defmethod multi-name dispatch-val [params] body...)
+    if args.len() < 3 {
+        return Err(EvalError::Runtime(
+            "defmethod requires name, dispatch-val, params, and body".into(),
+        ));
+    }
+    let multi_name = require_sym(args, 0, "defmethod")?;
+
+    let mf_ptr = match env.globals.lookup_in_ns(&env.current_ns, multi_name) {
+        Some(Value::MultiFn(mf)) => mf,
+        _ => {
+            return Err(EvalError::Runtime(format!(
+                "defmethod: {} is not a multimethod",
+                multi_name
+            )));
+        }
+    };
+
+    let dispatch_val = eval(&args[1], env)?;
+    let key = format!("{}", dispatch_val);
+
+    // Build CljxFn from ([params] body...).
+    let params_form = &args[2];
+    let body = &args[3..];
+    let arity = parse_arity(params_form, body)?;
+    let (closed_over_names, closed_over_vals) = env.all_local_bindings();
+    let fn_name = Some(Arc::from(multi_name));
+    let cljx_fn = CljxFn::new(
+        fn_name,
+        vec![arity],
+        closed_over_names,
+        closed_over_vals,
+        false,
+    );
+    let fn_val = Value::Fn(GcPtr::new(cljx_fn));
+
+    mf_ptr.get().methods.lock().unwrap().insert(key, fn_val);
+
+    Ok(Value::MultiFn(mf_ptr))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

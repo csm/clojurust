@@ -14,7 +14,9 @@ use crate::hash::{
 };
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
-use crate::types::{Atom, CljxCons, CljxFn, LazySeq, Namespace, NativeFn, Var};
+use crate::types::{
+    Atom, CljxCons, CljxFn, LazySeq, MultiFn, Namespace, NativeFn, Protocol, ProtocolFn, Var,
+};
 
 /// The central runtime type: every Clojure value is a `Value`.
 ///
@@ -62,6 +64,11 @@ pub enum Value {
     LazySeq(GcPtr<LazySeq>),
     /// A realized cons cell whose tail may itself be lazy.
     Cons(GcPtr<CljxCons>),
+
+    // ── Protocols & Multimethods ──────────────────────────────────────────────
+    Protocol(GcPtr<Protocol>),
+    ProtocolFn(GcPtr<ProtocolFn>),
+    MultiFn(GcPtr<MultiFn>),
 }
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
@@ -174,6 +181,16 @@ impl PartialEq for Value {
             }
             // Cons cells: compare element by element.
             (Value::Cons(_), _) | (_, Value::Cons(_)) => seq_equal(self, other),
+            // Pointer equality for protocol/multimethod objects.
+            (Value::Protocol(a), Value::Protocol(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::ProtocolFn(a), Value::ProtocolFn(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::MultiFn(a), Value::MultiFn(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
             _ => false,
         }
     }
@@ -312,6 +329,9 @@ impl ClojureHash for Value {
             Value::BigDecimal(d) => hash_string(&d.get().to_string()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
             Value::LazySeq(ls) => ls.get().realize().clojure_hash(),
+            Value::Protocol(p) => p.get() as *const _ as u32,
+            Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
+            Value::MultiFn(mf) => mf.get() as *const _ as u32,
             Value::Cons(_) => {
                 // Hash like an ordered sequence.
                 let mut h: u32 = 1;
@@ -505,6 +525,16 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Var(v) => write!(f, "#'{}/{}", v.get().namespace, v.get().name),
         Value::Atom(a) => write!(f, "#<Atom {}>", a.get().deref()),
         Value::Namespace(n) => write!(f, "#<Namespace {}>", n.get().name),
+        Value::Protocol(p) => write!(f, "#<Protocol {}>", p.get().name),
+        Value::ProtocolFn(pf) => {
+            write!(
+                f,
+                "#<fn {}/{}>",
+                pf.get().protocol.get().name,
+                pf.get().method_name
+            )
+        }
+        Value::MultiFn(mf) => write!(f, "#<MultiFn {}>", mf.get().name),
     }
 }
 
@@ -530,12 +560,17 @@ impl Value {
             Value::Map(_) => "map",
             Value::Set(_) => "set",
             Value::Queue(_) => "queue",
-            Value::NativeFunction(_) | Value::Fn(_) | Value::Macro(_) => "fn",
+            Value::NativeFunction(_)
+            | Value::Fn(_)
+            | Value::Macro(_)
+            | Value::ProtocolFn(_)
+            | Value::MultiFn(_) => "fn",
             Value::Var(_) => "var",
             Value::Atom(_) => "atom",
             Value::Namespace(_) => "namespace",
             Value::LazySeq(_) => "lazyseq",
             Value::Cons(_) => "cons",
+            Value::Protocol(_) => "protocol",
         }
     }
 

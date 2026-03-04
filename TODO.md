@@ -97,12 +97,15 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ## Phase 6 — Protocols & Multimethods
 
-- [ ] `defprotocol` — define named protocol with method signatures
-- [ ] `extend-type` / `extend-protocol` — implement protocols on types
-- [ ] Protocol dispatch (inline cache / vtable)
-- [ ] `defmulti` / `defmethod` — arbitrary dispatch multimethods
-- [ ] `prefer-method`, `remove-method`
-- [ ] Built-in protocols: `ISeq`, `ICollection`, `ICounted`, `IIndexed`, `ILookup`, `IFn`, `IPrintable`, etc.
+- [x] `defprotocol` — define named protocol with method signatures
+- [x] `extend-type` / `extend-protocol` — implement protocols on types
+- [x] Protocol dispatch on first-arg type tag (`type_tag_of`)
+- [x] `defmulti` / `defmethod` — arbitrary dispatch multimethods
+- [x] `prefer-method`, `remove-method`, `methods`, `satisfies?`, `extends?`, `isa?` (equality stub), `type`
+- [ ] Inline protocol dispatch cache — Phase 10 JIT optimization
+- [ ] Built-in protocols (`ISeq`, `ICounted`, etc.) — requires `deftype`/`defrecord` (Phase 7+)
+- [ ] `derive` / full `isa?` hierarchy
+- [ ] `deftype`, `defrecord`, `reify`
 
 ---
 

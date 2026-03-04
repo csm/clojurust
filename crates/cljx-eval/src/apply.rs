@@ -67,6 +67,40 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
     apply_value(&callee, args, env)
 }
 
+/// Return the canonical type tag for a value (used by protocol dispatch).
+pub fn type_tag_of(val: &Value) -> Arc<str> {
+    match val {
+        Value::Nil => Arc::from("nil"),
+        Value::Bool(_) => Arc::from("Boolean"),
+        Value::Long(_) => Arc::from("Long"),
+        Value::Double(_) => Arc::from("Double"),
+        Value::BigInt(_) => Arc::from("BigInt"),
+        Value::BigDecimal(_) => Arc::from("BigDecimal"),
+        Value::Ratio(_) => Arc::from("Ratio"),
+        Value::Char(_) => Arc::from("Character"),
+        Value::Str(_) => Arc::from("String"),
+        Value::Keyword(_) => Arc::from("Keyword"),
+        Value::Symbol(_) => Arc::from("Symbol"),
+        Value::List(_) | Value::Cons(_) | Value::LazySeq(_) => Arc::from("List"),
+        Value::Vector(_) => Arc::from("Vector"),
+        Value::Map(_) => Arc::from("Map"),
+        Value::Set(_) => Arc::from("Set"),
+        Value::Fn(_) | Value::NativeFunction(_) | Value::ProtocolFn(_) | Value::MultiFn(_) => {
+            Arc::from("Fn")
+        }
+        Value::Atom(_) => Arc::from("Atom"),
+        Value::Var(_) => Arc::from("Var"),
+        Value::Protocol(_) => Arc::from("Protocol"),
+        _ => Arc::from("Object"),
+    }
+}
+
+/// Resolve a type symbol from `extend-type` to a canonical tag.
+/// Canonical tags ARE the short names, so this just passes through.
+pub fn resolve_type_tag(sym: &str) -> Arc<str> {
+    Arc::from(sym)
+}
+
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     match callee {
@@ -75,6 +109,48 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             (nf.get().func)(&args).map_err(|e| EvalError::Runtime(e.to_string()))
         }
         Value::Fn(f) => call_cljx_fn(f.get(), args, env),
+        Value::ProtocolFn(pf) => {
+            let pf_ref = pf.get();
+            let dispatch_val = args.first().ok_or_else(|| {
+                EvalError::Runtime(format!(
+                    "{}: requires at least 1 argument",
+                    pf_ref.method_name
+                ))
+            })?;
+            let tag = type_tag_of(dispatch_val);
+            let impls = pf_ref.protocol.get().impls.lock().unwrap();
+            let impl_fn = impls
+                .get(tag.as_ref())
+                .and_then(|m| m.get(pf_ref.method_name.as_ref()))
+                .cloned()
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "No implementation of protocol {} for type {}",
+                        pf_ref.protocol.get().name,
+                        tag
+                    ))
+                })?;
+            drop(impls);
+            apply_value(&impl_fn, args, env)
+        }
+        Value::MultiFn(mf) => {
+            let mf_ref = mf.get();
+            let dispatch_val = apply_value(&mf_ref.dispatch_fn, args.clone(), env)?;
+            let key = format!("{}", dispatch_val);
+            let methods = mf_ref.methods.lock().unwrap();
+            let impl_fn = methods
+                .get(&key)
+                .or_else(|| methods.get(&mf_ref.default_dispatch))
+                .cloned()
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "No method in multimethod '{}' for dispatch value {}",
+                        mf_ref.name, key
+                    ))
+                })?;
+            drop(methods);
+            apply_value(&impl_fn, args, env)
+        }
         Value::Keyword(_kw) => {
             // (kw map) → map.get(kw)
             match args.first() {
