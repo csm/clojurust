@@ -480,8 +480,10 @@ pub const BOOTSTRAP_SOURCE: &str = r#"
                       (cons 'do body))
                 (list 'recur (list 'next '__s__))))))
 
-(defmacro for [[x coll] & body]
-  (list 'map (list 'fn (vector x) (cons 'do body)) coll))
+(defmacro for [binding & body]
+  (let [x (first binding)
+        coll (second binding)]
+    (list 'map (list 'fn (vector x) (cons 'do body)) coll)))
 
 (defmacro with-meta [obj meta-map]
   obj)
@@ -604,9 +606,10 @@ pub const BOOTSTRAP_SOURCE: &str = r#"
 (defn max [& args] (reduce (fn [a b] (if (>= a b) a b)) args))
 (defn min [& args] (reduce (fn [a b] (if (<= a b) a b)) args))
 
-(defmacro assert [test & [msg]]
-  (list 'when (list 'not test)
-        (list 'throw (list 'ex-info (or msg "assertion failed") {}))))
+(defmacro assert [test & args]
+  (let [msg (first args)]
+    (list 'when (list 'not test)
+          (list 'throw (list 'ex-info (or msg "assertion failed") {})))))
 
 (defn frequencies [coll]
   (reduce (fn [m v] (assoc m v (inc (get m v 0)))) {} coll))

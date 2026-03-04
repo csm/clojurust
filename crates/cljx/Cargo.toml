@@ -12,6 +12,7 @@ path = "src/main.rs"
 cljx-types    = { workspace = true }
 cljx-gc       = { workspace = true }
 cljx-reader   = { workspace = true }
+cljx-value    = { workspace = true }
 cljx-eval     = { workspace = true }
 cljx-runtime  = { workspace = true }
 cljx-compiler = { workspace = true }
