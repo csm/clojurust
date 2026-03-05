@@ -402,6 +402,9 @@
 (defn neg-int? [x] (and (integer? x) (neg? x)))
 (defn nat-int? [x] (and (integer? x) (not (neg? x))))
 (defn zero? [x] (= x 0))
+(defn NaN? [x] (and (float? x) (not (= x x))))
+(defn infinite? [x] (and (float? x) (or (= x ##Inf) (= x ##-Inf))))
+(defn finite? [x] (and (float? x) (not (NaN? x)) (not (infinite? x))))
 
 (defn qualified-symbol? [x]
   (and (symbol? x) (not (nil? (namespace x)))))

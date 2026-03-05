@@ -67,6 +67,9 @@ pub fn standard_env_minimal() -> Arc<GlobalEnv> {
     // Re-refer clojure.core after bootstrap defines HOFs.
     globals.refer_all("user", "clojure.core");
 
+    // Mark clojure.core as loaded so (require 'clojure.core) is a no-op.
+    globals.mark_loaded("clojure.core");
+
     // Set *ns* to the "user" namespace (the default REPL namespace).
     {
         let mut env = Env::new(globals.clone(), "user");

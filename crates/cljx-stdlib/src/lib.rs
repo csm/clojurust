@@ -22,6 +22,7 @@ mod string;
 const CLOJURE_TEST_SRC: &str = include_str!("clojure/test.cljrs");
 const CLOJURE_STRING_SRC: &str = include_str!("clojure/string.cljrs");
 const CLOJURE_SET_SRC: &str = include_str!("clojure/set.cljrs");
+const CLOJURE_TEMPLATE_SRC: &str = include_str!("clojure/template.cljrs");
 
 // ── Macro: register a batch of native fns into a namespace ───────────────────
 
@@ -60,6 +61,9 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     // clojure.set ─ same pattern.
     set::register(globals, "clojure.set");
     globals.register_builtin_source("clojure.set", CLOJURE_SET_SRC);
+
+    // clojure.template ─ pure Clojure, no native helpers.
+    globals.register_builtin_source("clojure.template", CLOJURE_TEMPLATE_SRC);
 
     // clojure.test ─ pure Clojure, no native helpers.
     globals.register_builtin_source("clojure.test", CLOJURE_TEST_SRC);

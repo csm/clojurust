@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use num_traits::Signed as _;
+
 use cljx_gc::GcPtr;
 use cljx_value::{
     Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
@@ -115,9 +117,10 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("map-keys", Arity::Fixed(2), builtin_map_keys_stub),
         ("map-vals", Arity::Fixed(2), builtin_map_vals_stub),
         // Atoms
-        ("atom", Arity::Fixed(1), builtin_atom),
+        ("atom", Arity::Variadic { min: 1 }, builtin_atom),
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
         ("reset!", Arity::Fixed(2), builtin_reset_bang),
+        ("get-validator", Arity::Fixed(1), builtin_get_validator),
         // Phase 7 — Concurrency primitives
         ("compare-and-set!", Arity::Fixed(3), builtin_compare_and_set),
         ("volatile!", Arity::Fixed(1), builtin_volatile),
@@ -642,8 +645,11 @@ fn builtin_min(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_abs(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Long(n) => Ok(Value::Long(n.abs())),
+        Value::Long(n) => Ok(Value::Long(n.wrapping_abs())),
         Value::Double(f) => Ok(Value::Double(f.abs())),
+        Value::BigInt(b) => Ok(Value::BigInt(GcPtr::new(b.get().abs()))),
+        Value::BigDecimal(d) => Ok(Value::BigDecimal(GcPtr::new(d.get().abs()))),
+        Value::Ratio(r) => Ok(Value::Ratio(GcPtr::new(r.get().abs()))),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -1627,13 +1633,50 @@ fn builtin_partition(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
-    let keys = value_to_seq(&args[0])?;
-    let vals = value_to_seq(&args[1])?;
+    let mut ks = args[0].clone();
+    let mut vs = args[1].clone();
     let mut m = MapValue::empty();
-    for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+    loop {
+        let Some((k, ks_rest)) = seq_first_rest(&ks)? else { break };
+        let Some((v, vs_rest)) = seq_first_rest(&vs)? else { break };
         m = m.assoc(k, v);
+        ks = ks_rest;
+        vs = vs_rest;
     }
     Ok(Value::Map(m))
+}
+
+/// Step one element from a sequence lazily. Returns `(first, rest)` or `None` if empty.
+fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
+    match v {
+        Value::Nil => Ok(None),
+        Value::LazySeq(ls) => seq_first_rest(&ls.get().realize()),
+        Value::Cons(c) => {
+            let cell = c.get();
+            Ok(Some((cell.head.clone(), cell.tail.clone())))
+        }
+        Value::List(l) => match l.get().first() {
+            None => Ok(None),
+            Some(first) => {
+                let rest = l.get().rest();
+                Ok(Some((first.clone(), Value::List(GcPtr::new((*rest).clone())))))
+            }
+        },
+        Value::Vector(vec) => {
+            let mut iter = vec.get().iter();
+            match iter.next() {
+                None => Ok(None),
+                Some(first) => {
+                    let rest = PersistentVector::from_iter(iter.cloned());
+                    Ok(Some((first.clone(), Value::Vector(GcPtr::new(rest)))))
+                }
+            }
+        }
+        _ => Err(ValueError::WrongType {
+            expected: "seq",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_select_keys(args: &[Value]) -> ValueResult<Value> {
@@ -1675,7 +1718,19 @@ fn builtin_map_vals_stub(_args: &[Value]) -> ValueResult<Value> {
 // ── Atoms ─────────────────────────────────────────────────────────────────────
 
 fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
+    // Actual option parsing (meta/validator) is handled in apply.rs handle_atom_call.
+    // This fallback is only hit by direct Value-level calls (e.g. tests via apply).
     Ok(Value::Atom(GcPtr::new(Atom::new(args[0].clone()))))
+}
+
+fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Atom(a) => Ok(a.get().get_validator().unwrap_or(Value::Nil)),
+        v => Err(ValueError::WrongType {
+            expected: "atom",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
@@ -3031,6 +3086,7 @@ fn builtin_thread_bound_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_meta(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => Ok(vp.get().get_meta().unwrap_or(Value::Nil)),
+        Value::Atom(a) => Ok(a.get().get_meta().unwrap_or(Value::Nil)),
         _ => Ok(Value::Nil),
     }
 }

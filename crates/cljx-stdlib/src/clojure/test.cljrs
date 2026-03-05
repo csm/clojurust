@@ -1,7 +1,8 @@
 ;; clojure.test — minimal compatible implementation for clojurust.
-;; Covers: deftest, is, testing, run-tests, test-var.
+;; Covers: deftest, is, are, testing, run-tests, test-var.
 
-(ns clojure.test)
+(ns clojure.test
+  (:require [clojure.template]))
 
 ;; ── Dynamic state ─────────────────────────────────────────────────────────────
 
@@ -59,16 +60,36 @@
 (defmacro is
   ([form] `(is ~form nil))
   ([form msg]
-   `(try
-      (let [__is-result__ ~form]
-        (if __is-result__
-          (do (report {:type :pass :expected (quote ~form) :actual __is-result__ :message ~msg})
-              true)
-          (do (report {:type :fail :expected (quote ~form) :actual __is-result__ :message ~msg})
-              false)))
-      (catch Exception __is-e__
-        (report {:type :error :expected (quote ~form) :actual __is-e__ :message ~msg})
-        false))))
+   (if (and (seq? form) (= 'thrown? (first form)))
+     ;; (is (thrown? ExClass expr)) — expect an exception.
+     (let [expr (first (rest (rest form)))]
+       `(try
+          ~expr
+          (do (report {:type :fail :expected '~form :actual "no exception thrown" :message ~msg})
+              false)
+          (catch Exception __is-e__
+            (report {:type :pass :expected '~form :actual __is-e__ :message ~msg})
+            true)))
+     ;; Normal boolean assertion.
+     `(try
+        (let [__is-result__ ~form]
+          (if __is-result__
+            (do (report {:type :pass :expected '~form :actual __is-result__ :message ~msg})
+                true)
+            (do (report {:type :fail :expected '~form :actual __is-result__ :message ~msg})
+                false)))
+        (catch Exception __is-e__
+          (report {:type :error :expected '~form :actual __is-e__ :message ~msg})
+          false)))))
+
+;; ── are macro ─────────────────────────────────────────────────────────────────
+
+(defmacro are
+  [argv expr & args]
+  (if (or (and (empty? args) (not (empty? argv)))
+          (and (not (empty? args)) (empty? argv)))
+    `(do)
+    `(clojure.template/do-template ~argv (is ~expr) ~@args)))
 
 ;; ── Context macro ─────────────────────────────────────────────────────────────
 
@@ -101,6 +122,7 @@
 (defn run-tests
   ([] (run-tests *ns*))
   ([ns]
+   (let [ns (if (symbol? ns) (find-ns ns) ns)]
    (binding [*report-counters* {:test 0 :pass 0 :fail 0 :error 0}]
      (report {:type :begin-test-ns :ns ns})
      (let [test-vars (filter (fn [v] (get (meta v) :test))
@@ -114,4 +136,4 @@
               :pass  (:pass *report-counters*)
               :fail  (:fail *report-counters*)
               :error (:error *report-counters*)})
-     *report-counters*)))
+     *report-counters*))))

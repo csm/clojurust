@@ -13,7 +13,7 @@ use cljx_value::{
 use crate::apply::eval_call;
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
-use crate::special::{SPECIAL_FORMS, eval_special};
+use crate::special::{SPECIAL_FORMS, eval_special, select_reader_cond};
 use crate::syntax_quote::syntax_quote;
 
 /// Evaluate a `Form` in the given `Env`.
@@ -119,10 +119,55 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
 
 // ── List / call dispatch ──────────────────────────────────────────────────────
 
+/// Expand reader conditionals in a flat slice of forms.
+///
+/// - Non-splicing `#?(...)`: replaced by the selected branch (or removed if none).
+/// - Splicing `#?@(...)`: selected branch must be a vector/list; its elements
+///   are inlined.  If no branch matches, the splice is removed (empty).
+pub fn expand_reader_conds(forms: &[Form]) -> Vec<Form> {
+    let mut out = Vec::with_capacity(forms.len());
+    for form in forms {
+        match &form.kind {
+            FormKind::ReaderCond { splicing: true, clauses } => {
+                if let Some(selected) = select_reader_cond(clauses) {
+                    match &selected.kind {
+                        FormKind::Vector(elems) | FormKind::List(elems) => {
+                            out.extend_from_slice(elems);
+                        }
+                        // Non-sequence branch: inline it as a single element.
+                        _ => out.push(selected.clone()),
+                    }
+                }
+                // No matching branch → splice nothing (empty).
+            }
+            FormKind::ReaderCond { splicing: false, clauses } => {
+                if let Some(selected) = select_reader_cond(clauses) {
+                    out.push(selected.clone());
+                }
+                // No matching branch → omit.
+            }
+            _ => out.push(form.clone()),
+        }
+    }
+    out
+}
+
 fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
     if forms.is_empty() {
         return Ok(Value::List(GcPtr::new(PersistentList::empty())));
     }
+
+    // Expand reader conditionals (both splicing and non-splicing) before dispatch.
+    let expanded: Vec<Form>;
+    let forms: &[Form] = if forms.iter().any(|f| matches!(f.kind, FormKind::ReaderCond { .. })) {
+        expanded = expand_reader_conds(forms);
+        if expanded.is_empty() {
+            return Ok(Value::List(GcPtr::new(PersistentList::empty())));
+        }
+        &expanded
+    } else {
+        forms
+    };
 
     // Check for special form.
     if let FormKind::Symbol(s) = &forms[0].kind
@@ -234,11 +279,13 @@ pub fn form_to_value(form: &Form) -> Value {
         FormKind::Regex(s) => Value::string(s.clone()),
 
         FormKind::List(forms) => {
-            let items: Vec<Value> = forms.iter().map(form_to_value).collect();
+            let expanded = expand_reader_conds(forms);
+            let items: Vec<Value> = expanded.iter().map(form_to_value).collect();
             Value::List(GcPtr::new(PersistentList::from_iter(items)))
         }
         FormKind::Vector(forms) => {
-            let items: Vec<Value> = forms.iter().map(form_to_value).collect();
+            let expanded = expand_reader_conds(forms);
+            let items: Vec<Value> = expanded.iter().map(form_to_value).collect();
             Value::Vector(GcPtr::new(PersistentVector::from_iter(items)))
         }
         FormKind::Map(forms) => {
@@ -290,7 +337,10 @@ pub fn form_to_value(form: &Form) -> Value {
             Value::List(GcPtr::new(PersistentList::from_iter(items)))
         }
         FormKind::TaggedLiteral(_, inner) => form_to_value(inner),
-        FormKind::ReaderCond { .. } => Value::Nil,
+        FormKind::ReaderCond { splicing: false, clauses } => {
+            select_reader_cond(clauses).map_or(Value::Nil, form_to_value)
+        }
+        FormKind::ReaderCond { splicing: true, .. } => Value::Nil, // splice must be handled by parent
     }
 }
 

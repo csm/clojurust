@@ -1,0 +1,28 @@
+;; clojure.template — minimal compatible implementation for clojurust.
+;; Covers: apply-template, do-template.
+
+(ns clojure.template)
+
+(defn apply-template
+  "Substitute symbols from argv with corresponding values throughout expr."
+  [argv expr values]
+  (let [m (zipmap argv values)]
+    (letfn [(subst [form]
+              (cond
+                (symbol? form)     (get m form form)
+                (vector? form)     (vec (map subst form))
+                (map? form)        (into {} (map (fn [kv]
+                                                   [(subst (first kv))
+                                                    (subst (second kv))])
+                                                 form))
+                (set? form)        (set (map subst form))
+                (sequential? form) (apply list (map subst form))
+                :else              form))]
+      (subst expr))))
+
+(defmacro do-template
+  [argv expr & args]
+  (let [c (count argv)]
+    (cons 'do
+          (map (fn [a] (apply-template argv expr (vec a)))
+               (partition c args)))))

@@ -45,6 +45,14 @@ enum Commands {
         /// The expression to evaluate.
         expr: String,
     },
+    /// Run clojure.test tests for one or more namespaces.
+    Test {
+        /// Namespaces to test (e.g. my.app.core-test).
+        namespaces: Vec<String>,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
+    },
 }
 
 fn main() -> miette::Result<()> {
@@ -84,6 +92,9 @@ fn run(cli: Cli) -> miette::Result<()> {
             if result != Value::Nil {
                 println!("{}", result);
             }
+        }
+        Commands::Test { namespaces, src_paths } => {
+            run_tests_command(namespaces, src_paths)?;
         }
     }
     Ok(())
@@ -134,6 +145,47 @@ fn format_eval_error(e: EvalError) -> miette::Report {
         EvalError::Read(e) => miette::Report::from(e),
         EvalError::Recur(_) => miette::miette!("recur outside of loop/fn"),
     }
+}
+
+// ── Test runner ───────────────────────────────────────────────────────────────
+
+fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette::Result<()> {
+    if namespaces.is_empty() {
+        eprintln!("cljx test: no namespaces specified");
+        std::process::exit(2);
+    }
+
+    let globals = standard_env_with_paths(src_paths);
+    let mut env = Env::new(globals, "user");
+
+    // Ensure clojure.test is loaded.
+    eval_in(&mut env, "(require 'clojure.test)", "<test>")?;
+
+    let mut total_fail = 0i64;
+    for ns in &namespaces {
+        eval_in(&mut env, &format!("(require '{ns})"), "<test>")?;
+        let counters = eval_in(&mut env, &format!("(clojure.test/run-tests '{ns})"), "<test>")?;
+        total_fail += counters_fail_count(&counters);
+    }
+
+    if total_fail > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Sum :fail + :error from a clojure.test counters map.
+fn counters_fail_count(val: &Value) -> i64 {
+    let Value::Map(m) = val else { return 0 };
+    let mut n = 0i64;
+    m.for_each(|k, v| {
+        if let (Value::Keyword(kw), Value::Long(count)) = (k, v)
+            && matches!(kw.get().name.as_ref(), "fail" | "error")
+        {
+            n += count;
+        }
+    });
+    n
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────

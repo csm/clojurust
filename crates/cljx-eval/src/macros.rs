@@ -78,17 +78,46 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
         Value::Double(f) => FormKind::Float(*f),
         Value::Str(s) => FormKind::Str(s.get().clone()),
         Value::Char(c) => FormKind::Char(*c),
+        Value::BigInt(b) => FormKind::BigInt(b.get().to_string()),
+        Value::BigDecimal(d) => FormKind::BigDecimal(d.get().to_string()),
+        Value::Ratio(r) => {
+            FormKind::Ratio(format!("{}/{}", r.get().numer(), r.get().denom()))
+        }
 
         Value::Symbol(s) => FormKind::Symbol(s.get().full_name()),
         Value::Keyword(k) => FormKind::Keyword(k.get().full_name()),
 
         Value::List(l) => {
-            let forms: Vec<Form> = l
-                .get()
-                .iter()
-                .map(|v| value_to_form(v, span.clone()))
-                .collect::<EvalResult<_>>()?;
-            FormKind::List(forms)
+            let items = l.get();
+            // Reconstruct reader special forms that were encoded as lists by form_to_value.
+            let head_sym = items.iter().next().and_then(|v| {
+                if let Value::Symbol(s) = v {
+                    Some(s.get().name.clone())
+                } else {
+                    None
+                }
+            });
+            match (head_sym.as_deref(), items.count()) {
+                (Some("syntax-quote"), 2) => {
+                    let inner = value_to_form(items.iter().nth(1).unwrap(), span.clone())?;
+                    FormKind::SyntaxQuote(Box::new(inner))
+                }
+                (Some("unquote"), 2) => {
+                    let inner = value_to_form(items.iter().nth(1).unwrap(), span.clone())?;
+                    FormKind::Unquote(Box::new(inner))
+                }
+                (Some("unquote-splicing"), 2) => {
+                    let inner = value_to_form(items.iter().nth(1).unwrap(), span.clone())?;
+                    FormKind::UnquoteSplice(Box::new(inner))
+                }
+                _ => {
+                    let forms: Vec<Form> = items
+                        .iter()
+                        .map(|v| value_to_form(v, span.clone()))
+                        .collect::<EvalResult<_>>()?;
+                    FormKind::List(forms)
+                }
+            }
         }
         Value::Vector(v) => {
             let forms: Vec<Form> = v
@@ -125,6 +154,34 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
                 .map(|v| value_to_form(&v, span.clone()))
                 .collect::<EvalResult<_>>()?;
             FormKind::Set(forms)
+        }
+
+        // Lazy sequences and cons cells: materialize into a list form.
+        // This handles macro output like (cons 'do (map ...)).
+        Value::LazySeq(ls) => {
+            return value_to_form(&ls.get().realize(), span);
+        }
+        Value::Cons(c) => {
+            let mut items: Vec<Form> = Vec::new();
+            let mut cur = Value::Cons(c.clone());
+            loop {
+                match cur {
+                    Value::Cons(cell) => {
+                        items.push(value_to_form(&cell.get().head, span.clone())?);
+                        cur = cell.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => cur = ls.get().realize(),
+                    Value::List(l) => {
+                        for v in l.get().iter() {
+                            items.push(value_to_form(v, span.clone())?);
+                        }
+                        break;
+                    }
+                    Value::Nil => break,
+                    _ => break,
+                }
+            }
+            FormKind::List(items)
         }
 
         // Non-data types: wrap in a symbol placeholder (best effort).

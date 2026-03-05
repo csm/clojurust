@@ -159,6 +159,13 @@ impl MapValue {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        // Identity shortcut: same GcPtr → equal without realizing.
+        // Required for infinite lazy seqs: (let [r (range)] (= r r)) must not hang.
+        if let (Value::LazySeq(a), Value::LazySeq(b)) = (self, other) {
+            if GcPtr::ptr_eq(a, b) {
+                return true;
+            }
+        }
         // Realize lazy sequences before comparing.
         if let Value::LazySeq(ls) = self {
             return ls.get().realize() == *other;
@@ -177,6 +184,8 @@ impl PartialEq for Value {
             (Value::Double(a), Value::Double(b)) => a == b, // NaN != NaN
             (Value::Long(a), Value::Double(b)) => b.fract() == 0.0 && b.to_i64() == Some(*a),
             (Value::Double(a), Value::Long(b)) => a.fract() == 0.0 && a.to_i64() == Some(*b),
+            (Value::BigDecimal(a), Value::BigDecimal(b)) => a.get() == b.get(),
+            (Value::Ratio(a), Value::Ratio(b)) => a.get() == b.get(),
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a.get() == b.get(),
             (Value::Symbol(a), Value::Symbol(b)) => a.get() == b.get(),
@@ -193,6 +202,16 @@ impl PartialEq for Value {
             }
             // Cons cells: compare element by element.
             (Value::Cons(_), _) | (_, Value::Cons(_)) => seq_equal(self, other),
+            // Pointer equality for functions.
+            (Value::Fn(a), Value::Fn(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Macro(a), Value::Macro(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
             // Pointer equality for protocol/multimethod objects.
             (Value::Protocol(a), Value::Protocol(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)

@@ -177,12 +177,16 @@ impl cljx_gc::Trace for Var {
 #[derive(Debug)]
 pub struct Atom {
     pub value: Mutex<Value>,
+    pub meta: Mutex<Option<Value>>,
+    pub validator: Mutex<Option<Value>>,
 }
 
 impl Atom {
     pub fn new(v: Value) -> Self {
         Self {
             value: Mutex::new(v),
+            meta: Mutex::new(None),
+            validator: Mutex::new(None),
         }
     }
 
@@ -195,11 +199,33 @@ impl Atom {
         *guard = v.clone();
         v
     }
+
+    pub fn get_meta(&self) -> Option<Value> {
+        self.meta.lock().unwrap().clone()
+    }
+
+    pub fn set_meta(&self, m: Option<Value>) {
+        *self.meta.lock().unwrap() = m;
+    }
+
+    pub fn get_validator(&self) -> Option<Value> {
+        self.validator.lock().unwrap().clone()
+    }
+
+    pub fn set_validator(&self, vf: Option<Value>) {
+        *self.validator.lock().unwrap() = vf;
+    }
 }
 
 impl cljx_gc::Trace for Atom {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
         self.value.lock().unwrap().trace(visitor);
+        if let Some(m) = self.meta.lock().unwrap().as_ref() {
+            m.trace(visitor);
+        }
+        if let Some(vf) = self.validator.lock().unwrap().as_ref() {
+            vf.trace(visitor);
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_value::{
-    AgentFn, AgentMsg, Arity, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
+    AgentFn, AgentMsg, Arity, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
     Symbol, Thunk, Value,
 };
 
@@ -59,6 +59,8 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
     if let Value::NativeFunction(nf) = &callee {
         match nf.get().name.as_ref() {
             "apply" => return handle_apply_call(arg_forms, env),
+            "atom" => return handle_atom_call(arg_forms, env),
+            "reset!" => return handle_reset_bang(arg_forms, env),
             "swap!" => return handle_swap_call(arg_forms, env),
             "make-lazy-seq" => return handle_make_lazy_seq(arg_forms, env),
             "make-delay" => return handle_make_delay(arg_forms, env),
@@ -517,6 +519,116 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 }
 
 /// Handle `(swap! atom f & args)`.
+// ── atom ──────────────────────────────────────────────────────────────────────
+
+fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "atom".into(),
+            expected: "1+".into(),
+            got: 0,
+        });
+    }
+    let initial = eval(&arg_forms[0], env)?;
+
+    // Evaluate and parse keyword options; unknown keys / nil keys are ignored.
+    let options: Vec<Value> = arg_forms[1..]
+        .iter()
+        .map(|f| eval(f, env))
+        .collect::<EvalResult<_>>()?;
+
+    let mut meta_opt: Option<Value> = None;
+    let mut validator_opt: Option<Value> = None;
+    let mut i = 0;
+    while i + 1 < options.len() {
+        match &options[i] {
+            Value::Keyword(k) if k.get().name.as_ref() == "meta" => {
+                meta_opt = Some(options[i + 1].clone());
+                i += 2;
+            }
+            Value::Keyword(k) if k.get().name.as_ref() == "validator" => {
+                let vf = options[i + 1].clone();
+                validator_opt = if vf == Value::Nil { None } else { Some(vf) };
+                i += 2;
+            }
+            _ => {
+                i += 2;
+            }
+        }
+    }
+
+    // Validate :meta must be nil or a map.
+    if let Some(ref m) = meta_opt {
+        if !matches!(m, Value::Nil | Value::Map(_)) {
+            return Err(EvalError::Thrown(Value::string(
+                "Atom metadata must be a map or nil".to_string(),
+            )));
+        }
+    }
+
+    // Check validator on the initial value.
+    if let Some(ref vf) = validator_opt {
+        let result = apply_value(vf, vec![initial.clone()], env)?;
+        if result == Value::Nil || result == Value::Bool(false) {
+            return Err(EvalError::Thrown(Value::string(
+                "Invalid initial value for atom".to_string(),
+            )));
+        }
+    }
+
+    let atom = GcPtr::new(Atom::new(initial));
+    if let Some(m) = meta_opt {
+        atom.get().set_meta(if m == Value::Nil { None } else { Some(m) });
+    }
+    if let Some(vf) = validator_opt {
+        atom.get().set_validator(Some(vf));
+    }
+    Ok(Value::Atom(atom))
+}
+
+// ── reset! ────────────────────────────────────────────────────────────────────
+
+fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "reset!".into(),
+            expected: "2".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let atom_val = eval(&arg_forms[0], env)?;
+    let new_val = eval(&arg_forms[1], env)?;
+
+    let atom = match &atom_val {
+        Value::Atom(a) => a.clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "reset! requires an atom, got {}",
+                v.type_name()
+            )));
+        }
+    };
+
+    validate_atom_value(&atom, &new_val, env)?;
+    atom.get().reset(new_val.clone());
+    Ok(new_val)
+}
+
+/// Call the atom's validator (if any) on `new_val`. Throws if invalid.
+fn validate_atom_value(atom: &GcPtr<Atom>, new_val: &Value, env: &mut Env) -> EvalResult<()> {
+    if let Some(vf) = atom.get().get_validator() {
+        let result = apply_value(&vf, vec![new_val.clone()], env)?;
+        if result == Value::Nil || result == Value::Bool(false) {
+            return Err(EvalError::Thrown(Value::string(
+                "Invalid value for atom".to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ── swap! ─────────────────────────────────────────────────────────────────────
+
 fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let mut evaled: Vec<Value> = arg_forms
         .iter()
@@ -547,6 +659,7 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let mut args = vec![atom.get().deref()];
     args.extend(evaled);
     let new_val = apply_value(&f, args, env)?;
+    validate_atom_value(&atom, &new_val, env)?;
     atom.get().reset(new_val.clone());
     Ok(new_val)
 }

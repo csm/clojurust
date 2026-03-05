@@ -795,7 +795,7 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
 
 /// Resolve a `#?(...)` reader conditional to the selected branch form, or
 /// `None` if no `:rust` or `:default` clause is present.
-fn select_reader_cond(clauses: &[Form]) -> Option<&Form> {
+pub fn select_reader_cond(clauses: &[Form]) -> Option<&Form> {
     let mut default: Option<&Form> = None;
     let mut i = 0;
     while i + 1 < clauses.len() {
