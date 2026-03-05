@@ -578,7 +578,8 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     let atom = GcPtr::new(Atom::new(initial));
     if let Some(m) = meta_opt {
-        atom.get().set_meta(if m == Value::Nil { None } else { Some(m) });
+        atom.get()
+            .set_meta(if m == Value::Nil { None } else { Some(m) });
     }
     if let Some(vf) = validator_opt {
         atom.get().set_validator(Some(vf));
@@ -957,10 +958,12 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
                     .globals
                     .resolve_alias(&env.current_ns, ns.as_ref())
                     .unwrap_or_else(|| ns.clone());
-                return Ok(match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
-                    Some(var_ptr) => Value::Var(var_ptr),
-                    None => Value::Nil,
-                });
+                return Ok(
+                    match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
+                        Some(var_ptr) => Value::Var(var_ptr),
+                        None => Value::Nil,
+                    },
+                );
             }
             sym.name.as_ref().to_string()
         }
@@ -972,8 +975,10 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             )));
         }
     };
-    Ok(match env.globals.lookup_var_in_ns(&env.current_ns, &sym_name) {
-        Some(var_ptr) => Value::Var(var_ptr),
-        None => Value::Nil,
-    })
+    Ok(
+        match env.globals.lookup_var_in_ns(&env.current_ns, &sym_name) {
+            Some(var_ptr) => Value::Var(var_ptr),
+            None => Value::Nil,
+        },
+    )
 }

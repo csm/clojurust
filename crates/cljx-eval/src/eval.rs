@@ -128,7 +128,10 @@ pub fn expand_reader_conds(forms: &[Form]) -> Vec<Form> {
     let mut out = Vec::with_capacity(forms.len());
     for form in forms {
         match &form.kind {
-            FormKind::ReaderCond { splicing: true, clauses } => {
+            FormKind::ReaderCond {
+                splicing: true,
+                clauses,
+            } => {
                 if let Some(selected) = select_reader_cond(clauses) {
                     match &selected.kind {
                         FormKind::Vector(elems) | FormKind::List(elems) => {
@@ -140,7 +143,10 @@ pub fn expand_reader_conds(forms: &[Form]) -> Vec<Form> {
                 }
                 // No matching branch → splice nothing (empty).
             }
-            FormKind::ReaderCond { splicing: false, clauses } => {
+            FormKind::ReaderCond {
+                splicing: false,
+                clauses,
+            } => {
                 if let Some(selected) = select_reader_cond(clauses) {
                     out.push(selected.clone());
                 }
@@ -159,7 +165,10 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
 
     // Expand reader conditionals (both splicing and non-splicing) before dispatch.
     let expanded: Vec<Form>;
-    let forms: &[Form] = if forms.iter().any(|f| matches!(f.kind, FormKind::ReaderCond { .. })) {
+    let forms: &[Form] = if forms
+        .iter()
+        .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
+    {
         expanded = expand_reader_conds(forms);
         if expanded.is_empty() {
             return Ok(Value::List(GcPtr::new(PersistentList::empty())));
@@ -337,9 +346,10 @@ pub fn form_to_value(form: &Form) -> Value {
             Value::List(GcPtr::new(PersistentList::from_iter(items)))
         }
         FormKind::TaggedLiteral(_, inner) => form_to_value(inner),
-        FormKind::ReaderCond { splicing: false, clauses } => {
-            select_reader_cond(clauses).map_or(Value::Nil, form_to_value)
-        }
+        FormKind::ReaderCond {
+            splicing: false,
+            clauses,
+        } => select_reader_cond(clauses).map_or(Value::Nil, form_to_value),
         FormKind::ReaderCond { splicing: true, .. } => Value::Nil, // splice must be handled by parent
     }
 }

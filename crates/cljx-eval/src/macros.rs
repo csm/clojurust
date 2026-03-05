@@ -25,10 +25,7 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
             let (names, vals) = env.all_local_bindings();
             let mut m = cljx_value::MapValue::empty();
             for (name, val) in names.iter().zip(vals.iter()) {
-                m = m.assoc(
-                    Value::symbol(Symbol::simple(name.as_ref())),
-                    val.clone(),
-                );
+                m = m.assoc(Value::symbol(Symbol::simple(name.as_ref())), val.clone());
             }
             Value::Map(m)
         };
@@ -80,9 +77,7 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
         Value::Char(c) => FormKind::Char(*c),
         Value::BigInt(b) => FormKind::BigInt(b.get().to_string()),
         Value::BigDecimal(d) => FormKind::BigDecimal(d.get().to_string()),
-        Value::Ratio(r) => {
-            FormKind::Ratio(format!("{}/{}", r.get().numer(), r.get().denom()))
-        }
+        Value::Ratio(r) => FormKind::Ratio(format!("{}/{}", r.get().numer(), r.get().denom())),
 
         Value::Symbol(s) => FormKind::Symbol(s.get().full_name()),
         Value::Keyword(k) => FormKind::Keyword(k.get().full_name()),

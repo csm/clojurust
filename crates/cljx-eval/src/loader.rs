@@ -11,11 +11,7 @@ use crate::eval;
 /// - Idempotent: if already loaded, skips file evaluation but still applies
 ///   alias/refer in the *current* namespace.
 /// - Cycle detection: returns an error if `spec.ns` is currently being loaded.
-pub fn load_ns(
-    globals: Arc<GlobalEnv>,
-    spec: &RequireSpec,
-    current_ns: &str,
-) -> EvalResult<()> {
+pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) -> EvalResult<()> {
     let ns_name = &spec.ns;
 
     // Skip file loading if already done, but still apply alias/refer.
@@ -39,9 +35,7 @@ pub fn load_ns(
                 (builtin.to_owned(), format!("<builtin:{ns_name}>"))
             } else {
                 find_source_file(&rel_path, &src_paths).ok_or_else(|| {
-                    EvalError::Runtime(format!(
-                        "Could not find namespace {ns_name} on source path"
-                    ))
+                    EvalError::Runtime(format!("Could not find namespace {ns_name} on source path"))
                 })?
             };
 
@@ -54,9 +48,7 @@ pub fn load_ns(
         {
             let mut env = Env::new(globals.clone(), ns_name);
             let mut parser = cljx_reader::Parser::new(src, file_path);
-            let forms = parser
-                .parse_all()
-                .map_err(EvalError::Read)?;
+            let forms = parser.parse_all().map_err(EvalError::Read)?;
             for form in forms {
                 eval::eval(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
             }

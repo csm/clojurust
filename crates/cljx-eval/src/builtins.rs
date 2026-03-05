@@ -1637,8 +1637,12 @@ fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
     let mut vs = args[1].clone();
     let mut m = MapValue::empty();
     loop {
-        let Some((k, ks_rest)) = seq_first_rest(&ks)? else { break };
-        let Some((v, vs_rest)) = seq_first_rest(&vs)? else { break };
+        let Some((k, ks_rest)) = seq_first_rest(&ks)? else {
+            break;
+        };
+        let Some((v, vs_rest)) = seq_first_rest(&vs)? else {
+            break;
+        };
         m = m.assoc(k, v);
         ks = ks_rest;
         vs = vs_rest;
@@ -1659,7 +1663,10 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
             None => Ok(None),
             Some(first) => {
                 let rest = l.get().rest();
-                Ok(Some((first.clone(), Value::List(GcPtr::new((*rest).clone())))))
+                Ok(Some((
+                    first.clone(),
+                    Value::List(GcPtr::new((*rest).clone())),
+                )))
             }
         },
         Value::Vector(vec) => {

@@ -203,9 +203,7 @@ impl PartialEq for Value {
             // Cons cells: compare element by element.
             (Value::Cons(_), _) | (_, Value::Cons(_)) => seq_equal(self, other),
             // Pointer equality for functions.
-            (Value::Fn(a), Value::Fn(b)) => {
-                std::ptr::eq(a.get() as *const _, b.get() as *const _)
-            }
+            (Value::Fn(a), Value::Fn(b)) => std::ptr::eq(a.get() as *const _, b.get() as *const _),
             (Value::Macro(a), Value::Macro(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }

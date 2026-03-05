@@ -834,7 +834,10 @@ fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
                     FormKind::ReaderCond { clauses, .. } => {
                         match select_reader_cond(clauses) {
                             Some(f) => f,
-                            None => { i += 1; continue; } // no matching branch — skip
+                            None => {
+                                i += 1;
+                                continue;
+                            } // no matching branch — skip
                         }
                     }
                     _ => &items[i],

@@ -93,7 +93,10 @@ fn run(cli: Cli) -> miette::Result<()> {
                 println!("{}", result);
             }
         }
-        Commands::Test { namespaces, src_paths } => {
+        Commands::Test {
+            namespaces,
+            src_paths,
+        } => {
             run_tests_command(namespaces, src_paths)?;
         }
     }
@@ -120,9 +123,7 @@ fn run_source(src: &str, filename: &str, src_paths: Vec<PathBuf>) -> miette::Res
 /// Evaluate `src` in an existing `Env`. Returns the last value.
 fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
     let mut parser = cljx_reader::Parser::new(src.to_string(), filename.to_string());
-    let forms = parser
-        .parse_all()
-        .map_err(miette::Report::from)?;
+    let forms = parser.parse_all().map_err(miette::Report::from)?;
 
     let mut result = Value::Nil;
     for form in forms {
@@ -164,7 +165,11 @@ fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette
     let mut total_fail = 0i64;
     for ns in &namespaces {
         eval_in(&mut env, &format!("(require '{ns})"), "<test>")?;
-        let counters = eval_in(&mut env, &format!("(clojure.test/run-tests '{ns})"), "<test>")?;
+        let counters = eval_in(
+            &mut env,
+            &format!("(clojure.test/run-tests '{ns})"),
+            "<test>",
+        )?;
         total_fail += counters_fail_count(&counters);
     }
 
