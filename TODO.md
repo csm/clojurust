@@ -146,6 +146,25 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ---
 
+## Phase 8-ext-2 — Dynamic Variables (`binding`) ✓
+
+- [x] `Var` gains `meta: Mutex<Option<Value>>` field with `get_meta`/`set_meta`
+- [x] `cljx-eval/src/dynamics.rs` — thread-local binding stack (`BINDING_STACK`), RAII `BindingGuard`, `push_frame`/`pop_frame`/`deref_var`/`is_thread_bound`/`set_thread_local`/`capture_current`/`install_frames`/`trace_current`
+- [x] `lookup_in_ns` routes through `dynamics::deref_var` (two sites: interns + refers)
+- [x] `deref_value` for `Value::Var` routes through `dynamics::deref_var`
+- [x] `eval_def` handles `FormKind::Meta` (`^:dynamic`, `^TypeHint`, `^{...}`); stores metadata on var
+- [x] `binding` special form: evaluates to RAII-guarded dynamic frame + body
+- [x] `set!` checks thread-local binding stack before falling back to root `var.bind`
+- [x] Binding conveyance in `future`: `capture_current` + `install_frames` on new thread
+- [x] `with-bindings*` intercepted in `eval_call`; `alter-var-root` and `vary-meta` handled similarly
+- [x] New builtins: `var-get`, `var-set!`, `bound?`, `thread-bound?`, `meta`, `with-meta`
+- [x] Sentinel builtins for `alter-var-root`, `vary-meta`, `with-bindings*` (env-needing, intercepted)
+- [x] Bootstrap dynamic vars: `*ns*`, `*out*`, `*err*`, `*assert*`, `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*`, `*1`–`*3`, `*e`
+- [x] `with-bindings` macro in bootstrap.cljrs
+- [x] 10 new tests (259 total)
+
+---
+
 ## Phase 9 — Rust Interop
 
 - [ ] Define calling conventions: how Clojure code invokes Rust functions
@@ -224,7 +243,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Reader compatibility: verify `.cljc` files with `:rust` conditionals behave correctly alongside `:clj`/`:cljs`
 - [ ] Numeric tower parity with Clojure (promotion, overflow to BigInt, etc.)
 - [ ] `*clojure-version*` / `*cljx-version*` vars
-- [ ] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars
+- [x] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars (defined in Phase 8-ext-2)
 
 ---
 

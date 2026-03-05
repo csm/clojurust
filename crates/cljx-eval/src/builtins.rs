@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cljx_gc::GcPtr;
 use cljx_value::{
     Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value,
-    ValueError, ValueResult, Volatile,
+    Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance,
+    Value, ValueError, ValueResult, Volatile,
 };
 
 use crate::env::GlobalEnv;
@@ -221,7 +221,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("newline", Arity::Fixed(0), builtin_newline),
         ("flush", Arity::Fixed(0), builtin_flush),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
-        ("binding", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("num", Arity::Fixed(1), builtin_num),
         ("bit-and", Arity::Fixed(2), builtin_bit_and),
         ("bit-or", Arity::Fixed(2), builtin_bit_or),
@@ -293,6 +292,48 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("record?", Arity::Fixed(1), builtin_record_q),
         ("instance?", Arity::Fixed(2), builtin_instance_q),
+        // Dynamic variables (Phase 9)
+        ("var-get", Arity::Fixed(1), builtin_var_get),
+        ("var-set!", Arity::Fixed(2), builtin_var_set_bang),
+        (
+            "alter-var-root",
+            Arity::Variadic { min: 2 },
+            builtin_alter_var_root_sentinel,
+        ),
+        ("bound?", Arity::Fixed(1), builtin_bound_q),
+        ("thread-bound?", Arity::Fixed(1), builtin_thread_bound_q),
+        ("meta", Arity::Fixed(1), builtin_meta),
+        ("with-meta", Arity::Fixed(2), builtin_with_meta),
+        (
+            "vary-meta",
+            Arity::Variadic { min: 2 },
+            builtin_vary_meta_sentinel,
+        ),
+        (
+            "with-bindings*",
+            Arity::Variadic { min: 2 },
+            builtin_with_bindings_star_sentinel,
+        ),
+        // Namespace reflection
+        ("namespace?", Arity::Fixed(1), builtin_namespace_q),
+        ("ns-name", Arity::Fixed(1), builtin_ns_name),
+        ("ns-interns", Arity::Fixed(1), builtin_ns_interns),
+        ("ns-publics", Arity::Fixed(1), builtin_ns_interns), // alias: no private yet
+        ("ns-refers", Arity::Fixed(1), builtin_ns_refers),
+        ("ns-map", Arity::Fixed(1), builtin_ns_map),
+        ("find-ns", Arity::Fixed(1), builtin_find_ns_sentinel),
+        ("all-ns", Arity::Fixed(0), builtin_all_ns_sentinel),
+        ("create-ns", Arity::Fixed(1), builtin_create_ns_sentinel),
+        ("ns-aliases", Arity::Fixed(1), builtin_ns_aliases_sentinel),
+        ("remove-ns", Arity::Fixed(1), builtin_remove_ns_sentinel),
+        ("the-ns", Arity::Fixed(1), builtin_find_ns_sentinel), // same behaviour as find-ns for now
+        (
+            "alter-meta!",
+            Arity::Variadic { min: 2 },
+            builtin_alter_meta_bang_sentinel,
+        ),
+        ("ns-resolve", Arity::Fixed(2), builtin_ns_resolve_sentinel),
+        ("resolve", Arity::Fixed(1), builtin_resolve_sentinel),
     ];
 
     for (name, arity, func) in fns {
@@ -311,6 +352,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
 
 // Bootstrap Clojure source defining higher-order functions.
 pub const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.cljrs");
+pub const CLOJURE_TEST_SOURCE: &str = include_str!("clojure_test.cljrs");
 
 // ── Helper: value to sequence vector ─────────────────────────────────────────
 
@@ -2929,4 +2971,244 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
         _ => false,
     };
     Ok(Value::Bool(result))
+}
+
+// ── Dynamic variables (Phase 9) ───────────────────────────────────────────────
+
+/// `(var-get v)` — return the current value of a var (dynamic bindings respected).
+fn builtin_var_get(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => Ok(crate::dynamics::deref_var(vp).unwrap_or(Value::Nil)),
+        v => Err(ValueError::WrongType {
+            expected: "var",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+/// `(var-set! v val)` — set the thread-local binding for `v`; if none, set root.
+fn builtin_var_set_bang(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => {
+            let val = args[1].clone();
+            if !crate::dynamics::set_thread_local(vp, val.clone()) {
+                vp.get().bind(val.clone());
+            }
+            Ok(val)
+        }
+        v => Err(ValueError::WrongType {
+            expected: "var",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+/// Sentinel — `alter-var-root` is intercepted in `eval_call` because it needs env.
+fn builtin_alter_var_root_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "alter-var-root sentinel should not be called directly".to_string(),
+    })
+}
+
+/// `(bound? v)` — true if var has any binding (thread-local or root).
+fn builtin_bound_q(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => Ok(Value::Bool(crate::dynamics::deref_var(vp).is_some())),
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// `(thread-bound? v)` — true if var has a thread-local binding on this thread.
+fn builtin_thread_bound_q(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => Ok(Value::Bool(crate::dynamics::is_thread_bound(vp))),
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// `(meta x)` — return the metadata map of a var, or nil.
+fn builtin_meta(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => Ok(vp.get().get_meta().unwrap_or(Value::Nil)),
+        _ => Ok(Value::Nil),
+    }
+}
+
+/// `(with-meta v m)` — set metadata on a var and return it; non-vars returned as-is.
+fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Var(vp) => {
+            vp.get().set_meta(args[1].clone());
+            Ok(args[0].clone())
+        }
+        _ => Ok(args[0].clone()),
+    }
+}
+
+/// Sentinel — `vary-meta` is intercepted in `eval_call` because it needs env.
+fn builtin_vary_meta_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "vary-meta sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `with-bindings*` is intercepted in `eval_call` (needs env).
+fn builtin_with_bindings_star_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "with-bindings* sentinel should not be called directly".to_string(),
+    })
+}
+
+// ── Namespace reflection ──────────────────────────────────────────────────────
+
+fn ns_from_arg(v: &Value) -> ValueResult<&cljx_gc::GcPtr<Namespace>> {
+    match v {
+        Value::Namespace(ns) => Ok(ns),
+        other => Err(ValueError::WrongType {
+            expected: "namespace",
+            got: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// `(namespace? x)` — true if x is a Namespace value.
+fn builtin_namespace_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::Namespace(_))))
+}
+
+/// `(ns-name ns)` — return the name of a namespace as a Symbol.
+fn builtin_ns_name(args: &[Value]) -> ValueResult<Value> {
+    let ns = ns_from_arg(&args[0])?;
+    let name = ns.get().name.clone();
+    Ok(Value::Symbol(cljx_gc::GcPtr::new(Symbol {
+        namespace: None,
+        name,
+    })))
+}
+
+/// `(ns-interns ns)` — map of unqualified Symbol → Var for all interned vars.
+fn builtin_ns_interns(args: &[Value]) -> ValueResult<Value> {
+    let ns = ns_from_arg(&args[0])?;
+    let interns = ns.get().interns.lock().unwrap();
+    let mut m = MapValue::empty();
+    for (name, var) in interns.iter() {
+        let sym = Value::Symbol(cljx_gc::GcPtr::new(Symbol {
+            namespace: None,
+            name: name.clone(),
+        }));
+        m = m.assoc(sym, Value::Var(var.clone()));
+    }
+    Ok(Value::Map(m))
+}
+
+/// `(ns-refers ns)` — map of Symbol → Var for all referred vars.
+fn builtin_ns_refers(args: &[Value]) -> ValueResult<Value> {
+    let ns = ns_from_arg(&args[0])?;
+    let refers = ns.get().refers.lock().unwrap();
+    let mut m = MapValue::empty();
+    for (name, var) in refers.iter() {
+        let sym = Value::Symbol(cljx_gc::GcPtr::new(Symbol {
+            namespace: None,
+            name: name.clone(),
+        }));
+        m = m.assoc(sym, Value::Var(var.clone()));
+    }
+    Ok(Value::Map(m))
+}
+
+/// `(ns-map ns)` — map of Symbol → Var for all visible names (interns + refers).
+/// Interns take priority over refers on name collision.
+fn builtin_ns_map(args: &[Value]) -> ValueResult<Value> {
+    let ns = ns_from_arg(&args[0])?;
+    let mut m = MapValue::empty();
+    // refers first (lower priority)
+    {
+        let refers = ns.get().refers.lock().unwrap();
+        for (name, var) in refers.iter() {
+            let sym = Value::Symbol(cljx_gc::GcPtr::new(Symbol {
+                namespace: None,
+                name: name.clone(),
+            }));
+            m = m.assoc(sym, Value::Var(var.clone()));
+        }
+    }
+    // interns override
+    {
+        let interns = ns.get().interns.lock().unwrap();
+        for (name, var) in interns.iter() {
+            let sym = Value::Symbol(cljx_gc::GcPtr::new(Symbol {
+                namespace: None,
+                name: name.clone(),
+            }));
+            m = m.assoc(sym, Value::Var(var.clone()));
+        }
+    }
+    Ok(Value::Map(m))
+}
+
+/// Sentinel — `find-ns` / `the-ns` need GlobalEnv; intercepted in `eval_call`.
+fn builtin_find_ns_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "find-ns sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `all-ns` needs GlobalEnv; intercepted in `eval_call`.
+fn builtin_all_ns_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "all-ns sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `create-ns` needs GlobalEnv; intercepted in `eval_call`.
+fn builtin_create_ns_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "create-ns sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `ns-aliases` needs GlobalEnv (to look up target ns); intercepted in `eval_call`.
+fn builtin_ns_aliases_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "ns-aliases sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `remove-ns` needs GlobalEnv; intercepted in `eval_call`.
+fn builtin_remove_ns_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "remove-ns sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `alter-meta!` needs apply_value; intercepted in `eval_call`.
+fn builtin_alter_meta_bang_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "alter-meta! sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `ns-resolve` needs GlobalEnv; intercepted in `eval_call`.
+fn builtin_ns_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "ns-resolve sentinel should not be called directly".to_string(),
+    })
+}
+
+/// Sentinel — `resolve` needs GlobalEnv + current ns; intercepted in `eval_call`.
+fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "resolve sentinel should not be called directly".to_string(),
+    })
 }

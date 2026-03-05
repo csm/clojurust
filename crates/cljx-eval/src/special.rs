@@ -1,5 +1,6 @@
 //! Special form evaluators.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::destructure::bind_pattern;
@@ -11,7 +12,7 @@ use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
 use cljx_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, MapValue, MultiFn, Protocol, ProtocolFn,
+    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
     ProtocolMethod, TypeInstance, Value,
 };
 
@@ -52,6 +53,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "defrecord",
     "reify",
     "load-file",
+    "binding",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -89,6 +91,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "defrecord" => eval_defrecord(args, env),
         "reify" => eval_reify(args, env),
         "load-file" => eval_load_file(args, env),
+        "binding" => eval_binding(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -96,7 +99,10 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
 // ── def ───────────────────────────────────────────────────────────────────────
 
 fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
-    let name = require_sym(args, 0, "def")?;
+    if args.is_empty() {
+        return Err(EvalError::Runtime("def requires a name".into()));
+    }
+    let (name, meta_opt) = extract_def_name(&args[0], env)?;
     let val = if args.len() > 1 {
         eval(&args[1], env)?
     } else {
@@ -104,8 +110,46 @@ fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
     };
     let var = env
         .globals
-        .intern(&env.current_ns, Arc::from(name), val.clone());
+        .intern(&env.current_ns, Arc::from(name.as_str()), val.clone());
+    if let Some(meta_val) = meta_opt {
+        var.get().set_meta(meta_val);
+    }
     Ok(Value::Var(var))
+}
+
+/// Extract the def name and optional metadata from the name form.
+fn extract_def_name(form: &Form, env: &mut Env) -> EvalResult<(String, Option<Value>)> {
+    match &form.kind {
+        FormKind::Symbol(s) => Ok((s.clone(), None)),
+        FormKind::Meta(meta_form, inner) => {
+            let meta_val = compile_meta_form(meta_form, env)?;
+            match &inner.kind {
+                FormKind::Symbol(s) => Ok((s.clone(), Some(meta_val))),
+                _ => Err(EvalError::Runtime("def name must be a symbol".into())),
+            }
+        }
+        _ => Err(EvalError::Runtime("def name must be a symbol".into())),
+    }
+}
+
+/// Expand a metadata shorthand form into a map value.
+fn compile_meta_form(meta: &Form, env: &mut Env) -> EvalResult<Value> {
+    match &meta.kind {
+        FormKind::Keyword(k) => {
+            // ^:dynamic  →  {:dynamic true}
+            let m = MapValue::empty().assoc(Value::keyword(Keyword::parse(k)), Value::Bool(true));
+            Ok(Value::Map(m))
+        }
+        FormKind::Symbol(s) => {
+            // ^TypeHint  →  {:tag "TypeHint"}
+            let m = MapValue::empty().assoc(
+                Value::keyword(Keyword::parse("tag")),
+                Value::string(s.clone()),
+            );
+            Ok(Value::Map(m))
+        }
+        _ => eval(meta, env), // literal map or general expr
+    }
 }
 
 // ── fn* ───────────────────────────────────────────────────────────────────────
@@ -157,7 +201,14 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Capture closed-over locals.
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
 
-    let cljx_fn = CljxFn::new(name, arities, closed_over_names, closed_over_vals, false);
+    let cljx_fn = CljxFn::new(
+        name,
+        arities,
+        closed_over_names,
+        closed_over_vals,
+        false,
+        Arc::clone(&env.current_ns),
+    );
     Ok(Value::Fn(GcPtr::new(cljx_fn)))
 }
 
@@ -371,7 +422,10 @@ fn eval_set_bang(args: &[Form], env: &mut Env) -> EvalResult {
         .globals
         .lookup_var_in_ns(ns, &parsed.name)
         .ok_or_else(|| EvalError::UnboundSymbol(sym))?;
-    var.get().bind(val.clone());
+    // Prefer updating the thread-local binding if one exists.
+    if !crate::dynamics::set_thread_local(&var, val.clone()) {
+        var.get().bind(val.clone());
+    }
     Ok(val)
 }
 
@@ -440,21 +494,20 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
     // Eval body.
     let mut result = eval_body(true_body, env);
 
-    // Handle catch.
-    result = match result {
-        Err(EvalError::Thrown(thrown_val)) => {
-            if let Some(sym) = catch_sym {
-                env.push_frame();
-                env.bind(Arc::from(sym), thrown_val);
-                let r = eval_body(catch_body, env);
-                env.pop_frame();
-                r
-            } else {
-                Err(EvalError::Thrown(thrown_val))
-            }
-        }
-        other => other,
-    };
+    // Handle catch: catches Thrown values and any non-Recur EvalError.
+    let should_catch =
+        matches!(&result, Err(e) if !matches!(e, EvalError::Recur(_))) && catch_sym.is_some();
+    if should_catch {
+        let sym = catch_sym.unwrap();
+        let caught_val = match result.unwrap_err() {
+            EvalError::Thrown(val) => val,
+            other => Value::Str(cljx_gc::GcPtr::new(other.to_string())),
+        };
+        env.push_frame();
+        env.bind(Arc::from(sym), caught_val);
+        result = eval_body(catch_body, env);
+        env.pop_frame();
+    }
 
     // Always run finally.
     if !fin_body.is_empty() {
@@ -548,6 +601,37 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
 
 // ── defmacro ──────────────────────────────────────────────────────────────────
 
+/// Prepend `&form` and `&env` Form symbols to an arity form's parameter vector.
+///
+/// Handles:
+/// - Single-arity vector `[params...]` → `[&form &env params...]`
+/// - Multi-arity clause list `([params...] body...)` → `([&form &env params...] body...)`
+fn prepend_macro_params(form: &Form) -> Form {
+    let span = form.span.clone();
+    match &form.kind {
+        FormKind::Vector(params) => {
+            let mut new_params = vec![
+                Form::new(FormKind::Symbol("&form".to_string()), span.clone()),
+                Form::new(FormKind::Symbol("&env".to_string()), span.clone()),
+            ];
+            new_params.extend_from_slice(params);
+            Form::new(FormKind::Vector(new_params), span)
+        }
+        FormKind::List(forms) => {
+            // Arity clause: ([params...] body...) — prepend to first element (params vector).
+            if let Some(first) = forms.first() {
+                let new_params_form = prepend_macro_params(first);
+                let mut new_forms = vec![new_params_form];
+                new_forms.extend_from_slice(&forms[1..]);
+                Form::new(FormKind::List(new_forms), span)
+            } else {
+                form.clone()
+            }
+        }
+        _ => form.clone(),
+    }
+}
+
 fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
     let name = require_sym(args, 0, "defmacro")?;
     let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
@@ -555,11 +639,14 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
     } else {
         1
     };
+    // Prepend implicit &form and &env params to each arity.
     let mut fn_args = vec![Form::new(
         FormKind::Symbol(name.to_string()),
         args[0].span.clone(),
     )];
-    fn_args.extend_from_slice(&args[rest_start..]);
+    for form in &args[rest_start..] {
+        fn_args.push(prepend_macro_params(form));
+    }
     let fn_val = eval_fn(&fn_args, env)?;
 
     // Convert Fn → Macro by setting is_macro = true.
@@ -620,7 +707,7 @@ fn eval_require(args: &[Form], env: &mut Env) -> EvalResult {
     for arg in args {
         let val = eval(arg, env)?;
         let spec = parse_require_spec_val(val).map_err(EvalError::Runtime)?;
-        load_ns(env.globals.clone(), &spec, &env.current_ns).map_err(EvalError::Runtime)?;
+        load_ns(env.globals.clone(), &spec, &env.current_ns)?;
     }
     Ok(Value::Nil)
 }
@@ -706,6 +793,22 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
     }
 }
 
+/// Resolve a `#?(...)` reader conditional to the selected branch form, or
+/// `None` if no `:rust` or `:default` clause is present.
+fn select_reader_cond(clauses: &[Form]) -> Option<&Form> {
+    let mut default: Option<&Form> = None;
+    let mut i = 0;
+    while i + 1 < clauses.len() {
+        match &clauses[i].kind {
+            FormKind::Keyword(k) if k == "rust" => return Some(&clauses[i + 1]),
+            FormKind::Keyword(k) if k == "default" => default = Some(&clauses[i + 1]),
+            _ => {}
+        }
+        i += 2;
+    }
+    default
+}
+
 /// Parse a `RequireSpec` from a raw `Form` (unevaluated, used in `ns` macro).
 fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
     match &form.kind {
@@ -726,7 +829,17 @@ fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
             let mut refer = RequireRefer::None;
             let mut i = 1;
             while i < items.len() {
-                match &items[i].kind {
+                // Resolve reader conditionals inline (e.g. #?(:cljs :refer-macros :default :refer)).
+                let item = match &items[i].kind {
+                    FormKind::ReaderCond { clauses, .. } => {
+                        match select_reader_cond(clauses) {
+                            Some(f) => f,
+                            None => { i += 1; continue; } // no matching branch — skip
+                        }
+                    }
+                    _ => &items[i],
+                };
+                match &item.kind {
                     FormKind::Keyword(k) if k == "as" => {
                         i += 1;
                         alias = Some(match items.get(i).map(|f| &f.kind) {
@@ -771,6 +884,7 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
     if name != "clojure.core" {
         env.globals.refer_all(name, "clojure.core");
     }
+    sync_star_ns(env);
 
     for clause in &args[1..] {
         if let FormKind::List(items) = &clause.kind {
@@ -779,7 +893,7 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
                     for spec_form in &items[1..] {
                         let spec =
                             parse_require_spec_form(spec_form).map_err(EvalError::Runtime)?;
-                        load_ns(env.globals.clone(), &spec, name).map_err(EvalError::Runtime)?;
+                        load_ns(env.globals.clone(), &spec, name)?;
                     }
                 }
                 // Other clauses (:refer-clojure, :use, :import) — skip for now.
@@ -788,7 +902,8 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
         }
     }
 
-    Ok(Value::Nil)
+    let ns_ptr = env.globals.get_or_create_ns(&env.current_ns);
+    Ok(Value::Namespace(ns_ptr))
 }
 
 // ── load-file ─────────────────────────────────────────────────────────────────
@@ -877,8 +992,11 @@ fn eval_in_ns(args: &[Form], env: &mut Env) -> EvalResult {
     let ns_val = eval(&args[0], env)?;
     let ns_name = extract_ns_name(&ns_val)?;
     env.globals.get_or_create_ns(&ns_name);
+    env.globals.refer_all(&ns_name, "clojure.core");
     env.current_ns = Arc::from(ns_name.as_str());
-    Ok(Value::Nil)
+    sync_star_ns(env);
+    let ns_ptr = env.globals.get_or_create_ns(&env.current_ns);
+    Ok(Value::Namespace(ns_ptr))
 }
 
 // ── alias ─────────────────────────────────────────────────────────────────────
@@ -1151,6 +1269,7 @@ fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
         closed_over_names,
         closed_over_vals,
         false,
+        Arc::clone(&env.current_ns),
     );
     Ok(Value::Fn(GcPtr::new(cljx_fn)))
 }
@@ -1232,6 +1351,7 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
         closed_over_names,
         closed_over_vals,
         false,
+        Arc::clone(&env.current_ns),
     );
     let fn_val = Value::Fn(GcPtr::new(cljx_fn));
 
@@ -1246,11 +1366,15 @@ fn eval_future(args: &[Form], env: &mut Env) -> EvalResult {
     // Capture body forms and env state for the new thread.
     let body_forms = args.to_vec();
     let child_env = env.child();
+    // Binding conveyance: snapshot the current thread's dynamic binding stack.
+    let captured_frames = crate::dynamics::capture_current();
 
     let future_ptr = GcPtr::new(CljxFuture::new());
     let future_clone = future_ptr.clone();
 
     std::thread::spawn(move || {
+        // Install the captured dynamic bindings on the new thread.
+        crate::dynamics::install_frames(captured_frames);
         let mut eval_env = child_env;
         let result = crate::eval::eval_body(&body_forms, &mut eval_env);
         let mut state = future_clone.get().state.lock().unwrap();
@@ -1262,6 +1386,43 @@ fn eval_future(args: &[Form], env: &mut Env) -> EvalResult {
     });
 
     Ok(Value::Future(future_ptr))
+}
+
+// ── binding ───────────────────────────────────────────────────────────────────
+
+fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
+    let pairs = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Vector(v)) => v.clone(),
+        _ => return Err(EvalError::Runtime("binding requires a vector".into())),
+    };
+    if pairs.len() % 2 != 0 {
+        return Err(EvalError::Runtime(
+            "binding vector must have even count".into(),
+        ));
+    }
+
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    for pair in pairs.chunks(2) {
+        let sym_str = match &pair[0].kind {
+            FormKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Runtime("binding targets must be symbols".into())),
+        };
+        let parsed = cljx_value::Symbol::parse(&sym_str);
+        let ns_part = parsed
+            .namespace
+            .as_deref()
+            .unwrap_or(env.current_ns.as_ref());
+        let var_ptr = env
+            .globals
+            .lookup_var_in_ns(ns_part, &parsed.name)
+            .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
+        let val = eval(&pair[1], env)?;
+        frame.insert(crate::dynamics::var_key_of(&var_ptr), val);
+    }
+
+    let _guard = crate::dynamics::push_frame(frame);
+    eval_body(&args[1..], env)
+    // _guard drops here → pop_frame()
 }
 
 // ── defrecord ─────────────────────────────────────────────────────────────────
@@ -1334,7 +1495,14 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
         };
         let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
-        let ctor = CljxFn::new(Some(fn_name.clone()), vec![arity], vec![], vec![], false);
+        let ctor = CljxFn::new(
+            Some(fn_name.clone()),
+            vec![arity],
+            vec![],
+            vec![],
+            false,
+            Arc::clone(&ns),
+        );
         globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
     }
 
@@ -1359,7 +1527,14 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
         };
         let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
-        let ctor = CljxFn::new(Some(fn_name.clone()), vec![arity], vec![], vec![], false);
+        let ctor = CljxFn::new(
+            Some(fn_name.clone()),
+            vec![arity],
+            vec![],
+            vec![],
+            false,
+            Arc::clone(&ns),
+        );
         globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
     }
 
@@ -1440,6 +1615,15 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Update the root binding of `*ns*` in `clojure.core` to the current namespace.
+/// Called whenever `env.current_ns` changes (ns, in-ns, standard_env setup).
+pub fn sync_star_ns(env: &mut Env) {
+    if let Some(star_ns_var) = env.globals.lookup_var("clojure.core", "*ns*") {
+        let ns_ptr = env.globals.get_or_create_ns(&env.current_ns);
+        star_ns_var.get().bind(Value::Namespace(ns_ptr));
+    }
+}
 
 fn require_sym<'a>(args: &'a [Form], idx: usize, form_name: &str) -> EvalResult<&'a str> {
     match args.get(idx).map(|f| &f.kind) {

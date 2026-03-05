@@ -1,0 +1,117 @@
+;; clojure.test — minimal compatible implementation for clojurust.
+;; Covers: deftest, is, testing, run-tests, test-var.
+
+(ns clojure.test)
+
+;; ── Dynamic state ─────────────────────────────────────────────────────────────
+
+(def ^:dynamic *testing-vars* '())
+(def ^:dynamic *testing-contexts* [])
+(def ^:dynamic *report-counters* nil)
+(def ^:dynamic *test-out* nil)
+
+;; ── Reporting ─────────────────────────────────────────────────────────────────
+
+(defmulti report :type)
+
+(defmethod report :default [m]
+  (println "Unknown report type:" (:type m)))
+
+(defmethod report :pass [_m]
+  (when *report-counters*
+    (set! *report-counters* (update *report-counters* :pass inc))))
+
+(defmethod report :fail [m]
+  (println "\nFAIL in" (str (first *testing-vars*)))
+  (doseq [ctx *testing-contexts*]
+    (println "  " ctx))
+  (when (:message m)
+    (println "Message:" (:message m)))
+  (println "expected:" (pr-str (:expected m)))
+  (println "  actual:" (pr-str (:actual m)))
+  (when *report-counters*
+    (set! *report-counters* (update *report-counters* :fail inc))))
+
+(defmethod report :error [m]
+  (println "\nERROR in" (str (first *testing-vars*)))
+  (doseq [ctx *testing-contexts*]
+    (println "  " ctx))
+  (when (:message m)
+    (println "Message:" (:message m)))
+  (println "expected:" (pr-str (:expected m)))
+  (println "  actual:" (str (:actual m)))
+  (when *report-counters*
+    (set! *report-counters* (update *report-counters* :error inc))))
+
+(defmethod report :begin-test-ns [m]
+  (println "\nTesting" (ns-name (:ns m))))
+
+(defmethod report :end-test-ns [_m])
+
+(defmethod report :summary [m]
+  (println "\nRan" (:test m) "tests containing"
+           (+ (:pass m) (:fail m) (:error m)) "assertions.")
+  (println (:fail m) "failures," (:error m) "errors."))
+
+;; ── Assertion macro ───────────────────────────────────────────────────────────
+;; Note: uses __is-result__ / __is-e__ instead of gensym to avoid reader issues.
+
+(defmacro is
+  ([form] `(is ~form nil))
+  ([form msg]
+   `(try
+      (let [__is-result__ ~form]
+        (if __is-result__
+          (do (report {:type :pass :expected (quote ~form) :actual __is-result__ :message ~msg})
+              true)
+          (do (report {:type :fail :expected (quote ~form) :actual __is-result__ :message ~msg})
+              false)))
+      (catch Exception __is-e__
+        (report {:type :error :expected (quote ~form) :actual __is-e__ :message ~msg})
+        false))))
+
+;; ── Context macro ─────────────────────────────────────────────────────────────
+
+(defmacro testing [string & body]
+  `(binding [*testing-contexts* (conj *testing-contexts* ~string)]
+     ~@body))
+
+;; ── Test definition ───────────────────────────────────────────────────────────
+
+(defmacro deftest [name & body]
+  `(do
+     (def ~name (fn [] ~@body))
+     (alter-meta! (var ~name) assoc :test (fn [] ~@body))
+     (var ~name)))
+
+;; ── Test runner ───────────────────────────────────────────────────────────────
+
+(defn test-var [v]
+  (let [test-fn (get (meta v) :test)]
+    (when test-fn
+      (binding [*testing-vars* (conj *testing-vars* v)]
+        (try
+          (test-fn)
+          (catch Exception __tv-e__
+            (report {:type    :error
+                     :expected nil
+                     :actual  __tv-e__
+                     :message nil})))))))
+
+(defn run-tests
+  ([] (run-tests *ns*))
+  ([ns]
+   (binding [*report-counters* {:test 0 :pass 0 :fail 0 :error 0}]
+     (report {:type :begin-test-ns :ns ns})
+     (let [test-vars (filter (fn [v] (get (meta v) :test))
+                             (vals (ns-publics ns)))]
+       (doseq [v test-vars]
+         (set! *report-counters* (update *report-counters* :test inc))
+         (test-var v)))
+     (report {:type :end-test-ns :ns ns})
+     (report {:type  :summary
+              :test  (:test *report-counters*)
+              :pass  (:pass *report-counters*)
+              :fail  (:fail *report-counters*)
+              :error (:error *report-counters*)})
+     *report-counters*)))

@@ -173,10 +173,9 @@ pub fn is_special_form(s: &str) -> bool {
 pub fn deref_value(v: Value) -> EvalResult {
     match v {
         Value::Atom(a) => Ok(a.get().deref()),
-        Value::Var(var) => var
-            .get()
-            .deref()
-            .ok_or_else(|| EvalError::Runtime("unbound var".into())),
+        Value::Var(var) => {
+            crate::dynamics::deref_var(&var).ok_or_else(|| EvalError::Runtime("unbound var".into()))
+        }
         Value::Volatile(vol) => Ok(vol.get().deref()),
         Value::Delay(d) => Ok(d.get().force()),
         Value::Agent(a) => Ok(a.get().get_state()),
@@ -1471,5 +1470,313 @@ mod tests {
         let (_, mut env) = make_env_with_paths(vec![]);
         let result = eval_src(&format!("(load-file \"{}\")", path.display()), &mut env).unwrap();
         assert_eq!(result, Value::Long(3));
+    }
+
+    // ── *ns* and namespace reflection ─────────────────────────────────────────
+
+    #[test]
+    fn test_star_ns_initial() {
+        // After standard_env(), *ns* should be the user namespace.
+        let (_, mut env) = make_env();
+        let v = eval_src("*ns*", &mut env).unwrap();
+        match v {
+            Value::Namespace(ns) => assert_eq!(ns.get().name.as_ref(), "user"),
+            other => panic!("expected Namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_star_ns_after_in_ns() {
+        let (_, mut env) = make_env();
+        eval_src("(in-ns 'myns)", &mut env).unwrap();
+        let v = eval_src("*ns*", &mut env).unwrap();
+        match v {
+            Value::Namespace(ns) => assert_eq!(ns.get().name.as_ref(), "myns"),
+            other => panic!("expected Namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_star_ns_after_ns_form() {
+        let (_, mut env) = make_env();
+        eval_src("(ns mytest.ns)", &mut env).unwrap();
+        let v = eval_src("*ns*", &mut env).unwrap();
+        match v {
+            Value::Namespace(ns) => assert_eq!(ns.get().name.as_ref(), "mytest.ns"),
+            other => panic!("expected Namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ns_name() {
+        let (_, mut env) = make_env();
+        let v = eval_src("(ns-name *ns*)", &mut env).unwrap();
+        match v {
+            Value::Symbol(s) => assert_eq!(s.get().name.as_ref(), "user"),
+            other => panic!("expected Symbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_find_ns() {
+        let (_, mut env) = make_env();
+        // known ns
+        let v = eval_src("(find-ns 'user)", &mut env).unwrap();
+        assert!(matches!(v, Value::Namespace(_)));
+        // unknown ns
+        let v2 = eval_src("(find-ns 'nonexistent)", &mut env).unwrap();
+        assert_eq!(v2, Value::Nil);
+    }
+
+    #[test]
+    fn test_all_ns() {
+        let (_, mut env) = make_env();
+        let v = eval_src("(all-ns)", &mut env).unwrap();
+        // Should be a list containing at least user and clojure.core
+        let names: Vec<String> = match &v {
+            Value::List(l) => l
+                .get()
+                .iter()
+                .filter_map(|ns| match ns {
+                    Value::Namespace(n) => Some(n.get().name.as_ref().to_string()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected list, got {other:?}"),
+        };
+        assert!(names.contains(&"user".to_string()));
+        assert!(names.contains(&"clojure.core".to_string()));
+    }
+
+    #[test]
+    fn test_ns_interns() {
+        let (_, mut env) = make_env();
+        eval_src("(def my-test-var 42)", &mut env).unwrap();
+        let v = eval_src("(ns-interns *ns*)", &mut env).unwrap();
+        let Value::Map(m) = v else {
+            panic!("expected map")
+        };
+        // The map should contain 'my-test-var
+        let sym = Value::Symbol(cljx_gc::GcPtr::new(cljx_value::Symbol {
+            namespace: None,
+            name: Arc::from("my-test-var"),
+        }));
+        assert!(m.get(&sym).is_some());
+    }
+
+    #[test]
+    fn test_create_ns() {
+        let (_, mut env) = make_env();
+        let v = eval_src("(create-ns 'fresh.ns)", &mut env).unwrap();
+        match v {
+            Value::Namespace(ns) => assert_eq!(ns.get().name.as_ref(), "fresh.ns"),
+            other => panic!("expected Namespace, got {other:?}"),
+        }
+        // find-ns should now find it
+        let v2 = eval_src("(find-ns 'fresh.ns)", &mut env).unwrap();
+        assert!(matches!(v2, Value::Namespace(_)));
+    }
+
+    // ── Dynamic variables (Phase 9) ───────────────────────────────────────────
+
+    #[test]
+    fn test_dynamic_var_basic() {
+        let (globals, mut env) = make_env();
+        let result = eval_src("(def ^:dynamic *x* 10) (binding [*x* 42] *x*)", &mut env).unwrap();
+        assert_eq!(result, Value::Long(42));
+        // verify root is still bound
+        let root = globals.lookup_in_ns("user", "*x*");
+        assert_eq!(root, Some(Value::Long(10)));
+    }
+
+    #[test]
+    fn test_dynamic_var_restore() {
+        let (globals, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
+        eval_src("(binding [*x* 42] *x*)", &mut env).unwrap();
+        // After binding block, value restored to root
+        let val = eval_src("*x*", &mut env).unwrap();
+        assert_eq!(val, Value::Long(10));
+    }
+
+    #[test]
+    fn test_dynamic_var_nested() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 1)", &mut env).unwrap();
+        let result = eval_src("(binding [*x* 2] (binding [*x* 3] *x*))", &mut env).unwrap();
+        assert_eq!(result, Value::Long(3));
+        // After both blocks
+        let val = eval_src("*x*", &mut env).unwrap();
+        assert_eq!(val, Value::Long(1));
+    }
+
+    #[test]
+    fn test_dynamic_var_unaffected() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
+        eval_src("(def y 99)", &mut env).unwrap();
+        eval_src("(binding [*x* 42] *x*)", &mut env).unwrap();
+        // non-dynamic var y is unchanged
+        let val = eval_src("y", &mut env).unwrap();
+        assert_eq!(val, Value::Long(99));
+    }
+
+    #[test]
+    fn test_binding_conveyance() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
+        let result = eval_src("(binding [*x* 42] @(future *x*))", &mut env).unwrap();
+        assert_eq!(result, Value::Long(42));
+    }
+
+    #[test]
+    fn test_var_set_in_binding() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
+        // set! inside binding sets thread-local
+        let inside = eval_src("(binding [*x* 1] (set! *x* 2) *x*)", &mut env).unwrap();
+        assert_eq!(inside, Value::Long(2));
+        // root still 10
+        let root = eval_src("*x*", &mut env).unwrap();
+        assert_eq!(root, Value::Long(10));
+    }
+
+    #[test]
+    fn test_with_bindings_star() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
+        let result = eval_src("(with-bindings* {#'*x* 99} (fn [] *x*))", &mut env).unwrap();
+        assert_eq!(result, Value::Long(99));
+    }
+
+    #[test]
+    fn test_meta_on_var() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 1)", &mut env).unwrap();
+        let m = eval_src("(meta #'*x*)", &mut env).unwrap();
+        // meta should be {:dynamic true}
+        if let Value::Map(mv) = &m {
+            let kw = Value::keyword(cljx_value::Keyword::parse("dynamic"));
+            assert_eq!(mv.get(&kw), Some(Value::Bool(true)));
+        } else {
+            panic!("expected map, got {m:?}");
+        }
+    }
+
+    #[test]
+    fn test_bound_pred() {
+        let (_, mut env) = make_env();
+        eval_src("(def ^:dynamic *x* 1)", &mut env).unwrap();
+        let t = eval_src("(bound? #'*x*)", &mut env).unwrap();
+        assert_eq!(t, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_alter_var_root() {
+        let (_, mut env) = make_env();
+        eval_src("(def x 1)", &mut env).unwrap();
+        eval_src("(alter-var-root #'x inc)", &mut env).unwrap();
+        let val = eval_src("x", &mut env).unwrap();
+        assert_eq!(val, Value::Long(2));
+    }
+
+    // ── clojure.test ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_clojure_test_is_pass() {
+        // (is expr) returns true on a passing assertion.
+        let (_, mut env) = make_env();
+        eval_src(
+            "(require '[clojure.test :refer [is deftest run-tests]])",
+            &mut env,
+        )
+        .unwrap();
+        let v = eval_src("(is (= 1 1))", &mut env).unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_clojure_test_is_fail() {
+        // (is expr) returns false on a failing assertion.
+        let (_, mut env) = make_env();
+        eval_src("(require '[clojure.test :refer [is]])", &mut env).unwrap();
+        let v = eval_src("(is (= 1 2))", &mut env).unwrap();
+        assert_eq!(v, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_clojure_test_is_catch_error() {
+        // (is expr) catches runtime errors and returns false.
+        let (_, mut env) = make_env();
+        eval_src("(require '[clojure.test :refer [is]])", &mut env).unwrap();
+        let v = eval_src("(is (/ 1 0))", &mut env).unwrap();
+        assert_eq!(v, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_clojure_test_deftest_and_run() {
+        // deftest + run-tests smoke test: counters reflect pass/fail.
+        let (_, mut env) = make_env();
+        eval_src(
+            "(require '[clojure.test :refer [deftest is run-tests]])",
+            &mut env,
+        )
+        .unwrap();
+        eval_src("(deftest my-passing-test (is (= 1 1)))", &mut env).unwrap();
+        eval_src("(deftest my-failing-test (is (= 1 2)))", &mut env).unwrap();
+        let counters = eval_src("(run-tests)", &mut env).unwrap();
+        // Should have run 2 tests, 1 pass, 1 fail.
+        if let Value::Map(m) = counters {
+            let get = |k: &str| {
+                m.get(&Value::keyword(cljx_value::Keyword {
+                    namespace: None,
+                    name: Arc::from(k),
+                }))
+            };
+            assert_eq!(get("test"), Some(Value::Long(2)));
+            assert_eq!(get("pass"), Some(Value::Long(1)));
+            assert_eq!(get("fail"), Some(Value::Long(1)));
+            assert_eq!(get("error"), Some(Value::Long(0)));
+        } else {
+            panic!("expected map from run-tests, got {counters:?}");
+        }
+    }
+
+    #[test]
+    fn test_alter_meta_bang() {
+        // alter-meta! applies fn to var's meta and stores result.
+        let (_, mut env) = make_env();
+        eval_src("(def myvar 42)", &mut env).unwrap();
+        eval_src("(alter-meta! #'myvar assoc :foo :bar)", &mut env).unwrap();
+        let m = eval_src("(meta #'myvar)", &mut env).unwrap();
+        if let Value::Map(map) = m {
+            let foo_key = Value::keyword(cljx_value::Keyword {
+                namespace: None,
+                name: Arc::from("foo"),
+            });
+            assert!(map.get(&foo_key).is_some());
+        } else {
+            panic!("expected map, got {m:?}");
+        }
+    }
+
+    #[test]
+    fn test_catch_runtime_error() {
+        // (try (/ 1 0) (catch Exception e "caught")) => "caught"
+        let (_, mut env) = make_env();
+        let v = eval_src(r#"(try (/ 1 0) (catch Exception e "caught"))"#, &mut env).unwrap();
+        assert_eq!(v, Value::string("caught".to_string()));
+    }
+
+    #[test]
+    fn test_ns_resolve() {
+        let (_, mut env) = make_env();
+        eval_src("(def somevar 99)", &mut env).unwrap();
+        // ns-resolve with current ns returns the var.
+        let v = eval_src("(ns-resolve *ns* 'somevar)", &mut env).unwrap();
+        assert!(matches!(v, Value::Var(_)));
+        // ns-resolve for non-existent symbol returns nil.
+        let v2 = eval_src("(ns-resolve *ns* 'nonexistent)", &mut env).unwrap();
+        assert_eq!(v2, Value::Nil);
     }
 }

@@ -279,8 +279,7 @@
 (defn associative? [x] (or (map? x) (vector? x)))
 (defn sorted? [_] false)
 
-(defn meta [_] nil)
-(defn vary-meta [obj f & args] obj)
+;; meta and vary-meta are native builtins (see builtins.rs)
 
 (defn seqable? [x]
   (or (nil? x) (seq? x) (vector? x) (map? x) (set? x) (string? x)))
@@ -394,6 +393,8 @@
           (swap! cache assoc args result)
           result)))))
 
+(defn some? [x] (not (nil? x)))
+(defn any? [x] true)
 (defn str? [x] (string? x))
 (defn int? [x] (integer? x))
 (defn double? [x] (float? x))
@@ -461,3 +462,21 @@
   Vector  (-seq [c] (seq c))
   Map     (-seq [c] (seq c))
   Set     (-seq [c] (seq c)))
+
+;; ── Dynamic variables ──────────────────────────────────────────────────────
+
+(def ^:dynamic *ns* nil)
+(def ^:dynamic *out* nil)
+(def ^:dynamic *err* nil)
+(def ^:dynamic *assert* true)
+(def ^:dynamic *print-dup* false)
+(def ^:dynamic *print-readably* true)
+(def ^:dynamic *print-length* nil)
+(def ^:dynamic *print-level* nil)
+(def ^:dynamic *1 nil)
+(def ^:dynamic *2 nil)
+(def ^:dynamic *3 nil)
+(def ^:dynamic *e nil)
+
+(defmacro with-bindings [binding-map & body]
+  `(with-bindings* ~binding-map (fn [] ~@body)))

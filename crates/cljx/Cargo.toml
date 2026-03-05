@@ -14,6 +14,7 @@ cljx-gc       = { workspace = true }
 cljx-reader   = { workspace = true }
 cljx-value    = { workspace = true }
 cljx-eval     = { workspace = true }
+cljx-stdlib   = { workspace = true }
 cljx-runtime  = { workspace = true }
 cljx-compiler = { workspace = true }
 cljx-interop  = { workspace = true }

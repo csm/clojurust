@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::env::{Env, GlobalEnv, RequireRefer, RequireSpec};
-use crate::error::EvalError;
+use crate::error::{EvalError, EvalResult};
 use crate::eval;
 
 /// Find, load, and wire up the source file for `spec.ns`.
@@ -15,7 +15,7 @@ pub fn load_ns(
     globals: Arc<GlobalEnv>,
     spec: &RequireSpec,
     current_ns: &str,
-) -> Result<(), String> {
+) -> EvalResult<()> {
     let ns_name = &spec.ns;
 
     // Skip file loading if already done, but still apply alias/refer.
@@ -25,16 +25,25 @@ pub fn load_ns(
         {
             let mut loading = globals.loading.lock().unwrap();
             if loading.contains(ns_name.as_ref()) {
-                return Err(format!("circular require: {ns_name}"));
+                return Err(EvalError::Runtime(format!("circular require: {ns_name}")));
             }
             loading.insert(ns_name.clone());
         }
 
-        // Resolve namespace name to a file path.
-        let rel_path = ns_name.replace('.', "/");
+        // Resolve namespace name: check built-in registry first, then disk.
+        // Clojure convention: dots → path separators, hyphens → underscores.
+        let rel_path = ns_name.replace('.', "/").replace('-', "_");
         let src_paths = globals.source_paths.read().unwrap().clone();
-        let (src, file_path) = find_source_file(&rel_path, &src_paths)
-            .ok_or_else(|| format!("Could not find namespace {ns_name} on source path"))?;
+        let (src, file_path): (String, String) =
+            if let Some(builtin) = globals.builtin_source(ns_name) {
+                (builtin.to_owned(), format!("<builtin:{ns_name}>"))
+            } else {
+                find_source_file(&rel_path, &src_paths).ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "Could not find namespace {ns_name} on source path"
+                    ))
+                })?
+            };
 
         // Pre-refer clojure.core so code in the file can use core fns before (ns ...).
         if ns_name.as_ref() != "clojure.core" {
@@ -47,10 +56,9 @@ pub fn load_ns(
             let mut parser = cljx_reader::Parser::new(src, file_path);
             let forms = parser
                 .parse_all()
-                .map_err(|e| format!("load error parsing {ns_name}: {e}"))?;
+                .map_err(EvalError::Read)?;
             for form in forms {
-                eval::eval(&form, &mut env)
-                    .map_err(|e| format!("load error in {ns_name}: {}", eval_err_msg(e)))?;
+                eval::eval(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
             }
         }
 
@@ -87,20 +95,16 @@ fn find_source_file(rel: &str, src_paths: &[std::path::PathBuf]) -> Option<(Stri
     None
 }
 
-fn eval_err_msg(e: EvalError) -> String {
+/// Wrap an EvalError with namespace context.  Read errors (which carry
+/// file/line/col in CljxError) are passed through unchanged so the CLI can
+/// render them with full location information.
+fn annotate(e: EvalError, ns_name: &Arc<str>) -> EvalError {
     match e {
-        EvalError::Runtime(s) => s,
-        EvalError::UnboundSymbol(s) => format!("unbound symbol: {s}"),
-        EvalError::Thrown(v) => format!("exception: {v}"),
-        EvalError::Arity {
-            name,
-            expected,
-            got,
-        } => {
-            format!("arity error in {name}: expected {expected} got {got}")
-        }
-        EvalError::NotCallable(s) => format!("not callable: {s}"),
-        EvalError::Read(e) => format!("read error: {e}"),
-        EvalError::Recur(_) => "unexpected recur".to_string(),
+        // Preserve read errors — they carry source location.
+        EvalError::Read(_) => e,
+        // Propagate recur unchanged (internal signal).
+        EvalError::Recur(_) => e,
+        // Annotate everything else with the namespace being loaded.
+        other => EvalError::Runtime(format!("in {ns_name}: {other}")),
     }
 }

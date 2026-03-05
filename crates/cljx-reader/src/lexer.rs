@@ -579,6 +579,39 @@ impl Lexer {
             }
         }
 
+        // Hex literal: 0x / 0X  (also -0x…)
+        if int_part == "0" && matches!(self.peek(), Some('x') | Some('X')) {
+            self.advance(); // consume 'x'/'X'
+            let mut hex = String::new();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_hexdigit() {
+                    hex.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            if hex.is_empty() {
+                let span = self.span_from(start_pos, start_line, start_col);
+                return Err(self.make_error("expected hex digits after 0x", span));
+            }
+            let value = u128::from_str_radix(&hex, 16).unwrap_or(u128::MAX);
+            let span = self.span_from(start_pos, start_line, start_col);
+            return if negative {
+                // -0x8000000000000000 == i64::MIN is valid; anything larger overflows.
+                if value <= (i64::MAX as u128) + 1 {
+                    Ok((Token::Int(0i64.wrapping_sub(value as i64)), span))
+                } else {
+                    // Store as signed decimal string for BigInt.
+                    Ok((Token::BigInt(format!("-{value}")), span))
+                }
+            } else if value <= i64::MAX as u128 {
+                Ok((Token::Int(value as i64), span))
+            } else {
+                Ok((Token::BigInt(value.to_string()), span))
+            };
+        }
+
         // Radix literal: NNrDIGITS
         if matches!(self.peek(), Some('r') | Some('R')) {
             let radix: u32 = int_part.parse().unwrap_or(0);
@@ -896,6 +929,21 @@ mod tests {
     fn test_bigint_suffix() {
         assert_eq!(lex_one("42N"), Token::BigInt("42".to_string()));
         assert_eq!(lex_one("-42N"), Token::BigInt("-42".to_string()));
+    }
+
+    #[test]
+    fn test_hex_literal() {
+        assert_eq!(lex_one("0xff"), Token::Int(255));
+        assert_eq!(lex_one("0xFF"), Token::Int(255));
+        assert_eq!(lex_one("0x0"), Token::Int(0));
+        assert_eq!(lex_one("0x7FFFFFFFFFFFFFFF"), Token::Int(i64::MAX));
+        assert_eq!(lex_one("-0x8000000000000000"), Token::Int(i64::MIN));
+        assert_eq!(lex_one("-0xff"), Token::Int(-255));
+        // Overflow → BigInt
+        match lex_one("0xFFFFFFFFFFFFFFFF") {
+            Token::BigInt(_) => {}
+            other => panic!("expected BigInt for 0xFFFF…, got {other:?}"),
+        }
     }
 
     #[test]

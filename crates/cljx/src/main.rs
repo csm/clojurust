@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
 
-use cljx_eval::{Env, EvalError, eval, standard_env, standard_env_with_paths};
+use cljx_eval::{Env, EvalError, eval};
+use cljx_stdlib::{standard_env, standard_env_with_paths};
 use cljx_value::Value;
 
 /// clojurust — a Rust-hosted dialect of the Clojure programming language.
@@ -110,7 +111,7 @@ fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
     let mut parser = cljx_reader::Parser::new(src.to_string(), filename.to_string());
     let forms = parser
         .parse_all()
-        .map_err(|e| miette::miette!("Read error: {e}"))?;
+        .map_err(miette::Report::from)?;
 
     let mut result = Value::Nil;
     for form in forms {
@@ -120,7 +121,7 @@ fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
 }
 
 fn format_eval_error(e: EvalError) -> miette::Report {
-    match &e {
+    match e {
         EvalError::Thrown(val) => miette::miette!("Unhandled exception: {}", val),
         EvalError::UnboundSymbol(s) => miette::miette!("Unable to resolve symbol: {}", s),
         EvalError::Arity {
@@ -130,7 +131,7 @@ fn format_eval_error(e: EvalError) -> miette::Report {
         } => miette::miette!("Wrong number of args ({got}) passed to {name}; expected {expected}"),
         EvalError::NotCallable(s) => miette::miette!("Not a function: {}", s),
         EvalError::Runtime(msg) => miette::miette!("{}", msg),
-        EvalError::Read(e) => miette::miette!("Read error: {e}"),
+        EvalError::Read(e) => miette::Report::from(e),
         EvalError::Recur(_) => miette::miette!("recur outside of loop/fn"),
     }
 }

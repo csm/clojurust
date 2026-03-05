@@ -15,6 +15,7 @@
 pub mod apply;
 pub mod builtins;
 pub mod destructure;
+pub mod dynamics;
 pub mod env;
 pub mod error;
 pub mod eval;
@@ -30,10 +31,13 @@ pub use loader::load_ns;
 
 use std::sync::Arc;
 
-/// Create a `GlobalEnv` pre-populated with `clojure.core` built-ins and
-/// the bootstrap HOF Clojure source, then set up a `user` namespace that
-/// refers everything from `clojure.core`.
-pub fn standard_env() -> Arc<GlobalEnv> {
+/// Create a minimal `GlobalEnv` with `clojure.core` builtins and bootstrap
+/// HOFs, but without any stdlib namespaces pre-loaded.
+///
+/// Used by `cljx-stdlib` as a foundation; also useful for lightweight tests
+/// that don't need stdlib.  Call [`standard_env`] for a batteries-included
+/// environment suitable for eval-crate tests.
+pub fn standard_env_minimal() -> Arc<GlobalEnv> {
     let globals = GlobalEnv::new();
 
     // Register all native builtins in clojure.core.
@@ -52,7 +56,6 @@ pub fn standard_env() -> Arc<GlobalEnv> {
             Ok(forms) => {
                 for form in forms {
                     if let Err(e) = eval::eval(&form, &mut env) {
-                        // Non-fatal: log and continue.
                         eprintln!("[bootstrap warning] {}: {:?}", form.span.start, e);
                     }
                 }
@@ -63,6 +66,48 @@ pub fn standard_env() -> Arc<GlobalEnv> {
 
     // Re-refer clojure.core after bootstrap defines HOFs.
     globals.refer_all("user", "clojure.core");
+
+    // Set *ns* to the "user" namespace (the default REPL namespace).
+    {
+        let mut env = Env::new(globals.clone(), "user");
+        special::sync_star_ns(&mut env);
+    }
+
+    globals
+}
+
+/// Create a `GlobalEnv` pre-populated with `clojure.core` built-ins,
+/// bootstrap HOFs, and `clojure.test` (eagerly loaded so eval-crate tests
+/// can use `(require '[clojure.test ...])` without a source path).
+///
+/// For the `cljx` binary, prefer `cljx_stdlib::standard_env()` which loads
+/// `clojure.test` and other stdlib namespaces lazily via the registry.
+pub fn standard_env() -> Arc<GlobalEnv> {
+    let globals = standard_env_minimal();
+
+    // Eagerly load clojure.test so eval-crate tests can `require` it.
+    {
+        let mut env = Env::new(globals.clone(), "clojure.core");
+        let src = builtins::CLOJURE_TEST_SOURCE;
+        let mut parser = cljx_reader::Parser::new(src.to_string(), "<clojure.test>".to_string());
+        match parser.parse_all() {
+            Ok(forms) => {
+                for form in forms {
+                    if let Err(e) = eval::eval(&form, &mut env) {
+                        eprintln!("[clojure.test warning] {}: {:?}", form.span.start, e);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[clojure.test parse error] {:?}", e),
+        }
+        globals.mark_loaded("clojure.test");
+    }
+
+    // Restore *ns* to "user" — loading clojure.test leaves it as "clojure.test".
+    {
+        let mut env = Env::new(globals.clone(), "user");
+        special::sync_star_ns(&mut env);
+    }
 
     globals
 }

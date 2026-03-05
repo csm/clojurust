@@ -1,0 +1,13 @@
+[package]
+name        = "cljx-stdlib"
+version     = "0.1.0"
+edition     = "2024"
+description = "Built-in standard library namespaces for clojurust (clojure.string, clojure.set, clojure.test, …)"
+
+[dependencies]
+cljx-gc    = { workspace = true }
+cljx-value = { workspace = true }
+cljx-eval  = { workspace = true }
+
+[dev-dependencies]
+cljx-reader = { workspace = true }

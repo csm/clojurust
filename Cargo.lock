@@ -173,6 +173,7 @@ dependencies = [
  "cljx-interop",
  "cljx-reader",
  "cljx-runtime",
+ "cljx-stdlib",
  "cljx-types",
  "cljx-value",
  "miette",
@@ -234,6 +235,16 @@ dependencies = [
  "cljx-eval",
  "cljx-gc",
  "cljx-types",
+]
+
+[[package]]
+name = "cljx-stdlib"
+version = "0.1.0"
+dependencies = [
+ "cljx-eval",
+ "cljx-gc",
+ "cljx-reader",
+ "cljx-value",
 ]
 
 [[package]]

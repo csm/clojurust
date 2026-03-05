@@ -1,11 +1,13 @@
 //! Function application and the recur trampoline.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_value::{
-    AgentFn, AgentMsg, Arity, CljxFn, CljxFnArity, Delay, LazySeq, PersistentList, Thunk, Value,
+    AgentFn, AgentMsg, Arity, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
+    Symbol, Thunk, Value,
 };
 
 use crate::destructure::value_to_seq_vec;
@@ -49,7 +51,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // Macro check: expand then re-eval.
     if let Value::Macro(mfn) = &callee {
-        let expanded = macro_apply(mfn.get(), arg_forms, env)?;
+        let expanded = macro_apply(mfn.get(), func_form, arg_forms, env)?;
         return eval(&expanded, env);
     }
 
@@ -62,6 +64,17 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             "make-delay" => return handle_make_delay(arg_forms, env),
             "vswap!" => return handle_vswap(arg_forms, env),
             "send" | "send-off" => return handle_send(arg_forms, env),
+            "with-bindings*" => return handle_with_bindings(arg_forms, env),
+            "alter-var-root" => return handle_alter_var_root(arg_forms, env),
+            "vary-meta" => return handle_vary_meta(arg_forms, env),
+            "find-ns" | "the-ns" => return handle_find_ns(arg_forms, env),
+            "all-ns" => return handle_all_ns(arg_forms, env),
+            "create-ns" => return handle_create_ns(arg_forms, env),
+            "ns-aliases" => return handle_ns_aliases(arg_forms, env),
+            "remove-ns" => return handle_remove_ns(arg_forms, env),
+            "alter-meta!" => return handle_alter_meta(arg_forms, env),
+            "ns-resolve" => return handle_ns_resolve(arg_forms, env),
+            "resolve" => return handle_resolve(arg_forms, env),
             _ => {}
         }
     }
@@ -204,8 +217,9 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
 pub fn call_cljx_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> EvalResult {
     let arity = select_arity(f, args.len())?;
 
-    // Create a fresh env with closure bindings.
-    let mut env = Env::with_closure(caller_env.globals.clone(), &caller_env.current_ns, f);
+    // Create a fresh env with closure bindings, executing in the defining namespace.
+    // This ensures macros qualify symbols relative to their definition site.
+    let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
     let mut current_args = args;
     loop {
@@ -314,12 +328,38 @@ fn check_arity(arity: &Arity, argc: usize, name: &str) -> EvalResult<()> {
 
 /// Expand a macro: convert unevaluated arg forms to values, call the macro fn,
 /// then convert the resulting Value back to a Form.
-fn macro_apply(mfn: &CljxFn, arg_forms: &[Form], env: &mut Env) -> EvalResult<Form> {
-    // Convert forms to values (unevaluated).
-    let args: Vec<Value> = arg_forms
-        .iter()
-        .map(|f| Ok(crate::eval::form_to_value(f)))
-        .collect::<EvalResult<_>>()?;
+///
+/// Clojure macros receive two implicit leading arguments:
+/// - `&form`: the entire call expression as a quoted value
+/// - `&env`: a map of local bindings at the call site (symbol → value)
+fn macro_apply(
+    mfn: &CljxFn,
+    func_form: &Form,
+    arg_forms: &[Form],
+    env: &mut Env,
+) -> EvalResult<Form> {
+    // &form: the whole call expression as a list value.
+    let form_val = {
+        let mut items = vec![crate::eval::form_to_value(func_form)];
+        for f in arg_forms {
+            items.push(crate::eval::form_to_value(f));
+        }
+        Value::List(GcPtr::new(PersistentList::from_iter(items)))
+    };
+
+    // &env: local variable bindings at call site as a map (symbol → value).
+    let env_val = {
+        let (names, vals) = env.all_local_bindings();
+        let mut m = MapValue::empty();
+        for (name, val) in names.iter().zip(vals.iter()) {
+            m = m.assoc(Value::symbol(Symbol::simple(name.as_ref())), val.clone());
+        }
+        Value::Map(m)
+    };
+
+    // Prepend &form and &env, then pass remaining arg forms as unevaluated values.
+    let mut args = vec![form_val, env_val];
+    args.extend(arg_forms.iter().map(crate::eval::form_to_value));
 
     let expanded_val = call_cljx_fn(mfn, args, env)?;
     let dummy_span = cljx_types::span::Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
@@ -509,4 +549,318 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let new_val = apply_value(&f, args, env)?;
     atom.get().reset(new_val.clone());
     Ok(new_val)
+}
+
+// ── with-bindings* ────────────────────────────────────────────────────────────
+
+/// `(with-bindings* {#'var val ...} fn)` — push a binding frame, call fn with
+/// no args, pop the frame, return the result.
+fn handle_with_bindings(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "with-bindings*".into(),
+            expected: "2".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let map_val = eval(&arg_forms[0], env)?;
+    let func_val = eval(&arg_forms[1], env)?;
+
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    if let Value::Map(m) = &map_val {
+        m.for_each(|k, v| {
+            if let Value::Var(vp) = k {
+                frame.insert(crate::dynamics::var_key_of(vp), v.clone());
+            }
+            // non-Var keys silently ignored
+        });
+    } else {
+        return Err(EvalError::Runtime(
+            "with-bindings*: first arg must be a map".into(),
+        ));
+    }
+
+    let _guard = crate::dynamics::push_frame(frame);
+    apply_value(&func_val, vec![], env)
+}
+
+// ── alter-var-root ────────────────────────────────────────────────────────────
+
+/// `(alter-var-root #'v f & args)` — atomically apply `f` to the root value.
+fn handle_alter_var_root(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "alter-var-root".into(),
+            expected: "2+".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let var_val = eval(&arg_forms[0], env)?;
+    let f = eval(&arg_forms[1], env)?;
+    let extra: Vec<Value> = arg_forms[2..]
+        .iter()
+        .map(|form| eval(form, env))
+        .collect::<EvalResult<_>>()?;
+
+    let vp = match &var_val {
+        Value::Var(vp) => vp.clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "alter-var-root: expected var, got {}",
+                v.type_name()
+            )));
+        }
+    };
+    let current = vp.get().deref().unwrap_or(Value::Nil);
+    let mut call_args = vec![current];
+    call_args.extend(extra);
+    let new_val = apply_value(&f, call_args, env)?;
+    vp.get().bind(new_val.clone());
+    Ok(new_val)
+}
+
+// ── vary-meta ────────────────────────────────────────────────────────────────
+
+/// `(vary-meta obj f & args)` — apply `f` to obj's metadata, store result as new meta.
+fn handle_vary_meta(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vary-meta".into(),
+            expected: "2+".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let obj = eval(&arg_forms[0], env)?;
+    let f = eval(&arg_forms[1], env)?;
+    let extra: Vec<Value> = arg_forms[2..]
+        .iter()
+        .map(|form| eval(form, env))
+        .collect::<EvalResult<_>>()?;
+
+    let current_meta = match &obj {
+        Value::Var(vp) => vp.get().get_meta().unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    };
+    let mut call_args = vec![current_meta];
+    call_args.extend(extra);
+    let new_meta = apply_value(&f, call_args, env)?;
+    if let Value::Var(vp) = &obj {
+        vp.get().set_meta(new_meta);
+    }
+    Ok(obj)
+}
+
+// ── Namespace reflection (env-needing) ────────────────────────────────────────
+
+fn ns_name_from_val(v: &Value) -> Result<String, EvalError> {
+    match v {
+        Value::Symbol(s) => Ok(s.get().name.as_ref().to_string()),
+        Value::Str(s) => Ok(s.get().clone()),
+        Value::Namespace(ns) => Ok(ns.get().name.as_ref().to_string()),
+        Value::Keyword(k) => Ok(k.get().name.as_ref().to_string()),
+        other => Err(EvalError::Runtime(format!(
+            "expected symbol, string, or namespace, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(find-ns sym)` / `(the-ns sym)` — look up a namespace by name; nil if not found.
+fn handle_find_ns(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "find-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let arg = eval(&arg_forms[0], env)?;
+    let name = ns_name_from_val(&arg)?;
+    let map = env.globals.namespaces.read().unwrap();
+    match map.get(name.as_str()) {
+        Some(ns) => Ok(Value::Namespace(ns.clone())),
+        None => Ok(Value::Nil),
+    }
+}
+
+/// `(all-ns)` — lazy sequence of all live namespaces.
+fn handle_all_ns(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if !arg_forms.is_empty() {
+        let _ = eval(&arg_forms[0], env)?; // tolerate extra args
+    }
+    let map = env.globals.namespaces.read().unwrap();
+    let items: Vec<Value> = map
+        .values()
+        .map(|ns| Value::Namespace(ns.clone()))
+        .collect();
+    drop(map);
+    Ok(Value::List(cljx_gc::GcPtr::new(
+        cljx_value::PersistentList::from_iter(items),
+    )))
+}
+
+/// `(create-ns sym)` — create (or return existing) namespace, return it.
+fn handle_create_ns(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "create-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let arg = eval(&arg_forms[0], env)?;
+    let name = ns_name_from_val(&arg)?;
+    let ns = env.globals.get_or_create_ns(&name);
+    Ok(Value::Namespace(ns))
+}
+
+/// `(ns-aliases ns)` — map of Symbol → Namespace for all aliases in ns.
+fn handle_ns_aliases(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "ns-aliases".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let ns_val = eval(&arg_forms[0], env)?;
+    let ns_name = ns_name_from_val(&ns_val)?;
+    let map = env.globals.namespaces.read().unwrap();
+    let ns = match map.get(ns_name.as_str()) {
+        Some(ns) => ns.clone(),
+        None => return Ok(Value::Map(cljx_value::MapValue::empty())),
+    };
+    let aliases = ns.get().aliases.lock().unwrap().clone();
+    drop(map);
+    let mut m = cljx_value::MapValue::empty();
+    for (alias, full_ns_name) in &aliases {
+        let sym = Value::Symbol(cljx_gc::GcPtr::new(cljx_value::Symbol {
+            namespace: None,
+            name: alias.clone(),
+        }));
+        let nsmap = env.globals.namespaces.read().unwrap();
+        if let Some(target_ns) = nsmap.get(full_ns_name.as_ref()) {
+            m = m.assoc(sym, Value::Namespace(target_ns.clone()));
+        }
+    }
+    Ok(Value::Map(m))
+}
+
+/// `(remove-ns sym)` — remove a namespace (returns nil; used sparingly in tests).
+fn handle_remove_ns(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "remove-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let arg = eval(&arg_forms[0], env)?;
+    let name = ns_name_from_val(&arg)?;
+    env.globals
+        .namespaces
+        .write()
+        .unwrap()
+        .remove(name.as_str());
+    Ok(Value::Nil)
+}
+
+/// `(alter-meta! ref f & args)` — apply f to ref's current meta + args, store and return new meta.
+fn handle_alter_meta(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "alter-meta!".into(),
+            expected: "2+".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let obj = eval(&arg_forms[0], env)?;
+    let f = eval(&arg_forms[1], env)?;
+    let extra: Vec<Value> = arg_forms[2..]
+        .iter()
+        .map(|form| eval(form, env))
+        .collect::<EvalResult<_>>()?;
+
+    let current_meta = match &obj {
+        Value::Var(vp) => vp
+            .get()
+            .get_meta()
+            .unwrap_or(Value::Map(cljx_value::MapValue::empty())),
+        _ => Value::Map(cljx_value::MapValue::empty()),
+    };
+    let mut call_args = vec![current_meta];
+    call_args.extend(extra);
+    let new_meta = apply_value(&f, call_args, env)?;
+    if let Value::Var(vp) = &obj {
+        vp.get().set_meta(new_meta.clone());
+    }
+    Ok(new_meta)
+}
+
+/// `(ns-resolve ns sym)` — return the Var for sym in ns, or nil if not found.
+fn handle_ns_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "ns-resolve".into(),
+            expected: "2".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let ns_arg = eval(&arg_forms[0], env)?;
+    let sym_arg = eval(&arg_forms[1], env)?;
+    let ns_name = ns_name_from_val(&ns_arg)?;
+    let sym_name = match &sym_arg {
+        Value::Symbol(s) => s.get().name.as_ref().to_string(),
+        Value::Str(s) => s.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "ns-resolve: second arg must be symbol or string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    match env.globals.lookup_var(&ns_name, &sym_name) {
+        Some(var_ptr) => Ok(Value::Var(var_ptr)),
+        None => Ok(Value::Nil),
+    }
+}
+
+/// `(resolve sym)` — return the Var for sym in the current namespace, or nil.
+fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "resolve".into(),
+            expected: "1".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let sym_arg = eval(&arg_forms[0], env)?;
+    let sym_name = match &sym_arg {
+        Value::Symbol(s) => {
+            let sym = s.get();
+            // If qualified (ns/name), use the given ns; otherwise current ns.
+            if let Some(ns) = &sym.namespace {
+                let full_ns = env
+                    .globals
+                    .resolve_alias(&env.current_ns, ns.as_ref())
+                    .unwrap_or_else(|| ns.clone());
+                return Ok(match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
+                    Some(var_ptr) => Value::Var(var_ptr),
+                    None => Value::Nil,
+                });
+            }
+            sym.name.as_ref().to_string()
+        }
+        Value::Str(s) => s.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "resolve: arg must be symbol or string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(match env.globals.lookup_var_in_ns(&env.current_ns, &sym_name) {
+        Some(var_ptr) => Value::Var(var_ptr),
+        None => Value::Nil,
+    })
 }

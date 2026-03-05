@@ -18,10 +18,22 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
         && let Some(FormKind::Symbol(s)) = parts.first().map(|f| &f.kind)
         && let Some(macro_fn) = resolve_macro(s, env)
     {
-        let args: Vec<Value> = parts[1..]
-            .iter()
-            .map(|f| Ok(form_to_value(f)))
-            .collect::<EvalResult<_>>()?;
+        // Build &form value (the whole call as a list).
+        let form_val = form_to_value(form);
+        // Build &env value (local bindings as a map — empty at top level).
+        let env_val = {
+            let (names, vals) = env.all_local_bindings();
+            let mut m = cljx_value::MapValue::empty();
+            for (name, val) in names.iter().zip(vals.iter()) {
+                m = m.assoc(
+                    Value::symbol(Symbol::simple(name.as_ref())),
+                    val.clone(),
+                );
+            }
+            Value::Map(m)
+        };
+        let mut args = vec![form_val, env_val];
+        args.extend(parts[1..].iter().map(form_to_value));
         let expanded = crate::apply::call_cljx_fn(&macro_fn, args, env)?;
         let dummy = Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
         return value_to_form(&expanded, dummy);

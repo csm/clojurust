@@ -120,7 +120,17 @@ fn sq_form(
             Ok(Value::Set(GcPtr::new(set)))
         }
 
-        // Everything else: wrap in quote.
+        // `'inner` inside syntax-quote: recursively process `inner` so that
+        // unquotes like `'~x` work — they evaluate x and wrap the result in (quote ...).
+        FormKind::Quote(inner) => {
+            let processed = sq_form(inner, env, gensyms)?;
+            Ok(Value::List(GcPtr::new(PersistentList::from_iter([
+                Value::symbol(Symbol::simple("quote")),
+                processed,
+            ]))))
+        }
+
+        // Everything else: wrap as literal data.
         _other => Ok(crate::eval::form_to_value(form)),
     }
 }
@@ -157,7 +167,9 @@ fn sq_seq(
 ///
 /// - `foo#` → unique gensym `foo__N__auto__` (same N within one backtick).
 /// - `ns/foo` → kept as-is (already qualified).
-/// - Special symbols (`nil`, `true`, `false`) → kept as-is.
+/// - Special literals (`nil`, `true`, `false`) → kept as-is.
+/// - Special forms (`def`, `if`, `try`, `catch`, `let`, …) → kept as-is.
+/// - Symbols that resolve in the current namespace → qualified with resolved ns.
 /// - Everything else → `current-ns/name`.
 fn qualify_symbol(
     s: &str,
@@ -179,6 +191,18 @@ fn qualify_symbol(
             Arc::from(format!("{base}__{n}__auto__"))
         });
         return generated.as_ref().to_string();
+    }
+    // Special forms and try-related tokens: never qualify.
+    if crate::special::SPECIAL_FORMS.contains(&s)
+        || matches!(s, "catch" | "finally" | "Exception" | "Throwable" | "Error")
+    {
+        return s.to_string();
+    }
+    // Resolve through current namespace (interns and refers).
+    // If the symbol resolves to a var, use that var's actual namespace.
+    if let Some(var_ptr) = env.globals.lookup_var_in_ns(&env.current_ns, s) {
+        let var_ns = var_ptr.get().namespace.as_ref().to_string();
+        return format!("{var_ns}/{s}");
     }
     // Default: qualify with current namespace.
     format!("{}/{}", env.current_ns, s)

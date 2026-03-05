@@ -3,7 +3,7 @@
 Tree-walking interpreter for clojurust.  Evaluates `Form` AST nodes produced
 by `cljx-reader` within a namespace-aware lexical environment.
 
-**Phase:** 5–8 + defrecord/reify/built-in protocols + source-path management/require — implemented.
+**Phase:** 5–8 + defrecord/reify/built-in protocols + source-path management/require + dynamic variables (`binding`) — implemented.
 
 ---
 
@@ -24,8 +24,9 @@ src/
   error.rs        — EvalError enum, EvalResult<T> alias
   env.rs          — Frame, GlobalEnv (namespace registry + source paths + loaded set), Env (lexical scope), RequireSpec, RequireRefer
   eval.rs         — top-level eval dispatcher, form_to_value, inline tests
-  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, handle_make_delay, handle_send, handle_vswap, type_tag_of, resolve_type_tag
-  special.rs      — all special form handlers, SPECIAL_FORMS list
+  dynamics.rs     — thread-local dynamic binding stack: BINDING_STACK, BindingGuard, push_frame/pop_frame, deref_var, set_thread_local, capture_current/install_frames, trace_current
+  apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, handle_make_delay, handle_send, handle_vswap, handle_with_bindings, handle_alter_var_root, handle_vary_meta, type_tag_of, resolve_type_tag
+  special.rs      — all special form handlers, SPECIAL_FORMS list; includes binding, extract_def_name, compile_meta_form
   loader.rs       — load_ns: resolves namespace names to files, evaluates them, applies alias/refer
   macros.rs       — macroexpand_1, macroexpand, value_to_form
   destructure.rs  — sequential + associative destructuring (bind_pattern, bind_sequential, bind_associative)
@@ -110,7 +111,7 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `if` / `do` / `and` / `or` | Control flow |
 | `quote` | Return unevaluated form |
 | `var` | Return `Value::Var` for a namespace var |
-| `set!` | Mutate a var's root binding |
+| `set!` | Set thread-local binding if inside `binding`; else mutate var's root |
 | `throw` / `try` / `catch` / `finally` | Exception handling |
 | `ns` | Switch current namespace; processes `:require` clauses; auto-refers `clojure.core` |
 | `require` | Load and wire namespaces; supports `:as` alias and `:refer [...]`/`:refer :all` |
@@ -123,9 +124,10 @@ pub type EvalResult<T = Value> = Result<T, EvalError>;
 | `extend-protocol` | Protocol-first sugar for `extend-type` |
 | `defmulti` | Define a multimethod with a dispatch function |
 | `defmethod` | Add an implementation for one dispatch value |
-| `future` | Evaluate body on a new thread; return `Value::Future` |
+| `future` | Evaluate body on a new thread; return `Value::Future`; conveys dynamic bindings |
 | `defrecord` | Define a named record type; generates `->Name`/`map->Name` constructors; supports inline protocol impls |
 | `reify` | Create an anonymous protocol-implementing instance with a gensym'd type tag |
+| `binding` | Establish thread-local dynamic var bindings for body (RAII `BindingGuard`) |
 
 ---
 
@@ -174,6 +176,9 @@ All built-ins have signature `fn(&[Value]) -> ValueResult<Value>`.
 **Multimethods:** `prefer-method` `remove-method` `methods` `isa?`
 
 **Records/reify:** `make-type-instance` `record?` `instance?`
+
+**Dynamic vars:** `var-get` `var-set!` `bound?` `thread-bound?` `meta` `with-meta`
+`alter-var-root` `vary-meta` `with-bindings*` (intercepted in `eval_call`)
 
 ---
 

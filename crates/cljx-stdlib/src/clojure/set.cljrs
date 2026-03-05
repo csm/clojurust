@@ -1,0 +1,4 @@
+;; clojure.set — set-relation operations for clojurust.
+;; Native implementations are pre-registered by cljx-stdlib before this
+;; source is evaluated.
+(ns clojure.set)

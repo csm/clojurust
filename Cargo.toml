@@ -5,6 +5,7 @@ members = [
     "crates/cljx-value",
     "crates/cljx-reader",
     "crates/cljx-eval",
+    "crates/cljx-stdlib",
     "crates/cljx-runtime",
     "crates/cljx-compiler",
     "crates/cljx-interop",
@@ -18,6 +19,7 @@ cljx-gc       = { path = "crates/cljx-gc" }
 cljx-value    = { path = "crates/cljx-value" }
 cljx-reader   = { path = "crates/cljx-reader" }
 cljx-eval     = { path = "crates/cljx-eval" }
+cljx-stdlib   = { path = "crates/cljx-stdlib" }
 cljx-runtime  = { path = "crates/cljx-runtime" }
 cljx-compiler = { path = "crates/cljx-compiler" }
 cljx-interop  = { path = "crates/cljx-interop" }

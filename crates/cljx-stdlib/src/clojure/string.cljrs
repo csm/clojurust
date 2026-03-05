@@ -1,0 +1,5 @@
+;; clojure.string — string utilities for clojurust.
+;; Native implementations are pre-registered by cljx-stdlib before this
+;; source is evaluated.  This file adds the few functions that are easier
+;; to express in Clojure than in Rust.
+(ns clojure.string)

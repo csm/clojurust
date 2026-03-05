@@ -71,6 +71,9 @@ pub struct GlobalEnv {
     pub loaded: Mutex<HashSet<Arc<str>>>,
     /// Namespaces currently being loaded (cycle detection).
     pub loading: Mutex<HashSet<Arc<str>>>,
+    /// Built-in namespace sources embedded in the binary.
+    /// Checked by `load_ns` before falling back to source-path search.
+    pub builtin_sources: RwLock<HashMap<Arc<str>, &'static str>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -86,12 +89,26 @@ impl GlobalEnv {
             source_paths: RwLock::new(Vec::new()),
             loaded: Mutex::new(HashSet::new()),
             loading: Mutex::new(HashSet::new()),
+            builtin_sources: RwLock::new(HashMap::new()),
         })
     }
 
     /// Replace the source path list.
     pub fn set_source_paths(&self, paths: Vec<std::path::PathBuf>) {
         *self.source_paths.write().unwrap() = paths;
+    }
+
+    /// Register an embedded namespace source (called by cljx-stdlib at startup).
+    pub fn register_builtin_source(&self, ns: &str, src: &'static str) {
+        self.builtin_sources
+            .write()
+            .unwrap()
+            .insert(Arc::from(ns), src);
+    }
+
+    /// Look up an embedded source for a namespace, if one has been registered.
+    pub fn builtin_source(&self, ns: &str) -> Option<&'static str> {
+        self.builtin_sources.read().unwrap().get(ns).copied()
     }
 
     /// Mark a namespace as fully loaded from a file.
@@ -156,6 +173,7 @@ impl GlobalEnv {
     }
 
     /// Look up a value in `ns_name`: checks interns then refers.
+    /// Routes through the dynamic binding stack so `binding` overrides work.
     pub fn lookup_in_ns(&self, ns_name: &str, sym_name: &str) -> Option<Value> {
         let map = self.namespaces.read().unwrap();
         let ns = map.get(ns_name)?;
@@ -164,14 +182,14 @@ impl GlobalEnv {
         {
             let interns = ns_ref.interns.lock().unwrap();
             if let Some(var) = interns.get(sym_name) {
-                return var.get().deref();
+                return crate::dynamics::deref_var(var);
             }
         }
         // Then refers.
         {
             let refers = ns_ref.refers.lock().unwrap();
             if let Some(var) = refers.get(sym_name) {
-                return var.get().deref();
+                return crate::dynamics::deref_var(var);
             }
         }
         None

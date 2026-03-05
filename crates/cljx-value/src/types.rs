@@ -124,6 +124,8 @@ pub struct Var {
     pub name: Arc<str>,
     pub value: Mutex<Option<Value>>,
     pub is_macro: bool,
+    /// Metadata map (e.g. `{:dynamic true}`).
+    pub meta: Mutex<Option<Value>>,
 }
 
 impl Var {
@@ -133,6 +135,7 @@ impl Var {
             name: name.into(),
             value: Mutex::new(None),
             is_macro: false,
+            meta: Mutex::new(None),
         }
     }
 
@@ -147,12 +150,23 @@ impl Var {
     pub fn bind(&self, v: Value) {
         *self.value.lock().unwrap() = Some(v);
     }
+
+    pub fn get_meta(&self) -> Option<Value> {
+        self.meta.lock().unwrap().clone()
+    }
+
+    pub fn set_meta(&self, m: Value) {
+        *self.meta.lock().unwrap() = Some(m);
+    }
 }
 
 impl cljx_gc::Trace for Var {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
         if let Some(v) = self.value.lock().unwrap().as_ref() {
             v.trace(visitor);
+        }
+        if let Some(m) = self.meta.lock().unwrap().as_ref() {
+            m.trace(visitor);
         }
     }
 }
@@ -290,6 +304,8 @@ pub struct CljxFn {
     pub closed_over_vals: Vec<Value>,
     /// True if this function was defined with `defmacro`.
     pub is_macro: bool,
+    /// Namespace in which this function was defined (for macro hygiene).
+    pub defining_ns: Arc<str>,
 }
 
 impl CljxFn {
@@ -299,6 +315,7 @@ impl CljxFn {
         closed_over_names: Vec<Arc<str>>,
         closed_over_vals: Vec<Value>,
         is_macro: bool,
+        defining_ns: Arc<str>,
     ) -> Self {
         Self {
             name,
@@ -306,6 +323,7 @@ impl CljxFn {
             closed_over_names,
             closed_over_vals,
             is_macro,
+            defining_ns,
         }
     }
 }
