@@ -342,8 +342,9 @@ pub fn form_to_value(form: &Form) -> Value {
         ]))),
         FormKind::Meta(_meta, inner) => form_to_value(inner),
         FormKind::AnonFn(body) => {
-            let items: Vec<Value> = body.iter().map(form_to_value).collect();
-            Value::List(GcPtr::new(PersistentList::from_iter(items)))
+            // Expand #(...) to (fn* [...] ...) so it round-trips correctly through quote.
+            let expanded = expand_anon_fn(body, form.span.clone());
+            form_to_value(&expanded)
         }
         FormKind::TaggedLiteral(_, inner) => form_to_value(inner),
         FormKind::ReaderCond {
@@ -417,7 +418,7 @@ fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
 // ── anon fn expansion ─────────────────────────────────────────────────────────
 
 /// Expand `#(...)` to `(fn* [p__1 p__2 ... & rest__] ...)`.
-fn expand_anon_fn(body: &[Form], span: cljx_types::span::Span) -> Form {
+pub fn expand_anon_fn(body: &[Form], span: cljx_types::span::Span) -> Form {
     let mut max_pos: usize = 0;
     let mut has_rest = false;
     find_pct_refs(body, &mut max_pos, &mut has_rest);
@@ -433,12 +434,18 @@ fn expand_anon_fn(body: &[Form], span: cljx_types::span::Span) -> Form {
 
     let new_body = rewrite_pct_refs(body, s.clone());
 
-    let mut fn_forms = vec![
-        Form::new(FormKind::Symbol("fn*".into()), s.clone()),
-        Form::new(FormKind::Vector(params), s.clone()),
-    ];
-    fn_forms.extend(new_body);
-    Form::new(FormKind::List(fn_forms), span)
+    // Wrap the rewritten body forms back into a single call expression.
+    // #(f a b) → (fn* [params] (f a b)), not (fn* [params] f a b).
+    let body_expr = Form::new(FormKind::List(new_body), s.clone());
+
+    Form::new(
+        FormKind::List(vec![
+            Form::new(FormKind::Symbol("fn*".into()), s.clone()),
+            Form::new(FormKind::Vector(params), s.clone()),
+            body_expr,
+        ]),
+        span,
+    )
 }
 
 fn find_pct_refs(forms: &[Form], max_pos: &mut usize, has_rest: &mut bool) {

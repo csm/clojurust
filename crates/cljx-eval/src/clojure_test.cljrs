@@ -59,16 +59,27 @@
 (defmacro is
   ([form] `(is ~form nil))
   ([form msg]
-   `(try
-      (let [__is-result__ ~form]
-        (if __is-result__
-          (do (report {:type :pass :expected (quote ~form) :actual __is-result__ :message ~msg})
-              true)
-          (do (report {:type :fail :expected (quote ~form) :actual __is-result__ :message ~msg})
-              false)))
-      (catch Exception __is-e__
-        (report {:type :error :expected (quote ~form) :actual __is-e__ :message ~msg})
-        false))))
+   (if (and (seq? form) (= (first form) 'thrown?))
+     ;; (is (thrown? ExClass expr)) — check that expr throws.
+     (let [expr (nth form 2)]
+       `(try
+          ~expr
+          (do (report {:type :fail :expected (quote ~form) :actual nil :message ~msg})
+              false)
+          (catch Exception __is-e__
+            (report {:type :pass :expected (quote ~form) :actual __is-e__ :message ~msg})
+            true)))
+     ;; Normal assertion.
+     `(try
+        (let [__is-result__ ~form]
+          (if __is-result__
+            (do (report {:type :pass :expected (quote ~form) :actual __is-result__ :message ~msg})
+                true)
+            (do (report {:type :fail :expected (quote ~form) :actual __is-result__ :message ~msg})
+                false)))
+        (catch Exception __is-e__
+          (report {:type :error :expected (quote ~form) :actual __is-e__ :message ~msg})
+          false)))))
 
 ;; ── Context macro ─────────────────────────────────────────────────────────────
 

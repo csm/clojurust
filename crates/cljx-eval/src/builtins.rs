@@ -50,6 +50,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("keyword?", Arity::Fixed(1), builtin_keyword_q),
         ("symbol?", Arity::Fixed(1), builtin_symbol_q),
         ("fn?", Arity::Fixed(1), builtin_fn_q),
+        ("ifn?", Arity::Fixed(1), builtin_ifn_q),
         ("seq?", Arity::Fixed(1), builtin_seq_q),
         ("map?", Arity::Fixed(1), builtin_map_q),
         ("vector?", Arity::Fixed(1), builtin_vector_q),
@@ -864,6 +865,19 @@ fn builtin_fn_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
         Value::Fn(_) | Value::NativeFunction(_)
+    )))
+}
+fn builtin_ifn_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(
+        args[0],
+        Value::Fn(_)
+            | Value::NativeFunction(_)
+            | Value::Macro(_)
+            | Value::Keyword(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::Vector(_)
+            | Value::Symbol(_)
     )))
 }
 fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {

@@ -130,6 +130,12 @@ fn sq_form(
             ]))))
         }
 
+        // #(...) anonymous function: expand to (fn* [...] ...) then syntax-quote.
+        FormKind::AnonFn(body) => {
+            let expanded = crate::eval::expand_anon_fn(body, form.span.clone());
+            sq_form(&expanded, env, gensyms)
+        }
+
         // Everything else: wrap as literal data.
         _other => Ok(crate::eval::form_to_value(form)),
     }

@@ -211,7 +211,10 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             }
             None => Ok(Value::Nil),
         },
-        other => Err(EvalError::NotCallable(format!("{}", other))),
+        other => Err(EvalError::NotCallable(format!(
+            "<{}> is not callable",
+            other.type_name()
+        ))),
     }
 }
 
