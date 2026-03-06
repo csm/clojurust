@@ -5,11 +5,7 @@ use std::sync::Arc;
 use num_traits::Signed as _;
 
 use cljx_gc::GcPtr;
-use cljx_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance,
-    Value, ValueError, ValueResult, Volatile,
-};
+use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
 
 use crate::env::GlobalEnv;
 
@@ -204,6 +200,16 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("rand-int", Arity::Fixed(1), builtin_rand_int),
         ("sort", Arity::Variadic { min: 1 }, builtin_sort),
         ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by_stub),
+        (
+            "sorted-set",
+            Arity::Variadic { min: 0 },
+            builtin_sorted_set,
+        ),
+        (
+            "sorted-map",
+            Arity::Variadic { min: 0 },
+            builtin_sorted_map,
+        ),
         ("group-by", Arity::Fixed(2), builtin_group_by_stub),
         ("max-key", Arity::Variadic { min: 2 }, builtin_max_key_stub),
         ("min-key", Arity::Variadic { min: 2 }, builtin_min_key_stub),
@@ -357,59 +363,79 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
 pub const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.cljrs");
 pub const CLOJURE_TEST_SOURCE: &str = include_str!("clojure_test.cljrs");
 
-// ── Helper: value to sequence vector ─────────────────────────────────────────
+// ── Helper: lazy value iterator ──────────────────────────────────────────────
 
-fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
-    match v {
-        Value::Nil => Ok(vec![]),
-        Value::LazySeq(ls) => value_to_seq(&ls.get().realize()),
-        Value::Cons(c) => {
-            let mut result = vec![c.get().head.clone()];
-            let mut tail = c.get().tail.clone();
-            loop {
-                match tail {
-                    Value::Nil => break,
-                    Value::List(l) => {
-                        result.extend(l.get().iter().cloned());
-                        break;
-                    }
-                    Value::Cons(next_c) => {
-                        result.push(next_c.get().head.clone());
-                        tail = next_c.get().tail.clone();
-                    }
-                    Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
-                    }
-                    other => {
-                        return Err(ValueError::WrongType {
-                            expected: "seq",
-                            got: other.type_name().to_string(),
-                        });
+/// An iterator that lazily steps through any seqable `Value`, realizing
+/// `LazySeq` and `Cons` cells one at a time instead of collecting into a `Vec`.
+/// Finite collections (List, Vector, Set, Map, Str) are converted to a List
+/// on first access, which is fine since they are already fully in memory.
+struct ValueIter {
+    current: Value,
+}
+
+impl ValueIter {
+    fn new(v: Value) -> Self {
+        ValueIter { current: v }
+    }
+}
+
+impl Iterator for ValueIter {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        loop {
+            match &self.current {
+                Value::Nil => return None,
+                Value::LazySeq(ls) => {
+                    self.current = ls.get().realize();
+                }
+                Value::Cons(c) => {
+                    let cell = c.get();
+                    let head = cell.head.clone();
+                    self.current = cell.tail.clone();
+                    return Some(head);
+                }
+                Value::List(l) => {
+                    if let Some(first) = l.get().first() {
+                        let head = first.clone();
+                        self.current = Value::List(GcPtr::new((*l.get().rest()).clone()));
+                        return Some(head);
+                    } else {
+                        return None;
                     }
                 }
+                Value::Vector(v) => {
+                    let items: Vec<Value> = v.get().iter().cloned().collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::Set(s) => {
+                    let items: Vec<Value> = s.get().iter().collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::Map(m) => {
+                    let mut pairs = Vec::new();
+                    m.for_each(|k, v| {
+                        pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                            k.clone(),
+                            v.clone(),
+                        ]))));
+                    });
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(pairs)));
+                }
+                Value::Str(s) => {
+                    let chars: Vec<Value> = s.get().chars().map(Value::Char).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(chars)));
+                }
+                _ => return None,
             }
-            Ok(result)
         }
-        Value::List(l) => Ok(l.get().iter().cloned().collect()),
-        Value::Vector(v) => Ok(v.get().iter().cloned().collect()),
-        Value::Set(s) => Ok(s.get().iter().collect()),
-        Value::Map(m) => {
-            let mut pairs = Vec::new();
-            m.for_each(|k, v| {
-                let pair = Value::Vector(GcPtr::new(PersistentVector::from_iter([
-                    k.clone(),
-                    v.clone(),
-                ])));
-                pairs.push(pair);
-            });
-            Ok(pairs)
-        }
-        Value::Str(s) => Ok(s.get().chars().map(Value::Char).collect()),
-        _ => Err(ValueError::WrongType {
-            expected: "seqable",
-            got: v.type_name().to_string(),
-        }),
     }
+}
+
+// ── Helper: value to sequence vector (eager — use only when random access is needed) ──
+
+fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
+    Ok(ValueIter::new(v.clone()).collect())
 }
 
 fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
@@ -431,6 +457,17 @@ fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
             expected: "integer",
             got: v.type_name().to_string(),
         }),
+    }
+}
+
+fn numeric_as_usize(v: &Value) -> ValueResult<usize> {
+    match v {
+        Value::Long(n) => Ok(*n as usize),
+        Value::Double(f) => Ok(*f as usize),
+        _ => Err(ValueError::WrongType {
+            expected: "integer",
+            got: v.type_name().to_string(),
+        })
     }
 }
 
@@ -896,8 +933,7 @@ fn builtin_list_star(args: &[Value]) -> ValueResult<Value> {
     }
     let last = &args[args.len() - 1];
     let mut items: Vec<Value> = args[..args.len() - 1].to_vec();
-    let tail = value_to_seq(last)?;
-    items.extend(tail);
+    items.extend(ValueIter::new(last.clone()));
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
 
@@ -1055,9 +1091,8 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
     let mut current = args[0].clone();
-    let keys = value_to_seq(&args[1])?;
     let default = args.get(2).cloned().unwrap_or(Value::Nil);
-    for k in keys {
+    for k in ValueIter::new(args[1].clone()) {
         current = match current {
             Value::Map(m) => m.get(&k).unwrap_or(Value::Nil),
             Value::Vector(v) => {
@@ -1085,9 +1120,9 @@ fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
 fn builtin_count(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::LazySeq(_) | Value::Cons(_) => {
-            // Realize and count elements (linear time).
-            let items = value_to_seq(&args[0])?;
-            return Ok(Value::Long(items.len() as i64));
+            // Walk and count elements lazily (linear time, no Vec alloc).
+            let n = ValueIter::new(args[0].clone()).count();
+            return Ok(Value::Long(n as i64));
         }
         _ => {}
     }
@@ -1255,8 +1290,10 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
     let default = args.get(2).cloned();
     match &args[0] {
         Value::LazySeq(_) | Value::Cons(_) => {
-            let items = value_to_seq(&args[0])?;
-            Ok(items.into_iter().nth(idx).or(default).unwrap_or(Value::Nil))
+            Ok(ValueIter::new(args[0].clone())
+                .nth(idx)
+                .or(default)
+                .unwrap_or(Value::Nil))
         }
         Value::List(l) => Ok(l
             .get()
@@ -1298,7 +1335,7 @@ fn builtin_reverse(args: &[Value]) -> ValueResult<Value> {
 fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
     let mut out = Vec::new();
     for arg in args {
-        out.extend(value_to_seq(arg)?);
+        out.extend(ValueIter::new(arg.clone()));
     }
     if out.is_empty() {
         Ok(Value::List(GcPtr::new(PersistentList::empty())))
@@ -1388,9 +1425,8 @@ fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_into(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(&args[1])?;
     let mut result = args[0].clone();
-    for item in items {
+    for item in ValueIter::new(args[1].clone()) {
         result = match result {
             Value::Nil => Value::List(GcPtr::new(PersistentList::from_iter([item]))),
             Value::List(l) => {
@@ -1429,17 +1465,13 @@ fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(&args[0])?;
     Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        items,
+        ValueIter::new(args[0].clone()),
     ))))
 }
 
 fn builtin_set_fn(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(&args[0])?;
-    let set = items
-        .into_iter()
-        .fold(PersistentHashSet::empty(), |s, v| s.conj(v));
+    let set = ValueIter::new(args[0].clone()).fold(PersistentHashSet::empty(), |s, v| s.conj(v));
     Ok(Value::Set(GcPtr::new(set)))
 }
 
@@ -1563,10 +1595,9 @@ fn builtin_flatten(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_distinct(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(&args[0])?;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for v in items {
+    for v in ValueIter::new(args[0].clone()) {
         use cljx_value::ClojureHash;
         let h = v.clojure_hash();
         if !seen.contains(&h) {
@@ -1578,9 +1609,8 @@ fn builtin_distinct(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_frequencies(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(&args[0])?;
     let mut m = MapValue::empty();
-    for v in items {
+    for v in ValueIter::new(args[0].clone()) {
         let count = m
             .get(&v)
             .and_then(|c| {
@@ -1597,22 +1627,40 @@ fn builtin_frequencies(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_interleave(args: &[Value]) -> ValueResult<Value> {
-    let seqs: Vec<Vec<Value>> = args.iter().map(value_to_seq).collect::<Result<_, _>>()?;
-    let len = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
-    let mut out = Vec::new();
-    for i in 0..len {
-        for seq in &seqs {
-            out.push(seq[i].clone());
-        }
+    if args.is_empty() {
+        return Ok(Value::List(GcPtr::new(PersistentList::empty())));
     }
-    Ok(Value::List(GcPtr::new(PersistentList::from_iter(out))))
+    // Step through all seqs in lockstep using first/rest, stopping when any is exhausted.
+    let mut seqs: Vec<Value> = args.to_vec();
+    let mut out = Vec::new();
+    loop {
+        // First pass: decompose all seqs into (first, rest). If any is empty, stop.
+        let mut firsts = Vec::with_capacity(seqs.len());
+        let mut rests = Vec::with_capacity(seqs.len());
+        for seq in &seqs {
+            match seq_first_rest(seq)? {
+                Some((first, rest)) => {
+                    firsts.push(first);
+                    rests.push(rest);
+                }
+                None => {
+                    return Ok(if out.is_empty() {
+                        Value::List(GcPtr::new(PersistentList::empty()))
+                    } else {
+                        Value::List(GcPtr::new(PersistentList::from_iter(out)))
+                    });
+                }
+            }
+        }
+        out.extend(firsts);
+        seqs = rests;
+    }
 }
 
 fn builtin_interpose(args: &[Value]) -> ValueResult<Value> {
     let sep = &args[0];
-    let items = value_to_seq(&args[1])?;
     let mut out = Vec::new();
-    for (i, v) in items.into_iter().enumerate() {
+    for (i, v) in ValueIter::new(args[1].clone()).enumerate() {
         if i > 0 {
             out.push(sep.clone());
         }
@@ -1679,6 +1727,50 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
                 }
             }
         }
+        Value::Set(s) => {
+            let mut iter = s.get().iter();
+            match iter.next() {
+                None => Ok(None),
+                Some(first) => {
+                    let rest: Vec<Value> = iter.collect();
+                    Ok(Some((
+                        first,
+                        Value::List(GcPtr::new(PersistentList::from_iter(rest))),
+                    )))
+                }
+            }
+        }
+        Value::Map(m) => {
+            let mut pairs = Vec::new();
+            m.for_each(|k, v| {
+                pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                    k.clone(),
+                    v.clone(),
+                ]))));
+            });
+            if pairs.is_empty() {
+                Ok(None)
+            } else {
+                let first = pairs.remove(0);
+                Ok(Some((
+                    first,
+                    Value::List(GcPtr::new(PersistentList::from_iter(pairs))),
+                )))
+            }
+        }
+        Value::Str(s) => {
+            let mut chars = s.get().chars();
+            match chars.next() {
+                None => Ok(None),
+                Some(ch) => {
+                    let rest: Vec<Value> = chars.map(Value::Char).collect();
+                    Ok(Some((
+                        Value::Char(ch),
+                        Value::List(GcPtr::new(PersistentList::from_iter(rest))),
+                    )))
+                }
+            }
+        }
         _ => Err(ValueError::WrongType {
             expected: "seq",
             got: v.type_name().to_string(),
@@ -1687,12 +1779,11 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
 }
 
 fn builtin_select_keys(args: &[Value]) -> ValueResult<Value> {
-    let keys = value_to_seq(&args[1])?;
     let mut m = MapValue::empty();
     if let Value::Map(src) = &args[0] {
-        for k in &keys {
-            if let Some(v) = src.get(k) {
-                m = m.assoc(k.clone(), v);
+        for k in ValueIter::new(args[1].clone()) {
+            if let Some(v) = src.get(&k) {
+                m = m.assoc(k, v);
             }
         }
     }
@@ -2491,15 +2582,45 @@ fn builtin_rand_int(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Long(n / 2)) // stub
 }
 
+fn value_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Long(x), Value::Long(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.get().cmp(y.get()),
+        (Value::Keyword(x), Value::Keyword(y)) => x.get().full_name().cmp(&y.get().full_name()),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
     let items = value_to_seq(args.last().unwrap_or(&Value::Nil))?;
     let mut sorted = items;
-    sorted.sort_by(|a, b| match (a, b) {
-        (Value::Long(x), Value::Long(y)) => x.cmp(y),
-        (Value::Str(x), Value::Str(y)) => x.get().cmp(y.get()),
-        _ => std::cmp::Ordering::Equal,
-    });
+    sorted.sort_by(value_compare);
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(sorted))))
+}
+
+fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
+    // TODO: proper sorted set type; for now return a list in sorted order.
+    let mut items: Vec<Value> = args.to_vec();
+    items.sort_by(value_compare);
+    items.dedup_by(|a, b| a == b);
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+}
+
+fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
+    // TODO: proper sorted map type; for now return a list of [k v] pairs in key order.
+    if args.len() % 2 != 0 {
+        return Err(ValueError::OddMap { count: args.len() });
+    }
+    let mut pairs: Vec<(Value, Value)> = args
+        .chunks(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+    pairs.sort_by(|a, b| value_compare(&a.0, &b.0));
+    let items: Vec<Value> = pairs
+        .into_iter()
+        .map(|(k, v)| Value::Vector(GcPtr::new(PersistentVector::from_iter([k, v]))))
+        .collect();
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
 
 fn builtin_sort_by_stub(_args: &[Value]) -> ValueResult<Value> {
@@ -2590,10 +2711,8 @@ fn builtin_join(args: &[Value]) -> ValueResult<Value> {
             &args[1],
         )
     };
-    let items = value_to_seq(coll)?;
-    let joined: String = items
-        .iter()
-        .map(|v| match v {
+    let joined: String = ValueIter::new(coll.clone())
+        .map(|v| match &v {
             Value::Str(s) => s.get().to_string(),
             other => format!("{}", other),
         })
