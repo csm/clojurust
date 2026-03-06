@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
@@ -46,8 +47,12 @@ enum Commands {
         expr: String,
     },
     /// Run clojure.test tests for one or more namespaces.
+    ///
+    /// If no namespaces are given, discovers and runs all test namespaces
+    /// found in the source paths.
     Test {
         /// Namespaces to test (e.g. my.app.core-test).
+        /// If omitted, all namespaces in --src-path are discovered.
         namespaces: Vec<String>,
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
@@ -150,11 +155,29 @@ fn format_eval_error(e: EvalError) -> miette::Report {
 
 // ── Test runner ───────────────────────────────────────────────────────────────
 
+/// Result of running tests for a single namespace.
+struct NsTestResult {
+    ns: String,
+    pass: i64,
+    fail: i64,
+    error: i64,
+    test_count: i64,
+    /// None if tests ran; Some(msg) if the ns failed to load.
+    load_error: Option<String>,
+}
+
 fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette::Result<()> {
-    if namespaces.is_empty() {
-        eprintln!("cljx test: no namespaces specified");
-        std::process::exit(2);
-    }
+    let namespaces = if namespaces.is_empty() {
+        let discovered = discover_namespaces(&src_paths);
+        if discovered.is_empty() {
+            eprintln!("cljx test: no test namespaces found in source paths");
+            std::process::exit(2);
+        }
+        eprintln!("Discovered {} test namespace(s).\n", discovered.len());
+        discovered
+    } else {
+        namespaces
+    };
 
     let globals = standard_env_with_paths(src_paths);
     let mut env = Env::new(globals, "user");
@@ -162,35 +185,190 @@ fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette
     // Ensure clojure.test is loaded.
     eval_in(&mut env, "(require 'clojure.test)", "<test>")?;
 
-    let mut total_fail = 0i64;
+    let start = Instant::now();
+    let mut results: Vec<NsTestResult> = Vec::new();
+
     for ns in &namespaces {
-        eval_in(&mut env, &format!("(require '{ns})"), "<test>")?;
-        let counters = eval_in(
-            &mut env,
-            &format!("(clojure.test/run-tests '{ns})"),
-            "<test>",
-        )?;
-        total_fail += counters_fail_count(&counters);
+        let result = run_single_ns_tests(&mut env, ns);
+        results.push(result);
     }
 
-    if total_fail > 0 {
+    let elapsed = start.elapsed();
+
+    // Print summary.
+    print_summary(&results, elapsed);
+
+    let total_fail: i64 = results.iter().map(|r| r.fail + r.error).sum();
+    let total_load_errors: usize = results.iter().filter(|r| r.load_error.is_some()).count();
+
+    if total_fail > 0 || total_load_errors > 0 {
         std::process::exit(1);
     }
     Ok(())
 }
 
-/// Sum :fail + :error from a clojure.test counters map.
-fn counters_fail_count(val: &Value) -> i64 {
-    let Value::Map(m) = val else { return 0 };
-    let mut n = 0i64;
+fn run_single_ns_tests(env: &mut Env, ns: &str) -> NsTestResult {
+    // Try to load the namespace.
+    if let Err(e) = eval_in(env, &format!("(require '{ns})"), "<test>") {
+        return NsTestResult {
+            ns: ns.to_string(),
+            pass: 0,
+            fail: 0,
+            error: 0,
+            test_count: 0,
+            load_error: Some(format!("{e}")),
+        };
+    }
+
+    // Run the tests.
+    match eval_in(
+        env,
+        &format!("(clojure.test/run-tests '{ns})"),
+        "<test>",
+    ) {
+        Ok(counters) => {
+            let (pass, fail, error, test_count) = extract_counters(&counters);
+            NsTestResult {
+                ns: ns.to_string(),
+                pass,
+                fail,
+                error,
+                test_count,
+                load_error: None,
+            }
+        }
+        Err(e) => NsTestResult {
+            ns: ns.to_string(),
+            pass: 0,
+            fail: 0,
+            error: 0,
+            test_count: 0,
+            load_error: Some(format!("run-tests failed: {e}")),
+        },
+    }
+}
+
+fn extract_counters(val: &Value) -> (i64, i64, i64, i64) {
+    let Value::Map(m) = val else {
+        return (0, 0, 0, 0);
+    };
+    let mut pass = 0i64;
+    let mut fail = 0i64;
+    let mut error = 0i64;
+    let mut test_count = 0i64;
     m.for_each(|k, v| {
-        if let (Value::Keyword(kw), Value::Long(count)) = (k, v)
-            && matches!(kw.get().name.as_ref(), "fail" | "error")
-        {
-            n += count;
+        if let (Value::Keyword(kw), Value::Long(count)) = (k, v) {
+            match kw.get().name.as_ref() {
+                "pass" => pass = *count,
+                "fail" => fail = *count,
+                "error" => error = *count,
+                "test" => test_count = *count,
+                _ => {}
+            }
         }
     });
-    n
+    (pass, fail, error, test_count)
+}
+
+fn print_summary(results: &[NsTestResult], elapsed: std::time::Duration) {
+    let total_tests: i64 = results.iter().map(|r| r.test_count).sum();
+    let total_assertions: i64 = results.iter().map(|r| r.pass + r.fail + r.error).sum();
+    let total_pass: i64 = results.iter().map(|r| r.pass).sum();
+    let total_fail: i64 = results.iter().map(|r| r.fail).sum();
+    let total_error: i64 = results.iter().map(|r| r.error).sum();
+    let load_errors: Vec<&NsTestResult> = results.iter().filter(|r| r.load_error.is_some()).collect();
+    let ns_with_failures: Vec<&NsTestResult> = results
+        .iter()
+        .filter(|r| r.load_error.is_none() && (r.fail > 0 || r.error > 0))
+        .collect();
+
+    println!();
+    println!("══════════════════════════════════════════════════════════════");
+    println!("Test Summary");
+    println!("══════════════════════════════════════════════════════════════");
+    println!(
+        "Ran {} tests containing {} assertions across {} namespace(s) in {:.1}s.",
+        total_tests,
+        total_assertions,
+        results.len(),
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "{} passed, {} failed, {} errors.",
+        total_pass, total_fail, total_error
+    );
+
+    if !load_errors.is_empty() {
+        println!();
+        println!(
+            "── {} namespace(s) failed to load ──────────────────────────────",
+            load_errors.len()
+        );
+        for r in &load_errors {
+            println!("  {} — {}", r.ns, r.load_error.as_deref().unwrap_or("?"));
+        }
+    }
+
+    if !ns_with_failures.is_empty() {
+        println!();
+        println!(
+            "── {} namespace(s) with test failures ──────────────────────────",
+            ns_with_failures.len()
+        );
+        for r in &ns_with_failures {
+            println!("  {} — {} failures, {} errors", r.ns, r.fail, r.error);
+        }
+    }
+
+    if load_errors.is_empty() && ns_with_failures.is_empty() {
+        println!();
+        println!("All tests passed.");
+    }
+    println!("══════════════════════════════════════════════════════════════");
+}
+
+/// Discover all namespace names from `.cljc` / `.cljrs` files in the given source paths.
+fn discover_namespaces(src_paths: &[PathBuf]) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    for dir in src_paths {
+        if dir.is_dir() {
+            discover_in_dir(dir, dir, &mut namespaces);
+        }
+    }
+    namespaces.sort();
+    namespaces
+}
+
+fn discover_in_dir(root: &PathBuf, dir: &PathBuf, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_in_dir(root, &path, out);
+        } else if let Some(ext) = path.extension() {
+            if ext == "cljc" || ext == "cljrs" {
+                if let Some(ns) = file_to_namespace(root, &path) {
+                    out.push(ns);
+                }
+            }
+        }
+    }
+}
+
+/// Convert a file path relative to the source root into a Clojure namespace name.
+/// e.g. `test/clojure/core_test/juxt.cljc` relative to `test/` → `clojure.core-test.juxt`
+fn file_to_namespace(root: &PathBuf, file: &PathBuf) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let stem = rel.with_extension(""); // remove .cljc / .cljrs
+    let ns = stem
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, ".")
+        .replace('_', "-");
+    Some(ns)
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
