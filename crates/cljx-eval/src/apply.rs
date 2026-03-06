@@ -518,9 +518,9 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     }
 }
 
-/// Handle `(swap! atom f & args)`.
 // ── atom ──────────────────────────────────────────────────────────────────────
 
+/// Handle `(swap! atom f & args)`.
 fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     if arg_forms.is_empty() {
         return Err(EvalError::Arity {
@@ -558,12 +558,10 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     }
 
     // Validate :meta must be nil or a map.
-    if let Some(ref m) = meta_opt {
-        if !matches!(m, Value::Nil | Value::Map(_)) {
-            return Err(EvalError::Thrown(Value::string(
-                "Atom metadata must be a map or nil".to_string(),
-            )));
-        }
+    if let Some(ref m) = meta_opt && !matches!(m, Value::Nil | Value::Map(_)) {
+        return Err(EvalError::Thrown(Value::string(
+            "Atom metadata must be a map or nil".to_string(),
+        )));
     }
 
     // Check validator on the initial value.
