@@ -48,8 +48,7 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
         // Save and restore *ns* so the caller's namespace is not disturbed.
         let saved_ns = globals
             .lookup_var("clojure.core", "*ns*")
-            .map(|v| crate::dynamics::deref_var(&v))
-            .flatten();
+            .and_then(|v| crate::dynamics::deref_var(&v));
         {
             let mut env = Env::new(globals.clone(), ns_name);
             let mut parser = cljx_reader::Parser::new(src, file_path);
@@ -59,11 +58,10 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
             }
         }
         // Restore *ns* to the caller's namespace.
-        if let Some(saved) = saved_ns {
-            if let Some(var) = globals.lookup_var("clojure.core", "*ns*") {
+        if let Some(saved) = saved_ns
+            && let Some(var) = globals.lookup_var("clojure.core", "*ns*") {
                 var.get().bind(saved);
             }
-        }
 
         // Mark loaded and remove from in-progress set.
         globals.loading.lock().unwrap().remove(ns_name.as_ref());

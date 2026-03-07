@@ -163,7 +163,9 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         // Identity shortcut: same GcPtr → equal without realizing.
         // Required for infinite lazy seqs: (let [r (range)] (= r r)) must not hang.
-        if let (Value::LazySeq(a), Value::LazySeq(b)) = (self, other) && GcPtr::ptr_eq(a, b) {
+        if let (Value::LazySeq(a), Value::LazySeq(b)) = (self, other)
+            && GcPtr::ptr_eq(a, b)
+        {
             return true;
         }
         // Realize lazy sequences before comparing.

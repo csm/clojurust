@@ -131,8 +131,17 @@ fn trim_newline(args: &[Value]) -> ValueResult<Value> {
 fn is_java_whitespace(c: char) -> bool {
     matches!(
         c,
-        ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C' | '\u{1C}' | '\u{1D}' | '\u{1E}' | '\u{1F}'
-            | '\u{2028}' | '\u{2029}'
+        ' ' | '\t'
+            | '\n'
+            | '\r'
+            | '\x0B'
+            | '\x0C'
+            | '\u{1C}'
+            | '\u{1D}'
+            | '\u{1E}'
+            | '\u{1F}'
+            | '\u{2028}'
+            | '\u{2029}'
     )
 }
 

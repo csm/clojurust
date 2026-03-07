@@ -170,7 +170,11 @@ struct NsTestResult {
     load_error: Option<String>,
 }
 
-fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>, verbose: bool) -> miette::Result<()> {
+fn run_tests_command(
+    namespaces: Vec<String>,
+    src_paths: Vec<PathBuf>,
+    verbose: bool,
+) -> miette::Result<()> {
     let namespaces = if namespaces.is_empty() {
         let discovered = discover_namespaces(&src_paths);
         if discovered.is_empty() {
@@ -233,11 +237,7 @@ fn run_single_ns_tests(env: &mut Env, ns: &str) -> NsTestResult {
     }
 
     // Run the tests.
-    match eval_in(
-        env,
-        &format!("(clojure.test/run-tests '{ns})"),
-        "<test>",
-    ) {
+    match eval_in(env, &format!("(clojure.test/run-tests '{ns})"), "<test>") {
         Ok(counters) => {
             let (pass, fail, error, test_count) = extract_counters(&counters);
             NsTestResult {
@@ -288,7 +288,8 @@ fn print_summary(results: &[NsTestResult], elapsed: std::time::Duration) {
     let total_pass: i64 = results.iter().map(|r| r.pass).sum();
     let total_fail: i64 = results.iter().map(|r| r.fail).sum();
     let total_error: i64 = results.iter().map(|r| r.error).sum();
-    let load_errors: Vec<&NsTestResult> = results.iter().filter(|r| r.load_error.is_some()).collect();
+    let load_errors: Vec<&NsTestResult> =
+        results.iter().filter(|r| r.load_error.is_some()).collect();
     let ns_with_failures: Vec<&NsTestResult> = results
         .iter()
         .filter(|r| r.load_error.is_none() && (r.fail > 0 || r.error > 0))

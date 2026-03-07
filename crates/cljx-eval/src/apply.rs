@@ -561,7 +561,9 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     }
 
     // Validate :meta must be nil or a map.
-    if let Some(ref m) = meta_opt && !matches!(m, Value::Nil | Value::Map(_)) {
+    if let Some(ref m) = meta_opt
+        && !matches!(m, Value::Nil | Value::Map(_))
+    {
         return Err(EvalError::Thrown(Value::string(
             "Atom metadata must be a map or nil".to_string(),
         )));
@@ -990,10 +992,8 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             )));
         }
     };
-    Ok(
-        match env.globals.lookup_var_in_ns(&resolve_ns, &sym_name) {
-            Some(var_ptr) => Value::Var(var_ptr),
-            None => Value::Nil,
-        },
-    )
+    Ok(match env.globals.lookup_var_in_ns(&resolve_ns, &sym_name) {
+        Some(var_ptr) => Value::Var(var_ptr),
+        None => Value::Nil,
+    })
 }

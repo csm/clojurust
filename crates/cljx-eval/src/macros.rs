@@ -146,7 +146,7 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
             let forms: Vec<Form> = s
                 .get()
                 .iter()
-                .map(|v| value_to_form(&v, span.clone()))
+                .map(|v| value_to_form(v, span.clone()))
                 .collect::<EvalResult<_>>()?;
             FormKind::Set(forms)
         }
