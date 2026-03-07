@@ -38,11 +38,15 @@ impl PersistentVector {
         self.inner.last()
     }
 
-    /// Return a new vector with element `idx` replaced.
+    /// Return a new vector with element `idx` replaced, or appended if `idx == len`.
     pub fn assoc_nth(&self, idx: usize, val: Value) -> Option<Self> {
-        Some(Self {
-            inner: self.inner.set(idx, val)?,
-        })
+        if idx == self.inner.len() {
+            Some(self.conj(val))
+        } else {
+            Some(Self {
+                inner: self.inner.set(idx, val)?,
+            })
+        }
     }
 
     /// Remove the last element. Returns `None` if empty.

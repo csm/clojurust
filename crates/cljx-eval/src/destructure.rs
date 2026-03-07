@@ -121,7 +121,7 @@ pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
         }
         Value::List(l) => l.get().iter().cloned().collect(),
         Value::Vector(v) => v.get().iter().cloned().collect(),
-        Value::Set(s) => s.get().iter().cloned().collect(),
+        Value::Set(s) => s.iter().cloned().collect(),
         _ => vec![],
     }
 }

@@ -692,13 +692,14 @@ fn eval_and(args: &[Form], env: &mut Env) -> EvalResult {
 }
 
 fn eval_or(args: &[Form], env: &mut Env) -> EvalResult {
+    let mut last = Value::Nil;
     for form in args {
-        let v = eval(form, env)?;
-        if !matches!(v, Value::Nil | Value::Bool(false)) {
-            return Ok(v);
+        last = eval(form, env)?;
+        if !matches!(last, Value::Nil | Value::Bool(false)) {
+            return Ok(last);
         }
     }
-    Ok(Value::Nil)
+    Ok(last)
 }
 
 // ── require ───────────────────────────────────────────────────────────────────

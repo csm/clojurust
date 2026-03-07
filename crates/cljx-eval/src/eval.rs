@@ -9,7 +9,7 @@ use cljx_value::{
     FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
     Value,
 };
-
+use cljx_value::value::SetValue;
 use crate::apply::eval_call;
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
@@ -71,7 +71,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
                 let v = eval(f, env)?;
                 s = s.conj(v);
             }
-            Ok(Value::Set(GcPtr::new(s)))
+            Ok(Value::Set(SetValue::Hash(GcPtr::new(s))))
         }
 
         // ── Reader macros ─────────────────────────────────────────────────
@@ -310,7 +310,7 @@ pub fn form_to_value(form: &Form) -> Value {
             let s = forms
                 .iter()
                 .fold(PersistentHashSet::empty(), |s, f| s.conj(form_to_value(f)));
-            Value::Set(GcPtr::new(s))
+            Value::Set(SetValue::Hash(GcPtr::new(s)))
         }
 
         FormKind::Quote(inner) => {

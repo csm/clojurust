@@ -203,7 +203,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
         }
         Value::Set(s) => match args.first() {
             Some(k) => {
-                if s.get().contains(k) {
+                if s.contains(k) {
                     Ok(k.clone())
                 } else {
                     Ok(Value::Nil)

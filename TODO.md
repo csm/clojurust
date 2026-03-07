@@ -244,6 +244,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Numeric tower parity with Clojure (promotion, overflow to BigInt, etc.)
 - [ ] `*clojure-version*` / `*cljx-version*` vars
 - [x] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars (defined in Phase 8-ext-2)
+- [ ] Preserve metadata for `assoc`.
 
 ---
 

@@ -7,12 +7,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use cljx_gc::GcPtr;
-use cljx_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance,
-    Value, ValueError, ValueResult, Volatile,
-};
-
+use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
+use cljx_value::value::SetValue;
 use crate::env::GlobalEnv;
 
 // ── Registration ──────────────────────────────────────────────────────────────
@@ -73,6 +69,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("even?", Arity::Fixed(1), builtin_even_q),
         ("odd?", Arity::Fixed(1), builtin_odd_q),
         ("ratio?", Arity::Fixed(1), builtin_ratio_q),
+        ("sorted?", Arity::Fixed(1), builtin_sorted_q),
         // Collections (non-HOF)
         ("list", Arity::Variadic { min: 0 }, builtin_list),
         ("list*", Arity::Variadic { min: 1 }, builtin_list_star),
@@ -102,6 +99,32 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("into", Arity::Fixed(2), builtin_into),
         ("empty", Arity::Fixed(1), builtin_empty),
         ("vec", Arity::Fixed(1), builtin_vec),
+        ("object-array", Arity::Fixed(1), builtin_object_array),
+        ("to-array", Arity::Fixed(1), builtin_to_array),
+        ("to-array-2d", Arity::Fixed(1), builtin_to_array_2d),
+        ("into-array", Arity::Variadic { min: 1 }, builtin_into_array),
+        ("aclone", Arity::Fixed(1), builtin_aclone),
+        ("alength", Arity::Fixed(1), builtin_alength),
+        ("aget", Arity::Variadic { min: 2 }, builtin_aget),
+        ("aset", Arity::Fixed(3), builtin_aset),
+        ("amap", Arity::Fixed(1), builtin_amap_stub),
+        ("areduce", Arity::Fixed(1), builtin_areduce_stub),
+        ("int-array", Arity::Variadic { min: 1 }, builtin_int_array),
+        ("long-array", Arity::Variadic { min: 1 }, builtin_long_array),
+        ("short-array", Arity::Variadic { min: 1 }, builtin_short_array),
+        ("byte-array", Arity::Variadic { min: 1 }, builtin_byte_array),
+        ("float-array", Arity::Variadic { min: 1 }, builtin_float_array),
+        ("double-array", Arity::Variadic { min: 1 }, builtin_double_array),
+        ("char-array", Arity::Variadic { min: 1 }, builtin_char_array),
+        ("boolean-array", Arity::Variadic { min: 1 }, builtin_boolean_array),
+        ("booleans", Arity::Fixed(1), builtin_identity_cast),
+        ("bytes", Arity::Fixed(1), builtin_identity_cast),
+        ("chars", Arity::Fixed(1), builtin_identity_cast),
+        ("shorts", Arity::Fixed(1), builtin_identity_cast),
+        ("ints", Arity::Fixed(1), builtin_identity_cast),
+        ("longs", Arity::Fixed(1), builtin_identity_cast),
+        ("floats", Arity::Fixed(1), builtin_identity_cast),
+        ("doubles", Arity::Fixed(1), builtin_identity_cast),
         ("set", Arity::Fixed(1), builtin_set_fn),
         ("disj", Arity::Variadic { min: 1 }, builtin_disj),
         ("peek", Arity::Fixed(1), builtin_peek),
@@ -415,7 +438,7 @@ impl Iterator for ValueIter {
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::Set(s) => {
-                    let items: Vec<Value> = s.get().iter().cloned().collect();
+                    let items: Vec<Value> = s.iter().cloned().collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::Map(m) => {
@@ -534,19 +557,124 @@ fn is_truthy(v: &Value) -> bool {
 
 // ── Arithmetic ────────────────────────────────────────────────────────────────
 
-fn builtin_add(args: &[Value]) -> ValueResult<Value> {
-    if args.iter().any(|v| matches!(v, Value::Double(_))) {
-        let mut sum = 0.0f64;
-        for v in args {
-            sum += numeric_as_f64(v)?;
+/// Determine the numeric "category" for type promotion.
+/// Double > BigDecimal > Ratio > BigInt > Long.
+/// Double is contagious; otherwise widen to the broadest non-Double type.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+enum NumCat {
+    Long,
+    BigInt,
+    Ratio,
+    BigDecimal,
+    Double,
+}
+
+fn num_category(v: &Value) -> ValueResult<NumCat> {
+    match v {
+        Value::Long(_) => Ok(NumCat::Long),
+        Value::BigInt(_) => Ok(NumCat::BigInt),
+        Value::Ratio(_) => Ok(NumCat::Ratio),
+        Value::BigDecimal(_) => Ok(NumCat::BigDecimal),
+        Value::Double(_) => Ok(NumCat::Double),
+        _ => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn widest_category(args: &[Value]) -> ValueResult<NumCat> {
+    let mut cat = NumCat::Long;
+    for v in args {
+        let c = num_category(v)?;
+        if c > cat {
+            cat = c;
         }
-        Ok(Value::Double(sum))
+    }
+    Ok(cat)
+}
+
+/// Simplify a Ratio: if denominator is 1, return Long or BigInt.
+/// If `preserve_bigint` is true, integer results stay as BigInt (for when an operand was BigInt).
+fn simplify_ratio_with(r: num_rational::Ratio<num_bigint::BigInt>, preserve_bigint: bool) -> Value {
+    if r.is_integer() {
+        let n = r.to_integer();
+        if preserve_bigint {
+            Value::BigInt(GcPtr::new(n))
+        } else {
+            match n.to_i64() {
+                Some(l) => Value::Long(l),
+                None => Value::BigInt(GcPtr::new(n)),
+            }
+        }
     } else {
-        let mut sum = 0i64;
-        for v in args {
-            sum = sum.wrapping_add(numeric_as_i64(v)?);
+        Value::Ratio(GcPtr::new(r))
+    }
+}
+
+fn simplify_ratio(r: num_rational::Ratio<num_bigint::BigInt>) -> Value {
+    simplify_ratio_with(r, false)
+}
+
+/// Simplify a BigInt: if it fits in i64, return Long.
+/// Used only when Long arithmetic overflows — NOT when BigInt was explicitly requested.
+fn simplify_bigint(n: num_bigint::BigInt) -> Value {
+    match n.to_i64() {
+        Some(l) => Value::Long(l),
+        None => Value::BigInt(GcPtr::new(n)),
+    }
+}
+
+fn builtin_add(args: &[Value]) -> ValueResult<Value> {
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double => {
+            let mut sum = 0.0f64;
+            for v in args {
+                sum += numeric_as_f64(v)?;
+            }
+            Ok(Value::Double(sum))
         }
-        Ok(Value::Long(sum))
+        NumCat::BigDecimal => {
+            let mut sum = bigdecimal::BigDecimal::from(0);
+            for v in args {
+                sum += numeric_as_bigdecimal(v)?;
+            }
+            Ok(Value::BigDecimal(GcPtr::new(sum)))
+        }
+        NumCat::Ratio => {
+            let mut sum = num_rational::Ratio::from(num_bigint::BigInt::from(0));
+            for v in args {
+                sum += numeric_as_ratio(v)?;
+            }
+            Ok(simplify_ratio(sum))
+        }
+        NumCat::BigInt => {
+            let mut sum = num_bigint::BigInt::from(0);
+            for v in args {
+                sum += numeric_as_bigint(v)?;
+            }
+            Ok(Value::BigInt(GcPtr::new(sum)))
+        }
+        NumCat::Long => {
+            let mut sum: i64 = 0;
+            for v in args {
+                let n = numeric_as_i64(v)?;
+                match sum.checked_add(n) {
+                    Some(s) => sum = s,
+                    None => {
+                        // Overflow: promote to BigInt for remaining args
+                        let mut big = num_bigint::BigInt::from(sum) + num_bigint::BigInt::from(n);
+                        for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
+                        {
+                            big += numeric_as_bigint(v2)?;
+                        }
+                        return Ok(simplify_bigint(big));
+                    }
+                }
+            }
+            Ok(Value::Long(sum))
+        }
     }
 }
 
@@ -560,42 +688,124 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
     }
     if args.len() == 1 {
         return match &args[0] {
-            Value::Long(n) => Ok(Value::Long(-n)),
+            Value::Long(n) => match n.checked_neg() {
+                Some(r) => Ok(Value::Long(r)),
+                None => Ok(Value::BigInt(GcPtr::new(-num_bigint::BigInt::from(*n)))),
+            },
             Value::Double(f) => Ok(Value::Double(-f)),
+            Value::BigInt(n) => Ok(simplify_bigint(-n.get().clone())),
+            Value::BigDecimal(d) => Ok(Value::BigDecimal(GcPtr::new(-d.get().clone()))),
+            Value::Ratio(r) => Ok(simplify_ratio(-r.get().clone())),
             v => Err(ValueError::WrongType {
                 expected: "number",
                 got: v.type_name().to_string(),
             }),
         };
     }
-    if args.iter().any(|v| matches!(v, Value::Double(_))) {
-        let mut result = numeric_as_f64(&args[0])?;
-        for v in &args[1..] {
-            result -= numeric_as_f64(v)?;
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double => {
+            let mut result = numeric_as_f64(&args[0])?;
+            for v in &args[1..] {
+                result -= numeric_as_f64(v)?;
+            }
+            Ok(Value::Double(result))
         }
-        Ok(Value::Double(result))
-    } else {
-        let mut result = numeric_as_i64(&args[0])?;
-        for v in &args[1..] {
-            result = result.wrapping_sub(numeric_as_i64(v)?);
+        NumCat::BigDecimal => {
+            let mut result = numeric_as_bigdecimal(&args[0])?;
+            for v in &args[1..] {
+                result -= numeric_as_bigdecimal(v)?;
+            }
+            Ok(Value::BigDecimal(GcPtr::new(result)))
         }
-        Ok(Value::Long(result))
+        NumCat::Ratio => {
+            let mut result = numeric_as_ratio(&args[0])?;
+            for v in &args[1..] {
+                result -= numeric_as_ratio(v)?;
+            }
+            Ok(simplify_ratio(result))
+        }
+        NumCat::BigInt => {
+            let mut result = numeric_as_bigint(&args[0])?;
+            for v in &args[1..] {
+                result -= numeric_as_bigint(v)?;
+            }
+            Ok(Value::BigInt(GcPtr::new(result)))
+        }
+        NumCat::Long => {
+            let mut result = numeric_as_i64(&args[0])?;
+            for v in &args[1..] {
+                let n = numeric_as_i64(v)?;
+                match result.checked_sub(n) {
+                    Some(r) => result = r,
+                    None => {
+                        let mut big =
+                            num_bigint::BigInt::from(result) - num_bigint::BigInt::from(n);
+                        for v2 in
+                            &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
+                        {
+                            big -= numeric_as_bigint(v2)?;
+                        }
+                        return Ok(simplify_bigint(big));
+                    }
+                }
+            }
+            Ok(Value::Long(result))
+        }
     }
 }
 
 fn builtin_mul(args: &[Value]) -> ValueResult<Value> {
-    if args.iter().any(|v| matches!(v, Value::Double(_))) {
-        let mut result = 1.0f64;
-        for v in args {
-            result *= numeric_as_f64(v)?;
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double => {
+            let mut result = 1.0f64;
+            for v in args {
+                result *= numeric_as_f64(v)?;
+            }
+            Ok(Value::Double(result))
         }
-        Ok(Value::Double(result))
-    } else {
-        let mut result = 1i64;
-        for v in args {
-            result = result.wrapping_mul(numeric_as_i64(v)?);
+        NumCat::BigDecimal => {
+            let mut result = bigdecimal::BigDecimal::from(1);
+            for v in args {
+                result *= numeric_as_bigdecimal(v)?;
+            }
+            Ok(Value::BigDecimal(GcPtr::new(result)))
         }
-        Ok(Value::Long(result))
+        NumCat::Ratio => {
+            let mut result = num_rational::Ratio::from(num_bigint::BigInt::from(1));
+            for v in args {
+                result *= numeric_as_ratio(v)?;
+            }
+            Ok(simplify_ratio(result))
+        }
+        NumCat::BigInt => {
+            let mut result = num_bigint::BigInt::from(1);
+            for v in args {
+                result *= numeric_as_bigint(v)?;
+            }
+            Ok(Value::BigInt(GcPtr::new(result)))
+        }
+        NumCat::Long => {
+            let mut result: i64 = 1;
+            for v in args {
+                let n = numeric_as_i64(v)?;
+                match result.checked_mul(n) {
+                    Some(r) => result = r,
+                    None => {
+                        let mut big =
+                            num_bigint::BigInt::from(result) * num_bigint::BigInt::from(n);
+                        for v2 in
+                            &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
+                        {
+                            big *= numeric_as_bigint(v2)?;
+                        }
+                        return Ok(simplify_bigint(big));
+                    }
+                }
+            }
+            Ok(Value::Long(result))
+        }
     }
 }
 
@@ -608,39 +818,42 @@ fn builtin_div(args: &[Value]) -> ValueResult<Value> {
         });
     }
     if args.len() == 1 {
-        let d = numeric_as_f64(&args[0])?;
-        return Ok(Value::Double(1.0 / d));
+        // (/ x) => 1/x — produce a ratio for integers
+        return builtin_div(&[Value::Long(1), args[0].clone()]);
     }
-    // If any arg is float, return float.
-    if args.iter().any(|v| matches!(v, Value::Double(_))) {
-        let mut result = numeric_as_f64(&args[0])?;
-        for v in &args[1..] {
-            let d = numeric_as_f64(v)?;
-            if d == 0.0 {
-                return Err(ValueError::Other("divide by zero".into()));
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double => {
+            let mut result = numeric_as_f64(&args[0])?;
+            for v in &args[1..] {
+                result /= numeric_as_f64(v)?;
             }
-            result /= d;
+            Ok(Value::Double(result))
         }
-        Ok(Value::Double(result))
-    } else {
-        // Integer division — check for exact division.
-        let mut result = numeric_as_i64(&args[0])?;
-        for v in &args[1..] {
-            let d = numeric_as_i64(v)?;
-            if d == 0 {
-                return Err(ValueError::Other("divide by zero".into()));
-            }
-            if result % d != 0 {
-                // Non-exact: promote to float division from the start.
-                let mut fr = numeric_as_f64(&args[0])?;
-                for v2 in &args[1..] {
-                    fr /= numeric_as_f64(v2)?;
+        NumCat::BigDecimal => {
+            let mut result = numeric_as_bigdecimal(&args[0])?;
+            for v in &args[1..] {
+                let d = numeric_as_bigdecimal(v)?;
+                if d.is_zero() {
+                    return Err(ValueError::Other("divide by zero".into()));
                 }
-                return Ok(Value::Double(fr));
+                result = result / d;
             }
-            result /= d;
+            Ok(Value::BigDecimal(GcPtr::new(result)))
         }
-        Ok(Value::Long(result))
+        _ => {
+            // For Long, BigInt, Ratio: use Ratio arithmetic to get exact results
+            let preserve_bigint = cat == NumCat::BigInt;
+            let mut result = numeric_as_ratio(&args[0])?;
+            for v in &args[1..] {
+                let d = numeric_as_ratio(v)?;
+                if d.is_zero() {
+                    return Err(ValueError::Other("divide by zero".into()));
+                }
+                result = result / d;
+            }
+            Ok(simplify_ratio_with(result, preserve_bigint))
+        }
     }
 }
 
@@ -1181,7 +1394,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::List(l) => l.get().is_empty(),
         Value::Vector(v) => v.get().is_empty(),
         Value::Map(m) => m.count() == 0,
-        Value::Set(s) => s.get().is_empty(),
+        Value::Set(s) => s.is_empty(),
         Value::Str(s) => s.get().is_empty(),
         _ => false,
     };
@@ -1196,6 +1409,10 @@ fn builtin_odd_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_ratio_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::Ratio(_))))
+}
+
+fn builtin_sorted_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(&args[0], Value::Map(MapValue::Sorted(_))) || matches!(&args[0], Value::Set(SetValue::Sorted(_)))))
 }
 
 // ── Collections ───────────────────────────────────────────────────────────────
@@ -1254,7 +1471,7 @@ fn builtin_hash_set(args: &[Value]) -> ValueResult<Value> {
         .iter()
         .cloned()
         .fold(PersistentHashSet::empty(), |s, v| s.conj(v));
-    Ok(Value::Set(GcPtr::new(set)))
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(set))))
 }
 
 fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
@@ -1271,7 +1488,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                 Value::List(GcPtr::new(PersistentList::cons(v.clone(), tail_clone)))
             }
             Value::Vector(vec) => Value::Vector(GcPtr::new(vec.get().conj(v.clone()))),
-            Value::Set(s) => Value::Set(GcPtr::new(s.get().conj(v.clone()))),
+            Value::Set(s) => Value::Set(s.conj(v.clone())),
             Value::Map(m) => {
                 // v should be a [key val] pair.
                 let pair = value_to_seq(v)?;
@@ -1374,7 +1591,7 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
             }
         }
         Value::Set(s) => {
-            if s.get().contains(&args[1]) {
+            if s.contains(&args[1]) {
                 Ok(args[1].clone())
             } else {
                 Ok(default)
@@ -1426,7 +1643,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
         Value::List(l) => l.get().count(),
         Value::Vector(v) => v.get().count(),
         Value::Map(m) => m.count(),
-        Value::Set(s) => s.get().count(),
+        Value::Set(s) => s.count(),
         Value::Str(s) => s.get().chars().count(),
         Value::TypeInstance(ti) => ti.get().fields.count(),
         _ => {
@@ -1478,10 +1695,10 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             Ok(Value::List(GcPtr::new(PersistentList::from_iter(pairs))))
         }
         Value::Set(s) => {
-            if s.get().is_empty() {
+            if s.is_empty() {
                 Ok(Value::Nil)
             } else {
-                let items: Vec<Value> = s.get().iter().cloned().collect();
+                let items: Vec<Value> = s.iter().cloned().collect();
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
             }
         }
@@ -1681,7 +1898,7 @@ fn builtin_vals(args: &[Value]) -> ValueResult<Value> {
 fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(match &args[0] {
         Value::Map(m) => m.contains_key(&args[1]),
-        Value::Set(s) => s.get().contains(&args[1]),
+        Value::Set(s) => s.contains(&args[1]),
         Value::Vector(v) => {
             if let Value::Long(idx) = &args[1] {
                 *idx >= 0 && (*idx as usize) < v.get().count()
@@ -1730,7 +1947,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
                 Value::List(GcPtr::new(PersistentList::cons(item, tail)))
             }
             Value::Vector(v) => Value::Vector(GcPtr::new(v.get().conj(item))),
-            Value::Set(s) => Value::Set(GcPtr::new(s.get().conj(item))),
+            Value::Set(s) => Value::Set(s.conj(item)),
             Value::Map(m) => {
                 let pair = value_to_seq(&item)?;
                 if pair.len() != 2 {
@@ -1754,7 +1971,7 @@ fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
         Value::List(_) => Value::List(GcPtr::new(PersistentList::empty())),
         Value::Vector(_) => Value::Vector(GcPtr::new(PersistentVector::empty())),
         Value::Map(_) => Value::Map(MapValue::empty()),
-        Value::Set(_) => Value::Set(GcPtr::new(PersistentHashSet::empty())),
+        Value::Set(_) => Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))),
         Value::Nil => Value::Nil,
         _ => Value::Nil,
     })
@@ -1766,19 +1983,266 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
     ))))
 }
 
+/// `(object-array size-or-coll)` — if given a number, creates a vector of nils;
+/// if given a collection, converts it to a vector.
+fn builtin_object_array(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(n) => {
+            let size = *n as usize;
+            let v = PersistentVector::from_iter(std::iter::repeat_n(Value::Nil, size));
+            Ok(Value::Vector(GcPtr::new(v)))
+        }
+        Value::Double(f) => {
+            let size = *f as usize;
+            let v = PersistentVector::from_iter(std::iter::repeat_n(Value::Nil, size));
+            Ok(Value::Vector(GcPtr::new(v)))
+        }
+        _ => {
+            // Treat as collection
+            let v = PersistentVector::from_iter(ValueIter::new(args[0].clone()));
+            Ok(Value::Vector(GcPtr::new(v)))
+        }
+    }
+}
+
+/// `(to-array coll)` — converts any collection to a vector.
+fn builtin_to_array(args: &[Value]) -> ValueResult<Value> {
+    let v = PersistentVector::from_iter(ValueIter::new(args[0].clone()));
+    Ok(Value::Vector(GcPtr::new(v)))
+}
+
+/// `(to-array-2d coll)` — converts a collection of collections to a vector of vectors.
+fn builtin_to_array_2d(args: &[Value]) -> ValueResult<Value> {
+    let outer: Vec<Value> = ValueIter::new(args[0].clone())
+        .map(|inner| {
+            let v = PersistentVector::from_iter(ValueIter::new(inner));
+            Value::Vector(GcPtr::new(v))
+        })
+        .collect();
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(outer))))
+}
+
+/// `(into-array coll)` or `(into-array type coll)` — converts to a vector (type arg ignored).
+fn builtin_into_array(args: &[Value]) -> ValueResult<Value> {
+    let coll = if args.len() >= 2 { &args[1] } else { &args[0] };
+    let v = PersistentVector::from_iter(ValueIter::new(coll.clone()));
+    Ok(Value::Vector(GcPtr::new(v)))
+}
+
+/// `(aclone arr)` — clone an array (returns a copy of the vector).
+fn builtin_aclone(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Vector(_) => Ok(args[0].clone()),
+        _ => Err(ValueError::WrongType {
+            expected: "array",
+            got: args[0].type_name().to_string(),
+        }),
+    }
+}
+
+/// `(alength arr)` — length of an array.
+fn builtin_alength(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::Long(v.get().count() as i64)),
+        _ => Err(ValueError::WrongType {
+            expected: "array",
+            got: args[0].type_name().to_string(),
+        }),
+    }
+}
+
+/// `(aget arr idx & idxs)` — get element from an array, supports nested access.
+fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
+    let mut current = args[0].clone();
+    for idx_val in &args[1..] {
+        let idx = numeric_as_i64(idx_val)? as usize;
+        match &current {
+            Value::Vector(v) => {
+                current = v.get().nth(idx).cloned().unwrap_or(Value::Nil);
+            }
+            _ => {
+                return Err(ValueError::WrongType {
+                    expected: "array",
+                    got: current.type_name().to_string(),
+                });
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// `(aset arr idx val)` — set element in an array (returns new vector).
+fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Vector(v) => {
+            let idx = numeric_as_i64(&args[1])? as usize;
+            match v.get().assoc_nth(idx, args[2].clone()) {
+                Some(new_v) => Ok(Value::Vector(GcPtr::new(new_v))),
+                None => Err(ValueError::Other(format!(
+                    "index out of bounds: {} >= {}",
+                    idx,
+                    v.get().count()
+                ))),
+            }
+        }
+        _ => Err(ValueError::WrongType {
+            expected: "array",
+            got: args[0].type_name().to_string(),
+        }),
+    }
+}
+
+// amap and areduce are macros in Clojure; stubs for now.
+fn builtin_amap_stub(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other("amap is a macro — not yet implemented".into()))
+}
+fn builtin_areduce_stub(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other("areduce is a macro — not yet implemented".into()))
+}
+
+/// Helper: build a typed array. `(xxx-array size init-or-coll)` or `(xxx-array size-or-coll)`.
+/// `coerce` converts each element to the target type.
+fn make_typed_array(
+    args: &[Value],
+    default: Value,
+    coerce: fn(&Value) -> ValueResult<Value>,
+) -> ValueResult<Value> {
+    match args.len() {
+        1 => {
+            // Single arg: size (numeric) or collection
+            match &args[0] {
+                Value::Long(n) => {
+                    let size = *n as usize;
+                    let v = PersistentVector::from_iter(std::iter::repeat_n(default, size));
+                    Ok(Value::Vector(GcPtr::new(v)))
+                }
+                _ => {
+                    // Treat as collection, coerce each element
+                    let items: ValueResult<Vec<Value>> =
+                        ValueIter::new(args[0].clone()).map(|v| coerce(&v)).collect();
+                    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(items?))))
+                }
+            }
+        }
+        2 => {
+            // Two args: (xxx-array size init-coll)
+            let size = numeric_as_i64(&args[0])? as usize;
+            let items: ValueResult<Vec<Value>> =
+                ValueIter::new(args[1].clone()).map(|v| coerce(&v)).collect();
+            let mut vec: Vec<Value> = items?;
+            vec.resize(size, default);
+            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vec))))
+        }
+        _ => Err(ValueError::ArityError {
+            name: "typed-array".into(),
+            expected: "1 or 2".into(),
+            got: args.len(),
+        }),
+    }
+}
+
+fn coerce_to_long(v: &Value) -> ValueResult<Value> {
+    Ok(Value::Long(numeric_as_i64(v)?))
+}
+
+fn coerce_to_double(v: &Value) -> ValueResult<Value> {
+    Ok(Value::Double(numeric_as_f64(v)?))
+}
+
+fn coerce_to_bool(v: &Value) -> ValueResult<Value> {
+    Ok(Value::Bool(is_truthy(v)))
+}
+
+fn coerce_to_char(v: &Value) -> ValueResult<Value> {
+    match v {
+        Value::Char(_) => Ok(v.clone()),
+        Value::Long(n) => {
+            char::from_u32(*n as u32)
+                .map(Value::Char)
+                .ok_or_else(|| ValueError::Other(format!("invalid char code point: {n}")))
+        }
+        _ => Err(ValueError::WrongType {
+            expected: "char",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_int_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Long(0), coerce_to_long)
+}
+
+fn builtin_long_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Long(0), coerce_to_long)
+}
+
+fn builtin_short_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Long(0), coerce_to_long)
+}
+
+fn builtin_byte_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Long(0), coerce_to_long)
+}
+
+fn builtin_float_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Double(0.0), coerce_to_double)
+}
+
+fn builtin_double_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Double(0.0), coerce_to_double)
+}
+
+fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
+    match args.len() {
+        1 => match &args[0] {
+            Value::Long(n) => {
+                let size = *n as usize;
+                let v = PersistentVector::from_iter(std::iter::repeat_n(Value::Char('\0'), size));
+                Ok(Value::Vector(GcPtr::new(v)))
+            }
+            Value::Str(s) => {
+                let v = PersistentVector::from_iter(s.get().chars().map(Value::Char));
+                Ok(Value::Vector(GcPtr::new(v)))
+            }
+            _ => make_typed_array(args, Value::Char('\0'), coerce_to_char),
+        },
+        2 => make_typed_array(args, Value::Char('\0'), coerce_to_char),
+        _ => Err(ValueError::ArityError {
+            name: "char-array".into(),
+            expected: "1 or 2".into(),
+            got: args.len(),
+        }),
+    }
+}
+
+fn builtin_boolean_array(args: &[Value]) -> ValueResult<Value> {
+    make_typed_array(args, Value::Bool(false), coerce_to_bool)
+}
+
+/// `(booleans x)`, `(ints x)`, etc. — type hint casts, identity in our runtime.
+fn builtin_identity_cast(args: &[Value]) -> ValueResult<Value> {
+    Ok(args[0].clone())
+}
+
 fn builtin_set_fn(args: &[Value]) -> ValueResult<Value> {
+    if !matches!(args[0], Value::List(_) | Value::Set(_) | Value::Map(_) | Value::LazySeq(_) | Value::Vector(_) | Value::Str(_) | Value::Nil) {
+        return Err(ValueError::WrongType {
+            expected: "seq",
+            got: args[0].type_name().to_string(),
+        })
+    }
     let set = ValueIter::new(args[0].clone()).fold(PersistentHashSet::empty(), |s, v| s.conj(v));
-    Ok(Value::Set(GcPtr::new(set)))
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(set))))
 }
 
 fn builtin_disj(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Set(s) => {
-            let mut result = s.get().clone();
+            let mut result = s.clone();
             for k in &args[1..] {
                 result = result.disj(k);
             }
-            Ok(Value::Set(GcPtr::new(result)))
+            Ok(Value::Set(result))
         }
         Value::Nil => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
@@ -2043,7 +2507,7 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
             }
         }
         Value::Set(s) => {
-            let mut iter = s.get().iter();
+            let mut iter = s.iter();
             match iter.next() {
                 None => Ok(None),
                 Some(first) => {
@@ -2914,28 +3378,18 @@ fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
-    // TODO: proper sorted set type; for now return a list in sorted order.
-    let mut items: Vec<Value> = args.to_vec();
-    items.sort_by(value_compare);
-    items.dedup_by(|a, b| a == b);
-    Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+    let set = SortedSet::from_iter(args.iter().cloned());
+    Ok(Value::Set(SetValue::Sorted(GcPtr::new(set))))
 }
 
 fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
-    // TODO: proper sorted map type; for now return a list of [k v] pairs in key order.
-    if args.len().is_multiple_of(2) {
+    if !args.len().is_multiple_of(2) {
         return Err(ValueError::OddMap { count: args.len() });
     }
-    let mut pairs: Vec<(Value, Value)> = args
-        .chunks(2)
-        .map(|c| (c[0].clone(), c[1].clone()))
-        .collect();
-    pairs.sort_by(|a, b| value_compare(&a.0, &b.0));
-    let items: Vec<Value> = pairs
-        .into_iter()
-        .map(|(k, v)| Value::Vector(GcPtr::new(PersistentVector::from_iter([k, v]))))
-        .collect();
-    Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+    let sm = cljx_value::SortedMap::from_pairs(
+        args.chunks(2).map(|pair| (pair[0].clone(), pair[1].clone())),
+    );
+    Ok(Value::Map(MapValue::Sorted(GcPtr::new(sm))))
 }
 
 fn builtin_sort_by_stub(_args: &[Value]) -> ValueResult<Value> {

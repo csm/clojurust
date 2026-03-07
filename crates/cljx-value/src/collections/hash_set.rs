@@ -31,6 +31,11 @@ impl PersistentHashSet {
             inner: self.inner.insert(val),
         }
     }
+    
+    pub fn conj_mut(&mut self, val: Value) -> &mut Self {
+        self.inner.insert_mut(val);
+        self
+    }
 
     /// Return a new set with `val` removed.
     pub fn disj(&self, val: &Value) -> Self {
@@ -45,13 +50,13 @@ impl PersistentHashSet {
     }
 }
 
-impl std::iter::FromIterator<Value> for PersistentHashSet {
+impl FromIterator<Value> for PersistentHashSet {
     fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
-        let mut s = Self::empty();
+        let mut inner = rpds::HashTrieSetSync::new_sync();
         for v in iter {
-            s = s.conj(v);
+            inner.insert_mut(v)
         }
-        s
+        Self { inner }
     }
 }
 

@@ -283,7 +283,6 @@
 (defn reversible? [x] (vector? x))
 (defn sequential? [x] (or (seq? x) (vector? x)))
 (defn associative? [x] (or (map? x) (vector? x)))
-(defn sorted? [_] false)
 
 ;; meta and vary-meta are native builtins (see builtins.rs)
 

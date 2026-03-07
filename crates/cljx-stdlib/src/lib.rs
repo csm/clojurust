@@ -224,7 +224,7 @@ mod tests {
         run("(require '[clojure.set :as s])", &mut env).unwrap();
         let v = run("(s/union #{1 2} #{2 3})", &mut env).unwrap();
         match v {
-            Value::Set(s) => assert_eq!(s.get().count(), 3),
+            Value::Set(s) => assert_eq!(s.count(), 3),
             other => panic!("expected set, got {other:?}"),
         }
     }
@@ -235,7 +235,7 @@ mod tests {
         run("(require '[clojure.set :as s])", &mut env).unwrap();
         let v = run("(s/intersection #{1 2 3} #{2 3 4})", &mut env).unwrap();
         match v {
-            Value::Set(s) => assert_eq!(s.get().count(), 2),
+            Value::Set(s) => assert_eq!(s.count(), 2),
             other => panic!("expected set, got {other:?}"),
         }
     }
@@ -246,7 +246,7 @@ mod tests {
         run("(require '[clojure.set :as s])", &mut env).unwrap();
         let v = run("(s/difference #{1 2 3} #{2 3})", &mut env).unwrap();
         match v {
-            Value::Set(s) => assert_eq!(s.get().count(), 1),
+            Value::Set(s) => assert_eq!(s.count(), 1),
             other => panic!("expected set, got {other:?}"),
         }
     }

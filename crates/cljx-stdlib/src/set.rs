@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use cljx_gc::GcPtr;
-use cljx_value::{Arity, MapValue, PersistentHashSet, Value, ValueError, ValueResult};
-
+use cljx_value::{Arity, MapValue, PersistentHashSet, SortedSet, Value, ValueError, ValueResult};
+use cljx_value::value::SetValue;
 use crate::register_fns;
 
 pub fn register(globals: &Arc<cljx_eval::GlobalEnv>, ns: &str) {
@@ -25,7 +25,7 @@ pub fn register(globals: &Arc<cljx_eval::GlobalEnv>, ns: &str) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-fn get_set(v: &Value) -> ValueResult<&GcPtr<PersistentHashSet>> {
+fn get_set(v: &Value) -> ValueResult<&SetValue> {
     match v {
         Value::Set(s) => Ok(s),
         other => Err(ValueError::WrongType {
@@ -39,61 +39,64 @@ fn get_set(v: &Value) -> ValueResult<&GcPtr<PersistentHashSet>> {
 
 /// `(union s1 s2 ...)` — all elements in any set.
 fn union(args: &[Value]) -> ValueResult<Value> {
+    // TODO - use first arg to influence type. First sorted-set -> sorted-set
     let mut result = PersistentHashSet::empty();
     for arg in args {
         let s = get_set(arg)?;
-        for v in s.get().iter() {
-            result = result.conj(v.clone());
+        for v in s.iter() {
+            result.conj_mut(v.clone());
         }
     }
-    Ok(Value::Set(GcPtr::new(result)))
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(result))))
 }
 
 /// `(intersection s1 s2 ...)` — elements present in every set.
 fn intersection(args: &[Value]) -> ValueResult<Value> {
+    // TODO - use first arg to influence type. First sorted-set -> sorted-set.
     if args.is_empty() {
-        return Ok(Value::Set(GcPtr::new(PersistentHashSet::empty())));
+        return Ok(Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))));
     }
     let first = get_set(&args[0])?;
-    let mut result = first.get().clone();
+    let mut result = PersistentHashSet::from_iter(first.iter().cloned());
     for arg in &args[1..] {
         let s = get_set(arg)?;
         let mut next = PersistentHashSet::empty();
         for v in result.iter() {
-            if s.get().contains(v) {
-                next = next.conj(v.clone());
+            if s.contains(v) {
+                next.conj_mut(v.clone());
             }
         }
         result = next;
     }
-    Ok(Value::Set(GcPtr::new(result)))
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(result))))
 }
 
 /// `(difference s1 s2 ...)` — elements in s1 not in any subsequent set.
 fn difference(args: &[Value]) -> ValueResult<Value> {
+    // TODO - use first arg to influence type. First sorted-set -> sorted-set
     if args.is_empty() {
-        return Ok(Value::Set(GcPtr::new(PersistentHashSet::empty())));
+        return Ok(Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))));
     }
     let first = get_set(&args[0])?;
-    let mut result = first.get().clone();
+    let mut result = PersistentHashSet::from_iter(first.iter().cloned());
     for arg in &args[1..] {
         let s = get_set(arg)?;
         let mut next = PersistentHashSet::empty();
         for v in result.iter() {
-            if !s.get().contains(v) {
-                next = next.conj(v.clone());
+            if !s.contains(v) {
+                next.conj_mut(v.clone());
             }
         }
         result = next;
     }
-    Ok(Value::Set(GcPtr::new(result)))
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(result))))
 }
 
 /// `(subset? s1 s2)` — true if every element of s1 is in s2.
 fn subset_q(args: &[Value]) -> ValueResult<Value> {
     let s1 = get_set(&args[0])?;
     let s2 = get_set(&args[1])?;
-    let result = s1.get().iter().all(|v| s2.get().contains(v));
+    let result = s1.iter().all(|v| s2.contains(v));
     Ok(Value::Bool(result))
 }
 
@@ -101,7 +104,7 @@ fn subset_q(args: &[Value]) -> ValueResult<Value> {
 fn superset_q(args: &[Value]) -> ValueResult<Value> {
     let s1 = get_set(&args[0])?;
     let s2 = get_set(&args[1])?;
-    let result = s2.get().iter().all(|v| s1.get().contains(v));
+    let result = s2.iter().all(|v| s1.contains(v));
     Ok(Value::Bool(result))
 }
 

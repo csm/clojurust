@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use cljx_gc::GcPtr;
 
 use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
-    PersistentVector,
+    PersistentVector, SortedMap, SortedSet
 };
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string,
@@ -45,8 +46,9 @@ pub enum Value {
     List(GcPtr<PersistentList>),
     Vector(GcPtr<PersistentVector>),
     /// Small maps (≤8 entries) are stored as an ArrayMap; larger ones as a HashMap.
+    /// Also contains sorted map.
     Map(MapValue),
-    Set(GcPtr<PersistentHashSet>),
+    Set(SetValue),
     Queue(GcPtr<PersistentQueue>),
 
     // ── Functions ─────────────────────────────────────────────────────────────
@@ -88,6 +90,7 @@ pub enum Value {
 pub enum MapValue {
     Array(GcPtr<PersistentArrayMap>),
     Hash(GcPtr<PersistentHashMap>),
+    Sorted(GcPtr<SortedMap>),
 }
 
 impl MapValue {
@@ -99,6 +102,7 @@ impl MapValue {
         match self {
             MapValue::Array(m) => m.get().get(key).cloned(),
             MapValue::Hash(m) => m.get().get(key).cloned(),
+            MapValue::Sorted(m) => m.get().get(key).cloned(),
         }
     }
 
@@ -106,6 +110,7 @@ impl MapValue {
         match self {
             MapValue::Array(m) => m.get().count(),
             MapValue::Hash(m) => m.get().count(),
+            MapValue::Sorted(m) => m.get().count(),
         }
     }
 
@@ -121,6 +126,7 @@ impl MapValue {
                 }
             },
             MapValue::Hash(m) => MapValue::Hash(GcPtr::new(m.get().assoc(k, v))),
+            MapValue::Sorted(m) => MapValue::Sorted(GcPtr::new(m.get().assoc(k, v))),
         }
     }
 
@@ -128,6 +134,7 @@ impl MapValue {
         match self {
             MapValue::Array(m) => MapValue::Array(GcPtr::new(m.get().dissoc(key))),
             MapValue::Hash(m) => MapValue::Hash(GcPtr::new(m.get().dissoc(key))),
+            MapValue::Sorted(m) => MapValue::Sorted(GcPtr::new(m.get().dissoc(key))),
         }
     }
 
@@ -135,6 +142,7 @@ impl MapValue {
         match self {
             MapValue::Array(m) => m.get().contains_key(key),
             MapValue::Hash(m) => m.get().contains_key(key),
+            MapValue::Sorted(m) => m.get().contains_key(key),
         }
     }
 
@@ -151,6 +159,85 @@ impl MapValue {
                     f(k, v);
                 }
             }
+            MapValue::Sorted(m) => {
+                for (k, v) in m.get().iter() {
+                    f(k, v);
+                }
+            }
+        }
+    }
+}
+
+/// A set value, either a hash set or a sorted set.
+#[derive(Clone, Debug)]
+pub enum SetValue {
+    Hash(GcPtr<PersistentHashSet>),
+    Sorted(GcPtr<SortedSet>),
+}
+
+impl SetValue {
+    pub fn empty() -> Self { Self::Hash(GcPtr::new(PersistentHashSet::empty())) }
+
+    pub fn count(&self) -> usize {
+        match self {
+            SetValue::Hash(m) => m.get().count(),
+            SetValue::Sorted(m) => m.get().count(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            SetValue::Hash(m) => m.get().is_empty(),
+            SetValue::Sorted(m) => m.get().is_empty(),
+        }
+    }
+
+    pub fn contains(&self, key: &Value) -> bool {
+        match self {
+            SetValue::Hash(m) => m.get().contains(key),
+            SetValue::Sorted(m) => m.get().contains(key),
+        }
+    }
+
+    pub fn conj(&self, value: Value) -> Self {
+        match self {
+            SetValue::Hash(m) => SetValue::Hash(GcPtr::new(m.get().conj(value))),
+            SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().conj(value)))
+        }
+    }
+    
+    pub fn conj_mut(&mut self, value: Value) -> &mut Self {
+        match self {
+            SetValue::Hash(m) => {
+                m.get_mut().conj_mut(value);
+            },
+            SetValue::Sorted(s) => {
+                s.get_mut().conj_mut(value);
+            }
+        }
+        self
+    }
+
+    pub fn disj(&self, value: &Value) -> Self {
+        match self {
+            SetValue::Hash(m) => SetValue::Hash(GcPtr::new(m.get().disj(value))),
+            SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().disj(value))),
+        }
+    }
+
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
+        match self {
+            SetValue::Hash(s) => Box::new(s.get().iter()),
+            SetValue::Sorted(s) => Box::new(s.get().iter()),
+        }
+    }
+}
+
+impl cljx_gc::Trace for SetValue {
+    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
+        match self {
+            SetValue::Hash(s) => s.get().trace(visitor),
+            SetValue::Sorted(s) => s.get().trace(visitor),
         }
     }
 }
@@ -195,7 +282,7 @@ impl PartialEq for Value {
             // Collection equality.
             (Value::List(a), Value::List(b)) => a.get() == b.get(),
             (Value::Vector(a), Value::Vector(b)) => a.get() == b.get(),
-            (Value::Set(a), Value::Set(b)) => a.get() == b.get(),
+            (Value::Set(a), Value::Set(b)) => sets_equal(a, b),
             (Value::Queue(a), Value::Queue(b)) => a.get() == b.get(),
             (Value::Map(a), Value::Map(b)) => maps_equal(a, b),
             // Sequential cross-type equality: '(1 2) == [1 2].
@@ -261,6 +348,18 @@ fn maps_equal(a: &MapValue, b: &MapValue) -> bool {
         }
     });
     equal
+}
+
+fn sets_equal(a: &SetValue, b: &SetValue) -> bool {
+    if a.count() != b.count() {
+        return false;
+    }
+    for k in a.iter() {
+        if !b.contains(k) {
+            return false;
+        }
+    }
+    true
 }
 
 fn seq_equal(a: &Value, b: &Value) -> bool {
@@ -358,7 +457,7 @@ impl ClojureHash for Value {
             }
             Value::Set(s) => {
                 let mut h: u32 = 0;
-                for k in s.get().iter() {
+                for k in s.iter() {
                     h = hash_combine_unordered(h, k.clojure_hash());
                 }
                 h
@@ -528,7 +627,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Set(s) => {
             write!(f, "#{{")?;
             let mut first = true;
-            for item in s.get().iter() {
+            for item in s.iter() {
                 if !first {
                     write!(f, " ")?;
                 }
@@ -721,7 +820,7 @@ impl cljx_gc::Trace for Value {
             Value::List(p) => visitor.visit(p),
             Value::Vector(p) => visitor.visit(p),
             Value::Map(m) => m.trace(visitor),
-            Value::Set(p) => visitor.visit(p),
+            Value::Set(s) => s.trace(visitor),
             Value::Queue(p) => visitor.visit(p),
             Value::NativeFunction(p) => visitor.visit(p),
             Value::Fn(p) | Value::Macro(p) => visitor.visit(p),
@@ -749,6 +848,7 @@ impl cljx_gc::Trace for MapValue {
         match self {
             MapValue::Array(p) => visitor.visit(p),
             MapValue::Hash(p) => visitor.visit(p),
+            MapValue::Sorted(p) => visitor.visit(p),
         }
     }
 }
@@ -891,5 +991,254 @@ mod tests {
         assert_eq!(Value::Double(f64::INFINITY).to_string(), "##Inf");
         assert_eq!(Value::Double(f64::NEG_INFINITY).to_string(), "##-Inf");
         assert_eq!(Value::Double(f64::NAN).to_string(), "##NaN");
+    }
+}
+
+// Ord impl for Value
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Same-type fast paths first, then cross-type numeric, then type-discriminant fallback.
+        match (self, other) {
+            // ── Nil ──
+            (Value::Nil, Value::Nil) => Ordering::Equal,
+
+            // ── Booleans ──
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+
+            // ── Numerics (same type) ──
+            (Value::Long(a), Value::Long(b)) => a.cmp(b),
+            (Value::Double(a), Value::Double(b)) => total_cmp_f64(*a, *b),
+            (Value::BigInt(a), Value::BigInt(b)) => a.get().cmp(b.get()),
+            (Value::BigDecimal(a), Value::BigDecimal(b)) => {
+                // BigDecimal doesn't impl Ord; compare via PartialOrd then string fallback.
+                a.get()
+                    .partial_cmp(b.get())
+                    .unwrap_or_else(|| a.get().to_string().cmp(&b.get().to_string()))
+            }
+            (Value::Ratio(a), Value::Ratio(b)) => a.get().cmp(b.get()),
+
+            // ── Cross-type numerics (promote to common type) ──
+            (Value::Long(a), Value::Double(b)) => total_cmp_f64(*a as f64, *b),
+            (Value::Double(a), Value::Long(b)) => total_cmp_f64(*a, *b as f64),
+            (Value::Long(a), Value::BigInt(b)) => BigInt::from(*a).cmp(b.get()),
+            (Value::BigInt(a), Value::Long(b)) => a.get().cmp(&BigInt::from(*b)),
+            (Value::Long(a), Value::Ratio(b)) => {
+                num_rational::Ratio::from(BigInt::from(*a)).cmp(b.get())
+            }
+            (Value::Ratio(a), Value::Long(b)) => {
+                a.get().cmp(&num_rational::Ratio::from(BigInt::from(*b)))
+            }
+            (Value::BigInt(a), Value::Ratio(b)) => {
+                num_rational::Ratio::from(a.get().clone()).cmp(b.get())
+            }
+            (Value::Ratio(a), Value::BigInt(b)) => {
+                a.get().cmp(&num_rational::Ratio::from(b.get().clone()))
+            }
+            (Value::Double(a), Value::BigInt(b)) => {
+                total_cmp_f64(*a, b.get().to_f64().unwrap_or(f64::MAX))
+            }
+            (Value::BigInt(a), Value::Double(b)) => {
+                total_cmp_f64(a.get().to_f64().unwrap_or(f64::MAX), *b)
+            }
+            (Value::Double(a), Value::Ratio(b)) => {
+                total_cmp_f64(*a, b.get().to_f64().unwrap_or(f64::MAX))
+            }
+            (Value::Ratio(a), Value::Double(b)) => {
+                total_cmp_f64(a.get().to_f64().unwrap_or(f64::MAX), *b)
+            }
+            (Value::Long(a), Value::BigDecimal(b)) => {
+                let ad = bigdecimal::BigDecimal::from(*a);
+                ad.partial_cmp(b.get())
+                    .unwrap_or_else(|| ad.to_string().cmp(&b.get().to_string()))
+            }
+            (Value::BigDecimal(a), Value::Long(b)) => {
+                let bd = bigdecimal::BigDecimal::from(*b);
+                a.get()
+                    .partial_cmp(&bd)
+                    .unwrap_or_else(|| a.get().to_string().cmp(&bd.to_string()))
+            }
+            (Value::Double(a), Value::BigDecimal(b)) => {
+                match bigdecimal::BigDecimal::try_from(*a) {
+                    Ok(ad) => ad
+                        .partial_cmp(b.get())
+                        .unwrap_or_else(|| ad.to_string().cmp(&b.get().to_string())),
+                    Err(_) => {
+                        // NaN or infinity
+                        if a.is_nan() {
+                            Ordering::Greater
+                        } else if *a < 0.0 {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                }
+            }
+            (Value::BigDecimal(a), Value::Double(b)) => {
+                match bigdecimal::BigDecimal::try_from(*b) {
+                    Ok(bd) => a
+                        .get()
+                        .partial_cmp(&bd)
+                        .unwrap_or_else(|| a.get().to_string().cmp(&bd.to_string())),
+                    Err(_) => {
+                        if b.is_nan() {
+                            Ordering::Less
+                        } else if *b < 0.0 {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                }
+            }
+            (Value::BigInt(a), Value::BigDecimal(b)) => {
+                let ad = bigdecimal::BigDecimal::from(a.get().clone());
+                ad.partial_cmp(b.get())
+                    .unwrap_or_else(|| ad.to_string().cmp(&b.get().to_string()))
+            }
+            (Value::BigDecimal(a), Value::BigInt(b)) => {
+                let bd = bigdecimal::BigDecimal::from(b.get().clone());
+                a.get()
+                    .partial_cmp(&bd)
+                    .unwrap_or_else(|| a.get().to_string().cmp(&bd.to_string()))
+            }
+            (Value::Ratio(a), Value::BigDecimal(b)) => {
+                let af = a.get().to_f64().unwrap_or(f64::MAX);
+                match bigdecimal::BigDecimal::try_from(af) {
+                    Ok(ad) => ad
+                        .partial_cmp(b.get())
+                        .unwrap_or_else(|| ad.to_string().cmp(&b.get().to_string())),
+                    Err(_) => Ordering::Greater,
+                }
+            }
+            (Value::BigDecimal(a), Value::Ratio(b)) => {
+                let bf = b.get().to_f64().unwrap_or(f64::MAX);
+                match bigdecimal::BigDecimal::try_from(bf) {
+                    Ok(bd) => a
+                        .get()
+                        .partial_cmp(&bd)
+                        .unwrap_or_else(|| a.get().to_string().cmp(&bd.to_string())),
+                    Err(_) => Ordering::Less,
+                }
+            }
+
+            // ── Characters ──
+            (Value::Char(a), Value::Char(b)) => a.cmp(b),
+
+            // ── Strings ──
+            (Value::Str(a), Value::Str(b)) => a.get().cmp(b.get()),
+
+            // ── Symbols ──
+            (Value::Symbol(a), Value::Symbol(b)) => cmp_ns_name(
+                &a.get().namespace,
+                &a.get().name,
+                &b.get().namespace,
+                &b.get().name,
+            ),
+
+            // ── Keywords ──
+            (Value::Keyword(a), Value::Keyword(b)) => cmp_ns_name(
+                &a.get().namespace,
+                &a.get().name,
+                &b.get().namespace,
+                &b.get().name,
+            ),
+
+            // ── Sequential collections: element-by-element ──
+            (Value::Vector(a), Value::Vector(b)) => {
+                iter_cmp(a.get().iter(), b.get().iter())
+            }
+            (Value::List(a), Value::List(b)) => {
+                iter_cmp(a.get().iter(), b.get().iter())
+            }
+
+            // ── Sets: compare by size, then elements ──
+            (Value::Set(a), Value::Set(b)) => a.count().cmp(&b.count()),
+
+            // ── Maps: compare by size ──
+            (Value::Map(a), Value::Map(b)) => a.count().cmp(&b.count()),
+
+            // ── Different types: order by type discriminant for a consistent total order ──
+            _ => type_discriminant(self).cmp(&type_discriminant(other)),
+        }
+    }
+}
+
+/// Compare two iterators of Values element-by-element.
+fn iter_cmp<'a>(mut a: impl Iterator<Item = &'a Value>, mut b: impl Iterator<Item = &'a Value>) -> Ordering {
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let c = x.cmp(y);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+        }
+    }
+}
+
+/// Total ordering for f64: NaN sorts after everything else, otherwise use IEEE total_order.
+fn total_cmp_f64(a: f64, b: f64) -> Ordering {
+    a.total_cmp(&b)
+}
+
+/// Compare namespace-qualified names: namespace first (None < Some), then name.
+fn cmp_ns_name(
+    ns_a: &Option<Arc<str>>,
+    name_a: &Arc<str>,
+    ns_b: &Option<Arc<str>>,
+    name_b: &Arc<str>,
+) -> Ordering {
+    match (ns_a, ns_b) {
+        (None, None) => name_a.cmp(name_b),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(a), Some(b)) => a.cmp(b).then_with(|| name_a.cmp(name_b)),
+    }
+}
+
+/// Assign a stable integer to each Value variant for cross-type ordering.
+fn type_discriminant(v: &Value) -> u8 {
+    match v {
+        Value::Nil => 0,
+        Value::Bool(_) => 1,
+        Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_) => 2,
+        Value::Char(_) => 3,
+        Value::Str(_) => 4,
+        Value::Symbol(_) => 5,
+        Value::Keyword(_) => 6,
+        Value::List(_) => 7,
+        Value::Vector(_) => 8,
+        Value::Map(_) => 9,
+        Value::Set(_) => 10,
+        Value::Queue(_) => 11,
+        Value::LazySeq(_) => 12,
+        Value::Cons(_) => 13,
+        Value::NativeFunction(_) => 14,
+        Value::Fn(_) => 15,
+        Value::Macro(_) => 16,
+        Value::Var(_) => 17,
+        Value::Atom(_) => 18,
+        Value::Namespace(_) => 19,
+        Value::Protocol(_) => 20,
+        Value::ProtocolFn(_) => 21,
+        Value::MultiFn(_) => 22,
+        Value::Volatile(_) => 23,
+        Value::Delay(_) => 24,
+        Value::Promise(_) => 25,
+        Value::Future(_) => 26,
+        Value::Agent(_) => 27,
+        Value::TypeInstance(_) => 28,
     }
 }

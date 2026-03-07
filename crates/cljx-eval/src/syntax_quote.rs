@@ -10,7 +10,7 @@ use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
 use cljx_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
-
+use cljx_value::value::SetValue;
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
 
@@ -117,7 +117,7 @@ fn sq_form(
             let set = out
                 .into_iter()
                 .fold(cljx_value::PersistentHashSet::empty(), |s, v| s.conj(v));
-            Ok(Value::Set(GcPtr::new(set)))
+            Ok(Value::Set(SetValue::Hash(GcPtr::new(set))))
         }
 
         // `'inner` inside syntax-quote: recursively process `inner` so that

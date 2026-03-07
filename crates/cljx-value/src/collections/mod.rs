@@ -4,10 +4,14 @@ pub mod hash_set;
 pub mod list;
 pub mod queue;
 pub mod vector;
+pub mod sorted_map;
+pub mod sorted_set;
 
 pub use array_map::PersistentArrayMap;
 pub use hash_map::PersistentHashMap;
 pub use hash_set::PersistentHashSet;
 pub use list::PersistentList;
 pub use queue::PersistentQueue;
+pub use sorted_map::SortedMap;
+pub use sorted_set::SortedSet;
 pub use vector::PersistentVector;

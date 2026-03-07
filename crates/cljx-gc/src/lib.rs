@@ -336,6 +336,10 @@ impl<T: Trace + 'static> GcPtr<T> {
         unsafe { &(*self.0.as_ptr()).value }
     }
 
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut (*self.0.as_ptr()).value }
+    }
+
     /// Identity comparison: `true` iff both pointers point to the same object.
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0

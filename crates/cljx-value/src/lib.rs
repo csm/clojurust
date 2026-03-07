@@ -8,7 +8,7 @@ pub mod value;
 
 pub use collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
-    PersistentVector,
+    PersistentVector, SortedMap, SortedSet
 };
 pub use error::{ValueError, ValueResult};
 pub use hash::ClojureHash;
