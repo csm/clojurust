@@ -60,7 +60,7 @@ fn intersection(args: &[Value]) -> ValueResult<Value> {
         let s = get_set(arg)?;
         let mut next = PersistentHashSet::empty();
         for v in result.iter() {
-            if s.get().contains(&v) {
+            if s.get().contains(v) {
                 next = next.conj(v.clone());
             }
         }
@@ -80,7 +80,7 @@ fn difference(args: &[Value]) -> ValueResult<Value> {
         let s = get_set(arg)?;
         let mut next = PersistentHashSet::empty();
         for v in result.iter() {
-            if !s.get().contains(&v) {
+            if !s.get().contains(v) {
                 next = next.conj(v.clone());
             }
         }
@@ -93,7 +93,7 @@ fn difference(args: &[Value]) -> ValueResult<Value> {
 fn subset_q(args: &[Value]) -> ValueResult<Value> {
     let s1 = get_set(&args[0])?;
     let s2 = get_set(&args[1])?;
-    let result = s1.get().iter().all(|v| s2.get().contains(&v));
+    let result = s1.get().iter().all(|v| s2.get().contains(v));
     Ok(Value::Bool(result))
 }
 
@@ -101,7 +101,7 @@ fn subset_q(args: &[Value]) -> ValueResult<Value> {
 fn superset_q(args: &[Value]) -> ValueResult<Value> {
     let s1 = get_set(&args[0])?;
     let s2 = get_set(&args[1])?;
-    let result = s2.get().iter().all(|v| s1.get().contains(&v));
+    let result = s2.get().iter().all(|v| s1.get().contains(v));
     Ok(Value::Bool(result))
 }
 

@@ -45,12 +45,23 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
         }
 
         // Evaluate the file in a new Env rooted at the namespace being loaded.
+        // Save and restore *ns* so the caller's namespace is not disturbed.
+        let saved_ns = globals
+            .lookup_var("clojure.core", "*ns*")
+            .map(|v| crate::dynamics::deref_var(&v))
+            .flatten();
         {
             let mut env = Env::new(globals.clone(), ns_name);
             let mut parser = cljx_reader::Parser::new(src, file_path);
             let forms = parser.parse_all().map_err(EvalError::Read)?;
             for form in forms {
                 eval::eval(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
+            }
+        }
+        // Restore *ns* to the caller's namespace.
+        if let Some(saved) = saved_ns {
+            if let Some(var) = globals.lookup_var("clojure.core", "*ns*") {
+                var.get().bind(saved);
             }
         }
 

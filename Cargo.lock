@@ -68,6 +68,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "archery"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e0a5f99dfebb87bb342d0f53bb92c81842e100bbb915223e38349580e5441d"
+dependencies = [
+ "triomphe",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -266,6 +275,7 @@ dependencies = [
  "num-bigint",
  "num-rational",
  "num-traits",
+ "rpds",
  "thiserror",
 ]
 
@@ -451,6 +461,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpds"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e75f485e819d4d3015e6c0d55d02a4fd3db47c1993d9e603e0361fba2bffb34"
+dependencies = [
+ "archery",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -546,6 +565,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "triomphe"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd69c5aa8f924c7519d6372789a74eac5b94fb0f8fcf0d4a97eb0bfc3e785f39"
 
 [[package]]
 name = "unicode-ident"

@@ -1,48 +1,47 @@
 use crate::Value;
-use crate::collections::hash_map::PersistentHashMap;
 
-/// An immutable hash set backed by a `PersistentHashMap` (keys map to themselves).
+/// An immutable hash set backed by `rpds::HashTrieSet`.
 #[derive(Debug, Clone)]
 pub struct PersistentHashSet {
-    map: PersistentHashMap,
+    inner: rpds::HashTrieSetSync<Value>,
 }
 
 impl PersistentHashSet {
     pub fn empty() -> Self {
         Self {
-            map: PersistentHashMap::empty(),
+            inner: rpds::HashTrieSetSync::new_sync(),
         }
     }
 
     pub fn count(&self) -> usize {
-        self.map.count()
+        self.inner.size()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.inner.is_empty()
     }
 
     pub fn contains(&self, val: &Value) -> bool {
-        self.map.contains_key(val)
+        self.inner.contains(val)
     }
 
     /// Return a new set with `val` added.
     pub fn conj(&self, val: Value) -> Self {
         Self {
-            map: self.map.assoc(val.clone(), val),
+            inner: self.inner.insert(val),
         }
     }
 
     /// Return a new set with `val` removed.
     pub fn disj(&self, val: &Value) -> Self {
         Self {
-            map: self.map.dissoc(val),
+            inner: self.inner.remove(val),
         }
     }
 
     /// Iterate over all elements in an unspecified order.
-    pub fn iter(&self) -> impl Iterator<Item = Value> {
-        self.map.keys().into_iter()
+    pub fn iter(&self) -> impl Iterator<Item = &Value> {
+        self.inner.iter()
     }
 }
 
@@ -61,14 +60,15 @@ impl PartialEq for PersistentHashSet {
         if self.count() != other.count() {
             return false;
         }
-        self.map.keys().iter().all(|k| other.contains(k))
-        // keys() returns Vec<Value>, so .iter() gives &Value refs
+        self.inner.iter().all(|k| other.contains(k))
     }
 }
 
 impl cljx_gc::Trace for PersistentHashSet {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
-        self.map.trace(visitor);
+        for v in self.inner.iter() {
+            v.trace(visitor);
+        }
     }
 }
 

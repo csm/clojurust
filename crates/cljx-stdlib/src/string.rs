@@ -30,16 +30,46 @@ pub fn register(globals: &Arc<cljx_eval::GlobalEnv>, ns: &str) {
             ("join", Arity::Variadic { min: 1 }, join),
             ("index-of", Arity::Variadic { min: 2 }, index_of),
             ("last-index-of", Arity::Variadic { min: 2 }, last_index_of),
+            ("reverse", Arity::Fixed(1), string_reverse),
+            ("escape", Arity::Fixed(2), string_escape),
         ]
     );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+/// Coerce a value to a string via `.toString()` semantics.
+/// Keywords → ":foo", symbols → "foo", numbers → "42", nil throws.
 fn get_str(v: &Value) -> ValueResult<Arc<str>> {
     match v {
         Value::Str(s) => Ok(s.get().clone().into()),
-        Value::Nil => Ok(Arc::from("")),
+        Value::Keyword(k) => Ok(Arc::from(format!(":{}", k.get().full_name()))),
+        Value::Symbol(s) => {
+            let sym = s.get();
+            Ok(Arc::from(match &sym.namespace {
+                Some(ns) => format!("{}/{}", ns, sym.name),
+                None => sym.name.as_ref().to_string(),
+            }))
+        }
+        Value::Long(n) => Ok(Arc::from(n.to_string())),
+        Value::Double(f) => Ok(Arc::from(f.to_string())),
+        Value::Char(c) => Ok(Arc::from(c.to_string())),
+        Value::Bool(b) => Ok(Arc::from(b.to_string())),
+        Value::Nil => Err(ValueError::WrongType {
+            expected: "string",
+            got: "nil".to_string(),
+        }),
+        other => Err(ValueError::WrongType {
+            expected: "string",
+            got: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// Strict: only accepts strings, throws on everything else (including nil).
+fn get_strict_str(v: &Value) -> ValueResult<Arc<str>> {
+    match v {
+        Value::Str(s) => Ok(s.get().clone().into()),
         other => Err(ValueError::WrongType {
             expected: "string",
             got: other.type_name().to_string(),
@@ -97,10 +127,19 @@ fn trim_newline(args: &[Value]) -> ValueResult<Value> {
     Ok(make_str(result.to_string()))
 }
 
+/// Java-compatible `Character.isWhitespace` check.
+fn is_java_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C' | '\u{1C}' | '\u{1D}' | '\u{1E}' | '\u{1F}'
+            | '\u{2028}' | '\u{2029}'
+    )
+}
+
 fn blank_q(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Nil => Ok(Value::Bool(true)),
-        Value::Str(s) => Ok(Value::Bool(s.get().chars().all(|c| c.is_whitespace()))),
+        Value::Str(s) => Ok(Value::Bool(s.get().chars().all(is_java_whitespace))),
         other => Err(ValueError::WrongType {
             expected: "string or nil",
             got: other.type_name().to_string(),
@@ -110,13 +149,13 @@ fn blank_q(args: &[Value]) -> ValueResult<Value> {
 
 fn starts_with_q(args: &[Value]) -> ValueResult<Value> {
     let s = get_str(&args[0])?;
-    let prefix = get_str(&args[1])?;
+    let prefix = get_strict_str(&args[1])?;
     Ok(Value::Bool(s.starts_with(prefix.as_ref())))
 }
 
 fn ends_with_q(args: &[Value]) -> ValueResult<Value> {
     let s = get_str(&args[0])?;
-    let suffix = get_str(&args[1])?;
+    let suffix = get_strict_str(&args[1])?;
     Ok(Value::Bool(s.ends_with(suffix.as_ref())))
 }
 
@@ -240,4 +279,32 @@ fn last_index_of(args: &[Value]) -> ValueResult<Value> {
         Some(idx) => Ok(Value::Long(idx as i64)),
         None => Ok(Value::Nil),
     }
+}
+
+fn string_reverse(args: &[Value]) -> ValueResult<Value> {
+    let s = get_strict_str(&args[0])?;
+    Ok(make_str(s.chars().rev().collect()))
+}
+
+/// `(escape s cmap)` — replace characters in s according to cmap (a map of
+/// char → replacement-string).
+fn string_escape(args: &[Value]) -> ValueResult<Value> {
+    let s = get_strict_str(&args[0])?;
+    let cmap = &args[1];
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let key = Value::Char(ch);
+        let replacement = match cmap {
+            Value::Map(m) => m.get(&key),
+            _ => None,
+        };
+        match replacement {
+            Some(v) => match v {
+                Value::Str(rs) => result.push_str(rs.get()),
+                other => result.push_str(&format!("{other}")),
+            },
+            None => result.push(ch),
+        }
+    }
+    Ok(make_str(result))
 }

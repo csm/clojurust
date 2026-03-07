@@ -1,8 +1,11 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
 use std::sync::Arc;
-
-use num_traits::Signed as _;
+use std::thread::sleep;
+use std::time::Duration;
+use num_bigint::Sign;
+use num_traits::float::FloatCore;
+use num_traits::{Signed as _, ToPrimitive, Zero as _};
 
 use cljx_gc::GcPtr;
 use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
@@ -45,7 +48,10 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("false?", Arity::Fixed(1), builtin_false_q),
         ("number?", Arity::Fixed(1), builtin_number_q),
         ("integer?", Arity::Fixed(1), builtin_integer_q),
+        ("int?", Arity::Fixed(1), builtin_int_q),
         ("float?", Arity::Fixed(1), builtin_float_q),
+        ("double?", Arity::Fixed(1), builtin_double_q),
+        ("decimal?", Arity::Fixed(1), builtin_decimal_q),
         ("string?", Arity::Fixed(1), builtin_string_q),
         ("keyword?", Arity::Fixed(1), builtin_keyword_q),
         ("symbol?", Arity::Fixed(1), builtin_symbol_q),
@@ -63,11 +69,13 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("empty?", Arity::Fixed(1), builtin_empty_q),
         ("even?", Arity::Fixed(1), builtin_even_q),
         ("odd?", Arity::Fixed(1), builtin_odd_q),
+        ("ratio?", Arity::Fixed(1), builtin_ratio_q),
         // Collections (non-HOF)
         ("list", Arity::Variadic { min: 0 }, builtin_list),
         ("list*", Arity::Variadic { min: 1 }, builtin_list_star),
         ("vector", Arity::Variadic { min: 0 }, builtin_vector),
         ("hash-map", Arity::Variadic { min: 0 }, builtin_hash_map),
+        ("array-map", Arity::Variadic { min: 0 }, builtin_array_map),
         ("hash-set", Arity::Variadic { min: 0 }, builtin_hash_set),
         ("conj", Arity::Variadic { min: 1 }, builtin_conj),
         ("assoc", Arity::Variadic { min: 3 }, builtin_assoc),
@@ -344,6 +352,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("ns-resolve", Arity::Fixed(2), builtin_ns_resolve_sentinel),
         ("resolve", Arity::Fixed(1), builtin_resolve_sentinel),
+        // special builtins for clojurust
+        ("sleep", Arity::Fixed(1), builtin_sleep),
     ];
 
     for (name, arity, func) in fns {
@@ -410,7 +420,7 @@ impl Iterator for ValueIter {
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::Set(s) => {
-                    let items: Vec<Value> = s.get().iter().collect();
+                    let items: Vec<Value> = s.get().iter().cloned().collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::Map(m) => {
@@ -443,6 +453,9 @@ fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
     match v {
         Value::Long(n) => Ok(*n as f64),
         Value::Double(f) => Ok(*f),
+        Value::BigInt(n) => Ok(n.get().to_f64().unwrap_or(f64::INFINITY)),
+        Value::BigDecimal(d) => Ok(d.get().to_f64().unwrap_or(f64::INFINITY)),
+        Value::Ratio(r) => Ok(r.get().to_f64().unwrap_or(f64::NAN)),
         _ => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -453,7 +466,16 @@ fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
 fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
     match v {
         Value::Long(n) => Ok(*n),
-        Value::Double(f) => Ok(*f as i64),
+        Value::Double(f) => if f64::is_infinite(*f) || f64::is_nan(*f) {
+            Err(ValueError::Other("cannot convert non-number to i64".to_string()))
+        } else {
+            Ok(*f as i64)
+        },
+        Value::Char(c) => Ok(*c as i64),
+        Value::BigInt(n) => n.get().to_i64().ok_or_else(|| ValueError::Other("BigInt too large for i64".into())),
+        Value::Ratio(r) => {
+            r.get().floor().to_i64().ok_or_else(|| { ValueError::Other("cannot convert ratio".into()) })
+        },
         _ => Err(ValueError::WrongType {
             expected: "integer",
             got: v.type_name().to_string(),
@@ -461,14 +483,44 @@ fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
     }
 }
 
-fn numeric_as_usize(v: &Value) -> ValueResult<usize> {
+fn numeric_as_bigint(v: &Value) -> ValueResult<num_bigint::BigInt> {
+    use num_bigint::BigInt;
     match v {
-        Value::Long(n) => Ok(*n as usize),
-        Value::Double(f) => Ok(*f as usize),
+        Value::Long(n) => Ok(BigInt::from(*n)),
+        Value::BigInt(n) => Ok(n.get().clone()),
+        Value::Ratio(r) => Ok(r.get().to_integer()),
         _ => Err(ValueError::WrongType {
             expected: "integer",
             got: v.type_name().to_string(),
-        })
+        }),
+    }
+}
+
+fn numeric_as_bigdecimal(v: &Value) -> ValueResult<bigdecimal::BigDecimal> {
+    use bigdecimal::BigDecimal;
+    match v {
+        Value::Long(n) => Ok(BigDecimal::from(*n)),
+        Value::BigInt(n) => Ok(BigDecimal::from(n.get().clone())),
+        Value::BigDecimal(d) => Ok(d.get().clone()),
+        Value::Double(f) => Ok(BigDecimal::try_from(*f).unwrap_or_else(|_| BigDecimal::from(0))),
+        _ => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn numeric_as_ratio(v: &Value) -> ValueResult<num_rational::Ratio<num_bigint::BigInt>> {
+    use num_bigint::BigInt;
+    use num_rational::Ratio;
+    match v {
+        Value::Long(n) => Ok(Ratio::from(BigInt::from(*n))),
+        Value::BigInt(n) => Ok(Ratio::from(n.get().clone())),
+        Value::Ratio(r) => Ok(r.get().clone()),
+        _ => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
     }
 }
 
@@ -589,30 +641,173 @@ fn builtin_div(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
-    let a = numeric_as_i64(&args[0])?;
-    let b = numeric_as_i64(&args[1])?;
-    if b == 0 {
-        return Err(ValueError::Other("mod by zero".into()));
+    // Clojure mod: result has same sign as divisor.
+    use num_bigint::BigInt;
+    match (&args[0], &args[1]) {
+        // NaN in either position → throw
+        (Value::Double(f), _) if f.is_nan() => {
+            Err(ValueError::Other("mod of NaN".into()))
+        }
+        (_, Value::Double(f)) if f.is_nan() => {
+            Err(ValueError::Other("mod by NaN".into()))
+        }
+        // Infinity as dividend → throw
+        (Value::Double(f), _) if f.is_infinite() => {
+            Err(ValueError::Other("mod of infinity".into()))
+        }
+        // Infinity as divisor → NaN
+        (_, Value::Double(f)) if f.is_infinite() => {
+            Ok(Value::Double(f64::NAN))
+        }
+        // Double in either → double mod
+        (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
+            let a = numeric_as_f64(&args[0])?;
+            let b = numeric_as_f64(&args[1])?;
+            if b == 0.0 {
+                return Err(ValueError::Other("mod by zero".into()));
+            }
+            let r = a % b;
+            let result = if (r > 0.0 && b < 0.0) || (r < 0.0 && b > 0.0) { r + b } else { r };
+            Ok(Value::Double(result))
+        }
+        // BigDecimal in either → BigDecimal mod
+        (Value::BigDecimal(_), _) | (_, Value::BigDecimal(_)) => {
+            let a = numeric_as_bigdecimal(&args[0])?;
+            let b = numeric_as_bigdecimal(&args[1])?;
+            if b.is_zero() {
+                return Err(ValueError::Other("mod by zero".into()));
+            }
+            let r = &a % &b;
+            let result = if (r > bigdecimal::BigDecimal::from(0) && b < bigdecimal::BigDecimal::from(0))
+                || (r < bigdecimal::BigDecimal::from(0) && b > bigdecimal::BigDecimal::from(0))
+            { r + &b } else { r };
+            Ok(Value::BigDecimal(GcPtr::new(result)))
+        }
+        // Ratio in either → ratio mod, result may be BigInt if integer
+        (Value::Ratio(_), _) | (_, Value::Ratio(_)) => {
+            let a = numeric_as_ratio(&args[0])?;
+            let b = numeric_as_ratio(&args[1])?;
+            if b.is_zero() {
+                return Err(ValueError::Other("mod by zero".into()));
+            }
+            let r = &a % &b;
+            let result = if (r > num_rational::Ratio::from(BigInt::from(0i64)) && b < num_rational::Ratio::from(BigInt::from(0i64)))
+                || (r < num_rational::Ratio::from(BigInt::from(0i64)) && b > num_rational::Ratio::from(BigInt::from(0i64)))
+            { r + &b } else { r };
+            if result.is_integer() {
+                Ok(Value::BigInt(GcPtr::new(result.to_integer())))
+            } else {
+                Ok(Value::Ratio(GcPtr::new(result)))
+            }
+        }
+        // BigInt in either → BigInt mod
+        (Value::BigInt(_), _) | (_, Value::BigInt(_)) => {
+            let a = numeric_as_bigint(&args[0])?;
+            let b = numeric_as_bigint(&args[1])?;
+            if b.is_zero() {
+                return Err(ValueError::Other("mod by zero".into()));
+            }
+            let r = &a % &b;
+            let result = if (r > BigInt::from(0i64) && b < BigInt::from(0i64))
+                || (r < BigInt::from(0i64) && b > BigInt::from(0i64))
+            { r + &b } else { r };
+            Ok(Value::BigInt(GcPtr::new(result)))
+        }
+        // Long × Long → Long
+        _ => {
+            let a = numeric_as_i64(&args[0])?;
+            let b = numeric_as_i64(&args[1])?;
+            if b == 0 {
+                return Err(ValueError::Other("mod by zero".into()));
+            }
+            Ok(Value::Long(((a % b) + b) % b))
+        }
     }
-    Ok(Value::Long(((a % b) + b) % b))
 }
 
 fn builtin_rem(args: &[Value]) -> ValueResult<Value> {
-    let a = numeric_as_i64(&args[0])?;
-    let b = numeric_as_i64(&args[1])?;
-    if b == 0 {
-        return Err(ValueError::Other("rem by zero".into()));
+    use num_bigint::BigInt;
+    match (&args[0], &args[1]) {
+        (Value::Double(f), _) if f.is_nan() => Err(ValueError::Other("rem of NaN".into())),
+        (_, Value::Double(f)) if f.is_nan() => Err(ValueError::Other("rem by NaN".into())),
+        (Value::Double(f), _) if f.is_infinite() => Err(ValueError::Other("rem of infinity".into())),
+        (_, Value::Double(f)) if f.is_infinite() => Ok(Value::Double(f64::NAN)),
+        (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
+            let a = numeric_as_f64(&args[0])?;
+            let b = numeric_as_f64(&args[1])?;
+            if b == 0.0 { return Err(ValueError::Other("rem by zero".into())); }
+            Ok(Value::Double(a % b))
+        }
+        (Value::BigDecimal(_), _) | (_, Value::BigDecimal(_)) => {
+            let a = numeric_as_bigdecimal(&args[0])?;
+            let b = numeric_as_bigdecimal(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("rem by zero".into())); }
+            Ok(Value::BigDecimal(GcPtr::new(&a % &b)))
+        }
+        (Value::Ratio(_), _) | (_, Value::Ratio(_)) => {
+            let a = numeric_as_ratio(&args[0])?;
+            let b = numeric_as_ratio(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("rem by zero".into())); }
+            let r = &a % &b;
+            if r.is_integer() {
+                Ok(Value::BigInt(GcPtr::new(r.to_integer())))
+            } else {
+                Ok(Value::Ratio(GcPtr::new(r)))
+            }
+        }
+        (Value::BigInt(_), _) | (_, Value::BigInt(_)) => {
+            let a = numeric_as_bigint(&args[0])?;
+            let b = numeric_as_bigint(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("rem by zero".into())); }
+            Ok(Value::BigInt(GcPtr::new(&a % &b)))
+        }
+        _ => {
+            let a = numeric_as_i64(&args[0])?;
+            let b = numeric_as_i64(&args[1])?;
+            if b == 0 { return Err(ValueError::Other("rem by zero".into())); }
+            Ok(Value::Long(a % b))
+        }
     }
-    Ok(Value::Long(a % b))
 }
 
 fn builtin_quot(args: &[Value]) -> ValueResult<Value> {
-    let a = numeric_as_i64(&args[0])?;
-    let b = numeric_as_i64(&args[1])?;
-    if b == 0 {
-        return Err(ValueError::Other("quot by zero".into()));
+    use num_bigint::BigInt;
+    match (&args[0], &args[1]) {
+        (Value::Double(f), _) if f.is_nan() => Err(ValueError::Other("quot of NaN".into())),
+        (_, Value::Double(f)) if f.is_nan() => Err(ValueError::Other("quot by NaN".into())),
+        (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
+            let a = numeric_as_f64(&args[0])?;
+            let b = numeric_as_f64(&args[1])?;
+            if b == 0.0 { return Err(ValueError::Other("quot by zero".into())); }
+            Ok(Value::Double((a / b).trunc()))
+        }
+        (Value::BigDecimal(_), _) | (_, Value::BigDecimal(_)) => {
+            let a = numeric_as_bigdecimal(&args[0])?;
+            let b = numeric_as_bigdecimal(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("quot by zero".into())); }
+            let q = &a / &b;
+            Ok(Value::BigDecimal(GcPtr::new(q.with_scale(0))))
+        }
+        (Value::Ratio(_), _) | (_, Value::Ratio(_)) => {
+            let a = numeric_as_ratio(&args[0])?;
+            let b = numeric_as_ratio(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("quot by zero".into())); }
+            let q = &a / &b;
+            Ok(Value::BigInt(GcPtr::new(q.to_integer())))
+        }
+        (Value::BigInt(_), _) | (_, Value::BigInt(_)) => {
+            let a = numeric_as_bigint(&args[0])?;
+            let b = numeric_as_bigint(&args[1])?;
+            if b.is_zero() { return Err(ValueError::Other("quot by zero".into())); }
+            Ok(Value::BigInt(GcPtr::new(&a / &b)))
+        }
+        _ => {
+            let a = numeric_as_i64(&args[0])?;
+            let b = numeric_as_i64(&args[1])?;
+            if b == 0 { return Err(ValueError::Other("quot by zero".into())); }
+            Ok(Value::Long(a / b))
+        }
     }
-    Ok(Value::Long(a / b))
 }
 
 fn builtin_inc(args: &[Value]) -> ValueResult<Value> {
@@ -808,9 +1003,16 @@ fn builtin_nil_q(args: &[Value]) -> ValueResult<Value> {
 }
 fn builtin_zero_q(args: &[Value]) -> ValueResult<Value> {
     let zero = match &args[0] {
+        Value::Nil => return Err(ValueError::Other("expected number, got nil".into())),
         Value::Long(n) => *n == 0,
         Value::Double(f) => *f == 0.0,
-        _ => false,
+        Value::Ratio(r) => r.get().numer().is_zero(),
+        Value::BigInt(i) => i.get().is_zero(),
+        Value::BigDecimal(d) => d.get().is_zero(),
+        _ => return Err(ValueError::WrongType {
+            expected: "number",
+            got: args[0].type_name().to_string(),
+        }),
     };
     Ok(Value::Bool(zero))
 }
@@ -818,14 +1020,24 @@ fn builtin_pos_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(match &args[0] {
         Value::Long(n) => *n > 0,
         Value::Double(f) => *f > 0.0,
+        Value::Ratio(r) => r.get().numer().is_positive(),
+        Value::BigInt(i) => i.get().sign() == Sign::Plus,
+        Value::BigDecimal(d) => d.get().sign() == Sign::Plus,
         _ => false,
     }))
 }
 fn builtin_neg_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(match &args[0] {
+        Value::Nil => return Err(ValueError::Other("expected number, got nil".into())),
         Value::Long(n) => *n < 0,
         Value::Double(f) => *f < 0.0,
-        _ => false,
+        Value::Ratio(r) => !r.get().numer().is_positive(),
+        Value::BigInt(i) => i.get().sign() == Sign::Minus,
+        Value::BigDecimal(d) => d.get().sign() == Sign::Minus,
+        _ => return Err(ValueError::WrongType {
+            expected: "number",
+            got: args[0].type_name().to_string(),
+        }),
     }))
 }
 fn builtin_not(args: &[Value]) -> ValueResult<Value> {
@@ -849,6 +1061,19 @@ fn builtin_integer_q(args: &[Value]) -> ValueResult<Value> {
         Value::Long(_) | Value::BigInt(_)
     )))
 }
+
+fn builtin_int_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::Long(_))))
+}
+
+fn builtin_double_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::Double(_))))
+}
+
+fn builtin_decimal_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::BigDecimal(_))))
+}
+
 fn builtin_float_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::Double(_))))
 }
@@ -929,6 +1154,10 @@ fn builtin_odd_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(numeric_as_i64(&args[0])? % 2 != 0))
 }
 
+fn builtin_ratio_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(if let Value::Ratio(_) = &args[0] { true } else { false }))
+}
+
 // ── Collections ───────────────────────────────────────────────────────────────
 
 fn builtin_list(args: &[Value]) -> ValueResult<Value> {
@@ -961,6 +1190,18 @@ fn builtin_hash_map(args: &[Value]) -> ValueResult<Value> {
     if !args.len().is_multiple_of(2) {
         return Err(ValueError::OddMap { count: args.len() });
     }
+    let mut m = MapValue::empty();
+    for pair in args.chunks(2) {
+        m = m.assoc(pair[0].clone(), pair[1].clone());
+    }
+    Ok(Value::Map(m))
+}
+
+fn builtin_array_map(args: &[Value]) -> ValueResult<Value> {
+    if !args.len().is_multiple_of(2) {
+        return Err(ValueError::OddMap { count: args.len() });
+    }
+    // Build as a regular map — starts as ArrayMap, promotes to HashMap if >8 entries.
     let mut m = MapValue::empty();
     for pair in args.chunks(2) {
         m = m.assoc(pair[0].clone(), pair[1].clone());
@@ -1200,7 +1441,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if s.get().is_empty() {
                 Ok(Value::Nil)
             } else {
-                let items: Vec<Value> = s.get().iter().collect();
+                let items: Vec<Value> = s.get().iter().cloned().collect();
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
             }
         }
@@ -1388,7 +1629,10 @@ fn builtin_vals(args: &[Value]) -> ValueResult<Value> {
             } else {
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(vals))))
             }
-        }
+        },
+        Value::List(_) => Ok(Value::Nil),
+        Value::Set(_) => Ok(Value::Nil),
+        Value::Vector(_) => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
             expected: "map",
             got: v.type_name().to_string(),
@@ -1541,17 +1785,31 @@ fn builtin_pop(args: &[Value]) -> ValueResult<Value> {
 fn builtin_subvec(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Vector(v) => {
-            let start = numeric_as_i64(&args[1])? as usize;
-            let end = if let Some(e) = args.get(2) {
-                numeric_as_i64(e)? as usize
-            } else {
-                v.get().count()
+            let len = v.get().count();
+            // NaN converts to 0 via (int) cast in Clojure
+            let start_i = match &args[1] {
+                Value::Double(f) if f.is_nan() => 0,
+                _ => numeric_as_i64(&args[1])?,
             };
+            let end_i = if let Some(e) = args.get(2) {
+                match e {
+                    Value::Double(f) if f.is_nan() => 0,
+                    _ => numeric_as_i64(e)?,
+                }
+            } else {
+                len as i64
+            };
+            if start_i < 0 || end_i < 0 || (start_i as usize) > len || (end_i as usize) > len || start_i > end_i {
+                return Err(ValueError::Other(format!(
+                    "subvec index out of range: start={}, end={}, count={}",
+                    start_i, end_i, len
+                )));
+            }
             let items: Vec<Value> = v
                 .get()
                 .iter()
-                .skip(start)
-                .take(end - start)
+                .skip(start_i as usize)
+                .take((end_i - start_i) as usize)
                 .cloned()
                 .collect();
             Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
@@ -1746,9 +2004,9 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
             match iter.next() {
                 None => Ok(None),
                 Some(first) => {
-                    let rest: Vec<Value> = iter.collect();
+                    let rest: Vec<Value> = iter.cloned().collect();
                     Ok(Some((
-                        first,
+                        first.clone(),
                         Value::List(GcPtr::new(PersistentList::from_iter(rest))),
                     )))
                 }
@@ -2693,13 +2951,20 @@ fn builtin_tree_seq_stub(_args: &[Value]) -> ValueResult<Value> {
 fn builtin_subs(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Str(s) => {
-            let start = numeric_as_i64(&args[1])? as usize;
-            let end = if let Some(e) = args.get(2) {
-                numeric_as_i64(e)? as usize
+            let len = s.get().chars().count();
+            let start_i = numeric_as_i64(&args[1])?;
+            let end_i = if let Some(e) = args.get(2) {
+                numeric_as_i64(e)?
             } else {
-                s.get().len()
+                len as i64
             };
-            let substr: String = s.get().chars().skip(start).take(end - start).collect();
+            if start_i < 0 || end_i < 0 || (start_i as usize) > len || (end_i as usize) > len || start_i > end_i {
+                return Err(ValueError::Other(format!(
+                    "String index out of range: start={}, end={}, length={}",
+                    start_i, end_i, len
+                )));
+            }
+            let substr: String = s.get().chars().skip(start_i as usize).take((end_i - start_i) as usize).collect();
             Ok(Value::string(substr))
         }
         v => Err(ValueError::WrongType {
@@ -3407,4 +3672,10 @@ fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
         expected: "intercepted",
         got: "resolve sentinel should not be called directly".to_string(),
     })
+}
+
+/// Sleep -- pause current thread for N ms
+fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
+    sleep(Duration::from_millis(i64::max(0, numeric_as_i64(&args[0])?) as u64));
+    Ok(Value::Nil)
 }

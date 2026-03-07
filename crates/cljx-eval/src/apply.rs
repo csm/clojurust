@@ -940,6 +940,19 @@ fn handle_ns_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     }
 }
 
+/// Get the namespace name from `*ns*` (dynamic var), falling back to `env.current_ns`.
+/// This is important for `resolve` inside macros, where `env.current_ns` is the
+/// macro's defining namespace but `*ns*` is the caller's namespace.
+fn resolve_current_ns(env: &Env) -> Arc<str> {
+    if let Some(var) = env.globals.lookup_var("clojure.core", "*ns*") {
+        let val = crate::dynamics::deref_var(&var);
+        if let Some(Value::Namespace(ns_ptr)) = val {
+            return ns_ptr.get().name.clone();
+        }
+    }
+    env.current_ns.clone()
+}
+
 /// `(resolve sym)` — return the Var for sym in the current namespace, or nil.
 fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     if arg_forms.len() != 1 {
@@ -949,6 +962,7 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             got: arg_forms.len(),
         });
     }
+    let resolve_ns = resolve_current_ns(env);
     let sym_arg = eval(&arg_forms[0], env)?;
     let sym_name = match &sym_arg {
         Value::Symbol(s) => {
@@ -957,7 +971,7 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             if let Some(ns) = &sym.namespace {
                 let full_ns = env
                     .globals
-                    .resolve_alias(&env.current_ns, ns.as_ref())
+                    .resolve_alias(&resolve_ns, ns.as_ref())
                     .unwrap_or_else(|| ns.clone());
                 return Ok(
                     match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
@@ -977,7 +991,7 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
     Ok(
-        match env.globals.lookup_var_in_ns(&env.current_ns, &sym_name) {
+        match env.globals.lookup_var_in_ns(&resolve_ns, &sym_name) {
             Some(var_ptr) => Value::Var(var_ptr),
             None => Value::Nil,
         },

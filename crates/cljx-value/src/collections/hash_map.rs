@@ -1,161 +1,74 @@
-use cljx_gc::GcPtr;
-
 use crate::Value;
 use crate::collections::array_map::PersistentArrayMap;
-use crate::collections::hamt::node::Node;
-use crate::hash::ClojureHash;
 
-/// A key-value pair stored in the HAMT.
-#[derive(Debug, Clone)]
-pub(crate) struct KVPair(pub Value, pub Value);
-
-/// An immutable hash map using a 32-way HAMT trie.
+/// An immutable hash map backed by `rpds::HashTrieMap`.
 ///
 /// Small maps (≤8 entries) are represented as `PersistentArrayMap` instead;
 /// the two types share the same `Value::Map` variant.  `PersistentHashMap` is
 /// used once the entry count exceeds the array-map threshold.
 #[derive(Debug, Clone)]
 pub struct PersistentHashMap {
-    root: Option<GcPtr<Node<KVPair>>>,
-    count: usize,
+    inner: rpds::HashTrieMapSync<Value, Value>,
 }
 
 impl PersistentHashMap {
     pub fn empty() -> Self {
         Self {
-            root: None,
-            count: 0,
+            inner: rpds::HashTrieMapSync::new_sync(),
         }
     }
 
     pub fn count(&self) -> usize {
-        self.count
+        self.inner.size()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    fn key_eq(key: &Value) -> impl Fn(&KVPair) -> bool + '_ {
-        move |pair: &KVPair| pair.0 == *key
+        self.inner.is_empty()
     }
 
     /// Look up a key.
     pub fn get(&self, key: &Value) -> Option<&Value> {
-        let root = self.root.as_ref()?;
-        let hash = key.clojure_hash();
-        root.get().get(hash, 0, &Self::key_eq(key)).map(|p| &p.1)
+        self.inner.get(key)
     }
 
     pub fn contains_key(&self, key: &Value) -> bool {
-        self.get(key).is_some()
+        self.inner.contains_key(key)
     }
 
     /// Return a new map with `key` → `value`.
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        let hash = key.clojure_hash();
-        let pair = KVPair(key, value);
-
-        let (new_root, new_count) = match &self.root {
-            None => {
-                let leaf = GcPtr::new(Node::Leaf { hash, value: pair });
-                (leaf, 1)
-            }
-            Some(root) => {
-                // Check if the key already exists (for count tracking).
-                let existed = root
-                    .get()
-                    .get(hash, 0, &|p: &KVPair| p.0 == pair.0)
-                    .is_some();
-                let key_eq = {
-                    let k = pair.0.clone();
-                    move |p: &KVPair| p.0 == k
-                };
-                let new_root = root.get().assoc(hash, 0, pair, &key_eq);
-                let new_count = if existed { self.count } else { self.count + 1 };
-                (new_root, new_count)
-            }
-        };
-
         Self {
-            root: Some(new_root),
-            count: new_count,
+            inner: self.inner.insert(key, value),
         }
     }
 
     /// Return a new map with `key` removed.
     pub fn dissoc(&self, key: &Value) -> Self {
-        let root = match &self.root {
-            None => return self.clone(),
-            Some(r) => r,
-        };
-        let hash = key.clojure_hash();
-        let existed = root.get().get(hash, 0, &Self::key_eq(key)).is_some();
-        if !existed {
-            return self.clone();
-        }
-        let new_root = root.get().dissoc(hash, 0, &Self::key_eq(key));
         Self {
-            root: new_root,
-            count: self.count - 1,
+            inner: self.inner.remove(key),
         }
     }
 
     /// Iterate over all `(key, value)` pairs in an unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
-        let pairs: Vec<(&Value, &Value)> = match &self.root {
-            None => vec![],
-            Some(root) => {
-                // We can't return an iterator that borrows from a local Vec,
-                // so collect into a Vec of references pointing into the trie.
-                let mut out = Vec::with_capacity(self.count);
-                root.get().for_each(&mut |p: &KVPair| {
-                    // SAFETY: the references point into Arc-backed nodes that
-                    // live at least as long as `self` (which owns the root Arc).
-                    let k: &Value = unsafe { &*(&p.0 as *const Value) };
-                    let v: &Value = unsafe { &*(&p.1 as *const Value) };
-                    out.push((k, v));
-                });
-                out
-            }
-        };
-        pairs.into_iter()
+        self.inner.iter()
     }
 
     /// Collect all keys.
     pub fn keys(&self) -> Vec<Value> {
-        match &self.root {
-            None => vec![],
-            Some(root) => {
-                let mut out = Vec::new();
-                root.get().for_each(&mut |p: &KVPair| out.push(p.0.clone()));
-                out
-            }
-        }
+        self.inner.keys().cloned().collect()
     }
 
     /// Collect all values.
     pub fn vals(&self) -> Vec<Value> {
-        match &self.root {
-            None => vec![],
-            Some(root) => {
-                let mut out = Vec::new();
-                root.get().for_each(&mut |p: &KVPair| out.push(p.1.clone()));
-                out
-            }
-        }
+        self.inner.values().cloned().collect()
     }
 
     /// Merge two maps; right-hand side wins on key collision.
     pub fn merge(&self, other: &Self) -> Self {
         let mut result = self.clone();
-        match &other.root {
-            None => {}
-            Some(root) => {
-                root.get().for_each(&mut |p: &KVPair| {
-                    result = result.assoc(p.0.clone(), p.1.clone());
-                });
-            }
+        for (k, v) in other.inner.iter() {
+            result = result.assoc(k.clone(), v.clone());
         }
         result
     }
@@ -177,40 +90,19 @@ impl PersistentHashMap {
 
 impl PartialEq for PersistentHashMap {
     fn eq(&self, other: &Self) -> bool {
-        if self.count != other.count {
+        if self.count() != other.count() {
             return false;
         }
-        // Every key in self must exist in other with the same value.
-        match &self.root {
-            None => true,
-            Some(root) => {
-                let mut equal = true;
-                root.get().for_each(&mut |p: &KVPair| {
-                    if equal {
-                        match other.get(&p.0) {
-                            Some(v) if v == &p.1 => {}
-                            _ => equal = false,
-                        }
-                    }
-                });
-                equal
-            }
-        }
+        self.inner.iter().all(|(k, v)| other.get(k) == Some(v))
     }
 }
 
 impl cljx_gc::Trace for PersistentHashMap {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
-        use cljx_gc::GcVisitor as _;
-        if let Some(root) = &self.root {
-            visitor.visit(root);
+        for (k, v) in self.inner.iter() {
+            k.trace(visitor);
+            v.trace(visitor);
         }
-    }
-}
-impl cljx_gc::Trace for KVPair {
-    fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
-        self.0.trace(visitor);
-        self.1.trace(visitor);
     }
 }
 
@@ -219,6 +111,7 @@ mod tests {
     use super::*;
     use crate::Value;
     use crate::collections::array_map::AssocResult;
+    use cljx_gc::GcPtr;
 
     fn kw(s: &str) -> Value {
         Value::Keyword(GcPtr::new(crate::keyword::Keyword::simple(s)))

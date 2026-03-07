@@ -670,6 +670,15 @@ impl Lexer {
             ));
         }
 
+        // BigDecimal suffix 'M' on integer literal (e.g. 4M)
+        if self.peek() == Some('M') {
+            self.advance();
+            return Ok((
+                Token::BigDecimal(format!("{sign_str}{int_part}")),
+                self.span_from(start_pos, start_line, start_col),
+            ));
+        }
+
         // Float: decimal point or exponent
         if matches!(self.peek(), Some('.') | Some('e') | Some('E')) {
             let mut raw = format!("{sign_str}{int_part}");

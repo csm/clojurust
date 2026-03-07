@@ -157,6 +157,8 @@ impl MapValue {
 
 // ── Equality ──────────────────────────────────────────────────────────────────
 
+impl Eq for Value {}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         // Identity shortcut: same GcPtr → equal without realizing.
@@ -528,7 +530,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
                 if !first {
                     write!(f, " ")?;
                 }
-                pr_str(&item, f, readably)?;
+                pr_str(item, f, readably)?;
                 first = false;
             }
             write!(f, "}}")

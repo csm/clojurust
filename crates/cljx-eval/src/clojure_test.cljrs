@@ -9,6 +9,7 @@
 (def ^:dynamic *testing-contexts* [])
 (def ^:dynamic *report-counters* nil)
 (def ^:dynamic *test-out* nil)
+(def ^:dynamic *verbose* false)
 
 ;; ── Reporting ─────────────────────────────────────────────────────────────────
 
@@ -17,7 +18,12 @@
 (defmethod report :default [m]
   (println "Unknown report type:" (:type m)))
 
-(defmethod report :pass [_m]
+(defmethod report :pass [m]
+  (when *verbose*
+    (println "\nPASS in" (str (first *testing-vars*)))
+    (doseq [ctx *testing-contexts*]
+      (println "  " ctx))
+    (println "expected:" (pr-str (:expected m))))
   (when *report-counters*
     (set! *report-counters* (update *report-counters* :pass inc))))
 
@@ -60,8 +66,10 @@
   ([form] `(is ~form nil))
   ([form msg]
    (if (and (seq? form) (= (first form) 'thrown?))
-     ;; (is (thrown? ExClass expr)) — check that expr throws.
-     (let [expr (nth form 2)]
+     ;; (is (thrown? ExClass expr)) or (is (thrown? expr)) — check that expr throws.
+     (let [expr (if (= 3 (count form))
+                  (nth form 2)
+                  (nth form 1))]
        `(try
           ~expr
           (do (report {:type :fail :expected (quote ~form) :actual nil :message ~msg})

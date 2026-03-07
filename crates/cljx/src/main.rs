@@ -57,6 +57,9 @@ enum Commands {
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
+        /// Print each passing assertion (helps identify which test hangs).
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -101,8 +104,9 @@ fn run(cli: Cli) -> miette::Result<()> {
         Commands::Test {
             namespaces,
             src_paths,
+            verbose,
         } => {
-            run_tests_command(namespaces, src_paths)?;
+            run_tests_command(namespaces, src_paths, verbose)?;
         }
     }
     Ok(())
@@ -166,7 +170,7 @@ struct NsTestResult {
     load_error: Option<String>,
 }
 
-fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette::Result<()> {
+fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>, verbose: bool) -> miette::Result<()> {
     let namespaces = if namespaces.is_empty() {
         let discovered = discover_namespaces(&src_paths);
         if discovered.is_empty() {
@@ -184,6 +188,14 @@ fn run_tests_command(namespaces: Vec<String>, src_paths: Vec<PathBuf>) -> miette
 
     // Ensure clojure.test is loaded.
     eval_in(&mut env, "(require 'clojure.test)", "<test>")?;
+
+    if verbose {
+        eval_in(
+            &mut env,
+            "(alter-var-root (var clojure.test/*verbose*) (constantly true))",
+            "<test>",
+        )?;
+    }
 
     let start = Instant::now();
     let mut results: Vec<NsTestResult> = Vec::new();
