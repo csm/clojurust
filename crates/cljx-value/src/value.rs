@@ -299,11 +299,21 @@ impl PartialEq for Value {
             return true;
         }
         // Realize lazy sequences before comparing.
+        // A lazy-seq that realizes to nil is an empty sequence, which is equal
+        // to both nil and any empty sequential collection (matching Clojure).
         if let Value::LazySeq(ls) = self {
-            return ls.get().realize() == *other;
+            let realized = ls.get().realize();
+            if realized == Value::Nil && other.is_sequential() {
+                return value_to_seq_vec(other).is_empty();
+            }
+            return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
-            return *self == ls.get().realize();
+            let realized = ls.get().realize();
+            if realized == Value::Nil && self.is_sequential() {
+                return value_to_seq_vec(self).is_empty();
+            }
+            return *self == realized;
         }
         match (self, other) {
             (Value::Nil, Value::Nil) => true,

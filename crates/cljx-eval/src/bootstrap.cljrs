@@ -77,10 +77,11 @@
       s)))
 
 (defn take-while [pred coll]
-  (loop [s (seq coll) acc []]
-    (if (and s (pred (first s)))
-      (recur (next s) (conj acc (first s)))
-      (seq acc))))
+  (lazy-seq
+    (when-let [s (seq coll)]
+      (let [x (first s)]
+        (when (pred x)
+          (cons x (take-while pred (rest s))))))))
 
 (defn drop-while [pred coll]
   (loop [s (seq coll)]
