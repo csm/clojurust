@@ -2,19 +2,19 @@
 
 use std::sync::Arc;
 
-use cljx_gc::GcPtr;
-use cljx_reader::Form;
-use cljx_reader::form::FormKind;
-use cljx_value::{
-    FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
-    Value,
-};
-use cljx_value::value::SetValue;
 use crate::apply::eval_call;
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
 use crate::special::{SPECIAL_FORMS, eval_special, select_reader_cond};
 use crate::syntax_quote::syntax_quote;
+use cljx_gc::GcPtr;
+use cljx_reader::Form;
+use cljx_reader::form::FormKind;
+use cljx_value::value::SetValue;
+use cljx_value::{
+    FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
+    Value,
+};
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {

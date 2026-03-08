@@ -59,9 +59,10 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
         }
         // Restore *ns* to the caller's namespace.
         if let Some(saved) = saved_ns
-            && let Some(var) = globals.lookup_var("clojure.core", "*ns*") {
-                var.get().bind(saved);
-            }
+            && let Some(var) = globals.lookup_var("clojure.core", "*ns*")
+        {
+            var.get().bind(saved);
+        }
 
         // Mark loaded and remove from in-progress set.
         globals.loading.lock().unwrap().remove(ns_name.as_ref());

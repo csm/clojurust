@@ -9,7 +9,7 @@ use cljx_gc::{GcPtr, MarkVisitor, Trace};
 
 use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
-    PersistentVector, SortedMap, SortedSet
+    PersistentVector, SortedMap, SortedSet,
 };
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string,
@@ -210,7 +210,9 @@ pub enum SetValue {
 }
 
 impl SetValue {
-    pub fn empty() -> Self { Self::Hash(GcPtr::new(PersistentHashSet::empty())) }
+    pub fn empty() -> Self {
+        Self::Hash(GcPtr::new(PersistentHashSet::empty()))
+    }
 
     pub fn count(&self) -> usize {
         match self {
@@ -236,7 +238,7 @@ impl SetValue {
     pub fn conj(&self, value: Value) -> Self {
         match self {
             SetValue::Hash(m) => SetValue::Hash(GcPtr::new(m.get().conj(value))),
-            SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().conj(value)))
+            SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().conj(value))),
         }
     }
 
@@ -244,7 +246,7 @@ impl SetValue {
         match self {
             SetValue::Hash(m) => {
                 m.get_mut().conj_mut(value);
-            },
+            }
             SetValue::Sorted(s) => {
                 s.get_mut().conj_mut(value);
             }
@@ -512,35 +514,35 @@ impl ClojureHash for Value {
                     h = hash_combine_ordered(h, if *b { 1231 } else { 1237 })
                 }
                 h
-            },
+            }
             Value::ByteArray(a) => {
                 let mut h: u32 = 0;
                 for b in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *b as u32)
                 }
                 h
-            },
+            }
             Value::ShortArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
-            },
+            }
             Value::IntArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
-            },
+            }
             Value::CharArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
-            },
+            }
             Value::LongArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
@@ -548,44 +550,50 @@ impl ClojureHash for Value {
                     h = hash_combine_ordered(h, hash_i64(v));
                 }
                 h
-            },
+            }
             Value::FloatArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
                     let f = *item;
-                    h = hash_combine_ordered(h, if f.fract() == 0.0
-                        && f.is_finite()
-                        && let Some(n) = ToPrimitive::to_i64(item)
-                    {
-                        hash_i64(n)
-                    } else {
-                        hash_i64(f.to_bits() as i64)
-                    })
+                    h = hash_combine_ordered(
+                        h,
+                        if f.fract() == 0.0
+                            && f.is_finite()
+                            && let Some(n) = ToPrimitive::to_i64(item)
+                        {
+                            hash_i64(n)
+                        } else {
+                            hash_i64(f.to_bits() as i64)
+                        },
+                    )
                 }
                 h
-            },
+            }
             Value::DoubleArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().lock().unwrap().iter() {
                     let f = *item;
-                    h = hash_combine_ordered(h, if f.fract() == 0.0
-                        && f.is_finite()
-                        && let Some(n) = ToPrimitive::to_i64(item)
-                    {
-                        hash_i64(n)
-                    } else {
-                        hash_i64(f.to_bits() as i64)
-                    })
+                    h = hash_combine_ordered(
+                        h,
+                        if f.fract() == 0.0
+                            && f.is_finite()
+                            && let Some(n) = ToPrimitive::to_i64(item)
+                        {
+                            hash_i64(n)
+                        } else {
+                            hash_i64(f.to_bits() as i64)
+                        },
+                    )
                 }
                 h
-            },
+            }
             Value::ObjectArray(a) => {
                 let mut h: u32 = 0;
                 for item in a.get().0.lock().unwrap().iter() {
                     h = hash_combine_ordered(h, item.clojure_hash())
                 }
                 h
-            },
+            }
 
             // For non-data types, use pointer identity.
             Value::Fn(f) => f.get() as *const _ as u32,
@@ -763,14 +771,14 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             write!(f, "}}")
         }
         Value::BooleanArray(_)
-            | Value::ByteArray(_)
-            | Value::ShortArray(_)
-            | Value::IntArray(_)
-            | Value::LongArray(_)
-            | Value::CharArray(_)
-            | Value::FloatArray(_)
-            | Value::DoubleArray(_)
-            | Value::ObjectArray(_) => write!(f, "#[array]"),
+        | Value::ByteArray(_)
+        | Value::ShortArray(_)
+        | Value::IntArray(_)
+        | Value::LongArray(_)
+        | Value::CharArray(_)
+        | Value::FloatArray(_)
+        | Value::DoubleArray(_)
+        | Value::ObjectArray(_) => write!(f, "#[array]"),
         Value::Queue(q) => {
             // Printed as a list with a type tag.
             write!(f, "#queue (")?;
@@ -987,7 +995,10 @@ impl cljx_gc::Trace for Value {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
         use cljx_gc::GcVisitor as _;
         match self {
-            Value::WithMeta(inner, meta) => { inner.trace(visitor); meta.trace(visitor); }
+            Value::WithMeta(inner, meta) => {
+                inner.trace(visitor);
+                meta.trace(visitor);
+            }
             Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => {}
             Value::BigInt(p) => visitor.visit(p),
             Value::BigDecimal(p) => visitor.visit(p),
@@ -1345,12 +1356,8 @@ impl Ord for Value {
             ),
 
             // ── Sequential collections: element-by-element ──
-            (Value::Vector(a), Value::Vector(b)) => {
-                iter_cmp(a.get().iter(), b.get().iter())
-            }
-            (Value::List(a), Value::List(b)) => {
-                iter_cmp(a.get().iter(), b.get().iter())
-            }
+            (Value::Vector(a), Value::Vector(b)) => iter_cmp(a.get().iter(), b.get().iter()),
+            (Value::List(a), Value::List(b)) => iter_cmp(a.get().iter(), b.get().iter()),
 
             // ── Sets: compare by size, then elements ──
             (Value::Set(a), Value::Set(b)) => a.count().cmp(&b.count()),
@@ -1365,7 +1372,10 @@ impl Ord for Value {
 }
 
 /// Compare two iterators of Values element-by-element.
-fn iter_cmp<'a>(mut a: impl Iterator<Item = &'a Value>, mut b: impl Iterator<Item = &'a Value>) -> Ordering {
+fn iter_cmp<'a>(
+    mut a: impl Iterator<Item = &'a Value>,
+    mut b: impl Iterator<Item = &'a Value>,
+) -> Ordering {
     loop {
         match (a.next(), b.next()) {
             (None, None) => return Ordering::Equal,
@@ -1407,7 +1417,11 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::WithMeta(inner, _) => type_discriminant(inner),
         Value::Nil => 0,
         Value::Bool(_) => 1,
-        Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_) => 2,
+        Value::Long(_)
+        | Value::Double(_)
+        | Value::BigInt(_)
+        | Value::BigDecimal(_)
+        | Value::Ratio(_) => 2,
         Value::Char(_) => 3,
         Value::Str(_) => 4,
         Value::Symbol(_) => 5,

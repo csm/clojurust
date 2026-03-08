@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use cljx_gc::GcPtr;
-use cljx_value::{Arity, MapValue, PersistentHashSet, SortedSet, Value, ValueError, ValueResult};
-use cljx_value::value::SetValue;
 use crate::register_fns;
+use cljx_gc::GcPtr;
+use cljx_value::value::SetValue;
+use cljx_value::{Arity, MapValue, PersistentHashSet, Value, ValueError, ValueResult};
 
 pub fn register(globals: &Arc<cljx_eval::GlobalEnv>, ns: &str) {
     register_fns!(
@@ -54,7 +54,9 @@ fn union(args: &[Value]) -> ValueResult<Value> {
 fn intersection(args: &[Value]) -> ValueResult<Value> {
     // TODO - use first arg to influence type. First sorted-set -> sorted-set.
     if args.is_empty() {
-        return Ok(Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))));
+        return Ok(Value::Set(SetValue::Hash(GcPtr::new(
+            PersistentHashSet::empty(),
+        ))));
     }
     let first = get_set(&args[0])?;
     let mut result = PersistentHashSet::from_iter(first.iter().cloned());
@@ -75,7 +77,9 @@ fn intersection(args: &[Value]) -> ValueResult<Value> {
 fn difference(args: &[Value]) -> ValueResult<Value> {
     // TODO - use first arg to influence type. First sorted-set -> sorted-set
     if args.is_empty() {
-        return Ok(Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))));
+        return Ok(Value::Set(SetValue::Hash(GcPtr::new(
+            PersistentHashSet::empty(),
+        ))));
     }
     let first = get_set(&args[0])?;
     let mut result = PersistentHashSet::from_iter(first.iter().cloned());

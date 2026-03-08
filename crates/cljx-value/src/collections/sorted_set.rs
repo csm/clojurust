@@ -3,21 +3,27 @@ use crate::Value;
 /// An immutable sorted set backed by `rpds::RedBlackTreeSet`.
 #[derive(Debug, Clone)]
 pub struct SortedSet {
-    inner: rpds::RedBlackTreeSetSync<Value>
+    inner: rpds::RedBlackTreeSetSync<Value>,
 }
 
 impl SortedSet {
     pub fn empty() -> Self {
         Self {
-            inner: rpds::RedBlackTreeSetSync::new_sync()
+            inner: rpds::RedBlackTreeSetSync::new_sync(),
         }
     }
 
-    pub fn count(&self) -> usize { self.inner.size() }
+    pub fn count(&self) -> usize {
+        self.inner.size()
+    }
 
-    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 
-    pub fn contains(&self, value: &Value) -> bool { self.inner.contains(value) }
+    pub fn contains(&self, value: &Value) -> bool {
+        self.inner.contains(value)
+    }
 
     /// Return a new set with `val` added.
     pub fn conj(&self, value: Value) -> Self {
@@ -30,20 +36,22 @@ impl SortedSet {
         self.inner.insert_mut(value);
         self
     }
-    
+
     /// Return a new set with `val` removed.
     pub fn disj(&self, value: &Value) -> Self {
         Self {
-            inner: self.inner.remove(value)
+            inner: self.inner.remove(value),
         }
     }
 
     /// Iterate over all elements in sorted order
-    pub fn iter(&self) -> impl Iterator<Item=&Value> { self.inner.iter() }
+    pub fn iter(&self) -> impl Iterator<Item = &Value> {
+        self.inner.iter()
+    }
 }
 
 impl FromIterator<Value> for SortedSet {
-    fn from_iter<I: IntoIterator<Item=Value>>(iter: I) -> Self {
+    fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
         let mut inner = rpds::RedBlackTreeSetSync::new_sync();
         for v in iter {
             inner.insert_mut(v);

@@ -25,7 +25,7 @@ pub enum ValueError {
 
     #[error("map must have an even number of forms, got {count}")]
     OddMap { count: usize },
-    
+
     #[error("this feature is not yet supported")]
     Unsupported,
 

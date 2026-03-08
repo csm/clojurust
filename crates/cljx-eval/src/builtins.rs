@@ -6,10 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
-use cljx_gc::GcPtr;
-use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashSet, PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
-use cljx_value::value::SetValue;
 use crate::env::GlobalEnv;
+use cljx_gc::GcPtr;
+use cljx_value::value::SetValue;
+use cljx_value::{
+    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
+    Namespace, NativeFn, ObjectArray, PersistentHashSet, PersistentList, PersistentVector,
+    SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
+};
 
 // ── Registration ──────────────────────────────────────────────────────────────
 
@@ -109,21 +113,45 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("aset", Arity::Fixed(3), builtin_aset),
         ("amap", Arity::Fixed(1), builtin_amap_stub),
         ("areduce", Arity::Fixed(1), builtin_areduce_stub),
-        ("aset-boolean", Arity::Variadic { min: 3}, builtin_aset_bool),
-        ("aset-byte", Arity::Variadic { min: 3}, builtin_aset_byte),
-        ("aset-short", Arity::Variadic { min: 3}, builtin_aset_short),
-        ("aset-int", Arity::Variadic { min: 3}, builtin_aset_int),
-        ("aset-long", Arity::Variadic { min: 3}, builtin_aset_long),
-        ("aset-double", Arity::Variadic { min: 3 }, builtin_aset_double),
+        (
+            "aset-boolean",
+            Arity::Variadic { min: 3 },
+            builtin_aset_bool,
+        ),
+        ("aset-byte", Arity::Variadic { min: 3 }, builtin_aset_byte),
+        ("aset-short", Arity::Variadic { min: 3 }, builtin_aset_short),
+        ("aset-int", Arity::Variadic { min: 3 }, builtin_aset_int),
+        ("aset-long", Arity::Variadic { min: 3 }, builtin_aset_long),
+        (
+            "aset-double",
+            Arity::Variadic { min: 3 },
+            builtin_aset_double,
+        ),
         ("aset-float", Arity::Variadic { min: 3 }, builtin_aset_float),
         ("int-array", Arity::Variadic { min: 1 }, builtin_int_array),
         ("long-array", Arity::Variadic { min: 1 }, builtin_long_array),
-        ("short-array", Arity::Variadic { min: 1 }, builtin_short_array),
+        (
+            "short-array",
+            Arity::Variadic { min: 1 },
+            builtin_short_array,
+        ),
         ("byte-array", Arity::Variadic { min: 1 }, builtin_byte_array),
-        ("float-array", Arity::Variadic { min: 1 }, builtin_float_array),
-        ("double-array", Arity::Variadic { min: 1 }, builtin_double_array),
+        (
+            "float-array",
+            Arity::Variadic { min: 1 },
+            builtin_float_array,
+        ),
+        (
+            "double-array",
+            Arity::Variadic { min: 1 },
+            builtin_double_array,
+        ),
         ("char-array", Arity::Variadic { min: 1 }, builtin_char_array),
-        ("boolean-array", Arity::Variadic { min: 1 }, builtin_boolean_array),
+        (
+            "boolean-array",
+            Arity::Variadic { min: 1 },
+            builtin_boolean_array,
+        ),
         ("booleans", Arity::Fixed(1), builtin_identity_cast),
         ("bytes", Arity::Fixed(1), builtin_identity_cast),
         ("chars", Arity::Fixed(1), builtin_identity_cast),
@@ -442,7 +470,7 @@ impl Iterator for ValueIter {
                         Some(head)
                     } else {
                         None
-                    }
+                    };
                 }
                 Value::Vector(v) => {
                     let items: Vec<Value> = v.get().iter().cloned().collect();
@@ -471,35 +499,83 @@ impl Iterator for ValueIter {
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::IntArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Long(*v as i64))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::LongArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Long(*v))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::ShortArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Long(*v as i64))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::ByteArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Long(*v as i64))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::FloatArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Double(*v as f64)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Double(*v as f64))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::DoubleArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Double(*v)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Double(*v))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::BooleanArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Bool(*v)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Bool(*v))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 Value::CharArray(a) => {
-                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Char(*v)).collect();
+                    let items: Vec<Value> = a
+                        .get()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| Value::Char(*v))
+                        .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
                 _ => return None,
@@ -808,8 +884,7 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
                     None => {
                         let mut big =
                             num_bigint::BigInt::from(result) - num_bigint::BigInt::from(n);
-                        for v2 in
-                            &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
+                        for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
                         {
                             big -= numeric_as_bigint(v2)?;
                         }
@@ -862,8 +937,7 @@ fn builtin_mul(args: &[Value]) -> ValueResult<Value> {
                     None => {
                         let mut big =
                             num_bigint::BigInt::from(result) * num_bigint::BigInt::from(n);
-                        for v2 in
-                            &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
+                        for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
                         {
                             big *= numeric_as_bigint(v2)?;
                         }
@@ -917,7 +991,7 @@ fn builtin_div(args: &[Value]) -> ValueResult<Value> {
                 if d.is_zero() {
                     return Err(ValueError::Other("divide by zero".into()));
                 }
-                result = result / d;
+                result /= d;
             }
             Ok(simplify_ratio_with(result, preserve_bigint))
         }
@@ -960,13 +1034,12 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
                 return Err(ValueError::Other("mod by zero".into()));
             }
             let r = &a % &b;
-            let result = if r.is_negative() && b.is_negative()
-                || (r.is_negative() && b.is_positive())
-            {
-                r + &b
-            } else {
-                r
-            };
+            let result =
+                if r.is_negative() && b.is_negative() || (r.is_negative() && b.is_positive()) {
+                    r + &b
+                } else {
+                    r
+                };
             Ok(Value::BigDecimal(GcPtr::new(result)))
         }
         // Ratio in either → ratio mod, result may be BigInt if integer
@@ -1435,7 +1508,10 @@ fn builtin_map_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Map(_))))
 }
 fn builtin_vector_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Vector(_))))
+    Ok(Value::Bool(matches!(
+        args[0].unwrap_meta(),
+        Value::Vector(_)
+    )))
 }
 fn builtin_set_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Set(_))))
@@ -1479,7 +1555,10 @@ fn builtin_ratio_q(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_sorted_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(&args[0], Value::Map(MapValue::Sorted(_))) || matches!(&args[0], Value::Set(SetValue::Sorted(_)))))
+    Ok(Value::Bool(
+        matches!(&args[0], Value::Map(MapValue::Sorted(_)))
+            || matches!(&args[0], Value::Set(SetValue::Sorted(_))),
+    ))
 }
 
 // ── Collections ───────────────────────────────────────────────────────────────
@@ -1604,10 +1683,12 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
         for pair in args[1..].chunks(2) {
             fields = fields.assoc(pair[0].clone(), pair[1].clone());
         }
-        return Ok(apply_meta(Value::TypeInstance(GcPtr::new(cljx_value::TypeInstance {
-            type_tag: ti.get().type_tag.clone(),
-            fields,
-        }))));
+        return Ok(apply_meta(Value::TypeInstance(GcPtr::new(
+            cljx_value::TypeInstance {
+                type_tag: ti.get().type_tag.clone(),
+                fields,
+            },
+        ))));
     }
     let mut result = match coll {
         Value::Nil => MapValue::empty(),
@@ -2091,15 +2172,14 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
         | Value::DoubleArray(_)
         | Value::BooleanArray(_)
         | Value::CharArray(_)
-        | Value::Nil =>
-            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
-                ValueIter::new(args[0].clone()),
-            )))),
+        | Value::Nil => Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            ValueIter::new(args[0].clone()),
+        )))),
 
         _ => Err(ValueError::WrongType {
             expected: "seq",
             got: args[0].type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -2109,11 +2189,15 @@ fn builtin_object_array(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => {
             let size = *n as usize;
-            Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(vec![Value::Nil; size]))))
+            Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(
+                vec![Value::Nil; size],
+            ))))
         }
         Value::Double(f) => {
             let size = *f as usize;
-            Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(vec![Value::Nil; size]))))
+            Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(
+                vec![Value::Nil; size],
+            ))))
         }
         _ => {
             let v: Vec<Value> = ValueIter::new(args[0].clone()).collect();
@@ -2153,14 +2237,30 @@ fn builtin_aclone(args: &[Value]) -> ValueResult<Value> {
             let cloned = a.get().0.lock().unwrap().clone();
             Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(cloned))))
         }
-        Value::IntArray(a) => Ok(Value::IntArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::LongArray(a) => Ok(Value::LongArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::ShortArray(a) => Ok(Value::ShortArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::ByteArray(a) => Ok(Value::ByteArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::FloatArray(a) => Ok(Value::FloatArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::DoubleArray(a) => Ok(Value::DoubleArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::BooleanArray(a) => Ok(Value::BooleanArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
-        Value::CharArray(a) => Ok(Value::CharArray(GcPtr::new(Mutex::new(a.get().lock().unwrap().clone())))),
+        Value::IntArray(a) => Ok(Value::IntArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::LongArray(a) => Ok(Value::LongArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::ShortArray(a) => Ok(Value::ShortArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::ByteArray(a) => Ok(Value::ByteArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::FloatArray(a) => Ok(Value::FloatArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::DoubleArray(a) => Ok(Value::DoubleArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::BooleanArray(a) => Ok(Value::BooleanArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
+        Value::CharArray(a) => Ok(Value::CharArray(GcPtr::new(Mutex::new(
+            a.get().lock().unwrap().clone(),
+        )))),
         _ => Err(ValueError::WrongType {
             expected: "array",
             got: args[0].type_name().to_string(),
@@ -2180,10 +2280,12 @@ fn builtin_alength(args: &[Value]) -> ValueResult<Value> {
         Value::DoubleArray(a) => a.get().lock().unwrap().len(),
         Value::BooleanArray(a) => a.get().lock().unwrap().len(),
         Value::CharArray(a) => a.get().lock().unwrap().len(),
-        _ => return Err(ValueError::WrongType {
-            expected: "array",
-            got: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(ValueError::WrongType {
+                expected: "array",
+                got: args[0].type_name().to_string(),
+            });
+        }
     };
     Ok(Value::Long(len as i64))
 }
@@ -2198,14 +2300,62 @@ fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
                 let guard = a.get().0.lock().unwrap();
                 guard.get(idx).cloned().unwrap_or(Value::Nil)
             }
-            Value::IntArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Long(*v as i64)).unwrap_or(Value::Nil),
-            Value::LongArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Long(*v)).unwrap_or(Value::Nil),
-            Value::ShortArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Long(*v as i64)).unwrap_or(Value::Nil),
-            Value::ByteArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Long(*v as i64)).unwrap_or(Value::Nil),
-            Value::FloatArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Double(*v as f64)).unwrap_or(Value::Nil),
-            Value::DoubleArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Double(*v)).unwrap_or(Value::Nil),
-            Value::BooleanArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Bool(*v)).unwrap_or(Value::Nil),
-            Value::CharArray(a) => a.get().lock().unwrap().get(idx).map(|v| Value::Char(*v)).unwrap_or(Value::Nil),
+            Value::IntArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Long(*v as i64))
+                .unwrap_or(Value::Nil),
+            Value::LongArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Long(*v))
+                .unwrap_or(Value::Nil),
+            Value::ShortArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Long(*v as i64))
+                .unwrap_or(Value::Nil),
+            Value::ByteArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Long(*v as i64))
+                .unwrap_or(Value::Nil),
+            Value::FloatArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Double(*v as f64))
+                .unwrap_or(Value::Nil),
+            Value::DoubleArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Double(*v))
+                .unwrap_or(Value::Nil),
+            Value::BooleanArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Bool(*v))
+                .unwrap_or(Value::Nil),
+            Value::CharArray(a) => a
+                .get()
+                .lock()
+                .unwrap()
+                .get(idx)
+                .map(|v| Value::Char(*v))
+                .unwrap_or(Value::Nil),
             _ => {
                 return Err(ValueError::WrongType {
                     expected: "array",
@@ -2225,7 +2375,10 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
         Value::ObjectArray(a) => {
             let mut guard = a.get().0.lock().unwrap();
             if idx >= guard.len() {
-                return Err(ValueError::IndexOutOfBounds { idx, count: guard.len() });
+                return Err(ValueError::IndexOutOfBounds {
+                    idx,
+                    count: guard.len(),
+                });
             }
             guard[idx] = newval.clone();
             Ok(newval)
@@ -2239,10 +2392,14 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
 
 // amap and areduce are macros in Clojure; stubs for now.
 fn builtin_amap_stub(_args: &[Value]) -> ValueResult<Value> {
-    Err(ValueError::Other("amap is a macro — not yet implemented".into()))
+    Err(ValueError::Other(
+        "amap is a macro — not yet implemented".into(),
+    ))
 }
 fn builtin_areduce_stub(_args: &[Value]) -> ValueResult<Value> {
-    Err(ValueError::Other("areduce is a macro — not yet implemented".into()))
+    Err(ValueError::Other(
+        "areduce is a macro — not yet implemented".into(),
+    ))
 }
 
 /// Helper: build a typed array. `(xxx-array size init-or-coll)` or `(xxx-array size-or-coll)`.
@@ -2273,8 +2430,9 @@ fn make_typed_array<T: Clone>(
         2 => {
             // Two args: (xxx-array size init-coll)
             let size = numeric_as_i64(&args[0])? as usize;
-            let items: ValueResult<Vec<T>> =
-                ValueIter::new(args[1].clone()).map(|v| coerce(&v)).collect();
+            let items: ValueResult<Vec<T>> = ValueIter::new(args[1].clone())
+                .map(|v| coerce(&v))
+                .collect();
             let mut vec: Vec<T> = items?;
             vec.resize(size, default);
             Ok(value_builder(vec))
@@ -2287,44 +2445,15 @@ fn make_typed_array<T: Clone>(
     }
 }
 
-fn coerce_to_long(v: &Value) -> ValueResult<Value> {
-    Ok(Value::Long(numeric_as_i64(v)?))
-}
-
-fn coerce_to_double(v: &Value) -> ValueResult<Value> {
-    Ok(Value::Double(numeric_as_f64(v)?))
-}
-
-fn coerce_to_bool(v: &Value) -> ValueResult<Value> {
-    Ok(Value::Bool(is_truthy(v)))
-}
-
-fn coerce_to_char(v: &Value) -> ValueResult<Value> {
+fn coerce_to_char_native(v: &Value) -> ValueResult<char> {
     match v {
-        Value::Char(_) => Ok(v.clone()),
-        Value::Long(n) => {
-            char::from_u32(*n as u32)
-                .map(Value::Char)
-                .ok_or_else(|| ValueError::Other(format!("invalid char code point: {n}")))
-        }
+        Value::Char(c) => Ok(*c),
+        Value::Long(n) => char::from_u32(*n as u32)
+            .ok_or_else(|| ValueError::Other(format!("invalid char code point: {n}"))),
         _ => Err(ValueError::WrongType {
             expected: "char",
             got: v.type_name().to_string(),
         }),
-    }
-}
-
-fn coerce_to_char_native(v: &Value) -> ValueResult<char> {
-    match v {
-        Value::Char(c) => Ok(*c),
-        Value::Long(n) => {
-            char::from_u32(*n as u32)
-                .ok_or_else(|| ValueError::Other(format!("invalid char code point: {n}")))
-        }
-        _ => Err(ValueError::WrongType {
-            expected: "char",
-            got: v.type_name().to_string(),
-        })
     }
 }
 
@@ -2337,7 +2466,10 @@ fn builtin_aset_bool(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = is_truthy(&args[2]);
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Bool(newval))
@@ -2346,7 +2478,7 @@ fn builtin_aset_bool(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "boolean-array",
                 got: args[0].type_name().to_string(),
-            })
+            }),
         },
         _ => Err(ValueError::Unsupported),
     }
@@ -2360,7 +2492,10 @@ fn builtin_aset_byte(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_i8(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval as i64))
@@ -2369,9 +2504,9 @@ fn builtin_aset_byte(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "byte-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
@@ -2383,7 +2518,10 @@ fn builtin_aset_int(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_i32(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval as i64))
@@ -2392,9 +2530,9 @@ fn builtin_aset_int(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "int-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
@@ -2406,7 +2544,10 @@ fn builtin_aset_short(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_i16(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval as i64))
@@ -2415,9 +2556,9 @@ fn builtin_aset_short(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "short-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
@@ -2429,7 +2570,10 @@ fn builtin_aset_long(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_i64(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval))
@@ -2438,9 +2582,9 @@ fn builtin_aset_long(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "long-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
@@ -2452,7 +2596,10 @@ fn builtin_aset_double(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_f64(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval as i64))
@@ -2461,9 +2608,9 @@ fn builtin_aset_double(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "double-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
@@ -2475,7 +2622,10 @@ fn builtin_aset_float(args: &[Value]) -> ValueResult<Value> {
                 let index = numeric_as_i64(&args[1])? as usize;
                 let newval = numeric_as_f32(&args[2])?;
                 if index >= v.len() {
-                    Err(ValueError::IndexOutOfBounds { idx: index, count: v.len() })
+                    Err(ValueError::IndexOutOfBounds {
+                        idx: index,
+                        count: v.len(),
+                    })
                 } else {
                     v[index] = newval;
                     Ok(Value::Long(newval as i64))
@@ -2484,34 +2634,46 @@ fn builtin_aset_float(args: &[Value]) -> ValueResult<Value> {
             _ => Err(ValueError::WrongType {
                 expected: "float-array",
                 got: args[0].type_name().to_string(),
-            })
-        }
-        _ => Err(ValueError::Unsupported)
+            }),
+        },
+        _ => Err(ValueError::Unsupported),
     }
 }
 
 fn builtin_int_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0, numeric_as_i32, |v| { Value::IntArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(args, 0, numeric_as_i32, |v| {
+        Value::IntArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_long_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0i64, numeric_as_i64, |v| { Value::LongArray(GcPtr::new(Mutex::new(v)))})
+    make_typed_array(args, 0i64, numeric_as_i64, |v| {
+        Value::LongArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_short_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0i16, numeric_as_i16, |v| { Value::ShortArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(args, 0i16, numeric_as_i16, |v| {
+        Value::ShortArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_byte_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0i8, numeric_as_i8, |v| { Value::ByteArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(args, 0i8, numeric_as_i8, |v| {
+        Value::ByteArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_float_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0f32, numeric_as_f32, |v| { Value::FloatArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(args, 0f32, numeric_as_f32, |v| {
+        Value::FloatArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_double_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, 0f64, numeric_as_f64, |v| { Value::DoubleArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(args, 0f64, numeric_as_f64, |v| {
+        Value::DoubleArray(GcPtr::new(Mutex::new(v)))
+    })
 }
 
 fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
@@ -2526,9 +2688,13 @@ fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
                 let vec = Vec::from_iter(s.get().chars());
                 Ok(Value::CharArray(GcPtr::new(Mutex::new(vec))))
             }
-            _ => make_typed_array(args, '\0', coerce_to_char_native, |v| { Value::CharArray(GcPtr::new(Mutex::new(v))) }),
+            _ => make_typed_array(args, '\0', coerce_to_char_native, |v| {
+                Value::CharArray(GcPtr::new(Mutex::new(v)))
+            }),
         },
-        2 => make_typed_array(args, '\0', coerce_to_char_native, |v| { Value::CharArray(GcPtr::new(Mutex::new(v))) }),
+        2 => make_typed_array(args, '\0', coerce_to_char_native, |v| {
+            Value::CharArray(GcPtr::new(Mutex::new(v)))
+        }),
         _ => Err(ValueError::ArityError {
             name: "char-array".into(),
             expected: "1 or 2".into(),
@@ -2538,7 +2704,12 @@ fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_boolean_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, false, |v| Ok(is_truthy(v)), |v| { Value::BooleanArray(GcPtr::new(Mutex::new(v))) })
+    make_typed_array(
+        args,
+        false,
+        |v| Ok(is_truthy(v)),
+        |v| Value::BooleanArray(GcPtr::new(Mutex::new(v))),
+    )
 }
 
 /// `(booleans x)`, `(ints x)`, etc. — type hint casts, identity in our runtime.
@@ -2547,11 +2718,20 @@ fn builtin_identity_cast(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_set_fn(args: &[Value]) -> ValueResult<Value> {
-    if !matches!(args[0], Value::List(_) | Value::Set(_) | Value::Map(_) | Value::LazySeq(_) | Value::Vector(_) | Value::Str(_) | Value::Nil) {
+    if !matches!(
+        args[0],
+        Value::List(_)
+            | Value::Set(_)
+            | Value::Map(_)
+            | Value::LazySeq(_)
+            | Value::Vector(_)
+            | Value::Str(_)
+            | Value::Nil
+    ) {
         return Err(ValueError::WrongType {
             expected: "seq",
             got: args[0].type_name().to_string(),
-        })
+        });
     }
     let set = ValueIter::new(args[0].clone()).fold(PersistentHashSet::empty(), |s, v| s.conj(v));
     Ok(Value::Set(SetValue::Hash(GcPtr::new(set))))
@@ -3713,7 +3893,8 @@ fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
         return Err(ValueError::OddMap { count: args.len() });
     }
     let sm = cljx_value::SortedMap::from_pairs(
-        args.chunks(2).map(|pair| (pair[0].clone(), pair[1].clone())),
+        args.chunks(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone())),
     );
     Ok(Value::Map(MapValue::Sorted(GcPtr::new(sm))))
 }

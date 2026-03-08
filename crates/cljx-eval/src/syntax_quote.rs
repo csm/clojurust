@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::env::Env;
+use crate::error::{EvalError, EvalResult};
 use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
-use cljx_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
 use cljx_value::value::SetValue;
-use crate::env::Env;
-use crate::error::{EvalError, EvalResult};
+use cljx_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 

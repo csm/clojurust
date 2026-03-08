@@ -31,7 +31,7 @@ impl PersistentHashSet {
             inner: self.inner.insert(val),
         }
     }
-    
+
     pub fn conj_mut(&mut self, val: Value) -> &mut Self {
         self.inner.insert_mut(val);
         self

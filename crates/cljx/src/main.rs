@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
@@ -362,19 +362,18 @@ fn discover_in_dir(root: &PathBuf, dir: &PathBuf, out: &mut Vec<String>) {
         let path = entry.path();
         if path.is_dir() {
             discover_in_dir(root, &path, out);
-        } else if let Some(ext) = path.extension() {
-            if ext == "cljc" || ext == "cljrs" {
-                if let Some(ns) = file_to_namespace(root, &path) {
-                    out.push(ns);
-                }
-            }
+        } else if let Some(ext) = path.extension()
+            && (ext == "cljc" || ext == "cljrs")
+            && let Some(ns) = file_to_namespace(root, &path)
+        {
+            out.push(ns);
         }
     }
 }
 
 /// Convert a file path relative to the source root into a Clojure namespace name.
 /// e.g. `test/clojure/core_test/juxt.cljc` relative to `test/` → `clojure.core-test.juxt`
-fn file_to_namespace(root: &PathBuf, file: &PathBuf) -> Option<String> {
+fn file_to_namespace(root: &PathBuf, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root).ok()?;
     let stem = rel.with_extension(""); // remove .cljc / .cljrs
     let ns = stem
