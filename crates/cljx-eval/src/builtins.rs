@@ -236,7 +236,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("ex-message", Arity::Fixed(1), builtin_ex_message),
         ("ex-cause", Arity::Fixed(1), builtin_ex_cause),
         ("range", Arity::Variadic { min: 0 }, builtin_range),
-        ("repeat", Arity::Variadic { min: 1 }, builtin_repeat),
         ("replicate", Arity::Fixed(2), builtin_replicate),
         ("symbol", Arity::Variadic { min: 1 }, builtin_symbol),
         ("keyword", Arity::Variadic { min: 1 }, builtin_keyword_fn),
@@ -646,6 +645,7 @@ fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
             .floor()
             .to_i64()
             .ok_or_else(|| ValueError::Other("cannot convert ratio".into())),
+        Value::Bool(b) => Ok(*b as i64),
         _ => Err(ValueError::WrongType {
             expected: "integer",
             got: v.type_name().to_string(),
@@ -3314,6 +3314,7 @@ fn builtin_swap_sentinel(_args: &[Value]) -> ValueResult<Value> {
 // ── I/O ───────────────────────────────────────────────────────────────────────
 
 fn print_vals(args: &[Value], sep: &str, readably: bool) -> String {
+    use cljx_value::value::PrintValue;
     args.iter()
         .map(|v| {
             if readably {
@@ -3321,7 +3322,8 @@ fn print_vals(args: &[Value], sep: &str, readably: bool) -> String {
             } else {
                 match v {
                     Value::Str(s) => s.get().to_string(),
-                    other => format!("{}", other),
+                    Value::Char(c) => c.to_string(),
+                    other => format!("{}", PrintValue(other)),
                 }
             }
         })
@@ -3349,18 +3351,14 @@ fn builtin_pr_str(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::string(print_vals(args, " ", true)))
 }
 fn builtin_str(args: &[Value]) -> ValueResult<Value> {
+    use cljx_value::value::PrintValue;
     let s: String = args
         .iter()
         .map(|v| match v {
             Value::Nil => String::new(),
             Value::Str(s) => s.get().to_string(),
-            other => {
-                // Strip outer quotes for str: print without readably
-                match other {
-                    Value::Char(c) => c.to_string(),
-                    v => format!("{}", v),
-                }
-            }
+            Value::Char(c) => c.to_string(),
+            other => format!("{}", PrintValue(other)),
         })
         .collect();
     Ok(Value::string(s))
@@ -3548,24 +3546,6 @@ fn builtin_range(args: &[Value]) -> ValueResult<Value> {
         i = i.wrapping_add(step);
     }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
-}
-
-fn builtin_repeat(args: &[Value]) -> ValueResult<Value> {
-    match args.len() {
-        1 => Err(ValueError::Other("infinite repeat not supported".into())),
-        2 => {
-            let n = numeric_as_i64(&args[0])? as usize;
-            let v = args[1].clone();
-            Ok(Value::List(GcPtr::new(PersistentList::from_iter(
-                std::iter::repeat_n(v, n),
-            ))))
-        }
-        _ => Err(ValueError::ArityError {
-            name: "repeat".into(),
-            expected: "1-2".into(),
-            got: args.len(),
-        }),
-    }
 }
 
 fn builtin_replicate(args: &[Value]) -> ValueResult<Value> {

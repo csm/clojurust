@@ -62,10 +62,13 @@
     (cat nil coll)))
 
 (defn take [n coll]
-  (lazy-seq
-    (when (pos? n)
-      (when-let [s (seq coll)]
-        (cons (first s) (take (dec n) (rest s)))))))
+  (let [n (int n)]
+    (cond (pos? n)
+          (when (pos? n)
+            (lazy-seq
+              (when-let [s (seq coll)]
+                (cons (first s) (take (dec n) (rest s))))))
+          :else [])))
 
 (defn drop [n coll]
   (loop [s (seq coll) n n]

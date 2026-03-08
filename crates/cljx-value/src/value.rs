@@ -661,6 +661,15 @@ impl fmt::Display for Value {
     }
 }
 
+/// A wrapper for printing a Value non-readably (for `str`, `println`).
+pub struct PrintValue<'a>(pub &'a Value);
+
+impl fmt::Display for PrintValue<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        pr_str(self.0, f, false)
+    }
+}
+
 /// Print a value.  `readably = true` quotes strings and escapes chars.
 pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Result {
     match v {
@@ -670,21 +679,36 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Long(n) => write!(f, "{n}"),
         Value::Double(d) => {
             if d.is_infinite() {
-                if *d > 0.0 {
-                    write!(f, "##Inf")
+                if readably {
+                    if *d > 0.0 { write!(f, "##Inf") } else { write!(f, "##-Inf") }
                 } else {
-                    write!(f, "##-Inf")
+                    if *d > 0.0 { write!(f, "Infinity") } else { write!(f, "-Infinity") }
                 }
             } else if d.is_nan() {
-                write!(f, "##NaN")
+                if readably { write!(f, "##NaN") } else { write!(f, "NaN") }
             } else if d.fract() == 0.0 && d.abs() < 1e15 {
                 write!(f, "{d:.1}")
             } else {
                 write!(f, "{d}")
             }
         }
-        Value::BigInt(n) => write!(f, "{}N", n.get()),
-        Value::BigDecimal(d) => write!(f, "{}M", d.get()),
+        Value::BigInt(n) => {
+            if readably { write!(f, "{}N", n.get()) } else { write!(f, "{}", n.get()) }
+        }
+        Value::BigDecimal(d) => {
+            let dec = d.get();
+            let s = format!("{}", dec);
+            // bigdecimal Display omits trailing zeros for zero values (e.g. 0.0 → "0").
+            // Preserve scale: if the value has fractional digits but displays without a dot, add them.
+            if !s.contains('.') && dec.fractional_digit_count() > 0 {
+                let zeros = "0".repeat(dec.fractional_digit_count() as usize);
+                if readably { write!(f, "{s}.{zeros}M") } else { write!(f, "{s}.{zeros}") }
+            } else if readably {
+                write!(f, "{s}M")
+            } else {
+                write!(f, "{s}")
+            }
+        }
         Value::Ratio(r) => write!(f, "{}", r.get()),
         Value::Char(c) => {
             if readably {
