@@ -89,6 +89,16 @@
            (is (big-int? (* 1 5N)))
            (is (big-int? (* 1N 5)))
            (is (big-int? (* 1N 5N)))]
+          :rust
+          [(is (big-int? (* 0 1N)))
+           (is (big-int? (* 0N 1)))
+           (is (big-int? (* 0N 1N)))
+           (is (big-int? (* 1N 1)))
+           (is (big-int? (* 1 1N)))
+           (is (big-int? (* 1N 1N)))
+           (is (big-int? (* 1 5N)))
+           (is (big-int? (* 1N 5)))
+           (is (big-int? (* 1N 5N)))]
           :default
           [(is (big-int? (* 0 1N)))
            (is (big-int? (* 0N 1)))
