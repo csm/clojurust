@@ -1879,6 +1879,94 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(chars))))
             }
         }
+        Value::ObjectArray(a) => {
+            let array = a.get().0.lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(array))))
+            }
+        }
+        Value::BooleanArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|b| Value::Bool(*b)),
+                ))))
+            }
+        }
+        Value::ByteArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|i| Value::Long(*i as i64)),
+                ))))
+            }
+        }
+        Value::ShortArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|i| Value::Long(*i as i64)),
+                ))))
+            }
+        }
+        Value::IntArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|i| Value::Long(*i as i64)),
+                ))))
+            }
+        }
+        Value::LongArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|i| Value::Long(*i)),
+                ))))
+            }
+        }
+        Value::CharArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|i| Value::Char(*i)),
+                ))))
+            }
+        }
+        Value::FloatArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|f| Value::Double(*f as f64)),
+                ))))
+            }
+        }
+        Value::DoubleArray(a) => {
+            let array = a.get().lock().unwrap().clone();
+            if array.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                    array.iter().map(|f| Value::Double(*f)),
+                ))))
+            }
+        }
         v => Err(ValueError::WrongType {
             expected: "seqable",
             got: v.type_name().to_string(),
