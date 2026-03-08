@@ -19,4 +19,4 @@ pub use types::{
     Delay, DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnPtr, Protocol,
     ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
 };
-pub use value::{MapValue, TypeInstance, Value};
+pub use value::{MapValue, ObjectArray, TypeInstance, Value};

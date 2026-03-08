@@ -245,6 +245,12 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] `*clojure-version*` / `*cljx-version*` vars
 - [x] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars (defined in Phase 8-ext-2)
 - [ ] Preserve metadata for `assoc`.
+- [ ] Full array compatibility with clojure.
+  - [ ] Regular object arrays (e.g. object-array) as Vec<Value>. Don't cheat and use PersistentVector.
+  - [ ] Coercion via vec, seq, etc.
+  - [ ] Equality support against collections.
+  - [ ] amap and areduce.
+  - [ ] Multi-dimensional aset variants.
 
 ---
 

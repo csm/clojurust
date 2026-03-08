@@ -499,34 +499,34 @@ mod tests {
 
 // Impls for vectors (backs "arrays" in clojure).
 
-impl Trace for Vec<i32> {
+impl Trace for std::sync::Mutex<Vec<i32>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<i64> {
+impl Trace for std::sync::Mutex<Vec<i64>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<i16> {
+impl Trace for std::sync::Mutex<Vec<i16>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<i8> {
+impl Trace for std::sync::Mutex<Vec<i8>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<char> {
+impl Trace for std::sync::Mutex<Vec<char>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<f64> {
+impl Trace for std::sync::Mutex<Vec<f64>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<f32> {
+impl Trace for std::sync::Mutex<Vec<f32>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }
 
-impl Trace for Vec<bool> {
+impl Trace for std::sync::Mutex<Vec<bool>> {
     fn trace(&self, _visitor: &mut MarkVisitor) {}
 }

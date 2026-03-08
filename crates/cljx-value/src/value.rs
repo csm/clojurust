@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
-use cljx_gc::GcPtr;
+use cljx_gc::{GcPtr, MarkVisitor, Trace};
 
 use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
@@ -20,6 +20,25 @@ use crate::types::{
     Agent, Atom, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn, Namespace,
     NativeFn, Protocol, ProtocolFn, Var, Volatile,
 };
+
+/// A GC-traced mutable array of Values (backs `object-array`).
+#[derive(Debug)]
+pub struct ObjectArray(pub Mutex<Vec<Value>>);
+
+impl ObjectArray {
+    pub fn new(v: Vec<Value>) -> Self {
+        Self(Mutex::new(v))
+    }
+}
+
+impl Trace for ObjectArray {
+    fn trace(&self, visitor: &mut MarkVisitor) {
+        let guard = self.0.lock().unwrap();
+        for v in guard.iter() {
+            v.trace(visitor);
+        }
+    }
+}
 
 /// The central runtime type: every Clojure value is a `Value`.
 ///
@@ -52,14 +71,15 @@ pub enum Value {
     Queue(GcPtr<PersistentQueue>),
 
     // Arrays
-    IntArray(GcPtr<Vec<i32>>),
-    LongArray(GcPtr<Vec<i64>>),
-    ShortArray(GcPtr<Vec<i16>>),
-    ByteArray(GcPtr<Vec<i8>>),
-    FloatArray(GcPtr<Vec<f32>>),
-    DoubleArray(GcPtr<Vec<f64>>),
-    BooleanArray(GcPtr<Vec<bool>>),
-    CharArray(GcPtr<Vec<char>>),
+    IntArray(GcPtr<Mutex<Vec<i32>>>),
+    LongArray(GcPtr<Mutex<Vec<i64>>>),
+    ShortArray(GcPtr<Mutex<Vec<i16>>>),
+    ByteArray(GcPtr<Mutex<Vec<i8>>>),
+    FloatArray(GcPtr<Mutex<Vec<f32>>>),
+    DoubleArray(GcPtr<Mutex<Vec<f64>>>),
+    BooleanArray(GcPtr<Mutex<Vec<bool>>>),
+    CharArray(GcPtr<Mutex<Vec<char>>>),
+    ObjectArray(GcPtr<ObjectArray>),
 
     // ── Functions ─────────────────────────────────────────────────────────────
     NativeFunction(GcPtr<NativeFn>),
@@ -476,42 +496,42 @@ impl ClojureHash for Value {
             // Arrays
             Value::BooleanArray(a) => {
                 let mut h: u32 = 0;
-                for b in a.get().iter() {
+                for b in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, if *b { 1231 } else { 1237 })
                 }
                 h
             },
             Value::ByteArray(a) => {
                 let mut h: u32 = 0;
-                for b in a.get().iter() {
+                for b in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *b as u32)
                 }
                 h
             },
             Value::ShortArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
             },
             Value::IntArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
             },
             Value::CharArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     h = hash_combine_ordered(h, *item as u32)
                 }
                 h
             },
             Value::LongArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     let v = *item;
                     h = hash_combine_ordered(h, hash_i64(v));
                 }
@@ -519,7 +539,7 @@ impl ClojureHash for Value {
             },
             Value::FloatArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     let f = *item;
                     h = hash_combine_ordered(h, if f.fract() == 0.0
                         && f.is_finite()
@@ -534,7 +554,7 @@ impl ClojureHash for Value {
             },
             Value::DoubleArray(a) => {
                 let mut h: u32 = 0;
-                for item in a.get().iter() {
+                for item in a.get().lock().unwrap().iter() {
                     let f = *item;
                     h = hash_combine_ordered(h, if f.fract() == 0.0
                         && f.is_finite()
@@ -544,6 +564,13 @@ impl ClojureHash for Value {
                     } else {
                         hash_i64(f.to_bits() as i64)
                     })
+                }
+                h
+            },
+            Value::ObjectArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().0.lock().unwrap().iter() {
+                    h = hash_combine_ordered(h, item.clojure_hash())
                 }
                 h
             },
@@ -729,7 +756,8 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             | Value::LongArray(_)
             | Value::CharArray(_)
             | Value::FloatArray(_)
-            | Value::DoubleArray(_) => write!(f, "#[array]"),
+            | Value::DoubleArray(_)
+            | Value::ObjectArray(_) => write!(f, "#[array]"),
         Value::Queue(q) => {
             // Printed as a list with a type tag.
             write!(f, "#queue (")?;
@@ -867,6 +895,7 @@ impl Value {
             Value::FloatArray(_) => "float-array",
             Value::DoubleArray(_) => "double-array",
             Value::CharArray(_) => "char-array",
+            Value::ObjectArray(_) => "object-array",
         }
     }
 
@@ -940,6 +969,7 @@ impl cljx_gc::Trace for Value {
             Value::Future(p) => visitor.visit(p),
             Value::Agent(p) => visitor.visit(p),
             Value::TypeInstance(p) => visitor.visit(p),
+            Value::ObjectArray(p) => visitor.visit(p),
             Value::BooleanArray(_)
             | Value::ByteArray(_)
             | Value::ShortArray(_)
@@ -1358,5 +1388,6 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::CharArray(_) => 34,
         Value::FloatArray(_) => 35,
         Value::DoubleArray(_) => 36,
+        Value::ObjectArray(_) => 37,
     }
 }
