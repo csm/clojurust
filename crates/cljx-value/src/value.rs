@@ -690,12 +690,22 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Double(d) => {
             if d.is_infinite() {
                 if readably {
-                    if *d > 0.0 { write!(f, "##Inf") } else { write!(f, "##-Inf") }
+                    if *d > 0.0 {
+                        write!(f, "##Inf")
+                    } else {
+                        write!(f, "##-Inf")
+                    }
+                } else if *d > 0.0 {
+                    write!(f, "Infinity")
                 } else {
-                    if *d > 0.0 { write!(f, "Infinity") } else { write!(f, "-Infinity") }
+                    write!(f, "-Infinity")
                 }
             } else if d.is_nan() {
-                if readably { write!(f, "##NaN") } else { write!(f, "NaN") }
+                if readably {
+                    write!(f, "##NaN")
+                } else {
+                    write!(f, "NaN")
+                }
             } else if d.fract() == 0.0 && d.abs() < 1e15 {
                 write!(f, "{d:.1}")
             } else {
@@ -703,7 +713,11 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
         }
         Value::BigInt(n) => {
-            if readably { write!(f, "{}N", n.get()) } else { write!(f, "{}", n.get()) }
+            if readably {
+                write!(f, "{}N", n.get())
+            } else {
+                write!(f, "{}", n.get())
+            }
         }
         Value::BigDecimal(d) => {
             let dec = d.get();
@@ -712,7 +726,11 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             // Preserve scale: if the value has fractional digits but displays without a dot, add them.
             if !s.contains('.') && dec.fractional_digit_count() > 0 {
                 let zeros = "0".repeat(dec.fractional_digit_count() as usize);
-                if readably { write!(f, "{s}.{zeros}M") } else { write!(f, "{s}.{zeros}") }
+                if readably {
+                    write!(f, "{s}.{zeros}M")
+                } else {
+                    write!(f, "{s}.{zeros}")
+                }
             } else if readably {
                 write!(f, "{s}M")
             } else {
