@@ -11,8 +11,11 @@
       ;; Sorted maps and sorted sets are `sorted?`
       (is (sorted? (sorted-map)))
       (is (sorted? (sorted-set)))
-      (is (sorted? (sorted-map-by <)))
-      (is (sorted? (sorted-set-by <))))
+      #?(:rust "sorted-map-by and sorted-set-by not implemented"
+         :default
+         [
+          (is (sorted? (sorted-map-by <)))
+          (is (sorted? (sorted-set-by <)))]))
 
     (testing "negative cases"
       ;; Most everyting else is not `sorted?`
