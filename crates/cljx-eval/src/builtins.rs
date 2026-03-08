@@ -3560,7 +3560,9 @@ fn builtin_symbol(args: &[Value]) -> ValueResult<Value> {
     match args.len() {
         1 => match &args[0] {
             Value::Str(s) => Ok(Value::symbol(Symbol::parse(s.get()))),
+            Value::Keyword(kw) => Ok(Value::symbol(Symbol::parse(&kw.get().full_name()))),
             Value::Symbol(s) => Ok(Value::Symbol(s.clone())),
+            Value::Var(v) => Ok(Value::symbol(Symbol::parse(&v.get().full_name()))),
             v => Err(ValueError::WrongType {
                 expected: "string",
                 got: v.type_name().to_string(),
