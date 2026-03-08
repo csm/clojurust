@@ -1,0 +1,31 @@
+{:min-bb-version "1.12.210"
+ :paths ["bb"]
+ :tasks
+ {test-jvm {:doc "Runs JVM tests"
+            :task (shell "lein test")}
+  test-bb {:doc "Runs bb tests"
+           :extra-deps {io.github.cognitect-labs/test-runner
+                        {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+           :extra-paths ["test"]
+           :task (exec 'cognitect.test-runner.api/test)
+           :exec-args {:patterns [".*"]}}
+  test-cljs {:doc "Runs CLJS tests"
+             :task (shell "npx shadow-cljs compile test")}
+  test-lpy {:doc  "Run Basilisp tests"
+            :task (shell
+                   {:extra-env {"BASILISP_TEST_PATH"         "./test"
+                                "BASILISP_TEST_FILE_PATTERN" ".*\\.(lpy|cljc)"}}
+                   "basilisp test -p test -- -n auto")}
+  new-test {:doc "Creates new test for the Clojure symbols named by <args>. Unqualified symbols assume clojure.core"
+            :requires ([new-test])
+            :task (new-test/new-test *command-line-args*)}
+  nrepl {:doc "Starts an nrepl server on port 1339 using an .nrepl-port file"
+         :requires ([babashka.fs :as fs]
+                    [babashka.nrepl.server :as srv])
+         :task (do (srv/start-server! {:host "localhost"
+                                       :port 1339})
+                   (spit ".nrepl-port" "1339")
+                   (-> (Runtime/getRuntime)
+                       (.addShutdownHook
+                         (Thread. (fn [] (fs/delete ".nrepl-port")))))
+                   (deref (promise)))}}}
