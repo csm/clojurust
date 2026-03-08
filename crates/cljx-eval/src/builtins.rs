@@ -463,6 +463,42 @@ impl Iterator for ValueIter {
                     let chars: Vec<Value> = s.get().chars().map(Value::Char).collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(chars)));
                 }
+                Value::ObjectArray(a) => {
+                    let items = a.get().0.lock().unwrap().clone();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::IntArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::LongArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::ShortArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::ByteArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Long(*v as i64)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::FloatArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Double(*v as f64)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::DoubleArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Double(*v)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::BooleanArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Bool(*v)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
+                Value::CharArray(a) => {
+                    let items: Vec<Value> = a.get().lock().unwrap().iter().map(|v| Value::Char(*v)).collect();
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
+                }
                 _ => return None,
             }
         }
@@ -2022,7 +2058,16 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
         | Value::LazySeq(_)
         | Value::Queue(_)
         | Value::Str(_)
-        | Value::Nil => // TODO arrays as well
+        | Value::ObjectArray(_)
+        | Value::IntArray(_)
+        | Value::LongArray(_)
+        | Value::ShortArray(_)
+        | Value::ByteArray(_)
+        | Value::FloatArray(_)
+        | Value::DoubleArray(_)
+        | Value::BooleanArray(_)
+        | Value::CharArray(_)
+        | Value::Nil =>
             Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
                 ValueIter::new(args[0].clone()),
             )))),
