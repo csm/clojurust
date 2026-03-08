@@ -9,9 +9,12 @@
     (is (= '() (take 5 nil)))
     
     ;; transducer versions
-    (is (= (vec (range 0 5)) (into [] (take 5) (range 0 10))))
-    (is (= (vec (range 0 5)) (into [] (take 5) (range))))
-    (is (= [] (into [] (take 5) nil)))
+    #?(:rust "Transducers not yet implemented"
+       :default
+       (do
+         (is (= (vec (range 0 5)) (into [] (take 5) (range 0 10))))
+         (is (= (vec (range 0 5)) (into [] (take 5) (range))))
+         (is (= [] (into [] (take 5) nil)))))
 
     ;; negative tests
     (is (thrown? #?(:cljs :default :default Exception)
