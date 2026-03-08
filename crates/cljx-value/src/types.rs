@@ -158,7 +158,7 @@ impl Var {
     pub fn set_meta(&self, m: Value) {
         *self.meta.lock().unwrap() = Some(m);
     }
-    
+
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.namespace, self.name)
     }
