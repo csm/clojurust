@@ -113,6 +113,10 @@ pub enum Value {
 
     // ── Records / reify instances ─────────────────────────────────────────────
     TypeInstance(GcPtr<TypeInstance>),
+
+    // ── Metadata wrapper ─────────────────────────────────────────────────────
+    /// A value with attached metadata. Transparent for equality, hashing, display.
+    WithMeta(Box<Value>, Box<Value>),
 }
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
@@ -278,6 +282,13 @@ impl Eq for Value {}
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        // Strip metadata — it is ignored for equality in Clojure.
+        if let Value::WithMeta(inner, _) = self {
+            return inner.as_ref() == other;
+        }
+        if let Value::WithMeta(inner, _) = other {
+            return self == inner.as_ref();
+        }
         // Identity shortcut: same GcPtr → equal without realizing.
         // Required for infinite lazy seqs: (let [r (range)] (= r r)) must not hang.
         if let (Value::LazySeq(a), Value::LazySeq(b)) = (self, other)
@@ -434,6 +445,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
 impl ClojureHash for Value {
     fn clojure_hash(&self) -> u32 {
         match self {
+            Value::WithMeta(inner, _) => inner.clojure_hash(),
             Value::Nil => 0,
             Value::Bool(b) => {
                 if *b { 1231 } else { 1237 } // Java Boolean.hashCode
@@ -644,6 +656,7 @@ impl fmt::Display for Value {
 /// Print a value.  `readably = true` quotes strings and escapes chars.
 pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Result {
     match v {
+        Value::WithMeta(inner, _) => pr_str(inner, f, readably),
         Value::Nil => write!(f, "nil"),
         Value::Bool(b) => write!(f, "{b}"),
         Value::Long(n) => write!(f, "{n}"),
@@ -848,12 +861,41 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
     }
 }
 
+// ── Metadata helpers ─────────────────────────────────────────────────────────
+
+impl Value {
+    /// Strip any `WithMeta` wrapper, returning the underlying value.
+    pub fn unwrap_meta(&self) -> &Value {
+        match self {
+            Value::WithMeta(inner, _) => inner.unwrap_meta(),
+            other => other,
+        }
+    }
+
+    /// Return metadata if present, or `None`.
+    pub fn get_meta(&self) -> Option<&Value> {
+        match self {
+            Value::WithMeta(_, meta) => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// Return a new value with metadata attached.
+    pub fn with_meta(self, meta: Value) -> Value {
+        match self {
+            Value::WithMeta(inner, _) => Value::WithMeta(inner, Box::new(meta)),
+            other => Value::WithMeta(Box::new(other), Box::new(meta)),
+        }
+    }
+}
+
 // ── type_name helper ──────────────────────────────────────────────────────────
 
 impl Value {
     /// A human-readable type name for error messages.
     pub fn type_name(&self) -> &'static str {
         match self {
+            Value::WithMeta(inner, _) => inner.type_name(),
             Value::Nil => "nil",
             Value::Bool(_) => "boolean",
             Value::Long(_) => "long",
@@ -924,6 +966,10 @@ impl Value {
 
     /// True for any collection.
     pub fn is_coll(&self) -> bool {
+        self.unwrap_meta().is_coll_inner()
+    }
+
+    fn is_coll_inner(&self) -> bool {
         matches!(
             self,
             Value::List(_)
@@ -941,6 +987,7 @@ impl cljx_gc::Trace for Value {
     fn trace(&self, visitor: &mut cljx_gc::MarkVisitor) {
         use cljx_gc::GcVisitor as _;
         match self {
+            Value::WithMeta(inner, meta) => { inner.trace(visitor); meta.trace(visitor); }
             Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => {}
             Value::BigInt(p) => visitor.visit(p),
             Value::BigDecimal(p) => visitor.visit(p),
@@ -1144,6 +1191,12 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Strip metadata for comparison.
+        let a = self.unwrap_meta();
+        let b = other.unwrap_meta();
+        if !std::ptr::eq(a, self) || !std::ptr::eq(b, other) {
+            return a.cmp(b);
+        }
         // Same-type fast paths first, then cross-type numeric, then type-discriminant fallback.
         match (self, other) {
             // ── Nil ──
@@ -1351,6 +1404,7 @@ fn cmp_ns_name(
 /// Assign a stable integer to each Value variant for cross-type ordering.
 fn type_discriminant(v: &Value) -> u8 {
     match v {
+        Value::WithMeta(inner, _) => type_discriminant(inner),
         Value::Nil => 0,
         Value::Bool(_) => 1,
         Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_) => 2,

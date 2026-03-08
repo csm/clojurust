@@ -215,9 +215,6 @@
         coll (second binding)]
     (list 'map (list 'fn (vector x) (cons 'do body)) coll)))
 
-(defmacro with-meta [obj meta-map]
-  obj)
-
 (defn second [coll] (first (rest coll)))
 (defn third [coll] (first (rest (rest coll))))
 (defn ffirst [coll] (first (first coll)))

@@ -423,6 +423,9 @@ impl Iterator for ValueIter {
         loop {
             match &self.current {
                 Value::Nil => return None,
+                Value::WithMeta(inner, _) => {
+                    self.current = inner.as_ref().clone();
+                }
                 Value::LazySeq(ls) => {
                     self.current = ls.get().realize();
                 }
@@ -1429,13 +1432,13 @@ fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
     )))
 }
 fn builtin_map_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0], Value::Map(_))))
+    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Map(_))))
 }
 fn builtin_vector_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0], Value::Vector(_))))
+    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Vector(_))))
 }
 fn builtin_set_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0], Value::Set(_))))
+    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Set(_))))
 }
 fn builtin_coll_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(args[0].is_coll()))
@@ -1453,7 +1456,7 @@ fn builtin_atom_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::Atom(_))))
 }
 fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
-    let empty = match &args[0] {
+    let empty = match args[0].unwrap_meta() {
         Value::Nil => true,
         Value::List(l) => l.get().is_empty(),
         Value::Vector(v) => v.get().is_empty(),
@@ -1542,7 +1545,8 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
     if args.is_empty() {
         return Ok(Value::Nil);
     }
-    let mut result = args[0].clone();
+    let meta = args[0].get_meta().cloned();
+    let mut result = args[0].unwrap_meta().clone();
     for v in &args[1..] {
         result = match result {
             Value::Nil => Value::List(GcPtr::new(PersistentList::from_iter([v.clone()]))),
@@ -1571,7 +1575,10 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
             }
         };
     }
-    Ok(result)
+    Ok(match meta {
+        Some(m) => result.with_meta(m),
+        None => result,
+    })
 }
 
 fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
@@ -1580,23 +1587,34 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
             "assoc requires map followed by key-value pairs".into(),
         ));
     }
+    // Capture metadata from the input to preserve on the result.
+    let meta = args[0].get_meta().cloned();
+    let coll = args[0].unwrap_meta();
+
+    let apply_meta = |v: Value| -> Value {
+        match meta {
+            Some(ref m) => v.with_meta(m.clone()),
+            None => v,
+        }
+    };
+
     // assoc on a TypeInstance: update field(s), return new TypeInstance.
-    if let Value::TypeInstance(ti) = &args[0] {
+    if let Value::TypeInstance(ti) = coll {
         let mut fields = ti.get().fields.clone();
         for pair in args[1..].chunks(2) {
             fields = fields.assoc(pair[0].clone(), pair[1].clone());
         }
-        return Ok(Value::TypeInstance(GcPtr::new(cljx_value::TypeInstance {
+        return Ok(apply_meta(Value::TypeInstance(GcPtr::new(cljx_value::TypeInstance {
             type_tag: ti.get().type_tag.clone(),
             fields,
-        })));
+        }))));
     }
-    let mut result = match &args[0] {
+    let mut result = match coll {
         Value::Nil => MapValue::empty(),
         Value::Map(m) => m.clone(),
         Value::Vector(_) => {
             // assoc on vector: (assoc v idx val)
-            let mut result = args[0].clone();
+            let mut result = coll.clone();
             for pair in args[1..].chunks(2) {
                 let idx = numeric_as_i64(&pair[0])? as usize;
                 let val = pair[1].clone();
@@ -1609,7 +1627,7 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
                     )?));
                 }
             }
-            return Ok(result);
+            return Ok(apply_meta(result));
         }
         v => {
             return Err(ValueError::WrongType {
@@ -1621,18 +1639,23 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
     for pair in args[1..].chunks(2) {
         result = result.assoc(pair[0].clone(), pair[1].clone());
     }
-    Ok(Value::Map(result))
+    Ok(apply_meta(Value::Map(result)))
 }
 
 fn builtin_dissoc(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    let meta = args[0].get_meta().cloned();
+    match args[0].unwrap_meta() {
         Value::Nil => Ok(Value::Nil),
         Value::Map(m) => {
             let mut result = m.clone();
             for k in &args[1..] {
                 result = result.dissoc(k);
             }
-            Ok(Value::Map(result))
+            let v = Value::Map(result);
+            Ok(match meta {
+                Some(m) => v.with_meta(m),
+                None => v,
+            })
         }
         v => Err(ValueError::WrongType {
             expected: "map",
@@ -1643,7 +1666,7 @@ fn builtin_dissoc(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_get(args: &[Value]) -> ValueResult<Value> {
     let default = args.get(2).cloned().unwrap_or(Value::Nil);
-    match &args[0] {
+    match args[0].unwrap_meta() {
         Value::Nil => Ok(default),
         Value::Map(m) => Ok(m.get(&args[1]).unwrap_or(default)),
         Value::TypeInstance(ti) => Ok(ti.get().fields.get(&args[1]).unwrap_or(default)),
@@ -1694,15 +1717,16 @@ fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_count(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    let v = args[0].unwrap_meta();
+    match v {
         Value::LazySeq(_) | Value::Cons(_) => {
             // Walk and count elements lazily (linear time, no Vec alloc).
-            let n = ValueIter::new(args[0].clone()).count();
+            let n = ValueIter::new(v.clone()).count();
             return Ok(Value::Long(n as i64));
         }
         _ => {}
     }
-    let n = match &args[0] {
+    let n = match v {
         Value::Nil => 0,
         Value::List(l) => l.get().count(),
         Value::Vector(v) => v.get().count(),
@@ -1713,7 +1737,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
         _ => {
             return Err(ValueError::WrongType {
                 expected: "collection",
-                got: args[0].type_name().to_string(),
+                got: v.type_name().to_string(),
             });
         }
     };
@@ -1721,7 +1745,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
             // Realize the lazy seq then apply seq to the result.
             let realized = ls.get().realize();
@@ -1968,7 +1992,7 @@ fn builtin_vals(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(match &args[0] {
+    Ok(Value::Bool(match args[0].unwrap_meta() {
         Value::Map(m) => m.contains_key(&args[1]),
         Value::Set(s) => s.contains(&args[1]),
         Value::Vector(v) => {
@@ -4301,18 +4325,19 @@ fn builtin_meta(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => Ok(vp.get().get_meta().unwrap_or(Value::Nil)),
         Value::Atom(a) => Ok(a.get().get_meta().unwrap_or(Value::Nil)),
+        Value::WithMeta(_, meta) => Ok(meta.as_ref().clone()),
         _ => Ok(Value::Nil),
     }
 }
 
-/// `(with-meta v m)` — set metadata on a var and return it; non-vars returned as-is.
+/// `(with-meta v m)` — attach metadata to a value.
 fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => {
             vp.get().set_meta(args[1].clone());
             Ok(args[0].clone())
         }
-        _ => Ok(args[0].clone()),
+        _ => Ok(args[0].clone().with_meta(args[1].clone())),
     }
 }
 

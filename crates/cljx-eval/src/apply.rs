@@ -183,7 +183,8 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
         Value::Keyword(_kw) => {
             // (kw map-or-record) → map.get(kw)
             let default = || args.get(1).cloned().unwrap_or(Value::Nil);
-            match args.first() {
+            let target = args.first().map(|a| a.unwrap_meta());
+            match target {
                 Some(Value::Map(m)) => Ok(m.get(callee).unwrap_or_else(default)),
                 Some(Value::TypeInstance(ti)) => {
                     Ok(ti.get().fields.get(callee).unwrap_or_else(default))
