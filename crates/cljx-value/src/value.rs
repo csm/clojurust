@@ -51,6 +51,16 @@ pub enum Value {
     Set(SetValue),
     Queue(GcPtr<PersistentQueue>),
 
+    // Arrays
+    IntArray(GcPtr<Vec<i32>>),
+    LongArray(GcPtr<Vec<i64>>),
+    ShortArray(GcPtr<Vec<i16>>),
+    ByteArray(GcPtr<Vec<i8>>),
+    FloatArray(GcPtr<Vec<f32>>),
+    DoubleArray(GcPtr<Vec<f64>>),
+    BooleanArray(GcPtr<Vec<bool>>),
+    CharArray(GcPtr<Vec<char>>),
+
     // ── Functions ─────────────────────────────────────────────────────────────
     NativeFunction(GcPtr<NativeFn>),
     Fn(GcPtr<CljxFn>),
@@ -205,7 +215,7 @@ impl SetValue {
             SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().conj(value)))
         }
     }
-    
+
     pub fn conj_mut(&mut self, value: Value) -> &mut Self {
         match self {
             SetValue::Hash(m) => {
@@ -462,6 +472,82 @@ impl ClojureHash for Value {
                 }
                 h
             }
+
+            // Arrays
+            Value::BooleanArray(a) => {
+                let mut h: u32 = 0;
+                for b in a.get().iter() {
+                    h = hash_combine_ordered(h, if *b { 1231 } else { 1237 })
+                }
+                h
+            },
+            Value::ByteArray(a) => {
+                let mut h: u32 = 0;
+                for b in a.get().iter() {
+                    h = hash_combine_ordered(h, *b as u32)
+                }
+                h
+            },
+            Value::ShortArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    h = hash_combine_ordered(h, *item as u32)
+                }
+                h
+            },
+            Value::IntArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    h = hash_combine_ordered(h, *item as u32)
+                }
+                h
+            },
+            Value::CharArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    h = hash_combine_ordered(h, *item as u32)
+                }
+                h
+            },
+            Value::LongArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    let v = *item;
+                    h = hash_combine_ordered(h, hash_i64(v));
+                }
+                h
+            },
+            Value::FloatArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    let f = *item;
+                    h = hash_combine_ordered(h, if f.fract() == 0.0
+                        && f.is_finite()
+                        && let Some(n) = ToPrimitive::to_i64(item)
+                    {
+                        hash_i64(n)
+                    } else {
+                        hash_i64(f.to_bits() as i64)
+                    })
+                }
+                h
+            },
+            Value::DoubleArray(a) => {
+                let mut h: u32 = 0;
+                for item in a.get().iter() {
+                    let f = *item;
+                    h = hash_combine_ordered(h, if f.fract() == 0.0
+                        && f.is_finite()
+                        && let Some(n) = ToPrimitive::to_i64(item)
+                    {
+                        hash_i64(n)
+                    } else {
+                        hash_i64(f.to_bits() as i64)
+                    })
+                }
+                h
+            },
+
             // For non-data types, use pointer identity.
             Value::Fn(f) => f.get() as *const _ as u32,
             Value::NativeFunction(f) => f.get() as *const _ as u32,
@@ -636,6 +722,14 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
             write!(f, "}}")
         }
+        Value::BooleanArray(_)
+            | Value::ByteArray(_)
+            | Value::ShortArray(_)
+            | Value::IntArray(_)
+            | Value::LongArray(_)
+            | Value::CharArray(_)
+            | Value::FloatArray(_)
+            | Value::DoubleArray(_) => write!(f, "#[array]"),
         Value::Queue(q) => {
             // Printed as a list with a type tag.
             write!(f, "#queue (")?;
@@ -765,6 +859,14 @@ impl Value {
             Value::Future(_) => "future",
             Value::Agent(_) => "agent",
             Value::TypeInstance(_) => "record",
+            Value::BooleanArray(_) => "boolean-array",
+            Value::ByteArray(_) => "byte-array",
+            Value::ShortArray(_) => "short-array",
+            Value::IntArray(_) => "int-array",
+            Value::LongArray(_) => "long-array",
+            Value::FloatArray(_) => "float-array",
+            Value::DoubleArray(_) => "double-array",
+            Value::CharArray(_) => "char-array",
         }
     }
 
@@ -838,6 +940,14 @@ impl cljx_gc::Trace for Value {
             Value::Future(p) => visitor.visit(p),
             Value::Agent(p) => visitor.visit(p),
             Value::TypeInstance(p) => visitor.visit(p),
+            Value::BooleanArray(_)
+            | Value::ByteArray(_)
+            | Value::ShortArray(_)
+            | Value::IntArray(_)
+            | Value::LongArray(_)
+            | Value::FloatArray(_)
+            | Value::DoubleArray(_)
+            | Value::CharArray(_) => {}
         }
     }
 }
@@ -1240,5 +1350,13 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Future(_) => 26,
         Value::Agent(_) => 27,
         Value::TypeInstance(_) => 28,
+        Value::BooleanArray(_) => 29,
+        Value::ByteArray(_) => 30,
+        Value::ShortArray(_) => 31,
+        Value::IntArray(_) => 32,
+        Value::LongArray(_) => 33,
+        Value::CharArray(_) => 34,
+        Value::FloatArray(_) => 35,
+        Value::DoubleArray(_) => 36,
     }
 }

@@ -496,3 +496,37 @@ mod tests {
         assert_eq!(heap.total_freed(), 1);
     }
 }
+
+// Impls for vectors (backs "arrays" in clojure).
+
+impl Trace for Vec<i32> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<i64> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<i16> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<i8> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<char> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<f64> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<f32> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}
+
+impl Trace for Vec<bool> {
+    fn trace(&self, _visitor: &mut MarkVisitor) {}
+}

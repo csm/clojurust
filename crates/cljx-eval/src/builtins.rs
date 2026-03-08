@@ -425,12 +425,12 @@ impl Iterator for ValueIter {
                     return Some(head);
                 }
                 Value::List(l) => {
-                    if let Some(first) = l.get().first() {
+                    return if let Some(first) = l.get().first() {
                         let head = first.clone();
                         self.current = Value::List(GcPtr::new((*l.get().rest()).clone()));
-                        return Some(head);
+                        Some(head)
                     } else {
-                        return None;
+                        None
                     }
                 }
                 Value::Vector(v) => {
@@ -479,6 +479,26 @@ fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
             got: v.type_name().to_string(),
         }),
     }
+}
+
+fn numeric_as_f32(v: &Value) -> ValueResult<f32> {
+    let n = numeric_as_f64(v)?;
+    Ok(n as f32)
+}
+
+fn numeric_as_i8(v: &Value) -> ValueResult<i8> {
+    let v = numeric_as_f64(v)?;
+    Ok(v as i8)
+}
+
+fn numeric_as_i16(v: &Value) -> ValueResult<i16> {
+    let v = numeric_as_f64(v)?;
+    Ok(v as i16)
+}
+
+fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
+    let v = numeric_as_f64(v)?;
+    Ok(v as i32)
 }
 
 fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
@@ -2102,10 +2122,11 @@ fn builtin_areduce_stub(_args: &[Value]) -> ValueResult<Value> {
 
 /// Helper: build a typed array. `(xxx-array size init-or-coll)` or `(xxx-array size-or-coll)`.
 /// `coerce` converts each element to the target type.
-fn make_typed_array(
+fn make_typed_array<T: Clone>(
     args: &[Value],
-    default: Value,
-    coerce: fn(&Value) -> ValueResult<Value>,
+    default: T,
+    coerce: fn(&Value) -> ValueResult<T>,
+    value_builder: fn(Vec<T>) -> Value,
 ) -> ValueResult<Value> {
     match args.len() {
         1 => {
@@ -2113,25 +2134,25 @@ fn make_typed_array(
             match &args[0] {
                 Value::Long(n) => {
                     let size = *n as usize;
-                    let v = PersistentVector::from_iter(std::iter::repeat_n(default, size));
-                    Ok(Value::Vector(GcPtr::new(v)))
+                    let vec: Vec<T> = Vec::from_iter(std::iter::repeat_n(default, size));
+                    Ok(value_builder(vec))
                 }
                 _ => {
-                    // Treat as collection, coerce each element
-                    let items: ValueResult<Vec<Value>> =
-                        ValueIter::new(args[0].clone()).map(|v| coerce(&v)).collect();
-                    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(items?))))
+                    let vec: Vec<T> = ValueIter::new(args[0].clone())
+                        .map(|v| coerce(&v))
+                        .collect::<ValueResult<Vec<T>>>()?;
+                    Ok(value_builder(vec))
                 }
             }
         }
         2 => {
             // Two args: (xxx-array size init-coll)
             let size = numeric_as_i64(&args[0])? as usize;
-            let items: ValueResult<Vec<Value>> =
+            let items: ValueResult<Vec<T>> =
                 ValueIter::new(args[1].clone()).map(|v| coerce(&v)).collect();
-            let mut vec: Vec<Value> = items?;
+            let mut vec: Vec<T> = items?;
             vec.resize(size, default);
-            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vec))))
+            Ok(value_builder(vec))
         }
         _ => Err(ValueError::ArityError {
             name: "typed-array".into(),
@@ -2168,28 +2189,42 @@ fn coerce_to_char(v: &Value) -> ValueResult<Value> {
     }
 }
 
+fn coerce_to_char_native(v: &Value) -> ValueResult<char> {
+    match v {
+        Value::Char(c) => Ok(*c),
+        Value::Long(n) => {
+            char::from_u32(*n as u32)
+                .ok_or_else(|| ValueError::Other(format!("invalid char code point: {n}")))
+        }
+        _ => Err(ValueError::WrongType {
+            expected: "char",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
 fn builtin_int_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Long(0), coerce_to_long)
+    make_typed_array(args, 0, numeric_as_i32, |v| { Value::IntArray(GcPtr::new(v)) })
 }
 
 fn builtin_long_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Long(0), coerce_to_long)
+    make_typed_array(args, 0i64, numeric_as_i64, |v| { Value::LongArray(GcPtr::new(v))})
 }
 
 fn builtin_short_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Long(0), coerce_to_long)
+    make_typed_array(args, 0i16, numeric_as_i16, |v| { Value::ShortArray(GcPtr::new(v)) })
 }
 
 fn builtin_byte_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Long(0), coerce_to_long)
+    make_typed_array(args, 0i8, numeric_as_i8, |v| { Value::ByteArray(GcPtr::new(v)) })
 }
 
 fn builtin_float_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Double(0.0), coerce_to_double)
+    make_typed_array(args, 0f32, numeric_as_f32, |v| { Value::FloatArray(GcPtr::new(v)) })
 }
 
 fn builtin_double_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Double(0.0), coerce_to_double)
+    make_typed_array(args, 0f64, numeric_as_f64, |v| { Value::DoubleArray(GcPtr::new(v)) })
 }
 
 fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
@@ -2197,16 +2232,16 @@ fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
         1 => match &args[0] {
             Value::Long(n) => {
                 let size = *n as usize;
-                let v = PersistentVector::from_iter(std::iter::repeat_n(Value::Char('\0'), size));
-                Ok(Value::Vector(GcPtr::new(v)))
+                let vec = Vec::from_iter(std::iter::repeat_n('\0', size));
+                Ok(Value::CharArray(GcPtr::new(vec)))
             }
             Value::Str(s) => {
-                let v = PersistentVector::from_iter(s.get().chars().map(Value::Char));
-                Ok(Value::Vector(GcPtr::new(v)))
+                let vec = Vec::from_iter(s.get().chars());
+                Ok(Value::CharArray(GcPtr::new(vec)))
             }
-            _ => make_typed_array(args, Value::Char('\0'), coerce_to_char),
+            _ => make_typed_array(args, '\0', coerce_to_char_native, |v| { Value::CharArray(GcPtr::new(v)) }),
         },
-        2 => make_typed_array(args, Value::Char('\0'), coerce_to_char),
+        2 => make_typed_array(args, '\0', coerce_to_char_native, |v| { Value::CharArray(GcPtr::new(v)) }),
         _ => Err(ValueError::ArityError {
             name: "char-array".into(),
             expected: "1 or 2".into(),
@@ -2216,7 +2251,7 @@ fn builtin_char_array(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_boolean_array(args: &[Value]) -> ValueResult<Value> {
-    make_typed_array(args, Value::Bool(false), coerce_to_bool)
+    make_typed_array(args, false, |v| Ok(is_truthy(v)), |v| { Value::BooleanArray(GcPtr::new(v)) })
 }
 
 /// `(booleans x)`, `(ints x)`, etc. — type hint casts, identity in our runtime.
