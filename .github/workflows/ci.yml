@@ -31,3 +31,6 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      - name: Clojure Tests
+        run: cargo run -p cljx test --src-path ./clojure-test-suite/test
