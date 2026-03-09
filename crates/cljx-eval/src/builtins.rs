@@ -61,6 +61,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("fn?", Arity::Fixed(1), builtin_fn_q),
         ("ifn?", Arity::Fixed(1), builtin_ifn_q),
         ("seq?", Arity::Fixed(1), builtin_seq_q),
+        ("list?", Arity::Fixed(1), builtin_list_q),
+        ("case=", Arity::Fixed(2), builtin_case_eq),
         ("map?", Arity::Fixed(1), builtin_map_q),
         ("vector?", Arity::Fixed(1), builtin_vector_q),
         ("set?", Arity::Fixed(1), builtin_set_q),
@@ -673,6 +675,11 @@ fn numeric_as_bigdecimal(v: &Value) -> ValueResult<bigdecimal::BigDecimal> {
         Value::BigInt(n) => Ok(BigDecimal::from(n.get().clone())),
         Value::BigDecimal(d) => Ok(d.get().clone()),
         Value::Double(f) => Ok(BigDecimal::try_from(*f).unwrap_or_else(|_| BigDecimal::from(0))),
+        Value::Ratio(r) => {
+            let numer = BigDecimal::from(r.get().numer().clone());
+            let denom = BigDecimal::from(r.get().denom().clone());
+            Ok(numer / denom)
+        }
         _ => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -1301,22 +1308,23 @@ fn builtin_not_eq(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn num_compare(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
-    let r = match (a, b) {
-        (Value::Long(x), Value::Long(y)) => x.cmp(y),
-        (Value::Double(x), Value::Double(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+    let cat = widest_category(&[a.clone(), b.clone()])?;
+    let r = match cat {
+        NumCat::Double => {
+            let x = numeric_as_f64(a)?;
+            let y = numeric_as_f64(b)?;
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
         }
-        (Value::Long(x), Value::Double(y)) => (*x as f64)
-            .partial_cmp(y)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Double(x), Value::Long(y)) => x
-            .partial_cmp(&(*y as f64))
-            .unwrap_or(std::cmp::Ordering::Equal),
+        NumCat::BigDecimal => {
+            let x = numeric_as_bigdecimal(a)?;
+            let y = numeric_as_bigdecimal(b)?;
+            x.cmp(&y)
+        }
         _ => {
-            return Err(ValueError::WrongType {
-                expected: "number",
-                got: a.type_name().to_string(),
-            });
+            // Long, BigInt, Ratio — compare as ratios for exact precision
+            let x = numeric_as_ratio(a)?;
+            let y = numeric_as_ratio(b)?;
+            x.cmp(&y)
         }
     };
     Ok(r)
@@ -1503,6 +1511,43 @@ fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
         args[0],
         Value::List(_) | Value::Cons(_)
     )))
+}
+
+fn builtin_list_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::List(_))))
+}
+
+/// Type-strict equality for `case`: numbers only match if they are the same numeric type.
+/// e.g. 1 (Long) != 1.0 (Double), 3.0 (Double) != 3.0M (BigDecimal).
+/// Long and BigInt ARE considered equivalent (matching Clojure JVM behavior).
+fn builtin_case_eq(args: &[Value]) -> ValueResult<Value> {
+    let a = args[0].unwrap_meta();
+    let b = args[1].unwrap_meta();
+    let same_numeric_type = match (a, b) {
+        // Long and BigInt are interchangeable in case (Clojure JVM behavior)
+        (Value::Long(_) | Value::BigInt(_), Value::Long(_) | Value::BigInt(_)) => true,
+        (Value::Double(_), Value::Double(_)) => true,
+        (Value::BigDecimal(_), Value::BigDecimal(_)) => true,
+        (Value::Ratio(_), Value::Ratio(_)) => true,
+        // Non-numeric types: fall through to regular equality
+        (
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+        ) => false,
+        _ => {
+            // Non-numeric: use regular equality
+            return Ok(Value::Bool(args[0] == args[1]));
+        }
+    };
+    Ok(Value::Bool(same_numeric_type && args[0] == args[1]))
 }
 fn builtin_map_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Map(_))))

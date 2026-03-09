@@ -149,17 +149,40 @@
     (throw (ex-info "condp: no matching clause" {}))))
 
 (defmacro case [expr & clauses]
-  (let [e (gensym)]
+  (let [e (gensym)
+        quote-const (fn [c]
+                      ;; Quote symbols and lists so they aren't evaluated.
+                      ;; Keywords, numbers, strings, chars, booleans, nil, vectors,
+                      ;; maps, and sets are self-evaluating and need no quoting.
+                      (if (or (symbol? c) (list? c))
+                        (list 'quote c)
+                        c))
+        build (fn build [cs]
+                (if (seq cs)
+                  (if (next cs)
+                    (let [test-expr (first cs)
+                          then-expr (second cs)
+                          rest-cs (next (next cs))]
+                      ;; A list test means multiple alternatives: (a b c) matches a OR b OR c
+                      ;; UNLESS it's a list wrapped in another list: ((list of things)) matches the inner list literally
+                      (if (and (list? test-expr) (not (nil? (seq test-expr))))
+                        (if (and (= 1 (count test-expr)) (list? (first test-expr)))
+                          ;; ((inner-list)) — match the inner list literally
+                          (list 'if (list 'case= e (quote-const (first test-expr)))
+                                then-expr
+                                (build rest-cs))
+                          ;; (a b c) — match any of the alternatives
+                          (list 'if (cons 'or (map (fn [c] (list 'case= e (quote-const c))) test-expr))
+                                then-expr
+                                (build rest-cs)))
+                        (list 'if (list 'case= e (quote-const test-expr))
+                              then-expr
+                              (build rest-cs))))
+                    ;; odd trailing form = default expression
+                    (first cs))
+                  (list 'throw (list 'new 'Exception (list 'str "No matching clause: " e)))))]
     (list 'let (vector e expr)
-          (let [build (fn build [cs]
-                        (if (seq cs)
-                          (if (next cs)
-                            (list 'if (list '= e (first cs))
-                                  (second cs)
-                                  (build (next (next cs))))
-                            (first cs))
-                          nil))]
-            (build clauses)))))
+          (build clauses))))
 
 (defmacro ->
   ([x] x)
