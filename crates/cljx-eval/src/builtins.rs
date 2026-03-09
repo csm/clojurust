@@ -2156,7 +2156,10 @@ fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
             let items: Vec<Value> = s.get().chars().skip(1).map(Value::Char).collect();
             Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
         }
-        _ => Ok(Value::List(GcPtr::new(PersistentList::empty()))),
+        _ => Err(ValueError::WrongType {
+            expected: "seqable",
+            got: args[0].type_name().to_string(),
+        }),
     }
 }
 
