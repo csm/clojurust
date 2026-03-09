@@ -66,6 +66,7 @@
 
   ;; Basilisp does not currently implemented sorted collections.
   #?(:lpy nil
+     :rust nil
      :default
      (testing "sorted collections"
        (are [in ex] (eq in ex)
@@ -81,8 +82,9 @@
       [1 '(2 3 [4])] (list 1 [2 3 '(4)])))
 
   (testing "regex"
-    ;; Basilisp regex patterns compare equal and identical?
+    ;; Basilisp regex patterns compare equal and identical? (rust too I guess)
     #?(:lpy (is (eq #"my regex" #"my regex"))
+       :rust (is (eq #"my regex" #"my regex"))
        ;; Value-equal regex are NOT eq, only identical?
        :default (is (not (eq #"my regex" #"my regex"))))
     (is (let [r #"my regex"
