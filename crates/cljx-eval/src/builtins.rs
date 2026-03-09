@@ -1,12 +1,5 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
-use std::ops::{Add, Sub};
-use num_bigint::{BigInt, Sign};
-use num_traits::{Signed as _, ToPrimitive, Zero as _};
-use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
-use num_rational::Ratio;
 use crate::env::GlobalEnv;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
@@ -15,7 +8,13 @@ use cljx_value::{
     Namespace, NativeFn, ObjectArray, PersistentHashSet, PersistentList, PersistentVector,
     SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
 };
-use crate::builtins::NumCat::BigDecimal;
+use num_bigint::{BigInt, Sign};
+use num_rational::Ratio;
+use num_traits::{Signed as _, ToPrimitive, Zero as _};
+use std::ops::{Add, Sub};
+use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -1211,12 +1210,11 @@ fn builtin_inc(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => Ok(Value::Long(n.wrapping_add(1))),
         Value::Double(f) => Ok(Value::Double(f + 1.0)),
-        Value::Ratio(r) =>
-            Ok(Value::Ratio(GcPtr::new(r.get().add(Ratio::new(BigInt::from(1), BigInt::from(1)))))),
-        Value::BigInt(i) =>
-            Ok(Value::BigInt(GcPtr::new(i.get().add(1)))),
-        Value::BigDecimal(d) =>
-            Ok(Value::BigDecimal(GcPtr::new(d.get().add(1)))),
+        Value::Ratio(r) => Ok(Value::Ratio(GcPtr::new(
+            r.get().add(Ratio::new(BigInt::from(1), BigInt::from(1))),
+        ))),
+        Value::BigInt(i) => Ok(Value::BigInt(GcPtr::new(i.get().add(1)))),
+        Value::BigDecimal(d) => Ok(Value::BigDecimal(GcPtr::new(d.get().add(1)))),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -1228,12 +1226,11 @@ fn builtin_dec(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => Ok(Value::Long(n.wrapping_sub(1))),
         Value::Double(f) => Ok(Value::Double(f - 1.0)),
-        Value::Ratio(r) =>
-            Ok(Value::Ratio(GcPtr::new(r.get().sub(Ratio::new(BigInt::from(1), BigInt::from(1)))))),
-        Value::BigInt(i) =>
-            Ok(Value::BigInt(GcPtr::new(i.get().sub(1)))),
-        Value::BigDecimal(d) =>
-            Ok(Value::BigDecimal(GcPtr::new(d.get().sub(1)))),
+        Value::Ratio(r) => Ok(Value::Ratio(GcPtr::new(
+            r.get().sub(Ratio::new(BigInt::from(1), BigInt::from(1))),
+        ))),
+        Value::BigInt(i) => Ok(Value::BigInt(GcPtr::new(i.get().sub(1)))),
+        Value::BigDecimal(d) => Ok(Value::BigDecimal(GcPtr::new(d.get().sub(1)))),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -1903,7 +1900,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
             // Realize the lazy seq then apply seq to the result.
-            let realized = ls.get().realize();
+            let realized = ls.get().try_realize().map_err(ValueError::Other)?;
             builtin_seq(&[realized])
         }
         Value::Cons(_) => Ok(args[0].clone()), // cons is always non-empty
@@ -2050,7 +2047,10 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
-        Value::LazySeq(ls) => builtin_first(&[ls.get().realize()]),
+        Value::LazySeq(ls) => {
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            builtin_first(&[v])
+        }
         Value::Cons(c) => Ok(c.get().head.clone()),
         Value::Nil => Ok(Value::Nil),
         Value::List(l) => Ok(l.get().first().cloned().unwrap_or(Value::Nil)),
@@ -2080,7 +2080,10 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
-        Value::LazySeq(ls) => builtin_rest(&[ls.get().realize()]),
+        Value::LazySeq(ls) => {
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            builtin_rest(&[v])
+        }
         Value::Cons(c) => {
             // Return the tail directly; it may be another LazySeq, Cons, List, or Nil.
             match &c.get().tail {

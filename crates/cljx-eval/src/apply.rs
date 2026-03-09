@@ -34,7 +34,10 @@ impl cljx_gc::Trace for ClosureThunk {
 impl Thunk for ClosureThunk {
     fn force(&self) -> Value {
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
-        call_cljx_fn(&self.f, vec![], &mut env).unwrap_or(Value::Nil)
+        match call_cljx_fn(&self.f, vec![], &mut env) {
+            Ok(v) => v,
+            Err(e) => panic!("Exception in lazy sequence: {e}"),
+        }
     }
 }
 

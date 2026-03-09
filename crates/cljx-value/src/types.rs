@@ -408,6 +408,37 @@ impl LazySeq {
         *guard = LazySeqState::Forced(result.clone());
         result
     }
+
+    /// Like `realize`, but catches panics from thunk evaluation and returns them as errors.
+    pub fn try_realize(&self) -> Result<Value, String> {
+        let mut guard = self.state.lock().unwrap();
+        if let LazySeqState::Forced(v) = &*guard {
+            return Ok(v.clone());
+        }
+        let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
+        let LazySeqState::Pending(thunk) = prev else {
+            unreachable!("state was not Pending")
+        };
+        // Drop the lock before forcing to avoid poisoning on panic.
+        drop(guard);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thunk.force())) {
+            Ok(result) => {
+                let mut guard = self.state.lock().unwrap();
+                *guard = LazySeqState::Forced(result.clone());
+                Ok(result)
+            }
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown error in lazy sequence".to_string()
+                };
+                Err(msg)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for LazySeq {
