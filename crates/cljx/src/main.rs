@@ -97,24 +97,8 @@ fn run(cli: Cli) -> miette::Result<()> {
         }
         Commands::Eval { expr } => {
             let result = eval_source(&expr, "<eval>")?;
-            // Printing/comparing may realize lazy seqs that panic; catch it.
-            let prev_hook = std::panic::take_hook();
-            std::panic::set_hook(Box::new(|_| {})); // suppress panic message
-            let print_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if result != Value::Nil {
-                    println!("{}", result);
-                }
-            }));
-            std::panic::set_hook(prev_hook);
-            if let Err(e) = print_result {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else {
-                    "error printing result".to_string()
-                };
-                return Err(miette::miette!("{}", msg));
+            if result != Value::Nil {
+                println!("{}", result);
             }
         }
         Commands::Test {

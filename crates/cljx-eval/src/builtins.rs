@@ -1900,7 +1900,10 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
             // Realize the lazy seq then apply seq to the result.
-            let realized = ls.get().try_realize().map_err(ValueError::Other)?;
+            let realized = ls.get().realize();
+            if let Some(err) = crate::apply::take_lazy_seq_error() {
+                return Err(ValueError::Other(err));
+            }
             builtin_seq(&[realized])
         }
         Value::Cons(_) => Ok(args[0].clone()), // cons is always non-empty
@@ -2048,7 +2051,10 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            let v = ls.get().realize();
+            if let Some(err) = crate::apply::take_lazy_seq_error() {
+                return Err(ValueError::Other(err));
+            }
             builtin_first(&[v])
         }
         Value::Cons(c) => Ok(c.get().head.clone()),
@@ -2081,7 +2087,10 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            let v = ls.get().realize();
+            if let Some(err) = crate::apply::take_lazy_seq_error() {
+                return Err(ValueError::Other(err));
+            }
             builtin_rest(&[v])
         }
         Value::Cons(c) => {
@@ -2376,14 +2385,22 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
-    Ok(match &args[0] {
+    let meta = args[0].get_meta().cloned();
+    let apply_meta = |v: Value| -> Value {
+        match meta {
+            Some(ref m) => v.with_meta(m.clone()),
+            None => v,
+        }
+    };
+    Ok(apply_meta(match &args[0] {
         Value::List(_) => Value::List(GcPtr::new(PersistentList::empty())),
         Value::Vector(_) => Value::Vector(GcPtr::new(PersistentVector::empty())),
         Value::Map(_) => Value::Map(MapValue::empty()),
         Value::Set(_) => Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::empty()))),
+        Value::LazySeq(_) => Value::List(GcPtr::new(PersistentList::empty())),
         Value::Nil => Value::Nil,
         _ => Value::Nil,
-    })
+    }))
 }
 
 fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
