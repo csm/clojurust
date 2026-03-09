@@ -1870,6 +1870,86 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
                 Ok(default)
             }
         }
+        Value::Str(s) => {
+            if let Value::Long(idx) = &args[1] {
+                Ok(s.get().chars().nth(*idx as usize).map(Value::Char).unwrap_or(default))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::BooleanArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Bool(*array.get(*idx as usize).unwrap()))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::ByteArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::ShortArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::IntArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::LongArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Long(*array.get(*idx as usize).unwrap()))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::CharArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Char(*array.get(*idx as usize).unwrap()))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::FloatArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Double(*array.get(*idx as usize).unwrap() as f64))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::DoubleArray(a) => {
+            let array = a.get().lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                Ok(Value::Double(*array.get(*idx as usize).unwrap()))
+            } else {
+                Ok(default)
+            }
+        }
+        Value::ObjectArray(a) => {
+            let array = a.get().0.lock().unwrap();
+            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+                let value = (*array).get(*idx as usize).unwrap().clone();
+                Ok(value)
+            } else {
+                Ok(default)
+            }
+        }
         _ => Ok(default),
     }
 }
