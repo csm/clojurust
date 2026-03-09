@@ -1556,6 +1556,8 @@ fn builtin_ifn_q(args: &[Value]) -> ValueResult<Value> {
             | Value::Set(_)
             | Value::Vector(_)
             | Value::Symbol(_)
+            | Value::Var(_)
+            | Value::Promise(_)
     )))
 }
 fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
