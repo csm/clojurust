@@ -10,7 +10,9 @@
     (is (= '() (drop 5 nil)))           ; nil acts as empty list
 
     ;; Transducer version
-    (is (= (vec (range 5 10)) (into [] (drop 5) (range 0 10))))
+    #?(:rust "Rust does not yet support transducers"
+       :default
+       (is (= (vec (range 5 10)) (into [] (drop 5) (range 0 10)))))
 
     ;; Note that we can drop from other types of collections, but
     ;; because they are not sequential, we don't know exactly what the
