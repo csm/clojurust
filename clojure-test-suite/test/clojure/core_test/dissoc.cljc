@@ -4,7 +4,8 @@
 
 (when-var-exists dissoc
 
-  (defrecord TestDissocRecord [a b c])
+  #?(:rust nil
+     :default (defrecord TestDissocRecord [a b c]))
 
   (deftest test-dissoc
 
@@ -35,13 +36,14 @@
             with-test-meta? #(= test-meta (meta %))]
         (is (with-test-meta? (dissoc (with-test-meta {:a 1 :b 2}) :a)))))
 
-    (testing "records"
-      (let [r (TestDissocRecord. 1 2 nil)]
-        (are [expected keys] (= expected (apply dissoc r keys))
-                             {:b 2 :c nil} [:a]
-                             {:b 2 :c nil} [:a :d]
-                             {} [:a :b :c]
-                             r [:d])))
+    #?(:rust "Records not yet implemented"
+       :default (testing "records"
+                  (let [r (TestDissocRecord. 1 2 nil)]
+                    (are [expected keys] (= expected (apply dissoc r keys))
+                                         {:b 2 :c nil} [:a]
+                                         {:b 2 :c nil} [:a :d]
+                                         {} [:a :b :c]
+                                         r [:d]))))
 
     (testing "bad shape"
       (are [m keys] (thrown? #?(:cljs js/Error :default Exception) (apply dissoc m keys))
