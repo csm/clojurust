@@ -247,13 +247,40 @@
                 (list 'recur (list 'inc i))))))
 
 (defmacro doseq [bindings & body]
-  (let [x (first bindings)
-        coll (second bindings)]
-    (list 'loop (vector '__s__ (list 'seq coll))
-          (list 'when '__s__
-                (list 'let (vector x (list 'first '__s__))
-                      (cons 'do body))
-                (list 'recur (list 'next '__s__))))))
+  (letfn [(emit [binds recur-form]
+            (if (seq binds)
+              (let [tag (first binds)]
+                (cond
+                  (= :when tag)
+                  ;; :when — skip element but continue loop
+                  (let [expr (second binds)]
+                    (list 'do
+                          (list 'when expr (emit (next (next binds)) nil))
+                          recur-form))
+
+                  (= :while tag)
+                  ;; :while — stop loop entirely when false
+                  (let [expr (second binds)]
+                    (list 'when expr (emit (next (next binds)) recur-form)))
+
+                  (= :let tag)
+                  (let [let-binds (second binds)]
+                    (list 'let let-binds (emit (next (next binds)) recur-form)))
+
+                  :else
+                  (let [x tag
+                        coll (second binds)
+                        rest-binds (next (next binds))
+                        gs (gensym "s__")
+                        inner-loop (list 'loop (vector gs (list 'seq coll))
+                                         (list 'when gs
+                                               (list 'let (vector x (list 'first gs))
+                                                     (emit rest-binds (list 'recur (list 'next gs))))))]
+                    (if recur-form
+                      (list 'do inner-loop recur-form)
+                      inner-loop))))
+              (list 'do (cons 'do body) recur-form)))]
+    (emit (seq bindings) nil)))
 
 (defmacro for [binding & body]
   (let [x (first binding)
