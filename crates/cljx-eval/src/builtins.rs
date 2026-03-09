@@ -1607,10 +1607,24 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(empty))
 }
 fn builtin_even_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(numeric_as_i64(&args[0])? % 2 == 0))
+    match &args[0] {
+        Value::Long(n) => Ok(Value::Bool(n % 2 == 0)),
+        Value::BigInt(n) => Ok(Value::Bool(!n.get().bit(0))),
+        _ => Err(ValueError::WrongType {
+            expected: "int",
+            got: args[0].type_name().to_string(),
+        }),
+    }
 }
 fn builtin_odd_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(numeric_as_i64(&args[0])? % 2 != 0))
+    match &args[0] {
+        Value::Long(n) => Ok(Value::Bool(n % 2 != 0)),
+        Value::BigInt(n) => Ok(Value::Bool(n.get().bit(0))),
+        _ => Err(ValueError::WrongType {
+            expected: "int",
+            got: args[0].type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_ratio_q(args: &[Value]) -> ValueResult<Value> {
