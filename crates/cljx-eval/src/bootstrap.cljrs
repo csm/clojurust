@@ -2,6 +2,24 @@
 (defn constantly [x] (fn [& _] x))
 (defn complement [f] (fn [& args] (not (apply f args))))
 
+(defn some-fn
+  ([p] (fn [& args] (some p args)))
+  ([p1 p2] (fn [& args] (or (some p1 args) (some p2 args))))
+  ([p1 p2 p3] (fn [& args] (or (some p1 args) (some p2 args) (some p3 args))))
+  ([p1 p2 p3 & ps]
+   (fn [& args]
+     (or (some p1 args) (some p2 args) (some p3 args)
+         (some (fn [p] (some p args)) ps)))))
+
+(defn every-pred
+  ([p] (fn [& args] (every? p args)))
+  ([p1 p2] (fn [& args] (and (every? p1 args) (every? p2 args))))
+  ([p1 p2 p3] (fn [& args] (and (every? p1 args) (every? p2 args) (every? p3 args))))
+  ([p1 p2 p3 & ps]
+   (fn [& args]
+     (and (every? p1 args) (every? p2 args) (every? p3 args)
+          (every? (fn [p] (every? p args)) ps)))))
+
 (defn not= [& args] (not (apply = args)))
 
 (defn comp
