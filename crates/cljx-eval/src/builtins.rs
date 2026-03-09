@@ -1,6 +1,6 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
-use std::ops::Sub;
+use std::ops::{Add, Sub};
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed as _, ToPrimitive, Zero as _};
 use std::sync::{Arc, Mutex};
@@ -1211,6 +1211,12 @@ fn builtin_inc(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => Ok(Value::Long(n.wrapping_add(1))),
         Value::Double(f) => Ok(Value::Double(f + 1.0)),
+        Value::Ratio(r) =>
+            Ok(Value::Ratio(GcPtr::new(r.get().add(Ratio::new(BigInt::from(1), BigInt::from(1)))))),
+        Value::BigInt(i) =>
+            Ok(Value::BigInt(GcPtr::new(i.get().add(1)))),
+        Value::BigDecimal(d) =>
+            Ok(Value::BigDecimal(GcPtr::new(d.get().add(1)))),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -2969,13 +2975,20 @@ fn builtin_set_fn(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_disj(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    let meta = args[0].get_meta().cloned();
+    let apply_meta = |v: Value| -> Value {
+        match meta {
+            Some(ref m) => v.with_meta(m.clone()),
+            None => v,
+        }
+    };
+    match args[0].unwrap_meta() {
         Value::Set(s) => {
             let mut result = s.clone();
             for k in &args[1..] {
                 result = result.disj(k);
             }
-            Ok(Value::Set(result))
+            Ok(apply_meta(Value::Set(result)))
         }
         Value::Nil => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
