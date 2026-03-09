@@ -178,6 +178,11 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
             FormKind::List(items)
         }
 
+        // WithMeta: strip metadata and convert the inner value.
+        Value::WithMeta(inner, _) => {
+            return value_to_form(inner, span);
+        }
+
         // Non-data types: wrap in a symbol placeholder (best effort).
         other => FormKind::Symbol(format!("#<{}>", other.type_name())),
     };

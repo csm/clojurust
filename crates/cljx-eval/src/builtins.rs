@@ -83,7 +83,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("hash-map", Arity::Variadic { min: 0 }, builtin_hash_map),
         ("array-map", Arity::Variadic { min: 0 }, builtin_array_map),
         ("hash-set", Arity::Variadic { min: 0 }, builtin_hash_set),
-        ("conj", Arity::Variadic { min: 1 }, builtin_conj),
+        ("conj", Arity::Variadic { min: 0 }, builtin_conj),
         ("assoc", Arity::Variadic { min: 3 }, builtin_assoc),
         ("dissoc", Arity::Variadic { min: 1 }, builtin_dissoc),
         ("get", Arity::Variadic { min: 2 }, builtin_get),
@@ -1667,7 +1667,7 @@ fn builtin_hash_set(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
     if args.is_empty() {
-        return Ok(Value::Nil);
+        return Ok(Value::Vector(GcPtr::new(PersistentVector::empty())));
     }
     let meta = args[0].get_meta().cloned();
     let mut result = args[0].unwrap_meta().clone();
@@ -1682,15 +1682,31 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
             Value::Vector(vec) => Value::Vector(GcPtr::new(vec.get().conj(v.clone()))),
             Value::Set(s) => Value::Set(s.conj(v.clone())),
             Value::Map(m) => {
-                // v should be a [key val] pair.
-                let pair = value_to_seq(v)?;
-                if pair.len() != 2 {
-                    return Err(ValueError::Other(
-                        "conj on map requires [key val] pairs".into(),
-                    ));
+                // v can be a [key val] pair or another map.
+                match v.unwrap_meta() {
+                    Value::Map(other) => {
+                        let mut merged = m;
+                        other.for_each(|k, val| {
+                            merged = merged.assoc(k.clone(), val.clone());
+                        });
+                        Value::Map(merged)
+                    }
+                    _ => {
+                        let pair = value_to_seq(v)?;
+                        if pair.len() != 2 {
+                            return Err(ValueError::Other(
+                                "conj on map requires [key val] pairs".into(),
+                            ));
+                        }
+                        Value::Map(m.assoc(pair[0].clone(), pair[1].clone()))
+                    }
                 }
-                Value::Map(m.assoc(pair[0].clone(), pair[1].clone()))
             }
+            // Conj onto lazy seq / cons: prepend like a list.
+            Value::LazySeq(_) | Value::Cons(_) => Value::Cons(GcPtr::new(CljxCons {
+                head: v.clone(),
+                tail: result,
+            })),
             _ => {
                 return Err(ValueError::WrongType {
                     expected: "collection",

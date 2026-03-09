@@ -191,7 +191,7 @@
                     (with-meta (list* (first form) x (next form)) (meta form))
                     (list form x))]
      (if (seq more)
-       (list '-> threaded (first more))
+       (list* '-> threaded more)
        threaded))))
 
 (defmacro ->>
@@ -201,7 +201,7 @@
                     (with-meta (concat (list (first form)) (next form) (list x)) (meta form))
                     (list form x))]
      (if (seq more)
-       (list '->> threaded (first more))
+       (list* '->> threaded more)
        threaded))))
 
 (defmacro as->
