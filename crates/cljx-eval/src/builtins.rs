@@ -1,5 +1,6 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
+use std::num::ParseFloatError;
 use crate::env::GlobalEnv;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
@@ -3853,7 +3854,15 @@ fn builtin_double_fn(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_float_fn(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Double(numeric_as_f32(&args[0])? as f64))
+    if let Value::Str(s) = &args[0] {
+        let num: Result<f32, ParseFloatError> = s.get().parse();
+        match num {
+            Ok(n) => Ok(Value::Double(n as f64)),
+            Err(e) => Err(ValueError::Other(e.to_string())),
+        }
+    } else {
+        Ok(Value::Double(numeric_as_f32(&args[0])? as f64))
+    }
 }
 
 fn builtin_char_fn(args: &[Value]) -> ValueResult<Value> {
