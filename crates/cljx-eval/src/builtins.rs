@@ -1595,6 +1595,14 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::Map(m) => m.count() == 0,
         Value::Set(s) => s.is_empty(),
         Value::Str(s) => s.get().is_empty(),
+        Value::BooleanArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::ByteArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::ShortArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::IntArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::LongArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::CharArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::FloatArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
             let realized = s.get().realize();
             return builtin_empty_q(&[realized]);
