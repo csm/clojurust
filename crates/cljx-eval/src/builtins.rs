@@ -1,11 +1,12 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
-use num_bigint::Sign;
+use std::ops::Sub;
+use num_bigint::{BigInt, Sign};
 use num_traits::{Signed as _, ToPrimitive, Zero as _};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
-
+use num_rational::Ratio;
 use crate::env::GlobalEnv;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
@@ -14,7 +15,7 @@ use cljx_value::{
     Namespace, NativeFn, ObjectArray, PersistentHashSet, PersistentList, PersistentVector,
     SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
 };
-
+use crate::builtins::NumCat::BigDecimal;
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -1221,6 +1222,12 @@ fn builtin_dec(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => Ok(Value::Long(n.wrapping_sub(1))),
         Value::Double(f) => Ok(Value::Double(f - 1.0)),
+        Value::Ratio(r) =>
+            Ok(Value::Ratio(GcPtr::new(r.get().sub(Ratio::new(BigInt::from(1), BigInt::from(1)))))),
+        Value::BigInt(i) =>
+            Ok(Value::BigInt(GcPtr::new(i.get().sub(1)))),
+        Value::BigDecimal(d) =>
+            Ok(Value::BigDecimal(GcPtr::new(d.get().sub(1)))),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
