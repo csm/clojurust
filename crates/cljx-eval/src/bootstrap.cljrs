@@ -89,7 +89,7 @@
           :else [])))
 
 (defn drop [n coll]
-  (loop [s (seq coll) n n]
+  (loop [s (seq coll) n (int n)]
     (if (and s (pos? n))
       (recur (next s) (dec n))
       (or s '()))))
@@ -313,7 +313,13 @@
       (recur (next s) (conj acc (first s)))
       (seq acc))))
 
-(defn drop-last [coll] (butlast coll))
+(defn drop-last
+  ([coll] (drop-last 1 coll))
+  ([n coll]
+   (let [s (seq coll)]
+     (if s
+       (take (- (count s) n) s)
+       '()))))
 
 (defn take-last [n coll]
   (let [s (seq coll)]
