@@ -48,7 +48,7 @@
          (is (= 0.0 (float "0")))
          (is (thrown? Exception (float :0)))]
         :rust
-        [(is (= r/max-double (float r/max-double)))
+        [(is (= ##Inf (float r/max-double)))
          (is (= ##Inf (float ##Inf)))
          (is (= ##-Inf (float ##-Inf)))
          (is (= 0.0 (float "0")))
