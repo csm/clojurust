@@ -1378,13 +1378,54 @@ fn builtin_gte(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
+    macro_rules! peq {
+        ($a:expr, $b:expr) => {
+            GcPtr::ptr_eq($a, $b)
+        };
+    }
     let same = match (&args[0], &args[1]) {
         (Value::Nil, Value::Nil) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Fn(a), Value::Fn(b)) => GcPtr::ptr_eq(a, b),
-        (Value::Var(a), Value::Var(b)) => GcPtr::ptr_eq(a, b),
-        (Value::Atom(a), Value::Atom(b)) => GcPtr::ptr_eq(a, b),
+        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::BigInt(a), Value::BigInt(b)) => peq!(a, b),
+        (Value::BigDecimal(a), Value::BigDecimal(b)) => peq!(a, b),
+        (Value::Ratio(a), Value::Ratio(b)) => peq!(a, b),
+        (Value::Str(a), Value::Str(b)) => peq!(a, b),
+        (Value::Symbol(a), Value::Symbol(b)) => peq!(a, b),
+        (Value::Keyword(a), Value::Keyword(b)) => peq!(a, b),
+        (Value::List(a), Value::List(b)) => peq!(a, b),
+        (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
+        (Value::Map(a), Value::Map(b)) => match (a, b) {
+            (MapValue::Array(a), MapValue::Array(b)) => peq!(a, b),
+            (MapValue::Hash(a), MapValue::Hash(b)) => peq!(a, b),
+            (MapValue::Sorted(a), MapValue::Sorted(b)) => peq!(a, b),
+            _ => false,
+        },
+        (Value::Set(a), Value::Set(b)) => match (a, b) {
+            (SetValue::Hash(a), SetValue::Hash(b)) => peq!(a, b),
+            (SetValue::Sorted(a), SetValue::Sorted(b)) => peq!(a, b),
+            _ => false,
+        },
+        (Value::Queue(a), Value::Queue(b)) => peq!(a, b),
+        (Value::NativeFunction(a), Value::NativeFunction(b)) => peq!(a, b),
+        (Value::Fn(a), Value::Fn(b)) => peq!(a, b),
+        (Value::Macro(a), Value::Macro(b)) => peq!(a, b),
+        (Value::Var(a), Value::Var(b)) => peq!(a, b),
+        (Value::Atom(a), Value::Atom(b)) => peq!(a, b),
+        (Value::Namespace(a), Value::Namespace(b)) => peq!(a, b),
+        (Value::LazySeq(a), Value::LazySeq(b)) => peq!(a, b),
+        (Value::Cons(a), Value::Cons(b)) => peq!(a, b),
+        (Value::Protocol(a), Value::Protocol(b)) => peq!(a, b),
+        (Value::ProtocolFn(a), Value::ProtocolFn(b)) => peq!(a, b),
+        (Value::MultiFn(a), Value::MultiFn(b)) => peq!(a, b),
+        (Value::Volatile(a), Value::Volatile(b)) => peq!(a, b),
+        (Value::Delay(a), Value::Delay(b)) => peq!(a, b),
+        (Value::Promise(a), Value::Promise(b)) => peq!(a, b),
+        (Value::Future(a), Value::Future(b)) => peq!(a, b),
+        (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
+        (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
         _ => false,
     };
     Ok(Value::Bool(same))
