@@ -27,6 +27,11 @@
               true (float 0.0)
               true (float 1.0)
               true (float -1.0)]
+             :rust
+             [;; same for rust
+              true (float 0.0)
+              true (float 1.0)
+              true (float -1.0)]
              :cljs
              [true (float 0.0)
               true (float 1.0)
@@ -38,8 +43,8 @@
              :default
              [false (float 0.0) ; surprising since (float? (double 0.0)) = true
               false (float 1.0) ; surprising since (float? (double 1.0)) = true
-              false (float -1.0) ; surprising since (float? (double -1.0)) = true
-              ])
+              false (float -1.0)]) ; surprising since (float? (double -1.0)) = true
+
          true  (double 0.0)
          true  (double 1.0)
          true  (double -1.0)
