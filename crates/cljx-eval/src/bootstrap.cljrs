@@ -469,8 +469,15 @@
   (fn [& args] (mapv (fn [f] (apply f args)) fns)))
 
 (defn fnil [f default & defaults]
-  (fn [x & args]
-    (apply f (if (nil? x) default x) args)))
+  (let [all-defaults (cons default defaults)
+        n (count all-defaults)
+        patch (fn patch [args defs]
+                (if (seq defs)
+                  (cons (if (nil? (first args)) (first defs) (first args))
+                        (patch (rest args) (rest defs)))
+                  args))]
+    (fn [& args]
+      (apply f (patch args all-defaults)))))
 
 (defn memoize [f]
   (let [cache (atom {})]
