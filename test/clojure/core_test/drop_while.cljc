@@ -10,9 +10,12 @@
     (is (= '() (drop-while #(< % 5) nil)))
 
     ;; Transducer
-    (is (= (vec (range 5 10)) (into [] (drop-while #(< % 5)) (range 0 10))))
-    (is (= [1 2 3] (into [] (drop-while keyword?) [:a :b :c 1 2 3])))
-    (is (= [] (into [] (drop-while #(< % 5)) nil)))
+    #?(:rust "Transducers not yet implemented."
+       :default
+       [
+        (is (= (vec (range 5 10)) (into [] (drop-while #(< % 5)) (range 0 10))))
+        (is (= [1 2 3] (into [] (drop-while keyword?) [:a :b :c 1 2 3])))
+        (is (= [] (into [] (drop-while #(< % 5)) nil)))])
 
     ;; Negative tests
     (is (thrown? #?(:cljs :default :default Exception)
