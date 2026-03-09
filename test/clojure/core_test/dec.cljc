@@ -27,6 +27,7 @@
          :cljr (is (thrown? Exception (dec Int64/MinValue)))
          :cljs (is (= (dec js/Number.MIN_SAFE_INTEGER) (- js/Number.MIN_SAFE_INTEGER 2)))
          :lpy []  ; Python integers cannot underflow
+         :rust [] ; Rust too, use wrapping_sub
          :default (is false "TODO underflow")))
 
     (testing "dec-nil"
