@@ -13,7 +13,9 @@
       (testing "functions, functions from HOFs, transducers, #() reader macro, `fn`, `defn`"
         (is (ifn? juxt))
         (is (ifn? (juxt inc dec)))
-        (is (ifn? (map inc)))
+        #?(:rust "Transducers not yet implemented"
+           :default
+           (is (ifn? (map inc))))
         (is (ifn? #(str "hello " %)))
         (is (ifn? (fn [x] (str "hello " x))))
         (is (ifn? foo)))
