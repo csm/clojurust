@@ -2036,7 +2036,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    match args[0].unwrap_meta() {
         Value::LazySeq(ls) => builtin_first(&[ls.get().realize()]),
         Value::Cons(c) => Ok(c.get().head.clone()),
         Value::Nil => Ok(Value::Nil),
@@ -2054,12 +2054,19 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
             });
             Ok(result.unwrap_or(Value::Nil))
         }
+        Value::Set(s) => Ok(s.iter().next().cloned().unwrap_or(Value::Nil)),
+        Value::Str(s) => Ok(s
+            .get()
+            .chars()
+            .next()
+            .map(Value::Char)
+            .unwrap_or(Value::Nil)),
         _ => Ok(Value::Nil),
     }
 }
 
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    match args[0].unwrap_meta() {
         Value::LazySeq(ls) => builtin_rest(&[ls.get().realize()]),
         Value::Cons(c) => {
             // Return the tail directly; it may be another LazySeq, Cons, List, or Nil.
@@ -2075,6 +2082,27 @@ fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
         }
         Value::Vector(v) => {
             let items: Vec<Value> = v.get().iter().skip(1).cloned().collect();
+            Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+        }
+        Value::Map(m) => {
+            let items: Vec<Value> = m
+                .iter()
+                .skip(1)
+                .map(|(k, v)| {
+                    Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                        k.clone(),
+                        v.clone(),
+                    ])))
+                })
+                .collect();
+            Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+        }
+        Value::Set(s) => {
+            let items: Vec<Value> = s.iter().skip(1).cloned().collect();
+            Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+        }
+        Value::Str(s) => {
+            let items: Vec<Value> = s.get().chars().skip(1).map(Value::Char).collect();
             Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
         }
         _ => Ok(Value::List(GcPtr::new(PersistentList::empty()))),
@@ -2109,10 +2137,15 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::Map(m) => {
-            let kvs = m.iter().map(|e| {
-                let v = vec![e.0.clone(), e.1.clone()];
-                Value::Vector(GcPtr::new(PersistentVector::from_iter(v.iter().cloned())))
-            }).collect::<Vec<_>>();
+            let kvs = m
+                .iter()
+                .map(|e| {
+                    Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                        e.0.clone(),
+                        e.1.clone(),
+                    ])))
+                })
+                .collect::<Vec<_>>();
             let tail = PersistentList::from_iter(kvs.iter().cloned());
             let new_list = PersistentList::cons(head, Arc::new(tail));
             Ok(Value::List(GcPtr::new(new_list)))
@@ -2123,9 +2156,7 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::Str(s) => {
-            let tail = PersistentList::from_iter(
-                s.get().chars().map(|c| Value::Char(c))
-            );
+            let tail = PersistentList::from_iter(s.get().chars().map(Value::Char));
             let new_list = PersistentList::cons(head, Arc::new(tail));
             Ok(Value::List(GcPtr::new(new_list)))
         }
@@ -2249,8 +2280,23 @@ fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
         Value::Vector(v) => {
             if let Value::Long(idx) = &args[1] {
                 *idx >= 0 && (*idx as usize) < v.get().count()
-            } else {
+            } else if let Value::Nil = &args[1] {
                 false
+            } else {
+                return Err(ValueError::WrongType {
+                    expected: "int",
+                    got: args[1].type_name().to_string(),
+                });
+            }
+        }
+        Value::Str(s) => {
+            if let Value::Long(idx) = &args[1] {
+                *idx >= 0 && (*idx as usize) < s.get().len()
+            } else {
+                return Err(ValueError::WrongType {
+                    expected: "int",
+                    got: args[1].type_name().to_string(),
+                });
             }
         }
         Value::Nil => false,
