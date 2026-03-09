@@ -1594,7 +1594,15 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::Map(m) => m.count() == 0,
         Value::Set(s) => s.is_empty(),
         Value::Str(s) => s.get().is_empty(),
-        _ => false,
+        Value::LazySeq(s) => {
+            let realized = s.get().realize();
+            return builtin_empty_q(&[realized])
+        }
+        Value::Cons(c) => matches!(c.get().head, Value::Nil),
+        _ => return Err(ValueError::WrongType {
+            expected: "seqable",
+            got: args[0].type_name().to_string()
+        }),
     };
     Ok(Value::Bool(empty))
 }
