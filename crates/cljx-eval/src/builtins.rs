@@ -1603,6 +1603,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::CharArray(a) => a.get().lock().unwrap().is_empty(),
         Value::FloatArray(a) => a.get().lock().unwrap().is_empty(),
         Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
+        Value::ObjectArray(a) => a.get().0.lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
             let realized = s.get().realize();
             return builtin_empty_q(&[realized]);
