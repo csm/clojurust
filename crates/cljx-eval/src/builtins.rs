@@ -1,6 +1,5 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
-use std::num::ParseFloatError;
 use crate::env::GlobalEnv;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
@@ -12,6 +11,7 @@ use cljx_value::{
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
 use num_traits::{Signed as _, ToPrimitive, Zero as _};
+use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -1597,13 +1597,15 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().is_empty(),
         Value::LazySeq(s) => {
             let realized = s.get().realize();
-            return builtin_empty_q(&[realized])
+            return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
-        _ => return Err(ValueError::WrongType {
-            expected: "seqable",
-            got: args[0].type_name().to_string()
-        }),
+        _ => {
+            return Err(ValueError::WrongType {
+                expected: "seqable",
+                got: args[0].type_name().to_string(),
+            });
+        }
     };
     Ok(Value::Bool(empty))
 }
@@ -2106,7 +2108,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
         _ => Err(ValueError::WrongType {
             expected: "seqable",
             got: args[0].type_name().to_string(),
-        })
+        }),
     }
 }
 
