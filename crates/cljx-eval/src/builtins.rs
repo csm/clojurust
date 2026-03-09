@@ -1955,6 +1955,9 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
+    if matches!(&args[0], Value::Nil) {
+        return Ok(Value::Nil);
+    }
     let mut current = args[0].clone();
     let default = args.get(2).cloned().unwrap_or(Value::Nil);
     for k in ValueIter::new(args[1].clone()) {
