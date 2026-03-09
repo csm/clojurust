@@ -2102,7 +2102,10 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
             .next()
             .map(Value::Char)
             .unwrap_or(Value::Nil)),
-        _ => Ok(Value::Nil),
+        _ => Err(ValueError::WrongType {
+            expected: "seqable",
+            got: args[0].type_name().to_string(),
+        })
     }
 }
 
