@@ -2108,6 +2108,27 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
             let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
             Ok(Value::List(GcPtr::new(new_list)))
         }
+        Value::Map(m) => {
+            let kvs = m.iter().map(|e| {
+                let v = vec![e.0.clone(), e.1.clone()];
+                Value::Vector(GcPtr::new(PersistentVector::from_iter(v.iter().cloned())))
+            }).collect::<Vec<_>>();
+            let tail = PersistentList::from_iter(kvs.iter().cloned());
+            let new_list = PersistentList::cons(head, Arc::new(tail));
+            Ok(Value::List(GcPtr::new(new_list)))
+        }
+        Value::Set(s) => {
+            let tail = PersistentList::from_iter(s.iter().cloned());
+            let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
+            Ok(Value::List(GcPtr::new(new_list)))
+        }
+        Value::Str(s) => {
+            let tail = PersistentList::from_iter(
+                s.get().chars().map(|c| Value::Char(c))
+            );
+            let new_list = PersistentList::cons(head, Arc::new(tail));
+            Ok(Value::List(GcPtr::new(new_list)))
+        }
         v => Err(ValueError::WrongType {
             expected: "seq",
             got: v.type_name().to_string(),
@@ -2532,6 +2553,14 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
             guard[idx] = newval.clone();
             Ok(newval)
         }
+        Value::IntArray(_) => builtin_aset_int(args),
+        Value::LongArray(_) => builtin_aset_long(args),
+        Value::ShortArray(_) => builtin_aset_short(args),
+        Value::ByteArray(_) => builtin_aset_byte(args),
+        Value::FloatArray(_) => builtin_aset_float(args),
+        Value::DoubleArray(_) => builtin_aset_double(args),
+        Value::BooleanArray(_) => builtin_aset_bool(args),
+        // TODO CharArray, need aset-char builtin
         _ => Err(ValueError::WrongType {
             expected: "array",
             got: args[0].type_name().to_string(),

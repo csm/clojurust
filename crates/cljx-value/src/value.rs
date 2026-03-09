@@ -200,6 +200,15 @@ impl MapValue {
             }
         }
     }
+
+    /// Iterate over key/value pairs.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (&Value, &Value)> + '_> {
+        match self {
+            MapValue::Array(m) => Box::new(m.get().iter()),
+            MapValue::Hash(m) => Box::new(m.get().iter()),
+            MapValue::Sorted(m) => Box::new(m.get().iter()),
+        }
+    }
 }
 
 /// A set value, either a hash set or a sorted set.
