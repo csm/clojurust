@@ -523,7 +523,7 @@
          acc (if (seq coll) [(first coll)] [])]
     (if s
       (recur (next s) (conj (conj acc sep) (first s)))
-      (seq acc))))
+      (or (seq acc) []))))
 
 (defn clojure-version [] "cljx-0.1.0")
 

@@ -372,7 +372,7 @@ fn parse_bigdecimal(s: &str) -> EvalResult {
 }
 
 fn parse_ratio(s: &str) -> EvalResult {
-    use num_traits::Zero;
+    use num_traits::{ToPrimitive, Zero};
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() != 2 {
         return Err(EvalError::Runtime(format!("bad ratio: {s}")));
@@ -386,9 +386,16 @@ fn parse_ratio(s: &str) -> EvalResult {
     if denom.is_zero() {
         return Err(EvalError::Runtime("ratio denominator is zero".into()));
     }
-    Ok(Value::Ratio(GcPtr::new(num_rational::Ratio::new(
-        numer, denom,
-    ))))
+    let r = num_rational::Ratio::new(numer, denom);
+    if r.is_integer() {
+        let n = r.to_integer();
+        match n.to_i64() {
+            Some(i) => Ok(Value::Long(i)),
+            None => Ok(Value::BigInt(GcPtr::new(n))),
+        }
+    } else {
+        Ok(Value::Ratio(GcPtr::new(r)))
+    }
 }
 
 // ── reader cond ───────────────────────────────────────────────────────────────
