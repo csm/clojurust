@@ -12,7 +12,7 @@ use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
 use num_traits::{Signed as _, ToPrimitive, Zero as _};
 use std::num::ParseFloatError;
-use std::ops::{Add, Sub};
+use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
@@ -622,8 +622,13 @@ fn numeric_as_i16(v: &Value) -> ValueResult<i16> {
 }
 
 fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
-    let v = numeric_as_f64(v)?;
-    Ok(v as i32)
+    let n = numeric_as_i64(v)?;
+    println!("value: {}, i64: {}", v, n);
+    if n < -2147483648 || n > 2147483647 {
+        Err(ValueError::OutOfRange)
+    } else {
+        Ok(n as i32)
+    }
 }
 
 fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
@@ -643,11 +648,27 @@ fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
             .get()
             .to_i64()
             .ok_or_else(|| ValueError::Other("BigInt too large for i64".into())),
-        Value::Ratio(r) => r
-            .get()
-            .floor()
-            .to_i64()
-            .ok_or_else(|| ValueError::Other("cannot convert ratio".into())),
+        Value::Ratio(r) => {
+            let trunc = if r.get().is_negative() {
+                // Use ceiling to truncate towards zero.
+                r.get().ceil()
+            } else {
+                r.get().floor()
+            };
+            trunc.to_i64()
+                .ok_or_else(|| ValueError::Other("cannot convert ratio".into()))
+        },
+        Value::BigDecimal(d) => {
+            let (num, exp) = d.get().as_bigint_and_exponent();
+            let res = if exp >= 0 {
+                let pow = BigInt::from(10).pow(exp as u32);
+                num.div(pow)
+            } else {
+                let scale = BigInt::from(10).pow((-exp) as u32);
+                num.mul(scale)
+            };
+            res.to_i64().ok_or_else(|| ValueError::Other("BigDecimal too large for i64".into()))
+        }
         Value::Bool(b) => Ok(*b as i64),
         _ => Err(ValueError::WrongType {
             expected: "integer",
@@ -3982,7 +4003,7 @@ fn builtin_boolean(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_int(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Long(numeric_as_i64(&args[0])?))
+    Ok(Value::Long(numeric_as_i32(&args[0])? as i64))
 }
 
 fn builtin_long(args: &[Value]) -> ValueResult<Value> {

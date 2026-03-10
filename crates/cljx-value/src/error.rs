@@ -31,6 +31,9 @@ pub enum ValueError {
 
     #[error("{0}")]
     Other(String),
+    
+    #[error("out of range")]
+    OutOfRange,
 }
 
 pub type ValueResult<T> = Result<T, ValueError>;
