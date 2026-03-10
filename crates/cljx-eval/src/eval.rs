@@ -839,21 +839,18 @@ mod tests {
 
     #[test]
     fn test_map_fn() {
-        let v = eval_str("(map inc [1 2 3])").unwrap();
-        assert!(matches!(v, Value::List(_)));
-        if let Value::List(l) = &v {
-            let items: Vec<_> = l.get().iter().cloned().collect();
-            assert_eq!(items, vec![long(2), long(3), long(4)]);
-        }
+        assert_eq!(
+            eval_str("(vec (map inc [1 2 3]))").unwrap(),
+            eval_str("[2 3 4]").unwrap()
+        );
     }
 
     #[test]
     fn test_filter_fn() {
-        let v = eval_str("(filter odd? [1 2 3 4 5])").unwrap();
-        assert!(matches!(v, Value::List(_)));
-        if let Value::List(l) = &v {
-            assert_eq!(l.get().count(), 3);
-        }
+        assert_eq!(
+            eval_str("(vec (filter odd? [1 2 3 4 5]))").unwrap(),
+            eval_str("[1 3 5]").unwrap()
+        );
     }
 
     #[test]

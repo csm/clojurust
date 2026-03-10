@@ -10,7 +10,7 @@ use cljx_value::{
 };
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
-use num_traits::{Signed as _, ToPrimitive, Zero as _};
+use num_traits::{Float, Signed as _, ToPrimitive, Zero as _};
 use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
@@ -1390,6 +1390,12 @@ fn builtin_gt(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_lte(args: &[Value]) -> ValueResult<Value> {
     for pair in args.windows(2) {
+        if let Value::Double(d) = pair[0] && d.is_nan() {
+            return Ok(Value::Bool(false));
+        }
+        if let Value::Double(d) = pair[1] && d.is_nan() {
+            return Ok(Value::Bool(false));
+        }
         if num_compare(&pair[0], &pair[1])? == std::cmp::Ordering::Greater {
             return Ok(Value::Bool(false));
         }
@@ -2085,6 +2091,19 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Long(n as i64))
 }
 
+/// Build a Cons chain from an iterator of Values (not a List, so list? returns false).
+fn cons_from_iter(items: impl IntoIterator<Item = Value>) -> Value {
+    let items: Vec<Value> = items.into_iter().collect();
+    let mut result = Value::Nil;
+    for item in items.into_iter().rev() {
+        result = Value::Cons(GcPtr::new(CljxCons {
+            head: item,
+            tail: result,
+        }));
+    }
+    result
+}
+
 fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
@@ -2108,8 +2127,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if v.get().is_empty() {
                 Ok(Value::Nil)
             } else {
-                let items: Vec<Value> = v.get().iter().cloned().collect();
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+                Ok(cons_from_iter(v.get().iter().cloned()))
             }
         }
         Value::Map(m) => {
@@ -2124,22 +2142,20 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
                 ])));
                 pairs.push(pair);
             });
-            Ok(Value::List(GcPtr::new(PersistentList::from_iter(pairs))))
+            Ok(cons_from_iter(pairs))
         }
         Value::Set(s) => {
             if s.is_empty() {
                 Ok(Value::Nil)
             } else {
-                let items: Vec<Value> = s.iter().cloned().collect();
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+                Ok(cons_from_iter(s.iter().cloned()))
             }
         }
         Value::Str(s) => {
             if s.get().is_empty() {
                 Ok(Value::Nil)
             } else {
-                let chars: Vec<Value> = s.get().chars().map(Value::Char).collect();
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(chars))))
+                Ok(cons_from_iter(s.get().chars().map(Value::Char)))
             }
         }
         Value::ObjectArray(a) => {
@@ -2147,7 +2163,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(array))))
+                Ok(cons_from_iter(array))
             }
         }
         Value::BooleanArray(a) => {
@@ -2155,9 +2171,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
-                    array.iter().map(|b| Value::Bool(*b)),
-                ))))
+                Ok(cons_from_iter(array.iter().map(|b| Value::Bool(*b))))
             }
         }
         Value::ByteArray(a) => {
@@ -2165,9 +2179,9 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                Ok(cons_from_iter(
                     array.iter().map(|i| Value::Long(*i as i64)),
-                ))))
+                ))
             }
         }
         Value::ShortArray(a) => {
@@ -2175,9 +2189,9 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                Ok(cons_from_iter(
                     array.iter().map(|i| Value::Long(*i as i64)),
-                ))))
+                ))
             }
         }
         Value::IntArray(a) => {
@@ -2185,9 +2199,9 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                Ok(cons_from_iter(
                     array.iter().map(|i| Value::Long(*i as i64)),
-                ))))
+                ))
             }
         }
         Value::LongArray(a) => {
@@ -2195,9 +2209,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
-                    array.iter().map(|i| Value::Long(*i)),
-                ))))
+                Ok(cons_from_iter(array.iter().map(|i| Value::Long(*i))))
             }
         }
         Value::CharArray(a) => {
@@ -2205,9 +2217,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
-                    array.iter().map(|i| Value::Char(*i)),
-                ))))
+                Ok(cons_from_iter(array.iter().map(|i| Value::Char(*i))))
             }
         }
         Value::FloatArray(a) => {
@@ -2215,9 +2225,9 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+                Ok(cons_from_iter(
                     array.iter().map(|f| Value::Double(*f as f64)),
-                ))))
+                ))
             }
         }
         Value::DoubleArray(a) => {
@@ -2225,9 +2235,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(Value::List(GcPtr::new(PersistentList::from_iter(
-                    array.iter().map(|f| Value::Double(*f)),
-                ))))
+                Ok(cons_from_iter(array.iter().map(|f| Value::Double(*f))))
             }
         }
         v => Err(ValueError::WrongType {
@@ -2420,9 +2428,22 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
 fn builtin_last(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Nil => Ok(Value::Nil),
-        Value::List(l) => Ok(l.get().iter().last().cloned().unwrap_or(Value::Nil)),
         Value::Vector(v) => Ok(v.get().peek().cloned().unwrap_or(Value::Nil)),
-        _ => Ok(Value::Nil),
+        _ => {
+            // Walk the seq to find the last element.
+            let mut s = builtin_seq(&[args[0].clone()])?;
+            if s == Value::Nil {
+                return Ok(Value::Nil);
+            }
+            loop {
+                let r = builtin_rest(&[s.clone()])?;
+                let next_s = builtin_seq(&[r])?;
+                if next_s == Value::Nil {
+                    return builtin_first(&[s]);
+                }
+                s = next_s;
+            }
+        }
     }
 }
 
@@ -2464,6 +2485,10 @@ fn builtin_keys(args: &[Value]) -> ValueResult<Value> {
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(keys))))
             }
         }
+        Value::Vector(_) | Value::List(_) | Value::Set(_) | Value::Str(_)
+        | Value::LazySeq(_) | Value::Cons(_) | Value::ObjectArray(_) | Value::BooleanArray(_)
+        | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_) | Value::FloatArray(_)
+        | Value::DoubleArray(_) | Value::CharArray(_) => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
             expected: "map",
             got: v.type_name().to_string(),
@@ -2601,6 +2626,7 @@ fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
 fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::List(_)
+        | Value::Cons(_)
         | Value::Set(_)
         | Value::Vector(_)
         | Value::Map(_)
@@ -3988,15 +4014,25 @@ fn builtin_keyword_fn(args: &[Value]) -> ValueResult<Value> {
             _ => Ok(Value::Nil),
         },
         2 => {
-            let ns = match &args[0] {
-                Value::Str(s) => s.get().clone(),
-                _ => return Ok(Value::Nil),
+            let ns: Option<String> = match &args[0] {
+                Value::Str(s) => Some(s.get().clone()),
+                Value::Nil => None,
+                _ => return Err(ValueError::WrongType {
+                    expected: "str",
+                    got: args[0].type_name().to_string(),
+                })
             };
             let name = match &args[1] {
                 Value::Str(s) => s.get().clone(),
-                _ => return Ok(Value::Nil),
+                _ => return Err(ValueError::WrongType {
+                    expected: "str",
+                    got: args[0].type_name().to_string(),
+                })
             };
-            Ok(Value::keyword(Keyword::qualified(ns, name)))
+            match ns {
+                Some(ns) => Ok(Value::keyword(Keyword::qualified(ns, name))),
+                None => Ok(Value::keyword(Keyword::parse(name.as_str()))),
+            }
         }
         n => Err(ValueError::ArityError {
             name: "keyword".into(),
@@ -4015,7 +4051,13 @@ fn builtin_int(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_long(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Long(numeric_as_i64(&args[0])?))
+    match &args[0] {
+        Value::Str(_) => Err(ValueError::WrongType {
+            expected: "number",
+            got: args[0].type_name().to_string(),
+        }),
+        _ => Ok(Value::Long(numeric_as_i64(&args[0])?))
+    }
 }
 
 fn builtin_double_fn(args: &[Value]) -> ValueResult<Value> {
