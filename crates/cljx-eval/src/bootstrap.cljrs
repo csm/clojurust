@@ -70,14 +70,38 @@
           (recur (next s) (conj acc v))))
       (seq acc))))
 
-(defn mapcat [f coll]
-  (letfn [(cat [xs colls]
-            (lazy-seq
-              (if-let [s (seq xs)]
-                (cons (first s) (cat (rest s) colls))
-                (when-let [cs (seq colls)]
-                  (cat (f (first cs)) (rest cs))))))]
-    (cat nil coll)))
+(defn mapcat
+  ([f coll]
+   (when-not (ifn? f) (throw (str "Argument must be a function: " f)))
+   (let [s (seq coll)]
+     (letfn [(cat [xs colls]
+               (lazy-seq
+                 (if-let [s (seq xs)]
+                   (cons (first s) (cat (rest s) colls))
+                   (when-let [cs (seq colls)]
+                     (cat (f (first cs)) (rest cs))))))]
+       (cat nil s))))
+  ([f c1 c2]
+   (when-not (ifn? f) (throw (str "Argument must be a function: " f)))
+   (letfn [(cat [xs s1 s2]
+             (lazy-seq
+               (if-let [s (seq xs)]
+                 (cons (first s) (cat (rest s) s1 s2))
+                 (when (and s1 s2)
+                   (cat (f (first s1) (first s2))
+                        (next s1) (next s2))))))]
+     (cat nil (seq c1) (seq c2))))
+  ([f c1 c2 & colls]
+   (when-not (ifn? f) (throw (str "Argument must be a function: " f)))
+   (let [all-colls (cons c1 (cons c2 colls))
+         step (fn step [xs seqs]
+                (lazy-seq
+                  (if-let [s (seq xs)]
+                    (cons (first s) (step (rest s) seqs))
+                    (when (every? seq seqs)
+                      (step (apply f (map first seqs))
+                            (map next seqs))))))]
+     (step nil (map seq all-colls)))))
 
 (defn take [n coll]
   (let [n (int n)]

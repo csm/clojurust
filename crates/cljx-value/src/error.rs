@@ -31,7 +31,7 @@ pub enum ValueError {
 
     #[error("{0}")]
     Other(String),
-    
+
     #[error("out of range")]
     OutOfRange,
 }

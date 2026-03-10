@@ -1,6 +1,7 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
 use crate::env::GlobalEnv;
+use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
 use cljx_value::{
@@ -10,13 +11,12 @@ use cljx_value::{
 };
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
-use num_traits::{Float, Signed as _, ToPrimitive, Zero as _};
+use num_traits::{Signed as _, ToPrimitive, Zero as _};
 use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
-use bigdecimal::BigDecimal;
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -439,11 +439,20 @@ pub const CLOJURE_TEST_SOURCE: &str = include_str!("clojure_test.cljrs");
 /// on first access, which is fine since they are already fully in memory.
 struct ValueIter {
     current: Value,
+    error: Option<String>,
 }
 
 impl ValueIter {
     fn new(v: Value) -> Self {
-        ValueIter { current: v }
+        ValueIter {
+            current: v,
+            error: None,
+        }
+    }
+
+    /// Check if an error occurred during iteration.
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 }
 
@@ -459,6 +468,11 @@ impl Iterator for ValueIter {
                 }
                 Value::LazySeq(ls) => {
                     self.current = ls.get().realize();
+                    if let Some(err) = crate::apply::take_lazy_seq_error() {
+                        self.error = Some(err);
+                        self.current = Value::Nil;
+                        return None;
+                    }
                 }
                 Value::Cons(c) => {
                     let cell = c.get();
@@ -590,7 +604,12 @@ impl Iterator for ValueIter {
 // ── Helper: value to sequence vector (eager — use only when random access is needed) ──
 
 fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
-    Ok(ValueIter::new(v.clone()).collect())
+    let mut iter = ValueIter::new(v.clone());
+    let result: Vec<Value> = iter.by_ref().collect();
+    if let Some(err) = iter.take_error() {
+        return Err(ValueError::Other(err));
+    }
+    Ok(result)
 }
 
 fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
@@ -624,7 +643,7 @@ fn numeric_as_i16(v: &Value) -> ValueResult<i16> {
 
 fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
     let n = numeric_as_i64(v)?;
-    if n < -2147483648 || n > 2147483647 {
+    if !(-2147483648..=2147483647).contains(&n) {
         Err(ValueError::OutOfRange)
     } else {
         Ok(n as i32)
@@ -640,7 +659,8 @@ fn bigdec_to_i64(d: &BigDecimal) -> ValueResult<i64> {
         let scale = BigInt::from(10).pow((-exp) as u32);
         num.mul(scale)
     };
-    res.to_i64().ok_or_else(|| ValueError::Other("BigDecimal too large for i64".into()))
+    res.to_i64()
+        .ok_or_else(|| ValueError::Other("BigDecimal too large for i64".into()))
 }
 
 fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
@@ -667,17 +687,18 @@ fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
             } else {
                 r.get().floor()
             };
-            trunc.to_i64()
+            trunc
+                .to_i64()
                 .ok_or_else(|| ValueError::Other("cannot convert ratio".into()))
-        },
+        }
         Value::BigDecimal(d) => bigdec_to_i64(d.get()),
         Value::Bool(b) => Ok(*b as i64),
-        Value::Str(s) => {
-            match s.get().parse::<BigDecimal>() {
-                Ok(d) => bigdec_to_i64(&d),
-                Err(_) => Err(ValueError::Other("failed to parse string as number".to_string())),
-            }
-        }
+        Value::Str(s) => match s.get().parse::<BigDecimal>() {
+            Ok(d) => bigdec_to_i64(&d),
+            Err(_) => Err(ValueError::Other(
+                "failed to parse string as number".to_string(),
+            )),
+        },
         _ => Err(ValueError::WrongType {
             expected: "integer",
             got: v.type_name().to_string(),
@@ -1390,10 +1411,14 @@ fn builtin_gt(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_lte(args: &[Value]) -> ValueResult<Value> {
     for pair in args.windows(2) {
-        if let Value::Double(d) = pair[0] && d.is_nan() {
+        if let Value::Double(d) = pair[0]
+            && d.is_nan()
+        {
             return Ok(Value::Bool(false));
         }
-        if let Value::Double(d) = pair[1] && d.is_nan() {
+        if let Value::Double(d) = pair[1]
+            && d.is_nan()
+        {
             return Ok(Value::Bool(false));
         }
         if num_compare(&pair[0], &pair[1])? == std::cmp::Ordering::Greater {
@@ -1746,7 +1771,11 @@ fn builtin_list_star(args: &[Value]) -> ValueResult<Value> {
     }
     let last = &args[args.len() - 1];
     let mut items: Vec<Value> = args[..args.len() - 1].to_vec();
-    items.extend(ValueIter::new(last.clone()));
+    let mut iter = ValueIter::new(last.clone());
+    items.extend(iter.by_ref());
+    if let Some(err) = iter.take_error() {
+        return Err(ValueError::Other(err));
+    }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
 
@@ -1950,14 +1979,21 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::Str(s) => {
             if let Value::Long(idx) = &args[1] {
-                Ok(s.get().chars().nth(*idx as usize).map(Value::Char).unwrap_or(default))
+                Ok(s.get()
+                    .chars()
+                    .nth(*idx as usize)
+                    .map(Value::Char)
+                    .unwrap_or(default))
             } else {
                 Ok(default)
             }
         }
         Value::BooleanArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Bool(*array.get(*idx as usize).unwrap()))
             } else {
                 Ok(default)
@@ -1965,7 +2001,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::ByteArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
             } else {
                 Ok(default)
@@ -1973,7 +2012,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::ShortArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
             } else {
                 Ok(default)
@@ -1981,7 +2023,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::IntArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Long(*array.get(*idx as usize).unwrap() as i64))
             } else {
                 Ok(default)
@@ -1989,7 +2034,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::LongArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Long(*array.get(*idx as usize).unwrap()))
             } else {
                 Ok(default)
@@ -1997,7 +2045,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::CharArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Char(*array.get(*idx as usize).unwrap()))
             } else {
                 Ok(default)
@@ -2005,7 +2056,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::FloatArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Double(*array.get(*idx as usize).unwrap() as f64))
             } else {
                 Ok(default)
@@ -2013,7 +2067,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::DoubleArray(a) => {
             let array = a.get().lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 Ok(Value::Double(*array.get(*idx as usize).unwrap()))
             } else {
                 Ok(default)
@@ -2021,7 +2078,10 @@ fn builtin_get(args: &[Value]) -> ValueResult<Value> {
         }
         Value::ObjectArray(a) => {
             let array = a.get().0.lock().unwrap();
-            if let Value::Long(idx) = &args[1] && *idx >= 0 && *idx < array.len() as i64 {
+            if let Value::Long(idx) = &args[1]
+                && *idx >= 0
+                && *idx < array.len() as i64
+            {
                 let value = (*array).get(*idx as usize).unwrap().clone();
                 Ok(value)
             } else {
@@ -2068,7 +2128,11 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
     match v {
         Value::LazySeq(_) | Value::Cons(_) => {
             // Walk and count elements lazily (linear time, no Vec alloc).
-            let n = ValueIter::new(v.clone()).count();
+            let mut iter = ValueIter::new(v.clone());
+            let n = iter.by_ref().count();
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
             return Ok(Value::Long(n as i64));
         }
         _ => {}
@@ -2179,9 +2243,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(cons_from_iter(
-                    array.iter().map(|i| Value::Long(*i as i64)),
-                ))
+                Ok(cons_from_iter(array.iter().map(|i| Value::Long(*i as i64))))
             }
         }
         Value::ShortArray(a) => {
@@ -2189,9 +2251,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(cons_from_iter(
-                    array.iter().map(|i| Value::Long(*i as i64)),
-                ))
+                Ok(cons_from_iter(array.iter().map(|i| Value::Long(*i as i64))))
             }
         }
         Value::IntArray(a) => {
@@ -2199,9 +2259,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
             if array.is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(cons_from_iter(
-                    array.iter().map(|i| Value::Long(*i as i64)),
-                ))
+                Ok(cons_from_iter(array.iter().map(|i| Value::Long(*i as i64))))
             }
         }
         Value::LongArray(a) => {
@@ -2399,10 +2457,14 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
     let idx = numeric_as_i64(&args[1])? as usize;
     let default = args.get(2).cloned();
     match &args[0] {
-        Value::LazySeq(_) | Value::Cons(_) => Ok(ValueIter::new(args[0].clone())
-            .nth(idx)
-            .or(default)
-            .unwrap_or(Value::Nil)),
+        Value::LazySeq(_) | Value::Cons(_) => {
+            let mut iter = ValueIter::new(args[0].clone());
+            let result = iter.nth(idx).or(default).unwrap_or(Value::Nil);
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
+            Ok(result)
+        }
         Value::List(l) => Ok(l
             .get()
             .iter()
@@ -2464,7 +2526,11 @@ fn builtin_reverse(args: &[Value]) -> ValueResult<Value> {
 fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
     let mut out = Vec::new();
     for arg in args {
-        out.extend(ValueIter::new(arg.clone()));
+        let mut iter = ValueIter::new(arg.clone());
+        out.extend(iter.by_ref());
+        if let Some(err) = iter.take_error() {
+            return Err(ValueError::Other(err));
+        }
     }
     if out.is_empty() {
         Ok(Value::List(GcPtr::new(PersistentList::empty())))
@@ -2485,10 +2551,20 @@ fn builtin_keys(args: &[Value]) -> ValueResult<Value> {
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter(keys))))
             }
         }
-        Value::Vector(_) | Value::List(_) | Value::Set(_) | Value::Str(_)
-        | Value::LazySeq(_) | Value::Cons(_) | Value::ObjectArray(_) | Value::BooleanArray(_)
-        | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_) | Value::FloatArray(_)
-        | Value::DoubleArray(_) | Value::CharArray(_) => Ok(Value::Nil),
+        Value::Vector(_)
+        | Value::List(_)
+        | Value::Set(_)
+        | Value::Str(_)
+        | Value::LazySeq(_)
+        | Value::Cons(_)
+        | Value::ObjectArray(_)
+        | Value::BooleanArray(_)
+        | Value::ShortArray(_)
+        | Value::IntArray(_)
+        | Value::LongArray(_)
+        | Value::FloatArray(_)
+        | Value::DoubleArray(_)
+        | Value::CharArray(_) => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
             expected: "map",
             got: v.type_name().to_string(),
@@ -2577,7 +2653,8 @@ fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_into(args: &[Value]) -> ValueResult<Value> {
     let mut result = args[0].clone();
-    for item in ValueIter::new(args[1].clone()) {
+    let mut iter = ValueIter::new(args[1].clone());
+    for item in iter.by_ref() {
         result = match result {
             Value::Nil => Value::List(GcPtr::new(PersistentList::from_iter([item]))),
             Value::List(l) => {
@@ -2600,6 +2677,9 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
                 });
             }
         };
+    }
+    if let Some(err) = iter.take_error() {
+        return Err(ValueError::Other(err));
     }
     Ok(result)
 }
@@ -2642,9 +2722,14 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
         | Value::DoubleArray(_)
         | Value::BooleanArray(_)
         | Value::CharArray(_)
-        | Value::Nil => Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
-            ValueIter::new(args[0].clone()),
-        )))),
+        | Value::Nil => {
+            let mut iter = ValueIter::new(args[0].clone());
+            let v: Vec<Value> = iter.by_ref().collect();
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
+            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(v))))
+        }
 
         _ => Err(ValueError::WrongType {
             expected: "seq",
@@ -4017,17 +4102,21 @@ fn builtin_keyword_fn(args: &[Value]) -> ValueResult<Value> {
             let ns: Option<String> = match &args[0] {
                 Value::Str(s) => Some(s.get().clone()),
                 Value::Nil => None,
-                _ => return Err(ValueError::WrongType {
-                    expected: "str",
-                    got: args[0].type_name().to_string(),
-                })
+                _ => {
+                    return Err(ValueError::WrongType {
+                        expected: "str",
+                        got: args[0].type_name().to_string(),
+                    });
+                }
             };
             let name = match &args[1] {
                 Value::Str(s) => s.get().clone(),
-                _ => return Err(ValueError::WrongType {
-                    expected: "str",
-                    got: args[0].type_name().to_string(),
-                })
+                _ => {
+                    return Err(ValueError::WrongType {
+                        expected: "str",
+                        got: args[0].type_name().to_string(),
+                    });
+                }
             };
             match ns {
                 Some(ns) => Ok(Value::keyword(Keyword::qualified(ns, name))),
@@ -4056,7 +4145,7 @@ fn builtin_long(args: &[Value]) -> ValueResult<Value> {
             expected: "number",
             got: args[0].type_name().to_string(),
         }),
-        _ => Ok(Value::Long(numeric_as_i64(&args[0])?))
+        _ => Ok(Value::Long(numeric_as_i64(&args[0])?)),
     }
 }
 
