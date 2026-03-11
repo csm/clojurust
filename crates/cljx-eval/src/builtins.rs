@@ -1807,11 +1807,23 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                         Value::Map(merged)
                     }
                     _ => {
-                        let k = builtin_first(std::slice::from_ref(v))?;
-                        let rest_v = builtin_rest(std::slice::from_ref(v))?;
+                        // Must be a 2-element seqable [key val].
+                        let seq_v = builtin_seq(std::slice::from_ref(v))?;
+                        if matches!(seq_v, Value::Nil) {
+                            return Err(ValueError::Other(
+                                "conj on map requires [key val] pairs".into(),
+                            ));
+                        }
+                        let k = builtin_first(std::slice::from_ref(&seq_v))?;
+                        let rest_v = builtin_rest(std::slice::from_ref(&seq_v))?;
+                        if matches!(builtin_seq(std::slice::from_ref(&rest_v))?, Value::Nil) {
+                            return Err(ValueError::Other(
+                                "conj on map requires [key val] pairs".into(),
+                            ));
+                        }
                         let val = builtin_first(std::slice::from_ref(&rest_v))?;
-                        let extra = builtin_rest(&[rest_v])?;
-                        if !matches!(builtin_seq(&[extra])?, Value::Nil) {
+                        let extra = builtin_rest(std::slice::from_ref(&rest_v))?;
+                        if !matches!(builtin_seq(std::slice::from_ref(&extra))?, Value::Nil) {
                             return Err(ValueError::Other(
                                 "conj on map requires [key val] pairs".into(),
                             ));
@@ -2594,19 +2606,20 @@ fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
     // Clojure: (reduce #(conj (or %1 {}) %2) maps)
-    // Note: unlike plain conj, merge always conj's into a map context.
-    let mut result: Option<Value> = None;
-    for arg in args {
-        if matches!(arg, Value::Nil) {
-            continue;
-        }
-        let base = match result {
-            None | Some(Value::Nil) => Value::Map(MapValue::empty()),
-            Some(v) => v,
-        };
-        result = Some(builtin_conj(&[base, arg.clone()])?);
+    // reduce with no init: first element is the initial accumulator.
+    if args.is_empty() {
+        return Ok(Value::Nil);
     }
-    Ok(result.unwrap_or(Value::Nil))
+    let mut result = args[0].clone();
+    for arg in &args[1..] {
+        let base = if matches!(result, Value::Nil) {
+            Value::Map(MapValue::empty())
+        } else {
+            result
+        };
+        result = builtin_conj(&[base, arg.clone()])?;
+    }
+    Ok(result)
 }
 
 fn builtin_into(args: &[Value]) -> ValueResult<Value> {
