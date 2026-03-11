@@ -31,9 +31,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("quot", Arity::Fixed(2), builtin_quot),
         ("inc", Arity::Fixed(1), builtin_inc),
         ("dec", Arity::Fixed(1), builtin_dec),
-        ("max", Arity::Variadic { min: 1 }, builtin_max),
-        ("min", Arity::Variadic { min: 1 }, builtin_min),
         ("abs", Arity::Fixed(1), builtin_abs),
+        ("nan?", Arity::Fixed(1), builtin_nan_q),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
         ("not=", Arity::Variadic { min: 1 }, builtin_not_eq),
@@ -1289,50 +1288,6 @@ fn builtin_dec(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn builtin_max(args: &[Value]) -> ValueResult<Value> {
-    let mut result = args[0].clone();
-    for v in &args[1..] {
-        let gt = match (&result, v) {
-            (Value::Long(a), Value::Long(b)) => b > a,
-            (Value::Double(a), Value::Double(b)) => b > a,
-            (Value::Long(a), Value::Double(b)) => b > &(*a as f64),
-            (Value::Double(a), Value::Long(b)) => (*b as f64) > *a,
-            _ => {
-                return Err(ValueError::WrongType {
-                    expected: "number",
-                    got: v.type_name().to_string(),
-                });
-            }
-        };
-        if gt {
-            result = v.clone();
-        }
-    }
-    Ok(result)
-}
-
-fn builtin_min(args: &[Value]) -> ValueResult<Value> {
-    let mut result = args[0].clone();
-    for v in &args[1..] {
-        let lt = match (&result, v) {
-            (Value::Long(a), Value::Long(b)) => b < a,
-            (Value::Double(a), Value::Double(b)) => b < a,
-            (Value::Long(a), Value::Double(b)) => b < &(*a as f64),
-            (Value::Double(a), Value::Long(b)) => (*b as f64) < *a,
-            _ => {
-                return Err(ValueError::WrongType {
-                    expected: "number",
-                    got: v.type_name().to_string(),
-                });
-            }
-        };
-        if lt {
-            result = v.clone();
-        }
-    }
-    Ok(result)
-}
-
 fn builtin_abs(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Long(n) => Ok(Value::Long(n.wrapping_abs())),
@@ -1345,6 +1300,15 @@ fn builtin_abs(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
+}
+
+fn builtin_nan_q(args: &[Value]) -> ValueResult<Value> {
+    let nan = if let Value::Double(d) = &args[0] {
+        d.is_nan()
+    } else {
+        false
+    };
+    Ok(Value::Bool(nan))
 }
 
 // ── Comparison ────────────────────────────────────────────────────────────────
@@ -1843,13 +1807,16 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                         Value::Map(merged)
                     }
                     _ => {
-                        let pair = value_to_seq(v)?;
-                        if pair.len() != 2 {
+                        let k = builtin_first(std::slice::from_ref(v))?;
+                        let rest_v = builtin_rest(std::slice::from_ref(v))?;
+                        let val = builtin_first(std::slice::from_ref(&rest_v))?;
+                        let extra = builtin_rest(&[rest_v])?;
+                        if !matches!(builtin_seq(&[extra])?, Value::Nil) {
                             return Err(ValueError::Other(
                                 "conj on map requires [key val] pairs".into(),
                             ));
                         }
-                        Value::Map(m.assoc(pair[0].clone(), pair[1].clone()))
+                        Value::Map(m.assoc(k, val))
                     }
                 }
             }
@@ -2626,29 +2593,20 @@ fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
-    let mut result = MapValue::empty();
-    let mut any = false;
+    // Clojure: (reduce #(conj (or %1 {}) %2) maps)
+    // Note: unlike plain conj, merge always conj's into a map context.
+    let mut result: Option<Value> = None;
     for arg in args {
-        match arg {
-            Value::Nil => {}
-            Value::Map(m) => {
-                any = true;
-                m.for_each(|k, v| {
-                    result = result.assoc(k.clone(), v.clone());
-                });
-            }
-            v => {
-                return Err(ValueError::WrongType {
-                    expected: "map",
-                    got: v.type_name().to_string(),
-                });
-            }
+        if matches!(arg, Value::Nil) {
+            continue;
         }
+        let base = match result {
+            None | Some(Value::Nil) => Value::Map(MapValue::empty()),
+            Some(v) => v,
+        };
+        result = Some(builtin_conj(&[base, arg.clone()])?);
     }
-    if !any {
-        return Ok(Value::Nil);
-    }
-    Ok(Value::Map(result))
+    Ok(result.unwrap_or(Value::Nil))
 }
 
 fn builtin_into(args: &[Value]) -> ValueResult<Value> {
