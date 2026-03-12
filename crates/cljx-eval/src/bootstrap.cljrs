@@ -399,10 +399,13 @@
   (or (nil? x) (seq? x) (vector? x) (map? x) (set? x) (string? x)))
 
 (defn nthrest [coll n]
-  (loop [s (seq coll) n n]
-    (if (and s (pos? n))
-      (recur (next s) (dec n))
-      s)))
+  (when-not (number? n) (throw (str "n must be a number, got: " (type n))))
+  (if (nil? coll)
+    (if (pos? n) (quote ()) nil)
+    (loop [s (seq coll) n n]
+      (if (and s (pos? n))
+        (recur (next s) (dec n))
+        (or s (quote ()))))))
 
 (defn split-at [n coll]
   [(take n coll) (drop n coll)])
