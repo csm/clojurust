@@ -326,10 +326,12 @@
 (defn fnext [coll] (first (next coll)))
 (defn nnext [coll] (next (next coll)))
 (defn nthnext [coll n]
-  (loop [s (seq coll) n n]
-    (if (and s (pos? n))
-      (recur (next s) (dec n))
-      s)))
+  (if (and (some? coll) (nil? n))
+    (throw (str "arg 2 must not be nil"))
+    (loop [s (seq coll) n n]
+      (if (and s (pos? n))
+        (recur (next s) (dec n))
+        s))))
 
 (defn butlast [coll]
   (loop [s (seq coll) acc []]

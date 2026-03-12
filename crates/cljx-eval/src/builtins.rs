@@ -2433,7 +2433,14 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
             .cloned()
             .or(default)
             .unwrap_or(Value::Nil)),
-        Value::Vector(v) => Ok(v.get().nth(idx).cloned().or(default).unwrap_or(Value::Nil)),
+        Value::Vector(v) => if idx >= v.get().count() && default.is_none() {
+            Err(ValueError::IndexOutOfBounds {
+                idx,
+                count: v.get().count(),
+            })
+        } else {
+            Ok(v.get().nth(idx).cloned().or(default).unwrap_or(Value::Nil))
+        },
         Value::Str(s) => Ok(s
             .get()
             .chars()
@@ -2441,6 +2448,7 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
             .map(Value::Char)
             .or(default)
             .unwrap_or(Value::Nil)),
+        Value::Nil => Ok(default.unwrap_or(Value::Nil)),
         v => Err(ValueError::WrongType {
             expected: "sequential",
             got: v.type_name().to_string(),
