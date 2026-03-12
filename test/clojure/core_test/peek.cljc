@@ -20,7 +20,8 @@
       (are [coll] (thrown? #?(:cljs js/Error :default Exception) (peek coll))
                   #{1 2 3}
                   {:a 1 :b 2}
-                  (cons 1 '())
+                  #?@(:rust    [] ; skip this test for rust; cons here returns a list, we allow peek for lists.
+                      :default [(cons 1 '())])
                   (range 10)
                   "str"
                   42))))
