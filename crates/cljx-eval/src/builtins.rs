@@ -3312,8 +3312,12 @@ fn builtin_peek(args: &[Value]) -> ValueResult<Value> {
 fn builtin_pop(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::List(l) => {
-            let rest = l.get().rest();
-            Ok(Value::List(GcPtr::new((*rest).clone())))
+            if l.get().is_empty() {
+                Err(ValueError::OutOfRange)
+            } else {
+                let rest = l.get().rest();
+                Ok(Value::List(GcPtr::new((*rest).clone())))
+            }
         }
         Value::Vector(v) => {
             if v.get().is_empty() {
@@ -3322,6 +3326,7 @@ fn builtin_pop(args: &[Value]) -> ValueResult<Value> {
                 Ok(Value::Vector(GcPtr::new(v.get().pop().unwrap())))
             }
         }
+        Value::Nil => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
             expected: "stack",
             got: v.type_name().to_string(),
