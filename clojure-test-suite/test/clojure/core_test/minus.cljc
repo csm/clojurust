@@ -91,6 +91,17 @@
            ;; Add these back in later
            #_(is (- r/min-int 1))
            #_(is (- r/max-int -1))]
+          :rust
+          [(is (thrown? Exception (- nil 1)))
+           (is (thrown? Exception (- 1 nil)))
+           (is (thrown? Exception (- nil 1N)))
+           (is (thrown? Exception (- 1N nil)))
+           (is (thrown? Exception (- nil 1.0)))
+           (is (thrown? Exception (- 1.0 nil)))
+           (is (thrown? Exception (- nil 1.0M)))
+           (is (thrown? Exception (- 1.0M nil)))
+           (is (= -9223372036854775809N (- r/min-int 1)))
+           (is (= 9223372036854775808N (- r/max-int -1)))]
           :default
           [(is (thrown? Exception (- nil 1)))
            (is (thrown? Exception (- 1 nil)))
