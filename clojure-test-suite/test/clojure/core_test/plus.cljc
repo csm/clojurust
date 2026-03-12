@@ -90,6 +90,7 @@
            ;; Python VMs integer types are arbitrary precision and have no min or max
            ;; and arithmetic operations between integers cannot overflow or underflow.
            #?@(:lpy []
+               :rust []
                :default
                [(is (thrown? Exception (+ r/max-int 1)))
                 (is (thrown? Exception (+ r/min-int -1)))])
