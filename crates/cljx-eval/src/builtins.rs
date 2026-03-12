@@ -1483,7 +1483,10 @@ fn builtin_pos_q(args: &[Value]) -> ValueResult<Value> {
         Value::Ratio(r) => r.get().numer().is_positive(),
         Value::BigInt(i) => i.get().sign() == Sign::Plus,
         Value::BigDecimal(d) => d.get().sign() == Sign::Plus,
-        _ => false,
+        _ => return Err(ValueError::WrongType {
+            expected: "number",
+            got: args[0].type_name().to_string(),
+        }),
     }))
 }
 fn builtin_neg_q(args: &[Value]) -> ValueResult<Value> {
