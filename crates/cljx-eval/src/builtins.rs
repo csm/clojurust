@@ -1203,7 +1203,8 @@ fn builtin_rem(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_quot(args: &[Value]) -> ValueResult<Value> {
     match (&args[0], &args[1]) {
-        (Value::Double(f), _) if f.is_nan() => Err(ValueError::Other("quot of NaN".into())),
+        // Inf, -Inf not allowed as the numerator.
+        (Value::Double(f), _) if f.is_nan() || f.is_infinite() => Err(ValueError::Other("quot of NaN or Infinite".into())),
         (_, Value::Double(f)) if f.is_nan() => Err(ValueError::Other("quot by NaN".into())),
         (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
             let a = numeric_as_f64(&args[0])?;
