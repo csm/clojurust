@@ -4447,7 +4447,8 @@ fn builtin_rand(args: &[Value]) -> ValueResult<Value> {
     } else {
         numeric_as_f64(&args[0])?
     };
-    Ok(Value::Double(0.5 * n)) // stub
+    let r = rand::random::<f64>();
+    Ok(Value::Double(r * n)) // stub
 }
 
 fn builtin_rand_int(args: &[Value]) -> ValueResult<Value> {
