@@ -438,8 +438,20 @@
           (recur (next s) (conj seen v) (conj acc v))))
       (seq acc))))
 
-(defn max [& args] (reduce (fn [a b] (if (>= a b) a b)) args))
-(defn min [& args] (reduce (fn [a b] (if (<= a b) a b)) args))
+(defn max [& args] (reduce (fn [a b]
+  (cond
+    (nan? a) a
+    (nan? b) b
+    (>= a b) a
+    :else b))
+  args))
+(defn min [& args] (reduce (fn [a b]
+  (cond
+    (nan? a) a
+    (nan? b) b
+    (<= a b) a
+    :else b))
+  args))
 
 (defmacro assert [test & args]
   (let [msg (first args)]
@@ -601,3 +613,39 @@
 
 (defmacro with-bindings [binding-map & body]
   `(with-bindings* ~binding-map (fn [] ~@body)))
+
+(defn max-key
+  "Returns the x for which (k x), a number, is greatest.
+
+  If there are multiple such xs, the last one is returned."
+  ([k x] x)
+  ([k x y] (if (> (k x) (k y)) x y))
+  ([k x y & more]
+   (let [kx (k x) ky (k y)
+         [v kv] (if (> kx ky) [x kx] [y ky])]
+     (loop [v v kv kv more more]
+       (if more
+         (let [w (first more)
+               kw (k w)]
+           (if (>= kw kv)
+             (recur w kw (next more))
+             (recur v kv (next more))))
+         v)))))
+
+(defn min-key
+  "Returns the x for which (k x), a number, is least.
+
+  If there are multiple such xs, the last one is returned."
+  ([k x] x)
+  ([k x y] (if (< (k x) (k y)) x y))
+  ([k x y & more]
+   (let [kx (k x) ky (k y)
+         [v kv] (if (< kx ky) [x kx] [y ky])]
+     (loop [v v kv kv more more]
+       (if more
+         (let [w (first more)
+               kw (k w)]
+           (if (<= kw kv)
+             (recur w kw (next more))
+             (recur v kv (next more))))
+         v)))))

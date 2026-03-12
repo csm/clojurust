@@ -275,18 +275,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by_stub),
         ("sorted-set", Arity::Variadic { min: 0 }, builtin_sorted_set),
         ("sorted-map", Arity::Variadic { min: 0 }, builtin_sorted_map),
-        ("group-by", Arity::Fixed(2), builtin_group_by_stub),
-        ("max-key", Arity::Variadic { min: 2 }, builtin_max_key_stub),
-        ("min-key", Arity::Variadic { min: 2 }, builtin_min_key_stub),
-        ("juxt", Arity::Variadic { min: 1 }, builtin_juxt_stub),
-        ("fnil", Arity::Variadic { min: 2 }, builtin_fnil_stub),
-        ("every?", Arity::Fixed(2), builtin_every_stub),
-        ("some", Arity::Fixed(2), builtin_some_stub),
-        ("not-any?", Arity::Fixed(2), builtin_not_any_stub),
-        ("not-every?", Arity::Fixed(2), builtin_not_every_stub),
-        ("mapv", Arity::Variadic { min: 2 }, builtin_mapv_stub),
-        ("filterv", Arity::Fixed(2), builtin_filterv_stub),
-        ("reduce-kv", Arity::Fixed(3), builtin_reduce_kv_stub),
         ("walk", Arity::Fixed(3), builtin_walk_stub),
         ("postwalk", Arity::Fixed(2), builtin_postwalk_stub),
         ("prewalk", Arity::Fixed(2), builtin_prewalk_stub),
@@ -2612,6 +2600,9 @@ fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
     }
     let mut result = args[0].clone();
     for arg in &args[1..] {
+        if matches!(arg, Value::Nil) {
+            continue;
+        }
         let base = if matches!(result, Value::Nil) {
             Value::Map(MapValue::empty())
         } else {
@@ -4453,42 +4444,7 @@ fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
 fn builtin_sort_by_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
-fn builtin_group_by_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Map(MapValue::empty()))
-}
-fn builtin_max_key_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_min_key_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_juxt_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_fnil_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_every_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(true))
-}
-fn builtin_some_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_not_any_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(true))
-}
-fn builtin_not_every_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(false))
-}
-fn builtin_mapv_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Vector(GcPtr::new(PersistentVector::empty())))
-}
-fn builtin_filterv_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Vector(GcPtr::new(PersistentVector::empty())))
-}
-fn builtin_reduce_kv_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
+
 fn builtin_walk_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
