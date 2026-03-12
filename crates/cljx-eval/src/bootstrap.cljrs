@@ -44,11 +44,32 @@
        (recur (next s) (f acc (first s)))
        acc))))
 
-(defn map [f coll]
-  (loop [s (seq coll) acc []]
-    (if s
-      (recur (next s) (conj acc (f (first s))))
-      (seq acc))))
+(defn map
+  ([f coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (cons (f (first s)) (map f (rest s))))))
+  ([f c1 c2]
+   (lazy-seq
+     (let [s1 (seq c1) s2 (seq c2)]
+       (when (and s1 s2)
+         (cons (f (first s1) (first s2))
+               (map f (rest s1) (rest s2)))))))
+  ([f c1 c2 c3]
+   (lazy-seq
+     (let [s1 (seq c1) s2 (seq c2) s3 (seq c3)]
+       (when (and s1 s2 s3)
+         (cons (f (first s1) (first s2) (first s3))
+               (map f (rest s1) (rest s2) (rest s3)))))))
+  ([f c1 c2 c3 & colls]
+   (let [all-colls (list* c1 c2 c3 colls)]
+     (letfn [(map-step [seqs]
+               (lazy-seq
+                 (let [ss (map seq seqs)]
+                   (when (every? identity ss)
+                     (cons (apply f (map first ss))
+                           (map-step (map rest ss)))))))]
+       (map-step all-colls)))))
 
 (defn filter [pred coll]
   (loop [s (seq coll) acc []]
