@@ -4453,7 +4453,8 @@ fn builtin_rand(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_rand_int(args: &[Value]) -> ValueResult<Value> {
     let n = numeric_as_i64(&args[0])?;
-    Ok(Value::Long(n / 2)) // stub
+    let r = rand::random::<i64>().abs();
+    Ok(Value::Long(r % n)) // stub
 }
 
 fn value_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
