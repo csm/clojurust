@@ -1,5 +1,6 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
+use std::cmp::Ordering;
 use crate::env::GlobalEnv;
 use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
@@ -11,7 +12,7 @@ use cljx_value::{
 };
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
-use num_traits::{Signed as _, ToPrimitive, Zero as _};
+use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
@@ -1790,8 +1791,8 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                         });
                         Value::Map(merged)
                     }
-                    _ => {
-                        // Must be a 2-element seqable [key val].
+                    Value::Vector(_) => {
+                        // Must be a 2-element vector [key val].
                         let seq_v = builtin_seq(std::slice::from_ref(v))?;
                         if matches!(seq_v, Value::Nil) {
                             return Err(ValueError::Other(
@@ -1813,6 +1814,12 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                             ));
                         }
                         Value::Map(m.assoc(k, val))
+                    }
+                    _ => {
+                        return Err(ValueError::WrongType {
+                            expected: "map-entry",
+                            got: v.type_name().to_string(),
+                        })
                     }
                 }
             }
@@ -4165,6 +4172,13 @@ fn builtin_short(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_byte(args: &[Value]) -> ValueResult<Value> {
+    // Special-case double and BigDecimal
+    if let Value::Double(d) = &args[0] && (*d < -128.0 || *d > 127.0) {
+        return Err(ValueError::OutOfRange);
+    }
+    if let Value::BigDecimal(d) = &args[0] && (d.get().cmp(&BigDecimal::from_f64(-128.0f64).unwrap()) == Ordering::Less || d.get().cmp(&BigDecimal::from_f64(127.0).unwrap()) == Ordering::Greater) {
+        return Err(ValueError::OutOfRange);
+    }
     let num = builtin_num(args)?;
     let num = numeric_as_i64(&num)?;
     if num < -0x80 || num > 0x7f {

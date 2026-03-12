@@ -135,7 +135,10 @@ pub fn expand_reader_conds(forms: &[Form]) -> Vec<Form> {
                 if let Some(selected) = select_reader_cond(clauses) {
                     match &selected.kind {
                         FormKind::Vector(elems) | FormKind::List(elems) => {
-                            out.extend_from_slice(elems);
+                            // Recursively expand any nested reader conditionals
+                            // within the spliced elements.
+                            let expanded_elems = expand_reader_conds(elems);
+                            out.extend(expanded_elems);
                         }
                         // Non-sequence branch: inline it as a single element.
                         _ => out.push(selected.clone()),
