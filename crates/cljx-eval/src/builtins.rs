@@ -283,6 +283,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("flush", Arity::Fixed(0), builtin_flush),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("num", Arity::Fixed(1), builtin_num),
+        ("short", Arity::Fixed(1), builtin_short),
+        ("byte", Arity::Fixed(1), builtin_byte),
         ("bit-and", Arity::Fixed(2), builtin_bit_and),
         ("bit-or", Arity::Fixed(2), builtin_bit_or),
         ("bit-xor", Arity::Fixed(2), builtin_bit_xor),
@@ -1511,7 +1513,7 @@ fn builtin_false_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_number_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
-        Value::Long(_) | Value::Double(_) | Value::BigInt(_)
+        Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_)
     )))
 }
 fn builtin_integer_q(args: &[Value]) -> ValueResult<Value> {
@@ -4144,12 +4146,31 @@ fn builtin_char_fn(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_num(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Long(_) | Value::Double(_) => Ok(args[0].clone()),
-        Value::Char(c) => Ok(Value::Long(*c as i64)),
+        Value::Long(_) | Value::Double(_) | Value::Ratio(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Nil => Ok(args[0].clone()),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
         }),
+    }
+}
+
+fn builtin_short(args: &[Value]) -> ValueResult<Value> {
+    let num = builtin_num(args)?;
+    let num = numeric_as_i64(&num)?;
+    if num < -0x8000 || num > 0x7fff {
+        Err(ValueError::OutOfRange)
+    } else {
+        Ok(Value::Long(num))
+    }
+}
+
+fn builtin_byte(args: &[Value]) -> ValueResult<Value> {
+    let num = builtin_num(args)?;
+    let num = numeric_as_i64(&num)?;
+    if num < -0x80 || num > 0x7f {
+        Err(ValueError::OutOfRange)
+    } else {
+        Ok(Value::Long(num))
     }
 }
 
