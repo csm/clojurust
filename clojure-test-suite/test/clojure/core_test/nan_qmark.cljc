@@ -7,6 +7,9 @@
    #?@(:cljs
        [(is (not (NaN? nil)))
         (is (NaN? "##NaN"))]            ; Surprising
+       :rust
+       [(is (not (NaN? nil)))
+        (is (not (NaN? "##NaN")))]
        :default
        [(is (thrown? Exception (NaN? nil)))
         (is (thrown? Exception (NaN? "##NaN")))])
