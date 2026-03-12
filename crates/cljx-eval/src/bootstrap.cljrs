@@ -440,15 +440,15 @@
 
 (defn max [& args] (reduce (fn [a b]
   (cond
-    (nan? a) a
-    (nan? b) b
+    (NaN? a) a
+    (NaN? b) b
     (>= a b) a
     :else b))
   args))
 (defn min [& args] (reduce (fn [a b]
   (cond
-    (nan? a) a
-    (nan? b) b
+    (NaN? a) a
+    (NaN? b) b
     (<= a b) a
     :else b))
   args))

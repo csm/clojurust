@@ -32,7 +32,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("inc", Arity::Fixed(1), builtin_inc),
         ("dec", Arity::Fixed(1), builtin_dec),
         ("abs", Arity::Fixed(1), builtin_abs),
-        ("nan?", Arity::Fixed(1), builtin_nan_q),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
         ("not=", Arity::Variadic { min: 1 }, builtin_not_eq),
@@ -1056,7 +1055,8 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
         }
         // Infinity as divisor → NaN
         (_, Value::Double(f)) if f.is_infinite() => Ok(Value::Double(f64::NAN)),
-        // Double in either → double mod
+        // Double in either (but not BigDecimal) → double mod
+        // Double in either → double mod (Double contaminates, even BigDecimal)
         (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
             let a = numeric_as_f64(&args[0])?;
             let b = numeric_as_f64(&args[1])?;
@@ -1071,7 +1071,7 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
             };
             Ok(Value::Double(result))
         }
-        // BigDecimal in either → BigDecimal mod
+        // BigDecimal (without Double) → BigDecimal mod
         (Value::BigDecimal(_), _) | (_, Value::BigDecimal(_)) => {
             let a = numeric_as_bigdecimal(&args[0])?;
             let b = numeric_as_bigdecimal(&args[1])?;
@@ -1079,12 +1079,15 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
                 return Err(ValueError::Other("mod by zero".into()));
             }
             let r = &a % &b;
-            let result =
-                if r.is_negative() && b.is_negative() || (r.is_negative() && b.is_positive()) {
-                    r + &b
-                } else {
-                    r
-                };
+            let result = if r.is_zero() {
+                r
+            } else if (r > bigdecimal::BigDecimal::from(0) && b < bigdecimal::BigDecimal::from(0))
+                || (r < bigdecimal::BigDecimal::from(0) && b > bigdecimal::BigDecimal::from(0))
+            {
+                r + &b
+            } else {
+                r
+            };
             Ok(Value::BigDecimal(GcPtr::new(result)))
         }
         // Ratio in either → ratio mod, result may be BigInt if integer
@@ -1288,15 +1291,6 @@ fn builtin_abs(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
-}
-
-fn builtin_nan_q(args: &[Value]) -> ValueResult<Value> {
-    let nan = if let Value::Double(d) = &args[0] {
-        d.is_nan()
-    } else {
-        false
-    };
-    Ok(Value::Bool(nan))
 }
 
 // ── Comparison ────────────────────────────────────────────────────────────────
