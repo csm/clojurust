@@ -3,13 +3,13 @@
 (defn complement [f] (fn [& args] (not (apply f args))))
 
 (defn some-fn
-  ([p] (fn [& args] (some p args)))
-  ([p1 p2] (fn [& args] (or (some p1 args) (some p2 args))))
-  ([p1 p2 p3] (fn [& args] (or (some p1 args) (some p2 args) (some p3 args))))
+  ([p] (fn [& args] (or (some p args) false)))
+  ([p1 p2] (fn [& args] (or (some p1 args) (some p2 args) false)))
+  ([p1 p2 p3] (fn [& args] (or (some p1 args) (some p2 args) (some p3 args) false)))
   ([p1 p2 p3 & ps]
    (fn [& args]
      (or (some p1 args) (some p2 args) (some p3 args)
-         (some (fn [p] (some p args)) ps)))))
+         (some (fn [p] (some p args)) ps) false))))
 
 (defn every-pred
   ([p] (fn [& args] (every? p args)))
