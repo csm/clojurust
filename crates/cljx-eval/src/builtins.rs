@@ -90,6 +90,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("get-in", Arity::Variadic { min: 2 }, builtin_get_in),
         ("count", Arity::Fixed(1), builtin_count),
         ("seq", Arity::Fixed(1), builtin_seq),
+        ("rseq", Arity::Fixed(1), builtin_rseq),
         ("first", Arity::Fixed(1), builtin_first),
         ("rest", Arity::Fixed(1), builtin_rest),
         ("next", Arity::Fixed(1), builtin_next),
@@ -1615,7 +1616,7 @@ fn builtin_ifn_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
-        Value::List(_) | Value::Cons(_)
+        Value::List(_) | Value::Cons(_) | Value::LazySeq(_)
     )))
 }
 
@@ -2179,6 +2180,44 @@ fn cons_from_iter(items: impl IntoIterator<Item = Value>) -> Value {
         }));
     }
     result
+}
+
+// TODO: rseq is O(n) — collects then reverses. Clojure's rseq is O(1) via
+// APersistentVector.RSeq which iterates backwards by index. To match, we'd
+// need a dedicated RSeq value type that wraps a vector and lazily yields
+// elements in reverse order.
+fn builtin_rseq(args: &[Value]) -> ValueResult<Value> {
+    match args[0].unwrap_meta() {
+        Value::Vector(v) => {
+            if v.get().is_empty() {
+                Ok(Value::Nil)
+            } else {
+                let items: Vec<Value> = v.get().iter().cloned().collect();
+                Ok(cons_from_iter(items.into_iter().rev()))
+            }
+        }
+        Value::Map(MapValue::Sorted(m)) => {
+            if m.get().is_empty() {
+                Ok(Value::Nil)
+            } else {
+                let pairs: Vec<Value> = m
+                    .get()
+                    .iter()
+                    .map(|(k, v)| {
+                        Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                            k.clone(),
+                            v.clone(),
+                        ])))
+                    })
+                    .collect();
+                Ok(cons_from_iter(pairs.into_iter().rev()))
+            }
+        }
+        v => Err(ValueError::WrongType {
+            expected: "reversible collection",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
