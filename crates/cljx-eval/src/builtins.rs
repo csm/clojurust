@@ -5,11 +5,7 @@ use crate::env::GlobalEnv;
 use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
-use cljx_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    Namespace, NativeFn, ObjectArray, PersistentHashSet, PersistentList, PersistentVector,
-    SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
-};
+use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
@@ -18,6 +14,8 @@ use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
+use rpds::HashTrieMapSync;
+use cljx_value::value::SetValue::Sorted;
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -275,7 +273,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("sort", Arity::Variadic { min: 1 }, builtin_sort),
         ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by_stub),
         ("sorted-set", Arity::Variadic { min: 0 }, builtin_sorted_set),
+        ("sorted-set?", Arity::Fixed(1), builtin_sorted_set_q),
         ("sorted-map", Arity::Variadic { min: 0 }, builtin_sorted_map),
+        ("sorted-map?", Arity::Fixed(1), builtin_sorted_map_q),
         ("walk", Arity::Fixed(3), builtin_walk_stub),
         ("postwalk", Arity::Fixed(2), builtin_postwalk_stub),
         ("prewalk", Arity::Fixed(2), builtin_prewalk_stub),
@@ -3734,15 +3734,38 @@ fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
 }
 
 fn builtin_select_keys(args: &[Value]) -> ValueResult<Value> {
-    let mut m = MapValue::empty();
-    if let Value::Map(src) = &args[0] {
-        for k in ValueIter::new(args[1].clone()) {
-            if let Some(v) = src.get(&k) {
-                m = m.assoc(k, v);
+    let mut map: HashTrieMapSync<Value, Value> = HashTrieMapSync::new_sync();
+    match &args[0] {
+        Value::Map(src) => {
+            if matches!(&args[1], Value::Map(_) | Value::Vector(_) | Value::List(_) | Value::Set(_) | Value::Cons(_) | Value::LazySeq(_) | Value::Nil) {
+                for k in ValueIter::new(args[1].clone()) {
+                    if let Some(v) = src.get(&k) {
+                        map.insert_mut(k.clone(), v.clone());
+                    }
+                }
+                Ok(Value::Map(MapValue::Hash(GcPtr::new(PersistentHashMap::new(map)))))
+            } else {
+                Err(ValueError::WrongType {
+                    expected: "seqable",
+                    got: args[0].type_name().to_string(),
+                })
             }
         }
+        Value::Set(_) => match &args[1] {
+            Value::Vector(v) if v.get().is_empty() =>
+                Ok(Value::Map(MapValue::empty())),
+            Value::Map(m) if m.count() == 0 =>
+                Ok(Value::Map(MapValue::empty())),
+            _ => Err(ValueError::Other("nth not supported for set".to_string()))
+        }
+        Value::Nil => Ok(Value::Map(MapValue::empty())),
+        _ => {
+            Err(ValueError::WrongType {
+                expected: "map",
+                got: args[0].type_name().to_string(),
+            })
+        }
     }
-    Ok(Value::Map(m))
 }
 
 fn builtin_find(args: &[Value]) -> ValueResult<Value> {
@@ -4600,6 +4623,10 @@ fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Set(SetValue::Sorted(GcPtr::new(set))))
 }
 
+fn builtin_sorted_set_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(&args[0], Value::Set(Sorted(_)))))
+}
+
 fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
     if !args.len().is_multiple_of(2) {
         return Err(ValueError::OddMap { count: args.len() });
@@ -4609,6 +4636,10 @@ fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
             .map(|pair| (pair[0].clone(), pair[1].clone())),
     );
     Ok(Value::Map(MapValue::Sorted(GcPtr::new(sm))))
+}
+
+fn builtin_sorted_map_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(&args[0], Value::Map(MapValue::Sorted(_)))))
 }
 
 fn builtin_sort_by_stub(_args: &[Value]) -> ValueResult<Value> {

@@ -227,6 +227,7 @@ dependencies = [
  "num-rational",
  "num-traits",
  "rand",
+ "rpds",
  "thiserror",
 ]
 

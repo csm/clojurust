@@ -1,3 +1,4 @@
+use rpds::HashTrieMapSync;
 use crate::Value;
 use crate::collections::array_map::PersistentArrayMap;
 
@@ -16,6 +17,10 @@ impl PersistentHashMap {
         Self {
             inner: rpds::HashTrieMapSync::new_sync(),
         }
+    }
+
+    pub fn new(map: HashTrieMapSync<Value, Value>) -> Self {
+        Self { inner: map }
     }
 
     pub fn count(&self) -> usize {

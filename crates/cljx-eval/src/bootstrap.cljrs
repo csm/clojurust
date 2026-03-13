@@ -410,7 +410,7 @@
     (when (seq coll) (c coll))))
 
 (defn counted? [x] (or (vector? x) (map? x) (set? x) (seq? x)))
-(defn reversible? [x] (vector? x))
+(defn reversible? [x] (or (vector? x) (sorted-map? x) (sorted-set? x)))
 (defn sequential? [x] (or (seq? x) (vector? x)))
 (defn associative? [x] (or (map? x) (vector? x)))
 
