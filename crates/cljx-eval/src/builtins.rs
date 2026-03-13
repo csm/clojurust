@@ -2758,8 +2758,91 @@ fn builtin_to_array_2d(args: &[Value]) -> ValueResult<Value> {
 /// `(into-array coll)` or `(into-array type coll)` — converts to an object array (type arg ignored).
 fn builtin_into_array(args: &[Value]) -> ValueResult<Value> {
     let coll = if args.len() >= 2 { &args[1] } else { &args[0] };
-    let v: Vec<Value> = ValueIter::new(coll.clone()).collect();
-    Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(v))))
+    let t = if args.len() >= 2 {
+        Some(&args[0])
+    } else {
+        None
+    };
+    match t {
+        Some(Value::Keyword(k)) if k.get().namespace.is_none() => {
+            let items: Vec<Value> = ValueIter::new(coll.clone()).collect();
+            match k.get().name.to_string().as_str() {
+                "boolean" => {
+                    let v: Vec<bool> = items.iter().map(|v| is_truthy(v)).collect();
+                    Ok(Value::BooleanArray(GcPtr::new(Mutex::new(v))))
+                }
+                "byte" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_i8(item)?);
+                    }
+                    Ok(Value::ByteArray(GcPtr::new(Mutex::new(v))))
+                }
+                "char" => {
+                    // TODO this could optimize fully for the String -> chars case.
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        match item {
+                            Value::Char(c) => v.push(*c),
+                            Value::Long(n) => {
+                                v.push(char::from_u32(*n as u32).ok_or_else(|| {
+                                    ValueError::Other(format!("invalid char code: {n}"))
+                                })?);
+                            }
+                            _ => {
+                                return Err(ValueError::WrongType {
+                                    expected: "char",
+                                    got: item.type_name().to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Value::CharArray(GcPtr::new(Mutex::new(v))))
+                }
+                "short" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_i16(item)?);
+                    }
+                    Ok(Value::ShortArray(GcPtr::new(Mutex::new(v))))
+                }
+                "int" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_i32(item)?);
+                    }
+                    Ok(Value::IntArray(GcPtr::new(Mutex::new(v))))
+                }
+                "long" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_i64(item)?);
+                    }
+                    Ok(Value::LongArray(GcPtr::new(Mutex::new(v))))
+                }
+                "float" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_f32(item)?);
+                    }
+                    Ok(Value::FloatArray(GcPtr::new(Mutex::new(v))))
+                }
+                "double" => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for item in &items {
+                        v.push(numeric_as_f64(item)?);
+                    }
+                    Ok(Value::DoubleArray(GcPtr::new(Mutex::new(v))))
+                }
+                _ => Err(ValueError::Other("unknown array type".to_string()))
+            }
+        }
+        None => {
+            let v: Vec<Value> = ValueIter::new(coll.clone()).collect();
+            Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(v))))
+        }
+        _ => Err(ValueError::Other("second arg to into-array must be a keyword giving a primitive type".to_string()))
+    }
 }
 
 /// `(aclone arr)` — clone an array.
