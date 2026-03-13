@@ -165,6 +165,218 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 
 ---
 
+## Phase 8.1 — program optimization
+
+### Phase 8.1.1 — IR Foundation
+
+- [ ] Convert AST to A-normal form.
+- [ ] Convert ANF to single static assignment form.
+- [ ] Add explicit instruction types, `AllocCons`, `AllocVector`, `AllocMap`, `AllocClosure`, `Call`, `Load`, `Store`, `Return`, `Branch`.
+- [ ] Attach effect metadata to instructions, `pure`, `alloc`, `heap_read`, `heap_write`, `unknown_call`
+
+### Phase 8.1.2 — Escape Analysis
+
+Runtime work:
+
+- [ ] Identify allocation instructions.
+- [ ] Track value flow through SSA graph.
+- [ ] Mark allocations as escaping if they:
+  - are returned
+  - stored in heap objects
+  - captured by closures
+  - passed to unknown functions
+  - inserted into global state
+- [ ] Everything else becomes non-escaping
+
+### Phase 8.1.3 — Function-local regions
+
+- [ ] Implement `Region` allocator.
+  E.g.
+```rust
+struct Region {
+  start
+  ptr
+  end
+}
+```
+- [ ] Provide operations
+  - `region_alloc(size)`
+  - `region_reset()`
+
+Compiler work:
+
+- [ ] Add IR nodes:
+  - `RegionStart`
+  - `RegionEnd`
+  - `RegionAlloc`
+- [ ] Replace non-escaping allocations with region allocations
+- [ ] Fallback to GC heap for escaping objects
+
+### Phase 8.1.4 — Persistent structure virtualization
+
+**Convert persistent chains into mutable construction**
+
+Pattern detection:
+
+```
+m1 = {}
+m2 = assoc m1
+m3 = assoc m2
+m4 = assoc m3
+```
+
+Lowering:
+
+```
+t = transient_map
+assoc_mut t
+assoc_mut t
+persistent t
+```
+
+or even:
+
+```
+region_map
+insert
+freeze
+```
+
+Checklist:
+- [ ] Detect assoc/conj chains.
+- [ ] Verify intermediate versions do not escape.
+- [ ] Replace with mutable builder.
+
+Applies to: maps, sets, vectors.
+
+### Phase 8.1.5 — Small collection specialization
+
+**Optimize tiny maps and vectors.**
+
+- [ ] Define specialized layouts
+
+Examples:
+
+```
+SmallMap1
+SmallMap2
+SmallMap4
+SmallVec4
+```
+
+- [ ] Compiler detects literal small collections
+
+Example:
+
+```clojure
+{:x 1 :y 2}
+```
+
+Lower to:
+
+```rust
+SmallMap2(:x, 1, :y, 2)
+```
+
+- [ ] Implement specialized lookup logic.
+
+Example:
+
+```
+if key == :x return v1
+if key == :y return v2
+```
+
+Also investigate fast lookup for keywords, switch/dispatch table for keywords.
+
+- [ ] Convert to HAMT if size exceeds limit
+
+### Phase 8.1.6 — Map shape system
+
+- [ ] Each map has a shape ID.
+- [ ] Shapes store key order and slot offsets.
+
+Example:
+
+```
+Shape12:
+[:user-id :name]
+```
+
+Maps reference:
+
+```
+shape_id
+values array
+```
+
+### Phase 8.1.7 — Inline caches for map lookup
+
+- [ ] Attach cache to each lookup node
+
+Example:
+
+```
+LookupNode {
+  keyword
+  cached_shape
+  cached_offset
+}
+```
+
+Runtime logic:
+
+```
+if map.shape == cached_shape
+  return values[offset]
+else
+  slow_lookup()
+```
+
+Slow path updates the cache.
+
+Optionally:
+
+- [ ] extend to polymorphic inline caches
+
+### Phase 8.1.8 — Allocation sinking
+
+**Reduce lifetimes further**
+
+- [ ] Move allocations closer to use sites.
+- [ ] Shorted object lifetimes.
+- [ ] Improve region inference.
+
+E.g.
+
+Before:
+
+```
+alloc
+if cond
+  use
+```
+
+After:
+
+```
+if cond
+  alloc
+  use
+```
+
+### Phase 8.1.9 — Deforestation / sequence fusion
+
+Eliminate temporary sequences.
+
+Pattern: `(map f (map g xs))`, lower to single loop.
+
+- [ ] Detect common pipelines.
+- [ ] Fuse map/filter/reduce.
+- [ ] Eliminate sequence allocations.
+
+---
+
 ## Phase 9 — Rust Interop
 
 - [ ] Define calling conventions: how Clojure code invokes Rust functions
@@ -195,6 +407,13 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] Primitive unboxing: where type feedback confirms a value is always `i64` or `f64`, emit raw arithmetic on machine registers — no `Value` boxing, no GC allocation
 - [ ] Escape analysis: values that do not escape their defining scope (not returned, not captured, not stored) may be stack-allocated rather than heap-allocated through the GC
 - [ ] Call-site monomorphization: generate type-specialized copies of hot functions when call-site type profiles are stable (e.g. `(map inc xs)` where `xs` is always `Vec<i64>`)
+
+### Phase 10.1 — JIT Optimization
+
+- [ ] Profile allocation escape rates.
+- [ ] Speculate region allocation.
+- [ ] Guard and promote to heap if needed.
+- [ ] Specialize hot lookup sites further.
 
 ---
 
