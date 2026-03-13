@@ -676,12 +676,3 @@
              (recur v kv (next more))))
          v)))))
 
-(defn ==
-  ([x] true)
-  ([x y] (= x y))
-  ([x y & more]
-    (if (== x y)
-      (if (next more)
-        (recur y (first more) (next more))
-        (== y (first more)))
-      false)))

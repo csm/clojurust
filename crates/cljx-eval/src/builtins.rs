@@ -35,6 +35,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("abs", Arity::Fixed(1), builtin_abs),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
+        ("==", Arity::Variadic { min: 1 }, builtin_numeric_equiv),
         ("not=", Arity::Variadic { min: 1 }, builtin_not_eq),
         ("<", Arity::Variadic { min: 1 }, builtin_lt),
         (">", Arity::Variadic { min: 1 }, builtin_gt),
@@ -1305,6 +1306,44 @@ fn builtin_eq(args: &[Value]) -> ValueResult<Value> {
     }
     for pair in args.windows(2) {
         if pair[0] != pair[1] {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn builtin_numeric_equiv(args: &[Value]) -> ValueResult<Value> {
+    // Clojure ==: numeric equality. All numeric types compared by value.
+    // Non-numeric values use regular =.
+    if args.len() < 2 {
+        return Ok(Value::Bool(true));
+    }
+    for pair in args.windows(2) {
+        let eq = match (&pair[0], &pair[1]) {
+            // Both numeric → compare via num_compare
+            (a, b)
+                if matches!(
+                    a,
+                    Value::Long(_)
+                        | Value::Double(_)
+                        | Value::BigInt(_)
+                        | Value::BigDecimal(_)
+                        | Value::Ratio(_)
+                ) && matches!(
+                    b,
+                    Value::Long(_)
+                        | Value::Double(_)
+                        | Value::BigInt(_)
+                        | Value::BigDecimal(_)
+                        | Value::Ratio(_)
+                ) =>
+            {
+                num_compare(a, b)? == std::cmp::Ordering::Equal
+            }
+            // Fallback: structural equality
+            (a, b) => a == b,
+        };
+        if !eq {
             return Ok(Value::Bool(false));
         }
     }
