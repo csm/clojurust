@@ -9,32 +9,38 @@
               (#?(:clj Integer.
                   :cljr identity
                   :cljs js/Number.
-                  :lpy python/int) x))
+                  :lpy python/int
+                  :rust int) x))
 
    :Integer #?(:clj Integer/TYPE
                :cljr System.Int32
                :cljs js/Number
-               :lpy python/int)
+               :lpy python/int
+               :rust :int)
 
    :Long #?(:clj Long/TYPE
             :cljr System.Int64
             :cljs js/Number
-            :lpy python/int)
+            :lpy python/int
+            :rust :long)
 
    :Float #?(:clj Long/TYPE
              :cljr System.Single
              :cljs js/Number
-             :lpy python/float)
+             :lpy python/float
+             :rust :float)
 
    :Double #?(:clj Double/TYPE
               :cljr System.Double
               :cljs js/Number
-              :lpy python/float)
+              :lpy python/float
+              :rust :double)
 
    :Boolean #?(:clj Boolean/TYPE
                :cljr System.Boolean
                :cljs js/Boolean
-               :lpy python/bool)})
+               :lpy python/bool
+               :rust :boolean)})
 
 
 (when-var-exists clojure.core/reduce
