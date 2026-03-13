@@ -10,7 +10,8 @@
     ;; test whether it's a fixed-length integer of some sort.
     (is (int? (short 0)))
     #?@(:cljs []
-        :lpy [] ; Python VMs only have one integer type.
+        :lpy []  ; Python VMs only have one integer type.
+        :rust [] ; Rust has i64/BigInt only
         :default
         [(is (instance? #?(:clj java.lang.Short :cljr System.Int16) (short 0)))])
 
