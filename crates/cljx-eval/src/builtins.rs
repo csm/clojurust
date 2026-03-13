@@ -107,6 +107,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("empty", Arity::Fixed(1), builtin_empty),
         ("vec", Arity::Fixed(1), builtin_vec),
         ("object-array", Arity::Fixed(1), builtin_object_array),
+        ("array?", Arity::Fixed(1), builtin_array_q),
         ("to-array", Arity::Fixed(1), builtin_to_array),
         ("to-array-2d", Arity::Fixed(1), builtin_to_array_2d),
         ("into-array", Arity::Variadic { min: 1 }, builtin_into_array),
@@ -2791,6 +2792,12 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
             got: args[0].type_name().to_string(),
         }),
     }
+}
+
+fn builtin_array_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(&args[0], Value::ObjectArray(_) | Value::BooleanArray(_)
+        | Value::ByteArray(_) | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_)
+        | Value::CharArray(_) | Value::FloatArray(_) | Value::DoubleArray(_))))
 }
 
 /// `(object-array size-or-coll)` — if given a number, creates a vector of nils;

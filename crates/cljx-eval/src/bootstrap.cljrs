@@ -417,7 +417,7 @@
 ;; meta and vary-meta are native builtins (see builtins.rs)
 
 (defn seqable? [x]
-  (or (nil? x) (seq? x) (vector? x) (map? x) (set? x) (string? x)))
+  (or (nil? x) (seq? x) (vector? x) (map? x) (set? x) (string? x) (array? x)))
 
 (defn nthrest [coll n]
   (when-not (number? n) (throw (str "n must be a number, got: " (type n))))
