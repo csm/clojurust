@@ -4795,8 +4795,13 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
         Value::Delay(d) => d.get().is_realized(),
         Value::Promise(p) => p.get().is_realized(),
         Value::Future(f) => f.get().is_done(),
-        Value::LazySeq(_) => false, // lazyseq is realized only after forcing
-        _ => true,                  // everything else is always "realized"
+        Value::LazySeq(ls) => {
+            matches!(&*ls.get().state.lock().unwrap(), cljx_value::types::LazySeqState::Forced(_))
+        }
+        v => return Err(ValueError::WrongType {
+            expected: "IPending",
+            got: v.type_name().to_string()
+        })
     };
     Ok(Value::Bool(realized))
 }
