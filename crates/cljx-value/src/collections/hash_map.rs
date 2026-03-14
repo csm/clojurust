@@ -1,6 +1,6 @@
-use rpds::HashTrieMapSync;
 use crate::Value;
 use crate::collections::array_map::PersistentArrayMap;
+use rpds::HashTrieMapSync;
 
 /// An immutable hash map backed by `rpds::HashTrieMap`.
 ///

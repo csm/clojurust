@@ -55,9 +55,9 @@ pub fn pop_eval_context() {
 pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     let (globals, ns) = EVAL_CONTEXT.with(|stack| {
         let s = stack.borrow();
-        let ec = s.last().ok_or_else(|| {
-            ValueError::Other("invoke called outside eval context".into())
-        })?;
+        let ec = s
+            .last()
+            .ok_or_else(|| ValueError::Other("invoke called outside eval context".into()))?;
         Ok((ec.globals.clone(), ec.current_ns.clone()))
     })?;
     let mut env = Env::new(globals, &ns);

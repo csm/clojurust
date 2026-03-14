@@ -258,7 +258,11 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
                     destructure_params.push((idx, p.clone()));
                 }
             }
-            _ => return Err(EvalError::Runtime("fn params must be symbols, vectors, or maps".into())),
+            _ => {
+                return Err(EvalError::Runtime(
+                    "fn params must be symbols, vectors, or maps".into(),
+                ));
+            }
         }
     }
 

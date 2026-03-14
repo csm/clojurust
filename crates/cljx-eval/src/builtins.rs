@@ -1,21 +1,25 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
-use std::cmp::Ordering;
 use crate::env::GlobalEnv;
 use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
-use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
+use cljx_value::value::SetValue::Sorted;
+use cljx_value::{
+    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
+};
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
+use rpds::HashTrieMapSync;
+use std::cmp::Ordering;
 use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
-use rpds::HashTrieMapSync;
-use cljx_value::value::SetValue::Sorted;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -628,10 +632,21 @@ impl Iterator for ValueIter {
 
 fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
     match v {
-        Value::List(_) | Value::Map(_) | Value::Set(_) | Value::Vector(_) | Value::Cons(_)
-        | Value::LazySeq(_) | Value::ObjectArray(_) | Value::BooleanArray(_)
-        | Value::ByteArray(_) | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_)
-        | Value::CharArray(_) | Value::FloatArray(_) | Value::DoubleArray(_)
+        Value::List(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Vector(_)
+        | Value::Cons(_)
+        | Value::LazySeq(_)
+        | Value::ObjectArray(_)
+        | Value::BooleanArray(_)
+        | Value::ByteArray(_)
+        | Value::ShortArray(_)
+        | Value::IntArray(_)
+        | Value::LongArray(_)
+        | Value::CharArray(_)
+        | Value::FloatArray(_)
+        | Value::DoubleArray(_)
         | Value::Str(_) => {
             let mut iter = ValueIter::new(v.clone());
             let result: Vec<Value> = iter.by_ref().collect();
@@ -643,10 +658,9 @@ fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
         Value::Nil => Ok(Vec::new()),
         _ => Err(ValueError::WrongType {
             expected: "seqable",
-            got: v.type_name().to_string()
-        })
+            got: v.type_name().to_string(),
+        }),
     }
-
 }
 
 fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
@@ -1132,9 +1146,7 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
             let r = &a % &b;
             let result = if r.is_zero() {
                 r
-            } else if (r > bigdecimal::BigDecimal::from(0) && b < bigdecimal::BigDecimal::from(0))
-                || (r < bigdecimal::BigDecimal::from(0) && b > bigdecimal::BigDecimal::from(0))
-            {
+            } else if (r > 0 && b < 0) || (r < 0 && b > 0) {
                 r + &b
             } else {
                 r
@@ -1252,7 +1264,9 @@ fn builtin_rem(args: &[Value]) -> ValueResult<Value> {
 fn builtin_quot(args: &[Value]) -> ValueResult<Value> {
     match (&args[0], &args[1]) {
         // Inf, -Inf not allowed as the numerator.
-        (Value::Double(f), _) if f.is_nan() || f.is_infinite() => Err(ValueError::Other("quot of NaN or Infinite".into())),
+        (Value::Double(f), _) if f.is_nan() || f.is_infinite() => {
+            Err(ValueError::Other("quot of NaN or Infinite".into()))
+        }
         (_, Value::Double(f)) if f.is_nan() => Err(ValueError::Other("quot by NaN".into())),
         (_, _) if matches!(&args[0], Value::Double(_)) || matches!(&args[1], Value::Double(_)) => {
             let a = numeric_as_f64(&args[0])?;
@@ -1561,10 +1575,12 @@ fn builtin_pos_q(args: &[Value]) -> ValueResult<Value> {
         Value::Ratio(r) => r.get().numer().is_positive(),
         Value::BigInt(i) => i.get().sign() == Sign::Plus,
         Value::BigDecimal(d) => d.get().sign() == Sign::Plus,
-        _ => return Err(ValueError::WrongType {
-            expected: "number",
-            got: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(ValueError::WrongType {
+                expected: "number",
+                got: args[0].type_name().to_string(),
+            });
+        }
     }))
 }
 fn builtin_neg_q(args: &[Value]) -> ValueResult<Value> {
@@ -1595,7 +1611,11 @@ fn builtin_false_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_number_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
-        Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_)
+        Value::Long(_)
+            | Value::Double(_)
+            | Value::BigInt(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_)
     )))
 }
 fn builtin_integer_q(args: &[Value]) -> ValueResult<Value> {
@@ -1900,7 +1920,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                         return Err(ValueError::WrongType {
                             expected: "map-entry",
                             got: v.type_name().to_string(),
-                        })
+                        });
                     }
                 }
             }
@@ -2561,14 +2581,16 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
             .cloned()
             .or(default)
             .unwrap_or(Value::Nil)),
-        Value::Vector(v) => if idx >= v.get().count() && default.is_none() {
-            Err(ValueError::IndexOutOfBounds {
-                idx,
-                count: v.get().count(),
-            })
-        } else {
-            Ok(v.get().nth(idx).cloned().or(default).unwrap_or(Value::Nil))
-        },
+        Value::Vector(v) => {
+            if idx >= v.get().count() && default.is_none() {
+                Err(ValueError::IndexOutOfBounds {
+                    idx,
+                    count: v.get().count(),
+                })
+            } else {
+                Ok(v.get().nth(idx).cloned().or(default).unwrap_or(Value::Nil))
+            }
+        }
         Value::Str(s) => Ok(s
             .get()
             .chars()
@@ -2831,9 +2853,18 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_array_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(&args[0], Value::ObjectArray(_) | Value::BooleanArray(_)
-        | Value::ByteArray(_) | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_)
-        | Value::CharArray(_) | Value::FloatArray(_) | Value::DoubleArray(_))))
+    Ok(Value::Bool(matches!(
+        &args[0],
+        Value::ObjectArray(_)
+            | Value::BooleanArray(_)
+            | Value::ByteArray(_)
+            | Value::ShortArray(_)
+            | Value::IntArray(_)
+            | Value::LongArray(_)
+            | Value::CharArray(_)
+            | Value::FloatArray(_)
+            | Value::DoubleArray(_)
+    )))
 }
 
 /// `(object-array size-or-coll)` — if given a number, creates a vector of nils;
@@ -2889,7 +2920,7 @@ fn builtin_into_array(args: &[Value]) -> ValueResult<Value> {
             let items: Vec<Value> = ValueIter::new(coll.clone()).collect();
             match k.get().name.to_string().as_str() {
                 "boolean" => {
-                    let v: Vec<bool> = items.iter().map(|v| is_truthy(v)).collect();
+                    let v: Vec<bool> = items.iter().map(is_truthy).collect();
                     Ok(Value::BooleanArray(GcPtr::new(Mutex::new(v))))
                 }
                 "byte" => {
@@ -2955,14 +2986,16 @@ fn builtin_into_array(args: &[Value]) -> ValueResult<Value> {
                     }
                     Ok(Value::DoubleArray(GcPtr::new(Mutex::new(v))))
                 }
-                _ => Err(ValueError::Other("unknown array type".to_string()))
+                _ => Err(ValueError::Other("unknown array type".to_string())),
             }
         }
         None => {
             let v: Vec<Value> = ValueIter::new(coll.clone()).collect();
             Ok(Value::ObjectArray(GcPtr::new(ObjectArray::new(v))))
         }
-        _ => Err(ValueError::Other("second arg to into-array must be a keyword giving a primitive type".to_string()))
+        _ => Err(ValueError::Other(
+            "second arg to into-array must be a keyword giving a primitive type".to_string(),
+        )),
     }
 }
 
@@ -3819,13 +3852,24 @@ fn builtin_select_keys(args: &[Value]) -> ValueResult<Value> {
     let mut map: HashTrieMapSync<Value, Value> = HashTrieMapSync::new_sync();
     match &args[0] {
         Value::Map(src) => {
-            if matches!(&args[1], Value::Map(_) | Value::Vector(_) | Value::List(_) | Value::Set(_) | Value::Cons(_) | Value::LazySeq(_) | Value::Nil) {
+            if matches!(
+                &args[1],
+                Value::Map(_)
+                    | Value::Vector(_)
+                    | Value::List(_)
+                    | Value::Set(_)
+                    | Value::Cons(_)
+                    | Value::LazySeq(_)
+                    | Value::Nil
+            ) {
                 for k in ValueIter::new(args[1].clone()) {
                     if let Some(v) = src.get(&k) {
                         map.insert_mut(k.clone(), v.clone());
                     }
                 }
-                Ok(Value::Map(MapValue::Hash(GcPtr::new(PersistentHashMap::new(map)))))
+                Ok(Value::Map(MapValue::Hash(GcPtr::new(
+                    PersistentHashMap::new(map),
+                ))))
             } else {
                 Err(ValueError::WrongType {
                     expected: "seqable",
@@ -3834,19 +3878,15 @@ fn builtin_select_keys(args: &[Value]) -> ValueResult<Value> {
             }
         }
         Value::Set(_) => match &args[1] {
-            Value::Vector(v) if v.get().is_empty() =>
-                Ok(Value::Map(MapValue::empty())),
-            Value::Map(m) if m.count() == 0 =>
-                Ok(Value::Map(MapValue::empty())),
-            _ => Err(ValueError::Other("nth not supported for set".to_string()))
-        }
+            Value::Vector(v) if v.get().is_empty() => Ok(Value::Map(MapValue::empty())),
+            Value::Map(m) if m.count() == 0 => Ok(Value::Map(MapValue::empty())),
+            _ => Err(ValueError::Other("nth not supported for set".to_string())),
+        },
         Value::Nil => Ok(Value::Map(MapValue::empty())),
-        _ => {
-            Err(ValueError::WrongType {
-                expected: "map",
-                got: args[0].type_name().to_string(),
-            })
-        }
+        _ => Err(ValueError::WrongType {
+            expected: "map",
+            got: args[0].type_name().to_string(),
+        }),
     }
 }
 
@@ -4401,7 +4441,12 @@ fn builtin_char_fn(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_num(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Long(_) | Value::Double(_) | Value::Ratio(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Nil => Ok(args[0].clone()),
+        Value::Long(_)
+        | Value::Double(_)
+        | Value::Ratio(_)
+        | Value::BigInt(_)
+        | Value::BigDecimal(_)
+        | Value::Nil => Ok(args[0].clone()),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),
@@ -4412,7 +4457,7 @@ fn builtin_num(args: &[Value]) -> ValueResult<Value> {
 fn builtin_short(args: &[Value]) -> ValueResult<Value> {
     let num = builtin_num(args)?;
     let num = numeric_as_i64(&num)?;
-    if num < -0x8000 || num > 0x7fff {
+    if !(-0x8000..=0x7fff).contains(&num) {
         Err(ValueError::OutOfRange)
     } else {
         Ok(Value::Long(num))
@@ -4421,15 +4466,20 @@ fn builtin_short(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_byte(args: &[Value]) -> ValueResult<Value> {
     // Special-case double and BigDecimal
-    if let Value::Double(d) = &args[0] && (*d < -128.0 || *d > 127.0) {
+    if let Value::Double(d) = &args[0]
+        && (*d < -128.0 || *d > 127.0)
+    {
         return Err(ValueError::OutOfRange);
     }
-    if let Value::BigDecimal(d) = &args[0] && (d.get().cmp(&BigDecimal::from_f64(-128.0f64).unwrap()) == Ordering::Less || d.get().cmp(&BigDecimal::from_f64(127.0).unwrap()) == Ordering::Greater) {
+    if let Value::BigDecimal(d) = &args[0]
+        && (d.get().cmp(&BigDecimal::from_f64(-128.0f64).unwrap()) == Ordering::Less
+            || d.get().cmp(&BigDecimal::from_f64(127.0).unwrap()) == Ordering::Greater)
+    {
         return Err(ValueError::OutOfRange);
     }
     let num = builtin_num(args)?;
     let num = numeric_as_i64(&num)?;
-    if num < -0x80 || num > 0x7f {
+    if !(-0x80..=0x7f).contains(&num) {
         Err(ValueError::OutOfRange)
     } else {
         Ok(Value::Long(num))
@@ -4703,10 +4753,18 @@ fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering>
         (_, Value::Nil) => Ok(std::cmp::Ordering::Greater),
         (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
         // All numeric types: cross-type comparison
-        (Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_),
-         Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_)) => {
-            num_compare(a, b)
-        }
+        (
+            Value::Long(_)
+            | Value::Double(_)
+            | Value::BigInt(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+            Value::Long(_)
+            | Value::Double(_)
+            | Value::BigInt(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+        ) => num_compare(a, b),
         (Value::Str(x), Value::Str(y)) => Ok(x.get().cmp(y.get())),
         (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
         (Value::Keyword(x), Value::Keyword(y)) => {
@@ -4803,7 +4861,7 @@ fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
         merge_sort(&mut items, &|a, b| invoke_compare(&comp, a, b))?;
         match &args[1] {
             Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
-            _ => Ok(cons_from_iter(items))
+            _ => Ok(cons_from_iter(items)),
         }
     } else {
         // (sort coll)
@@ -4811,7 +4869,7 @@ fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
         merge_sort(&mut items, &|a, b| value_compare_result(a, b))?;
         match &args[0] {
             Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
-            _ => Ok(cons_from_iter(items))
+            _ => Ok(cons_from_iter(items)),
         }
     }
 }
@@ -4872,7 +4930,10 @@ fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_sorted_map_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(&args[0], Value::Map(MapValue::Sorted(_)))))
+    Ok(Value::Bool(matches!(
+        &args[0],
+        Value::Map(MapValue::Sorted(_))
+    )))
 }
 
 fn builtin_sort_by(args: &[Value]) -> ValueResult<Value> {
@@ -4915,19 +4976,22 @@ fn builtin_sort_by(args: &[Value]) -> ValueResult<Value> {
     let sorted: Vec<Value> = indices.into_iter().map(|i| items[i].clone()).collect();
     match coll {
         Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
-        _ => Ok(cons_from_iter(sorted))
+        _ => Ok(cons_from_iter(sorted)),
     }
 }
 
 fn builtin_walk_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
+
 fn builtin_postwalk_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
+
 fn builtin_prewalk_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
+
 fn builtin_tree_seq_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
@@ -5222,12 +5286,17 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
         Value::Promise(p) => p.get().is_realized(),
         Value::Future(f) => f.get().is_done(),
         Value::LazySeq(ls) => {
-            matches!(&*ls.get().state.lock().unwrap(), cljx_value::types::LazySeqState::Forced(_))
+            matches!(
+                &*ls.get().state.lock().unwrap(),
+                cljx_value::types::LazySeqState::Forced(_)
+            )
         }
-        v => return Err(ValueError::WrongType {
-            expected: "IPending",
-            got: v.type_name().to_string()
-        })
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "IPending",
+                got: v.type_name().to_string(),
+            });
+        }
     };
     Ok(Value::Bool(realized))
 }
