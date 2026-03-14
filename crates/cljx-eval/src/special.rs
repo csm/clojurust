@@ -12,8 +12,8 @@ use cljx_gc::GcPtr;
 use cljx_reader::Form;
 use cljx_reader::form::FormKind;
 use cljx_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
-    ProtocolMethod, TypeInstance, Value,
+    CljxFn, CljxFnArity, Keyword, MapValue, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
+    TypeInstance, Value,
 };
 
 /// The set of names that trigger special-form dispatch.
@@ -1386,34 +1386,6 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
     mf_ptr.get().methods.lock().unwrap().insert(key, fn_val);
 
     Ok(Value::MultiFn(mf_ptr))
-}
-
-// ── future ────────────────────────────────────────────────────────────────────
-
-fn eval_future(args: &[Form], env: &mut Env) -> EvalResult {
-    // Capture body forms and env state for the new thread.
-    let body_forms = args.to_vec();
-    let child_env = env.child();
-    // Binding conveyance: snapshot the current thread's dynamic binding stack.
-    let captured_frames = crate::dynamics::capture_current();
-
-    let future_ptr = GcPtr::new(CljxFuture::new());
-    let future_clone = future_ptr.clone();
-
-    std::thread::spawn(move || {
-        // Install the captured dynamic bindings on the new thread.
-        crate::dynamics::install_frames(captured_frames);
-        let mut eval_env = child_env;
-        let result = crate::eval::eval_body(&body_forms, &mut eval_env);
-        let mut state = future_clone.get().state.lock().unwrap();
-        match result {
-            Ok(v) => *state = FutureState::Done(v),
-            Err(e) => *state = FutureState::Failed(format!("{e}")),
-        }
-        future_clone.get().cond.notify_all();
-    });
-
-    Ok(Value::Future(future_ptr))
 }
 
 // ── binding ───────────────────────────────────────────────────────────────────
