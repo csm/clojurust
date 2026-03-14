@@ -11,7 +11,9 @@ use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet,
 };
-use crate::hash::{ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128};
+use crate::hash::{
+    ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
+};
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
 use crate::types::{
@@ -1071,7 +1073,12 @@ impl cljx_gc::Trace for Value {
                 inner.trace(visitor);
                 meta.trace(visitor);
             }
-            Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) | Value::Uuid(_) => {}
+            Value::Nil
+            | Value::Bool(_)
+            | Value::Long(_)
+            | Value::Double(_)
+            | Value::Char(_)
+            | Value::Uuid(_) => {}
             Value::BigInt(p) => visitor.visit(p),
             Value::BigDecimal(p) => visitor.visit(p),
             Value::Ratio(p) => visitor.visit(p),

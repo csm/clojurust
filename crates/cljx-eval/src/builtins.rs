@@ -2190,7 +2190,7 @@ fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
                         None => return Ok(default),
                     }
                 } else {
-                    return Ok(default)
+                    return Ok(default);
                 }
             }
             Value::Nil => {
@@ -5784,7 +5784,7 @@ fn builtin_parse_uuid(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "str",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
