@@ -679,3 +679,7 @@
 (defmacro future
   [& body]
   (list 'future-call* (list 'fn [] (cons 'do body)) []))
+
+(defmacro comment
+  [& _]
+  nil)
