@@ -676,3 +676,6 @@
              (recur v kv (next more))))
          v)))))
 
+(defmacro future
+  [& body]
+  (list 'future-call* (list 'fn [] (cons 'do body)) []))

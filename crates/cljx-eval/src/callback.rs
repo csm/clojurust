@@ -41,6 +41,29 @@ pub fn pop_eval_context() {
     });
 }
 
+/// Capture the current eval context so it can be installed on another thread.
+///
+/// Returns `None` if there is no active context.
+pub fn capture_eval_context() -> Option<(Arc<GlobalEnv>, Arc<str>)> {
+    EVAL_CONTEXT.with(|stack| {
+        let s = stack.borrow();
+        let ec = s.last()?;
+        Some((ec.globals.clone(), ec.current_ns.clone()))
+    })
+}
+
+/// Install a previously captured eval context on the current thread.
+///
+/// Call this at the start of a spawned thread so that `invoke` works.
+pub fn install_eval_context(globals: Arc<GlobalEnv>, ns: Arc<str>) {
+    EVAL_CONTEXT.with(|stack| {
+        stack.borrow_mut().push(EvalContext {
+            globals,
+            current_ns: ns,
+        });
+    });
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Call a Clojure-callable `Value` with the given arguments.

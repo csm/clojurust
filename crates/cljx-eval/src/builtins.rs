@@ -5,11 +5,7 @@ use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
 use cljx_value::value::SetValue::Sorted;
-use cljx_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxPromise, FutureState, Keyword, MapValue,
-    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
-    PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile,
-};
+use cljx_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, FutureState, Keyword, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError, ValueResult, Volatile};
 use num_bigint::{BigInt, Sign};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
@@ -18,8 +14,10 @@ use std::cmp::Ordering;
 use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::thread;
+use std::thread::{sleep, Thread};
 use std::time::Duration;
+use crate::callback::{capture_eval_context, install_eval_context};
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -242,6 +240,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
             builtin_future_cancelled_q,
         ),
         ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
+        ("future-call*", Arity::Fixed(2), builtin_future_call_star),
         ("agent", Arity::Fixed(1), builtin_agent),
         ("await", Arity::Variadic { min: 1 }, builtin_await),
         ("agent-error", Arity::Fixed(1), builtin_agent_error),
@@ -5367,6 +5366,52 @@ fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
+}
+
+fn builtin_future_call_star(args: &[Value]) -> ValueResult<Value> {
+    let future = CljxFuture::new();
+    let future_ptr = GcPtr::new(future);
+    let thunk_ptr = future_ptr.clone();
+    let env = match capture_eval_context() {
+        Some(env) => env,
+        None => return Err(ValueError::Other("future-call* called without eval context".to_string()))
+    };
+    let func = match &args[0] {
+        Value::Fn(f) => Value::Fn(f.clone()),
+        _ => return Err(ValueError::WrongType {
+            expected: "fn",
+            got: args[0].type_name().to_string(),
+        })
+    };
+    let args: Vec<Value> = match &args[1] {
+        Value::Vector(v) => {
+            v.get().iter().map(|v| v.clone()).collect()
+        },
+        _ => return Err(ValueError::WrongType {
+            expected: "vector",
+            got: args[1].type_name().to_string(),
+        })
+    };
+    thread::spawn(move || {
+        install_eval_context(env.0, env.1.clone());
+        match crate::callback::invoke(&func, args) {
+            Ok(result) => {
+                let mut state = thunk_ptr.get().state.lock().unwrap();
+                if matches!(&*state, FutureState::Running) {
+                    *state = FutureState::Done(result);
+                }
+            }
+            Err(e) => {
+                let mut state = thunk_ptr.get().state.lock().unwrap();
+                if matches!(&*state, FutureState::Running) {
+                    *state = FutureState::Failed(format!("{}", e));
+                }
+            }
+        }
+
+        thunk_ptr.get().cond.notify_all();
+    });
+    Ok(Value::Future(future_ptr))
 }
 
 fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
