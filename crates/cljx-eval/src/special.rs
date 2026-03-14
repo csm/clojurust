@@ -227,6 +227,8 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
 
     let mut params: Vec<Arc<str>> = Vec::new();
     let mut rest_param: Option<Arc<str>> = None;
+    let mut destructure_params: Vec<(usize, Form)> = Vec::new();
+    let mut destructure_rest: Option<Form> = None;
     let mut saw_amp = false;
 
     for p in param_forms {
@@ -242,7 +244,21 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
                     params.push(Arc::from(s.as_str()));
                 }
             }
-            _ => return Err(EvalError::Runtime("fn params must be symbols".into())),
+            // Destructuring patterns: vectors and maps
+            FormKind::Vector(_) | FormKind::Map(_) => {
+                if saw_amp {
+                    let gensym = format!("__destructure_rest_{}", params.len());
+                    rest_param = Some(Arc::from(gensym.as_str()));
+                    destructure_rest = Some(p.clone());
+                    break;
+                } else {
+                    let idx = params.len();
+                    let gensym = format!("__destructure_{idx}");
+                    params.push(Arc::from(gensym.as_str()));
+                    destructure_params.push((idx, p.clone()));
+                }
+            }
+            _ => return Err(EvalError::Runtime("fn params must be symbols, vectors, or maps".into())),
         }
     }
 
@@ -250,6 +266,8 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         params,
         rest_param,
         body: body.to_vec(),
+        destructure_params,
+        destructure_rest,
     })
 }
 
@@ -896,7 +914,9 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
         if let FormKind::List(items) = &clause.kind {
             match items.first().map(|f| &f.kind) {
                 Some(FormKind::Keyword(k)) if k == "require" => {
-                    for spec_form in &items[1..] {
+                    // Expand reader conditionals among require specs
+                    let expanded = crate::eval::expand_reader_conds(&items[1..]);
+                    for spec_form in &expanded {
                         let spec =
                             parse_require_spec_form(spec_form).map_err(EvalError::Runtime)?;
                         load_ns(env.globals.clone(), &spec, name)?;
@@ -1499,6 +1519,8 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             params,
             rest_param,
             body,
+            destructure_params: vec![],
+            destructure_rest: None,
         };
         let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
         let ctor = CljxFn::new(
@@ -1531,6 +1553,8 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             params: vec![m_sym],
             rest_param: None,
             body,
+            destructure_params: vec![],
+            destructure_rest: None,
         };
         let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
         let ctor = CljxFn::new(

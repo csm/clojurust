@@ -290,10 +290,21 @@ fn bind_fn_params(arity: &CljxFnArity, args: &[Value], env: &mut Env) -> EvalRes
     // Bind rest param.
     if let Some(ref rest) = arity.rest_param {
         let rest_items = args[n..].to_vec();
-        env.bind(
-            rest.clone(),
-            Value::List(GcPtr::new(PersistentList::from_iter(rest_items))),
-        );
+        let rest_val = if rest_items.is_empty() {
+            Value::Nil
+        } else {
+            Value::List(GcPtr::new(PersistentList::from_iter(rest_items)))
+        };
+        env.bind(rest.clone(), rest_val.clone());
+        // Apply rest destructuring if present.
+        if let Some(ref pattern) = arity.destructure_rest {
+            crate::destructure::bind_pattern(pattern, rest_val, env)?;
+        }
+    }
+    // Apply positional destructuring patterns.
+    for (idx, pattern) in &arity.destructure_params {
+        let val = args.get(*idx).cloned().unwrap_or(Value::Nil);
+        crate::destructure::bind_pattern(pattern, val, env)?;
     }
     Ok(())
 }

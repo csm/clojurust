@@ -627,12 +627,26 @@ impl Iterator for ValueIter {
 // ── Helper: value to sequence vector (eager — use only when random access is needed) ──
 
 fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
-    let mut iter = ValueIter::new(v.clone());
-    let result: Vec<Value> = iter.by_ref().collect();
-    if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+    match v {
+        Value::List(_) | Value::Map(_) | Value::Set(_) | Value::Vector(_) | Value::Cons(_)
+        | Value::LazySeq(_) | Value::ObjectArray(_) | Value::BooleanArray(_)
+        | Value::ByteArray(_) | Value::ShortArray(_) | Value::IntArray(_) | Value::LongArray(_)
+        | Value::CharArray(_) | Value::FloatArray(_) | Value::DoubleArray(_)
+        | Value::Str(_) => {
+            let mut iter = ValueIter::new(v.clone());
+            let result: Vec<Value> = iter.by_ref().collect();
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
+            Ok(result)
+        }
+        Value::Nil => Ok(Vec::new()),
+        _ => Err(ValueError::WrongType {
+            expected: "seqable",
+            got: v.type_name().to_string()
+        })
     }
-    Ok(result)
+
 }
 
 fn numeric_as_f64(v: &Value) -> ValueResult<f64> {
@@ -4787,12 +4801,19 @@ fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
         let comp = args[0].clone();
         let mut items = value_to_seq(&args[1])?;
         merge_sort(&mut items, &|a, b| invoke_compare(&comp, a, b))?;
-        return Ok(cons_from_iter(items));
+        match &args[1] {
+            Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
+            _ => Ok(cons_from_iter(items))
+        }
+    } else {
+        // (sort coll)
+        let mut items = value_to_seq(&args[0])?;
+        merge_sort(&mut items, &|a, b| value_compare_result(a, b))?;
+        match &args[0] {
+            Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
+            _ => Ok(cons_from_iter(items))
+        }
     }
-    // (sort coll)
-    let mut items = value_to_seq(&args[0])?;
-    merge_sort(&mut items, &|a, b| value_compare_result(a, b))?;
-    Ok(cons_from_iter(items))
 }
 
 /// Interpret the result of calling a Clojure comparator.
@@ -4892,7 +4913,10 @@ fn builtin_sort_by(args: &[Value]) -> ValueResult<Value> {
         return Err(err);
     }
     let sorted: Vec<Value> = indices.into_iter().map(|i| items[i].clone()).collect();
-    Ok(cons_from_iter(sorted))
+    match coll {
+        Value::Nil => Ok(Value::List(GcPtr::new(PersistentList::Empty))),
+        _ => Ok(cons_from_iter(sorted))
+    }
 }
 
 fn builtin_walk_stub(_args: &[Value]) -> ValueResult<Value> {

@@ -314,11 +314,18 @@ impl cljx_gc::Trace for NativeFn {
 #[derive(Debug, Clone)]
 pub struct CljxFnArity {
     /// Simple parameter names (no `&`).
+    /// For destructured params, these are gensym'd names.
     pub params: Vec<Arc<str>>,
     /// The name after `&`, if any.
     pub rest_param: Option<Arc<str>>,
     /// The body forms for this arity.
     pub body: Vec<Form>,
+    /// Destructuring patterns: (param_index, original_form).
+    /// After binding the gensym'd param, these patterns are applied
+    /// via `bind_pattern` to destructure the value.
+    pub destructure_params: Vec<(usize, Form)>,
+    /// If the rest param is destructured, the original form.
+    pub destructure_rest: Option<Form>,
 }
 
 // ── CljxFn ────────────────────────────────────────────────────────────────────
