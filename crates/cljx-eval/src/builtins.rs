@@ -1,6 +1,7 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
 use crate::callback::{capture_eval_context, install_eval_context};
+use crate::dynamics;
 use crate::env::GlobalEnv;
 use bigdecimal::BigDecimal;
 use cljx_gc::GcPtr;
@@ -5403,8 +5404,10 @@ fn builtin_future_call_star(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
+    let captured_bindings = dynamics::capture_current();
     thread::spawn(move || {
         install_eval_context(env.0, env.1.clone());
+        dynamics::install_frames(captured_bindings);
         match crate::callback::invoke(&func, args) {
             Ok(result) => {
                 let mut state = thunk_ptr.get().state.lock().unwrap();
