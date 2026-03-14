@@ -111,9 +111,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             splicing: _,
             clauses,
         } => eval_reader_cond(clauses, env),
-        FormKind::TaggedLiteral(_, _) => Err(EvalError::Runtime(
-            "tagged literals not yet supported".into(),
-        )),
+        FormKind::TaggedLiteral(tag, inner) => eval_tagged_literal(tag, inner, env),
     }
 }
 
@@ -349,7 +347,19 @@ pub fn form_to_value(form: &Form) -> Value {
             let expanded = expand_anon_fn(body, form.span.clone());
             form_to_value(&expanded)
         }
-        FormKind::TaggedLiteral(_, inner) => form_to_value(inner),
+        FormKind::TaggedLiteral(tag, inner) => match tag.as_str() {
+            "uuid" => {
+                if let FormKind::Str(s) = &inner.kind {
+                    match uuid::Uuid::parse_str(s) {
+                        Ok(u) => Value::Uuid(u.as_u128()),
+                        Err(_) => form_to_value(inner),
+                    }
+                } else {
+                    form_to_value(inner)
+                }
+            }
+            _ => form_to_value(inner),
+        },
         FormKind::ReaderCond {
             splicing: false,
             clauses,
@@ -422,6 +432,35 @@ fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
     match default {
         Some(f) => eval(f, env),
         None => Ok(Value::Nil),
+    }
+}
+
+// ── tagged literals ──────────────────────────────────────────────────────────
+
+fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
+    match tag {
+        "uuid" => {
+            let val = eval(inner, env)?;
+            match &val {
+                Value::Str(s) => {
+                    let uuid = uuid::Uuid::parse_str(s.get())
+                        .map_err(|e| EvalError::Runtime(format!("invalid UUID: {e}")))?;
+                    Ok(Value::Uuid(uuid.as_u128()))
+                }
+                _ => Err(EvalError::Runtime(format!(
+                    "#uuid expects a string, got {}",
+                    val.type_name()
+                ))),
+            }
+        }
+        "inst" => {
+            // TODO: implement #inst for date/time literals
+            let val = eval(inner, env)?;
+            Ok(val)
+        }
+        _ => Err(EvalError::Runtime(format!(
+            "unknown tagged literal: #{tag}"
+        ))),
     }
 }
 

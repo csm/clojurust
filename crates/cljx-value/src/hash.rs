@@ -28,6 +28,14 @@ pub fn hash_i64(n: i64) -> u32 {
     murmur3_mix(lo ^ hi)
 }
 
+pub fn hash_u128(n: u128) -> u32 {
+    let a = n as u32;
+    let b = ((n >> 32) & 0xFFFFFFFF) as u32;
+    let c = ((n >> 64) & 0xFFFFFFFF) as u32;
+    let d = ((n >> 96) & 0xFFFFFFFF) as u32;
+    murmur3_mix(a ^ b ^ c ^ d)
+}
+
 /// Hash a string using the JVM `String.hashCode` algorithm (UTF-16 codepoints).
 /// This matches `(hash "foo")` in Clojure.
 pub fn hash_string(s: &str) -> u32 {

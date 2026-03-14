@@ -436,6 +436,10 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("ns-resolve", Arity::Fixed(2), builtin_ns_resolve_sentinel),
         ("resolve", Arity::Fixed(1), builtin_resolve_sentinel),
+        // uuids
+        ("uuid?", Arity::Fixed(1), builtin_uuid_q),
+        ("parse-uuid", Arity::Fixed(1), builtin_parse_uuid),
+        ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
     ];
@@ -5750,4 +5754,31 @@ fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
         i64::max(0, numeric_as_i64(&args[0])?) as u64,
     ));
     Ok(Value::Nil)
+}
+
+/// uuid?
+fn builtin_uuid_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(&args[0], Value::Uuid(_))))
+}
+
+/// parse-uuid
+fn builtin_parse_uuid(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Str(s) => {
+            let uuid = uuid::Uuid::parse_str(s.get());
+            match uuid {
+                Ok(uuid) => Ok(Value::Uuid(uuid.as_u128())),
+                Err(_) => Ok(Value::Nil),
+            }
+        }
+        v => Err(ValueError::WrongType {
+            expected: "str",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
+fn builtin_random_uuid(_args: &[Value]) -> ValueResult<Value> {
+    let uuid = uuid::Uuid::new_v4();
+    Ok(Value::Uuid(uuid.as_u128()))
 }

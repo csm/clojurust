@@ -11,9 +11,7 @@ use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet,
 };
-use crate::hash::{
-    ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string,
-};
+use crate::hash::{ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128};
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
 use crate::types::{
@@ -56,6 +54,7 @@ pub enum Value {
     Ratio(GcPtr<num_rational::Ratio<BigInt>>),
     Char(char),
     Str(GcPtr<String>),
+    Uuid(u128),
 
     // ── Identifiers ───────────────────────────────────────────────────────────
     Symbol(GcPtr<Symbol>),
@@ -387,6 +386,8 @@ impl PartialEq for Value {
             (Value::Agent(a), Value::Agent(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }
+            // UUID equality: same u128 value.
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
             // Record equality: same tag and same fields.
             (Value::TypeInstance(a), Value::TypeInstance(b)) => {
                 a.get().type_tag == b.get().type_tag && maps_equal(&a.get().fields, &b.get().fields)
@@ -494,6 +495,7 @@ impl ClojureHash for Value {
             Value::Str(s) => hash_string(s.get()),
             Value::Keyword(k) => hash_string(&k.get().to_string()),
             Value::Symbol(s) => hash_string(&s.get().to_string()),
+            Value::Uuid(u) => hash_u128(*u),
             Value::List(l) => {
                 let mut h: u32 = 1;
                 for v in l.get().iter() {
@@ -747,6 +749,10 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
         }
         Value::Ratio(r) => write!(f, "{}", r.get()),
+        Value::Uuid(u) => {
+            let uuid = uuid::Uuid::from_u128(*u);
+            write!(f, "#uuid \"{}\"", uuid.to_string())
+        }
         Value::Char(c) => {
             if readably {
                 match c {
@@ -976,6 +982,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::Keyword(_) => "keyword",
+            Value::Uuid(_) => "uuid",
             Value::List(_) => "list",
             Value::Vector(_) => "vector",
             Value::Map(_) => "map",
@@ -1060,7 +1067,7 @@ impl cljx_gc::Trace for Value {
                 inner.trace(visitor);
                 meta.trace(visitor);
             }
-            Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => {}
+            Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) | Value::Uuid(_) => {}
             Value::BigInt(p) => visitor.visit(p),
             Value::BigDecimal(p) => visitor.visit(p),
             Value::Ratio(p) => visitor.visit(p),
@@ -1518,5 +1525,6 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::FloatArray(_) => 35,
         Value::DoubleArray(_) => 36,
         Value::ObjectArray(_) => 37,
+        Value::Uuid(_) => 38,
     }
 }
