@@ -157,7 +157,10 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
     match callee {
         Value::NativeFunction(nf) => {
             check_arity(&nf.get().arity, args.len(), &nf.get().name)?;
-            (nf.get().func)(&args).map_err(|e| EvalError::Runtime(e.to_string()))
+            crate::callback::push_eval_context(env);
+            let result = (nf.get().func)(&args).map_err(|e| EvalError::Runtime(e.to_string()));
+            crate::callback::pop_eval_context();
+            result
         }
         Value::Fn(f) => call_cljx_fn(f.get(), args, env),
         Value::ProtocolFn(pf) => {

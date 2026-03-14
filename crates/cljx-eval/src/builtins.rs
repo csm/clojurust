@@ -16,6 +16,36 @@ use std::thread::sleep;
 use std::time::Duration;
 use rpds::HashTrieMapSync;
 use cljx_value::value::SetValue::Sorted;
+// ── Output capture (for with-out-str) ─────────────────────────────────────────
+
+thread_local! {
+    static OUTPUT_CAPTURE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push a new capture buffer onto the stack.
+pub fn push_output_capture() {
+    OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().push(String::new()));
+}
+
+/// Pop the top capture buffer and return its contents.
+pub fn pop_output_capture() -> Option<String> {
+    OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().pop())
+}
+
+/// Write to the current capture buffer if active, otherwise to stdout.
+/// Returns true if captured, false if written to stdout.
+fn capture_or_print(s: &str) -> bool {
+    OUTPUT_CAPTURE.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(buf) = stack.last_mut() {
+            buf.push_str(s);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -273,7 +303,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("rand", Arity::Variadic { min: 0 }, builtin_rand),
         ("rand-int", Arity::Fixed(1), builtin_rand_int),
         ("sort", Arity::Variadic { min: 1 }, builtin_sort),
-        ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by_stub),
+        ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by),
         ("sorted-set", Arity::Variadic { min: 0 }, builtin_sorted_set),
         ("sorted-set?", Arity::Fixed(1), builtin_sorted_set_q),
         ("sorted-map", Arity::Variadic { min: 0 }, builtin_sorted_map),
@@ -285,6 +315,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("printf", Arity::Variadic { min: 1 }, builtin_printf),
         ("newline", Arity::Fixed(0), builtin_newline),
         ("flush", Arity::Fixed(0), builtin_flush),
+        // with-out-str is a special form, but register a stub so resolve finds it
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("num", Arity::Fixed(1), builtin_num),
         ("short", Arity::Fixed(1), builtin_short),
@@ -1483,17 +1514,8 @@ fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_compare(args: &[Value]) -> ValueResult<Value> {
-    match num_compare(&args[0], &args[1]) {
-        Ok(std::cmp::Ordering::Less) => Ok(Value::Long(-1)),
-        Ok(std::cmp::Ordering::Equal) => Ok(Value::Long(0)),
-        Ok(std::cmp::Ordering::Greater) => Ok(Value::Long(1)),
-        Err(_) => {
-            // Fall back to string comparison for non-numerics.
-            let a = format!("{}", args[0]);
-            let b = format!("{}", args[1]);
-            Ok(Value::Long(a.cmp(&b) as i64))
-        }
-    }
+    let ord = value_compare_result(&args[0], &args[1])?;
+    Ok(Value::Long(ord as i64))
 }
 
 // ── Predicates ────────────────────────────────────────────────────────────────
@@ -3986,20 +4008,32 @@ fn print_vals(args: &[Value], sep: &str, readably: bool) -> String {
         .join(sep)
 }
 
+fn emit_output(s: &str) {
+    if !capture_or_print(s) {
+        print!("{}", s);
+    }
+}
+
+fn emit_output_ln(s: &str) {
+    if !capture_or_print(&format!("{s}\n")) {
+        println!("{}", s);
+    }
+}
+
 fn builtin_print(args: &[Value]) -> ValueResult<Value> {
-    print!("{}", print_vals(args, " ", false));
+    emit_output(&print_vals(args, " ", false));
     Ok(Value::Nil)
 }
 fn builtin_println(args: &[Value]) -> ValueResult<Value> {
-    println!("{}", print_vals(args, " ", false));
+    emit_output_ln(&print_vals(args, " ", false));
     Ok(Value::Nil)
 }
 fn builtin_prn(args: &[Value]) -> ValueResult<Value> {
-    println!("{}", print_vals(args, " ", true));
+    emit_output_ln(&print_vals(args, " ", true));
     Ok(Value::Nil)
 }
 fn builtin_pr(args: &[Value]) -> ValueResult<Value> {
-    print!("{}", print_vals(args, " ", true));
+    emit_output(&print_vals(args, " ", true));
     Ok(Value::Nil)
 }
 fn builtin_pr_str(args: &[Value]) -> ValueResult<Value> {
@@ -4439,13 +4473,13 @@ fn builtin_format(args: &[Value]) -> ValueResult<Value> {
 fn builtin_printf(args: &[Value]) -> ValueResult<Value> {
     let s = builtin_format(args)?;
     if let Value::Str(s) = s {
-        print!("{}", s.get())
+        emit_output(s.get());
     }
     Ok(Value::Nil)
 }
 
 fn builtin_newline(_args: &[Value]) -> ValueResult<Value> {
-    println!();
+    emit_output_ln("");
     Ok(Value::Nil)
 }
 
@@ -4648,20 +4682,152 @@ fn builtin_rand_int(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Long(r % n)) // stub
 }
 
-fn value_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => x.cmp(y),
-        (Value::Str(x), Value::Str(y)) => x.get().cmp(y.get()),
-        (Value::Keyword(x), Value::Keyword(y)) => x.get().full_name().cmp(&y.get().full_name()),
-        _ => std::cmp::Ordering::Equal,
+        (Value::Nil, Value::Nil) => Ok(std::cmp::Ordering::Equal),
+        (Value::Nil, _) => Ok(std::cmp::Ordering::Less),
+        (_, Value::Nil) => Ok(std::cmp::Ordering::Greater),
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        // All numeric types: cross-type comparison
+        (Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_),
+         Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::BigDecimal(_) | Value::Ratio(_)) => {
+            num_compare(a, b)
+        }
+        (Value::Str(x), Value::Str(y)) => Ok(x.get().cmp(y.get())),
+        (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
+        (Value::Keyword(x), Value::Keyword(y)) => {
+            // Compare namespace first, then name (matching Clojure)
+            let ns_cmp = match (&x.get().namespace, &y.get().namespace) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp(b),
+            };
+            Ok(ns_cmp.then_with(|| x.get().name.cmp(&y.get().name)))
+        }
+        (Value::Symbol(x), Value::Symbol(y)) => {
+            let ns_cmp = match (&x.get().namespace, &y.get().namespace) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp(b),
+            };
+            Ok(ns_cmp.then_with(|| x.get().name.cmp(&y.get().name)))
+        }
+        (Value::Vector(x), Value::Vector(y)) => {
+            // Lexicographic comparison
+            let x = x.get();
+            let y = y.get();
+            let mut xi = x.iter();
+            let mut yi = y.iter();
+            loop {
+                match (xi.next(), yi.next()) {
+                    (None, None) => return Ok(std::cmp::Ordering::Equal),
+                    (None, Some(_)) => return Ok(std::cmp::Ordering::Less),
+                    (Some(_), None) => return Ok(std::cmp::Ordering::Greater),
+                    (Some(a), Some(b)) => {
+                        let cmp = value_compare_result(a, b)?;
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                    }
+                }
+            }
+        }
+        _ => Err(ValueError::Other(format!(
+            "cannot compare {} to {}",
+            a.type_name(),
+            b.type_name()
+        ))),
     }
 }
 
+/// Fallible merge sort — propagates errors from the comparator.
+fn merge_sort<F>(items: &mut [Value], compare: &F) -> ValueResult<()>
+where
+    F: Fn(&Value, &Value) -> ValueResult<std::cmp::Ordering>,
+{
+    let len = items.len();
+    if len <= 1 {
+        return Ok(());
+    }
+    let mid = len / 2;
+    merge_sort(&mut items[..mid], compare)?;
+    merge_sort(&mut items[mid..], compare)?;
+    // Merge into temp buffer
+    let left = items[..mid].to_vec();
+    let right = items[mid..].to_vec();
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while i < left.len() && j < right.len() {
+        if compare(&left[i], &right[j])? != std::cmp::Ordering::Greater {
+            items[k] = left[i].clone();
+            i += 1;
+        } else {
+            items[k] = right[j].clone();
+            j += 1;
+        }
+        k += 1;
+    }
+    while i < left.len() {
+        items[k] = left[i].clone();
+        i += 1;
+        k += 1;
+    }
+    while j < right.len() {
+        items[k] = right[j].clone();
+        j += 1;
+        k += 1;
+    }
+    Ok(())
+}
+
 fn builtin_sort(args: &[Value]) -> ValueResult<Value> {
-    let items = value_to_seq(args.last().unwrap_or(&Value::Nil))?;
-    let mut sorted = items;
-    sorted.sort_by(value_compare);
-    Ok(Value::List(GcPtr::new(PersistentList::from_iter(sorted))))
+    if args.len() == 2 {
+        // (sort comp coll)
+        let comp = args[0].clone();
+        let mut items = value_to_seq(&args[1])?;
+        merge_sort(&mut items, &|a, b| invoke_compare(&comp, a, b))?;
+        return Ok(cons_from_iter(items));
+    }
+    // (sort coll)
+    let mut items = value_to_seq(&args[0])?;
+    merge_sort(&mut items, &|a, b| value_compare_result(a, b))?;
+    Ok(cons_from_iter(items))
+}
+
+/// Interpret the result of calling a Clojure comparator.
+/// Clojure comparators return either:
+/// - a number (negative/zero/positive) like `compare`
+/// - a boolean (true = first arg comes first) like `<`
+fn interpret_compare_result(v: &Value) -> ValueResult<std::cmp::Ordering> {
+    match v {
+        Value::Long(n) => Ok(if *n < 0 {
+            std::cmp::Ordering::Less
+        } else if *n > 0 {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }),
+        Value::Double(f) => Ok(if *f < 0.0 {
+            std::cmp::Ordering::Less
+        } else if *f > 0.0 {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }),
+        Value::Bool(true) => Ok(std::cmp::Ordering::Less),
+        Value::Bool(false) => Ok(std::cmp::Ordering::Greater),
+        other => Err(ValueError::Other(format!(
+            "comparator must return a number or boolean, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Call a Clojure comparator function and interpret the result.
+fn invoke_compare(comp: &Value, a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
+    let result = crate::callback::invoke(comp, vec![a.clone(), b.clone()])?;
+    interpret_compare_result(&result)
 }
 
 fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
@@ -4688,8 +4854,45 @@ fn builtin_sorted_map_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(&args[0], Value::Map(MapValue::Sorted(_)))))
 }
 
-fn builtin_sort_by_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
+fn builtin_sort_by(args: &[Value]) -> ValueResult<Value> {
+    // (sort-by keyfn coll) or (sort-by keyfn comp coll)
+    let keyfn = &args[0];
+    let (comp, coll) = if args.len() == 3 {
+        (Some(&args[1]), &args[2])
+    } else {
+        (None, &args[1])
+    };
+    let items = value_to_seq(coll)?;
+    // Pre-compute keys to avoid calling keyfn O(n log n) times
+    let mut keys: Vec<Value> = Vec::with_capacity(items.len());
+    for item in &items {
+        keys.push(crate::callback::invoke(keyfn, vec![item.clone()])?);
+    }
+    // Build index array and sort by keys
+    let mut indices: Vec<usize> = (0..items.len()).collect();
+    let mut sort_error: Option<ValueError> = None;
+    indices.sort_by(|&i, &j| {
+        if sort_error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        let result = if let Some(comp) = comp {
+            invoke_compare(comp, &keys[i], &keys[j])
+        } else {
+            value_compare_result(&keys[i], &keys[j])
+        };
+        match result {
+            Ok(ord) => ord,
+            Err(e) => {
+                sort_error = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(err) = sort_error {
+        return Err(err);
+    }
+    let sorted: Vec<Value> = indices.into_iter().map(|i| items[i].clone()).collect();
+    Ok(cons_from_iter(sorted))
 }
 
 fn builtin_walk_stub(_args: &[Value]) -> ValueResult<Value> {

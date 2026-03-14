@@ -54,6 +54,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "reify",
     "load-file",
     "binding",
+    "with-out-str",
 ];
 
 /// Dispatch to the right special-form handler.
@@ -92,6 +93,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "reify" => eval_reify(args, env),
         "load-file" => eval_load_file(args, env),
         "binding" => eval_binding(args, env),
+        "with-out-str" => eval_with_out_str(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -1636,4 +1638,15 @@ fn require_sym<'a>(args: &'a [Form], idx: usize, form_name: &str) -> EvalResult<
             "{form_name} requires a symbol at position {idx}"
         ))),
     }
+}
+
+// ── with-out-str ──────────────────────────────────────────────────────────────
+
+fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
+    crate::builtins::push_output_capture();
+    let result = eval_body(body, env);
+    let captured = crate::builtins::pop_output_capture().unwrap_or_default();
+    // Propagate errors but still pop the capture buffer
+    result?;
+    Ok(Value::string(captured))
 }

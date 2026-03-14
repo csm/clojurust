@@ -575,10 +575,10 @@
   (and (keyword? x) (nil? (namespace x))))
 
 (defn println-str [& args]
-  (str (apply str (interpose " " (map str args))) "\n"))
+  (str (apply str (interpose " " (map (fnil str "nil") args))) "\n"))
 
 (defn print-str [& args]
-  (apply str (interpose " " (map str args))))
+  (apply str (interpose " " (map (fnil str "nil") args))))
 
 (defn interpose [sep coll]
   (loop [s (next (seq coll))

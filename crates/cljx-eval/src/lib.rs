@@ -14,6 +14,7 @@
 
 pub mod apply;
 pub mod builtins;
+pub mod callback;
 pub mod destructure;
 pub mod dynamics;
 pub mod env;
@@ -24,6 +25,7 @@ pub mod macros;
 pub mod special;
 pub mod syntax_quote;
 
+pub use callback::invoke;
 pub use env::{Env, GlobalEnv};
 pub use error::{EvalError, EvalResult};
 pub use eval::eval;

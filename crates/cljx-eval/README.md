@@ -25,6 +25,7 @@ src/
   env.rs          — Frame, GlobalEnv (namespace registry + source paths + loaded set), Env (lexical scope), RequireSpec, RequireRefer
   eval.rs         — top-level eval dispatcher, form_to_value, inline tests
   dynamics.rs     — thread-local dynamic binding stack: BINDING_STACK, BindingGuard, push_frame/pop_frame, deref_var, set_thread_local, capture_current/install_frames, trace_current
+  callback.rs     — thread-local eval context for Rust→Clojure callbacks; invoke(f, args) lets builtins call Clojure functions
   apply.rs        — eval_call, apply_value, call_cljx_fn, ClosureThunk, handle_make_lazy_seq, handle_make_delay, handle_send, handle_vswap, handle_with_bindings, handle_alter_var_root, handle_vary_meta, type_tag_of, resolve_type_tag
   special.rs      — all special form handlers, SPECIAL_FORMS list; includes binding, extract_def_name, compile_meta_form
   loader.rs       — load_ns: resolves namespace names to files, evaluates them, applies alias/refer
