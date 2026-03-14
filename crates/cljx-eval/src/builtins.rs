@@ -2183,6 +2183,16 @@ fn builtin_get_in(args: &[Value]) -> ValueResult<Value> {
                     Value::Nil
                 }
             }
+            Value::Str(s) => {
+                if let Value::Long(idx) = &k {
+                    match s.get().chars().nth(*idx as usize) {
+                        Some(c) => Value::Char(c),
+                        None => return Ok(default),
+                    }
+                } else {
+                    return Ok(default)
+                }
+            }
             Value::Nil => {
                 return Ok(default);
             }

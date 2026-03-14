@@ -178,6 +178,14 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
             FormKind::List(items)
         }
 
+        Value::Uuid(u) => {
+            let uuid_str = uuid::Uuid::from_u128(*u).to_string();
+            FormKind::TaggedLiteral(
+                "uuid".to_string(),
+                Box::new(Form::new(FormKind::Str(uuid_str), span.clone())),
+            )
+        }
+
         // WithMeta: strip metadata and convert the inner value.
         Value::WithMeta(inner, _) => {
             return value_to_form(inner, span);

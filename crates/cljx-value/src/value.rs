@@ -751,7 +751,11 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Ratio(r) => write!(f, "{}", r.get()),
         Value::Uuid(u) => {
             let uuid = uuid::Uuid::from_u128(*u);
-            write!(f, "#uuid \"{}\"", uuid.to_string())
+            if readably {
+                write!(f, "#uuid \"{}\"", uuid)
+            } else {
+                write!(f, "{}", uuid)
+            }
         }
         Value::Char(c) => {
             if readably {
