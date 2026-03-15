@@ -213,7 +213,48 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
         }
     }
 
+    // JVM class names resolve to themselves as symbols (for instance?, catch, etc.)
+    if is_jvm_class_name(s) {
+        return Ok(Value::symbol(Symbol::simple(s)));
+    }
+
     Err(EvalError::UnboundSymbol(s.to_string()))
+}
+
+/// Recognise JVM-style class names used in Clojure for `instance?`, `catch`, etc.
+fn is_jvm_class_name(s: &str) -> bool {
+    matches!(
+        s,
+        "clojure.lang.BigInt"
+            | "java.math.BigDecimal"
+            | "java.math.BigInteger"
+            | "clojure.lang.Ratio"
+            | "java.lang.Long"
+            | "java.lang.Double"
+            | "java.lang.String"
+            | "java.lang.Boolean"
+            | "java.lang.Character"
+            | "java.lang.Number"
+            | "clojure.lang.Symbol"
+            | "clojure.lang.Keyword"
+            | "clojure.lang.PersistentList"
+            | "clojure.lang.PersistentVector"
+            | "clojure.lang.PersistentHashMap"
+            | "clojure.lang.PersistentHashSet"
+            | "clojure.lang.PersistentArrayMap"
+            | "clojure.lang.IFn"
+            | "clojure.lang.ISeq"
+            | "clojure.lang.Atom"
+            | "clojure.lang.Var"
+            | "clojure.lang.Namespace"
+            | "java.util.UUID"
+            | "java.lang.Exception"
+            | "java.lang.Throwable"
+            | "java.lang.Error"
+            | "Exception"
+            | "Throwable"
+            | "Error"
+    )
 }
 
 // ── is_special_form ───────────────────────────────────────────────────────────

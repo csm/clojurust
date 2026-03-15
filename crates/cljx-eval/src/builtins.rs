@@ -5837,14 +5837,50 @@ fn builtin_record_q(args: &[Value]) -> ValueResult<Value> {
 /// `(instance? TypeName x)` — true if x is a TypeInstance with the given type tag.
 /// TypeName may be a Symbol or String.
 fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
-    let expected_tag = match &args[0] {
-        Value::Symbol(s) => s.get().name.clone(),
-        Value::Str(s) => Arc::from(s.get().as_str()),
+    let expected_tag: String = match &args[0] {
+        Value::Symbol(s) => s.get().full_name(),
+        Value::Str(s) => s.get().clone(),
         _ => return Ok(Value::Bool(false)),
     };
-    let result = match &args[1] {
-        Value::TypeInstance(ti) => ti.get().type_tag == expected_tag,
-        _ => false,
+    let val = &args[1];
+    let result = match expected_tag.as_ref() {
+        "clojure.lang.BigInt" | "BigInt" => matches!(val, Value::BigInt(_)),
+        "java.math.BigDecimal" | "BigDecimal" => matches!(val, Value::BigDecimal(_)),
+        "clojure.lang.Ratio" | "Ratio" => matches!(val, Value::Ratio(_)),
+        "java.lang.Long" | "Long" => matches!(val, Value::Long(_)),
+        "java.lang.Double" | "Double" => matches!(val, Value::Double(_)),
+        "java.lang.String" | "String" => matches!(val, Value::Str(_)),
+        "java.lang.Boolean" | "Boolean" => matches!(val, Value::Bool(_)),
+        "java.lang.Character" | "Character" => matches!(val, Value::Char(_)),
+        "clojure.lang.Symbol" | "Symbol" => matches!(val, Value::Symbol(_)),
+        "clojure.lang.Keyword" | "Keyword" => matches!(val, Value::Keyword(_)),
+        "clojure.lang.PersistentList" | "List" => matches!(val, Value::List(_)),
+        "clojure.lang.PersistentVector" | "Vector" => matches!(val, Value::Vector(_)),
+        "clojure.lang.PersistentHashMap" | "PersistentHashMap" | "Map" => {
+            matches!(val, Value::Map(_))
+        }
+        "clojure.lang.PersistentHashSet" | "PersistentHashSet" | "Set" => {
+            matches!(val, Value::Set(_))
+        }
+        "clojure.lang.IFn" | "IFn" => {
+            matches!(val, Value::Fn(_) | Value::NativeFunction(_) | Value::Keyword(_))
+        }
+        "clojure.lang.ISeq" | "ISeq" => {
+            matches!(val, Value::List(_) | Value::Cons(_) | Value::LazySeq(_))
+        }
+        "java.lang.Number" | "Number" => matches!(
+            val,
+            Value::Long(_)
+                | Value::Double(_)
+                | Value::BigInt(_)
+                | Value::BigDecimal(_)
+                | Value::Ratio(_)
+        ),
+        "java.util.UUID" => matches!(val, Value::Uuid(_)),
+        _ => match val {
+            Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),
+            _ => false,
+        },
     };
     Ok(Value::Bool(result))
 }
