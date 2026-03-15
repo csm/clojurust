@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use cljx_eval::GlobalEnv;
 
+mod edn;
 pub mod io;
 mod set;
 mod string;
@@ -25,6 +26,7 @@ const CLOJURE_STRING_SRC: &str = include_str!("clojure/string.cljrs");
 const CLOJURE_SET_SRC: &str = include_str!("clojure/set.cljrs");
 const CLOJURE_TEMPLATE_SRC: &str = include_str!("clojure/template.cljrs");
 const CLOJURE_RUST_IO_SRC: &str = include_str!("clojure/rust/io.cljrs");
+const CLOJURE_EDN_SRC: &str = include_str!("clojure/edn.cljrs");
 
 // ── Macro: register a batch of native fns into a namespace ───────────────────
 
@@ -73,6 +75,10 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     // clojure.rust.io ─ I/O resources.
     io::register(globals, "clojure.rust.io");
     globals.register_builtin_source("clojure.rust.io", CLOJURE_RUST_IO_SRC);
+
+    // clojure.edn ─ EDN reader.
+    edn::register(globals, "clojure.edn");
+    globals.register_builtin_source("clojure.edn", CLOJURE_EDN_SRC);
 }
 
 /// Create a `GlobalEnv` with all built-ins and stdlib registered.
