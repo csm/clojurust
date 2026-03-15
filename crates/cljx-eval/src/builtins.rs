@@ -13,13 +13,14 @@ use cljx_value::{
     PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError,
     ValueResult, Volatile,
 };
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use rpds::HashTrieMapSync;
 use std::cmp::Ordering;
 use std::num::{NonZero, NonZeroU64, ParseFloatError};
 use std::ops::{Add, Div, Mul, Sub};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
@@ -174,6 +175,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("odd?", Arity::Fixed(1), builtin_odd_q),
         ("ratio?", Arity::Fixed(1), builtin_ratio_q),
         ("sorted?", Arity::Fixed(1), builtin_sorted_q),
+        ("bigdec", Arity::Fixed(1), builtin_bigdec),
+        ("bigint", Arity::Fixed(1), builtin_bigint),
         // Collections (non-HOF)
         ("list", Arity::Variadic { min: 0 }, builtin_list),
         ("list*", Arity::Variadic { min: 1 }, builtin_list_star),
@@ -1963,6 +1966,33 @@ fn builtin_sorted_q(args: &[Value]) -> ValueResult<Value> {
         matches!(&args[0], Value::Map(MapValue::Sorted(_)))
             || matches!(&args[0], Value::Set(SetValue::Sorted(_))),
     ))
+}
+
+fn builtin_bigdec(args: &[Value]) -> ValueResult<Value> {
+    if let Value::Str(s) = &args[0] {
+        BigDecimal::from_str(s.get().as_str())
+            .map(|d| Value::BigDecimal(GcPtr::new(d)))
+            .map_err(|e| ValueError::Other(format!("{}", e)))
+    } else {
+        numeric_as_bigdecimal(&args[0]).map(|n| Value::BigDecimal(GcPtr::new(n)))
+    }
+}
+
+fn builtin_bigint(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(_) | Value::BigInt(_ ) =>
+            numeric_as_bigdecimal(&args[0]).map(|n| Value::BigDecimal(GcPtr::new(n))),
+        Value::Double(_) | Value::BigDecimal(_) => {
+            let d = numeric_as_bigdecimal(&args[0])?;
+            let d = d.to_bigint()
+                .map(|d| Value::BigInt(GcPtr::new(d)));
+            Ok(d.unwrap_or(Value::Nil))
+        }
+        _ => Err(ValueError::WrongType {
+            expected: "number",
+            got: args[0].type_name().to_string(),
+        })
+    }
 }
 
 // ── Collections ───────────────────────────────────────────────────────────────
