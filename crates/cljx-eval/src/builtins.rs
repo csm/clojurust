@@ -128,6 +128,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("abs", Arity::Fixed(1), builtin_abs),
         ("push-precision!", Arity::Variadic { min: 1 }, builtin_push_precision_bang),
         ("pop-precision!", Arity::Fixed(0), builtin_pop_precision_bang),
+        ("rationalize", Arity::Fixed(1), builtin_rationalize),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
         ("==", Arity::Variadic { min: 1 }, builtin_numeric_equiv),
@@ -1477,6 +1478,44 @@ fn builtin_pop_precision_bang(args: &[Value]) -> ValueResult<Value> {
         prec.pop();
         Ok(Value::Nil)
     })
+}
+
+fn builtin_rationalize(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(_) | Value::Ratio(_) | Value::BigInt(_) => Ok(args[0].clone()),
+        Value::Double(f) => {
+            if f.is_nan() || f.is_infinite() {
+                return Err(ValueError::Other("cannot rationalize NaN or Infinity".into()));
+            }
+            // Use Display to get exact decimal representation, then rationalize
+            let s = format!("{f}");
+            let bigdec: BigDecimal = s.parse().map_err(|e: bigdecimal::ParseBigDecimalError| {
+                ValueError::Other(format!("cannot rationalize: {e}"))
+            })?;
+            bigdec_to_ratio(bigdec)
+        }
+        Value::BigDecimal(d) => bigdec_to_ratio(d.get().clone()),
+        v => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn bigdec_to_ratio(bigdec: BigDecimal) -> ValueResult<Value> {
+    let (digits, scale) = bigdec.into_bigint_and_scale();
+    if scale <= 0 {
+        // scale <= 0 means the value is digits * 10^(-scale), an integer
+        let result = if scale == 0 {
+            digits
+        } else {
+            digits * BigInt::from(10).pow((-scale) as u32)
+        };
+        Ok(simplify_bigint(result))
+    } else {
+        let denom = BigInt::from(10).pow(scale as u32);
+        Ok(simplify_ratio(Ratio::new(digits, denom)))
+    }
 }
 
 // ── Comparison ────────────────────────────────────────────────────────────────

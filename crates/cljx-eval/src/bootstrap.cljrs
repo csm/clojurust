@@ -709,6 +709,10 @@
   [v]
   (and (or (keyword? v) (symbol? v)) (nil? (namespace v))))
 
+(defn qualified-ident?
+  [v]
+  (and (or (keyword? v) (symbol? v)) (not (nil? (namespace v)))))
+
 (defn val
   [x]
   (if (and (vector? x) (= 2 (count x)))
