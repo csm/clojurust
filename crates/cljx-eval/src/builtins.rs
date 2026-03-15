@@ -3,7 +3,7 @@
 use crate::callback::{capture_eval_context, install_eval_context};
 use crate::dynamics;
 use crate::env::GlobalEnv;
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, RoundingMode};
 use cljx_gc::GcPtr;
 use cljx_value::value::SetValue;
 use cljx_value::value::SetValue::Sorted;
@@ -18,16 +18,73 @@ use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use rpds::HashTrieMapSync;
 use std::cmp::Ordering;
-use std::num::ParseFloatError;
+use std::num::{NonZero, NonZeroU64, ParseFloatError};
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use rand::prelude::SliceRandom;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
     static OUTPUT_CAPTURE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// BigDecimal precision
+
+struct BigDecimalPrecision {
+    precision: u64,
+    rounding: Option<RoundingMode>,
+    unnecessary: bool,
+}
+
+thread_local! {
+    static BIG_DECIMAL_SCALE: std::cell::RefCell<Vec<BigDecimalPrecision>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn round_bigdecimal(result: BigDecimal, prec: &BigDecimalPrecision) -> ValueResult<BigDecimal> {
+    let precision: u64 = prec.precision;
+    if prec.unnecessary {
+        // UNNECESSARY: error if rounding would change the value
+        let rounded = result.with_prec(precision);
+        if rounded != result {
+            return Err(ValueError::Other(
+                "rounding necessary".to_string(),
+            ));
+        }
+        return Ok(rounded);
+    }
+    Ok(if let Some(rounding) = prec.rounding {
+        result.with_precision_round(precision.try_into().unwrap(), rounding)
+    } else {
+        result.with_prec(precision.try_into().unwrap())
+    })
+}
+
+/// Apply the current `with-precision` context (if any) to a BigDecimal result.
+fn apply_precision(result: BigDecimal) -> ValueResult<BigDecimal> {
+    BIG_DECIMAL_SCALE.with_borrow(|stack| {
+        if let Some(prec) = stack.last() {
+            round_bigdecimal(result, prec)
+        } else {
+            Ok(result)
+        }
+    })
+}
+
+/// Like `apply_precision` but uses a default (precision=10, HALF_UP) when no
+/// `with-precision` context is active. Used by division which always needs rounding.
+fn apply_precision_or_default(result: BigDecimal) -> ValueResult<BigDecimal> {
+    BIG_DECIMAL_SCALE.with_borrow(|stack| {
+        let default = BigDecimalPrecision {
+            precision: 10,
+            rounding: Some(RoundingMode::HalfUp),
+            unnecessary: false,
+        };
+        let prec = stack.last().unwrap_or(&default);
+        round_bigdecimal(result, prec)
+    })
 }
 
 /// Push a new capture buffer onto the stack.
@@ -69,6 +126,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("inc", Arity::Fixed(1), builtin_inc),
         ("dec", Arity::Fixed(1), builtin_dec),
         ("abs", Arity::Fixed(1), builtin_abs),
+        ("push-precision!", Arity::Variadic { min: 1 }, builtin_push_precision_bang),
+        ("pop-precision!", Arity::Fixed(0), builtin_pop_precision_bang),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
         ("==", Arity::Variadic { min: 1 }, builtin_numeric_equiv),
@@ -224,6 +283,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("find", Arity::Fixed(2), builtin_find),
         ("map-keys", Arity::Fixed(2), builtin_map_keys_stub),
         ("map-vals", Arity::Fixed(2), builtin_map_vals_stub),
+        ("shuffle", Arity::Fixed(1), builtin_shuffle),
         // Atoms
         ("atom", Arity::Variadic { min: 1 }, builtin_atom),
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
@@ -901,7 +961,7 @@ fn builtin_add(args: &[Value]) -> ValueResult<Value> {
             for v in args {
                 sum += numeric_as_bigdecimal(v)?;
             }
-            Ok(Value::BigDecimal(GcPtr::new(sum)))
+            Ok(Value::BigDecimal(GcPtr::new(apply_precision(sum)?)))
         }
         NumCat::Ratio => {
             let mut sum = num_rational::Ratio::from(num_bigint::BigInt::from(0));
@@ -977,7 +1037,7 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
             for v in &args[1..] {
                 result -= numeric_as_bigdecimal(v)?;
             }
-            Ok(Value::BigDecimal(GcPtr::new(result)))
+            Ok(Value::BigDecimal(GcPtr::new(apply_precision(result)?)))
         }
         NumCat::Ratio => {
             let mut result = numeric_as_ratio(&args[0])?;
@@ -1030,7 +1090,7 @@ fn builtin_mul(args: &[Value]) -> ValueResult<Value> {
             for v in args {
                 result *= numeric_as_bigdecimal(v)?;
             }
-            Ok(Value::BigDecimal(GcPtr::new(result)))
+            Ok(Value::BigDecimal(GcPtr::new(apply_precision(result)?)))
         }
         NumCat::Ratio => {
             let mut result = num_rational::Ratio::from(num_bigint::BigInt::from(1));
@@ -1098,7 +1158,7 @@ fn builtin_div(args: &[Value]) -> ValueResult<Value> {
                 }
                 result = result / d;
             }
-            Ok(Value::BigDecimal(GcPtr::new(result)))
+            Ok(Value::BigDecimal(GcPtr::new(apply_precision_or_default(result)?)))
         }
         _ => {
             // For Long, BigInt, Ratio: use Ratio arithmetic to get exact results
@@ -1366,6 +1426,57 @@ fn builtin_abs(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
+}
+
+fn builtin_push_precision_bang(args: &[Value]) -> ValueResult<Value> {
+    let precision = numeric_as_i64(&args[0])?;
+    let precision = if precision > 0 {
+        precision as u64
+    } else {
+        return Err(ValueError::Other("negative precision".into()));
+    };
+    let prec = if args.len() == 1 {
+        BigDecimalPrecision {
+            precision,
+            rounding: Some(RoundingMode::HalfUp),
+            unnecessary: false,
+        }
+    } else if args.len() == 2 {
+        let (rounding, unnecessary) = match &args[1] {
+            Value::Symbol(s) if s.get().namespace.is_none() => {
+                match s.get().name.to_string().as_str() {
+                    "CEILING" => (Some(RoundingMode::Ceiling), false),
+                    "FLOOR" => (Some(RoundingMode::Floor), false),
+                    "HALF_UP" => (Some(RoundingMode::HalfUp), false),
+                    "HALF_DOWN" => (Some(RoundingMode::HalfDown), false),
+                    "HALF_EVEN" => (Some(RoundingMode::HalfEven), false),
+                    "UP" => (Some(RoundingMode::Up), false),
+                    "DOWN" => (Some(RoundingMode::Down), false),
+                    "UNNECESSARY" => (None, true),
+                    _ => return Err(ValueError::Other("invalid rounding mode".to_string()))
+                }
+            }
+            _ => return Err(ValueError::Other("invalid rounding mode".to_string()))
+        };
+        BigDecimalPrecision {
+            precision,
+            rounding,
+            unnecessary,
+        }
+    } else {
+        return Err(ValueError::Other("push-precision! takes 1 or 2 arguments".to_string()))
+    };
+    BIG_DECIMAL_SCALE.with_borrow_mut(|precision| {
+        precision.push(prec);
+        Ok(Value::Nil)
+    })
+}
+
+fn builtin_pop_precision_bang(args: &[Value]) -> ValueResult<Value> {
+    BIG_DECIMAL_SCALE.with_borrow_mut(|prec| {
+        prec.pop();
+        Ok(Value::Nil)
+    })
 }
 
 // ── Comparison ────────────────────────────────────────────────────────────────
@@ -3930,6 +4041,22 @@ fn builtin_map_keys_stub(_args: &[Value]) -> ValueResult<Value> {
 }
 fn builtin_map_vals_stub(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
+}
+
+fn builtin_shuffle(args: &[Value]) -> ValueResult<Value> {
+    let mut rng = rand::rng();
+    match &args[0] {
+        // Collections, but not maps.
+        Value::List(_) | Value::Vector(_) | Value::Set(_) | Value::LazySeq(_) | Value::Cons(_) => {
+            let mut items = value_to_seq(&args[0])?;
+            items.shuffle(&mut rng);
+            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(items.iter().cloned()))))
+        },
+        v => Err(ValueError::WrongType {
+            expected: "coll",
+            got: v.type_name().to_string(),
+        })
+    }
 }
 
 // ── Atoms ─────────────────────────────────────────────────────────────────────

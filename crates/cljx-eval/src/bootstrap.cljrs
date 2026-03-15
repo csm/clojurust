@@ -683,3 +683,34 @@
 (defmacro comment
   [& _]
   nil)
+
+(defmacro prn-str
+  [& body]
+  (list 'str (cons 'pr-str body) \newline))
+
+; (try
+;   (do body)
+;   (finally (pop-precision!)))
+
+(defmacro with-precision
+  [precision & body]
+  (if (and (= :rounding (first body))
+           (symbol? (second body)))
+    (list 'do (list 'push-precision! precision (list 'quote (second body)))
+          (list 'try
+            (cons 'do (drop 2 body))
+            (list 'finally (list 'pop-precision!))))
+    (list 'do (list 'push-precision! precision)
+          (list 'try
+            (cons 'do body)
+            (list 'finally (list 'pop-precision!))))))
+
+(defn simple-ident?
+  [v]
+  (and (or (keyword? v) (symbol? v)) (nil? (namespace v))))
+
+(defn val
+  [x]
+  (if (and (vector? x) (= 2 (count x)))
+    (second x)
+    (throw (ex-info "not a map entry" {}))))
