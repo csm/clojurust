@@ -2,6 +2,7 @@ pub mod collections;
 pub mod error;
 pub mod hash;
 pub mod keyword;
+pub mod resource;
 pub mod symbol;
 pub mod types;
 pub mod value;
@@ -19,4 +20,5 @@ pub use types::{
     Delay, DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnPtr, Protocol,
     ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
 };
+pub use resource::{Resource, ResourceHandle};
 pub use value::{MapValue, ObjectArray, TypeInstance, Value};

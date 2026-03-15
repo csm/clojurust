@@ -16,6 +16,7 @@ use crate::hash::{
 };
 use crate::keyword::Keyword;
 use crate::symbol::Symbol;
+use crate::resource::ResourceHandle;
 use crate::types::{
     Agent, Atom, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn, Namespace,
     NativeFn, Protocol, ProtocolFn, Var, Volatile,
@@ -114,6 +115,9 @@ pub enum Value {
 
     // ── Records / reify instances ─────────────────────────────────────────────
     TypeInstance(GcPtr<TypeInstance>),
+
+    // ── I/O resources (Arc-ref-counted, NOT GcPtr) ───────────────────────────
+    Resource(ResourceHandle),
 
     // ── Metadata wrapper ─────────────────────────────────────────────────────
     /// A value with attached metadata. Transparent for equality, hashing, display.
@@ -390,6 +394,8 @@ impl PartialEq for Value {
             }
             // UUID equality: same u128 value.
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            // Resource equality: pointer identity.
+            (Value::Resource(a), Value::Resource(b)) => Arc::ptr_eq(&a.0, &b.0),
             // Record equality: same tag and same fields.
             (Value::TypeInstance(a), Value::TypeInstance(b)) => {
                 a.get().type_tag == b.get().type_tag && maps_equal(&a.get().fields, &b.get().fields)
@@ -498,6 +504,10 @@ impl ClojureHash for Value {
             Value::Keyword(k) => hash_string(&k.get().to_string()),
             Value::Symbol(s) => hash_string(&s.get().to_string()),
             Value::Uuid(u) => hash_u128(*u),
+            Value::Resource(r) => {
+                let ptr = Arc::as_ptr(&r.0) as *const () as usize;
+                hash_i64(ptr as i64)
+            }
             Value::List(l) => {
                 let mut h: u32 = 1;
                 for v in l.get().iter() {
@@ -939,6 +949,13 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             });
             write!(f, "}}")
         }
+        Value::Resource(r) => {
+            if r.is_closed() {
+                write!(f, "#<{} (closed)>", r.resource_type())
+            } else {
+                write!(f, "#<{}>", r.resource_type())
+            }
+        }
     }
 }
 
@@ -1020,6 +1037,7 @@ impl Value {
             Value::DoubleArray(_) => "double-array",
             Value::CharArray(_) => "char-array",
             Value::ObjectArray(_) => "object-array",
+            Value::Resource(r) => r.resource_type(),
         }
     }
 
@@ -1115,6 +1133,8 @@ impl cljx_gc::Trace for Value {
             | Value::FloatArray(_)
             | Value::DoubleArray(_)
             | Value::CharArray(_) => {}
+            // Resource is Arc-ref-counted, not GcPtr — nothing to trace.
+            Value::Resource(_) => {}
         }
     }
 }
@@ -1537,5 +1557,6 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::DoubleArray(_) => 36,
         Value::ObjectArray(_) => 37,
         Value::Uuid(_) => 38,
+        Value::Resource(_) => 39,
     }
 }

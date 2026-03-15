@@ -142,6 +142,7 @@ pub fn type_tag_of(val: &Value) -> Arc<str> {
         Value::Future(_) => Arc::from("Future"),
         Value::Agent(_) => Arc::from("Agent"),
         Value::TypeInstance(ti) => ti.get().type_tag.clone(),
+        Value::Resource(_) => Arc::from("Resource"),
         _ => Arc::from("Object"),
     }
 }

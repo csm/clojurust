@@ -1,0 +1,18 @@
+(ns clojure.rust.io)
+
+(defmacro with-open
+  "bindings => [name init ...]
+
+  Evaluates body in a try expression with names bound to the values
+  of the inits, and a finally clause that calls (close name) on each
+  name in reverse order."
+  [bindings & body]
+  (if (= (count bindings) 0)
+    `(do ~@body)
+    (let [name (first bindings)
+          init (second bindings)
+          rest-bindings (drop 2 bindings)]
+      `(let [~name ~init]
+         (try
+           (with-open ~(vec rest-bindings) ~@body)
+           (finally (close ~name)))))))
