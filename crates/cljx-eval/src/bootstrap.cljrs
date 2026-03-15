@@ -713,6 +713,12 @@
   [v]
   (and (or (keyword? v) (symbol? v)) (not (nil? (namespace v)))))
 
+(defn key
+  [x]
+  (if (and (vector? x) (= 2 (count x)))
+    (first x)
+    (throw (ex-info "not a map entry" {}))))
+
 (defn val
   [x]
   (if (and (vector? x) (= 2 (count x)))
