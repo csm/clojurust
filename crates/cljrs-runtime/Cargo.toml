@@ -1,0 +1,10 @@
+[package]
+name = "cljrs-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Core standard library (clojure.core equivalent) for clojurust"
+
+[dependencies]
+cljrs-types = { workspace = true }
+cljrs-gc    = { workspace = true }
+cljrs-eval  = { workspace = true }

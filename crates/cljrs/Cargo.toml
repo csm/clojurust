@@ -1,0 +1,22 @@
+[package]
+name = "cljrs"
+version = "0.1.0"
+edition = "2024"
+description = "clojurust CLI — run, repl, compile, and eval"
+
+[[bin]]
+name = "cljrs"
+path = "src/main.rs"
+
+[dependencies]
+cljrs-types    = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-stdlib   = { workspace = true }
+cljrs-runtime  = { workspace = true }
+cljrs-compiler = { workspace = true }
+cljrs-interop  = { workspace = true }
+clap          = { workspace = true }
+miette        = { workspace = true }

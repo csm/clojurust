@@ -195,40 +195,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
-name = "cljx"
+name = "cljrs"
 version = "0.1.0"
 dependencies = [
  "clap",
- "cljx-compiler",
- "cljx-eval",
- "cljx-gc",
- "cljx-interop",
- "cljx-reader",
- "cljx-runtime",
- "cljx-stdlib",
- "cljx-types",
- "cljx-value",
+ "cljrs-compiler",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-interop",
+ "cljrs-reader",
+ "cljrs-runtime",
+ "cljrs-stdlib",
+ "cljrs-types",
+ "cljrs-value",
  "miette",
 ]
 
 [[package]]
-name = "cljx-compiler"
+name = "cljrs-compiler"
 version = "0.1.0"
 dependencies = [
- "cljx-eval",
- "cljx-gc",
- "cljx-types",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-types",
 ]
 
 [[package]]
-name = "cljx-eval"
+name = "cljrs-eval"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
- "cljx-gc",
- "cljx-reader",
- "cljx-types",
- "cljx-value",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-types",
+ "cljrs-value",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -239,7 +239,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cljx-gc"
+name = "cljrs-gc"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
@@ -248,42 +248,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "cljx-interop"
+name = "cljrs-interop"
 version = "0.1.0"
 dependencies = [
- "cljx-gc",
- "cljx-types",
+ "cljrs-gc",
+ "cljrs-types",
 ]
 
 [[package]]
-name = "cljx-reader"
+name = "cljrs-reader"
 version = "0.1.0"
 dependencies = [
- "cljx-types",
+ "cljrs-types",
  "miette",
 ]
 
 [[package]]
-name = "cljx-runtime"
+name = "cljrs-runtime"
 version = "0.1.0"
 dependencies = [
- "cljx-eval",
- "cljx-gc",
- "cljx-types",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-types",
 ]
 
 [[package]]
-name = "cljx-stdlib"
+name = "cljrs-stdlib"
 version = "0.1.0"
 dependencies = [
- "cljx-eval",
- "cljx-gc",
- "cljx-reader",
- "cljx-value",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-value",
 ]
 
 [[package]]
-name = "cljx-types"
+name = "cljrs-types"
 version = "0.1.0"
 dependencies = [
  "miette",
@@ -291,13 +291,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cljx-value"
+name = "cljrs-value"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
- "cljx-gc",
- "cljx-reader",
- "cljx-types",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-types",
  "num-bigint",
  "num-rational",
  "num-traits",

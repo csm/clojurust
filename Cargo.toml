@@ -1,28 +1,28 @@
 [workspace]
 members = [
-    "crates/cljx-types",
-    "crates/cljx-gc",
-    "crates/cljx-value",
-    "crates/cljx-reader",
-    "crates/cljx-eval",
-    "crates/cljx-stdlib",
-    "crates/cljx-runtime",
-    "crates/cljx-compiler",
-    "crates/cljx-interop",
-    "crates/cljx",
+    "crates/cljrs-types",
+    "crates/cljrs-gc",
+    "crates/cljrs-value",
+    "crates/cljrs-reader",
+    "crates/cljrs-eval",
+    "crates/cljrs-stdlib",
+    "crates/cljrs-runtime",
+    "crates/cljrs-compiler",
+    "crates/cljrs-interop",
+    "crates/cljrs",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-cljx-types    = { path = "crates/cljx-types" }
-cljx-gc       = { path = "crates/cljx-gc" }
-cljx-value    = { path = "crates/cljx-value" }
-cljx-reader   = { path = "crates/cljx-reader" }
-cljx-eval     = { path = "crates/cljx-eval" }
-cljx-stdlib   = { path = "crates/cljx-stdlib" }
-cljx-runtime  = { path = "crates/cljx-runtime" }
-cljx-compiler = { path = "crates/cljx-compiler" }
-cljx-interop  = { path = "crates/cljx-interop" }
+cljrs-types    = { path = "crates/cljrs-types" }
+cljrs-gc       = { path = "crates/cljrs-gc" }
+cljrs-value    = { path = "crates/cljrs-value" }
+cljrs-reader   = { path = "crates/cljrs-reader" }
+cljrs-eval     = { path = "crates/cljrs-eval" }
+cljrs-stdlib   = { path = "crates/cljrs-stdlib" }
+cljrs-runtime  = { path = "crates/cljrs-runtime" }
+cljrs-compiler = { path = "crates/cljrs-compiler" }
+cljrs-interop  = { path = "crates/cljrs-interop" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
