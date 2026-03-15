@@ -724,3 +724,11 @@
   (if (and (vector? x) (= 2 (count x)))
     (second x)
     (throw (ex-info "not a map entry" {}))))
+
+(defn inc'
+  [x]
+  (+' x 1))
+
+(defn dec'
+  [x]
+  (+' x -1))

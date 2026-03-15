@@ -18,7 +18,7 @@ use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use rpds::HashTrieMapSync;
 use std::cmp::Ordering;
-use std::num::{NonZero, NonZeroU64, ParseFloatError};
+use std::num::ParseFloatError;
 use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -118,7 +118,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // Arithmetic
         ("+", Arity::Variadic { min: 0 }, builtin_add),
+        ("+'", Arity::Variadic { min: 0 }, builtin_add_quote),
         ("-", Arity::Variadic { min: 1 }, builtin_sub),
+        ("-'", Arity::Variadic { min: 1 }, builtin_sub_quote),
         ("*", Arity::Variadic { min: 0 }, builtin_mul),
         ("/", Arity::Variadic { min: 1 }, builtin_div),
         ("mod", Arity::Fixed(2), builtin_mod),
@@ -1006,6 +1008,36 @@ fn builtin_add(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+// Addition, with automatic promotion long->bigint, double->bigdecimal
+fn builtin_add_quote(args: &[Value]) -> ValueResult<Value> {
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double => {
+            let mut sum = BigDecimal::from(0);
+            for v in args {
+                sum += numeric_as_bigdecimal(v)?;
+            }
+            match sum.to_f64() {
+                Some(sum ) => Ok(Value::Double(sum)),
+                None => Ok(Value::BigDecimal(GcPtr::new(apply_precision(sum)?))),
+            }
+        }
+        NumCat::Long => {
+            // Do the sum as bigints, return long if it fits in i64
+            let mut sum = BigInt::from(0);
+            for v in args {
+                sum += numeric_as_bigint(v)?;
+            }
+            if sum > BigInt::from(0x7f00000000000000i64) || sum < BigInt::from(-0x8000000000000000i64) {
+                Ok(Value::BigInt(GcPtr::new(sum)))
+            } else {
+                Ok(Value::Long(sum.to_i64().unwrap()))
+            }
+        }
+        _ => builtin_add(args),
+    }
+}
+
 fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
     if args.is_empty() {
         return Err(ValueError::ArityError {
@@ -1079,6 +1111,42 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
             }
             Ok(Value::Long(result))
         }
+    }
+}
+
+fn builtin_sub_quote(args: &[Value]) -> ValueResult<Value> {
+    let cat = widest_category(args)?;
+    match cat {
+        NumCat::Double if !args.is_empty() => {
+            let mut sum = BigDecimal::from(0);
+            for v in args {
+                sum -= numeric_as_bigdecimal(v)?;
+            }
+            match sum.to_f64() { // produces +Inf/-Inf on overflow
+                Some(f ) => if f.is_infinite() {
+                    Ok(Value::BigDecimal(GcPtr::new(sum)))
+                } else {
+                    Ok(Value::Double(f))
+                }
+                None => Ok(Value::BigDecimal(GcPtr::new(sum))),
+            }
+        }
+        NumCat::Long if !args.is_empty() => {
+            let mut sum = numeric_as_bigint(&args[0])?;
+            for v in args[1..].iter() {
+                sum -= numeric_as_bigint(v)?;
+                println!("builtin_sub_quote: partial sum: {}, arg: {}", sum, v);
+            }
+            println!("builtin_sub_quote: sum = {}", sum);
+            if sum < BigInt::from(-0x8000000000000000i64) || sum > BigInt::from(0x7f00000000000000i64) {
+                println!("builtin_sub_quote: promote to BigInt");
+                Ok(Value::BigInt(GcPtr::new(sum)))
+            } else {
+                println!("builtin_sub_quote: keep as long");
+                Ok(Value::Long(sum.to_i64().unwrap()))
+            }
+        }
+        _ => builtin_sub(args),
     }
 }
 
@@ -1479,7 +1547,7 @@ fn builtin_push_precision_bang(args: &[Value]) -> ValueResult<Value> {
     })
 }
 
-fn builtin_pop_precision_bang(args: &[Value]) -> ValueResult<Value> {
+fn builtin_pop_precision_bang(_args: &[Value]) -> ValueResult<Value> {
     BIG_DECIMAL_SCALE.with_borrow_mut(|prec| {
         prec.pop();
         Ok(Value::Nil)
@@ -1980,8 +2048,14 @@ fn builtin_bigdec(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_bigint(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::Str(s) => {
+            match BigInt::from_str(s.get().as_str()) {
+                Ok(n) => Ok(Value::BigInt(GcPtr::new(n))),
+                Err(e) => Err(ValueError::Other(format!("{}", e))),
+            }
+        }
         Value::Long(_) | Value::BigInt(_ ) =>
-            numeric_as_bigdecimal(&args[0]).map(|n| Value::BigDecimal(GcPtr::new(n))),
+            numeric_as_bigint(&args[0]).map(|n| Value::BigInt(GcPtr::new(n))),
         Value::Double(_) | Value::BigDecimal(_) => {
             let d = numeric_as_bigdecimal(&args[0])?;
             let d = d.to_bigint()
