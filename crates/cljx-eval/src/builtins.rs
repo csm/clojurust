@@ -385,8 +385,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("printf", Arity::Variadic { min: 1 }, builtin_printf),
         ("newline", Arity::Fixed(0), builtin_newline),
         ("flush", Arity::Fixed(0), builtin_flush),
-        // with-out-str is a special form, but register a stub so resolve finds it
+        // Special forms need stub vars so (resolve 'name) finds them
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("and", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("or", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("num", Arity::Fixed(1), builtin_num),
         ("short", Arity::Fixed(1), builtin_short),
         ("byte", Arity::Fixed(1), builtin_byte),
@@ -4198,6 +4201,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                 }
             }
         }
+        Value::Volatile(v) => Ok(v.get().deref()),
         v => Err(ValueError::WrongType {
             expected: "atom, var, delay, promise, future, or agent",
             got: v.type_name().to_string(),
