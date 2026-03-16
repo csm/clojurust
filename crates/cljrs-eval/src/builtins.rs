@@ -3948,6 +3948,7 @@ fn builtin_set_fn(args: &[Value]) -> ValueResult<Value> {
             | Value::Set(_)
             | Value::Map(_)
             | Value::LazySeq(_)
+            | Value::Cons(_)
             | Value::Vector(_)
             | Value::Str(_)
             | Value::Nil
@@ -4396,42 +4397,50 @@ fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
-        Value::Atom(a) => {
-            let key = args[1].clone();
-            let f = args[2].clone();
-            let atom = a.get();
-            let mut watches = atom.watches.lock().unwrap();
-            // Replace if key already exists
-            if let Some(entry) = watches.iter_mut().find(|(k, _)| k == &key) {
-                entry.1 = f;
-            } else {
-                watches.push((key, f));
-            }
-            Ok(args[0].clone())
-        }
-        v => Err(ValueError::WrongType {
-            expected: "atom",
-            got: v.type_name().to_string(),
-        }),
+fn add_watch_to(watches: &Mutex<Vec<(Value, Value)>>, key: Value, f: Value) {
+    let mut ws = watches.lock().unwrap();
+    if let Some(entry) = ws.iter_mut().find(|(k, _)| k == &key) {
+        entry.1 = f;
+    } else {
+        ws.push((key, f));
     }
 }
 
-fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
+fn remove_watch_from(watches: &Mutex<Vec<(Value, Value)>>, key: &Value) {
+    watches.lock().unwrap().retain(|(k, _)| k != key);
+}
+
+fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
+    let key = args[1].clone();
+    let f = args[2].clone();
     match &args[0] {
-        Value::Atom(a) => {
-            let key = &args[1];
-            let atom = a.get();
-            let mut watches = atom.watches.lock().unwrap();
-            watches.retain(|(k, _)| k != key);
-            Ok(args[0].clone())
+        Value::Atom(a) => add_watch_to(&a.get().watches, key, f),
+        Value::Var(v) => add_watch_to(&v.get().watches, key, f),
+        Value::Agent(a) => add_watch_to(&a.get().watches, key, f),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "atom, var, or agent",
+                got: v.type_name().to_string(),
+            })
         }
-        v => Err(ValueError::WrongType {
-            expected: "atom",
-            got: v.type_name().to_string(),
-        }),
     }
+    Ok(args[0].clone())
+}
+
+fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
+    let key = &args[1];
+    match &args[0] {
+        Value::Atom(a) => remove_watch_from(&a.get().watches, key),
+        Value::Var(v) => remove_watch_from(&v.get().watches, key),
+        Value::Agent(a) => remove_watch_from(&a.get().watches, key),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "atom, var, or agent",
+                got: v.type_name().to_string(),
+            })
+        }
+    }
+    Ok(args[0].clone())
 }
 
 fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
@@ -6052,6 +6061,7 @@ fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
         state: state_arc,
         error: error_arc,
         sender: std::sync::Mutex::new(tx),
+        watches: std::sync::Mutex::new(Vec::new()),
     })))
 }
 

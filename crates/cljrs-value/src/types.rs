@@ -126,6 +126,7 @@ pub struct Var {
     pub is_macro: bool,
     /// Metadata map (e.g. `{:dynamic true}`).
     pub meta: Mutex<Option<Value>>,
+    pub watches: Mutex<Vec<(Value, Value)>>,
 }
 
 impl Var {
@@ -136,6 +137,7 @@ impl Var {
             value: Mutex::new(None),
             is_macro: false,
             meta: Mutex::new(None),
+            watches: Mutex::new(Vec::new()),
         }
     }
 
@@ -171,6 +173,10 @@ impl cljrs_gc::Trace for Var {
         }
         if let Some(m) = self.meta.lock().unwrap().as_ref() {
             m.trace(visitor);
+        }
+        for (key, f) in self.watches.lock().unwrap().iter() {
+            key.trace(visitor);
+            f.trace(visitor);
         }
     }
 }
@@ -686,6 +692,7 @@ pub struct Agent {
     pub error: Arc<Mutex<Option<String>>>,
     /// Channel to send actions to the worker thread.
     pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
+    pub watches: Mutex<Vec<(Value, Value)>>,
 }
 
 impl Agent {
@@ -710,7 +717,10 @@ impl std::fmt::Debug for Agent {
 
 impl cljrs_gc::Trace for Agent {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        // Trace through the Arc<Mutex<Value>> — the worker thread shares this Arc.
         self.state.lock().unwrap().trace(visitor);
+        for (key, f) in self.watches.lock().unwrap().iter() {
+            key.trace(visitor);
+            f.trace(visitor);
+        }
     }
 }

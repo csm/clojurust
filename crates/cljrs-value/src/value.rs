@@ -397,6 +397,15 @@ impl PartialEq for Value {
             (Value::Agent(a), Value::Agent(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }
+            (Value::Atom(a), Value::Atom(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Var(a), Value::Var(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
+            (Value::Namespace(a), Value::Namespace(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
             // UUID equality: same u128 value.
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
             // Resource equality: pointer identity.

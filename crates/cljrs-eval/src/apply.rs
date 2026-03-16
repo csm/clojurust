@@ -15,6 +15,51 @@ use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
 use crate::eval::eval;
 
+// ── Watch notification ───────────────────────────────────────────────────────
+
+/// Fire all watches on a watchable (atom, var, agent).
+/// Each watch fn is called as `(f key ref old new)`.
+/// Errors thrown by watch fns are re-thrown (matching Clojure behavior).
+fn fire_watches(
+    watches: &std::sync::Mutex<Vec<(Value, Value)>>,
+    reference: &Value,
+    old: &Value,
+    new: &Value,
+    env: &mut Env,
+) {
+    let ws: Vec<(Value, Value)> = watches.lock().unwrap().clone();
+    for (key, f) in &ws {
+        let args = vec![key.clone(), reference.clone(), old.clone(), new.clone()];
+        if let Err(e) = apply_value(f, args, env) {
+            // Re-throw watch errors (Clojure behavior: exception propagates to caller)
+            // We can't return EvalResult from here, so we store and re-throw below.
+            // For now, propagate by re-invoking so it surfaces.
+            // Actually, in Clojure, watch exceptions propagate to the mutating call.
+            // We need to handle this differently — but for simplicity, just ignore for now
+            // and let the caller check. Actually let's just use a thread-local to propagate.
+            WATCH_ERROR.with(|cell| {
+                cell.borrow_mut().replace(e);
+            });
+            return;
+        }
+    }
+}
+
+thread_local! {
+    static WATCH_ERROR: std::cell::RefCell<Option<EvalError>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Check if a watch error occurred and propagate it.
+fn check_watch_error() -> EvalResult<()> {
+    WATCH_ERROR.with(|cell| {
+        if let Some(e) = cell.borrow_mut().take() {
+            Err(e)
+        } else {
+            Ok(())
+        }
+    })
+}
+
 // ── Lazy seq error propagation ───────────────────────────────────────────────
 
 thread_local! {
@@ -539,11 +584,27 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     match &agent_val {
         Value::Agent(a) => {
+            let agent_clone = a.clone();
+            let agent_val_clone = agent_val.clone();
             let agent_fn: AgentFn = Box::new(move |state| {
-                let mut call_args = vec![state];
+                let mut call_args = vec![state.clone()];
                 call_args.extend(extra);
                 let mut call_env = Env::new(globals, &ns);
-                apply_value(&f, call_args, &mut call_env).map_err(|e| format!("{e}"))
+                let new_val =
+                    apply_value(&f, call_args, &mut call_env).map_err(|e| format!("{e}"))?;
+                // Fire watches (agent watches fire on the agent thread)
+                fire_watches(
+                    &agent_clone.get().watches,
+                    &agent_val_clone,
+                    &state,
+                    &new_val,
+                    &mut call_env,
+                );
+                // Watch errors become agent errors
+                if let Err(e) = check_watch_error() {
+                    return Err(format!("{e}"));
+                }
+                Ok(new_val)
             });
             a.get()
                 .sender
@@ -653,7 +714,10 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     validate_atom_value(&atom, &new_val, env)?;
+    let old_val = atom.get().deref();
     atom.get().reset(new_val.clone());
+    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+    check_watch_error()?;
     Ok(new_val)
 }
 
@@ -699,11 +763,14 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
 
-    let mut args = vec![atom.get().deref()];
+    let old_val = atom.get().deref();
+    let mut args = vec![old_val.clone()];
     args.extend(evaled);
     let new_val = apply_value(&f, args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
     atom.get().reset(new_val.clone());
+    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+    check_watch_error()?;
     Ok(new_val)
 }
 
@@ -767,11 +834,13 @@ fn handle_alter_var_root(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             )));
         }
     };
-    let current = vp.get().deref().unwrap_or(Value::Nil);
-    let mut call_args = vec![current];
+    let old_val = vp.get().deref().unwrap_or(Value::Nil);
+    let mut call_args = vec![old_val.clone()];
     call_args.extend(extra);
     let new_val = apply_value(&f, call_args, env)?;
     vp.get().bind(new_val.clone());
+    fire_watches(&vp.get().watches, &var_val, &old_val, &new_val, env);
+    check_watch_error()?;
     Ok(new_val)
 }
 
