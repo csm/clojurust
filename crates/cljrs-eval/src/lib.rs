@@ -24,6 +24,9 @@ pub mod loader;
 pub mod macros;
 pub mod special;
 pub mod syntax_quote;
+mod transients;
+mod util;
+mod bitops;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};

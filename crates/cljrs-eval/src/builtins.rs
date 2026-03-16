@@ -20,12 +20,15 @@ use rand::prelude::SliceRandom;
 use rpds::HashTrieMapSync;
 use std::cmp::Ordering;
 use std::num::ParseFloatError;
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use crate::bitops::{builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test};
+use crate::transients::{builtin_assoc_bang, builtin_conj_bang, builtin_disj_bang, builtin_dissoc_bang, builtin_persistent_bang, builtin_pop_bang, builtin_transient};
+use crate::util::numeric_as_i64;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -139,6 +142,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
             builtin_pop_precision_bang,
         ),
         ("rationalize", Arity::Fixed(1), builtin_rationalize),
+        ("denominator", Arity::Fixed(1), builtin_denominator),
+        ("numerator", Arity::Fixed(1), builtin_numerator),
+        ("parse-boolean", Arity::Fixed(1), builtin_parse_boolean),
+        ("parse-long", Arity::Fixed(1), builtin_parse_long),
+        ("parse-double", Arity::Fixed(1), builtin_parse_double),
         // Comparison
         ("=", Arity::Variadic { min: 1 }, builtin_eq),
         ("==", Arity::Variadic { min: 1 }, builtin_numeric_equiv),
@@ -523,6 +531,22 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
+
+        // Transients
+        ("transient", Arity::Fixed(1), builtin_transient),
+        ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
+        ("assoc!", Arity::Variadic { min: 3 }, builtin_assoc_bang),
+        ("conj!", Arity::Variadic { min: 0 }, builtin_conj_bang),
+        ("disj!", Arity::Variadic { min: 1 }, builtin_disj_bang),
+        ("dissoc!", Arity::Variadic { min: 2 }, builtin_dissoc_bang),
+        ("pop!", Arity::Fixed(1), builtin_pop_bang),
+
+        // bit ops
+        ("bit-and-not", Arity::Variadic { min: 2 }, builtin_bit_and_not),
+        ("bit-clear", Arity::Fixed(2), builtin_bit_clear),
+        ("bit-flip", Arity::Fixed(2), builtin_bit_flip),
+        ("bit-set", Arity::Fixed(2), builtin_bit_set),
+        ("bit-test", Arity::Fixed(2), builtin_bit_test),
     ];
 
     for (name, arity, func) in fns {
@@ -786,61 +810,6 @@ fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
     }
 }
 
-fn bigdec_to_i64(d: &BigDecimal) -> ValueResult<i64> {
-    let (num, exp) = d.as_bigint_and_exponent();
-    let res = if exp >= 0 {
-        let pow = BigInt::from(10).pow(exp as u32);
-        num.div(pow)
-    } else {
-        let scale = BigInt::from(10).pow((-exp) as u32);
-        num.mul(scale)
-    };
-    res.to_i64()
-        .ok_or_else(|| ValueError::Other("BigDecimal too large for i64".into()))
-}
-
-fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
-    match v {
-        Value::Long(n) => Ok(*n),
-        Value::Double(f) => {
-            if f64::is_infinite(*f) || f64::is_nan(*f) {
-                Err(ValueError::Other(
-                    "cannot convert non-number to i64".to_string(),
-                ))
-            } else {
-                Ok(*f as i64)
-            }
-        }
-        Value::Char(c) => Ok(*c as i64),
-        Value::BigInt(n) => n
-            .get()
-            .to_i64()
-            .ok_or_else(|| ValueError::Other("BigInt too large for i64".into())),
-        Value::Ratio(r) => {
-            let trunc = if r.get().is_negative() {
-                // Use ceiling to truncate towards zero.
-                r.get().ceil()
-            } else {
-                r.get().floor()
-            };
-            trunc
-                .to_i64()
-                .ok_or_else(|| ValueError::Other("cannot convert ratio".into()))
-        }
-        Value::BigDecimal(d) => bigdec_to_i64(d.get()),
-        Value::Bool(b) => Ok(*b as i64),
-        Value::Str(s) => match s.get().parse::<BigDecimal>() {
-            Ok(d) => bigdec_to_i64(&d),
-            Err(_) => Err(ValueError::Other(
-                "failed to parse string as number".to_string(),
-            )),
-        },
-        _ => Err(ValueError::WrongType {
-            expected: "integer",
-            got: v.type_name().to_string(),
-        }),
-    }
-}
 
 fn numeric_as_bigint(v: &Value) -> ValueResult<num_bigint::BigInt> {
     use num_bigint::BigInt;
@@ -1620,6 +1589,70 @@ fn builtin_rationalize(args: &[Value]) -> ValueResult<Value> {
             expected: "number",
             got: v.type_name().to_string(),
         }),
+    }
+}
+
+fn builtin_denominator(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Ratio(r) => Ok(Value::BigInt(GcPtr::new(r.get().denom().clone()))),
+        v => Err(ValueError::WrongType {
+            expected: "ratio",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
+fn builtin_numerator(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Ratio(r) => Ok(Value::BigInt(GcPtr::new(r.get().numer().clone()))),
+        v => Err(ValueError::WrongType {
+            expected: "ratio",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
+fn builtin_parse_boolean(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Str(s) => match s.get().as_str() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Ok(Value::Nil)
+        }
+        v => Err(ValueError::WrongType {
+            expected: "string",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
+fn builtin_parse_long(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Str(s) => {
+            match s.get().parse::<i64>() {
+                Ok(d) => Ok(Value::Long(d)),
+                Err(_) => Ok(Value::Nil),
+            }
+        }
+        v => Err(ValueError::WrongType {
+            expected: "string",
+            got: v.type_name().to_string(),
+        })
+    }
+}
+
+fn builtin_parse_double(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Str(s) => {
+            match s.get().parse::<f64>() {
+                Ok(d) => Ok(Value::Double(d)),
+                Err(_) => Ok(Value::Nil)
+            }
+        }
+        v => Err(ValueError::WrongType {
+            expected: "string",
+            got: v.type_name().to_string(),
+        })
     }
 }
 

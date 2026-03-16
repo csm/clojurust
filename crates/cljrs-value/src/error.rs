@@ -34,6 +34,12 @@ pub enum ValueError {
 
     #[error("out of range")]
     OutOfRange,
+
+    #[error("transient already persisted")]
+    TransientAlreadyPersisted,
+
+    #[error("could not parse value")]
+    Parse
 }
 
 pub type ValueResult<T> = Result<T, ValueError>;

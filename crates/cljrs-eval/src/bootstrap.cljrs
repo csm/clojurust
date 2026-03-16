@@ -732,3 +732,5 @@
 (defn dec'
   [x]
   (+' x -1))
+
+(defn ident? [x] (or (symbol? x) (keyword? x)))

@@ -7,10 +7,7 @@ use num_traits::ToPrimitive;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 
-use crate::collections::{
-    PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
-    PersistentVector, SortedMap, SortedSet,
-};
+use crate::collections::{PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector};
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
 };
@@ -71,6 +68,11 @@ pub enum Value {
     Map(MapValue),
     Set(SetValue),
     Queue(GcPtr<PersistentQueue>),
+
+    // Transients
+    TransientMap(GcPtr<TransientMap>),
+    TransientSet(GcPtr<TransientSet>),
+    TransientVector(GcPtr<TransientVector>),
 
     // Arrays
     IntArray(GcPtr<Mutex<Vec<i32>>>),
@@ -539,6 +541,9 @@ impl ClojureHash for Value {
                 }
                 h
             }
+            Value::TransientMap(m) => m.get().clojure_hash(),
+            Value::TransientSet(s) => s.get().clojure_hash(),
+            Value::TransientVector(v) => v.get().clojure_hash(),
 
             // Arrays
             Value::BooleanArray(a) => {
@@ -956,6 +961,9 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
                 write!(f, "#<{}>", r.resource_type())
             }
         }
+        Value::TransientMap(_) => write!(f, "#<TransientMap>"),
+        Value::TransientSet(_) => write!(f, "#<TransientSet>"),
+        Value::TransientVector(_) => write!(f, "#<TransientVector>"),
     }
 }
 
@@ -1038,6 +1046,9 @@ impl Value {
             Value::CharArray(_) => "char-array",
             Value::ObjectArray(_) => "object-array",
             Value::Resource(r) => r.resource_type(),
+            Value::TransientMap(_) => "transient-map",
+            Value::TransientSet(_) => "transient-set",
+            Value::TransientVector(_) => "transient-vector",
         }
     }
 
@@ -1135,6 +1146,9 @@ impl cljrs_gc::Trace for Value {
             | Value::CharArray(_) => {}
             // Resource is Arc-ref-counted, not GcPtr — nothing to trace.
             Value::Resource(_) => {}
+            Value::TransientMap(m) => visitor.visit(m),
+            Value::TransientVector(p) => visitor.visit(p),
+            Value::TransientSet(m) => visitor.visit(m),
         }
     }
 }
@@ -1558,5 +1572,8 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::ObjectArray(_) => 37,
         Value::Uuid(_) => 38,
         Value::Resource(_) => 39,
+        Value::TransientMap(_) => 40,
+        Value::TransientSet(_) => 41,
+        Value::TransientVector(_) => 42,
     }
 }

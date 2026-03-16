@@ -6,6 +6,9 @@ pub mod queue;
 pub mod sorted_map;
 pub mod sorted_set;
 pub mod vector;
+pub mod transient_map;
+pub mod transient_vector;
+pub mod transient_set;
 
 pub use array_map::PersistentArrayMap;
 pub use hash_map::PersistentHashMap;
@@ -15,3 +18,6 @@ pub use queue::PersistentQueue;
 pub use sorted_map::SortedMap;
 pub use sorted_set::SortedSet;
 pub use vector::PersistentVector;
+pub use transient_map::TransientMap;
+pub use transient_set::TransientSet;
+pub use transient_vector::TransientVector;

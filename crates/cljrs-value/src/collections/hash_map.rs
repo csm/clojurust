@@ -91,6 +91,10 @@ impl PersistentHashMap {
     pub fn from_array_map(am: &PersistentArrayMap) -> Self {
         Self::from_pairs(am.iter().map(|(k, v)| (k.clone(), v.clone())))
     }
+    
+    pub fn inner(&self) -> &HashTrieMapSync<Value, Value> {
+        &self.inner
+    }
 }
 
 impl PartialEq for PersistentHashMap {

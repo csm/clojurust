@@ -12,6 +12,10 @@ impl PersistentHashSet {
             inner: rpds::HashTrieSetSync::new_sync(),
         }
     }
+    
+    pub fn from_set(set: rpds::HashTrieSetSync<Value>) -> Self {
+        Self { inner: set }
+    }
 
     pub fn count(&self) -> usize {
         self.inner.size()
@@ -47,6 +51,10 @@ impl PersistentHashSet {
     /// Iterate over all elements in an unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
+    }
+    
+    pub fn inner(&self) -> &rpds::HashTrieSetSync<Value> {
+        &self.inner
     }
 }
 
