@@ -171,6 +171,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("float?", Arity::Fixed(1), builtin_float_q),
         ("double?", Arity::Fixed(1), builtin_double_q),
         ("decimal?", Arity::Fixed(1), builtin_decimal_q),
+        ("rational?", Arity::Fixed(1), builtin_rational_q),
         ("string?", Arity::Fixed(1), builtin_string_q),
         ("keyword?", Arity::Fixed(1), builtin_keyword_q),
         ("symbol?", Arity::Fixed(1), builtin_symbol_q),
@@ -192,6 +193,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("odd?", Arity::Fixed(1), builtin_odd_q),
         ("ratio?", Arity::Fixed(1), builtin_ratio_q),
         ("sorted?", Arity::Fixed(1), builtin_sorted_q),
+        ("special-symbol?", Arity::Fixed(1), builtin_special_symbol_q),
         ("bigdec", Arity::Fixed(1), builtin_bigdec),
         ("bigint", Arity::Fixed(1), builtin_bigint),
         // Collections (non-HOF)
@@ -1950,6 +1952,13 @@ fn builtin_decimal_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::BigDecimal(_))))
 }
 
+fn builtin_rational_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(
+        args[0],
+        Value::Long(_) | Value::BigInt(_) | Value::Ratio(_) | Value::BigDecimal(_)
+    )))
+}
+
 fn builtin_float_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(args[0], Value::Double(_))))
 }
@@ -2114,6 +2123,16 @@ fn builtin_sorted_q(args: &[Value]) -> ValueResult<Value> {
         matches!(&args[0], Value::Map(MapValue::Sorted(_)))
             || matches!(&args[0], Value::Set(SetValue::Sorted(_))),
     ))
+}
+
+fn builtin_special_symbol_q(args: &[Value]) -> ValueResult<Value> {
+    let is_special = match &args[0] {
+        Value::Symbol(sym) if sym.get().namespace.is_none() => {
+            crate::special::SPECIAL_FORMS.contains(&sym.get().name.as_ref())
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(is_special))
 }
 
 fn builtin_bigdec(args: &[Value]) -> ValueResult<Value> {
