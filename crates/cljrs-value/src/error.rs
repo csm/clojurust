@@ -39,7 +39,7 @@ pub enum ValueError {
     TransientAlreadyPersisted,
 
     #[error("could not parse value")]
-    Parse
+    Parse,
 }
 
 pub type ValueResult<T> = Result<T, ValueError>;

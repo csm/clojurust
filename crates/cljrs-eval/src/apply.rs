@@ -99,6 +99,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             "alter-meta!" => return handle_alter_meta(arg_forms, env),
             "ns-resolve" => return handle_ns_resolve(arg_forms, env),
             "resolve" => return handle_resolve(arg_forms, env),
+            "intern" => return handle_intern(arg_forms, env),
             _ => {}
         }
     }
@@ -1034,4 +1035,47 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         Some(var_ptr) => Value::Var(var_ptr),
         None => Value::Nil,
     })
+}
+
+fn handle_intern(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 || arg_forms.len() > 3 {
+        return Err(EvalError::Runtime("intern expects 2 or 3 arguments".into()));
+    }
+    let ns_val = eval(&arg_forms[0], env)?;
+    let ns_name: Arc<str> = match &ns_val {
+        Value::Symbol(s) => s.get().name.clone(),
+        Value::Namespace(ns) => ns.get().name.clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "intern: first arg must be namespace or symbol, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let var_name: Arc<str> = match eval(&arg_forms[1], env)? {
+        Value::Symbol(s) => s.get().name.clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "intern: second arg must be symbol, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let var = if arg_forms.len() == 3 {
+        let val = eval(&arg_forms[2], env)?;
+        env.globals.intern(&ns_name, var_name, val)
+    } else {
+        // Intern without a value — just create the var if it doesn't exist
+        let ns = env.globals.get_or_create_ns(&ns_name);
+        let mut interns = ns.get().interns.lock().unwrap();
+        if let Some(var) = interns.get(&var_name) {
+            var.clone()
+        } else {
+            let var =
+                cljrs_gc::GcPtr::new(cljrs_value::Var::new(ns_name.clone(), var_name.clone()));
+            interns.insert(var_name, var.clone());
+            var
+        }
+    };
+    Ok(Value::Var(var))
 }

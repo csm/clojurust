@@ -12,7 +12,7 @@ impl PersistentVector {
             inner: rpds::VectorSync::new_sync(),
         }
     }
-    
+
     pub fn from_vector(vector: rpds::VectorSync<Value>) -> Self {
         Self { inner: vector }
     }
@@ -64,7 +64,7 @@ impl PersistentVector {
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
     }
-    
+
     pub fn inner(&self) -> &rpds::VectorSync<Value> {
         &self.inner
     }

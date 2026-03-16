@@ -1,7 +1,7 @@
+use crate::hash::hash_combine_ordered;
+use crate::{ClojureHash, PersistentVector, Value, ValueError, ValueResult};
 use std::hash::Hash;
 use std::sync::Mutex;
-use crate::{ClojureHash, PersistentVector, Value, ValueError, ValueResult};
-use crate::hash::hash_combine_ordered;
 
 #[derive(Debug)]
 pub struct TransientVector {

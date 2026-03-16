@@ -1,27 +1,27 @@
+use crate::hash::hash_combine_unordered;
+use crate::{ClojureHash, PersistentHashSet, PersistentVector, Value, ValueError, ValueResult};
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Mutex;
-use crate::{ClojureHash, PersistentHashSet, PersistentVector, Value, ValueError, ValueResult};
-use crate::hash::hash_combine_unordered;
 
 #[derive(Debug)]
 pub struct TransientSet {
     set: Mutex<rpds::HashTrieSetSync<Value>>,
-    persisted: Mutex<bool>
+    persisted: Mutex<bool>,
 }
 
 impl TransientSet {
     pub fn new() -> Self {
         TransientSet {
             set: Mutex::new(Default::default()),
-            persisted: Mutex::new(false)
+            persisted: Mutex::new(false),
         }
     }
 
     pub fn new_from_set(set: &rpds::HashTrieSetSync<Value>) -> TransientSet {
         TransientSet {
             set: Mutex::new(set.clone()),
-            persisted: Mutex::new(false)
+            persisted: Mutex::new(false),
         }
     }
 
@@ -32,7 +32,7 @@ impl TransientSet {
         self.set.lock().unwrap().insert_mut(value.clone());
         Ok(())
     }
-    
+
     pub fn disj(&self, value: &Value) -> ValueResult<()> {
         if *self.persisted.lock().unwrap() {
             return Err(ValueError::TransientAlreadyPersisted);
@@ -40,7 +40,7 @@ impl TransientSet {
         self.set.lock().unwrap().remove_mut(value);
         Ok(())
     }
-    
+
     pub fn persistent(&self) -> ValueResult<PersistentHashSet> {
         let set = self.set.lock().unwrap();
         let mut persisted = self.persisted.lock().unwrap();
@@ -56,7 +56,7 @@ impl Clone for TransientSet {
     fn clone(&self) -> Self {
         Self {
             set: Mutex::new(self.set.lock().unwrap().clone()),
-            persisted: Mutex::new(*self.persisted.lock().unwrap())
+            persisted: Mutex::new(*self.persisted.lock().unwrap()),
         }
     }
 }

@@ -183,6 +183,7 @@ pub struct Atom {
     pub value: Mutex<Value>,
     pub meta: Mutex<Option<Value>>,
     pub validator: Mutex<Option<Value>>,
+    pub watches: Mutex<Vec<(Value, Value)>>,
 }
 
 impl Atom {
@@ -191,6 +192,7 @@ impl Atom {
             value: Mutex::new(v),
             meta: Mutex::new(None),
             validator: Mutex::new(None),
+            watches: Mutex::new(Vec::new()),
         }
     }
 
@@ -229,6 +231,10 @@ impl cljrs_gc::Trace for Atom {
         }
         if let Some(vf) = self.validator.lock().unwrap().as_ref() {
             vf.trace(visitor);
+        }
+        for (key, f) in self.watches.lock().unwrap().iter() {
+            key.trace(visitor);
+            f.trace(visitor);
         }
     }
 }

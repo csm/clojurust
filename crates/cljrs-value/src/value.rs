@@ -7,7 +7,10 @@ use num_traits::ToPrimitive;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 
-use crate::collections::{PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector};
+use crate::collections::{
+    PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
+    PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector,
+};
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
 };

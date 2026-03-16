@@ -740,3 +740,15 @@
   (let [n (rand-int (count coll))]
     (nth coll n)))
 
+(defmacro when-first
+  [bindings & body]
+  (let [x (first bindings)
+        xs (second bindings)]
+    (list 'when-let [(first bindings) (list 'seq (second bindings))]
+      (list* 'let [(first bindings) (list 'first (first bindings))]
+        body))))
+
+(defmacro bound-fn
+  [& fntail]
+  (list 'bound-fn* (cons 'fn fntail)))
+

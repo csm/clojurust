@@ -1,8 +1,8 @@
+use crate::util::numeric_as_i64;
 use cljrs_gc::GcPtr;
-use cljrs_value::{MapValue, Value, ValueError, ValueResult};
 use cljrs_value::collections::{TransientMap, TransientSet, TransientVector};
 use cljrs_value::value::SetValue;
-use crate::util::numeric_as_i64;
+use cljrs_value::{MapValue, Value, ValueError, ValueResult};
 
 pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
@@ -13,31 +13,35 @@ pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
             }
             Ok(Value::TransientMap(GcPtr::new(map)))
         }
-        Value::Map(MapValue::Hash(m)) =>
-            Ok(Value::TransientMap(GcPtr::new(TransientMap::new_from_map(m.get().inner())))),
-        Value::Set(SetValue::Hash(s)) =>
-            Ok(Value::TransientSet(GcPtr::new(TransientSet::new_from_set(s.get().inner())))),
-        Value::Vector(v) =>
-            Ok(Value::TransientVector(GcPtr::new(TransientVector::new_from_vector(v.get().inner())))),
+        Value::Map(MapValue::Hash(m)) => Ok(Value::TransientMap(GcPtr::new(
+            TransientMap::new_from_map(m.get().inner()),
+        ))),
+        Value::Set(SetValue::Hash(s)) => Ok(Value::TransientSet(GcPtr::new(
+            TransientSet::new_from_set(s.get().inner()),
+        ))),
+        Value::Vector(v) => Ok(Value::TransientVector(GcPtr::new(
+            TransientVector::new_from_vector(v.get().inner()),
+        ))),
         v => Err(ValueError::WrongType {
             expected: "editable",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
 pub fn builtin_persistent_bang(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::TransientMap(m) =>
-            Ok(Value::Map(MapValue::Hash(GcPtr::new(m.get().persistent()?)))),
-        Value::TransientSet(s) =>
-            Ok(Value::Set(SetValue::Hash(GcPtr::new(s.get().persistent()?)))),
-        Value::TransientVector(v) =>
-            Ok(Value::Vector(GcPtr::new(v.get().persistent()?))),
+        Value::TransientMap(m) => Ok(Value::Map(MapValue::Hash(GcPtr::new(
+            m.get().persistent()?,
+        )))),
+        Value::TransientSet(s) => Ok(Value::Set(SetValue::Hash(GcPtr::new(
+            s.get().persistent()?,
+        )))),
+        Value::TransientVector(v) => Ok(Value::Vector(GcPtr::new(v.get().persistent()?))),
         v => Err(ValueError::WrongType {
             expected: "transient",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -68,7 +72,7 @@ pub fn builtin_assoc_bang(args: &[Value]) -> ValueResult<Value> {
                     return Err(ValueError::IndexOutOfBounds {
                         idx: k,
                         count: v.get().count(),
-                    })
+                    });
                 }
             }
             if args.len() % 2 == 0 {
@@ -81,17 +85,15 @@ pub fn builtin_assoc_bang(args: &[Value]) -> ValueResult<Value> {
                     return Err(ValueError::IndexOutOfBounds {
                         idx: k,
                         count: v.get().count(),
-                    })
+                    });
                 }
             }
             Ok(args[0].clone())
         }
-        v => {
-            Err(ValueError::WrongType {
-                expected: "transient",
-                got: v.type_name().to_string(),
-            })
-        }
+        v => Err(ValueError::WrongType {
+            expected: "transient",
+            got: v.type_name().to_string(),
+        }),
     }
 }
 
@@ -118,7 +120,7 @@ pub fn builtin_conj_bang(args: &[Value]) -> ValueResult<Value> {
                         return Err(ValueError::WrongType {
                             expected: "map-entry",
                             got: v.type_name().to_string(),
-                        })
+                        });
                     }
                 }
             }
@@ -140,7 +142,7 @@ pub fn builtin_conj_bang(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "transient",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -155,7 +157,7 @@ pub fn builtin_disj_bang(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "transient-set",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -170,7 +172,7 @@ pub fn builtin_dissoc_bang(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "transient-map",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -183,6 +185,6 @@ pub fn builtin_pop_bang(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "transient-vector",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }

@@ -1,8 +1,8 @@
-use std::ops::{Div, Mul};
 use bigdecimal::BigDecimal;
+use cljrs_value::{Value, ValueError, ValueResult};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
-use cljrs_value::{Value, ValueError, ValueResult};
+use std::ops::{Div, Mul};
 
 pub fn bigdec_to_i64(d: &BigDecimal) -> ValueResult<i64> {
     let (num, exp) = d.as_bigint_and_exponent();

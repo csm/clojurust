@@ -1,9 +1,9 @@
-use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use cljrs_gc::GcPtr;
-use crate::{ClojureHash, MapValue, PersistentHashMap, Value, ValueError, ValueResult};
 use crate::hash::{hash_combine_ordered, hash_combine_unordered};
+use crate::{ClojureHash, MapValue, PersistentHashMap, Value, ValueError, ValueResult};
+use cljrs_gc::GcPtr;
+use std::hash::Hash;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub struct TransientMap {
@@ -27,8 +27,8 @@ impl TransientMap {
     }
 
     pub fn assoc(&self, key: Value, value: Value) -> ValueResult<()> {
-        if *self.persisted.lock().unwrap()  {
-            return Err(ValueError::TransientAlreadyPersisted)
+        if *self.persisted.lock().unwrap() {
+            return Err(ValueError::TransientAlreadyPersisted);
         }
         let mut map = self.map.lock().unwrap();
         map.insert_mut(key.clone(), value.clone());
@@ -37,7 +37,7 @@ impl TransientMap {
 
     pub fn dissoc(&self, key: &Value) -> ValueResult<()> {
         if *self.persisted.lock().unwrap() {
-            return Err(ValueError::TransientAlreadyPersisted)
+            return Err(ValueError::TransientAlreadyPersisted);
         }
         let mut map = self.map.lock().unwrap();
         map.remove_mut(key);
@@ -48,7 +48,7 @@ impl TransientMap {
         let map = self.map.lock().unwrap();
         let mut persisted = self.persisted.lock().unwrap();
         if *persisted {
-            return Err(ValueError::TransientAlreadyPersisted)
+            return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
         Ok(PersistentHashMap::new(map.clone()))
@@ -68,7 +68,10 @@ impl ClojureHash for TransientMap {
     fn clojure_hash(&self) -> u32 {
         let mut hash: u32 = 0;
         for (k, v) in self.map.lock().unwrap().iter() {
-            hash = hash_combine_unordered(hash, hash_combine_ordered(k.clojure_hash(), v.clojure_hash()));
+            hash = hash_combine_unordered(
+                hash,
+                hash_combine_ordered(k.clojure_hash(), v.clojure_hash()),
+            );
         }
         hash
     }

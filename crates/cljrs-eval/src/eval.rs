@@ -244,6 +244,7 @@ fn is_jvm_class_name(s: &str) -> bool {
             | "clojure.lang.PersistentArrayMap"
             | "clojure.lang.IFn"
             | "clojure.lang.ISeq"
+            | "clojure.lang.IPending"
             | "clojure.lang.Atom"
             | "clojure.lang.Var"
             | "clojure.lang.Namespace"

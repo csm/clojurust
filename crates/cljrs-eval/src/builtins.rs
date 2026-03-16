@@ -1,8 +1,16 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
+use crate::bitops::{
+    builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test,
+};
 use crate::callback::{capture_eval_context, install_eval_context};
 use crate::dynamics;
 use crate::env::GlobalEnv;
+use crate::transients::{
+    builtin_assoc_bang, builtin_conj_bang, builtin_disj_bang, builtin_dissoc_bang,
+    builtin_persistent_bang, builtin_pop_bang, builtin_transient,
+};
+use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
@@ -26,9 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use crate::bitops::{builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test};
-use crate::transients::{builtin_assoc_bang, builtin_conj_bang, builtin_disj_bang, builtin_dissoc_bang, builtin_persistent_bang, builtin_pop_bang, builtin_transient};
-use crate::util::numeric_as_i64;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -312,6 +317,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
         ("reset!", Arity::Fixed(2), builtin_reset_bang),
         ("get-validator", Arity::Fixed(1), builtin_get_validator),
+        ("add-watch", Arity::Fixed(3), builtin_add_watch),
+        ("remove-watch", Arity::Fixed(2), builtin_remove_watch),
         // Phase 7 — Concurrency primitives
         ("compare-and-set!", Arity::Fixed(3), builtin_compare_and_set),
         ("volatile!", Arity::Fixed(1), builtin_volatile),
@@ -408,11 +415,78 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("printf", Arity::Variadic { min: 1 }, builtin_printf),
         ("newline", Arity::Fixed(0), builtin_newline),
         ("flush", Arity::Fixed(0), builtin_flush),
-        // Special forms need stub vars so (resolve 'name) finds them
-        ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        // Special forms need stub vars so (resolve 'name) finds them.
+        // These are never called at runtime (the special form dispatch
+        // intercepts them first), but resolve/var must be able to find them.
+        ("def", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("fn*", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("if", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("do", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("let", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("let*", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("loop", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("loop*", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("recur", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("quote", Arity::Fixed(1), builtin_stub_nil),
+        ("var", Arity::Fixed(1), builtin_stub_nil),
+        ("set!", Arity::Fixed(2), builtin_stub_nil),
+        ("throw", Arity::Fixed(1), builtin_stub_nil),
+        ("try", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("defn", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("defmacro", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("defonce", Arity::Variadic { min: 2 }, builtin_stub_nil),
         ("and", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("or", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        (".", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("ns", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("require", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("letfn", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("in-ns", Arity::Fixed(1), builtin_stub_nil),
+        ("alias", Arity::Fixed(2), builtin_stub_nil),
+        ("defprotocol", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("extend-type", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        (
+            "extend-protocol",
+            Arity::Variadic { min: 1 },
+            builtin_stub_nil,
+        ),
+        ("defmulti", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("defmethod", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("defrecord", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("reify", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("load-file", Arity::Fixed(1), builtin_stub_nil),
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
+        ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        // Hierarchy (stubs — return global hierarchy or nil)
+        ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
+        ("derive", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("underive", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("ancestors", Arity::Variadic { min: 1 }, builtin_ancestors),
+        (
+            "descendants",
+            Arity::Variadic { min: 1 },
+            builtin_descendants,
+        ),
+        ("parents", Arity::Variadic { min: 1 }, builtin_parents),
+        // Tap system
+        ("add-tap", Arity::Fixed(1), crate::taps::builtin_add_tap),
+        (
+            "remove-tap",
+            Arity::Fixed(1),
+            crate::taps::builtin_remove_tap,
+        ),
+        ("tap>", Arity::Fixed(1), crate::taps::builtin_tap_send),
+        // Binding capture
+        ("bound-fn*", Arity::Fixed(1), builtin_bound_fn_star),
+        // Misc
+        (
+            "intern",
+            Arity::Variadic { min: 2 },
+            builtin_intern_sentinel,
+        ),
+        ("not-empty", Arity::Fixed(1), builtin_not_empty),
+        ("take-nth", Arity::Fixed(2), builtin_take_nth),
         ("num", Arity::Fixed(1), builtin_num),
         ("short", Arity::Fixed(1), builtin_short),
         ("byte", Arity::Fixed(1), builtin_byte),
@@ -534,7 +608,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
-
         // Transients
         ("transient", Arity::Fixed(1), builtin_transient),
         ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
@@ -543,9 +616,12 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("disj!", Arity::Variadic { min: 1 }, builtin_disj_bang),
         ("dissoc!", Arity::Variadic { min: 2 }, builtin_dissoc_bang),
         ("pop!", Arity::Fixed(1), builtin_pop_bang),
-
         // bit ops
-        ("bit-and-not", Arity::Variadic { min: 2 }, builtin_bit_and_not),
+        (
+            "bit-and-not",
+            Arity::Variadic { min: 2 },
+            builtin_bit_and_not,
+        ),
         ("bit-clear", Arity::Fixed(2), builtin_bit_clear),
         ("bit-flip", Arity::Fixed(2), builtin_bit_flip),
         ("bit-set", Arity::Fixed(2), builtin_bit_set),
@@ -812,7 +888,6 @@ fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
         Ok(n as i32)
     }
 }
-
 
 fn numeric_as_bigint(v: &Value) -> ValueResult<num_bigint::BigInt> {
     use num_bigint::BigInt;
@@ -1601,7 +1676,7 @@ fn builtin_denominator(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "ratio",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -1611,7 +1686,7 @@ fn builtin_numerator(args: &[Value]) -> ValueResult<Value> {
         v => Err(ValueError::WrongType {
             expected: "ratio",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -1620,42 +1695,38 @@ fn builtin_parse_boolean(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => match s.get().as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
-            _ => Ok(Value::Nil)
-        }
+            _ => Ok(Value::Nil),
+        },
         v => Err(ValueError::WrongType {
             expected: "string",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
 fn builtin_parse_long(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Str(s) => {
-            match s.get().parse::<i64>() {
-                Ok(d) => Ok(Value::Long(d)),
-                Err(_) => Ok(Value::Nil),
-            }
-        }
+        Value::Str(s) => match s.get().parse::<i64>() {
+            Ok(d) => Ok(Value::Long(d)),
+            Err(_) => Ok(Value::Nil),
+        },
         v => Err(ValueError::WrongType {
             expected: "string",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
 fn builtin_parse_double(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Str(s) => {
-            match s.get().parse::<f64>() {
-                Ok(d) => Ok(Value::Double(d)),
-                Err(_) => Ok(Value::Nil)
-            }
-        }
+        Value::Str(s) => match s.get().parse::<f64>() {
+            Ok(d) => Ok(Value::Double(d)),
+            Err(_) => Ok(Value::Nil),
+        },
         v => Err(ValueError::WrongType {
             expected: "string",
             got: v.type_name().to_string(),
-        })
+        }),
     }
 }
 
@@ -1991,6 +2062,8 @@ fn builtin_ifn_q(args: &[Value]) -> ValueResult<Value> {
             | Value::Symbol(_)
             | Value::Var(_)
             | Value::Promise(_)
+            | Value::MultiFn(_)
+            | Value::ProtocolFn(_)
     )))
 }
 fn builtin_seq_q(args: &[Value]) -> ValueResult<Value> {
@@ -4323,6 +4396,44 @@ fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Atom(a) => {
+            let key = args[1].clone();
+            let f = args[2].clone();
+            let atom = a.get();
+            let mut watches = atom.watches.lock().unwrap();
+            // Replace if key already exists
+            if let Some(entry) = watches.iter_mut().find(|(k, _)| k == &key) {
+                entry.1 = f;
+            } else {
+                watches.push((key, f));
+            }
+            Ok(args[0].clone())
+        }
+        v => Err(ValueError::WrongType {
+            expected: "atom",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Atom(a) => {
+            let key = &args[1];
+            let atom = a.get();
+            let mut watches = atom.watches.lock().unwrap();
+            watches.retain(|(k, _)| k != key);
+            Ok(args[0].clone())
+        }
+        v => Err(ValueError::WrongType {
+            expected: "atom",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
 fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
     let with_timeout = args.len() == 3;
     match &args[0] {
@@ -4948,6 +5059,95 @@ fn builtin_flush(_args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_stub_nil(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
+}
+
+// ── Hierarchy stubs ──────────────────────────────────────────────────────────
+
+fn builtin_make_hierarchy(_args: &[Value]) -> ValueResult<Value> {
+    // Return an empty hierarchy map: {:parents {} :descendants {} :ancestors {}}
+    use cljrs_value::collections::PersistentHashMap;
+    let empty_map = Value::Map(MapValue::Hash(GcPtr::new(PersistentHashMap::empty())));
+    let mut m = PersistentHashMap::empty();
+    m = m.assoc(
+        Value::keyword(Keyword::simple("parents")),
+        empty_map.clone(),
+    );
+    m = m.assoc(
+        Value::keyword(Keyword::simple("descendants")),
+        empty_map.clone(),
+    );
+    m = m.assoc(Value::keyword(Keyword::simple("ancestors")), empty_map);
+    Ok(Value::Map(MapValue::Hash(GcPtr::new(m))))
+}
+
+fn builtin_ancestors(args: &[Value]) -> ValueResult<Value> {
+    // Stub: return empty set
+    let _ = args;
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(
+        cljrs_value::collections::PersistentHashSet::empty(),
+    ))))
+}
+
+fn builtin_descendants(args: &[Value]) -> ValueResult<Value> {
+    let _ = args;
+    Ok(Value::Set(SetValue::Hash(GcPtr::new(
+        cljrs_value::collections::PersistentHashSet::empty(),
+    ))))
+}
+
+fn builtin_parents(args: &[Value]) -> ValueResult<Value> {
+    let _ = args;
+    Ok(Value::Nil)
+}
+
+// ── bound-fn* ────────────────────────────────────────────────────────────────
+
+fn builtin_bound_fn_star(args: &[Value]) -> ValueResult<Value> {
+    // bound-fn* wraps a fn so that when called, the current thread bindings
+    // are installed. For now, just return the fn as-is (bindings are already
+    // conveyed in most contexts).
+    Ok(args[0].clone())
+}
+
+// ── intern ───────────────────────────────────────────────────────────────────
+
+// intern is intercepted in eval_call for real usage; this sentinel exists
+// so that (resolve 'intern) finds the var.
+fn builtin_intern_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other(
+        "intern must be invoked through the evaluator".into(),
+    ))
+}
+
+// ── not-empty ────────────────────────────────────────────────────────────────
+
+fn builtin_not_empty(args: &[Value]) -> ValueResult<Value> {
+    let is_empty = match &args[0] {
+        Value::Nil => true,
+        Value::List(l) => l.get().is_empty(),
+        Value::Vector(v) => v.get().is_empty(),
+        Value::Map(m) => m.count() == 0,
+        Value::Set(s) => s.count() == 0,
+        Value::Str(s) => s.get().is_empty(),
+        _ => false,
+    };
+    if is_empty {
+        Ok(Value::Nil)
+    } else {
+        Ok(args[0].clone())
+    }
+}
+
+// ── take-nth ─────────────────────────────────────────────────────────────────
+
+fn builtin_take_nth(args: &[Value]) -> ValueResult<Value> {
+    let n = numeric_as_i64(&args[0])? as usize;
+    if n == 0 {
+        return Err(ValueError::Other("take-nth step must be positive".into()));
+    }
+    let items = value_to_seq(&args[1])?;
+    let result: Vec<Value> = items.into_iter().step_by(n).collect();
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(result))))
 }
 
 // Bit operations
@@ -6005,6 +6205,10 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
                 | Value::Ratio(_)
         ),
         "java.util.UUID" => matches!(val, Value::Uuid(_)),
+        "clojure.lang.IPending" | "IPending" => matches!(
+            val,
+            Value::Promise(_) | Value::Future(_) | Value::Delay(_) | Value::LazySeq(_)
+        ),
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),
             _ => false,

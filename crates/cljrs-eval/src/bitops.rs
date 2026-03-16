@@ -1,5 +1,5 @@
-use cljrs_value::{Value, ValueResult};
 use crate::util::numeric_as_i64;
+use cljrs_value::{Value, ValueResult};
 
 pub fn builtin_bit_and_not(args: &[Value]) -> ValueResult<Value> {
     let mut result = numeric_as_i64(&args[0])?;

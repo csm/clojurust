@@ -13,6 +13,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod apply;
+mod bitops;
 pub mod builtins;
 pub mod callback;
 pub mod destructure;
@@ -24,9 +25,9 @@ pub mod loader;
 pub mod macros;
 pub mod special;
 pub mod syntax_quote;
+pub mod taps;
 mod transients;
 mod util;
-mod bitops;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};

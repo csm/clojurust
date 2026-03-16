@@ -12,7 +12,7 @@ impl PersistentHashSet {
             inner: rpds::HashTrieSetSync::new_sync(),
         }
     }
-    
+
     pub fn from_set(set: rpds::HashTrieSetSync<Value>) -> Self {
         Self { inner: set }
     }
@@ -52,7 +52,7 @@ impl PersistentHashSet {
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
     }
-    
+
     pub fn inner(&self) -> &rpds::HashTrieSetSync<Value> {
         &self.inner
     }
