@@ -9,6 +9,7 @@
       (are [arg] (special-symbol? 'arg)
                  ;; Basilisp does not recognize these as special symbols.
                  #?@(:lpy [catch
+                           finally
                            deftype*
                            letfn*]
                      :rust [] ; rust has even fewer
@@ -18,7 +19,6 @@
                  .
                  def
                  do
-                 finally
                  fn*
                  if
                  let*
