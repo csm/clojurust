@@ -255,6 +255,7 @@ fn is_jvm_class_name(s: &str) -> bool {
             | "Exception"
             | "Throwable"
             | "Error"
+            | "clojure.lang.ExceptionInfo"
     )
 }
 
