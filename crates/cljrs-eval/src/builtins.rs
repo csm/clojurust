@@ -394,6 +394,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("clojure-version", Arity::Fixed(0), builtin_clojure_version),
         ("rand", Arity::Variadic { min: 0 }, builtin_rand),
         ("rand-int", Arity::Fixed(1), builtin_rand_int),
+        ("random-sample", Arity::Fixed(2), builtin_random_sample),
         ("sort", Arity::Variadic { min: 1 }, builtin_sort),
         ("sort-by", Arity::Variadic { min: 2 }, builtin_sort_by),
         ("sorted-set", Arity::Variadic { min: 0 }, builtin_sorted_set),
@@ -5134,8 +5135,33 @@ fn builtin_rand(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_rand_int(args: &[Value]) -> ValueResult<Value> {
     let n = numeric_as_i64(&args[0])?;
-    let r = rand::random::<i64>().abs();
-    Ok(Value::Long(r % n)) // stub
+    if n == 0 {
+        Ok(Value::Long(0))
+    } else {
+        let r = rand::random::<i64>().abs();
+        Ok(Value::Long(r % n))
+    }
+}
+
+fn builtin_random_sample(args: &[Value]) -> ValueResult<Value> {
+    let prob = match &args[0] {
+        Value::Double(d) => *d,
+        Value::Long(n) => *n as f64,
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "number",
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    let items = value_to_seq(&args[1])?;
+    let mut result = Vec::new();
+    for item in items {
+        if rand::random::<f64>() < prob {
+            result.push(item);
+        }
+    }
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(result))))
 }
 
 fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {

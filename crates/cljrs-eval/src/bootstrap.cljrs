@@ -734,3 +734,9 @@
   (+' x -1))
 
 (defn ident? [x] (or (symbol? x) (keyword? x)))
+
+(defn rand-nth
+  [coll]
+  (let [n (rand-int (count coll))]
+    (nth coll n)))
+
