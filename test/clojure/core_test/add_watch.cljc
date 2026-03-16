@@ -147,6 +147,7 @@
 
     #?(:cljs nil
        :lpy nil
+       :rust nil
        :default
        (testing "watch ref"
          (let [state (volatile! [])
