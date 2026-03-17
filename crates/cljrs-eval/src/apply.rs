@@ -1139,12 +1139,28 @@ fn handle_intern(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             )));
         }
     };
+    // Namespace must already exist (Clojure throws if it doesn't)
+    let ns = {
+        let map = env.globals.namespaces.read().unwrap();
+        map.get(ns_name.as_ref()).cloned()
+    };
+    let ns = ns.ok_or_else(|| {
+        EvalError::Runtime(format!("No namespace: {ns_name} found"))
+    })?;
     let var = if arg_forms.len() == 3 {
         let val = eval(&arg_forms[2], env)?;
-        env.globals.intern(&ns_name, var_name, val)
+        let mut interns = ns.get().interns.lock().unwrap();
+        if let Some(var) = interns.get(&var_name) {
+            var.get().bind(val);
+            var.clone()
+        } else {
+            let var =
+                cljrs_gc::GcPtr::new(cljrs_value::Var::new(ns_name.clone(), var_name.clone()));
+            var.get().bind(val);
+            interns.insert(var_name, var.clone());
+            var
+        }
     } else {
-        // Intern without a value — just create the var if it doesn't exist
-        let ns = env.globals.get_or_create_ns(&ns_name);
         let mut interns = ns.get().interns.lock().unwrap();
         if let Some(var) = interns.get(&var_name) {
             var.clone()
