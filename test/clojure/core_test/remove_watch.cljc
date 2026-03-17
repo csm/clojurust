@@ -104,6 +104,10 @@
        :lpy
        nil
 
+       ;; Rust doesn't have refs either yet.
+       :rust
+       nil
+
        :default
        (testing "remove watch refs"
          (let [messages (volatile! #{})
