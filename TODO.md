@@ -471,6 +471,10 @@ Pattern: `(map f (map g xs))`, lower to single loop.
   - [ ] `amap` and `areduce`.
   - [ ] Multi-dimensional aset variants.
 - [ ] Implement `sorted-map-by` and `sorted-set-by`.
+- [ ] Implement hierarchies `ancestors`, `descendants`, `derive`, `underive` etc.
+- [ ] Implement `ref` and STM.
+- [ ] Implement "core" namespaces `clojure.data`, `clojure.walk`, `clojure.zip`, `clojure.pprint`.
+- [ ] Implement `transduce` and transducer variants of common higher-order functions.
 
 ---
 
