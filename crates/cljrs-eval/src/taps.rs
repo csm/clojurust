@@ -133,10 +133,8 @@ pub fn builtin_tap_send(args: &[Value]) -> ValueResult<Value> {
         }
         spawn
     };
-    if should_spawn {
-        if let Some((globals, ns)) = capture_eval_context() {
-            spawn_drain_thread(globals, ns);
-        }
+    if should_spawn && let Some((globals, ns)) = capture_eval_context() {
+        spawn_drain_thread(globals, ns);
     }
     let (_, cvar) = &*TAP;
     cvar.notify_one();

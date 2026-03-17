@@ -17,8 +17,8 @@ pub use keyword::Keyword;
 pub use resource::{Resource, ResourceHandle};
 pub use symbol::Symbol;
 pub use types::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture, CljxPromise,
-    Delay, DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnPtr, Protocol,
-    ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
+    Agent, AgentFn, AgentMsg, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture,
+    CljxPromise, Delay, DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn,
+    NativeFnPtr, Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
 };
 pub use value::{MapValue, ObjectArray, TypeInstance, Value};

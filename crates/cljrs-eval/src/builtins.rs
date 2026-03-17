@@ -4422,7 +4422,7 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
             return Err(ValueError::WrongType {
                 expected: "atom, var, or agent",
                 got: v.type_name().to_string(),
-            })
+            });
         }
     }
     Ok(args[0].clone())
@@ -4438,7 +4438,7 @@ fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
             return Err(ValueError::WrongType {
                 expected: "atom, var, or agent",
                 got: v.type_name().to_string(),
-            })
+            });
         }
     }
     Ok(args[0].clone())
@@ -5139,10 +5139,12 @@ fn builtin_not_empty(args: &[Value]) -> ValueResult<Value> {
         Value::Map(m) => m.count() == 0,
         Value::Set(s) => s.count() == 0,
         Value::Str(s) => s.get().is_empty(),
-        v => return Err(ValueError::WrongType {
-            expected: "seqable",
-            got: v.type_name().to_string()
-        }),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "seqable",
+                got: v.type_name().to_string(),
+            });
+        }
     };
     if is_empty {
         Ok(Value::Nil)

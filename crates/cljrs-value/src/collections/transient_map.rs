@@ -1,9 +1,14 @@
+/*
+ * transient_map.rs -- implementation of transient maps.
+ * Copyright (C) 2026 Casey Marshall
+ *
+ * This file is licensed under the Eclipse Public License, Version 1,
+ * the same license as Clojure.
+ */
+
 use crate::hash::{hash_combine_ordered, hash_combine_unordered};
-use crate::{ClojureHash, MapValue, PersistentHashMap, Value, ValueError, ValueResult};
-use cljrs_gc::GcPtr;
-use std::hash::Hash;
+use crate::{ClojureHash, PersistentHashMap, Value, ValueError, ValueResult};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub struct TransientMap {
@@ -82,6 +87,13 @@ impl cljrs_gc::Trace for TransientMap {
         let map = self.map.lock().unwrap();
         for (k, v) in map.iter() {
             k.trace(visitor);
+            v.trace(visitor);
         }
+    }
+}
+
+impl Default for TransientMap {
+    fn default() -> Self {
+        Self::new()
     }
 }

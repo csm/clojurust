@@ -609,7 +609,7 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
                 call_args.extend(extra);
                 let mut call_env = Env::new(globals, &ns);
                 let new_val =
-                    apply_value(&f, call_args, &mut call_env).map_err(|e| eval_error_to_value(e))?;
+                    apply_value(&f, call_args, &mut call_env).map_err(eval_error_to_value)?;
                 // Fire watches (agent watches fire on the agent thread)
                 fire_watches(
                     &agent_clone.get().watches,
@@ -1153,9 +1153,7 @@ fn handle_intern(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         let map = env.globals.namespaces.read().unwrap();
         map.get(ns_name.as_ref()).cloned()
     };
-    let ns = ns.ok_or_else(|| {
-        EvalError::Runtime(format!("No namespace: {ns_name} found"))
-    })?;
+    let ns = ns.ok_or_else(|| EvalError::Runtime(format!("No namespace: {ns_name} found")))?;
     let var = if arg_forms.len() == 3 {
         let val = eval(&arg_forms[2], env)?;
         let mut interns = ns.get().interns.lock().unwrap();
@@ -1202,10 +1200,8 @@ fn handle_bound_fn_star(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     for frame in &frames {
         merged.extend(frame.iter().map(|(k, v)| (*k, v.clone())));
     }
-    Ok(Value::BoundFn(cljrs_gc::GcPtr::new(
-        cljrs_value::BoundFn {
-            wrapped: f,
-            captured_bindings: merged,
-        },
-    )))
+    Ok(Value::BoundFn(cljrs_gc::GcPtr::new(cljrs_value::BoundFn {
+        wrapped: f,
+        captured_bindings: merged,
+    })))
 }

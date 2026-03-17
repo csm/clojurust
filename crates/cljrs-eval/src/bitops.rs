@@ -5,7 +5,7 @@ pub fn builtin_bit_and_not(args: &[Value]) -> ValueResult<Value> {
     let mut result = numeric_as_i64(&args[0])?;
     for arg in &args[1..] {
         let arg = numeric_as_i64(arg)?;
-        result = result & !arg;
+        result &= !arg;
     }
     Ok(Value::Long(result))
 }

@@ -1,7 +1,5 @@
 use crate::hash::hash_combine_unordered;
-use crate::{ClojureHash, PersistentHashSet, PersistentVector, Value, ValueError, ValueResult};
-use std::hash::Hash;
-use std::ops::Deref;
+use crate::{ClojureHash, PersistentHashSet, Value, ValueError, ValueResult};
 use std::sync::Mutex;
 
 #[derive(Debug)]
@@ -77,5 +75,11 @@ impl cljrs_gc::Trace for TransientSet {
         for v in map.iter() {
             v.trace(visitor);
         }
+    }
+}
+
+impl Default for TransientSet {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -1,6 +1,5 @@
 use crate::hash::hash_combine_ordered;
 use crate::{ClojureHash, PersistentVector, Value, ValueError, ValueResult};
-use std::hash::Hash;
 use std::sync::Mutex;
 
 #[derive(Debug)]
@@ -100,5 +99,11 @@ impl cljrs_gc::Trace for TransientVector {
         for v in vec.iter() {
             v.trace(visitor);
         }
+    }
+}
+
+impl Default for TransientVector {
+    fn default() -> Self {
+        Self::new()
     }
 }

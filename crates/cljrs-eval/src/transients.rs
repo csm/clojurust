@@ -54,7 +54,7 @@ pub fn builtin_assoc_bang(args: &[Value]) -> ValueResult<Value> {
                 m.get().assoc(k.clone(), v.clone())?;
             }
             // Odd number of args, assoc nil with the final key.
-            if args.len() % 2 == 0 {
+            if args.len().is_multiple_of(2) {
                 let k = &args[args.len() - 1];
                 m.get().assoc(k.clone(), Value::Nil)?;
             }
@@ -75,7 +75,7 @@ pub fn builtin_assoc_bang(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             }
-            if args.len() % 2 == 0 {
+            if args.len().is_multiple_of(2) {
                 let k = numeric_as_i64(&args[args.len() - 1])? as usize;
                 if k < v.get().count() {
                     v.get().set(k, Value::Nil)?;
@@ -98,7 +98,7 @@ pub fn builtin_assoc_bang(args: &[Value]) -> ValueResult<Value> {
 }
 
 pub fn builtin_conj_bang(args: &[Value]) -> ValueResult<Value> {
-    if args.len() == 0 {
+    if args.is_empty() {
         return Ok(Value::TransientVector(GcPtr::new(TransientVector::new())));
     }
     match &args[0] {
