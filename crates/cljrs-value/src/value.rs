@@ -18,8 +18,8 @@ use crate::keyword::Keyword;
 use crate::resource::ResourceHandle;
 use crate::symbol::Symbol;
 use crate::types::{
-    Agent, Atom, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn, Namespace,
-    NativeFn, Protocol, ProtocolFn, Var, Volatile,
+    Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
+    Namespace, NativeFn, Protocol, ProtocolFn, Var, Volatile,
 };
 
 /// A GC-traced mutable array of Values (backs `object-array`).
@@ -92,6 +92,7 @@ pub enum Value {
     NativeFunction(GcPtr<NativeFn>),
     Fn(GcPtr<CljxFn>),
     Macro(GcPtr<CljxFn>),
+    BoundFn(GcPtr<BoundFn>),
 
     // ── Mutable state ─────────────────────────────────────────────────────────
     Var(GcPtr<Var>),
@@ -647,6 +648,7 @@ impl ClojureHash for Value {
 
             // For non-data types, use pointer identity.
             Value::Fn(f) => f.get() as *const _ as u32,
+            Value::BoundFn(f) => f.get() as *const _ as u32,
             Value::NativeFunction(f) => f.get() as *const _ as u32,
             Value::Var(v) => v.get() as *const _ as u32,
             Value::Atom(a) => a.get() as *const _ as u32,
@@ -925,6 +927,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             write!(f, ")")
         }
         Value::NativeFunction(nf) => write!(f, "#<NativeFn {}>", nf.get().name),
+        Value::BoundFn(_) => write!(f, "#<BoundFn>"),
         Value::Fn(fun) => match &fun.get().name {
             Some(n) => write!(f, "#<Fn {n}>"),
             None => write!(f, "#<Fn>"),
@@ -1033,6 +1036,7 @@ impl Value {
             Value::Queue(_) => "queue",
             Value::NativeFunction(_)
             | Value::Fn(_)
+            | Value::BoundFn(_)
             | Value::Macro(_)
             | Value::ProtocolFn(_)
             | Value::MultiFn(_) => "fn",
@@ -1132,6 +1136,7 @@ impl cljrs_gc::Trace for Value {
             Value::Set(s) => s.trace(visitor),
             Value::Queue(p) => visitor.visit(p),
             Value::NativeFunction(p) => visitor.visit(p),
+            Value::BoundFn(p) => visitor.visit(p),
             Value::Fn(p) | Value::Macro(p) => visitor.visit(p),
             Value::Var(p) => visitor.visit(p),
             Value::Atom(p) => visitor.visit(p),
@@ -1559,6 +1564,7 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::LazySeq(_) => 12,
         Value::Cons(_) => 13,
         Value::NativeFunction(_) => 14,
+        Value::BoundFn(_) => 14,
         Value::Fn(_) => 15,
         Value::Macro(_) => 16,
         Value::Var(_) => 17,

@@ -154,6 +154,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             "ns-resolve" => return handle_ns_resolve(arg_forms, env),
             "resolve" => return handle_resolve(arg_forms, env),
             "intern" => return handle_intern(arg_forms, env),
+            "bound-fn*" => return handle_bound_fn_star(arg_forms, env),
             _ => {}
         }
     }
@@ -219,6 +220,14 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             result
         }
         Value::Fn(f) => call_cljrs_fn(f.get(), args, env),
+        Value::BoundFn(bf) => {
+            let bf_ref = bf.get();
+            // Push captured bindings as a frame on top of the current stack.
+            // This means captured bindings take priority over the caller's,
+            // but vars not in the capture fall through to the caller's frames.
+            let _guard = crate::dynamics::push_frame(bf_ref.captured_bindings.clone());
+            apply_value(&bf_ref.wrapped, args, env)
+        }
         Value::ProtocolFn(pf) => {
             let pf_ref = pf.get();
             let dispatch_val = args.first().ok_or_else(|| {
@@ -1172,4 +1181,31 @@ fn handle_intern(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
     Ok(Value::Var(var))
+}
+
+// ── bound-fn* ────────────────────────────────────────────────────────────────
+
+/// `(bound-fn* f)` — capture current dynamic bindings and wrap `f` so that
+/// when the wrapper is called, those bindings are installed.
+fn handle_bound_fn_star(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "bound-fn*".into(),
+            expected: "1".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let f = eval(&arg_forms[0], env)?;
+    // Merge all binding frames into a single flat frame (bottom-up so inner wins)
+    let frames = crate::dynamics::capture_current();
+    let mut merged = std::collections::HashMap::new();
+    for frame in &frames {
+        merged.extend(frame.iter().map(|(k, v)| (*k, v.clone())));
+    }
+    Ok(Value::BoundFn(cljrs_gc::GcPtr::new(
+        cljrs_value::BoundFn {
+            wrapped: f,
+            captured_bindings: merged,
+        },
+    )))
 }

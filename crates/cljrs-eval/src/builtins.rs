@@ -2046,13 +2046,14 @@ fn builtin_symbol_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_fn_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
-        Value::Fn(_) | Value::NativeFunction(_)
+        Value::Fn(_) | Value::BoundFn(_) | Value::NativeFunction(_)
     )))
 }
 fn builtin_ifn_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
         args[0],
         Value::Fn(_)
+            | Value::BoundFn(_)
             | Value::NativeFunction(_)
             | Value::Macro(_)
             | Value::Keyword(_)

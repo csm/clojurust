@@ -385,6 +385,29 @@ impl cljrs_gc::Trace for CljxFn {
     }
 }
 
+// ── BoundFn ──────────────────────────────────────────────────────────────────
+
+/// A function wrapped with captured dynamic bindings.
+/// When called, the captured bindings are pushed as a frame before delegating
+/// to the wrapped function. This means captured bindings override the caller's
+/// for the same var, but vars not in the capture fall through normally.
+#[derive(Debug)]
+pub struct BoundFn {
+    /// The wrapped callable.
+    pub wrapped: Value,
+    /// Captured dynamic bindings (merged flat frame; opaque to cljrs-value).
+    pub captured_bindings: HashMap<usize, Value>,
+}
+
+impl cljrs_gc::Trace for BoundFn {
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        self.wrapped.trace(visitor);
+        for val in self.captured_bindings.values() {
+            val.trace(visitor);
+        }
+    }
+}
+
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────
 
 /// A deferred computation that produces a `Value` when forced.
