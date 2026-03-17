@@ -13,13 +13,15 @@
         () 2 nil))
 
     ;; 1-arity transducer
-    (testing "Arity-1 transducer"
-      (are [expected n coll] (= (vec expected) (transduce (take-nth n) conj [] coll))
-        (range 0 10 1) 1 (range 10)
-        (range 0 10 2) 2 (range 10)
-        (range 0 10 3) 3 (range 10)
-        '(\C \o \u \e \R \c \s) 2 "Clojure Rocks" ; works on any seq
-        () 2 nil))
+    #?(:rust "Transducers not implemented"
+       :default
+       (testing "Arity-1 transducer"
+         (are [expected n coll] (= (vec expected) (transduce (take-nth n) conj [] coll))
+           (range 0 10 1) 1 (range 10)
+           (range 0 10 2) 2 (range 10)
+           (range 0 10 3) 3 (range 10)
+           '(\C \o \u \e \R \c \s) 2 "Clojure Rocks" ; works on any seq
+           () 2 nil)))
 
     (testing "Negative cases"
       ;; Note: passing a non-positive integer (either zero or
@@ -31,15 +33,20 @@
       ;; arity-1 version and it treats it the same as if n was
       ;; positive. If you pass in zero, it throws an exception (see
       ;; below).
-      (are [expected n coll] (= (vec expected) (transduce (take-nth n) conj [] coll))
-        (range 0 10 1) -1 (range 10)
-        (range 0 10 2) -2 (range 10))
+      #?(:rust "Transducers not implemented"
+         :default
+         (are [expected n coll] (= (vec expected) (transduce (take-nth n) conj [] coll))
+           (range 0 10 1) -1 (range 10)
+           (range 0 10 2) -2 (range 10)))
 
       (is (thrown? #?(:cljs :default :default Exception)
                    (seq (take-nth nil (range 10)))))
-      (is (thrown? #?(:cljs :default :default Exception)
-                   (transduce (take-nth nil) conj [] (range 10))))
+      #?(:rust "Transducers not implemented"
+         :default
+         (is (thrown? #?(:cljs :default :default Exception)
+                      (transduce (take-nth nil) conj [] (range 10)))))
       #?(:cljs
          (is (= [] (transduce (take-nth 0) conj [] (range 10))))
+         :rust "Transducers not implemented"
          :default
          (is (thrown? Exception (transduce (take-nth 0) conj [] (range 10))))))))
