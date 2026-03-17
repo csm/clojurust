@@ -676,7 +676,7 @@ impl cljrs_gc::Trace for CljxFuture {
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
 /// A Clojure agent action: takes the current state, returns the new state.
-pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
+pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, Value> + Send>;
 
 /// Messages sent to an agent's worker thread.
 pub enum AgentMsg {
@@ -689,7 +689,7 @@ pub struct Agent {
     /// Current state, shared between the Value::Agent handle and the worker thread.
     pub state: Arc<Mutex<Value>>,
     /// Last error, shared similarly.
-    pub error: Arc<Mutex<Option<String>>>,
+    pub error: Arc<Mutex<Option<Value>>>,
     /// Channel to send actions to the worker thread.
     pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
@@ -700,7 +700,7 @@ impl Agent {
         self.state.lock().unwrap().clone()
     }
 
-    pub fn get_error(&self) -> Option<String> {
+    pub fn get_error(&self) -> Option<Value> {
         self.error.lock().unwrap().clone()
     }
 
@@ -718,6 +718,9 @@ impl std::fmt::Debug for Agent {
 impl cljrs_gc::Trace for Agent {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.state.lock().unwrap().trace(visitor);
+        if let Some(e) = self.error.lock().unwrap().as_ref() {
+            e.trace(visitor);
+        }
         for (key, f) in self.watches.lock().unwrap().iter() {
             key.trace(visitor);
             f.trace(visitor);

@@ -15,6 +15,15 @@ use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
 use crate::eval::eval;
 
+/// Convert an EvalError to a Value for storage (e.g. agent errors).
+/// Preserves Thrown values (ex-info); other errors become strings.
+fn eval_error_to_value(e: EvalError) -> Value {
+    match e {
+        EvalError::Thrown(v) => v,
+        other => Value::string(format!("{other}")),
+    }
+}
+
 // ── Watch notification ───────────────────────────────────────────────────────
 
 /// Fire all watches on a watchable (atom, var, agent).
@@ -591,7 +600,7 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
                 call_args.extend(extra);
                 let mut call_env = Env::new(globals, &ns);
                 let new_val =
-                    apply_value(&f, call_args, &mut call_env).map_err(|e| format!("{e}"))?;
+                    apply_value(&f, call_args, &mut call_env).map_err(|e| eval_error_to_value(e))?;
                 // Fire watches (agent watches fire on the agent thread)
                 fire_watches(
                     &agent_clone.get().watches,
@@ -602,7 +611,7 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
                 );
                 // Watch errors become agent errors
                 if let Err(e) = check_watch_error() {
-                    return Err(format!("{e}"));
+                    return Err(eval_error_to_value(e));
                 }
                 Ok(new_val)
             });

@@ -6040,7 +6040,7 @@ fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
     let init = args[0].clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<AgentMsg>(1024);
     let state_arc = Arc::new(std::sync::Mutex::new(init.clone()));
-    let error_arc: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let error_arc: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
     let worker_state = state_arc.clone();
     let worker_error = error_arc.clone();
     std::thread::spawn(move || {
@@ -6097,7 +6097,7 @@ fn builtin_await(args: &[Value]) -> ValueResult<Value> {
 fn builtin_agent_error(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Agent(a) => match a.get().get_error() {
-            Some(e) => Ok(Value::string(e)),
+            Some(e) => Ok(e),
             None => Ok(Value::Nil),
         },
         v => Err(ValueError::WrongType {
