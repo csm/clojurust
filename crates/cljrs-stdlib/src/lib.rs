@@ -28,6 +28,7 @@ const CLOJURE_TEMPLATE_SRC: &str = include_str!("clojure/template.cljrs");
 const CLOJURE_RUST_IO_SRC: &str = include_str!("clojure/rust/io.cljrs");
 const CLOJURE_EDN_SRC: &str = include_str!("clojure/edn.cljrs");
 const CLOJURE_WALK_SRC: &str = include_str!("clojure/walk.cljrs");
+const CLOJURE_DATA_SRC: &str = include_str!("clojure/data.cljrs");
 
 // ── Macro: register a batch of native fns into a namespace ───────────────────
 
@@ -83,6 +84,9 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 
     // clojure.walk ─ pure Clojure, no native helpers.
     globals.register_builtin_source("clojure.walk", CLOJURE_WALK_SRC);
+
+    // clojure.data ─ pure Clojure, no native helpers.
+    globals.register_builtin_source("clojure.data", CLOJURE_DATA_SRC);
 }
 
 /// Create a `GlobalEnv` with all built-ins and stdlib registered.

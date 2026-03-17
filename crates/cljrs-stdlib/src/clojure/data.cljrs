@@ -1,0 +1,100 @@
+;; clojure.data — recursive comparison of Clojure data structures.
+(ns clojure.data
+  (:require [clojure.set :as set]))
+
+(defn equality-partition
+  "Returns the equality partition for x: :atom, :set, :sequential, or :map."
+  [x]
+  (cond
+    (nil? x)        :atom
+    (map? x)        :map
+    (set? x)        :set
+    (sequential? x) :sequential
+    :else           :atom))
+
+(defn atom-diff
+  "Diff for atomic (non-collection) values."
+  [a b]
+  (if (= a b) [nil nil a] [a b nil]))
+
+(defn vectorize
+  "Convert an associative-by-numeric-index collection to a vector,
+  filling nil for missing indices."
+  [m]
+  (when (seq m)
+    (reduce (fn [result [k v]]
+              (assoc result k v))
+            (vec (repeat (apply max (keys m)) nil))
+            m)))
+
+(defn diff-sequential
+  "Diff two sequential collections."
+  [a b]
+  (let [a-len (count a)
+        b-len (count b)
+        max-len (max a-len b-len)
+        diffs (map (fn [i]
+                     (diff (nth a i nil) (nth b i nil)))
+                   (range max-len))
+        only-a (map first diffs)
+        only-b (map second diffs)
+        both   (map #(nth % 2) diffs)
+        nnil?  (fn [s] (some #(not (nil? %)) s))]
+    [(when (nnil? only-a) (vec only-a))
+     (when (nnil? only-b) (vec only-b))
+     (when (nnil? both)   (vec both))]))
+
+(defn diff-set
+  "Diff two sets."
+  [a b]
+  (let [only-a (set/difference a b)
+        only-b (set/difference b a)
+        both   (set/intersection a b)]
+    [(not-empty only-a)
+     (not-empty only-b)
+     (not-empty both)]))
+
+(defn diff-map
+  "Diff two maps."
+  [a b]
+  (let [all-keys (set (concat (keys a) (keys b)))
+        categorize (fn [k]
+                     (let [in-a (contains? a k)
+                           in-b (contains? b k)]
+                       (cond
+                         (and in-a in-b)
+                         (let [[da db both] (diff (get a k) (get b k))]
+                           [(when (not (nil? da)) [k da])
+                            (when (not (nil? db)) [k db])
+                            (when (not (nil? both)) [k both])])
+
+                         in-a
+                         [[k (get a k)] nil nil]
+
+                         :else
+                         [nil [k (get b k)] nil])))
+        parts (map categorize all-keys)
+        collect (fn [idx]
+                  (let [entries (keep #(nth % idx) parts)]
+                    (when (seq entries)
+                      (into {} entries))))]
+    [(collect 0)
+     (collect 1)
+     (collect 2)]))
+
+(defn diff
+  "Recursively computes the difference of a and b, returning a tuple of:
+  [things-only-in-a things-only-in-b things-in-both]
+  Each entry uses the appropriate collection type where possible."
+  [a b]
+  (if (= a b)
+    [nil nil a]
+    (let [part-a (equality-partition a)
+          part-b (equality-partition b)]
+      (if (= part-a part-b)
+        (case part-a
+          :atom       (atom-diff a b)
+          :set        (diff-set a b)
+          :sequential (diff-sequential a b)
+          :map        (diff-map a b))
+        (atom-diff a b)))))
