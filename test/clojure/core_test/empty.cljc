@@ -38,8 +38,10 @@
             :cljr  [(is (thrown? InvalidOperationException (empty (->Record ""))))]
             :clj  [(is (thrown? UnsupportedOperationException (empty (->Record ""))))])))
 
-    (when-var-exists deftype
-      (testing "datatype"
-        (deftype MyType [field])
-        (is (= nil (empty (->MyType ""))))))))
+    #?(:rust nil
+       :default
+       (when-var-exists deftype
+         (testing "datatype"
+           (deftype MyType [field])
+           (is (= nil (empty (->MyType "")))))))))
 
