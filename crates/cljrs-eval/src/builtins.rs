@@ -229,6 +229,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("contains?", Arity::Fixed(2), builtin_contains_q),
         ("merge", Arity::Variadic { min: 0 }, builtin_merge),
         ("into", Arity::Fixed(2), builtin_into),
+        ("reduce", Arity::Variadic { min: 2 }, builtin_reduce),
         ("empty", Arity::Fixed(1), builtin_empty),
         ("vec", Arity::Fixed(1), builtin_vec),
         ("object-array", Arity::Fixed(1), builtin_object_array),
@@ -327,6 +328,10 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("volatile?", Arity::Fixed(1), builtin_volatile_q),
         ("force", Arity::Fixed(1), builtin_force),
         ("realized?", Arity::Fixed(1), builtin_realized_q),
+        ("reduced", Arity::Fixed(1), builtin_reduced),
+        ("reduced?", Arity::Fixed(1), builtin_reduced_q),
+        ("unreduced", Arity::Fixed(1), builtin_unreduced),
+        ("ensure-reduced", Arity::Fixed(1), builtin_ensure_reduced),
         ("promise", Arity::Fixed(0), builtin_promise),
         ("deliver", Arity::Fixed(2), builtin_deliver),
         ("future-done?", Arity::Fixed(1), builtin_future_done_q),
@@ -3246,6 +3251,49 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
     Ok(result)
 }
 
+fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
+    let f = &args[0];
+    match args.len() {
+        2 => {
+            // (reduce f coll) — no init value
+            let mut iter = ValueIter::new(args[1].clone());
+            let Some(first) = iter.next() else {
+                // empty coll: call (f) for init
+                return crate::callback::invoke(f, vec![]);
+            };
+            let mut acc = first;
+            for item in iter.by_ref() {
+                acc = crate::callback::invoke(f, vec![acc, item])?;
+                if let Value::Reduced(inner) = acc {
+                    return Ok(*inner);
+                }
+            }
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
+            Ok(acc)
+        }
+        3 => {
+            // (reduce f init coll)
+            let mut acc = args[1].clone();
+            let mut iter = ValueIter::new(args[2].clone());
+            for item in iter.by_ref() {
+                acc = crate::callback::invoke(f, vec![acc, item])?;
+                if let Value::Reduced(inner) = acc {
+                    return Ok(*inner);
+                }
+            }
+            if let Some(err) = iter.take_error() {
+                return Err(ValueError::Other(err));
+            }
+            Ok(acc)
+        }
+        n => Err(ValueError::Other(format!(
+            "reduce requires 2 or 3 args, got {n}"
+        ))),
+    }
+}
+
 fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
     let meta = args[0].get_meta().cloned();
     let apply_meta = |v: Value| -> Value {
@@ -5932,6 +5980,30 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
         }
     };
     Ok(Value::Bool(realized))
+}
+
+// ── reduced ──────────────────────────────────────────────────────────────────
+
+fn builtin_reduced(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Reduced(Box::new(args[0].clone())))
+}
+
+fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::Reduced(_))))
+}
+
+fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Reduced(inner) => Ok(*inner.clone()),
+        other => Ok(other.clone()),
+    }
+}
+
+fn builtin_ensure_reduced(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Reduced(_) => Ok(args[0].clone()),
+        other => Ok(Value::Reduced(Box::new(other.clone()))),
+    }
 }
 
 fn builtin_promise(_args: &[Value]) -> ValueResult<Value> {

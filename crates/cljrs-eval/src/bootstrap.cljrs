@@ -32,17 +32,7 @@
 (defn partial [f & args]
   (fn [& more] (apply f (concat args more))))
 
-(defn reduce
-  ([f coll]
-   (let [s (seq coll)]
-     (if s
-       (reduce f (first s) (rest s))
-       (f))))
-  ([f val coll]
-   (loop [s (seq coll) acc val]
-     (if s
-       (recur (next s) (f acc (first s)))
-       acc))))
+;; reduce is a native builtin (supports reduced/early-termination)
 
 (defn map
   ([f coll]

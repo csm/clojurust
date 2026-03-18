@@ -98,6 +98,9 @@ pub enum Value {
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
 
+    // ── Reduced (early termination sentinel for reduce/transduce) ───────────
+    Reduced(Box<Value>),
+
     // ── Other ─────────────────────────────────────────────────────────────────
     Namespace(GcPtr<Namespace>),
 
@@ -311,6 +314,13 @@ impl PartialEq for Value {
         if let Value::WithMeta(inner, _) = other {
             return self == inner.as_ref();
         }
+        // Unwrap Reduced for equality.
+        if let Value::Reduced(inner) = self {
+            return inner.as_ref() == other;
+        }
+        if let Value::Reduced(inner) = other {
+            return self == inner.as_ref();
+        }
         // Identity shortcut: same GcPtr → equal without realizing.
         // Required for infinite lazy seqs: (let [r (range)] (= r r)) must not hang.
         if let (Value::LazySeq(a), Value::LazySeq(b)) = (self, other)
@@ -491,6 +501,7 @@ impl ClojureHash for Value {
     fn clojure_hash(&self) -> u32 {
         match self {
             Value::WithMeta(inner, _) => inner.clojure_hash(),
+            Value::Reduced(inner) => inner.clojure_hash(),
             Value::Nil => 0,
             Value::Bool(b) => {
                 if *b { 1231 } else { 1237 } // Java Boolean.hashCode
@@ -726,6 +737,10 @@ impl fmt::Display for PrintValue<'_> {
 pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Result {
     match v {
         Value::WithMeta(inner, _) => pr_str(inner, f, readably),
+        Value::Reduced(inner) => {
+            write!(f, "#reduced ")?;
+            pr_str(inner, f, readably)
+        }
         Value::Nil => write!(f, "nil"),
         Value::Bool(b) => write!(f, "{b}"),
         Value::Long(n) => write!(f, "{n}"),
@@ -1017,6 +1032,7 @@ impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::WithMeta(inner, _) => inner.type_name(),
+            Value::Reduced(_) => "reduced",
             Value::Nil => "nil",
             Value::Bool(_) => "boolean",
             Value::Long(_) => "long",
@@ -1114,6 +1130,7 @@ impl cljrs_gc::Trace for Value {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         match self {
+            Value::Reduced(inner) => inner.trace(visitor),
             Value::WithMeta(inner, meta) => {
                 inner.trace(visitor);
                 meta.trace(visitor);
@@ -1545,6 +1562,7 @@ fn cmp_ns_name(
 fn type_discriminant(v: &Value) -> u8 {
     match v {
         Value::WithMeta(inner, _) => type_discriminant(inner),
+        Value::Reduced(inner) => type_discriminant(inner),
         Value::Nil => 0,
         Value::Bool(_) => 1,
         Value::Long(_)
