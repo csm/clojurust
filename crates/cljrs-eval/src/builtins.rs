@@ -228,7 +228,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("vals", Arity::Fixed(1), builtin_vals),
         ("contains?", Arity::Fixed(2), builtin_contains_q),
         ("merge", Arity::Variadic { min: 0 }, builtin_merge),
-        ("into", Arity::Fixed(2), builtin_into),
+        ("into", Arity::Variadic { min: 2 }, builtin_into),
         ("reduce", Arity::Variadic { min: 2 }, builtin_reduce),
         ("empty", Arity::Fixed(1), builtin_empty),
         ("vec", Arity::Fixed(1), builtin_vec),
@@ -3219,6 +3219,40 @@ fn builtin_merge(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_into(args: &[Value]) -> ValueResult<Value> {
+    if args.len() == 3 {
+        // (into to xform from) — apply xform to conj, then reduce
+        let to = &args[0];
+        let xform = &args[1];
+        let from = &args[2];
+        // conj is already a NativeFunction, look it up isn't straightforward,
+        // so we build it inline as a plain fn pointer
+        let conj_rf = Value::NativeFunction(GcPtr::new(NativeFn {
+            name: std::sync::Arc::from("conj"),
+            arity: Arity::Variadic { min: 0 },
+            func: builtin_conj,
+        }));
+        // Apply xform to conj
+        let xf_rf = crate::callback::invoke(xform, vec![conj_rf])?;
+        // Reduce over from with xf_rf
+        let mut acc = to.clone();
+        let mut iter = ValueIter::new(from.clone());
+        for item in iter.by_ref() {
+            acc = crate::callback::invoke(&xf_rf, vec![acc, item])?;
+            if let Value::Reduced(inner) = acc {
+                acc = *inner;
+                break;
+            }
+        }
+        if let Some(err) = iter.take_error() {
+            return Err(ValueError::Other(err));
+        }
+        // Call completion arity
+        acc = crate::callback::invoke(&xf_rf, vec![acc])?;
+        if let Value::Reduced(inner) = acc {
+            acc = *inner;
+        }
+        return Ok(acc);
+    }
     let mut result = args[0].clone();
     let mut iter = ValueIter::new(args[1].clone());
     for item in iter.by_ref() {

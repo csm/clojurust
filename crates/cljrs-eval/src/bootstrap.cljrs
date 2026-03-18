@@ -34,7 +34,47 @@
 
 ;; reduce is a native builtin (supports reduced/early-termination)
 
+(defn completing
+  "Takes a reducing function f (with 2-arg step arity) and returns a fn
+  with 0, 1, and 2 arities: 0-arg calls (f), 1-arg calls cf (default
+  identity) for completion, 2-arg calls f for the step."
+  ([f] (completing f identity))
+  ([f cf]
+   (fn
+     ([] (f))
+     ([result] (cf result))
+     ([result input] (f result input)))))
+
+(defn transduce
+  "reduce with a transformation of f (xf). If init is not supplied,
+  (f) will be called to produce it. f should be a reducing function
+  that accepts 0 and 2 arities. Returns the value obtained by applying
+  (xform f) to init and the elements of coll."
+  ([xform f coll]
+   (transduce xform f (f) coll))
+  ([xform f init coll]
+   (let [f (xform f)
+         ret (reduce f init coll)]
+     (f ret))))
+
+(defn sequence
+  "Coerces coll to a (possibly empty) sequence, if it is not already one.
+  With a transducer, returns a lazy sequence of applications of the transform
+  to the items in coll(s)."
+  ([coll] (seq coll))
+  ([xform coll]
+   (let [rf (xform conj)
+         result (reduce rf [] coll)
+         result (rf result)]
+     (seq (if (reduced? result) (unreduced result) result)))))
+
 (defn map
+  ([f]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input] (rf result (f input))))))
   ([f coll]
    (lazy-seq
      (when-let [s (seq coll)]
@@ -61,27 +101,57 @@
                            (map-step (map rest ss)))))))]
        (map-step all-colls)))))
 
-(defn filter [pred coll]
-  (loop [s (seq coll) acc []]
-    (if s
-      (if (pred (first s))
-        (recur (next s) (conj acc (first s)))
-        (recur (next s) acc))
-      (seq acc))))
+(defn filter
+  ([pred]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (if (pred input)
+          (rf result input)
+          result)))))
+  ([pred coll]
+   (loop [s (seq coll) acc []]
+     (if s
+       (if (pred (first s))
+         (recur (next s) (conj acc (first s)))
+         (recur (next s) acc))
+       (seq acc)))))
 
-(defn remove [pred coll]
-  (filter (complement pred) coll))
+(defn remove
+  ([pred] (filter (complement pred)))
+  ([pred coll] (filter (complement pred) coll)))
 
-(defn keep [f coll]
-  (loop [s (seq coll) acc []]
-    (if s
-      (let [v (f (first s))]
-        (if (nil? v)
-          (recur (next s) acc)
-          (recur (next s) (conj acc v))))
-      (seq acc))))
+(defn keep
+  ([f]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (let [v (f input)]
+          (if (nil? v) result (rf result v)))))))
+  ([f coll]
+   (loop [s (seq coll) acc []]
+     (if s
+       (let [v (f (first s))]
+         (if (nil? v)
+           (recur (next s) acc)
+           (recur (next s) (conj acc v))))
+       (seq acc)))))
+
+(defn cat
+  "A transducer which concatenates the contents of each input, which must
+  be a collection, into the reduction."
+  [rf]
+  (fn
+    ([] (rf))
+    ([result] (rf result))
+    ([result input] (reduce rf result input))))
 
 (defn mapcat
+  ([f] (comp (map f) cat))
   ([f coll]
    (when-not (ifn? f) (throw (str "Argument must be a function: " f)))
    (let [s (seq coll)]
@@ -114,33 +184,81 @@
                             (map next seqs))))))]
      (step nil (map seq all-colls)))))
 
-(defn take [n coll]
-  (let [n (int n)]
-    (cond (pos? n)
-          (when (pos? n)
-            (lazy-seq
-              (when-let [s (seq coll)]
-                (cons (first s) (take (dec n) (rest s))))))
-          :else [])))
+(defn take
+  ([n]
+   (fn [rf]
+     (let [nv (volatile! n)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [n @nv
+                nn (vswap! nv dec)
+                result (if (pos? n) (rf result input) result)]
+            (if (not (pos? nn))
+              (ensure-reduced result)
+              result)))))))
+  ([n coll]
+   (let [n (int n)]
+     (cond (pos? n)
+           (when (pos? n)
+             (lazy-seq
+               (when-let [s (seq coll)]
+                 (cons (first s) (take (dec n) (rest s))))))
+           :else []))))
 
-(defn drop [n coll]
-  (loop [s (seq coll) n (int n)]
-    (if (and s (pos? n))
-      (recur (next s) (dec n))
-      (or s '()))))
+(defn drop
+  ([n]
+   (fn [rf]
+     (let [nv (volatile! n)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [n (vswap! nv dec)]
+            (if (neg? n)
+              (rf result input)
+              result)))))))
+  ([n coll]
+   (loop [s (seq coll) n (int n)]
+     (if (and s (pos? n))
+       (recur (next s) (dec n))
+       (or s '())))))
 
-(defn take-while [pred coll]
-  (lazy-seq
-    (when-let [s (seq coll)]
-      (let [x (first s)]
-        (when (pred x)
-          (cons x (take-while pred (rest s))))))))
+(defn take-while
+  ([pred]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (if (pred input)
+          (rf result input)
+          (reduced result))))))
+  ([pred coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [x (first s)]
+         (when (pred x)
+           (cons x (take-while pred (rest s)))))))))
 
-(defn drop-while [pred coll]
-  (loop [s (seq coll)]
-    (if (and s (pred (first s)))
-      (recur (next s))
-      (or s '()))))
+(defn drop-while
+  ([pred]
+   (fn [rf]
+     (let [dv (volatile! true)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (if (and @dv (pred input))
+            result
+            (do (vreset! dv false)
+                (rf result input))))))))
+  ([pred coll]
+   (loop [s (seq coll)]
+     (if (and s (pred (first s)))
+       (recur (next s))
+       (or s '())))))
 
 (defn dorun [coll]
   (loop [s (seq coll)]
@@ -365,9 +483,6 @@
         (recur (next s) (next lead))
         s))))
 
-(defn into [to from]
-  (reduce conj to from))
-
 (defmacro lazy-seq [& body]
   (list 'make-lazy-seq (list 'fn [] (cons 'do body))))
 
@@ -433,26 +548,128 @@
           (seq acc)))
       (seq acc))))
 
-(defn partition-all [n coll]
-  (loop [s (seq coll) acc []]
-    (if s
-      (let [part (take n s)]
-        (recur (nthnext s n) (conj acc part)))
-      (seq acc))))
+(defn partition-all
+  ([n]
+   (fn [rf]
+     (let [a (volatile! [])]
+       (fn
+         ([] (rf))
+         ([result]
+          (let [result (if (seq @a)
+                         (let [v @a]
+                           (vreset! a [])
+                           (unreduced (rf result v)))
+                         result)]
+            (rf result)))
+         ([result input]
+          (let [buf (vswap! a conj input)]
+            (if (= (count buf) n)
+              (do (vreset! a [])
+                  (rf result buf))
+              result)))))))
+  ([n coll]
+   (loop [s (seq coll) acc []]
+     (if s
+       (let [part (take n s)]
+         (recur (nthnext s n) (conj acc part)))
+       (seq acc)))))
 
 (defn flatten [x]
   (if (coll? x)
     (mapcat flatten x)
     (list x)))
 
-(defn distinct [coll]
-  (loop [s (seq coll) seen #{} acc []]
-    (if s
-      (let [v (first s)]
-        (if (contains? seen v)
-          (recur (next s) seen acc)
-          (recur (next s) (conj seen v) (conj acc v))))
-      (seq acc))))
+(defn distinct
+  ([]
+   (fn [rf]
+     (let [seen (volatile! #{})]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (if (contains? @seen input)
+            result
+            (do (vswap! seen conj input)
+                (rf result input))))))))
+  ([coll]
+   (loop [s (seq coll) seen #{} acc []]
+     (if s
+       (let [v (first s)]
+         (if (contains? seen v)
+           (recur (next s) seen acc)
+           (recur (next s) (conj seen v) (conj acc v))))
+       (seq acc)))))
+
+(defn dedupe
+  "Returns a lazy sequence removing consecutive duplicates in coll.
+  Returns a transducer when no collection is provided."
+  ([]
+   (fn [rf]
+     (let [pv (volatile! ::none)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [prior @pv]
+            (vreset! pv input)
+            (if (= prior input)
+              result
+              (rf result input))))))))
+  ([coll]
+   (sequence (dedupe) coll)))
+
+(defn partition-by
+  "Applies f to each value in coll, splitting it each time f returns a
+  new value. Returns a lazy sequence of partitions. Returns a transducer
+  when no collection is provided."
+  ([f]
+   (fn [rf]
+     (let [started (volatile! false)
+           a       (volatile! [])
+           pv      (volatile! nil)]
+       (fn
+         ([] (rf))
+         ([result]
+          (let [result (if (seq @a)
+                         (let [v @a]
+                           (vreset! a [])
+                           (unreduced (rf result v)))
+                         result)]
+            (rf result)))
+         ([result input]
+          (let [pval @pv
+                val  (f input)]
+            (vreset! pv val)
+            (if (or (not @started) (= val pval))
+              (do (vreset! started true)
+                  (vswap! a conj input)
+                  result)
+              (let [v @a]
+                (vreset! a [input])
+                (rf result v)))))))))
+  ([f coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [fst (first s)
+             fv  (f fst)
+             run (cons fst (take-while #(= fv (f %)) (rest s)))]
+         (cons (vec run)
+               (partition-by f (drop (count run) s))))))))
+
+(defn map-indexed
+  "Returns a lazy sequence of (f index item) for each item in coll.
+  Returns a transducer when no collection is provided."
+  ([f]
+   (fn [rf]
+     (let [i (volatile! -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (rf result (f (vswap! i inc) input)))))))
+  ([f coll]
+   (let [idx (volatile! -1)]
+     (map (fn [x] (f (vswap! idx inc) x)) coll))))
 
 (defn max [& args] (reduce (fn [a b]
   (cond
@@ -489,20 +706,29 @@
       (if (= (first s) v) i (recur (next s) (inc i)))
       -1)))
 
-(defn map-indexed [f coll]
-  (loop [s (seq coll) i 0 acc []]
-    (if s
-      (recur (next s) (inc i) (conj acc (f i (first s))))
-      (seq acc))))
-
-(defn keep-indexed [f coll]
-  (loop [s (seq coll) i 0 acc []]
-    (if s
-      (let [v (f i (first s))]
-        (if (nil? v)
-          (recur (next s) (inc i) acc)
-          (recur (next s) (inc i) (conj acc v))))
-      (seq acc))))
+(defn keep-indexed
+  "Returns a lazy sequence of the non-nil results of (f index item).
+  Returns a transducer when no collection is provided."
+  ([f]
+   (fn [rf]
+     (let [i (volatile! -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [idx (vswap! i inc)
+                v   (f idx input)]
+            (if (nil? v)
+              result
+              (rf result v))))))))
+  ([f coll]
+   (loop [s (seq coll) i 0 acc []]
+     (if s
+       (let [v (f i (first s))]
+         (if (nil? v)
+           (recur (next s) (inc i) acc)
+           (recur (next s) (inc i) (conj acc v))))
+       (seq acc)))))
 
 (defn reduce-kv [f init m]
   (reduce (fn [acc kv] (f acc (first kv) (second kv))) init m))
@@ -570,12 +796,29 @@
 (defn print-str [& args]
   (apply str (interpose " " (map (fnil str "nil") args))))
 
-(defn interpose [sep coll]
-  (loop [s (next (seq coll))
-         acc (if (seq coll) [(first coll)] [])]
-    (if s
-      (recur (next s) (conj (conj acc sep) (first s)))
-      (or (seq acc) []))))
+(defn interpose
+  "Returns a lazy sequence of the elements of coll separated by sep.
+  Returns a transducer when no collection is provided."
+  ([sep]
+   (fn [rf]
+     (let [started (volatile! false)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (if @started
+            (let [sepr (rf result sep)]
+              (if (reduced? sepr)
+                sepr
+                (rf sepr input)))
+            (do (vreset! started true)
+                (rf result input))))))))
+  ([sep coll]
+   (loop [s (next (seq coll))
+          acc (if (seq coll) [(first coll)] [])]
+     (if s
+       (recur (next s) (conj (conj acc sep) (first s)))
+       (or (seq acc) [])))))
 
 (defn clojure-version [] "cljx-0.1.0")
 
