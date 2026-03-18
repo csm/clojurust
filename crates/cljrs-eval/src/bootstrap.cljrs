@@ -828,6 +828,25 @@
   ([prob coll]
    (filter (fn [_] (< (rand) prob)) coll)))
 
+(defn take-nth
+  "Returns a lazy sequence of every nth item in coll. Returns a transducer
+  when no collection is provided."
+  ([n]
+   (fn [rf]
+     (let [i (volatile! -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [idx (vswap! i inc)]
+            (if (zero? (rem idx n))
+              (rf result input)
+              result)))))))
+  ([n coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (cons (first s) (take-nth n (drop n s)))))))
+
 (defn clojure-version [] "cljx-0.1.0")
 
 ;; ── Phase 7: Concurrency primitives ──────────────────────────────────────────
