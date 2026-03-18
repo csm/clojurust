@@ -11,8 +11,7 @@
       (testing "functions, functions from HOFs, transducers, #() reader macro, `fn`, `defn`"
         (is (fn? juxt))
         (is (fn? (juxt inc dec)))
-        #?(:rust "Rust still needs transducers"
-           :default (is (fn? (map inc))))
+        (is (fn? (map inc)))
         (is (fn? #(str "hello " %)))
         (is (fn? (fn [x] (str "hello " x))))
         (is (fn? foo)))
