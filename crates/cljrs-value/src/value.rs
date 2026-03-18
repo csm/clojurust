@@ -125,6 +125,9 @@ pub enum Value {
     // ── Records / reify instances ─────────────────────────────────────────────
     TypeInstance(GcPtr<TypeInstance>),
 
+    // ── Native Rust objects (GcPtr-managed, for interop) ─────────────────────
+    NativeObject(GcPtr<crate::native_object::NativeObjectBox>),
+
     // ── I/O resources (Arc-ref-counted, NOT GcPtr) ───────────────────────────
     Resource(ResourceHandle),
 
@@ -419,6 +422,10 @@ impl PartialEq for Value {
             }
             // UUID equality: same u128 value.
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            // NativeObject equality: pointer identity.
+            (Value::NativeObject(a), Value::NativeObject(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            }
             // Resource equality: pointer identity.
             (Value::Resource(a), Value::Resource(b)) => Arc::ptr_eq(&a.0, &b.0),
             // Record equality: same tag and same fields.
@@ -530,6 +537,10 @@ impl ClojureHash for Value {
             Value::Keyword(k) => hash_string(&k.get().to_string()),
             Value::Symbol(s) => hash_string(&s.get().to_string()),
             Value::Uuid(u) => hash_u128(*u),
+            Value::NativeObject(obj) => {
+                let ptr = obj.get() as *const _ as usize;
+                hash_i64(ptr as i64)
+            }
             Value::Resource(r) => {
                 let ptr = Arc::as_ptr(&r.0) as *const () as usize;
                 hash_i64(ptr as i64)
@@ -984,6 +995,9 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             });
             write!(f, "}}")
         }
+        Value::NativeObject(obj) => {
+            write!(f, "#<{} {:?}>", obj.get().type_tag(), obj.get().inner())
+        }
         Value::Resource(r) => {
             if r.is_closed() {
                 write!(f, "#<{} (closed)>", r.resource_type())
@@ -1068,6 +1082,7 @@ impl Value {
             Value::Future(_) => "future",
             Value::Agent(_) => "agent",
             Value::TypeInstance(_) => "record",
+            Value::NativeObject(_) => "native-object",
             Value::BooleanArray(_) => "boolean-array",
             Value::ByteArray(_) => "byte-array",
             Value::ShortArray(_) => "short-array",
@@ -1178,6 +1193,7 @@ impl cljrs_gc::Trace for Value {
             | Value::FloatArray(_)
             | Value::DoubleArray(_)
             | Value::CharArray(_) => {}
+            Value::NativeObject(p) => visitor.visit(p),
             // Resource is Arc-ref-counted, not GcPtr — nothing to trace.
             Value::Resource(_) => {}
             Value::TransientMap(m) => visitor.visit(m),
@@ -1607,6 +1623,7 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::DoubleArray(_) => 36,
         Value::ObjectArray(_) => 37,
         Value::Uuid(_) => 38,
+        Value::NativeObject(_) => 43,
         Value::Resource(_) => 39,
         Value::TransientMap(_) => 40,
         Value::TransientSet(_) => 41,

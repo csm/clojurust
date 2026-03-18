@@ -24,8 +24,9 @@ src/
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
+  native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
-  value.rs                       — Value enum, MapValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
+  value.rs                       — Value enum (incl. NativeObject variant), MapValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
     array_map.rs                 — PersistentArrayMap (≤8 entries, linear scan)

@@ -10,6 +10,7 @@ members = [
     "crates/cljrs-compiler",
     "crates/cljrs-interop",
     "crates/cljrs",
+    "examples/rust-interop",
 ]
 resolver = "2"
 

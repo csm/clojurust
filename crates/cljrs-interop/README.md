@@ -4,7 +4,7 @@ Rust ↔ Clojure interoperability layer. Exposes Rust functions to Clojure code,
 marshals values across the boundary, and wraps opaque Rust structs as
 GC-managed `NativeObject` values.
 
-**Phase:** 9 — stub only, not yet implemented.
+**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging).
 
 ---
 
@@ -12,42 +12,53 @@ GC-managed `NativeObject` values.
 
 ```
 src/
-  lib.rs    — doc-comment stub describing planned implementation
+  lib.rs       — re-exports, crate entry point
+  error.rs     — wrap_result: Rust Result → ValueResult<Value>
+  marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
+```
+
+The `NativeObject` trait and `NativeObjectBox` wrapper live in `cljrs-value::native_object`
+and are re-exported from this crate for convenience.
+
+---
+
+## Public API
+
+### NativeObject (re-exported from cljrs-value)
+
+```rust
+pub trait NativeObject: Send + Sync + Debug + Trace + 'static {
+    fn type_tag(&self) -> &str;       // used for protocol dispatch
+    fn as_any(&self) -> &dyn Any;     // downcast support
+}
+
+pub struct NativeObjectBox { /* wraps Box<dyn NativeObject> */ }
+pub fn gc_native_object(obj: impl NativeObject) -> GcPtr<NativeObjectBox>;
+```
+
+### Type marshalling
+
+```rust
+pub trait IntoValue { fn into_value(self) -> Value; }
+pub trait FromValue: Sized { fn from_value(v: &Value) -> ValueResult<Self>; }
+```
+
+Implemented for: `()`, `bool`, `i64`, `f64`, `String`, `&str`, `BigInt`, `Option<T>`, `Vec<Value>`, `Value`.
+
+### Error bridging
+
+```rust
+pub fn wrap_result<T: IntoValue, E: Display>(r: Result<T, E>) -> ValueResult<Value>;
 ```
 
 ---
 
-## Planned public API (Phase 9)
+## Remaining work (Phase 9)
 
-```rust
-/// Opaque wrapper that lets the GC manage an arbitrary Rust struct.
-/// Created via the `#[cljx::export]` proc-macro or `NativeObject::new`.
-pub struct NativeObject { /* private */ }
-
-impl NativeObject {
-    pub fn new<T: 'static + Send>(value: T) -> GcPtr<NativeObject>
-    pub fn downcast<T: 'static>(&self) -> Option<&T>
-}
-```
-
-The primary developer-facing surface is the `#[cljx::export]` proc-macro
-(implemented as a separate proc-macro crate in a later phase):
-
-```rust
-#[cljx::export(name = "my-ns/my-fn")]
-fn my_fn(x: i64) -> CljxResult<i64> {
-    Ok(x * 2)
-}
-```
-
-Planned features:
-- `#[cljx::export]` proc-macro — exposes a Rust `fn` as a Clojure native function
-- Type marshalling — bidirectional conversion between `Value` and Rust primitives
-  (`i64`, `f64`, `bool`, `String`, `Vec`, `HashMap`, …)
-- Error bridging — Rust `Result::Err` and `panic!` are caught and re-raised as
-  Clojure exceptions
-- `cljx.rust` namespace — `rust/cast`, `rust/unsafe`, `rust/import`
-- Dynamic linking — load compiled `.so`/`.dylib` Rust extensions at runtime
+- `#[cljx::export]` proc-macro — syntactic sugar over manual registration
+- `cljx.rust` namespace with intrinsics
+- Dynamic linking — load `.so`/`.dylib` Rust extensions at runtime
+- RAII / `with-open` resource management
 
 ---
 
@@ -56,4 +67,6 @@ Planned features:
 | Crate | Role |
 |-------|------|
 | `cljrs-types` (workspace) | `CljxError`, `CljxResult` |
-| `cljrs-gc` (workspace) | `GcPtr` — NativeObject lives behind the GC |
+| `cljrs-gc` (workspace) | `GcPtr`, `Trace`, `MarkVisitor` |
+| `cljrs-value` (workspace) | `Value`, `NativeObject`, `NativeObjectBox` |
+| `num-bigint` (workspace) | `BigInt` marshalling |

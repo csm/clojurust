@@ -565,6 +565,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("record?", Arity::Fixed(1), builtin_record_q),
         ("instance?", Arity::Fixed(2), builtin_instance_q),
+        // Native objects (Phase 9 interop)
+        ("native-object?", Arity::Fixed(1), builtin_native_object_q),
+        ("native-type", Arity::Fixed(1), builtin_native_type),
         // Dynamic variables (Phase 9)
         ("var-get", Arity::Fixed(1), builtin_var_get),
         ("var-set!", Arity::Fixed(2), builtin_var_set_bang),
@@ -1928,6 +1931,7 @@ fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
         (Value::Future(a), Value::Future(b)) => peq!(a, b),
         (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
         (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
+        (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
         _ => false,
     };
     Ok(Value::Bool(same))
@@ -6333,6 +6337,7 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
         ),
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),
+            Value::NativeObject(obj) => obj.get().type_tag() == expected_tag.as_str(),
             _ => false,
         },
     };
@@ -6614,4 +6619,19 @@ fn builtin_parse_uuid(args: &[Value]) -> ValueResult<Value> {
 fn builtin_random_uuid(_args: &[Value]) -> ValueResult<Value> {
     let uuid = uuid::Uuid::new_v4();
     Ok(Value::Uuid(uuid.as_u128()))
+}
+
+// ── Native objects (Phase 9 interop) ─────────────────────────────────────────
+
+/// `(native-object? x)` — true if x is a NativeObject.
+fn builtin_native_object_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::NativeObject(_))))
+}
+
+/// `(native-type x)` — returns the type tag string of a NativeObject, or nil.
+fn builtin_native_type(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::NativeObject(obj) => Ok(Value::Str(GcPtr::new(obj.get().type_tag().to_string()))),
+        _ => Ok(Value::Nil),
+    }
 }

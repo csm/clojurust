@@ -253,6 +253,8 @@ version = "0.1.0"
 dependencies = [
  "cljrs-gc",
  "cljrs-types",
+ "cljrs-value",
+ "num-bigint",
 ]
 
 [[package]]
@@ -629,6 +631,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e75f485e819d4d3015e6c0d55d02a4fd3db47c1993d9e603e0361fba2bffb34"
 dependencies = [
  "archery",
+]
+
+[[package]]
+name = "rust-interop-example"
+version = "0.1.0"
+dependencies = [
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-interop",
+ "cljrs-reader",
+ "cljrs-stdlib",
+ "cljrs-value",
 ]
 
 [[package]]

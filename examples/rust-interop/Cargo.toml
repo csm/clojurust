@@ -1,0 +1,13 @@
+[package]
+name = "rust-interop-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cljrs-interop = { path = "../../crates/cljrs-interop" }
+cljrs-eval    = { path = "../../crates/cljrs-eval" }
+cljrs-stdlib  = { path = "../../crates/cljrs-stdlib" }
+cljrs-value   = { path = "../../crates/cljrs-value" }
+cljrs-reader  = { path = "../../crates/cljrs-reader" }
+cljrs-gc      = { path = "../../crates/cljrs-gc" }

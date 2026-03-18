@@ -7,3 +7,5 @@ description = "Rust<->Clojure FFI, type marshalling, and NativeObject support"
 [dependencies]
 cljrs-types = { workspace = true }
 cljrs-gc    = { workspace = true }
+cljrs-value = { workspace = true }
+num-bigint  = { workspace = true }
