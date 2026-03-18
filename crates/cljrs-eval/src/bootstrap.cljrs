@@ -820,6 +820,14 @@
        (recur (next s) (conj (conj acc sep) (first s)))
        (or (seq acc) [])))))
 
+(defn random-sample
+  "Returns items from coll for which (rand) < prob. Returns a transducer
+  when no collection is provided."
+  ([prob]
+   (filter (fn [_] (< (rand) prob))))
+  ([prob coll]
+   (filter (fn [_] (< (rand) prob)) coll)))
+
 (defn clojure-version [] "cljx-0.1.0")
 
 ;; ── Phase 7: Concurrency primitives ──────────────────────────────────────────
