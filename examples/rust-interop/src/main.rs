@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use cljrs_eval::{Env, eval};
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-use cljrs_interop::{FromValue, IntoValue, NativeObject, gc_native_object, wrap_result};
+use cljrs_interop::{
+    FromValue, IntoValue, NativeObject, gc_native_object, wrap_fn1, wrap_fn2, wrap_result,
+};
 use cljrs_stdlib::standard_env;
 use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 
@@ -135,15 +137,53 @@ fn register_counter_fns(env: &mut Env) {
         globals.intern(
             ns,
             std::sync::Arc::from(name),
-            Value::NativeFunction(GcPtr::new(NativeFn {
-                name: std::sync::Arc::from(format!("{ns}/{name}")),
-                arity: arity.clone(),
+            Value::NativeFunction(GcPtr::new(NativeFn::new(
+                format!("{ns}/{name}"),
+                arity.clone(),
                 func,
-            })),
+            ))),
         );
     }
 
     // Mark as loaded so `require` doesn't try to find it on the filesystem.
+    globals.mark_loaded(ns);
+}
+
+/// Example using `wrap_fn*` helpers — no manual marshalling needed.
+fn register_math_fns(env: &mut Env) {
+    let globals = &env.globals;
+    let ns = "mymath";
+
+    // wrap_fn2 automatically marshals i64 args and i64 return via FromValue/IntoValue.
+    let nf = wrap_fn2::<i64, i64, i64, std::convert::Infallible, _>("mymath/gcd", |a, b| {
+        let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        Ok(a as i64)
+    });
+    globals.intern(
+        ns,
+        std::sync::Arc::from("gcd"),
+        Value::NativeFunction(GcPtr::new(nf)),
+    );
+
+    // wrap_fn1 with error handling — returns Result with a real error type.
+    let nf = wrap_fn1::<f64, f64, String, _>("mymath/safe-sqrt", |x| {
+        if x < 0.0 {
+            Err(format!("Cannot take sqrt of negative number: {x}"))
+        } else {
+            Ok(x.sqrt())
+        }
+    });
+    globals.intern(
+        ns,
+        std::sync::Arc::from("safe-sqrt"),
+        Value::NativeFunction(GcPtr::new(nf)),
+    );
+
     globals.mark_loaded(ns);
 }
 
@@ -153,6 +193,9 @@ fn main() {
 
     // Register our Counter native functions in the "counter" namespace.
     register_counter_fns(&mut env);
+
+    // Register math functions using wrap_fn* helpers.
+    register_math_fns(&mut env);
 
     // Evaluate Clojure code that uses the Counter.
     let clojure_code = r#"
@@ -200,6 +243,21 @@ fn main() {
         (println "Identity: (identical? my-counter c2) =>" (identical? my-counter c2))
         (def c3 (c/make-counter "other" 0))
         (println "Different: (= my-counter c3) =>" (= my-counter c3))
+
+        ;; ── wrap_fn* demo: auto-marshalled math functions ──────────────
+        (require '[mymath :as m])
+
+        (println "\n── wrap_fn helpers ──")
+        (println "gcd(12, 8):" (m/gcd 12 8))
+        (println "gcd(100, 75):" (m/gcd 100 75))
+        (println "safe-sqrt(16.0):" (m/safe-sqrt 16.0))
+        (println "safe-sqrt(2.0):" (m/safe-sqrt 2.0))
+
+        ;; Error handling: safe-sqrt of negative number
+        (try
+          (m/safe-sqrt -1.0)
+          (catch Exception e
+            (println "Caught error:" e)))
 
         (println "\nDone!")
     "#;

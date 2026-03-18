@@ -13,12 +13,14 @@
 
 pub mod error;
 pub mod marshal;
+pub mod register;
 
 // Re-export the core interop traits from cljrs-value so downstream crates
 // only need to depend on cljrs-interop.
 pub use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 pub use cljrs_value::native_object::{NativeObject, NativeObjectBox, gc_native_object};
-pub use cljrs_value::{Value, ValueError, ValueResult};
+pub use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 
 pub use error::wrap_result;
 pub use marshal::{FromValue, IntoValue};
+pub use register::{wrap_fn_variadic, wrap_fn0, wrap_fn1, wrap_fn2, wrap_fn3};

@@ -291,7 +291,13 @@ impl cljrs_gc::Trace for Namespace {
 // ── NativeFn ──────────────────────────────────────────────────────────────────
 
 /// A Rust function callable from Clojure.
+/// Legacy type alias kept for source compatibility. Bare `fn` pointers
+/// implement `Fn` and can be passed anywhere a `NativeFnFunc` is expected.
 pub type NativeFnPtr = fn(&[Value]) -> crate::error::ValueResult<Value>;
+
+/// The callable stored inside a `NativeFn`. Supports both bare function
+/// pointers and closures that capture state.
+pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum Arity {
@@ -299,20 +305,43 @@ pub enum Arity {
     Variadic { min: usize },
 }
 
-#[derive(Debug)]
 pub struct NativeFn {
     pub name: Arc<str>,
     pub arity: Arity,
-    pub func: NativeFnPtr,
+    pub func: NativeFnFunc,
 }
 
 impl NativeFn {
+    /// Create from a bare function pointer (backwards-compatible).
     pub fn new(name: impl Into<Arc<str>>, arity: Arity, func: NativeFnPtr) -> Self {
         Self {
             name: name.into(),
             arity,
-            func,
+            func: Arc::new(func),
         }
+    }
+
+    /// Create from a closure or any `Fn(&[Value]) -> ValueResult<Value>`.
+    pub fn with_closure(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            arity,
+            func: Arc::new(func),
+        }
+    }
+}
+
+impl std::fmt::Debug for NativeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeFn")
+            .field("name", &self.name)
+            .field("arity", &self.arity)
+            .field("func", &"<fn>")
+            .finish()
     }
 }
 

@@ -4,7 +4,7 @@ Rust ↔ Clojure interoperability layer. Exposes Rust functions to Clojure code,
 marshals values across the boundary, and wraps opaque Rust structs as
 GC-managed `NativeObject` values.
 
-**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging).
+**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging, registration helpers).
 
 ---
 
@@ -15,6 +15,7 @@ src/
   lib.rs       — re-exports, crate entry point
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
+  register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
 ```
 
 The `NativeObject` trait and `NativeObjectBox` wrapper live in `cljrs-value::native_object`
@@ -51,6 +52,21 @@ Implemented for: `()`, `bool`, `i64`, `f64`, `String`, `&str`, `BigInt`, `Option
 pub fn wrap_result<T: IntoValue, E: Display>(r: Result<T, E>) -> ValueResult<Value>;
 ```
 
+### Registration helpers
+
+Auto-marshalling wrappers that convert idiomatic Rust function signatures into `NativeFn`:
+
+```rust
+pub fn wrap_fn0<R, E, F>(name: impl Into<Arc<str>>, f: F) -> NativeFn;
+pub fn wrap_fn1<A, R, E, F>(name: impl Into<Arc<str>>, f: F) -> NativeFn;
+pub fn wrap_fn2<A, B, R, E, F>(name: impl Into<Arc<str>>, f: F) -> NativeFn;
+pub fn wrap_fn3<A, B, C, R, E, F>(name: impl Into<Arc<str>>, f: F) -> NativeFn;
+pub fn wrap_fn_variadic<R, E, F>(name: impl Into<Arc<str>>, min: usize, f: F) -> NativeFn;
+```
+
+These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
+`Arc<dyn Fn(&[Value]) -> ValueResult<Value> + Send + Sync>`.
+
 ---
 
 ## Remaining work (Phase 9)
@@ -68,5 +84,5 @@ pub fn wrap_result<T: IntoValue, E: Display>(r: Result<T, E>) -> ValueResult<Val
 |-------|------|
 | `cljrs-types` (workspace) | `CljxError`, `CljxResult` |
 | `cljrs-gc` (workspace) | `GcPtr`, `Trace`, `MarkVisitor` |
-| `cljrs-value` (workspace) | `Value`, `NativeObject`, `NativeObjectBox` |
+| `cljrs-value` (workspace) | `Value`, `NativeFn`, `NativeObject`, `NativeObjectBox` |
 | `num-bigint` (workspace) | `BigInt` marshalling |

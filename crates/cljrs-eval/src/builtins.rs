@@ -3230,11 +3230,11 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         let from = &args[2];
         // conj is already a NativeFunction, look it up isn't straightforward,
         // so we build it inline as a plain fn pointer
-        let conj_rf = Value::NativeFunction(GcPtr::new(NativeFn {
-            name: std::sync::Arc::from("conj"),
-            arity: Arity::Variadic { min: 0 },
-            func: builtin_conj,
-        }));
+        let conj_rf = Value::NativeFunction(GcPtr::new(NativeFn::new(
+            "conj",
+            Arity::Variadic { min: 0 },
+            builtin_conj,
+        )));
         // Apply xform to conj
         let xf_rf = crate::callback::invoke(xform, vec![conj_rf])?;
         // Reduce over from with xf_rf
