@@ -6,8 +6,7 @@
  interpose
  (deftest test-interpose
    (testing "common cases"
-     #?(:rust "Transducers not yet implemented for rust"
-        :default (is (fn? (interpose "a"))))
+     (is (fn? (interpose "a")))
      (are [in ex] (= (apply interpose in) ex)
        ["a" [1 2 3]]              [1 "a" 2 "a" 3]
        [#{1} #{"a"}]              ["a"]

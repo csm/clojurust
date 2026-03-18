@@ -10,12 +10,10 @@
     (is (= '() (take-while #(< % 5) nil)))
     
     ;; transducer versions
-    #?(:rust "Transducers not yet implemented"
-       :default
-       (do
-         (is (= (vec (range 0 5)) (into [] (take-while #(< % 5)) (range 0 10))))
-         (is (= [:a :b :c] (into [] (take-while keyword?) [:a :b :c 1 2 3])))
-         (is (= [] (into [] (take-while #(< % 5)) nil)))))
+    (do
+      (is (= (vec (range 0 5)) (into [] (take-while #(< % 5)) (range 0 10))))
+      (is (= [:a :b :c] (into [] (take-while keyword?) [:a :b :c 1 2 3])))
+      (is (= [] (into [] (take-while #(< % 5)) nil))))
 
     ;; Negative tests
     (is (thrown? #?(:cljs :default :default Exception)

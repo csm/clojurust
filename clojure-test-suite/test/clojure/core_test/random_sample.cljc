@@ -34,42 +34,28 @@
           prob 0.5]
       (testing "positive tests"
         (check nitems (repeatedly draws #(random-sample prob coll)))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (check nitems (repeatedly draws #(transduce (random-sample prob) conj [] coll))))
+        (check nitems (repeatedly draws #(transduce (random-sample prob) conj [] coll)))
         ;; if probability is 0, then the result is always an empty seq
         (is (every? (comp nil? seq) (repeatedly draws #(random-sample 0 coll))))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample 0) conj [] coll)))))
+        (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample 0) conj [] coll))))
         ;; if probability is 1, then the result is always the input collection
         (is (every? #(= % coll) (repeatedly draws #(random-sample 1 coll))))
-        #?(:rust "Transducers not yet implemented"
-           :default (is (every? #(= % coll) (repeatedly draws #(transduce (random-sample 1) conj [] coll)))))
+        (is (every? #(= % coll) (repeatedly draws #(transduce (random-sample 1) conj [] coll))))
         ;; if input collection is empty, then the result is always empty
         (is (every? (comp nil? seq) (repeatedly draws #(random-sample 1 []))))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample 1) conj [] []))))))
+        (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample 1) conj [] [])))))
 
       (testing "negative tests"
         ;; if probablity is < 0, always empty
         (is (every? (comp nil? seq) (repeatedly draws #(random-sample -1 coll))))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample -1) conj [] coll)))))
+        (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample -1) conj [] coll))))
         ;; if probability is > 1, then the result is always the input collection
         (is (every? #(= % coll) (repeatedly draws #(random-sample 10 coll))))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (is (every? #(= % coll) (repeatedly draws #(transduce (random-sample 10) conj [] coll)))))
+        (is (every? #(= % coll) (repeatedly draws #(transduce (random-sample 10) conj [] coll))))
         ;; if nil as input collection, then the result is always empty
         (is (every? (comp nil? seq) (repeatedly draws #(random-sample -1 nil))))
-        #?(:rust "Transducers not yet implemented"
-           :default
-           (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample -1) conj [] nil)))))
+        (is (every? (comp nil? seq) (repeatedly draws #(transduce (random-sample -1) conj [] nil))))
         
-        #?(:cljs (is (nil? (seq (random-sample nil coll))))
-           :default (is (thrown? Exception (seq (random-sample nil coll)))))
+        (is (thrown? Exception (seq (random-sample nil coll))))
         (is (thrown? #?(:cljs :default :default Exception) (seq (random-sample 0.5 42))))
         (is (thrown? #?(:cljs :default :default Exception) (seq (random-sample 0.5 :foo))))))))
