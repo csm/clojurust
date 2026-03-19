@@ -24,6 +24,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod region;
+
 use std::cell::Cell;
 use std::ptr::NonNull;
 use std::sync::Mutex;
@@ -87,7 +89,7 @@ pub trait GcVisitor {
 /// The `trace_fn` and `drop_fn` pointers recover the concrete `T` by casting
 /// from a `*const GcBoxHeader` to `*const GcBox<T>`.
 #[repr(C)]
-struct GcBoxHeader {
+pub(crate) struct GcBoxHeader {
     /// `true` iff this object was reached during the current mark phase.
     marked: Cell<bool>,
     /// Intrusive singly-linked list: next allocation in [`GcHeapInner::head`].
@@ -96,6 +98,18 @@ struct GcBoxHeader {
     trace_fn: unsafe fn(*const GcBoxHeader, &mut MarkVisitor),
     /// Type-erased: drops the enclosing `GcBox<T>` and frees its memory.
     drop_fn: unsafe fn(*mut GcBoxHeader),
+}
+
+impl GcBoxHeader {
+    /// Create a header for a `GcBox<T>`.  Used by both the GC heap and regions.
+    pub(crate) fn new<T: Trace + 'static>() -> Self {
+        Self {
+            marked: Cell::new(false),
+            next: Cell::new(std::ptr::null_mut()),
+            trace_fn: trace_gc_box::<T>,
+            drop_fn: drop_gc_box::<T>,
+        }
+    }
 }
 
 // SAFETY: accessed only under heap lock (`next`, `drop`) or during the
@@ -107,12 +121,12 @@ unsafe impl Sync for GcBoxHeader {}
 // ── GcBox<T> ─────────────────────────────────────────────────────────────────
 
 #[repr(C)]
-struct GcBox<T: Trace + 'static> {
-    header: GcBoxHeader,
-    value: T,
+pub(crate) struct GcBox<T: Trace + 'static> {
+    pub(crate) header: GcBoxHeader,
+    pub(crate) value: T,
 }
 
-unsafe fn trace_gc_box<T: Trace + 'static>(header: *const GcBoxHeader, visitor: &mut MarkVisitor) {
+pub(crate) unsafe fn trace_gc_box<T: Trace + 'static>(header: *const GcBoxHeader, visitor: &mut MarkVisitor) {
     // SAFETY: `header` is the first field of `GcBox<T>` (#[repr(C)]).
     unsafe {
         let gc_box = header as *const GcBox<T>;
@@ -177,12 +191,7 @@ impl GcHeap {
     /// Allocate a new GC-managed value and register it in the heap.
     pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
         let gc_box = Box::new(GcBox {
-            header: GcBoxHeader {
-                marked: Cell::new(false),
-                next: Cell::new(std::ptr::null_mut()),
-                trace_fn: trace_gc_box::<T>,
-                drop_fn: drop_gc_box::<T>,
-            },
+            header: GcBoxHeader::new::<T>(),
             value,
         });
         let raw: *mut GcBox<T> = Box::into_raw(gc_box);

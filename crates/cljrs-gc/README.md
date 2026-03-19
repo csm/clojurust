@@ -18,8 +18,9 @@ is O(1); `drop` is a no-op.  Memory is freed only during `GcHeap::collect`.
 
 ```
 src/
-  lib.rs    — GcVisitor, Trace, GcBoxHeader, GcBox<T>, GcHeap, MarkVisitor,
-              HEAP singleton, GcPtr<T>, leaf Trace impls (i64, f64, BigInt, …)
+  lib.rs      — GcVisitor, Trace, GcBoxHeader, GcBox<T>, GcHeap, MarkVisitor,
+                HEAP singleton, GcPtr<T>, leaf Trace impls (i64, f64, BigInt, …)
+  region.rs   — Region bump allocator, RegionGuard, thread-local region stack
 ```
 
 ---
@@ -102,6 +103,30 @@ pub static HEAP: GcHeap;
 ```
 
 Global singleton; all `GcPtr::new` calls allocate here.
+
+### `region::Region`
+
+```rust
+pub struct Region { /* chunks, bump pointer, drop registry */ }
+
+impl Region {
+    pub fn new() -> Self
+    pub fn with_capacity(cap: usize) -> Self
+    pub fn alloc<T: Trace + 'static>(&mut self, value: T) -> GcPtr<T>
+    pub fn reset(&mut self)
+    pub fn bytes_used(&self) -> usize
+    pub fn object_count(&self) -> usize
+}
+```
+
+Bump allocator for short-lived objects. ~2.6x faster than `GcHeap::alloc`
+(no mutex, no `Box::new`). Objects are NOT in the GC heap linked list.
+Destructors run on `reset()` or `drop`.
+
+### `region::RegionGuard`
+
+RAII guard that pushes a `Region` onto the thread-local stack. Use with
+`try_alloc_in_region()` for opportunistic region allocation.
 
 ---
 

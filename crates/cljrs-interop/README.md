@@ -74,7 +74,6 @@ These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
 - `#[cljx::export]` proc-macro — syntactic sugar over manual registration
 - `cljx.rust` namespace with intrinsics
 - Dynamic linking — load `.so`/`.dylib` Rust extensions at runtime
-- RAII / `with-open` resource management
 
 ---
 

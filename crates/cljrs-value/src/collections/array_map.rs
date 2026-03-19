@@ -119,6 +119,28 @@ impl PersistentArrayMap {
         }
     }
 
+    /// Build directly from a pre-evaluated flat entries vector `[k0, v0, k1, v1, ...]`.
+    ///
+    /// This avoids intermediate allocations when the entries are already known.
+    /// Caller must ensure even length. Does NOT check for duplicate keys —
+    /// if duplicates are possible, use `from_pairs` instead.
+    pub fn from_flat_entries(entries: Vec<Value>) -> AssocResult {
+        debug_assert!(entries.len().is_multiple_of(2));
+        if entries.len() / 2 > THRESHOLD {
+            let mut pairs = Vec::with_capacity(entries.len() / 2);
+            let mut i = 0;
+            while i < entries.len() {
+                pairs.push((entries[i].clone(), entries[i + 1].clone()));
+                i += 2;
+            }
+            AssocResult::Promote(pairs)
+        } else {
+            AssocResult::Array(Self {
+                entries: Arc::new(entries),
+            })
+        }
+    }
+
     /// Build from an iterator of `(key, value)` pairs.
     /// Pairs are inserted left-to-right; later values win on duplicate keys.
     pub fn from_pairs<I: IntoIterator<Item = (Value, Value)>>(iter: I) -> AssocResult {

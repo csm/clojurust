@@ -1,11 +1,11 @@
 # cljrs-compiler
 
-JIT and AOT compiler backend for clojurust. Lowers `Form` AST nodes to native
-code via a Cranelift-based code generator. Hot interpreter paths are promoted
-to compiled code at runtime (JIT); `cljx compile` produces standalone binaries
-(AOT).
+Program analysis and optimization for clojurust. Provides an intermediate
+representation (IR) in A-normal form with SSA, escape analysis, and collection
+chain detection. Currently generates optimization hints for the interpreter;
+will serve as the input to Cranelift-based JIT/AOT code generation in Phase 10/11.
 
-**Phase:** 10 (JIT) + Phase 11 (AOT) — stub only, not yet implemented.
+**Phase:** 8.1 (program optimization) — IR foundation + escape analysis implemented.
 
 ---
 
@@ -13,34 +13,45 @@ to compiled code at runtime (JIT); `cljx compile` produces standalone binaries
 
 ```
 src/
-  lib.rs    — doc-comment stub describing planned implementation
+  lib.rs      — module declarations, crate doc
+  ir.rs       — IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId, KnownFn, Effect, Const
+  anf.rs      — ANF lowering: Form AST → IR instructions (AstLowering builder)
+  escape.rs   — Escape analysis: EscapeState, def-use chains, collection chain detection
 ```
 
 ---
 
-## Planned public API (Phase 10 + 11)
+## Public API
+
+### IR types (`ir.rs`)
 
 ```rust
-/// JIT-compile a function and return a callable native function pointer.
-/// The function must already have been interpreted at least once so its
-/// call-site profile is available.
-pub fn jit_compile(func: &Value, env: &Env) -> CljxResult<NativeFn>
-
-/// AOT-compile `file` to a self-contained native binary at `output`.
-pub fn aot_compile(file: &Path, output: &Path, env: &Env) -> CljxResult<()>
+pub struct IrFunction { name, params, blocks, ... }
+pub struct Block { id, phis, insts, terminator }
+pub enum Inst { Const, LoadLocal, LoadGlobal, AllocVector, AllocMap, AllocSet, AllocList, AllocCons, AllocClosure, CallKnown, Call, Deref, DefVar, SetBang, Throw, Phi, Recur, SourceLoc, RegionStart, RegionAlloc, RegionEnd }
+pub enum RegionAllocKind { Vector, Map, Set, List, Cons }
+pub enum Terminator { Jump, Branch, Return, RecurJump, Unreachable }
+pub enum KnownFn { Vector, HashMap, Assoc, Conj, Get, Count, Add, Sub, ... }
+pub enum Effect { Pure, Alloc, HeapRead, HeapWrite, IO, UnknownCall }
 ```
 
-Planned features:
-- IR lowering from `Form` AST (SSA-based intermediate representation)
-- [Cranelift](https://cranelift.dev/) native code generation (x86-64 and AArch64)
-- Inline caches for keyword lookup and protocol dispatch
-- On-stack replacement (OSR): seamlessly promote an in-progress interpreter
-  frame to compiled code
-- AOT whole-program analysis, dead-code elimination, and static linking
+### ANF lowering (`anf.rs`)
 
-Both JIT and AOT share the same `Value` representation as the interpreter — no
-separate boxed/unboxed split at the API boundary; specialization is internal to
-the compiler.
+```rust
+pub fn lower_fn_body(name: Option<&str>, ns: &str, params: &[Arc<str>], body: &[Form]) -> LowerResult<IrFunction>;
+```
+
+Handles: atoms, symbols, collections, `if`, `let`, `loop`/`recur`, `def`, `fn*`, `and`/`or`, `throw`, `set!`, `quote`, function calls (known + unknown).
+
+### Escape analysis (`escape.rs`)
+
+```rust
+pub fn analyze(func: &IrFunction) -> EscapeAnalysis;
+pub fn detect_collection_chains(func: &IrFunction, escape: &EscapeAnalysis) -> Vec<CollectionChain>;
+
+pub enum EscapeState { NoEscape, ArgEscape { callee, arg_index }, Escapes }
+pub struct CollectionChain { root, ops, result }
+```
 
 ---
 
@@ -49,5 +60,7 @@ the compiler.
 | Crate | Role |
 |-------|------|
 | `cljrs-types` (workspace) | `Span`, `CljxError`, `CljxResult` |
-| `cljrs-gc` (workspace) | `GcPtr<Value>` — GC interaction during compilation |
-| `cljrs-eval` (workspace) | `Env`, `Form`, `Value` — input to the compiler pipeline |
+| `cljrs-gc` (workspace) | `GcPtr<Value>` — GC interaction |
+| `cljrs-value` (workspace) | `Value`, `NativeFn` — value types referenced by IR |
+| `cljrs-reader` (workspace) | `Form`, `FormKind` — input AST for lowering |
+| `cljrs-eval` (workspace) | `Env`, `GlobalEnv` — evaluator types |

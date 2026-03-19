@@ -217,7 +217,9 @@ version = "0.1.0"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
+ "cljrs-reader",
  "cljrs-types",
+ "cljrs-value",
 ]
 
 [[package]]

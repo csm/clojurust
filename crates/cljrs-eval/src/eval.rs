@@ -57,21 +57,27 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
                     "map literal must have an even number of forms".into(),
                 ));
             }
-            let mut m = MapValue::empty();
+            // Evaluate all key-value pairs, then build the map in one shot.
+            // This avoids N intermediate GcPtr allocations that the old
+            // empty()+assoc+assoc chain would create.
+            let mut pairs = Vec::with_capacity(forms.len() / 2);
             for pair in forms.chunks(2) {
                 let k = eval(&pair[0], env)?;
                 let v = eval(&pair[1], env)?;
-                m = m.assoc(k, v);
+                pairs.push((k, v));
             }
-            Ok(Value::Map(m))
+            Ok(Value::Map(MapValue::from_pairs(pairs)))
         }
         FormKind::Set(forms) => {
-            let mut s = PersistentHashSet::empty();
-            for f in forms {
-                let v = eval(f, env)?;
-                s = s.conj(v);
-            }
-            Ok(Value::Set(SetValue::Hash(GcPtr::new(s))))
+            // Evaluate all elements, then build the set in one shot using
+            // FromIterator (uses insert_mut internally, single allocation).
+            let vals: Vec<Value> = forms
+                .iter()
+                .map(|f| eval(f, env))
+                .collect::<EvalResult<Vec<_>>>()?;
+            Ok(Value::Set(SetValue::Hash(GcPtr::new(
+                PersistentHashSet::from_iter(vals),
+            ))))
         }
 
         // ── Reader macros ─────────────────────────────────────────────────
@@ -1934,5 +1940,81 @@ mod tests {
         // ns-resolve for non-existent symbol returns nil.
         let v2 = eval_src("(ns-resolve *ns* 'nonexistent)", &mut env).unwrap();
         assert_eq!(v2, Value::Nil);
+    }
+
+    // ── Persistent structure virtualization ──────────────────────────────
+
+    #[test]
+    fn test_assoc_chain_virtualized() {
+        // Assoc chain where intermediates aren't used — should be virtualized.
+        let v = eval_str(
+            "(let [m {}
+                   a (assoc m :x 1)
+                   b (assoc a :y 2)
+                   c (assoc b :z 3)]
+               c)",
+        )
+        .unwrap();
+        // Result should be {:x 1, :y 2, :z 3}.
+        assert!(matches!(&v, Value::Map(_)));
+        if let Value::Map(m) = &v {
+            assert_eq!(m.count(), 3);
+            assert_eq!(m.get(&Value::keyword(Keyword::simple("x"))), Some(long(1)));
+            assert_eq!(m.get(&Value::keyword(Keyword::simple("y"))), Some(long(2)));
+            assert_eq!(m.get(&Value::keyword(Keyword::simple("z"))), Some(long(3)));
+        }
+    }
+
+    #[test]
+    fn test_conj_chain_virtualized() {
+        // Conj chain on a vector.
+        let v = eval_str(
+            "(let [v [1]
+                   a (conj v 2)
+                   b (conj a 3)
+                   c (conj b 4)]
+               c)",
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            eval_str("[1 2 3 4]").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_assoc_chain_intermediate_used_no_virtualize() {
+        // If an intermediate is used in the body, virtualization should not apply,
+        // but the result should still be correct.
+        let v = eval_str(
+            "(let [a (assoc {} :x 1)
+                   b (assoc a :y 2)]
+               (list (count a) (count b)))",
+        )
+        .unwrap();
+        // a has 1 entry, b has 2.
+        if let Value::List(l) = &v {
+            let items: Vec<_> = l.get().iter().cloned().collect();
+            assert_eq!(items, vec![long(1), long(2)]);
+        } else {
+            panic!("expected list, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_assoc_chain_on_existing_map() {
+        // Chain on an existing non-empty map.
+        let v = eval_str(
+            "(let [m {:a 1}
+                   a (assoc m :b 2)
+                   b (assoc a :c 3)]
+               b)",
+        )
+        .unwrap();
+        if let Value::Map(m) = &v {
+            assert_eq!(m.count(), 3);
+        } else {
+            panic!("expected map");
+        }
     }
 }

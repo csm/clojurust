@@ -149,6 +149,38 @@ impl MapValue {
         MapValue::Array(GcPtr::new(PersistentArrayMap::empty()))
     }
 
+    /// Build a map from pre-evaluated key-value pairs.
+    ///
+    /// Chooses the optimal representation based on size: ArrayMap for small
+    /// maps (≤8 entries), HashTrieMap for larger ones. This avoids N
+    /// intermediate allocations that `empty() + assoc + assoc + ...` would
+    /// create.
+    pub fn from_pairs(pairs: Vec<(Value, Value)>) -> Self {
+        use crate::collections::array_map::AssocResult;
+
+        // Check for duplicates by building through assoc (last wins).
+        match PersistentArrayMap::from_pairs(pairs) {
+            AssocResult::Array(m) => MapValue::Array(GcPtr::new(m)),
+            AssocResult::Promote(pairs) => {
+                MapValue::Hash(GcPtr::new(PersistentHashMap::from_pairs(pairs)))
+            }
+        }
+    }
+
+    /// Build a map from a flat evaluated entries vector `[k0, v0, k1, v1, ...]`.
+    ///
+    /// Similar to `from_pairs` but takes flat key-value entries. Handles
+    /// duplicate keys (last wins via assoc). Avoids intermediate allocations.
+    pub fn from_flat_entries(entries: Vec<Value>) -> Self {
+        debug_assert!(entries.len().is_multiple_of(2));
+        // We need to handle duplicate keys, so build through assoc.
+        let pairs: Vec<(Value, Value)> = entries
+            .chunks(2)
+            .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+            .collect();
+        Self::from_pairs(pairs)
+    }
+
     pub fn get(&self, key: &Value) -> Option<Value> {
         match self {
             MapValue::Array(m) => m.get().get(key).cloned(),

@@ -308,9 +308,33 @@ fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
         ));
     }
 
+    let body = &args[1..];
+
+    // Detect assoc/conj chains that can be virtualized.
+    let chains = crate::virtualize::detect_let_chains(&bindings);
+    let virtualizable_chains = find_virtualizable_chains(&chains, &bindings, body);
+
     env.push_frame();
 
-    for pair in bindings.chunks(2) {
+    let pairs: Vec<_> = bindings.chunks(2).collect();
+    let mut i = 0;
+    while i < pairs.len() {
+        // Check if this binding starts a virtualizable chain.
+        if let Some(chain) = virtualizable_chains.iter().find(|c| c.start == i) {
+            match eval_virtualized_chain(chain, &pairs, env) {
+                Ok(()) => {
+                    i += chain.len;
+                    continue;
+                }
+                Err(e) => {
+                    env.pop_frame();
+                    return Err(e);
+                }
+            }
+        }
+
+        // Normal evaluation.
+        let pair = pairs[i];
         let val = match eval(&pair[1], env) {
             Ok(v) => v,
             Err(e) => {
@@ -322,12 +346,146 @@ fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
             env.pop_frame();
             return Err(e);
         }
+        i += 1;
     }
 
-    let body = &args[1..];
     let result = eval_body(body, env);
     env.pop_frame();
     result
+}
+
+/// Filter chains to only those that are safe to virtualize.
+///
+/// A chain is safe if no intermediate binding is used outside the chain
+/// (i.e., it's only used as the collection argument of the next step).
+fn find_virtualizable_chains<'a>(
+    chains: &'a [crate::virtualize::LetChain],
+    bindings: &[Form],
+    body: &[Form],
+) -> Vec<&'a crate::virtualize::LetChain> {
+    chains
+        .iter()
+        .filter(|chain| {
+            // Check that no intermediate (all except the last) is used in body
+            // or in other bindings outside the chain.
+            for j in chain.start..(chain.start + chain.len - 1) {
+                let name = match &bindings[j * 2].kind {
+                    FormKind::Symbol(s) => s.as_str(),
+                    _ => return false,
+                };
+                if crate::virtualize::binding_used_in_body(name, body) {
+                    return false;
+                }
+                if crate::virtualize::binding_used_in_other_bindings(
+                    name,
+                    bindings,
+                    chain.start,
+                    chain.len,
+                ) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Evaluate an assoc/conj chain using transient operations.
+///
+/// Instead of creating N intermediate persistent collections, we:
+/// 1. Evaluate the root collection (first arg of the first assoc/conj)
+/// 2. Convert to transient
+/// 3. Apply each assoc!/conj! mutably
+/// 4. Convert back to persistent
+/// 5. Bind only the final name (and intermediate names point to intermediate
+///    transient values for correctness, though they shouldn't be used).
+fn eval_virtualized_chain(
+    chain: &crate::virtualize::LetChain,
+    pairs: &[&[Form]],
+    env: &mut Env,
+) -> Result<(), EvalError> {
+    use crate::transients::{builtin_assoc_bang, builtin_conj_bang, builtin_persistent_bang, builtin_transient};
+
+    // Step 1: Evaluate the root collection (first arg of the first call).
+    let first_pair = pairs[chain.start];
+    let first_expr_forms = match &first_pair[1].kind {
+        FormKind::List(forms) => forms,
+        _ => unreachable!("chain detection ensures this is a list"),
+    };
+    let root_collection = eval(&first_expr_forms[1], env)?;
+
+    // Step 2: Convert to transient.
+    let mut transient = match builtin_transient(std::slice::from_ref(&root_collection)) {
+        Ok(t) => t,
+        Err(_) => {
+            // Collection doesn't support transients (e.g., sorted map).
+            // Fall back to normal evaluation for the whole chain.
+            return eval_chain_normally(chain, pairs, env);
+        }
+    };
+
+    // Step 3: Apply each chain operation using transient mutation.
+    for j in 0..chain.len {
+        let pair_idx = chain.start + j;
+        let pair = pairs[pair_idx];
+        let expr_forms = match &pair[1].kind {
+            FormKind::List(forms) => forms,
+            _ => unreachable!(),
+        };
+
+        // Evaluate the non-collection arguments.
+        let mut args = vec![transient.clone()];
+        for arg_form in expr_forms.iter().skip(2) {
+            args.push(eval(arg_form, env)?);
+        }
+
+        // Apply the transient operation.
+        transient = match chain.ops[j] {
+            crate::virtualize::ChainOpKind::Assoc => {
+                builtin_assoc_bang(&args).map_err(|e| EvalError::Runtime(e.to_string()))?
+            }
+            crate::virtualize::ChainOpKind::Conj => {
+                builtin_conj_bang(&args).map_err(|e| EvalError::Runtime(e.to_string()))?
+            }
+        };
+
+        // Bind intermediate names to a placeholder (they shouldn't be used,
+        // but we need them in the env for structural correctness).
+        // Only the last binding gets the persistent result.
+        if j < chain.len - 1 {
+            let name = match &pair[0].kind {
+                FormKind::Symbol(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            // Bind to nil as placeholder — intermediates are verified as unused.
+            env.bind(Arc::from(name.as_str()), Value::Nil);
+        }
+    }
+
+    // Step 4: Convert back to persistent.
+    let persistent =
+        builtin_persistent_bang(&[transient]).map_err(|e| EvalError::Runtime(e.to_string()))?;
+
+    // Step 5: Bind the final name.
+    let last_pair = pairs[chain.start + chain.len - 1];
+    bind_pattern(&last_pair[0], persistent, env)?;
+
+    Ok(())
+}
+
+/// Fallback: evaluate a chain using normal persistent operations.
+fn eval_chain_normally(
+    chain: &crate::virtualize::LetChain,
+    pairs: &[&[Form]],
+    env: &mut Env,
+) -> Result<(), EvalError> {
+    for j in 0..chain.len {
+        let pair_idx = chain.start + j;
+        let pair = pairs[pair_idx];
+        let val = eval(&pair[1], env)?;
+        bind_pattern(&pair[0], val, env)?;
+    }
+    Ok(())
 }
 
 // ── loop* / recur ─────────────────────────────────────────────────────────────

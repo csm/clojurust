@@ -1,8 +1,14 @@
-//! JIT and AOT compiler for clojurust.
+//! Program analysis and optimization for clojurust.
 //!
-//! Phase 10 (JIT) and Phase 11 (AOT) will implement:
-//! - IR lowering from `Form` AST
-//! - Cranelift-based native code generation
-//! - Inline caches for protocol dispatch and keyword lookup
-//! - On-stack replacement (OSR) from interpreter to JIT
-//! - AOT whole-program analysis and static linking
+//! This crate provides:
+//! - **IR** — intermediate representation (ANF/SSA) for analysis
+//! - **ANF lowering** — convert `Form` AST to IR instructions
+//! - **Escape analysis** — track value flow and identify non-escaping allocations
+//!
+//! Currently used to generate optimization hints for the interpreter.
+//! In Phase 10/11, this IR will be the input to Cranelift-based JIT/AOT
+//! code generation.
+
+pub mod anf;
+pub mod escape;
+pub mod ir;

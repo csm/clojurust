@@ -363,6 +363,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("read-string", Arity::Fixed(1), builtin_read_string),
         ("spit", Arity::Fixed(2), builtin_spit),
         ("slurp", Arity::Fixed(1), builtin_slurp),
+        ("close", Arity::Fixed(1), builtin_close),
         // Misc
         ("gensym", Arity::Variadic { min: 0 }, builtin_gensym),
         ("type", Arity::Fixed(1), builtin_type),
@@ -4755,6 +4756,19 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
     };
     let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::string(content))
+}
+
+fn builtin_close(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Resource(r) => {
+            r.close()?;
+            Ok(Value::Nil)
+        }
+        v => Err(ValueError::WrongType {
+            expected: "resource",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_make_lazy_seq_sentinel(_args: &[Value]) -> ValueResult<Value> {

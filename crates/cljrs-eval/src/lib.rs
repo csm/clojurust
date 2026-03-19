@@ -28,6 +28,7 @@ pub mod syntax_quote;
 pub mod taps;
 mod transients;
 mod util;
+mod virtualize;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};
