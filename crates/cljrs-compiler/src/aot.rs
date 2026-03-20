@@ -171,13 +171,13 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
     use cljrs_reader::form::FormKind;
     match &form.kind {
         FormKind::List(parts) => {
-            if let Some(head) = parts.first() {
-                if let FormKind::Symbol(s) = &head.kind {
-                    // defn, defmacro, defonce need the interpreter because
-                    // they create closures (fn* values) which codegen can't
-                    // emit yet.
-                    return matches!(s.as_str(), "defn" | "defmacro" | "defonce" | "ns" | "require");
-                }
+            if let Some(head) = parts.first()
+                && let FormKind::Symbol(s) = &head.kind
+            {
+                // defn, defmacro, defonce need the interpreter because
+                // they create closures (fn* values) which codegen can't
+                // emit yet.
+                return matches!(s.as_str(), "defn" | "defmacro" | "defonce" | "ns" | "require");
             }
             false
         }

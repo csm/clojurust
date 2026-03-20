@@ -489,10 +489,10 @@ impl AstLowering {
         let recur_block = self.current_block;
         for (i, arg) in arg_vars.iter().enumerate() {
             // Find the phi node in the header block and add our predecessor.
-            if let Some(header_block) = self.func.blocks.iter_mut().find(|b| b.id == header) {
-                if let Some(Inst::Phi(_, entries)) = header_block.phis.get_mut(i) {
-                    entries.push((recur_block, *arg));
-                }
+            if let Some(header_block) = self.func.blocks.iter_mut().find(|b| b.id == header)
+                && let Some(Inst::Phi(_, entries)) = header_block.phis.get_mut(i)
+            {
+                entries.push((recur_block, *arg));
             }
         }
 

@@ -494,10 +494,10 @@ pub unsafe extern "C" fn rt_load_global(
             return box_val(val);
         }
         // If ns is the current namespace, also check refers (e.g. clojure.core).
-        if ns == current_ns.as_ref() {
-            if let Some(val) = globals.lookup_in_ns(&current_ns, name) {
-                return box_val(val);
-            }
+        if ns == current_ns.as_ref()
+            && let Some(val) = globals.lookup_in_ns(&current_ns, name)
+        {
+            return box_val(val);
         }
     }
     rt_const_nil()

@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 //! Program analysis and optimization for clojurust.
 //!
 //! This crate provides:

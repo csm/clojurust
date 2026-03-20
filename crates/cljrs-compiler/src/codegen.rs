@@ -166,7 +166,6 @@ impl Compiler {
                     ptr_type: self.ptr_type,
                     var_map: HashMap::new(),
                     block_map: HashMap::new(),
-                    user_funcs: &self.user_funcs,
                 };
                 translator.translate(ir_func)?;
             }
@@ -198,7 +197,6 @@ struct FunctionTranslator<'a, 'b> {
     var_map: HashMap<VarId, Variable>,
     /// Maps IR BlockId → Cranelift Block.
     block_map: HashMap<BlockId, cranelift_codegen::ir::Block>,
-    user_funcs: &'b HashMap<Arc<str>, FuncId>,
 }
 
 impl<'a, 'b> FunctionTranslator<'a, 'b> {
