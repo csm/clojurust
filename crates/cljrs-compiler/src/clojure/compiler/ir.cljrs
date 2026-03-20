@@ -1,0 +1,245 @@
+(ns cljrs.compiler.ir)
+
+;; ── Constant constructors ───────────────────────────────────────────────────
+
+(defn const-nil [] {:type :nil})
+(defn const-bool [b] {:type :bool :val b})
+(defn const-long [n] {:type :long :val n})
+(defn const-double [d] {:type :double :val d})
+(defn const-string [s] {:type :string :val s})
+(defn const-keyword [k] {:type :keyword :val k})
+(defn const-symbol [s] {:type :symbol :val s})
+(defn const-char [c] {:type :char :val c})
+
+;; ── Instruction constructors ────────────────────────────────────────────────
+
+(defn inst-const [dst c]
+  {:op :const :dst dst :value c})
+
+(defn inst-load-local [dst name]
+  {:op :load-local :dst dst :name name})
+
+(defn inst-load-global [dst ns name]
+  {:op :load-global :dst dst :ns ns :name name})
+
+(defn inst-alloc-vector [dst elems]
+  {:op :alloc-vector :dst dst :elems elems})
+
+(defn inst-alloc-map [dst pairs]
+  {:op :alloc-map :dst dst :pairs pairs})
+
+(defn inst-alloc-set [dst elems]
+  {:op :alloc-set :dst dst :elems elems})
+
+(defn inst-alloc-list [dst elems]
+  {:op :alloc-list :dst dst :elems elems})
+
+(defn inst-alloc-cons [dst head tail]
+  {:op :alloc-cons :dst dst :head head :tail tail})
+
+(defn inst-alloc-closure [dst closure-name captures]
+  {:op :alloc-closure :dst dst :closure-name closure-name :captures captures})
+
+(defn inst-call-known [dst func args]
+  {:op :call-known :dst dst :func func :args args})
+
+(defn inst-call [dst callee args]
+  {:op :call :dst dst :callee callee :args args})
+
+(defn inst-deref [dst src]
+  {:op :deref :dst dst :src src})
+
+(defn inst-def-var [dst ns name value]
+  {:op :def-var :dst dst :ns ns :name name :value value})
+
+(defn inst-set! [var value]
+  {:op :set! :var var :value value})
+
+(defn inst-throw [value]
+  {:op :throw :value value})
+
+(defn inst-phi [dst entries]
+  {:op :phi :dst dst :entries entries})
+
+(defn inst-recur [args]
+  {:op :recur :args args})
+
+;; ── Terminator constructors ─────────────────────────────────────────────────
+
+(defn term-jump [target]
+  {:op :jump :target target})
+
+(defn term-branch [cond then-block else-block]
+  {:op :branch :cond cond :then-block then-block :else-block else-block})
+
+(defn term-return [var]
+  {:op :return :var var})
+
+(defn term-recur-jump [target args]
+  {:op :recur-jump :target target :args args})
+
+(defn term-unreachable []
+  {:op :unreachable})
+
+;; ── Builder context (mutable via atom) ──────────────────────────────────────
+
+(defn make-ctx
+  "Create a new lowering context. Returns an atom."
+  [name ns params]
+  (atom {:name name
+         :ns ns
+         :params []
+         :blocks []
+         :current-block 0
+         :current-insts []
+         :locals [{}]
+         :loop-headers []
+         :next-var 0
+         :next-block 1}))
+
+(defn fresh-var!
+  "Allocate a fresh variable ID."
+  [ctx]
+  (let [id (:next-var @ctx)]
+    (swap! ctx update :next-var inc)
+    id))
+
+(defn fresh-block!
+  "Allocate a fresh block ID."
+  [ctx]
+  (let [id (:next-block @ctx)]
+    (swap! ctx update :next-block inc)
+    id))
+
+(defn emit!
+  "Append an instruction to the current block."
+  [ctx inst]
+  (swap! ctx update :current-insts conj inst))
+
+(defn emit-const!
+  "Emit a constant instruction, returning the fresh VarId."
+  [ctx c]
+  (let [dst (fresh-var! ctx)]
+    (emit! ctx (inst-const dst c))
+    dst))
+
+(defn emit-phi!
+  "Emit a phi node instruction."
+  [ctx dst entries]
+  (emit! ctx (inst-phi dst entries)))
+
+(defn finish-block!
+  "Finalize the current block with a terminator."
+  [ctx terminator]
+  (let [state @ctx
+        insts (:current-insts state)
+        phis (filterv (fn [i] (= (:op i) :phi)) insts)
+        regular (filterv (fn [i] (not= (:op i) :phi)) insts)
+        block {:id (:current-block state)
+               :phis phis
+               :insts regular
+               :terminator terminator}]
+    (swap! ctx (fn [s]
+                 (-> s
+                     (update :blocks conj block)
+                     (assoc :current-insts []))))))
+
+(defn start-block!
+  "Begin building a new block."
+  [ctx block-id]
+  (swap! ctx assoc :current-block block-id))
+
+(defn push-scope!
+  "Push a new scope for local bindings."
+  [ctx]
+  (swap! ctx update :locals conj {}))
+
+(defn pop-scope!
+  "Pop the innermost scope."
+  [ctx]
+  (swap! ctx update :locals pop))
+
+(defn bind-local!
+  "Bind a local variable name to a VarId in the current scope."
+  [ctx name var-id]
+  (swap! ctx update :locals
+         (fn [scopes]
+           (let [n (count scopes)]
+             (assoc scopes (- n 1) (assoc (nth scopes (- n 1)) name var-id))))))
+
+(defn lookup-local
+  "Search the scope stack for a local binding. Returns VarId or nil."
+  [ctx name]
+  (let [scopes (:locals @ctx)]
+    (loop [i (- (count scopes) 1)]
+      (if (< i 0)
+        nil
+        (let [scope (nth scopes i)
+              v (get scope name)]
+          (if v
+            v
+            (recur (- i 1))))))))
+
+(defn current-ns
+  "Return the current namespace of the context."
+  [ctx]
+  (:ns @ctx))
+
+(defn push-loop-header!
+  "Push a loop header for recur resolution."
+  [ctx header-block phi-vars]
+  (swap! ctx update :loop-headers conj [header-block phi-vars]))
+
+(defn pop-loop-header!
+  "Pop the current loop header."
+  [ctx]
+  (swap! ctx update :loop-headers pop))
+
+(defn current-loop-header
+  "Return the current loop header [block-id phi-vars], or nil."
+  [ctx]
+  (let [headers (:loop-headers @ctx)]
+    (if (seq headers)
+      (peek headers)
+      nil)))
+
+(defn current-block-id
+  "Return the current block ID."
+  [ctx]
+  (:current-block @ctx))
+
+(defn update-phi-in-header!
+  "Add a predecessor entry to a phi node in the header block."
+  [ctx header-block phi-index from-block var-id]
+  (swap! ctx update :blocks
+         (fn [blocks]
+           (mapv (fn [block]
+                   (if (= (:id block) header-block)
+                     (update block :phis
+                             (fn [phis]
+                               (let [phi (nth phis phi-index)
+                                     updated (update phi :entries conj [from-block var-id])]
+                                 (assoc phis phi-index updated))))
+                     block))
+                 blocks))))
+
+(defn get-all-locals
+  "Return all local bindings across all scopes (for closure capture)."
+  [ctx]
+  (let [scopes (:locals @ctx)]
+    (reduce (fn [acc scope]
+              (reduce (fn [a [k v]] (if (get a k) a (assoc a k v)))
+                      acc
+                      scope))
+            {}
+            scopes)))
+
+(defn build-ir-function
+  "Extract the final IrFunction data map from the context."
+  [ctx]
+  (let [state @ctx]
+    {:name (:name state)
+     :params (:params state)
+     :blocks (:blocks state)
+     :next-var (:next-var state)
+     :next-block (:next-block state)}))

@@ -1,0 +1,62 @@
+(ns cljrs.compiler.known)
+
+(def known-fns
+  {"vector" :vector
+   "hash-map" :hash-map
+   "hash-set" :hash-set
+   "list" :list
+   "assoc" :assoc
+   "dissoc" :dissoc
+   "conj" :conj
+   "disj" :disj
+   "get" :get
+   "nth" :nth
+   "count" :count
+   "contains?" :contains
+   "transient" :transient
+   "assoc!" :assoc!
+   "conj!" :conj!
+   "persistent!" :persistent!
+   "first" :first
+   "rest" :rest
+   "next" :next
+   "cons" :cons
+   "seq" :seq
+   "lazy-seq" :lazy-seq
+   "+" :+
+   "-" :-
+   "*" :*
+   "/" :/
+   "rem" :rem
+   "mod" :rem
+   "=" :=
+   "<" :<
+   ">" :>
+   "<=" :<=
+   ">=" :>=
+   "nil?" :nil?
+   "seq?" :seq?
+   "vector?" :vector?
+   "map?" :map?
+   "identical?" :identical?
+   "str" :str
+   "deref" :deref
+   "println" :println
+   "pr" :pr
+   "apply" :apply})
+
+(defn strip-ns-prefix
+  "Strip namespace prefix from a symbol name (e.g. 'clojure.core/map' -> 'map')."
+  [s]
+  (loop [i (- (count s) 1)]
+    (if (< i 0)
+      s
+      (if (= (nth s i) \/)
+        (subs s (+ i 1))
+        (recur (- i 1))))))
+
+(defn resolve-known-fn
+  "Resolve a symbol name to a KnownFn keyword, or nil if not known.
+   Strips namespace prefix for core functions."
+  [sym-name]
+  (get known-fns (strip-ns-prefix sym-name)))

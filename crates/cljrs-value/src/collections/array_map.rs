@@ -145,10 +145,23 @@ impl PersistentArrayMap {
     /// Pairs are inserted left-to-right; later values win on duplicate keys.
     pub fn from_pairs<I: IntoIterator<Item = (Value, Value)>>(iter: I) -> AssocResult {
         let mut map = Self::empty();
-        for (k, v) in iter {
+        let mut iter = iter.into_iter();
+        for (k, v) in iter.by_ref() {
             match map.assoc(k, v) {
                 AssocResult::Array(m) => map = m,
-                p @ AssocResult::Promote(_) => return p,
+                AssocResult::Promote(pairs) => {
+                    // Continue inserting remaining pairs into the promoted map.
+                    let mut promoted = pairs;
+                    for (k2, v2) in iter {
+                        // Check if key already exists (last wins).
+                        if let Some(pos) = promoted.iter().position(|(pk, _)| *pk == k2) {
+                            promoted[pos].1 = v2;
+                        } else {
+                            promoted.push((k2, v2));
+                        }
+                    }
+                    return AssocResult::Promote(promoted);
+                }
             }
         }
         AssocResult::Array(map)
@@ -266,6 +279,43 @@ mod tests {
         // Adding one more should trigger promotion.
         let result = m.assoc(int(THRESHOLD as i64), int(0));
         assert!(matches!(result, AssocResult::Promote(_)));
+    }
+
+    #[test]
+    fn test_from_pairs_preserves_all_entries_past_threshold() {
+        // Regression: from_pairs used to drop entries after promotion.
+        let pairs: Vec<(Value, Value)> = (0..15i64).map(|i| (int(i), int(i * 10))).collect();
+        let result = PersistentArrayMap::from_pairs(pairs);
+        match result {
+            AssocResult::Promote(pairs) => {
+                assert_eq!(pairs.len(), 15, "all 15 entries must survive promotion");
+                for i in 0..15i64 {
+                    let found = pairs.iter().find(|(k, _)| *k == int(i));
+                    assert!(
+                        found.is_some(),
+                        "key {i} missing after promotion"
+                    );
+                    assert_eq!(found.unwrap().1, int(i * 10));
+                }
+            }
+            AssocResult::Array(_) => panic!("expected promotion for 15 entries"),
+        }
+    }
+
+    #[test]
+    fn test_from_pairs_duplicate_keys_after_promotion() {
+        // 10 unique entries triggers promotion; include a duplicate to test last-wins.
+        let mut pairs: Vec<(Value, Value)> = (0..10i64).map(|i| (int(i), int(i))).collect();
+        pairs.push((int(0), int(999))); // duplicate key 0
+        let result = PersistentArrayMap::from_pairs(pairs);
+        match result {
+            AssocResult::Promote(pairs) => {
+                assert_eq!(pairs.len(), 10, "duplicate should not add extra entry");
+                let val = pairs.iter().find(|(k, _)| *k == int(0)).unwrap();
+                assert_eq!(val.1, int(999), "last value should win for duplicate key");
+            }
+            AssocResult::Array(_) => panic!("expected promotion"),
+        }
     }
 
     #[test]

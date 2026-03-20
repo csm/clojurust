@@ -17,6 +17,8 @@ use cljrs_reader::Parser;
 
 use crate::anf::lower_fn_body;
 use crate::codegen::Compiler;
+use crate::ir::IrFunction;
+use crate::ir_convert;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -67,6 +69,104 @@ impl From<crate::codegen::CodegenError> for AotError {
 }
 
 pub type AotResult<T> = Result<T, AotError>;
+
+// ── Clojure-based lowering ──────────────────────────────────────────────────
+
+/// Lower forms via the Clojure compiler front-end.
+///
+/// 1. Ensures compiler namespaces are loaded
+/// 2. Converts Forms → Values via `form_to_value`
+/// 3. Calls `cljrs.compiler.anf/lower-fn-body` via `callback::invoke`
+/// 4. Converts returned Value → `IrFunction` via `ir_convert`
+pub fn lower_via_clojure(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    compilable_forms: &[cljrs_reader::Form],
+    env: &mut cljrs_eval::Env,
+) -> AotResult<IrFunction> {
+    // Register compiler sources so require can find them.
+    crate::register_compiler_sources(&env.globals);
+
+    // Push eval context so callback::invoke can work.
+    cljrs_eval::callback::push_eval_context(env);
+
+    let result = lower_via_clojure_inner(name, ns, params, compilable_forms, env);
+
+    // Always pop eval context, regardless of success or failure.
+    cljrs_eval::callback::pop_eval_context();
+
+    result
+}
+
+fn lower_via_clojure_inner(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    compilable_forms: &[cljrs_reader::Form],
+    env: &mut cljrs_eval::Env,
+) -> AotResult<IrFunction> {
+    use cljrs_value::Value;
+    use cljrs_value::collections::vector::PersistentVector;
+    use cljrs_gc::GcPtr;
+
+    // Ensure the ANF namespace is loaded.
+    let require_form = cljrs_reader::Form::new(
+        cljrs_reader::form::FormKind::List(vec![
+            cljrs_reader::Form::new(
+                cljrs_reader::form::FormKind::Symbol("require".into()),
+                cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+            ),
+            cljrs_reader::Form::new(
+                cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Symbol("cljrs.compiler.anf".into()),
+                    cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+                ))),
+                cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+            ),
+        ]),
+        cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+    );
+    cljrs_eval::eval(&require_form, env).map_err(|e| AotError::Eval(format!("{e:?}")))?;
+
+    // Look up the lower-fn-body function.
+    let lower_fn = env
+        .globals
+        .lookup_var_in_ns("cljrs.compiler.anf", "lower-fn-body")
+        .ok_or_else(|| AotError::Eval("cljrs.compiler.anf/lower-fn-body not found".to_string()))?;
+    let lower_fn_val = lower_fn.get().deref().unwrap_or(Value::Nil);
+
+    // Build arguments:
+    // 1. fname (string or nil)
+    let fname_val = match name {
+        Some(n) => Value::string(n.to_string()),
+        None => Value::Nil,
+    };
+
+    // 2. ns (string)
+    let ns_val = Value::string(ns.to_string());
+
+    // 3. params (vector of strings)
+    let params_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
+        params.iter().map(|p| Value::string(p.to_string())),
+    )));
+
+    // 4. body-forms (vector of form values)
+    let body_forms_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
+        compilable_forms.iter().map(cljrs_eval::eval::form_to_value),
+    )));
+
+    // Call the Clojure function.
+    let result = cljrs_eval::callback::invoke(
+        &lower_fn_val,
+        vec![fname_val, ns_val, params_val, body_forms_val],
+    )
+    .map_err(|e| AotError::Eval(format!("Clojure lowering failed: {e:?}")))?;
+
+    // Convert the result Value → IrFunction.
+    ir_convert::value_to_ir_function(&result)
+        .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))
+}
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -144,7 +244,24 @@ pub fn compile_file(
     } else {
         compilable
     };
-    let ir_func = lower_fn_body(Some("__cljrs_main"), "user", &params, &compilable_forms)?;
+
+    // Try Clojure front-end first; fall back to Rust if it fails.
+    let ir_func = match lower_via_clojure(
+        Some("__cljrs_main"),
+        "user",
+        &params,
+        &compilable_forms,
+        &mut env,
+    ) {
+        Ok(ir) => {
+            eprintln!("[aot] lowered via Clojure front-end");
+            ir
+        }
+        Err(e) => {
+            eprintln!("[aot] Clojure front-end failed ({e}), falling back to Rust");
+            lower_fn_body(Some("__cljrs_main"), "user", &params, &compilable_forms)?
+        }
+    };
     eprintln!(
         "[aot] lowered to {} block(s), {} var(s)",
         ir_func.blocks.len(),
