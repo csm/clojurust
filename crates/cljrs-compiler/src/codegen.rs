@@ -15,7 +15,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-use crate::ir::{BlockId, Const, IrFunction, Inst, KnownFn, Terminator, VarId};
+use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, Terminator, VarId};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -100,21 +100,21 @@ impl Compiler {
     pub fn new() -> CodegenResult<Self> {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
-        flag_builder
-            .set("is_pic", "true")
-            .unwrap();
+        flag_builder.set("is_pic", "true").unwrap();
 
-        let isa_builder = cranelift_native::builder().map_err(|e| {
-            CodegenError::Codegen(format!("failed to create ISA builder: {e}"))
-        })?;
+        let isa_builder = cranelift_native::builder()
+            .map_err(|e| CodegenError::Codegen(format!("failed to create ISA builder: {e}")))?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| CodegenError::Codegen(format!("failed to build ISA: {e}")))?;
 
         let ptr_type = isa.pointer_type();
 
-        let obj_builder =
-            ObjectBuilder::new(isa, "clojurust_aot", cranelift_module::default_libcall_names())?;
+        let obj_builder = ObjectBuilder::new(
+            isa,
+            "clojurust_aot",
+            cranelift_module::default_libcall_names(),
+        )?;
         let mut module = ObjectModule::new(obj_builder);
 
         let rt = declare_runtime_funcs(&mut module, ptr_type)?;
@@ -130,30 +130,25 @@ impl Compiler {
     }
 
     /// Declare a user function (makes it available for calls before definition).
-    pub fn declare_function(
-        &mut self,
-        name: &str,
-        param_count: usize,
-    ) -> CodegenResult<FuncId> {
+    pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId> {
         let mut sig = self.module.make_signature();
         for _ in 0..param_count {
             sig.params.push(AbiParam::new(self.ptr_type));
         }
         sig.returns.push(AbiParam::new(self.ptr_type));
-        let func_id = self
-            .module
-            .declare_function(name, Linkage::Export, &sig)?;
+        let func_id = self.module.declare_function(name, Linkage::Export, &sig)?;
         self.user_funcs.insert(Arc::from(name), func_id);
         Ok(func_id)
     }
 
     /// Compile an IR function and define it in the module.
-    pub fn compile_function(
-        &mut self,
-        ir_func: &IrFunction,
-        func_id: FuncId,
-    ) -> CodegenResult<()> {
-        self.ctx.func.signature = self.module.declarations().get_function_decl(func_id).signature.clone();
+    pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()> {
+        self.ctx.func.signature = self
+            .module
+            .declarations()
+            .get_function_decl(func_id)
+            .signature
+            .clone();
         self.ctx.func.name = cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32());
 
         {
@@ -210,7 +205,8 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         // Entry block: append params.
         let entry_block = self.block_map[&ir_func.blocks[0].id];
         self.builder.switch_to_block(entry_block);
-        self.builder.append_block_params_for_function_params(entry_block);
+        self.builder
+            .append_block_params_for_function_params(entry_block);
 
         // Bind function parameters to variables.
         for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
@@ -339,7 +335,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
             Inst::Throw(_val) => {
                 // TODO: implement throw with rt_throw
-                self.builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(0));
+                self.builder
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(0));
             }
 
             Inst::Phi(_, _) => {
@@ -404,17 +402,24 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let else_b = self.block_map[else_block];
                 let then_args = self.collect_phi_args(*then_block, current_block_id, ir_func);
                 let else_args = self.collect_phi_args(*else_block, current_block_id, ir_func);
-                self.builder.ins().brif(truthy, then_b, &then_args, else_b, &else_args);
+                self.builder
+                    .ins()
+                    .brif(truthy, then_b, &then_args, else_b, &else_args);
             }
 
             Terminator::RecurJump { target, args } => {
                 let clif_block = self.block_map[target];
-                let arg_vals: Vec<BlockArg> = args.iter().map(|a| BlockArg::Value(self.use_var(*a))).collect();
+                let arg_vals: Vec<BlockArg> = args
+                    .iter()
+                    .map(|a| BlockArg::Value(self.use_var(*a)))
+                    .collect();
                 self.builder.ins().jump(clif_block, &arg_vals);
             }
 
             Terminator::Unreachable => {
-                self.builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                self.builder
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
             }
         }
         Ok(())
@@ -543,7 +548,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         let ns_ptr = self.builder.ins().global_value(self.ptr_type, ns_gv);
         let ns_len = self.builder.ins().iconst(types::I64, ns.len() as i64);
 
-        let name_gv = self.module.declare_data_in_func(name_data, self.builder.func);
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data, self.builder.func);
         let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
         let name_len = self.builder.ins().iconst(types::I64, name.len() as i64);
 
@@ -576,7 +583,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         let ns_ptr = self.builder.ins().global_value(self.ptr_type, ns_gv);
         let ns_len = self.builder.ins().iconst(types::I64, ns.len() as i64);
 
-        let name_gv = self.module.declare_data_in_func(name_data, self.builder.func);
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data, self.builder.func);
         let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
         let name_len = self.builder.ins().iconst(types::I64, name.len() as i64);
 
@@ -608,18 +617,18 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         }
 
         // Allocate stack space for element pointers.
-        let slot = self.builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            (n * 8) as u32,
-            3, // align to 8 bytes
-        ));
+        let slot = self
+            .builder
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (n * 8) as u32,
+                3, // align to 8 bytes
+            ));
 
         // Store each element pointer.
         for (i, elem_var) in elems.iter().enumerate() {
             let val = self.use_var(*elem_var);
-            self.builder
-                .ins()
-                .stack_store(val, slot, (i * 8) as i32);
+            self.builder.ins().stack_store(val, slot, (i * 8) as i32);
         }
 
         // Get the stack slot address.
@@ -699,19 +708,18 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             let null = self.builder.ins().iconst(self.ptr_type, 0);
             let zero = self.builder.ins().iconst(types::I64, 0);
             let func_ref = self.import_func(self.rt.rt_call);
-            let call = self
-                .builder
-                .ins()
-                .call(func_ref, &[callee_val, null, zero]);
+            let call = self.builder.ins().call(func_ref, &[callee_val, null, zero]);
             return Ok(self.builder.inst_results(call)[0]);
         }
 
         // Spill args to stack.
-        let slot = self.builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            (n * 8) as u32,
-            3,
-        ));
+        let slot = self
+            .builder
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (n * 8) as u32,
+                3,
+            ));
         for (i, arg) in args.iter().enumerate() {
             let val = self.use_var(*arg);
             self.builder.ins().stack_store(val, slot, (i * 8) as i32);
@@ -743,10 +751,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         self.module.declare_func_in_func(func_id, self.builder.func)
     }
 
-    fn call_rt_0(
-        &mut self,
-        func_id: FuncId,
-    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+    fn call_rt_0(&mut self, func_id: FuncId) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[]);
         Ok(self.builder.inst_results(call)[0])
@@ -881,7 +886,11 @@ mod tests {
         forms
     }
 
-    fn lower(name: &str, params: &[Arc<str>], body: &[cljrs_reader::Form]) -> crate::ir::IrFunction {
+    fn lower(
+        name: &str,
+        params: &[Arc<str>],
+        body: &[cljrs_reader::Form],
+    ) -> crate::ir::IrFunction {
         // Run on a thread with a larger stack since Clojure eval is deeply recursive.
         let name = name.to_string();
         let params = params.to_vec();
@@ -891,7 +900,8 @@ mod tests {
             .spawn(move || {
                 let globals = cljrs_stdlib::standard_env();
                 let mut env = cljrs_eval::Env::new(globals, "user");
-                crate::aot::lower_via_clojure(Some(&name), "user", &params, &body, &mut env).unwrap()
+                crate::aot::lower_via_clojure(Some(&name), "user", &params, &body, &mut env)
+                    .unwrap()
             })
             .unwrap()
             .join()
@@ -956,9 +966,7 @@ mod tests {
     #[test]
     fn test_compile_loop_recur() {
         // (defn sum [n] (loop [i 0 acc 0] (if (= i n) acc (recur (+ i 1) (+ acc i)))))
-        let body = parse_body(
-            "(loop [i 0 acc 0] (if (= i n) acc (recur (+ i 1) (+ acc i))))",
-        );
+        let body = parse_body("(loop [i 0 acc 0] (if (= i n) acc (recur (+ i 1) (+ acc i))))");
         let params: Vec<Arc<str>> = vec![Arc::from("n")];
         let ir = lower("sum", &params, &body);
 

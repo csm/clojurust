@@ -404,7 +404,9 @@ fn eval_virtualized_chain(
     pairs: &[&[Form]],
     env: &mut Env,
 ) -> Result<(), EvalError> {
-    use crate::transients::{builtin_assoc_bang, builtin_conj_bang, builtin_persistent_bang, builtin_transient};
+    use crate::transients::{
+        builtin_assoc_bang, builtin_conj_bang, builtin_persistent_bang, builtin_transient,
+    };
 
     // Step 1: Evaluate the root collection (first arg of the first call).
     let first_pair = pairs[chain.start];

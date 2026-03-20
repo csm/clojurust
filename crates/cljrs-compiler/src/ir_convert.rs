@@ -151,7 +151,9 @@ pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction> {
     for p in &params_vec {
         let pair = as_vec(p)?;
         if pair.len() != 2 {
-            return Err(ConvertError::TypeError("param must be [name var-id]".into()));
+            return Err(ConvertError::TypeError(
+                "param must be [name var-id]".into(),
+            ));
         }
         let name = as_str(&pair[0])?;
         let var_id = as_var_id(&pair[1])?;
@@ -282,8 +284,9 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
         "call-known" => {
             let dst = as_var_id(&get_field(map, "dst")?)?;
             let func_kw = as_keyword_name(&get_field(map, "func")?)?;
-            let known = keyword_to_known_fn(&func_kw)
-                .ok_or_else(|| ConvertError::UnknownVariant(format!("unknown KnownFn: {func_kw}")))?;
+            let known = keyword_to_known_fn(&func_kw).ok_or_else(|| {
+                ConvertError::UnknownVariant(format!("unknown KnownFn: {func_kw}"))
+            })?;
             let args = as_var_id_vec(&get_field(map, "args")?)?;
             Ok(Inst::CallKnown(dst, known, args))
         }
@@ -322,7 +325,9 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
             for e in &entries_vec {
                 let pair = as_vec(e)?;
                 if pair.len() != 2 {
-                    return Err(ConvertError::TypeError("phi entry must be [block-id var-id]".into()));
+                    return Err(ConvertError::TypeError(
+                        "phi entry must be [block-id var-id]".into(),
+                    ));
                 }
                 entries.push((as_block_id(&pair[0])?, as_var_id(&pair[1])?));
             }
@@ -344,7 +349,9 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
                 col,
             )))
         }
-        other => Err(ConvertError::UnknownVariant(format!("unknown inst op: {other}"))),
+        other => Err(ConvertError::UnknownVariant(format!(
+            "unknown inst op: {other}"
+        ))),
     }
 }
 
@@ -395,7 +402,9 @@ fn value_to_const(val: &Value) -> ConvertResult<Const> {
             let v = get_field(map, "val")?;
             match v {
                 Value::Bool(b) => Ok(Const::Bool(b)),
-                _ => Err(ConvertError::TypeError("expected bool for :bool const".into())),
+                _ => Err(ConvertError::TypeError(
+                    "expected bool for :bool const".into(),
+                )),
             }
         }
         "long" => {
@@ -407,7 +416,9 @@ fn value_to_const(val: &Value) -> ConvertResult<Const> {
             match v {
                 Value::Double(d) => Ok(Const::Double(d)),
                 Value::Long(n) => Ok(Const::Double(n as f64)),
-                _ => Err(ConvertError::TypeError("expected double for :double const".into())),
+                _ => Err(ConvertError::TypeError(
+                    "expected double for :double const".into(),
+                )),
             }
         }
         "string" => {
@@ -426,7 +437,9 @@ fn value_to_const(val: &Value) -> ConvertResult<Const> {
             let v = get_field(map, "val")?;
             match v {
                 Value::Char(c) => Ok(Const::Char(c)),
-                _ => Err(ConvertError::TypeError("expected char for :char const".into())),
+                _ => Err(ConvertError::TypeError(
+                    "expected char for :char const".into(),
+                )),
             }
         }
         other => Err(ConvertError::UnknownVariant(format!(
@@ -521,39 +534,28 @@ mod tests {
 
     #[test]
     fn test_const_nil() {
-        let val = make_map(vec![
-            (kw("type"), kw("nil")),
-        ]);
+        let val = make_map(vec![(kw("type"), kw("nil"))]);
         let c = value_to_const(&val).unwrap();
         assert!(matches!(c, Const::Nil));
     }
 
     #[test]
     fn test_const_long() {
-        let val = make_map(vec![
-            (kw("type"), kw("long")),
-            (kw("val"), Value::Long(42)),
-        ]);
+        let val = make_map(vec![(kw("type"), kw("long")), (kw("val"), Value::Long(42))]);
         let c = value_to_const(&val).unwrap();
         assert!(matches!(c, Const::Long(42)));
     }
 
     #[test]
     fn test_terminator_return() {
-        let val = make_map(vec![
-            (kw("op"), kw("return")),
-            (kw("var"), Value::Long(0)),
-        ]);
+        let val = make_map(vec![(kw("op"), kw("return")), (kw("var"), Value::Long(0))]);
         let t = value_to_terminator(&val).unwrap();
         assert!(matches!(t, Terminator::Return(VarId(0))));
     }
 
     #[test]
     fn test_inst_const() {
-        let const_map = make_map(vec![
-            (kw("type"), kw("long")),
-            (kw("val"), Value::Long(42)),
-        ]);
+        let const_map = make_map(vec![(kw("type"), kw("long")), (kw("val"), Value::Long(42))]);
         let val = make_map(vec![
             (kw("op"), kw("const")),
             (kw("dst"), Value::Long(0)),
@@ -566,19 +568,13 @@ mod tests {
     #[test]
     fn test_simple_ir_function() {
         // Build: {:name "test" :params [["x" 0]] :blocks [...] :next-var 2 :next-block 1}
-        let const_val = make_map(vec![
-            (kw("type"), kw("long")),
-            (kw("val"), Value::Long(42)),
-        ]);
+        let const_val = make_map(vec![(kw("type"), kw("long")), (kw("val"), Value::Long(42))]);
         let inst = make_map(vec![
             (kw("op"), kw("const")),
             (kw("dst"), Value::Long(1)),
             (kw("value"), const_val),
         ]);
-        let terminator = make_map(vec![
-            (kw("op"), kw("return")),
-            (kw("var"), Value::Long(1)),
-        ]);
+        let terminator = make_map(vec![(kw("op"), kw("return")), (kw("var"), Value::Long(1))]);
         let block = make_map(vec![
             (kw("id"), Value::Long(0)),
             (kw("phis"), make_vec(vec![])),

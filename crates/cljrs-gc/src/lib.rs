@@ -126,7 +126,10 @@ pub(crate) struct GcBox<T: Trace + 'static> {
     pub(crate) value: T,
 }
 
-pub(crate) unsafe fn trace_gc_box<T: Trace + 'static>(header: *const GcBoxHeader, visitor: &mut MarkVisitor) {
+pub(crate) unsafe fn trace_gc_box<T: Trace + 'static>(
+    header: *const GcBoxHeader,
+    visitor: &mut MarkVisitor,
+) {
     // SAFETY: `header` is the first field of `GcBox<T>` (#[repr(C)]).
     unsafe {
         let gc_box = header as *const GcBox<T>;

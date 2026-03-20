@@ -11,9 +11,7 @@
 use cljrs_gc::GcPtr;
 use cljrs_value::keyword::Keyword;
 use cljrs_value::value::{MapValue, PrintValue, SetValue};
-use cljrs_value::{
-    CljxCons, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value,
-};
+use cljrs_value::{CljxCons, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value};
 
 use std::sync::Arc;
 
@@ -285,7 +283,10 @@ pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Valu
 pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice.iter().map(|p| unsafe { val_ref(*p) }.clone()).collect();
+    let items: Vec<Value> = slice
+        .iter()
+        .map(|p| unsafe { val_ref(*p) }.clone())
+        .collect();
     box_val(Value::Vector(GcPtr::new(PersistentVector::from_iter(
         items,
     ))))
@@ -317,7 +318,10 @@ pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *co
 pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice.iter().map(|p| unsafe { val_ref(*p) }.clone()).collect();
+    let items: Vec<Value> = slice
+        .iter()
+        .map(|p| unsafe { val_ref(*p) }.clone())
+        .collect();
     let set = PersistentHashSet::from_iter(items);
     box_val(Value::Set(SetValue::Hash(GcPtr::new(set))))
 }
@@ -330,7 +334,10 @@ pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *co
 pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice.iter().map(|p| unsafe { val_ref(*p) }.clone()).collect();
+    let items: Vec<Value> = slice
+        .iter()
+        .map(|p| unsafe { val_ref(*p) }.clone())
+        .collect();
     box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
 
@@ -339,10 +346,7 @@ pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *c
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_alloc_cons(
-    head: *const Value,
-    tail: *const Value,
-) -> *const Value {
+pub unsafe extern "C" fn rt_alloc_cons(head: *const Value, tail: *const Value) -> *const Value {
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
     box_val(Value::Cons(GcPtr::new(CljxCons { head: h, tail: t })))
@@ -484,8 +488,12 @@ pub unsafe extern "C" fn rt_load_global(
     name_ptr: *const u8,
     name_len: u64,
 ) -> *const Value {
-    let ns = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize)) };
-    let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let ns = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
+    };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
 
     // Look up in the global environment via the thread-local eval context.
     if let Some((globals, current_ns)) = cljrs_eval::callback::capture_eval_context() {
@@ -515,8 +523,12 @@ pub unsafe extern "C" fn rt_def_var(
     name_len: u64,
     val: *const Value,
 ) -> *const Value {
-    let ns = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize)) };
-    let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let ns = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
+    };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
     let val = unsafe { val_ref(val) }.clone();
 
     if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() {
@@ -629,10 +641,7 @@ pub unsafe extern "C" fn rt_is_vector(v: *const Value) -> *const Value {
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
-    box_val(Value::Bool(matches!(
-        unsafe { val_ref(v) },
-        Value::Map(_)
-    )))
+    box_val(Value::Bool(matches!(unsafe { val_ref(v) }, Value::Map(_))))
 }
 
 // ── Identity ────────────────────────────────────────────────────────────────

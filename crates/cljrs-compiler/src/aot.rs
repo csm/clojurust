@@ -98,9 +98,9 @@ fn lower_via_clojure_inner(
     compilable_forms: &[cljrs_reader::Form],
     env: &mut cljrs_eval::Env,
 ) -> AotResult<IrFunction> {
+    use cljrs_gc::GcPtr;
     use cljrs_value::Value;
     use cljrs_value::collections::vector::PersistentVector;
-    use cljrs_gc::GcPtr;
 
     // Ensure the ANF namespace is loaded.
     let require_form = cljrs_reader::Form::new(
@@ -167,11 +167,7 @@ fn lower_via_clojure_inner(
 /// `src_path` is the input source file.  `out_path` is the desired output
 /// binary.  `src_dirs` are additional directories for `require` resolution
 /// during macro expansion.
-pub fn compile_file(
-    src_path: &Path,
-    out_path: &Path,
-    src_dirs: &[PathBuf],
-) -> AotResult<()> {
+pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()> {
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
     let filename = src_path.display().to_string();
@@ -276,7 +272,10 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
                 // defn, defmacro, defonce need the interpreter because
                 // they create closures (fn* values) which codegen can't
                 // emit yet.
-                return matches!(s.as_str(), "defn" | "defmacro" | "defonce" | "ns" | "require");
+                return matches!(
+                    s.as_str(),
+                    "defn" | "defmacro" | "defonce" | "ns" | "require"
+                );
             }
             false
         }
@@ -288,7 +287,11 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
 
 /// Create a temporary Cargo project that links the compiled object code with
 /// the clojurust runtime and produces a binary.
-fn build_harness(out_path: &Path, obj_bytes: &[u8], interpreted_source: &str) -> AotResult<PathBuf> {
+fn build_harness(
+    out_path: &Path,
+    obj_bytes: &[u8],
+    interpreted_source: &str,
+) -> AotResult<PathBuf> {
     // Place the harness in a temp dir next to the output.
     let harness_dir = out_path
         .parent()
@@ -419,9 +422,7 @@ fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AotError::Link(format!(
-            "cargo build failed:\n{stderr}"
-        )));
+        return Err(AotError::Link(format!("cargo build failed:\n{stderr}")));
     }
 
     // The binary is at target/release/cljrs-aot-harness.

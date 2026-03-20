@@ -291,10 +291,7 @@ mod tests {
                 assert_eq!(pairs.len(), 15, "all 15 entries must survive promotion");
                 for i in 0..15i64 {
                     let found = pairs.iter().find(|(k, _)| *k == int(i));
-                    assert!(
-                        found.is_some(),
-                        "key {i} missing after promotion"
-                    );
+                    assert!(found.is_some(), "key {i} missing after promotion");
                     assert_eq!(found.unwrap().1, int(i * 10));
                 }
             }

@@ -217,7 +217,6 @@ pub enum Inst {
     SourceLoc(Span),
 
     // ── Region allocation nodes ─────────────────────────────────────────
-
     /// Begin a region scope.  The `VarId` identifies the region handle,
     /// used by subsequent `RegionAlloc` instructions.  Paired with
     /// `RegionEnd`.
@@ -291,10 +290,7 @@ pub enum Terminator {
     Return(VarId),
 
     /// Recur (tail-call back to loop header).
-    RecurJump {
-        target: BlockId,
-        args: Vec<VarId>,
-    },
+    RecurJump { target: BlockId, args: Vec<VarId> },
 
     /// Unreachable (e.g., after a `throw`).
     Unreachable,
@@ -557,11 +553,7 @@ impl fmt::Display for Inst {
             Inst::AllocList(dst, elems) => write!(f, "{dst} = alloc_list {elems:?}"),
             Inst::AllocCons(dst, h, t) => write!(f, "{dst} = cons {h} {t}"),
             Inst::AllocClosure(dst, tmpl, captures) => {
-                write!(
-                    f,
-                    "{dst} = closure {:?} captures={captures:?}",
-                    tmpl.name
-                )
+                write!(f, "{dst} = closure {:?} captures={captures:?}", tmpl.name)
             }
             Inst::CallKnown(dst, func, args) => write!(f, "{dst} = call_known {func:?} {args:?}"),
             Inst::Call(dst, callee, args) => write!(f, "{dst} = call {callee} {args:?}"),

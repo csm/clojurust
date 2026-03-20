@@ -1976,10 +1976,7 @@ mod tests {
                c)",
         )
         .unwrap();
-        assert_eq!(
-            v,
-            eval_str("[1 2 3 4]").unwrap()
-        );
+        assert_eq!(v, eval_str("[1 2 3 4]").unwrap());
     }
 
     #[test]

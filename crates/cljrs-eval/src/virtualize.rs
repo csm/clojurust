@@ -15,8 +15,8 @@
 //! ```
 //! Optimized to internally: `transient(m) → assoc! :x 1 → assoc! :y 2 → assoc! :z 3 → persistent!`
 
-use cljrs_reader::form::FormKind;
 use cljrs_reader::Form;
+use cljrs_reader::form::FormKind;
 
 /// An assoc/conj chain detected in let bindings.
 #[derive(Debug)]
@@ -249,8 +249,7 @@ mod tests {
 
     #[test]
     fn test_detect_conj_chain() {
-        let bindings =
-            parse_bindings("(let [a (conj v 1) b (conj a 2) c (conj b 3)] c)");
+        let bindings = parse_bindings("(let [a (conj v 1) b (conj a 2) c (conj b 3)] c)");
         let chains = detect_let_chains(&bindings);
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].len, 3);
@@ -267,16 +266,14 @@ mod tests {
     #[test]
     fn test_no_chain_different_names() {
         // b doesn't reference a — not a chain.
-        let bindings =
-            parse_bindings("(let [a (assoc m :x 1) b (assoc m :y 2)] b)");
+        let bindings = parse_bindings("(let [a (assoc m :x 1) b (assoc m :y 2)] b)");
         let chains = detect_let_chains(&bindings);
         assert!(chains.is_empty());
     }
 
     #[test]
     fn test_mixed_chain() {
-        let bindings =
-            parse_bindings("(let [a (assoc m :x 1) b (conj a 2) c (assoc b :z 3)] c)");
+        let bindings = parse_bindings("(let [a (assoc m :x 1) b (conj a 2) c (assoc b :z 3)] c)");
         let chains = detect_let_chains(&bindings);
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].len, 3);

@@ -38,9 +38,8 @@ impl Chunk {
         let layout =
             Layout::from_size_align(size, align.max(16)).expect("Region: invalid chunk layout");
         // SAFETY: layout has non-zero size.
-        let data = unsafe {
-            NonNull::new(alloc::alloc(layout)).expect("Region: chunk allocation failed")
-        };
+        let data =
+            unsafe { NonNull::new(alloc::alloc(layout)).expect("Region: chunk allocation failed") };
         Self { data, layout }
     }
 }
