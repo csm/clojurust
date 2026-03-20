@@ -12,10 +12,8 @@
 //! IR as plain Clojure data. The `ir_convert` module translates this back to the
 //! Rust `IrFunction` structs that `codegen.rs` consumes.
 
-pub mod anf;
 pub mod aot;
 pub mod codegen;
-pub mod escape;
 pub mod ir;
 pub mod ir_convert;
 pub mod rt_abi;

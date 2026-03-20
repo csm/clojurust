@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use cljrs_reader::Parser;
 
-use crate::anf::lower_fn_body;
 use crate::codegen::Compiler;
 use crate::ir::IrFunction;
 use crate::ir_convert;
@@ -26,7 +25,6 @@ use crate::ir_convert;
 pub enum AotError {
     Io(std::io::Error),
     Parse(cljrs_types::error::CljxError),
-    Lower(crate::anf::LowerError),
     Codegen(crate::codegen::CodegenError),
     Eval(String),
     Link(String),
@@ -37,9 +35,8 @@ impl std::fmt::Display for AotError {
         match self {
             AotError::Io(e) => write!(f, "I/O error: {e}"),
             AotError::Parse(e) => write!(f, "parse error: {e}"),
-            AotError::Lower(e) => write!(f, "lowering error: {e}"),
             AotError::Codegen(e) => write!(f, "codegen error: {e:?}"),
-            AotError::Eval(e) => write!(f, "macro expansion error: {e}"),
+            AotError::Eval(e) => write!(f, "eval/lowering error: {e}"),
             AotError::Link(e) => write!(f, "link error: {e}"),
         }
     }
@@ -55,11 +52,6 @@ impl From<std::io::Error> for AotError {
 impl From<cljrs_types::error::CljxError> for AotError {
     fn from(e: cljrs_types::error::CljxError) -> Self {
         AotError::Parse(e)
-    }
-}
-impl From<crate::anf::LowerError> for AotError {
-    fn from(e: crate::anf::LowerError) -> Self {
-        AotError::Lower(e)
     }
 }
 impl From<crate::codegen::CodegenError> for AotError {
@@ -245,23 +237,13 @@ pub fn compile_file(
         compilable
     };
 
-    // Try Clojure front-end first; fall back to Rust if it fails.
-    let ir_func = match lower_via_clojure(
+    let ir_func = lower_via_clojure(
         Some("__cljrs_main"),
         "user",
         &params,
         &compilable_forms,
         &mut env,
-    ) {
-        Ok(ir) => {
-            eprintln!("[aot] lowered via Clojure front-end");
-            ir
-        }
-        Err(e) => {
-            eprintln!("[aot] Clojure front-end failed ({e}), falling back to Rust");
-            lower_fn_body(Some("__cljrs_main"), "user", &params, &compilable_forms)?
-        }
-    };
+    )?;
     eprintln!(
         "[aot] lowered to {} block(s), {} var(s)",
         ir_func.blocks.len(),

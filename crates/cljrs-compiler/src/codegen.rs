@@ -870,7 +870,6 @@ fn declare_runtime_funcs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anf::lower_fn_body;
     use cljrs_reader::Parser;
 
     fn parse_body(src: &str) -> Vec<cljrs_reader::Form> {
@@ -882,11 +881,28 @@ mod tests {
         forms
     }
 
+    fn lower(name: &str, params: &[Arc<str>], body: &[cljrs_reader::Form]) -> crate::ir::IrFunction {
+        // Run on a thread with a larger stack since Clojure eval is deeply recursive.
+        let name = name.to_string();
+        let params = params.to_vec();
+        let body = body.to_vec();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let globals = cljrs_stdlib::standard_env();
+                let mut env = cljrs_eval::Env::new(globals, "user");
+                crate::aot::lower_via_clojure(Some(&name), "user", &params, &body, &mut env).unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[test]
     fn test_compile_constant_function() {
         // (defn f [] 42)
         let body = parse_body("42");
-        let ir = lower_fn_body(Some("f"), "user", &[], &body).unwrap();
+        let ir = lower("f", &[], &body);
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("f", 0).unwrap();
@@ -900,7 +916,7 @@ mod tests {
         // (defn add [a b] (+ a b))
         let body = parse_body("(+ a b)");
         let params: Vec<Arc<str>> = vec![Arc::from("a"), Arc::from("b")];
-        let ir = lower_fn_body(Some("add"), "user", &params, &body).unwrap();
+        let ir = lower("add", &params, &body);
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("add", 2).unwrap();
@@ -914,7 +930,7 @@ mod tests {
         // (defn f [x] (if x 1 2))
         let body = parse_body("(if x 1 2)");
         let params: Vec<Arc<str>> = vec![Arc::from("x")];
-        let ir = lower_fn_body(Some("f"), "user", &params, &body).unwrap();
+        let ir = lower("f", &params, &body);
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("f", 1).unwrap();
@@ -928,7 +944,7 @@ mod tests {
         // (defn f [x] (let [y (+ x 1)] y))
         let body = parse_body("(let [y (+ x 1)] y)");
         let params: Vec<Arc<str>> = vec![Arc::from("x")];
-        let ir = lower_fn_body(Some("f"), "user", &params, &body).unwrap();
+        let ir = lower("f", &params, &body);
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("f", 1).unwrap();
@@ -944,7 +960,7 @@ mod tests {
             "(loop [i 0 acc 0] (if (= i n) acc (recur (+ i 1) (+ acc i))))",
         );
         let params: Vec<Arc<str>> = vec![Arc::from("n")];
-        let ir = lower_fn_body(Some("sum"), "user", &params, &body).unwrap();
+        let ir = lower("sum", &params, &body);
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("sum", 1).unwrap();

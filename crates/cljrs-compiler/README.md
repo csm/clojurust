@@ -4,11 +4,10 @@ Program analysis, optimization, and AOT compilation for clojurust. Provides an
 intermediate representation (IR) in A-normal form with SSA, escape analysis,
 Cranelift-based native code generation, and a C-ABI runtime bridge.
 
-The compiler has two front-ends for ANF lowering:
-- **Rust front-end** (`anf.rs`, `escape.rs`) — the original implementation
-- **Clojure front-end** (`cljrs.compiler.anf`, `cljrs.compiler.escape`) — tree/graph transformations written in Clojure, producing IR as plain data maps
-
-The AOT driver tries the Clojure front-end first and falls back to Rust on failure.
+ANF lowering and escape analysis are written in Clojure (`cljrs.compiler.anf`,
+`cljrs.compiler.escape`), producing IR as plain data maps. A thin Rust conversion
+layer (`ir_convert.rs`) translates these back to the `IrFunction` structs that the
+Cranelift codegen backend consumes.
 
 **Phase:** 8.1 (optimization) + 11 (AOT compilation) — end-to-end AOT working for simple programs.
 
@@ -21,8 +20,6 @@ src/
   lib.rs        — module declarations, embedded Clojure sources, register_compiler_sources()
   ir.rs         — IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId, KnownFn, Effect, Const
   ir_convert.rs — Value → IrFunction conversion (Clojure data → Rust IR types)
-  anf.rs        — ANF lowering (Rust): Form AST → IR instructions (AstLowering builder)
-  escape.rs     — Escape analysis (Rust): EscapeState, def-use chains, collection chain detection
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
   codegen.rs    — Cranelift code generator: IrFunction → native object code
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
@@ -57,14 +54,6 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn>;
 ```
 
 Converts Clojure data maps (produced by the Clojure front-end) back to Rust IR types.
-
-### ANF lowering (`anf.rs`)
-
-```rust
-pub fn lower_fn_body(name: Option<&str>, ns: &str, params: &[Arc<str>], body: &[Form]) -> LowerResult<IrFunction>;
-```
-
-Handles: atoms, symbols, collections, `if`, `let`, `loop`/`recur`, `def`, `fn*`, `and`/`or`, `throw`, `set!`, `quote`, function calls (known + unknown).
 
 ### Compiler source registration (`lib.rs`)
 
@@ -107,14 +96,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 ```
 
-Pipeline: read source → parse → macro-expand → ANF lower (Clojure→Rust fallback) → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
-
-### Escape analysis (`escape.rs`)
-
-```rust
-pub fn analyze(func: &IrFunction) -> EscapeAnalysis;
-pub fn detect_collection_chains(func: &IrFunction, escape: &EscapeAnalysis) -> Vec<CollectionChain>;
-```
+Pipeline: read source → parse → macro-expand → ANF lower (Clojure) → IR convert → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
 
 ---
 
