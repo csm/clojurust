@@ -80,6 +80,7 @@ struct RuntimeFuncs {
     rt_str: FuncId,
     rt_load_global: FuncId,
     rt_def_var: FuncId,
+    rt_make_fn: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -161,6 +162,7 @@ impl Compiler {
                     ptr_type: self.ptr_type,
                     var_map: HashMap::new(),
                     block_map: HashMap::new(),
+                    user_funcs: &self.user_funcs,
                 };
                 translator.translate(ir_func)?;
             }
@@ -190,6 +192,8 @@ struct FunctionTranslator<'a, 'b> {
     ptr_type: types::Type,
     /// Maps IR VarId → Cranelift Variable.
     var_map: HashMap<VarId, Variable>,
+    /// Maps function names → FuncId (for referencing compiled subfunctions).
+    user_funcs: &'b HashMap<Arc<str>, FuncId>,
     /// Maps IR BlockId → Cranelift Block.
     block_map: HashMap<BlockId, cranelift_codegen::ir::Block>,
 }
@@ -352,11 +356,70 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 // No-op in codegen (could add debug info later).
             }
 
-            Inst::AllocClosure(dst, _template, _captures) => {
-                // TODO: implement closure allocation
-                let val = self.call_rt_0(self.rt.rt_const_nil)?;
-                let var = self.ensure_var(*dst);
-                self.builder.def_var(var, val);
+            Inst::AllocClosure(dst, template, captures) => {
+                // Get the first arity's compiled function name and param count.
+                // For now we support single-arity closures; multi-arity TBD.
+                if template.arity_fn_names.is_empty() {
+                    // No compiled arities — fall back to nil.
+                    let val = self.call_rt_0(self.rt.rt_const_nil)?;
+                    let var = self.ensure_var(*dst);
+                    self.builder.def_var(var, val);
+                } else {
+                    let arity_fn_name = &template.arity_fn_names[0];
+                    let param_count = template.param_counts[0];
+
+                    // Get the FuncId for the compiled arity function.
+                    let arity_func_id = self.user_funcs[arity_fn_name];
+
+                    // Get a function pointer to the compiled function.
+                    let func_ref = self.module.declare_func_in_func(arity_func_id, self.builder.func);
+                    let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
+
+                    // Emit the function name as a data constant.
+                    let name_str = template.name.as_deref().unwrap_or(arity_fn_name);
+                    let name_data = self.module.declare_anonymous_data(false, false)?;
+                    let mut name_desc = cranelift_module::DataDescription::new();
+                    name_desc.define(name_str.as_bytes().to_vec().into_boxed_slice());
+                    self.module.define_data(name_data, &name_desc)?;
+                    let name_gv = self.module.declare_data_in_func(name_data, self.builder.func);
+                    let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
+                    let name_len = self.builder.ins().iconst(types::I64, name_str.len() as i64);
+
+                    let param_count_val = self.builder.ins().iconst(types::I64, param_count as i64);
+
+                    // Spill captures to stack.
+                    let ncaptures = captures.len();
+                    let (captures_ptr, ncaptures_val) = if ncaptures == 0 {
+                        let null = self.builder.ins().iconst(self.ptr_type, 0);
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        (null, zero)
+                    } else {
+                        let slot = self.builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (ncaptures * 8) as u32,
+                                3,
+                            ),
+                        );
+                        for (i, cap_var) in captures.iter().enumerate() {
+                            let cap_val = self.use_var(*cap_var);
+                            self.builder.ins().stack_store(cap_val, slot, (i * 8) as i32);
+                        }
+                        let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                        let n = self.builder.ins().iconst(types::I64, ncaptures as i64);
+                        (slot_addr, n)
+                    };
+
+                    // Call rt_make_fn(name_ptr, name_len, fn_ptr, param_count, captures, ncaptures)
+                    let func_ref = self.import_func(self.rt.rt_make_fn);
+                    let call = self.builder.ins().call(
+                        func_ref,
+                        &[name_ptr, name_len, fn_ptr, param_count_val, captures_ptr, ncaptures_val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    let var = self.ensure_var(*dst);
+                    self.builder.def_var(var, result);
+                }
             }
 
             Inst::RegionStart(dst) | Inst::RegionAlloc(dst, _, _, _) => {
@@ -865,6 +928,12 @@ fn declare_runtime_funcs(
             module,
             "rt_def_var",
             &[ptr, types::I64, ptr, types::I64, ptr],
+            ptr,
+        )?,
+        rt_make_fn: declare_rt(
+            module,
+            "rt_make_fn",
+            &[ptr, types::I64, ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
     })

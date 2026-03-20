@@ -168,6 +168,18 @@ pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction> {
         blocks.push(value_to_block(b)?);
     }
 
+    // Parse subfunctions (optional — may not be present)
+    let subfunctions = if let Some(subs_val) = get_field_opt(map, "subfunctions") {
+        let subs_vec = as_vec(&subs_val)?;
+        let mut subs = Vec::with_capacity(subs_vec.len());
+        for s in &subs_vec {
+            subs.push(value_to_ir_function(s)?);
+        }
+        subs
+    } else {
+        vec![]
+    };
+
     Ok(IrFunction {
         name,
         params,
@@ -175,6 +187,7 @@ pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction> {
         next_var,
         next_block,
         span: None,
+        subfunctions,
     })
 }
 
@@ -273,11 +286,29 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
             let name = get_field_opt(map, "closure-name")
                 .map(|v| as_str(&v))
                 .transpose()?;
-            // body-forms are stored as the original forms — we pass them through
-            // as empty here since codegen doesn't use them directly.
+            // Parse arity function names
+            let arity_fn_names = if let Some(v) = get_field_opt(map, "arity-fn-names") {
+                as_vec(&v)?.iter().map(as_str).collect::<ConvertResult<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            // Parse parameter counts
+            let param_counts = if let Some(v) = get_field_opt(map, "param-counts") {
+                as_vec(&v)?.iter().map(|n| as_long(n).map(|i| i as usize)).collect::<ConvertResult<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            // Parse capture names
+            let capture_names = if let Some(v) = get_field_opt(map, "capture-names") {
+                as_vec(&v)?.iter().map(as_str).collect::<ConvertResult<Vec<_>>>()?
+            } else {
+                vec![]
+            };
             let tmpl = ClosureTemplate {
                 name,
-                body_forms: vec![],
+                arity_fn_names,
+                param_counts,
+                capture_names,
             };
             Ok(Inst::AllocClosure(dst, tmpl, captures))
         }

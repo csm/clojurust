@@ -52,8 +52,12 @@ pub fn bind_sequential(pattern: &[Form], val: &Value, env: &mut Env) -> EvalResu
             let rest_pat = pattern
                 .get(i)
                 .ok_or_else(|| EvalError::Runtime("& in destructuring requires a name".into()))?;
-            let rest_vals: Vec<Value> = items[idx..].to_vec();
-            let rest_list = Value::List(GcPtr::new(PersistentList::from_iter(rest_vals)));
+            let rest_list = if idx < items.len() {
+                let rest_vals: Vec<Value> = items[idx..].to_vec();
+                Value::List(GcPtr::new(PersistentList::from_iter(rest_vals)))
+            } else {
+                Value::Nil
+            };
             bind_pattern(rest_pat, rest_list, env)?;
             i += 1;
             // Skip optional `:as` after rest.
@@ -95,6 +99,7 @@ pub fn bind_sequential(pattern: &[Form], val: &Value, env: &mut Env) -> EvalResu
 /// Convert any sequential Value to a Vec of its elements.
 pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
     match val {
+        Value::WithMeta(inner, _) => value_to_seq_vec(inner),
         Value::Nil => vec![],
         Value::LazySeq(ls) => value_to_seq_vec(&ls.get().realize()),
         Value::Cons(c) => {
@@ -164,7 +169,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
     }
 
     let get_val = |key: &Value| -> Value {
-        match val {
+        match val.unwrap_meta() {
             Value::Map(m) => m.get(key).unwrap_or(Value::Nil),
             _ => Value::Nil,
         }
@@ -234,19 +239,21 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 // Already processed in the first pass.
             }
             _ => {
-                // Regular {binding-sym :key-form} pair.
-                let key = form_to_value(k);
-                let sym_name = match &v.kind {
-                    FormKind::Symbol(s) => s.as_str(),
-                    _ => continue,
-                };
-                let mut bound_val = get_val(&key);
-                if matches!(bound_val, Value::Nil)
-                    && let Some(d) = defaults.get(sym_name)
-                {
-                    bound_val = d.clone();
+                // Regular {binding-form lookup-key} pair.
+                // In Clojure map destructuring {a :x}, the key position is the
+                // binding target and the value position is the lookup key.
+                let lookup_key = form_to_value(v);
+                let mut bound_val = get_val(&lookup_key);
+                // Apply defaults for simple symbol bindings.
+                if matches!(bound_val, Value::Nil) {
+                    if let FormKind::Symbol(sym) = &k.kind {
+                        if let Some(d) = defaults.get(sym.as_str()) {
+                            bound_val = d.clone();
+                        }
+                    }
                 }
-                env.bind(Arc::from(sym_name), bound_val);
+                // Bind via pattern to support nested destructuring.
+                bind_pattern(k, bound_val, env)?;
             }
         }
     }

@@ -3023,7 +3023,7 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
 fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
     let idx = numeric_as_i64(&args[1])? as usize;
     let default = args.get(2).cloned();
-    match &args[0] {
+    match &args[0].unwrap_meta() {
         Value::LazySeq(_) | Value::Cons(_) => {
             let mut iter = ValueIter::new(args[0].clone());
             let result = iter.nth(idx).or(default).unwrap_or(Value::Nil);

@@ -303,6 +303,29 @@
     (ir/emit! ctx (ir/inst-def-var dst (ir/current-ns ctx) (str name-sym) fn-val))
     dst))
 
+(defn lower-fn-arity
+  "Lower a single function arity body, returning an IrFunction data map.
+   capture-names: vector of captured variable name strings (prepended as params).
+   arity-params: vector of parameter name symbols.
+   body-forms: vector of body forms."
+  [parent-ctx arity-name ns capture-names arity-params body-forms]
+  (let [;; Build param list: captures first, then real params
+        all-param-names (into (vec capture-names)
+                              (mapv str arity-params))
+        sub-ctx (ir/make-ctx arity-name ns all-param-names)]
+    ;; Bind params
+    (let [param-pairs (reduce (fn [acc pname]
+                                (let [id (ir/fresh-var! sub-ctx)]
+                                  (ir/bind-local! sub-ctx pname id)
+                                  (conj acc [pname id])))
+                              []
+                              all-param-names)]
+      (swap! sub-ctx assoc :params param-pairs))
+    ;; Lower body
+    (let [result (lower-body sub-ctx body-forms)]
+      (ir/finish-block! sub-ctx (ir/term-return result))
+      (ir/build-ir-function sub-ctx))))
+
 (defn lower-fn
   "Lower (fn* name? [params] body...) or (fn* name? ([params] body...) ...)."
   [ctx args]
@@ -311,11 +334,38 @@
                                 [nil 0])
         ;; Capture all locals
         all-locals (ir/get-all-locals ctx)
-        capture-names (keys all-locals)
-        capture-vars (mapv (fn [n] (get all-locals n)) capture-names)
-        dst (ir/fresh-var! ctx)]
-    (ir/emit! ctx (ir/inst-alloc-closure dst fn-name capture-vars))
-    dst))
+        capture-name-list (vec (keys all-locals))
+        capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
+        ns (ir/current-ns ctx)
+        ;; Parse arities: either single [params] body... or multi ([params] body...) ...
+        rest-args (subvec (vec args) body-start)
+        arities (if (and (not (empty? rest-args)) (vector? (first rest-args)))
+                  ;; Single arity: [params] body...
+                  [[(first rest-args) (vec (rest rest-args))]]
+                  ;; Multi arity: ([params] body...) ([params] body...) ...
+                  (mapv (fn [arity-form]
+                          (let [arity-seq (vec arity-form)]
+                            [(first arity-seq) (vec (rest arity-seq))]))
+                        rest-args))
+        ;; Generate a unique base name for the compiled functions
+        base-name (or fn-name (str "__cljrs_anon_" (ir/fresh-var! ctx)))
+        ;; Lower each arity
+        arity-fn-names (vec (map-indexed
+                              (fn [i [params _body]]
+                                (str "__cljrs_fn_" ns "_" base-name "_arity" (count params)))
+                              arities))
+        param-counts (mapv (fn [[params _body]] (count params)) arities)]
+    ;; Compile each arity as a subfunction
+    (doseq [i (range (count arities))]
+      (let [[params body] (nth arities i)
+            arity-name (nth arity-fn-names i)
+            subfn (lower-fn-arity ctx arity-name ns capture-name-list params body)]
+        (ir/emit-subfunction! ctx subfn)))
+    ;; Emit AllocClosure
+    (let [dst (ir/fresh-var! ctx)]
+      (ir/emit! ctx (ir/inst-alloc-closure dst fn-name capture-vars
+                                           arity-fn-names param-counts capture-name-list))
+      dst)))
 
 (defn lower-throw
   "Lower (throw expr)."

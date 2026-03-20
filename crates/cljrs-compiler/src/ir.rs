@@ -11,7 +11,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cljrs_reader::Form;
 use cljrs_types::span::Span;
 
 // ── Variable IDs ─────────────────────────────────────────────────────────────
@@ -266,9 +265,12 @@ impl fmt::Display for RegionAllocKind {
 pub struct ClosureTemplate {
     /// Function name (if named).
     pub name: Option<Arc<str>>,
-    /// The original `fn*` body forms, kept for the interpreter.
-    /// In the future, each arity would have its own `IrFunction`.
-    pub body_forms: Vec<Form>,
+    /// Compiled function names for each arity (indices match `param_counts`).
+    pub arity_fn_names: Vec<Arc<str>>,
+    /// Parameter count for each arity.
+    pub param_counts: Vec<usize>,
+    /// Names of the captured variables (in order).
+    pub capture_names: Vec<Arc<str>>,
 }
 
 // ── Terminators ──────────────────────────────────────────────────────────────
@@ -325,6 +327,8 @@ pub struct IrFunction {
     pub next_block: u32,
     /// Source span of the original function definition.
     pub span: Option<Span>,
+    /// Nested function bodies (from `fn*` forms), each compiled separately.
+    pub subfunctions: Vec<IrFunction>,
 }
 
 impl IrFunction {
@@ -337,6 +341,7 @@ impl IrFunction {
             next_var: 0,
             next_block: 0,
             span,
+            subfunctions: Vec::new(),
         }
     }
 

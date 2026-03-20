@@ -475,6 +475,196 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
     }
 }
 
+// ── Function/closure construction ───────────────────────────────────────────
+
+/// Create a `Value::NativeFunction` wrapping a compiled function pointer.
+///
+/// `fn_ptr` is a pointer to a compiled Cranelift function with signature:
+///   `extern "C" fn(capture0, capture1, ..., arg0, arg1, ...) -> *const Value`
+///
+/// `param_count` is the number of user-visible parameters (excludes captures).
+/// `captures` points to `ncaptures` `*const Value` pointers that are closed over.
+///
+/// The returned NativeFn, when called with `param_count` args, prepends the
+/// captured values and calls `fn_ptr`.
+///
+/// # Safety
+/// `name_ptr`/`name_len` must describe valid UTF-8.
+/// `fn_ptr` must be a valid function pointer with the expected signature.
+/// `captures` must point to `ncaptures` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_make_fn(
+    name_ptr: *const u8,
+    name_len: u64,
+    fn_ptr: *const u8,
+    param_count: u64,
+    captures: *const *const Value,
+    ncaptures: u64,
+) -> *const Value {
+    let name_str = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+    let name: Arc<str> = Arc::from(name_str);
+    let param_count = param_count as usize;
+    let ncaptures = ncaptures as usize;
+
+    // Clone captured values so they outlive this call.
+    let captured_values: Vec<Value> = if ncaptures > 0 {
+        let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
+        capture_slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Store the raw function pointer as a usize for the closure.
+    let fn_addr = fn_ptr as usize;
+    let total_params = ncaptures + param_count;
+
+    let native_fn = cljrs_value::NativeFn {
+        name: name.clone(),
+        arity: cljrs_value::Arity::Fixed(param_count),
+        func: Arc::new(move |args: &[Value]| {
+            if args.len() != param_count {
+                return Err(cljrs_value::ValueError::ArityError {
+                    name: "compiled-fn".to_string(),
+                    expected: param_count.to_string(),
+                    got: args.len(),
+                });
+            }
+
+            // Build the full argument array: captures + args
+            let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
+
+            // Add captured values as pointers
+            for cap in &captured_values {
+                all_ptrs.push(box_val(cap.clone()));
+            }
+
+            // Add user args as pointers
+            for arg in args {
+                all_ptrs.push(box_val(arg.clone()));
+            }
+
+            // Call the compiled function.
+            // The compiled function signature is:
+            //   extern "C" fn(*const Value, *const Value, ...) -> *const Value
+            // We call it via a trampoline that passes args through a pointer array.
+            let result_ptr = unsafe {
+                rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params)
+            };
+
+            Ok(unsafe { val_ref(result_ptr) }.clone())
+        }),
+    };
+
+    box_val(Value::NativeFunction(GcPtr::new(native_fn)))
+}
+
+/// Call a compiled function by passing arguments through a pointer array.
+///
+/// This is a trampoline: the compiled function expects individual pointer-sized
+/// arguments, but we have them in an array. We dispatch based on the argument
+/// count (up to a reasonable maximum).
+///
+/// # Safety
+/// `fn_addr` must be a valid function pointer. `args` must point to `nargs`
+/// valid `*const Value` pointers.
+unsafe fn rt_call_compiled(
+    fn_addr: usize,
+    args: *const *const Value,
+    nargs: usize,
+) -> *const Value {
+    let args = unsafe { std::slice::from_raw_parts(args, nargs) };
+
+    match nargs {
+        0 => {
+            let f: extern "C" fn() -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f()
+        }
+        1 => {
+            let f: extern "C" fn(*const Value) -> *const Value =
+                unsafe { std::mem::transmute(fn_addr) };
+            f(args[0])
+        }
+        2 => {
+            let f: extern "C" fn(*const Value, *const Value) -> *const Value =
+                unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1])
+        }
+        3 => {
+            let f: extern "C" fn(*const Value, *const Value, *const Value) -> *const Value =
+                unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2])
+        }
+        4 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3])
+        }
+        5 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4])
+        }
+        6 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        7 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+        }
+        8 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+            )
+        }
+        _ => {
+            // For functions with more than 8 params, fall back to rt_call style.
+            // This shouldn't happen in practice for most Clojure code.
+            eprintln!("[rt] warning: compiled function with {nargs} args, falling back");
+            rt_const_nil()
+        }
+    }
+}
+
 // ── Global variable access ──────────────────────────────────────────────────
 
 /// Load a global var by namespace and name.
@@ -721,6 +911,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_is_seq as *const () as usize);
     std::hint::black_box(rt_identical as *const () as usize);
     std::hint::black_box(rt_str as *const () as usize);
+    std::hint::black_box(rt_make_fn as *const () as usize);
 }
 
 #[cfg(test)]

@@ -229,9 +229,7 @@ impl GlobalEnv {
         let src_interns = src.get().interns.lock().unwrap();
         let mut dst_refers = dst.get().refers.lock().unwrap();
         for (name, var) in src_interns.iter() {
-            dst_refers
-                .entry(name.clone())
-                .or_insert_with(|| var.clone());
+            dst_refers.insert(name.clone(), var.clone());
         }
     }
 

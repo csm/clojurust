@@ -37,8 +37,9 @@
 (defn inst-alloc-cons [dst head tail]
   {:op :alloc-cons :dst dst :head head :tail tail})
 
-(defn inst-alloc-closure [dst closure-name captures]
-  {:op :alloc-closure :dst dst :closure-name closure-name :captures captures})
+(defn inst-alloc-closure [dst closure-name captures arity-fn-names param-counts capture-names]
+  {:op :alloc-closure :dst dst :closure-name closure-name :captures captures
+   :arity-fn-names arity-fn-names :param-counts param-counts :capture-names capture-names})
 
 (defn inst-call-known [dst func args]
   {:op :call-known :dst dst :func func :args args})
@@ -95,7 +96,8 @@
          :locals [{}]
          :loop-headers []
          :next-var 0
-         :next-block 1}))
+         :next-block 1
+         :subfunctions []}))
 
 (defn fresh-var!
   "Allocate a fresh variable ID."
@@ -234,6 +236,11 @@
             {}
             scopes)))
 
+(defn emit-subfunction!
+  "Add a completed subfunction IR map to the context."
+  [ctx subfn]
+  (swap! ctx update :subfunctions conj subfn))
+
 (defn build-ir-function
   "Extract the final IrFunction data map from the context."
   [ctx]
@@ -242,4 +249,5 @@
      :params (:params state)
      :blocks (:blocks state)
      :next-var (:next-var state)
-     :next-block (:next-block state)}))
+     :next-block (:next-block state)
+     :subfunctions (:subfunctions state)}))

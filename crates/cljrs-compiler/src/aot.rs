@@ -248,6 +248,13 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 
     // ── 4. Cranelift codegen → .o ───────────────────────────────────────
     let mut compiler = Compiler::new()?;
+
+    // Declare all subfunctions first (so they can reference each other).
+    declare_subfunctions(&ir_func, &mut compiler)?;
+
+    // Compile subfunctions before the main function.
+    compile_subfunctions(&ir_func, &mut compiler)?;
+
     let func_id = compiler.declare_function("__cljrs_main", 0)?;
     compiler.compile_function(&ir_func, func_id)?;
     let obj_bytes = compiler.finish();
@@ -269,18 +276,40 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
             if let Some(head) = parts.first()
                 && let FormKind::Symbol(s) = &head.kind
             {
-                // defn, defmacro, defonce need the interpreter because
-                // they create closures (fn* values) which codegen can't
-                // emit yet.
+                // defmacro/defonce need the interpreter (macros must be
+                // available at compile time). ns/require are module-level.
                 return matches!(
                     s.as_str(),
-                    "defn" | "defmacro" | "defonce" | "ns" | "require"
+                    "defmacro" | "defonce" | "ns" | "require"
                 );
             }
             false
         }
         _ => false,
     }
+}
+
+// ── Subfunction compilation ─────────────────────────────────────────────────
+
+/// Recursively declare all subfunctions in the compiler module.
+fn declare_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotResult<()> {
+    for sub in &ir_func.subfunctions {
+        let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
+        compiler.declare_function(name, sub.params.len())?;
+        declare_subfunctions(sub, compiler)?;
+    }
+    Ok(())
+}
+
+/// Recursively compile all subfunctions.
+fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotResult<()> {
+    for sub in &ir_func.subfunctions {
+        compile_subfunctions(sub, compiler)?;
+        let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
+        let func_id = compiler.declare_function(name, sub.params.len())?;
+        compiler.compile_function(sub, func_id)?;
+    }
+    Ok(())
 }
 
 // ── Harness generation ──────────────────────────────────────────────────────
