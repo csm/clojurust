@@ -40,6 +40,9 @@ enum Commands {
         /// Output binary path.
         #[arg(short, long)]
         out: PathBuf,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
     },
     /// Evaluate a single Clojure expression and print the result.
     Eval {
@@ -88,12 +91,13 @@ fn run(cli: Cli) -> miette::Result<()> {
         Commands::Repl { src_paths } => {
             run_repl(src_paths);
         }
-        Commands::Compile { file, out } => {
-            eprintln!(
-                "[not yet implemented] cljrs compile {} -o {}",
-                file.display(),
-                out.display()
-            );
+        Commands::Compile {
+            file,
+            out,
+            src_paths,
+        } => {
+            cljrs_compiler::aot::compile_file(&file, &out, &src_paths)
+                .map_err(|e| miette::miette!("{e}"))?;
         }
         Commands::Eval { expr } => {
             let result = eval_source(&expr, "<eval>")?;

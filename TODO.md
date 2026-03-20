@@ -365,9 +365,9 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 
 ## Phase 10 — JIT Compiler
 
-- [ ] Choose JIT backend (Cranelift recommended; LLVM as alternative)
-- [ ] Define intermediate representation (IR) for clojurust forms
-- [ ] Emit IR for core special forms and function calls
+- [x] Choose JIT backend (Cranelift recommended; LLVM as alternative)
+- [x] Define intermediate representation (IR) for clojurust forms
+- [x] Emit IR for core special forms and function calls
 - [ ] Type inference / specialization for numeric code paths
 - [ ] Inline caches for protocol dispatch and keyword lookup
 - [ ] OSR (on-stack replacement) to transition from interpreter to JIT mid-execution
@@ -389,10 +389,10 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 
 ## Phase 11 — AOT Compiler
 
-- [ ] AOT compilation command: `cljx compile <source> -o <binary>`
+- [x] AOT compilation command: `cljx compile <source> -o <binary>`
 - [ ] Whole-program analysis for direct calls and dead-code elimination
-- [ ] Emit machine code (via same backend as JIT)
-- [ ] Static linking of runtime + GC + core library into single binary
+- [x] Emit machine code (via same backend as JIT)
+- [x] Static linking of runtime + GC + core library into single binary
 - [ ] Reflection stubs for dynamic features that survive AOT
 - [ ] Cross-compilation support (target triples via `--target`)
 - [ ] Source maps / debug info (DWARF) for compiled binaries

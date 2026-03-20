@@ -35,3 +35,11 @@ bigdecimal   = "0.4"
 rand         = "0.10.0"
 rpds         = "1"
 uuid         = "1.22.0"
+
+# Cranelift compiler backend (all crates must be at the same version)
+cranelift-codegen  = "0.129.1"
+cranelift-frontend = "0.129.1"
+cranelift-module   = "0.129.1"
+cranelift-object   = "0.129.1"
+cranelift-native   = "0.129.1"
+target-lexicon     = "0.13"

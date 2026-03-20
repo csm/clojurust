@@ -10,3 +10,11 @@ cljrs-gc     = { workspace = true }
 cljrs-value  = { workspace = true }
 cljrs-reader = { workspace = true }
 cljrs-eval   = { workspace = true }
+cljrs-stdlib = { workspace = true }
+
+cranelift-codegen  = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module   = { workspace = true }
+cranelift-object   = { workspace = true }
+cranelift-native   = { workspace = true }
+target-lexicon     = { workspace = true }

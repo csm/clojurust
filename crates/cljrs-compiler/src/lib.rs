@@ -10,5 +10,8 @@
 //! code generation.
 
 pub mod anf;
+pub mod aot;
+pub mod codegen;
 pub mod escape;
 pub mod ir;
+pub mod rt_abi;

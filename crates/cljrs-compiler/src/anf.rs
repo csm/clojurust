@@ -107,6 +107,8 @@ pub struct AstLowering {
     locals: Vec<HashMap<Arc<str>, VarId>>,
     /// The current namespace (for resolving globals).
     current_ns: Arc<str>,
+    /// Stack of loop headers (block ID + phi VarIds) for recur resolution.
+    loop_headers: Vec<(BlockId, Vec<VarId>)>,
 }
 
 impl AstLowering {
@@ -120,6 +122,7 @@ impl AstLowering {
             current_insts: Vec::new(),
             locals: vec![HashMap::new()],
             current_ns: Arc::from(ns),
+            loop_headers: Vec::new(),
         }
     }
 
@@ -288,8 +291,10 @@ impl AstLowering {
                 "binding" | "with-out-str" | "try" | "letfn" => {
                     return Err(LowerError::Unsupported(format!("{s} (not yet in IR)")));
                 }
-                // defn, defmacro, defonce are syntactic sugar — ideally expanded before IR.
-                "defn" | "defmacro" | "defonce" => {
+                // defn desugars to (def name (fn* name ...))
+                "defn" => return self.lower_defn(args),
+                // defmacro, defonce not supported in AOT.
+                "defmacro" | "defonce" => {
                     return Err(LowerError::Unsupported(format!(
                         "{s} (should be expanded before IR)"
                     )));
@@ -439,9 +444,15 @@ impl AstLowering {
             phi_vars.push(phi_var);
         }
 
+        // Push loop header so recur can find it.
+        self.loop_headers.push((header, phi_vars.clone()));
+
         // Lower the body.
         let body_result = self.lower_body(&args[1..])?;
         let body_exit = self.current_block;
+
+        // Pop loop header.
+        self.loop_headers.pop();
 
         // The body block returns from the loop (non-recur exit).
         let exit_block = self.func.fresh_block();
@@ -467,33 +478,32 @@ impl AstLowering {
     /// Lower `(recur args...)`.
     fn lower_recur(&mut self, args: &[Form]) -> LowerResult<VarId> {
         let arg_vars = self.lower_forms(args)?;
-        // Emit a recur terminator. The pass that finalizes the function
-        // will connect this back to the loop header's phi nodes.
-        self.finish_block(Terminator::Unreachable);
-        // Replace the terminator we just set with a Recur instruction +
-        // Unreachable. The recur values are placed as an instruction.
-        // Actually, let's use RecurJump as the terminator once we know
-        // the loop header. For now, emit Recur as an instruction.
-        // The last block's terminator will be patched.
-        // Simpler approach: emit a Recur instruction and Unreachable terminator.
-        // The optimizer will interpret this.
-        //
-        // Actually, let's just emit the instructions into the block and use
-        // the Unreachable terminator. The recur args are captured in the Inst.
-        // We need to re-insert them before the terminator.
 
-        // Back up: we already finished the block. Let's undo that.
-        // Instead, let's not call finish_block above. Restructure:
-        // We emit the recur inst, then finish with Unreachable.
+        let (header, _phi_vars) = self
+            .loop_headers
+            .last()
+            .cloned()
+            .ok_or_else(|| LowerError::Malformed("recur outside of loop".into()))?;
 
-        // The issue is finish_block was already called. Let's fix this:
-        // Remove the last block's terminator and re-do.
-        if let Some(block) = self.func.blocks.last_mut() {
-            block.insts.push(Inst::Recur(arg_vars));
+        // Add this block as a predecessor to the header's phi nodes.
+        let recur_block = self.current_block;
+        for (i, arg) in arg_vars.iter().enumerate() {
+            // Find the phi node in the header block and add our predecessor.
+            if let Some(header_block) = self.func.blocks.iter_mut().find(|b| b.id == header) {
+                if let Some(Inst::Phi(_, entries)) = header_block.phis.get_mut(i) {
+                    entries.push((recur_block, *arg));
+                }
+            }
         }
 
+        // Terminate with RecurJump back to the loop header.
+        self.finish_block(Terminator::RecurJump {
+            target: header,
+            args: arg_vars,
+        });
+
         // Recur never produces a value that's used, but we need to return
-        // something to satisfy the type system. Return a dummy nil.
+        // something to satisfy the type system. Start a dead block.
         let new_block = self.func.fresh_block();
         self.start_block(new_block);
         self.emit_const(Const::Nil)
@@ -521,6 +531,37 @@ impl AstLowering {
 
         let dst = self.func.fresh_var();
         self.emit(Inst::DefVar(dst, Arc::clone(&self.current_ns), name, val));
+        Ok(dst)
+    }
+
+    /// Lower `(defn name [params] body...)` — desugars to `(def name (fn* name [params] body...))`.
+    fn lower_defn(&mut self, args: &[Form]) -> LowerResult<VarId> {
+        if args.is_empty() {
+            return Err(LowerError::Malformed("defn requires a name".into()));
+        }
+        let name = match &args[0].kind {
+            FormKind::Symbol(s) => s.clone(),
+            _ => return Err(LowerError::Malformed("defn requires a symbol name".into())),
+        };
+        // Skip optional docstring.
+        let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
+            2
+        } else {
+            1
+        };
+        // Build (fn* name ...) args and lower it.
+        let mut fn_args = vec![args[0].clone()]; // name
+        fn_args.extend_from_slice(&args[rest_start..]);
+        let fn_val = self.lower_fn(&fn_args)?;
+
+        // (def name fn_val)
+        let dst = self.func.fresh_var();
+        self.emit(Inst::DefVar(
+            dst,
+            Arc::clone(&self.current_ns),
+            Arc::from(name.as_str()),
+            fn_val,
+        ));
         Ok(dst)
     }
 
