@@ -245,12 +245,11 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 let lookup_key = form_to_value(v);
                 let mut bound_val = get_val(&lookup_key);
                 // Apply defaults for simple symbol bindings.
-                if matches!(bound_val, Value::Nil) {
-                    if let FormKind::Symbol(sym) = &k.kind {
-                        if let Some(d) = defaults.get(sym.as_str()) {
-                            bound_val = d.clone();
-                        }
-                    }
+                if matches!(bound_val, Value::Nil)
+                    && let FormKind::Symbol(sym) = &k.kind
+                    && let Some(d) = defaults.get(sym.as_str())
+                {
+                    bound_val = d.clone();
                 }
                 // Bind via pattern to support nested destructuring.
                 bind_pattern(k, bound_val, env)?;

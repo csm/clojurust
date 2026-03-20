@@ -278,10 +278,7 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
             {
                 // defmacro/defonce need the interpreter (macros must be
                 // available at compile time). ns/require are module-level.
-                return matches!(
-                    s.as_str(),
-                    "defmacro" | "defonce" | "ns" | "require"
-                );
+                return matches!(s.as_str(), "defmacro" | "defonce" | "ns" | "require");
             }
             false
         }

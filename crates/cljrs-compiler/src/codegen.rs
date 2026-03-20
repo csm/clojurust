@@ -372,7 +372,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     let arity_func_id = self.user_funcs[arity_fn_name];
 
                     // Get a function pointer to the compiled function.
-                    let func_ref = self.module.declare_func_in_func(arity_func_id, self.builder.func);
+                    let func_ref = self
+                        .module
+                        .declare_func_in_func(arity_func_id, self.builder.func);
                     let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
 
                     // Emit the function name as a data constant.
@@ -381,7 +383,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     let mut name_desc = cranelift_module::DataDescription::new();
                     name_desc.define(name_str.as_bytes().to_vec().into_boxed_slice());
                     self.module.define_data(name_data, &name_desc)?;
-                    let name_gv = self.module.declare_data_in_func(name_data, self.builder.func);
+                    let name_gv = self
+                        .module
+                        .declare_data_in_func(name_data, self.builder.func);
                     let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
                     let name_len = self.builder.ins().iconst(types::I64, name_str.len() as i64);
 
@@ -403,7 +407,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         );
                         for (i, cap_var) in captures.iter().enumerate() {
                             let cap_val = self.use_var(*cap_var);
-                            self.builder.ins().stack_store(cap_val, slot, (i * 8) as i32);
+                            self.builder
+                                .ins()
+                                .stack_store(cap_val, slot, (i * 8) as i32);
                         }
                         let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                         let n = self.builder.ins().iconst(types::I64, ncaptures as i64);
@@ -414,7 +420,14 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     let func_ref = self.import_func(self.rt.rt_make_fn);
                     let call = self.builder.ins().call(
                         func_ref,
-                        &[name_ptr, name_len, fn_ptr, param_count_val, captures_ptr, ncaptures_val],
+                        &[
+                            name_ptr,
+                            name_len,
+                            fn_ptr,
+                            param_count_val,
+                            captures_ptr,
+                            ncaptures_val,
+                        ],
                     );
                     let result = self.builder.inst_results(call)[0];
                     let var = self.ensure_var(*dst);

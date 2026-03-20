@@ -288,19 +288,28 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
                 .transpose()?;
             // Parse arity function names
             let arity_fn_names = if let Some(v) = get_field_opt(map, "arity-fn-names") {
-                as_vec(&v)?.iter().map(as_str).collect::<ConvertResult<Vec<_>>>()?
+                as_vec(&v)?
+                    .iter()
+                    .map(as_str)
+                    .collect::<ConvertResult<Vec<_>>>()?
             } else {
                 vec![]
             };
             // Parse parameter counts
             let param_counts = if let Some(v) = get_field_opt(map, "param-counts") {
-                as_vec(&v)?.iter().map(|n| as_long(n).map(|i| i as usize)).collect::<ConvertResult<Vec<_>>>()?
+                as_vec(&v)?
+                    .iter()
+                    .map(|n| as_long(n).map(|i| i as usize))
+                    .collect::<ConvertResult<Vec<_>>>()?
             } else {
                 vec![]
             };
             // Parse capture names
             let capture_names = if let Some(v) = get_field_opt(map, "capture-names") {
-                as_vec(&v)?.iter().map(as_str).collect::<ConvertResult<Vec<_>>>()?
+                as_vec(&v)?
+                    .iter()
+                    .map(as_str)
+                    .collect::<ConvertResult<Vec<_>>>()?
             } else {
                 vec![]
             };

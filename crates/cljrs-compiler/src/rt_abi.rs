@@ -552,9 +552,7 @@ pub unsafe extern "C" fn rt_make_fn(
             // The compiled function signature is:
             //   extern "C" fn(*const Value, *const Value, ...) -> *const Value
             // We call it via a trampoline that passes args through a pointer array.
-            let result_ptr = unsafe {
-                rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params)
-            };
+            let result_ptr = unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
 
             Ok(unsafe { val_ref(result_ptr) }.clone())
         }),
@@ -639,7 +637,9 @@ unsafe fn rt_call_compiled(
                 *const Value,
                 *const Value,
             ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
-            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+            )
         }
         8 => {
             let f: extern "C" fn(
