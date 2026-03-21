@@ -84,5 +84,8 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
         Ok((ec.globals.clone(), ec.current_ns.clone()))
     })?;
     let mut env = Env::new(globals, &ns);
-    apply_value(f, args, &mut env).map_err(|e| ValueError::Other(format!("{e}")))
+    apply_value(f, args, &mut env).map_err(|e| match e {
+        crate::error::EvalError::Thrown(v) => ValueError::Thrown(v),
+        other => ValueError::Other(format!("{other}")),
+    })
 }

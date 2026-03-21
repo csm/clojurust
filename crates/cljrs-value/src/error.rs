@@ -40,6 +40,9 @@ pub enum ValueError {
 
     #[error("could not parse value")]
     Parse,
+
+    #[error("thrown exception")]
+    Thrown(crate::Value),
 }
 
 pub type ValueResult<T> = Result<T, ValueError>;

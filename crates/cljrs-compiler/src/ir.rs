@@ -112,6 +112,9 @@ pub enum KnownFn {
 
     // Apply
     Apply,
+
+    // Exception handling
+    TryCatchFinally,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -508,6 +511,9 @@ impl KnownFn {
 
             // Apply calls an unknown function
             KnownFn::Apply => Effect::UnknownCall,
+
+            // Try/catch calls unknown closures
+            KnownFn::TryCatchFinally => Effect::UnknownCall,
         }
     }
 }

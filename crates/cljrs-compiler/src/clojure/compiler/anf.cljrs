@@ -145,8 +145,9 @@
           ;; Protocol forms — not yet in IR
           ("defprotocol" "extend-type" "extend-protocol" "defmulti" "defmethod" "defrecord" "reify")
           (throw (str "unsupported: " s " (not yet in IR)"))
+          "try" (lower-try ctx (vec args))
           ;; Interpreter-only
-          ("binding" "with-out-str" "try" "letfn")
+          ("binding" "with-out-str" "letfn")
           (throw (str "unsupported: " s " (not yet in IR)"))
           ;; defmacro/defonce
           ("defmacro" "defonce")
@@ -378,6 +379,76 @@
     (let [new-block (ir/fresh-block! ctx)]
       (ir/start-block! ctx new-block)
       (ir/emit-const! ctx (ir/const-nil)))))
+
+(defn lower-try
+  "Lower (try body... (catch ExType e handler...) (finally cleanup...)).
+   Compiles body, catch handler, and finally as closures, then emits
+   a CallKnown :try-catch-finally with three closure arguments."
+  [ctx args]
+  (let [;; Parse: split args into body forms, catch clause, finally clause
+        body-forms (vec (take-while
+                          (fn [form]
+                            (not (and (seq? form)
+                                      (let [h (first form)]
+                                        (or (= h 'catch) (= h 'finally))))))
+                          args))
+        rest-forms (vec (drop (count body-forms) args))
+        ;; Find catch clause
+        catch-form (first (filter (fn [f] (and (seq? f) (= (first f) 'catch))) rest-forms))
+        ;; Find finally clause
+        finally-form (first (filter (fn [f] (and (seq? f) (= (first f) 'finally))) rest-forms))
+        ;; Parse catch: (catch ExType e handler-body...)
+        catch-sym (when catch-form (str (nth (vec catch-form) 2)))
+        catch-body (when catch-form (vec (drop 3 catch-form)))
+        ;; Parse finally: (finally body...)
+        finally-body (when finally-form (vec (rest finally-form)))
+        ;; Capture all locals for closures
+        all-locals (ir/get-all-locals ctx)
+        capture-name-list (vec (keys all-locals))
+        capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
+        ns (ir/current-ns ctx)
+        ncaptures (count capture-name-list)
+        ;; Build the body closure (zero-arg fn, captures passed as extra params)
+        body-name (str "__cljrs_try_body_" (ir/fresh-var! ctx))
+        body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] body-forms)
+        _ (ir/emit-subfunction! ctx body-fn-ir)
+        body-closure (ir/fresh-var! ctx)
+        _ (ir/emit! ctx (ir/inst-alloc-closure body-closure nil capture-vars
+                                                [body-name] [ncaptures]
+                                                capture-name-list))
+        ;; Build the catch closure (one-arg fn, captures + exception param)
+        catch-closure (if catch-sym
+                        (let [catch-name (str "__cljrs_try_catch_" (ir/fresh-var! ctx))
+                              catch-params [(symbol catch-sym)]
+                              catch-fn-ir (lower-fn-arity ctx catch-name ns
+                                                           capture-name-list catch-params
+                                                           catch-body)
+                              _ (ir/emit-subfunction! ctx catch-fn-ir)
+                              dst (ir/fresh-var! ctx)]
+                          (ir/emit! ctx (ir/inst-alloc-closure dst nil capture-vars
+                                                                [catch-name]
+                                                                [(+ ncaptures 1)]
+                                                                capture-name-list))
+                          dst)
+                        (ir/emit-const! ctx (ir/const-nil)))
+        ;; Build the finally closure (zero-arg fn)
+        finally-closure (if finally-body
+                          (let [fin-name (str "__cljrs_try_finally_" (ir/fresh-var! ctx))
+                                fin-fn-ir (lower-fn-arity ctx fin-name ns
+                                                           capture-name-list [] finally-body)
+                                _ (ir/emit-subfunction! ctx fin-fn-ir)
+                                dst (ir/fresh-var! ctx)]
+                            (ir/emit! ctx (ir/inst-alloc-closure dst nil capture-vars
+                                                                  [fin-name]
+                                                                  [ncaptures]
+                                                                  capture-name-list))
+                            dst)
+                          (ir/emit-const! ctx (ir/const-nil)))
+        ;; Emit CallKnown :try-catch-finally with the three closures
+        result (ir/fresh-var! ctx)]
+    (ir/emit! ctx (ir/inst-call-known result :try-catch-finally
+                                       [body-closure catch-closure finally-closure]))
+    result))
 
 (defn lower-set-bang
   "Lower (set! var-sym value)."

@@ -538,6 +538,7 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn> {
         "atom-reset" => Some(KnownFn::AtomReset),
         "atom-swap" => Some(KnownFn::AtomSwap),
         "apply" => Some(KnownFn::Apply),
+        "try-catch-finally" => Some(KnownFn::TryCatchFinally),
         _ => None,
     }
 }

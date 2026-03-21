@@ -754,7 +754,14 @@ pub unsafe extern "C" fn rt_call(
 
     match cljrs_eval::callback::invoke(callee, arg_values) {
         Ok(result) => box_val(result),
-        Err(_e) => rt_const_nil(), // TODO: proper error handling / unwinding
+        Err(cljrs_value::ValueError::Thrown(val)) => {
+            // Store thrown exception in thread-local for rt_try to find.
+            PENDING_EXCEPTION.with(|cell| {
+                *cell.borrow_mut() = Some(box_val(val));
+            });
+            rt_const_nil()
+        }
+        Err(_e) => rt_const_nil(),
     }
 }
 
@@ -858,6 +865,100 @@ pub unsafe extern "C" fn rt_str(v: *const Value) -> *const Value {
     box_val(Value::Str(GcPtr::new(s)))
 }
 
+// ── Exception handling ───────────────────────────────────────────────────────
+
+// Thread-local pending exception for compiled code.
+// When rt_throw is called, it stores the exception here and returns a
+// sentinel. rt_try checks this after calling the body function.
+thread_local! {
+    static PENDING_EXCEPTION: std::cell::RefCell<Option<*const Value>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `(throw val)` — throws a Clojure value as an exception.
+///
+/// Stores the value in a thread-local and returns nil.  The caller (compiled
+/// code) will reach an `unreachable` terminator; `rt_try` checks the
+/// thread-local after each body call.
+///
+/// # Safety
+/// `val` must be a valid pointer to a live `Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_throw(val: *const Value) -> *const Value {
+    PENDING_EXCEPTION.with(|cell| {
+        *cell.borrow_mut() = Some(val);
+    });
+    rt_const_nil()
+}
+
+/// Check if a thrown exception is pending and clear it.
+fn take_pending_exception() -> Option<*const Value> {
+    PENDING_EXCEPTION.with(|cell| cell.borrow_mut().take())
+}
+
+/// `(try body (catch Ex e handler) (finally cleanup))` — exception handling.
+///
+/// `body_fn`: a zero-arg Clojure function for the try body.
+/// `catch_fn`: a one-arg Clojure function for the catch handler (receives the
+///             thrown value), or a nil Value pointer if no catch clause.
+/// `finally_fn`: a zero-arg Clojure function for the finally clause, or a nil
+///               Value pointer if no finally clause.
+///
+/// # Safety
+/// All pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_try(
+    body_fn: *const Value,
+    catch_fn: *const Value,
+    finally_fn: *const Value,
+) -> *const Value {
+    let body = unsafe { val_ref(body_fn) }.clone();
+    let catch = unsafe { val_ref(catch_fn) }.clone();
+    let finally = unsafe { val_ref(finally_fn) }.clone();
+
+    // Call the body.
+    let body_result = cljrs_eval::callback::invoke(&body, vec![]);
+
+    // Check for thrown exception (set by rt_throw in compiled code).
+    let ret = if let Some(thrown_ptr) = take_pending_exception() {
+        // Exception was thrown from compiled code.
+        if !matches!(catch, Value::Nil) {
+            let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
+            match cljrs_eval::callback::invoke(&catch, vec![thrown_val]) {
+                Ok(v) => box_val(v),
+                Err(_) => rt_const_nil(),
+            }
+        } else {
+            rt_const_nil()
+        }
+    } else {
+        match body_result {
+            Ok(val) => box_val(val),
+            Err(val_err) => {
+                // Body returned a ValueError (e.g. thrown via interpreter).
+                if !matches!(catch, Value::Nil) {
+                    let thrown_val = match val_err {
+                        cljrs_value::ValueError::Thrown(v) => v,
+                        other => Value::Str(GcPtr::new(other.to_string())),
+                    };
+                    match cljrs_eval::callback::invoke(&catch, vec![thrown_val]) {
+                        Ok(v) => box_val(v),
+                        Err(_) => rt_const_nil(),
+                    }
+                } else {
+                    rt_const_nil()
+                }
+            }
+        }
+    };
+
+    // Always run finally.
+    if !matches!(finally, Value::Nil) {
+        let _ = cljrs_eval::callback::invoke(&finally, vec![]);
+    }
+
+    ret
+}
+
 // ── Symbol anchor ────────────────────────────────────────────────────────────
 
 /// Force the linker to include all `rt_*` symbols.
@@ -912,6 +1013,8 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_identical as *const () as usize);
     std::hint::black_box(rt_str as *const () as usize);
     std::hint::black_box(rt_make_fn as *const () as usize);
+    std::hint::black_box(rt_throw as *const () as usize);
+    std::hint::black_box(rt_try as *const () as usize);
 }
 
 #[cfg(test)]

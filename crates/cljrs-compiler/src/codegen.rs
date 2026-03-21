@@ -81,6 +81,8 @@ struct RuntimeFuncs {
     rt_load_global: FuncId,
     rt_def_var: FuncId,
     rt_make_fn: FuncId,
+    rt_throw: FuncId,
+    rt_try: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -337,11 +339,13 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 // TODO: implement set!
             }
 
-            Inst::Throw(_val) => {
-                // TODO: implement throw with rt_throw
-                self.builder
-                    .ins()
-                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(0));
+            Inst::Throw(val) => {
+                let v = self.use_var(*val);
+                let func_ref = self.import_func(self.rt.rt_throw);
+                self.builder.ins().call(func_ref, &[v]);
+                // rt_throw stores the exception in a thread-local and returns.
+                // The block ends with Unreachable which returns nil, allowing
+                // the caller (rt_try) to check the thread-local.
             }
 
             Inst::Phi(_, _) => {
@@ -493,9 +497,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
 
             Terminator::Unreachable => {
-                self.builder
-                    .ins()
-                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                // Return nil as a safe fallback. In practice, throw paths
+                // return before reaching here (see Inst::Throw above).
+                let nil_ref = self.import_func(self.rt.rt_const_nil);
+                let nil_call = self.builder.ins().call(nil_ref, &[]);
+                let nil_val = self.builder.inst_results(nil_call)[0];
+                self.builder.ins().return_(&[nil_val]);
             }
         }
         Ok(())
@@ -757,6 +764,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::IsSeq => self.rt.rt_is_seq,
             KnownFn::Identical => self.rt.rt_identical,
             KnownFn::Str => self.rt.rt_str,
+            KnownFn::TryCatchFinally => self.rt.rt_try,
             _ => {
                 // Fall back to generic rt_call for unhandled known functions.
                 // Build a symbol for the function name and call through rt_call.
@@ -949,6 +957,8 @@ fn declare_runtime_funcs(
             &[ptr, types::I64, ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
+        rt_throw: declare_rt(module, "rt_throw", &[ptr], ptr)?,
+        rt_try: declare_rt(module, "rt_try", &[ptr, ptr, ptr], ptr)?,
     })
 }
 
