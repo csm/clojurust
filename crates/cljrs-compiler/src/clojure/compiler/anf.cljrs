@@ -142,12 +142,13 @@
           ;; Module-level forms — not lowered
           ("ns" "require" "in-ns" "alias" "load-file")
           (throw (str "unsupported: " s " (module-level only)"))
-          ;; Protocol forms — not yet in IR
+          ;; Protocol forms — fall through to generic interpreter call
           ("defprotocol" "extend-type" "extend-protocol" "defmulti" "defmethod" "defrecord" "reify")
-          (throw (str "unsupported: " s " (not yet in IR)"))
+          (lower-call ctx head (vec args))
           "try" (lower-try ctx (vec args))
+          "binding" (lower-binding ctx (vec args))
           ;; Interpreter-only
-          ("binding" "with-out-str" "letfn")
+          ("with-out-str" "letfn")
           (throw (str "unsupported: " s " (not yet in IR)"))
           ;; defmacro/defonce
           ("defmacro" "defonce")
@@ -643,12 +644,69 @@
                                        [body-closure catch-closure finally-closure]))
     result))
 
+(defn lower-binding
+  "Lower (binding [var1 val1 var2 val2 ...] body...).
+   Resolves each var symbol to a global Var, evaluates values,
+   compiles body as a closure, and emits CallKnown :with-bindings."
+  [ctx args]
+  (when (empty? args)
+    (throw "binding requires a binding vector"))
+  (let [bindings (nth args 0)]
+    (when (not (vector? bindings))
+      (throw "binding bindings must be a vector"))
+    (when (not= 0 (rem (count bindings) 2))
+      (throw "binding requires even number of binding forms"))
+    ;; Evaluate binding pairs: var-symbol -> Var object, val -> lowered value
+    (let [binding-pairs (vec (map (fn [i]
+                                    (let [var-sym (nth bindings i)
+                                          val-form (nth bindings (+ i 1))
+                                          ;; Resolve the var symbol to a Var object (not its value)
+                                          sym-str (str var-sym)
+                                          parts (split-ns-name sym-str)
+                                          var-ns (if parts (nth parts 0) (ir/current-ns ctx))
+                                          var-name (if parts (nth parts 1) sym-str)
+                                          var-var (let [dst (ir/fresh-var! ctx)]
+                                                    (ir/emit! ctx (ir/inst-load-var dst var-ns var-name))
+                                                    dst)
+                                          ;; Evaluate the value
+                                          val-var (lower-form ctx val-form)]
+                                      [var-var val-var]))
+                                  (range 0 (count bindings) 2)))
+          ;; Build the body as a closure
+          all-locals (ir/get-all-locals ctx)
+          capture-name-list (vec (keys all-locals))
+          capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
+          ns (ir/current-ns ctx)
+          ncaptures (count capture-name-list)
+          body-name (str "__cljrs_binding_body_" (ir/fresh-var! ctx))
+          body-forms (vec (rest args))
+          body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] body-forms)
+          _ (ir/emit-subfunction! ctx body-fn-ir)
+          body-closure (ir/fresh-var! ctx)
+          _ (ir/emit! ctx (ir/inst-alloc-closure body-closure nil capture-vars
+                                                  [body-name] [ncaptures]
+                                                  capture-name-list))
+          ;; Build args: [var0 val0 var1 val1 ... body-closure]
+          flat-bindings (vec (apply concat binding-pairs))
+          all-args (conj flat-bindings body-closure)
+          result (ir/fresh-var! ctx)]
+      (ir/emit! ctx (ir/inst-call-known result :with-bindings all-args))
+      result)))
+
 (defn lower-set-bang
   "Lower (set! var-sym value)."
   [ctx args]
   (when (not= 2 (count args))
     (throw "set! expects 2 arguments"))
-  (let [var (lower-form ctx (first args))
+  (let [;; Resolve the symbol to a Var object (not its value)
+        var-sym (first args)
+        sym-str (str var-sym)
+        parts (split-ns-name sym-str)
+        var-ns (if parts (nth parts 0) (ir/current-ns ctx))
+        var-name (if parts (nth parts 1) sym-str)
+        var (let [dst (ir/fresh-var! ctx)]
+              (ir/emit! ctx (ir/inst-load-var dst var-ns var-name))
+              dst)
         val (lower-form ctx (nth args 1))]
     (ir/emit! ctx (ir/inst-set! var val))
     val))

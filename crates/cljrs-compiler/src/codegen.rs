@@ -96,6 +96,9 @@ struct RuntimeFuncs {
     rt_atom_reset: FuncId,
     rt_atom_swap: FuncId,
     rt_apply: FuncId,
+    rt_set_bang: FuncId,
+    rt_with_bindings: FuncId,
+    rt_load_var: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -290,6 +293,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 self.builder.def_var(var, val);
             }
 
+            Inst::LoadVar(dst, ns, name) => {
+                let val = self.emit_load_var(ns, name)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, val);
+            }
+
             Inst::AllocVector(dst, elems) => {
                 let val = self.emit_alloc_collection(self.rt.rt_alloc_vector, elems)?;
                 let var = self.ensure_var(*dst);
@@ -348,8 +357,11 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 self.builder.def_var(var, val);
             }
 
-            Inst::SetBang(_var, _val) => {
-                // TODO: implement set!
+            Inst::SetBang(var, val) => {
+                let var_v = self.use_var(*var);
+                let val_v = self.use_var(*val);
+                let func_ref = self.import_func(self.rt.rt_set_bang);
+                self.builder.ins().call(func_ref, &[var_v, val_v]);
             }
 
             Inst::Throw(val) => {
@@ -658,6 +670,40 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         Ok(self.builder.inst_results(call)[0])
     }
 
+    /// Emit a LoadVar (ns/name lookup) — returns the Var object, not its value.
+    fn emit_load_var(
+        &mut self,
+        ns: &str,
+        name: &str,
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let ns_data = self.module.declare_anonymous_data(false, false)?;
+        let mut ns_desc = cranelift_module::DataDescription::new();
+        ns_desc.define(ns.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(ns_data, &ns_desc)?;
+
+        let name_data = self.module.declare_anonymous_data(false, false)?;
+        let mut name_desc = cranelift_module::DataDescription::new();
+        name_desc.define(name.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(name_data, &name_desc)?;
+
+        let ns_gv = self.module.declare_data_in_func(ns_data, self.builder.func);
+        let ns_ptr = self.builder.ins().global_value(self.ptr_type, ns_gv);
+        let ns_len = self.builder.ins().iconst(types::I64, ns.len() as i64);
+
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data, self.builder.func);
+        let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
+        let name_len = self.builder.ins().iconst(types::I64, name.len() as i64);
+
+        let func_ref = self.import_func(self.rt.rt_load_var);
+        let call = self
+            .builder
+            .ins()
+            .call(func_ref, &[ns_ptr, ns_len, name_ptr, name_len]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
     /// Emit a `(def ns/name val)` — interns the var in the global env.
     fn emit_def_var(
         &mut self,
@@ -758,6 +804,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::HashSet => return self.emit_alloc_collection(self.rt.rt_alloc_set, args),
             KnownFn::List => return self.emit_alloc_collection(self.rt.rt_alloc_list, args),
             KnownFn::AtomSwap => return self.emit_atom_swap(args),
+            KnownFn::WithBindings => return self.emit_with_bindings(args),
             _ => {}
         }
 
@@ -801,6 +848,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::PersistentBang => self.rt.rt_persistent_bang,
             KnownFn::AtomReset => self.rt.rt_atom_reset,
             KnownFn::Apply => self.rt.rt_apply,
+            KnownFn::SetBangVar => self.rt.rt_set_bang,
             _ => {
                 return self.emit_unknown_call_from_args(args);
             }
@@ -850,6 +898,50 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             .builder
             .ins()
             .call(func_ref, &[atom_val, f_val, extra_ptr, extra_count]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Emit `(binding [var val ...] body)` via rt_with_bindings.
+    ///
+    /// args layout: [var0, val0, var1, val1, ..., body_closure]
+    fn emit_with_bindings(
+        &mut self,
+        args: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Last arg is the body closure, everything before is var/val pairs
+        let body_var = *args.last().unwrap();
+        let binding_args = &args[..args.len() - 1];
+        let npairs = binding_args.len() / 2;
+
+        let body_val = self.use_var(body_var);
+
+        let (bindings_ptr, npairs_val) = if npairs > 0 {
+            let n = binding_args.len();
+            let slot = self
+                .builder
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (n * 8) as u32,
+                    3,
+                ));
+            for (i, arg) in binding_args.iter().enumerate() {
+                let val = self.use_var(*arg);
+                self.builder.ins().stack_store(val, slot, (i * 8) as i32);
+            }
+            let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+            let count = self.builder.ins().iconst(types::I64, npairs as i64);
+            (addr, count)
+        } else {
+            let null = self.builder.ins().iconst(self.ptr_type, 0);
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            (null, zero)
+        };
+
+        let func_ref = self.import_func(self.rt.rt_with_bindings);
+        let call = self.builder.ins().call(
+            func_ref,
+            &[bindings_ptr, npairs_val, body_val],
+        );
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1051,6 +1143,19 @@ fn declare_runtime_funcs(
             ptr,
         )?,
         rt_apply: declare_rt(module, "rt_apply", &[ptr, ptr], ptr)?,
+        rt_set_bang: declare_rt(module, "rt_set_bang", &[ptr, ptr], ptr)?,
+        rt_with_bindings: declare_rt(
+            module,
+            "rt_with_bindings",
+            &[ptr, types::I64, ptr],
+            ptr,
+        )?,
+        rt_load_var: declare_rt(
+            module,
+            "rt_load_var",
+            &[ptr, types::I64, ptr, types::I64],
+            ptr,
+        )?,
     })
 }
 

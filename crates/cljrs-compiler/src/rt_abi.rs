@@ -737,6 +737,41 @@ pub unsafe extern "C" fn rt_def_var(
     }
 }
 
+/// Load a global Var object (NOT its value) by namespace and name.
+///
+/// Returns `Value::Var(var)` so it can be used with `set!` and `binding`.
+///
+/// # Safety
+/// String pointers must be valid UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_load_var(
+    ns_ptr: *const u8,
+    ns_len: u64,
+    name_ptr: *const u8,
+    name_len: u64,
+) -> *const Value {
+    let ns = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
+    };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+
+    if let Some((globals, current_ns)) = cljrs_eval::callback::capture_eval_context() {
+        // Try the specified namespace (interns + refers).
+        if let Some(var) = globals.lookup_var_in_ns(ns, name) {
+            return box_val(Value::Var(var));
+        }
+        // If ns is the current namespace, also check refers via current ns.
+        if ns == current_ns.as_ref()
+            && let Some(var) = globals.lookup_var_in_ns(&current_ns, name)
+        {
+            return box_val(Value::Var(var));
+        }
+    }
+    rt_const_nil()
+}
+
 // ── Function calls ──────────────────────────────────────────────────────────
 
 /// Call a Clojure function value with `nargs` arguments.
@@ -1270,6 +1305,79 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
     }
 }
 
+// ── set! ─────────────────────────────────────────────────────────────────────
+
+/// `(set! var val)` — set a dynamic var's thread-local or root binding.
+///
+/// `var_ptr` is a `Value::Var` (the resolved var).
+/// `val_ptr` is the new value.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_set_bang(var_ptr: *const Value, val_ptr: *const Value) -> *const Value {
+    let var_val = unsafe { val_ref(var_ptr) };
+    let val = unsafe { val_ref(val_ptr) }.clone();
+    match var_val {
+        Value::Var(var) => {
+            // Prefer updating thread-local binding if one exists.
+            if !cljrs_eval::dynamics::set_thread_local(var, val.clone()) {
+                var.get().bind(val.clone());
+            }
+            box_val(val)
+        }
+        _ => box_val(val),
+    }
+}
+
+// ── binding ──────────────────────────────────────────────────────────────────
+
+/// `(binding [var1 val1 var2 val2 ...] body-fn)` — push dynamic bindings, call
+/// body, pop bindings (even on exception).
+///
+/// `bindings` is an array of alternating `*const Value` pairs: [var, val, var, val, ...]
+/// `npairs` is the number of var/val pairs (half the array length).
+/// `body_fn` is a zero-arg callable to invoke with bindings in effect.
+///
+/// # Safety
+/// `bindings` must point to `2 * npairs` valid `*const Value` pointers.
+/// `body_fn` must be a valid `*const Value` pointing to a callable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_with_bindings(
+    bindings: *const *const Value,
+    npairs: u64,
+    body_fn: *const Value,
+) -> *const Value {
+    use std::collections::HashMap;
+
+    let npairs = npairs as usize;
+    let binding_slice = unsafe { std::slice::from_raw_parts(bindings, npairs * 2) };
+
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    for i in 0..npairs {
+        let var_val = unsafe { val_ref(binding_slice[i * 2]) };
+        let val = unsafe { val_ref(binding_slice[i * 2 + 1]) }.clone();
+        if let Value::Var(var) = var_val {
+            frame.insert(cljrs_eval::dynamics::var_key_of(var), val);
+        }
+    }
+
+    let _guard = cljrs_eval::dynamics::push_frame(frame);
+    let body = unsafe { val_ref(body_fn) }.clone();
+
+    match cljrs_eval::callback::invoke(&body, vec![]) {
+        Ok(result) => box_val(result),
+        Err(cljrs_value::ValueError::Thrown(val)) => {
+            PENDING_EXCEPTION.with(|cell| {
+                *cell.borrow_mut() = Some(box_val(val));
+            });
+            rt_const_nil()
+        }
+        Err(_) => rt_const_nil(),
+    }
+    // _guard drops here → pop_frame()
+}
+
 // ── Exception handling ───────────────────────────────────────────────────────
 
 // Thread-local pending exception for compiled code.
@@ -1433,6 +1541,9 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_atom_reset as *const () as usize);
     std::hint::black_box(rt_atom_swap as *const () as usize);
     std::hint::black_box(rt_apply as *const () as usize);
+    std::hint::black_box(rt_set_bang as *const () as usize);
+    std::hint::black_box(rt_with_bindings as *const () as usize);
+    std::hint::black_box(rt_load_var as *const () as usize);
 }
 
 #[cfg(test)]

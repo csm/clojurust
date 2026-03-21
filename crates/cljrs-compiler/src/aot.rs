@@ -188,7 +188,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 
     let mut expanded = Vec::with_capacity(forms.len());
     for form in &forms {
-        match cljrs_eval::macros::macroexpand(form, &mut env) {
+        match cljrs_eval::macros::macroexpand_all(form, &mut env) {
             Ok(f) => expanded.push(f),
             Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
         }
@@ -278,7 +278,21 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
             {
                 // defmacro/defonce need the interpreter (macros must be
                 // available at compile time). ns/require are module-level.
-                return matches!(s.as_str(), "defmacro" | "defonce" | "ns" | "require");
+                // Protocol/multimethod forms modify global dispatch tables
+                // and are best handled by the interpreter at startup.
+                return matches!(
+                    s.as_str(),
+                    "defmacro"
+                        | "defonce"
+                        | "ns"
+                        | "require"
+                        | "defprotocol"
+                        | "extend-type"
+                        | "extend-protocol"
+                        | "defmulti"
+                        | "defmethod"
+                        | "defrecord"
+                );
             }
             false
         }

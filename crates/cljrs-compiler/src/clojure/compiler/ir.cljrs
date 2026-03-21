@@ -22,6 +22,9 @@
 (defn inst-load-global [dst ns name]
   {:op :load-global :dst dst :ns ns :name name})
 
+(defn inst-load-var [dst ns name]
+  {:op :load-var :dst dst :ns ns :name name})
+
 (defn inst-alloc-vector [dst elems]
   {:op :alloc-vector :dst dst :elems elems})
 

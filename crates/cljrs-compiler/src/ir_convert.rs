@@ -245,6 +245,12 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
             let name = as_str(&get_field(map, "name")?)?;
             Ok(Inst::LoadGlobal(dst, ns, name))
         }
+        "load-var" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            let ns = as_str(&get_field(map, "ns")?)?;
+            let name = as_str(&get_field(map, "name")?)?;
+            Ok(Inst::LoadVar(dst, ns, name))
+        }
         "alloc-vector" => {
             let dst = as_var_id(&get_field(map, "dst")?)?;
             let elems = as_var_id_vec(&get_field(map, "elems")?)?;
@@ -539,6 +545,8 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn> {
         "atom-swap" => Some(KnownFn::AtomSwap),
         "apply" => Some(KnownFn::Apply),
         "try-catch-finally" => Some(KnownFn::TryCatchFinally),
+        "set!-var" => Some(KnownFn::SetBangVar),
+        "with-bindings" => Some(KnownFn::WithBindings),
         _ => None,
     }
 }

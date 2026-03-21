@@ -115,6 +115,10 @@ pub enum KnownFn {
 
     // Exception handling
     TryCatchFinally,
+
+    // Dynamic binding
+    SetBangVar,
+    WithBindings,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -170,8 +174,11 @@ pub enum Inst {
     /// Load a local variable by name (from the interpreter's Env).
     LoadLocal(VarId, Arc<str>),
 
-    /// Load a global var by namespace-qualified name.
+    /// Load a global var by namespace-qualified name (returns the dereferenced value).
     LoadGlobal(VarId, Arc<str>, Arc<str>), // dst, ns, name
+
+    /// Load a global Var object (not its value) — for `set!` and `binding`.
+    LoadVar(VarId, Arc<str>, Arc<str>), // dst, ns, name
 
     /// Allocate a vector from elements.
     AllocVector(VarId, Vec<VarId>),
@@ -372,7 +379,7 @@ impl Inst {
             Inst::Const(..) | Inst::LoadLocal(..) | Inst::Phi(..) | Inst::SourceLoc(..) => {
                 Effect::Pure
             }
-            Inst::LoadGlobal(..) => Effect::HeapRead,
+            Inst::LoadGlobal(..) | Inst::LoadVar(..) => Effect::HeapRead,
             Inst::AllocVector(..)
             | Inst::AllocMap(..)
             | Inst::AllocSet(..)
@@ -397,6 +404,7 @@ impl Inst {
             Inst::Const(v, _)
             | Inst::LoadLocal(v, _)
             | Inst::LoadGlobal(v, _, _)
+            | Inst::LoadVar(v, _, _)
             | Inst::AllocVector(v, _)
             | Inst::AllocMap(v, _)
             | Inst::AllocSet(v, _)
@@ -421,9 +429,11 @@ impl Inst {
     /// Return all VarIds used (read) by this instruction.
     pub fn uses(&self) -> Vec<VarId> {
         match self {
-            Inst::Const(..) | Inst::LoadLocal(..) | Inst::LoadGlobal(..) | Inst::SourceLoc(..) => {
-                vec![]
-            }
+            Inst::Const(..)
+            | Inst::LoadLocal(..)
+            | Inst::LoadGlobal(..)
+            | Inst::LoadVar(..)
+            | Inst::SourceLoc(..) => vec![],
             Inst::AllocVector(_, elems) | Inst::AllocSet(_, elems) | Inst::AllocList(_, elems) => {
                 elems.clone()
             }
@@ -514,6 +524,10 @@ impl KnownFn {
 
             // Try/catch calls unknown closures
             KnownFn::TryCatchFinally => Effect::UnknownCall,
+
+            // Dynamic binding
+            KnownFn::SetBangVar => Effect::HeapWrite,
+            KnownFn::WithBindings => Effect::UnknownCall,
         }
     }
 }
@@ -558,6 +572,7 @@ impl fmt::Display for Inst {
             Inst::Const(dst, c) => write!(f, "{dst} = const {c:?}"),
             Inst::LoadLocal(dst, name) => write!(f, "{dst} = load_local {name:?}"),
             Inst::LoadGlobal(dst, ns, name) => write!(f, "{dst} = load_global {ns}/{name}"),
+            Inst::LoadVar(dst, ns, name) => write!(f, "{dst} = load_var {ns}/{name}"),
             Inst::AllocVector(dst, elems) => write!(f, "{dst} = alloc_vec {elems:?}"),
             Inst::AllocMap(dst, pairs) => write!(f, "{dst} = alloc_map {pairs:?}"),
             Inst::AllocSet(dst, elems) => write!(f, "{dst} = alloc_set {elems:?}"),
