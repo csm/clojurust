@@ -147,8 +147,9 @@
           (lower-call ctx head (vec args))
           "try" (lower-try ctx (vec args))
           "binding" (lower-binding ctx (vec args))
+          "letfn" (lower-letfn ctx (vec args))
           ;; Interpreter-only
-          ("with-out-str" "letfn")
+          ("with-out-str")
           (throw (str "unsupported: " s " (not yet in IR)"))
           ;; defmacro/defonce
           ("defmacro" "defonce")
@@ -692,6 +693,61 @@
           result (ir/fresh-var! ctx)]
       (ir/emit! ctx (ir/inst-call-known result :with-bindings all-args))
       result)))
+
+(defn lower-letfn
+  "Lower (letfn [(f [params] body...) ...] body...).
+   Uses global vars for indirection so that all letfn-bound functions
+   can reference each other (including self-recursion and mutual recursion).
+   Function bodies resolve names via load-global, which dereferences the
+   var at call time — by which point all closures have been assigned."
+  [ctx args]
+  (when (< (count args) 2)
+    (throw "letfn requires a binding vector and body"))
+  (let [bindings (nth args 0)]
+    (when (not (vector? bindings))
+      (throw "letfn bindings must be a vector"))
+    (let [ns (ir/current-ns ctx)
+          ;; Parse each binding: (name [params] body...)
+          parsed (mapv (fn [binding]
+                         (let [parts (vec binding)
+                               name-sym (first parts)
+                               name-str (str name-sym)]
+                           (when (< (count parts) 3)
+                             (throw (str "letfn binding for " name-str " requires name, params, and body")))
+                           {:name name-str
+                            :params (nth parts 1)
+                            :body (vec (drop 2 parts))}))
+                       bindings)
+          ;; 1. Define a global var for each binding name, initialized to nil.
+          ;;    The function bodies will find these via load-global.
+          _ (doseq [p parsed]
+              (let [nil-val (ir/emit-const! ctx (ir/const-nil))
+                    dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-def-var dst ns (:name p) nil-val))))
+          ;; 2. Compile each function body as fn*.
+          ;;    Inside the body, references to other letfn names fall through
+          ;;    lower-symbol → load-global → dereferences the var at call time.
+          closures (mapv (fn [p]
+                           (lower-fn ctx [(symbol (:name p)) (:params p) (cons 'do (:body p))]))
+                         parsed)
+          ;; 3. Set! each var to its closure value
+          _ (doseq [i (range (count parsed))]
+              (let [p (nth parsed i)
+                    closure-var (nth closures i)
+                    var-obj (let [dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-load-var dst ns (:name p)))
+                              dst)]
+                (ir/emit! ctx (ir/inst-set! var-obj closure-var))))]
+      ;; 4. Push scope, bind each name locally for the body
+      (ir/push-scope! ctx)
+      (doseq [p parsed]
+        (let [fn-val (let [dst (ir/fresh-var! ctx)]
+                       (ir/emit! ctx (ir/inst-load-global dst ns (:name p)))
+                       dst)]
+          (ir/bind-local! ctx (:name p) fn-val)))
+      (let [result (lower-body ctx (vec (rest args)))]
+        (ir/pop-scope! ctx)
+        result))))
 
 (defn lower-set-bang
   "Lower (set! var-sym value)."
