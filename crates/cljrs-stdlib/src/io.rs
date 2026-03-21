@@ -385,7 +385,7 @@ fn builtin_delete_file(args: &[Value]) -> ValueResult<Value> {
     let silently = args.len() >= 2 && args[1] != Value::Nil && args[1] != Value::Bool(false);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(Value::Bool(true)),
-        Err(e) if silently => Ok(Value::Bool(false)),
+        Err(_) if silently => Ok(Value::Bool(false)),
         Err(e) => Err(ValueError::Other(format!("cannot delete {path}: {e}"))),
     }
 }
