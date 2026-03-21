@@ -424,6 +424,14 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
             let rest = l.get().rest();
             Value::List(GcPtr::new((*rest).clone()))
         }
+        Value::Vector(v) => {
+            if v.get().count() <= 1 {
+                Value::List(GcPtr::new(PersistentList::empty()))
+            } else {
+                let items: Vec<Value> = v.get().iter().skip(1).cloned().collect();
+                Value::List(GcPtr::new(PersistentList::from_iter(items)))
+            }
+        }
         Value::Cons(c) => c.get().tail.clone(),
         Value::Nil => Value::List(GcPtr::new(PersistentList::empty())),
         _ => Value::List(GcPtr::new(PersistentList::empty())),
@@ -865,6 +873,403 @@ pub unsafe extern "C" fn rt_str(v: *const Value) -> *const Value {
     box_val(Value::Str(GcPtr::new(s)))
 }
 
+// ── Collection operations (extended) ─────────────────────────────────────────
+
+/// `(dissoc m k)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_dissoc(m: *const Value, k: *const Value) -> *const Value {
+    let m = unsafe { val_ref(m) };
+    let k = unsafe { val_ref(k) };
+    match m {
+        Value::Map(map) => box_val(Value::Map(map.dissoc(k))),
+        _ => box_val(m.clone()),
+    }
+}
+
+/// `(disj set val)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_disj(set: *const Value, val: *const Value) -> *const Value {
+    let set = unsafe { val_ref(set) };
+    let val = unsafe { val_ref(val) };
+    match set {
+        Value::Set(s) => box_val(Value::Set(s.disj(val))),
+        _ => box_val(set.clone()),
+    }
+}
+
+/// `(nth coll idx)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) };
+    let idx = unsafe { val_ref(idx) };
+    let i = match idx {
+        Value::Long(n) => *n as usize,
+        _ => return rt_const_nil(),
+    };
+    let result = match coll {
+        Value::Vector(v) => v.get().nth(i).cloned(),
+        Value::List(l) => l.get().iter().nth(i).cloned(),
+        Value::Str(s) => s.get().chars().nth(i).map(Value::Char),
+        _ => None,
+    };
+    box_val(result.unwrap_or(Value::Nil))
+}
+
+/// `(contains? coll key)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) };
+    let key = unsafe { val_ref(key) };
+    let result = match coll {
+        Value::Map(m) => m.contains_key(key),
+        Value::Set(s) => s.contains(key),
+        Value::Vector(v) => {
+            if let Value::Long(i) = key {
+                let i = *i as usize;
+                i < v.get().count()
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    box_val(Value::Bool(result))
+}
+
+// ── Sequence operations (extended) ──────────────────────────────────────────
+
+/// `(seq coll)` — returns a seq on the collection, or nil if empty.
+///
+/// # Safety
+/// `coll` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) };
+    match coll {
+        Value::Nil => rt_const_nil(),
+        Value::List(l) => {
+            if l.get().is_empty() {
+                rt_const_nil()
+            } else {
+                box_val(coll.clone())
+            }
+        }
+        Value::Vector(v) => {
+            if v.get().count() == 0 {
+                rt_const_nil()
+            } else {
+                // Convert vector to list for seq iteration.
+                let items: Vec<Value> = v.get().iter().cloned().collect();
+                box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+            }
+        }
+        Value::Map(m) => {
+            if m.count() == 0 {
+                rt_const_nil()
+            } else {
+                let mut pairs = Vec::new();
+                m.for_each(|k, v| {
+                    pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+                        vec![k.clone(), v.clone()],
+                    ))));
+                });
+                box_val(Value::List(GcPtr::new(PersistentList::from_iter(pairs))))
+            }
+        }
+        Value::Set(s) => {
+            if s.count() == 0 {
+                rt_const_nil()
+            } else {
+                let items: Vec<Value> = s.iter().cloned().collect();
+                box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+            }
+        }
+        Value::Str(s) => {
+            if s.get().is_empty() {
+                rt_const_nil()
+            } else {
+                let chars: Vec<Value> = s.get().chars().map(Value::Char).collect();
+                box_val(Value::List(GcPtr::new(PersistentList::from_iter(chars))))
+            }
+        }
+        Value::Cons(_) | Value::LazySeq(_) => box_val(coll.clone()),
+        _ => rt_const_nil(),
+    }
+}
+
+/// `(lazy-seq thunk-fn)` — creates a lazy sequence from a zero-arg function.
+///
+/// # Safety
+/// `thunk_fn` must be a valid pointer to a callable Value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
+    use cljrs_value::types::{LazySeq, Thunk};
+
+    let f = unsafe { val_ref(thunk_fn) }.clone();
+
+    #[derive(Debug)]
+    struct CompiledThunk(Value);
+
+    impl Thunk for CompiledThunk {
+        fn force(&self) -> Value {
+            match cljrs_eval::callback::invoke(&self.0, vec![]) {
+                Ok(v) => v,
+                Err(_) => Value::Nil,
+            }
+        }
+    }
+
+    impl cljrs_gc::Trace for CompiledThunk {
+        fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+            self.0.trace(visitor);
+        }
+    }
+
+    // SAFETY: Value is Send + Sync
+    unsafe impl Send for CompiledThunk {}
+    unsafe impl Sync for CompiledThunk {}
+
+    box_val(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(
+        CompiledThunk(f),
+    )))))
+}
+
+// ── Transient operations ────────────────────────────────────────────────────
+
+/// `(transient coll)`.
+///
+/// # Safety
+/// `coll` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_transient(coll: *const Value) -> *const Value {
+    use cljrs_value::collections::{TransientMap, TransientSet, TransientVector};
+
+    let coll = unsafe { val_ref(coll) };
+    match coll {
+        Value::Vector(v) => box_val(Value::TransientVector(GcPtr::new(
+            TransientVector::new_from_vector(v.get().inner()),
+        ))),
+        Value::Map(MapValue::Hash(m)) => box_val(Value::TransientMap(GcPtr::new(
+            TransientMap::new_from_map(m.get().inner()),
+        ))),
+        Value::Set(SetValue::Hash(s)) => box_val(Value::TransientSet(GcPtr::new(
+            TransientSet::new_from_set(s.get().inner()),
+        ))),
+        _ => box_val(coll.clone()),
+    }
+}
+
+/// `(assoc! t k v)`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_assoc_bang(
+    t: *const Value,
+    k: *const Value,
+    v: *const Value,
+) -> *const Value {
+    let t = unsafe { val_ref(t) };
+    let k = unsafe { val_ref(k) }.clone();
+    let v = unsafe { val_ref(v) }.clone();
+    match t {
+        Value::TransientMap(m) => {
+            let _ = m.get().assoc(k, v);
+            box_val(t.clone())
+        }
+        Value::TransientVector(tv) => {
+            if let Value::Long(idx) = &k {
+                let _ = tv.get().set(*idx as usize, v);
+            }
+            box_val(t.clone())
+        }
+        _ => box_val(t.clone()),
+    }
+}
+
+/// `(conj! t v)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_conj_bang(t: *const Value, v: *const Value) -> *const Value {
+    let t = unsafe { val_ref(t) };
+    let v = unsafe { val_ref(v) }.clone();
+    match t {
+        Value::TransientVector(tv) => {
+            let _ = tv.get().append(v);
+            box_val(t.clone())
+        }
+        Value::TransientMap(m) => {
+            // (conj! transient-map [k v])
+            if let Value::Vector(pair) = &v
+                && pair.get().count() == 2
+            {
+                let k = pair.get().nth(0).cloned().unwrap_or(Value::Nil);
+                let val = pair.get().nth(1).cloned().unwrap_or(Value::Nil);
+                let _ = m.get().assoc(k, val);
+            }
+            box_val(t.clone())
+        }
+        Value::TransientSet(s) => {
+            let _ = s.get().conj(v);
+            box_val(t.clone())
+        }
+        _ => box_val(t.clone()),
+    }
+}
+
+/// `(persistent! t)`.
+///
+/// # Safety
+/// `t` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
+    let t = unsafe { val_ref(t) };
+    match t {
+        Value::TransientVector(tv) => match tv.get().persistent() {
+            Ok(v) => box_val(Value::Vector(GcPtr::new(v))),
+            Err(_) => rt_const_nil(),
+        },
+        Value::TransientMap(m) => match m.get().persistent() {
+            Ok(m) => box_val(Value::Map(MapValue::Hash(GcPtr::new(m)))),
+            Err(_) => rt_const_nil(),
+        },
+        Value::TransientSet(s) => match s.get().persistent() {
+            Ok(s) => box_val(Value::Set(SetValue::Hash(GcPtr::new(s)))),
+            Err(_) => rt_const_nil(),
+        },
+        _ => box_val(t.clone()),
+    }
+}
+
+// ── Atom operations ─────────────────────────────────────────────────────────
+
+/// `(reset! atom val)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) -> *const Value {
+    let atom = unsafe { val_ref(atom) };
+    let val = unsafe { val_ref(val) }.clone();
+    match atom {
+        Value::Atom(a) => box_val(a.get().reset(val)),
+        _ => rt_const_nil(),
+    }
+}
+
+/// `(swap! atom f & args)`.
+///
+/// # Safety
+/// `atom` and `f` must be valid pointers.
+/// `extra_args` must point to `nextra` valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_atom_swap(
+    atom: *const Value,
+    f: *const Value,
+    extra_args: *const *const Value,
+    nextra: u64,
+) -> *const Value {
+    let atom_val = unsafe { val_ref(atom) };
+    let f = unsafe { val_ref(f) }.clone();
+    let nextra = nextra as usize;
+    let extra: Vec<Value> = if nextra > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(extra_args, nextra) };
+        slice.iter().map(|p| unsafe { val_ref(*p) }.clone()).collect()
+    } else {
+        vec![]
+    };
+
+    match atom_val {
+        Value::Atom(a) => {
+            // swap! semantics: (f current-val extra-args...)
+            // CAS loop
+            loop {
+                let current = a.get().value.lock().unwrap().clone();
+                let mut args = vec![current.clone()];
+                args.extend(extra.iter().cloned());
+                match cljrs_eval::callback::invoke(&f, args) {
+                    Ok(new_val) => {
+                        let mut guard = a.get().value.lock().unwrap();
+                        if *guard == current {
+                            *guard = new_val.clone();
+                            return box_val(new_val);
+                        }
+                        // CAS failed, retry
+                    }
+                    Err(_) => return rt_const_nil(),
+                }
+            }
+        }
+        _ => rt_const_nil(),
+    }
+}
+
+// ── Apply ───────────────────────────────────────────────────────────────────
+
+/// `(apply f arglist)`.
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let arglist = unsafe { val_ref(arglist) };
+
+    // Collect the arg list into a Vec.
+    let mut args = Vec::new();
+    let mut current = arglist.clone();
+    loop {
+        match &current {
+            Value::Nil => break,
+            Value::List(l) => {
+                for item in l.get().iter() {
+                    args.push(item.clone());
+                }
+                break;
+            }
+            Value::Vector(v) => {
+                for item in v.get().iter() {
+                    args.push(item.clone());
+                }
+                break;
+            }
+            Value::Cons(c) => {
+                args.push(c.get().head.clone());
+                current = c.get().tail.clone();
+            }
+            Value::LazySeq(ls) => {
+                current = ls.get().realize();
+            }
+            _ => break,
+        }
+    }
+
+    match cljrs_eval::callback::invoke(&f, args) {
+        Ok(result) => box_val(result),
+        Err(cljrs_value::ValueError::Thrown(val)) => {
+            PENDING_EXCEPTION.with(|cell| {
+                *cell.borrow_mut() = Some(box_val(val));
+            });
+            rt_const_nil()
+        }
+        Err(_) => rt_const_nil(),
+    }
+}
+
 // ── Exception handling ───────────────────────────────────────────────────────
 
 // Thread-local pending exception for compiled code.
@@ -1015,6 +1420,19 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_make_fn as *const () as usize);
     std::hint::black_box(rt_throw as *const () as usize);
     std::hint::black_box(rt_try as *const () as usize);
+    std::hint::black_box(rt_dissoc as *const () as usize);
+    std::hint::black_box(rt_disj as *const () as usize);
+    std::hint::black_box(rt_nth as *const () as usize);
+    std::hint::black_box(rt_contains as *const () as usize);
+    std::hint::black_box(rt_seq as *const () as usize);
+    std::hint::black_box(rt_lazy_seq as *const () as usize);
+    std::hint::black_box(rt_transient as *const () as usize);
+    std::hint::black_box(rt_assoc_bang as *const () as usize);
+    std::hint::black_box(rt_conj_bang as *const () as usize);
+    std::hint::black_box(rt_persistent_bang as *const () as usize);
+    std::hint::black_box(rt_atom_reset as *const () as usize);
+    std::hint::black_box(rt_atom_swap as *const () as usize);
+    std::hint::black_box(rt_apply as *const () as usize);
 }
 
 #[cfg(test)]

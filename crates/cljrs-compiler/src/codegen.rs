@@ -83,6 +83,19 @@ struct RuntimeFuncs {
     rt_make_fn: FuncId,
     rt_throw: FuncId,
     rt_try: FuncId,
+    rt_dissoc: FuncId,
+    rt_disj: FuncId,
+    rt_nth: FuncId,
+    rt_contains: FuncId,
+    rt_seq: FuncId,
+    rt_lazy_seq: FuncId,
+    rt_transient: FuncId,
+    rt_assoc_bang: FuncId,
+    rt_conj_bang: FuncId,
+    rt_persistent_bang: FuncId,
+    rt_atom_reset: FuncId,
+    rt_atom_swap: FuncId,
+    rt_apply: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -738,6 +751,16 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         known_fn: &KnownFn,
         args: &[VarId],
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Collection constructors use variadic stack-spill pattern.
+        match known_fn {
+            KnownFn::Vector => return self.emit_alloc_collection(self.rt.rt_alloc_vector, args),
+            KnownFn::HashMap => return self.emit_alloc_collection(self.rt.rt_alloc_map, args),
+            KnownFn::HashSet => return self.emit_alloc_collection(self.rt.rt_alloc_set, args),
+            KnownFn::List => return self.emit_alloc_collection(self.rt.rt_alloc_list, args),
+            KnownFn::AtomSwap => return self.emit_atom_swap(args),
+            _ => {}
+        }
+
         let rt_func = match known_fn {
             KnownFn::Add => self.rt.rt_add,
             KnownFn::Sub => self.rt.rt_sub,
@@ -755,7 +778,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::Rest | KnownFn::Next => self.rt.rt_rest,
             KnownFn::Assoc => self.rt.rt_assoc,
             KnownFn::Conj => self.rt.rt_conj,
-            KnownFn::Deref => self.rt.rt_deref,
+            KnownFn::Deref | KnownFn::AtomDeref => self.rt.rt_deref,
             KnownFn::Println => self.rt.rt_println,
             KnownFn::Pr => self.rt.rt_pr,
             KnownFn::IsNil => self.rt.rt_is_nil,
@@ -765,9 +788,20 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::Identical => self.rt.rt_identical,
             KnownFn::Str => self.rt.rt_str,
             KnownFn::TryCatchFinally => self.rt.rt_try,
+            KnownFn::Dissoc => self.rt.rt_dissoc,
+            KnownFn::Disj => self.rt.rt_disj,
+            KnownFn::Nth => self.rt.rt_nth,
+            KnownFn::Contains => self.rt.rt_contains,
+            KnownFn::Cons => self.rt.rt_alloc_cons,
+            KnownFn::Seq => self.rt.rt_seq,
+            KnownFn::LazySeq => self.rt.rt_lazy_seq,
+            KnownFn::Transient => self.rt.rt_transient,
+            KnownFn::AssocBang => self.rt.rt_assoc_bang,
+            KnownFn::ConjBang => self.rt.rt_conj_bang,
+            KnownFn::PersistentBang => self.rt.rt_persistent_bang,
+            KnownFn::AtomReset => self.rt.rt_atom_reset,
+            KnownFn::Apply => self.rt.rt_apply,
             _ => {
-                // Fall back to generic rt_call for unhandled known functions.
-                // Build a symbol for the function name and call through rt_call.
                 return self.emit_unknown_call_from_args(args);
             }
         };
@@ -776,6 +810,46 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
         let func_ref = self.import_func(rt_func);
         let call = self.builder.ins().call(func_ref, &arg_vals);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Emit `(swap! atom f extra-args...)` — variadic via stack-spill.
+    fn emit_atom_swap(
+        &mut self,
+        args: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // args[0] = atom, args[1] = f, args[2..] = extra args
+        let atom_val = self.use_var(args[0]);
+        let f_val = self.use_var(args[1]);
+        let extra = &args[2..];
+        let n = extra.len();
+
+        let (extra_ptr, extra_count) = if n > 0 {
+            let slot = self
+                .builder
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (n * 8) as u32,
+                    3,
+                ));
+            for (i, arg) in extra.iter().enumerate() {
+                let val = self.use_var(*arg);
+                self.builder.ins().stack_store(val, slot, (i * 8) as i32);
+            }
+            let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+            let count = self.builder.ins().iconst(types::I64, n as i64);
+            (addr, count)
+        } else {
+            let null = self.builder.ins().iconst(self.ptr_type, 0);
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            (null, zero)
+        };
+
+        let func_ref = self.import_func(self.rt.rt_atom_swap);
+        let call = self
+            .builder
+            .ins()
+            .call(func_ref, &[atom_val, f_val, extra_ptr, extra_count]);
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -959,6 +1033,24 @@ fn declare_runtime_funcs(
         )?,
         rt_throw: declare_rt(module, "rt_throw", &[ptr], ptr)?,
         rt_try: declare_rt(module, "rt_try", &[ptr, ptr, ptr], ptr)?,
+        rt_dissoc: declare_rt(module, "rt_dissoc", &[ptr, ptr], ptr)?,
+        rt_disj: declare_rt(module, "rt_disj", &[ptr, ptr], ptr)?,
+        rt_nth: declare_rt(module, "rt_nth", &[ptr, ptr], ptr)?,
+        rt_contains: declare_rt(module, "rt_contains", &[ptr, ptr], ptr)?,
+        rt_seq: declare_rt(module, "rt_seq", &[ptr], ptr)?,
+        rt_lazy_seq: declare_rt(module, "rt_lazy_seq", &[ptr], ptr)?,
+        rt_transient: declare_rt(module, "rt_transient", &[ptr], ptr)?,
+        rt_assoc_bang: declare_rt(module, "rt_assoc_bang", &[ptr, ptr, ptr], ptr)?,
+        rt_conj_bang: declare_rt(module, "rt_conj_bang", &[ptr, ptr], ptr)?,
+        rt_persistent_bang: declare_rt(module, "rt_persistent_bang", &[ptr], ptr)?,
+        rt_atom_reset: declare_rt(module, "rt_atom_reset", &[ptr, ptr], ptr)?,
+        rt_atom_swap: declare_rt(
+            module,
+            "rt_atom_swap",
+            &[ptr, ptr, ptr, types::I64],
+            ptr,
+        )?,
+        rt_apply: declare_rt(module, "rt_apply", &[ptr, ptr], ptr)?,
     })
 }
 

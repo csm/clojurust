@@ -46,14 +46,15 @@
    "apply" :apply})
 
 (defn strip-ns-prefix
-  "Strip namespace prefix from a symbol name (e.g. 'clojure.core/map' -> 'map')."
   [s]
-  (loop [i (- (count s) 1)]
-    (if (< i 0)
-      s
-      (if (= (nth s i) \/)
-        (subs s (+ i 1))
-        (recur (- i 1))))))
+  (if (= s "/")
+    s
+    (loop [i (- (count s) 1)]
+      (if (< i 0)
+        s
+        (if (= (nth s i) \/)
+          (subs s (+ i 1))
+          (recur (- i 1)))))))
 
 (defn resolve-known-fn
   "Resolve a symbol name to a KnownFn keyword, or nil if not known.
