@@ -1223,7 +1223,10 @@ pub unsafe extern "C" fn rt_atom_swap(
     let nextra = nextra as usize;
     let extra: Vec<Value> = if nextra > 0 {
         let slice = unsafe { std::slice::from_raw_parts(extra_args, nextra) };
-        slice.iter().map(|p| unsafe { val_ref(*p) }.clone()).collect()
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
     } else {
         vec![]
     };

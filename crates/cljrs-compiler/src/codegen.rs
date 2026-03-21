@@ -862,10 +862,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
     }
 
     /// Emit `(swap! atom f extra-args...)` — variadic via stack-spill.
-    fn emit_atom_swap(
-        &mut self,
-        args: &[VarId],
-    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+    fn emit_atom_swap(&mut self, args: &[VarId]) -> CodegenResult<cranelift_codegen::ir::Value> {
         // args[0] = atom, args[1] = f, args[2..] = extra args
         let atom_val = self.use_var(args[0]);
         let f_val = self.use_var(args[1]);
@@ -873,13 +870,13 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         let n = extra.len();
 
         let (extra_ptr, extra_count) = if n > 0 {
-            let slot = self
-                .builder
-                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                    (n * 8) as u32,
-                    3,
-                ));
+            let slot =
+                self.builder
+                    .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (n * 8) as u32,
+                        3,
+                    ));
             for (i, arg) in extra.iter().enumerate() {
                 let val = self.use_var(*arg);
                 self.builder.ins().stack_store(val, slot, (i * 8) as i32);
@@ -917,13 +914,13 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
         let (bindings_ptr, npairs_val) = if npairs > 0 {
             let n = binding_args.len();
-            let slot = self
-                .builder
-                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                    (n * 8) as u32,
-                    3,
-                ));
+            let slot =
+                self.builder
+                    .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (n * 8) as u32,
+                        3,
+                    ));
             for (i, arg) in binding_args.iter().enumerate() {
                 let val = self.use_var(*arg);
                 self.builder.ins().stack_store(val, slot, (i * 8) as i32);
@@ -938,10 +935,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         };
 
         let func_ref = self.import_func(self.rt.rt_with_bindings);
-        let call = self.builder.ins().call(
-            func_ref,
-            &[bindings_ptr, npairs_val, body_val],
-        );
+        let call = self
+            .builder
+            .ins()
+            .call(func_ref, &[bindings_ptr, npairs_val, body_val]);
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1136,20 +1133,10 @@ fn declare_runtime_funcs(
         rt_conj_bang: declare_rt(module, "rt_conj_bang", &[ptr, ptr], ptr)?,
         rt_persistent_bang: declare_rt(module, "rt_persistent_bang", &[ptr], ptr)?,
         rt_atom_reset: declare_rt(module, "rt_atom_reset", &[ptr, ptr], ptr)?,
-        rt_atom_swap: declare_rt(
-            module,
-            "rt_atom_swap",
-            &[ptr, ptr, ptr, types::I64],
-            ptr,
-        )?,
+        rt_atom_swap: declare_rt(module, "rt_atom_swap", &[ptr, ptr, ptr, types::I64], ptr)?,
         rt_apply: declare_rt(module, "rt_apply", &[ptr, ptr], ptr)?,
         rt_set_bang: declare_rt(module, "rt_set_bang", &[ptr, ptr], ptr)?,
-        rt_with_bindings: declare_rt(
-            module,
-            "rt_with_bindings",
-            &[ptr, types::I64, ptr],
-            ptr,
-        )?,
+        rt_with_bindings: declare_rt(module, "rt_with_bindings", &[ptr, types::I64, ptr], ptr)?,
         rt_load_var: declare_rt(
             module,
             "rt_load_var",
