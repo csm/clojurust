@@ -68,6 +68,17 @@
 (defn inst-recur [args]
   {:op :recur :args args})
 
+;; ── Region allocation instruction constructors ───────────────────────────────
+
+(defn inst-region-start [dst]
+  {:op :region-start :dst dst})
+
+(defn inst-region-alloc [dst region kind operands]
+  {:op :region-alloc :dst dst :region region :kind kind :operands operands})
+
+(defn inst-region-end [region]
+  {:op :region-end :region region})
+
 ;; ── Terminator constructors ─────────────────────────────────────────────────
 
 (defn term-jump [target]

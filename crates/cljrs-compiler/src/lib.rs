@@ -32,6 +32,9 @@ pub const COMPILER_ANF_SOURCE: &str = include_str!("clojure/compiler/anf.cljrs")
 /// Clojure source for the escape analysis namespace.
 pub const COMPILER_ESCAPE_SOURCE: &str = include_str!("clojure/compiler/escape.cljrs");
 
+/// Clojure source for the optimization pass namespace.
+pub const COMPILER_OPTIMIZE_SOURCE: &str = include_str!("clojure/compiler/optimize.cljrs");
+
 /// Register all compiler Clojure source files as builtin sources in the
 /// given `GlobalEnv`, so that `require` can load them without filesystem access.
 pub fn register_compiler_sources(globals: &std::sync::Arc<cljrs_eval::env::GlobalEnv>) {
@@ -39,4 +42,5 @@ pub fn register_compiler_sources(globals: &std::sync::Arc<cljrs_eval::env::Globa
     globals.register_builtin_source("cljrs.compiler.known", COMPILER_KNOWN_SOURCE);
     globals.register_builtin_source("cljrs.compiler.anf", COMPILER_ANF_SOURCE);
     globals.register_builtin_source("cljrs.compiler.escape", COMPILER_ESCAPE_SOURCE);
+    globals.register_builtin_source("cljrs.compiler.optimize", COMPILER_OPTIMIZE_SOURCE);
 }

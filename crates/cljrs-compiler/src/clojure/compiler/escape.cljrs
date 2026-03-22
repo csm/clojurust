@@ -139,8 +139,8 @@
 
 ;; ── Known function arg escape semantics ─────────────────────────────────────
 
-(def ^:private non-escaping-fns
-  "Known functions where no argument escapes."
+;; Known functions where no argument escapes.
+(def non-escaping-fns
   #{:get :nth :first :count :contains :+ :- :* :/ :rem
     := :< :> :<= :>= :nil? :seq? :vector? :map? :identical?
     :str :deref :atom-deref :println :pr})
@@ -256,7 +256,7 @@
 
 ;; ── Collection chain detection ──────────────────────────────────────────────
 
-(def ^:private chainable-ops #{:assoc :conj :dissoc :disj})
+(def chainable-ops #{:assoc :conj :dissoc :disj})
 
 (defn detect-collection-chains
   "Detect assoc/conj chains where intermediate collections don't escape.

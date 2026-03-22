@@ -103,8 +103,14 @@ fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
         return Err(EvalError::Runtime("def requires a name".into()));
     }
     let (name, meta_opt) = extract_def_name(&args[0], env)?;
-    let val = if args.len() > 1 {
-        eval(&args[1], env)?
+    // Skip optional docstring: (def name "docstring" value)
+    let val_idx = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
+        2
+    } else {
+        1
+    };
+    let val = if args.len() > val_idx {
+        eval(&args[val_idx], env)?
     } else {
         Value::Nil
     };

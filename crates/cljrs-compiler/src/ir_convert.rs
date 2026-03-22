@@ -395,6 +395,24 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
                 col,
             )))
         }
+        "region-start" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            Ok(Inst::RegionStart(dst))
+        }
+        "region-alloc" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            let region = as_var_id(&get_field(map, "region")?)?;
+            let kind_kw = as_keyword_name(&get_field(map, "kind")?)?;
+            let kind = keyword_to_region_alloc_kind(&kind_kw).ok_or_else(|| {
+                ConvertError::UnknownVariant(format!("unknown RegionAllocKind: {kind_kw}"))
+            })?;
+            let operands = as_var_id_vec(&get_field(map, "operands")?)?;
+            Ok(Inst::RegionAlloc(dst, region, kind, operands))
+        }
+        "region-end" => {
+            let region = as_var_id(&get_field(map, "region")?)?;
+            Ok(Inst::RegionEnd(region))
+        }
         other => Err(ConvertError::UnknownVariant(format!(
             "unknown inst op: {other}"
         ))),
@@ -547,6 +565,18 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn> {
         "try-catch-finally" => Some(KnownFn::TryCatchFinally),
         "set!-var" => Some(KnownFn::SetBangVar),
         "with-bindings" => Some(KnownFn::WithBindings),
+        _ => None,
+    }
+}
+
+/// Map a keyword name to a `RegionAllocKind` variant.
+fn keyword_to_region_alloc_kind(kw: &str) -> Option<RegionAllocKind> {
+    match kw {
+        "vector" => Some(RegionAllocKind::Vector),
+        "map" => Some(RegionAllocKind::Map),
+        "set" => Some(RegionAllocKind::Set),
+        "list" => Some(RegionAllocKind::List),
+        "cons" => Some(RegionAllocKind::Cons),
         _ => None,
     }
 }

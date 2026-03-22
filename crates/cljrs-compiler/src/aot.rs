@@ -102,24 +102,27 @@ fn lower_via_clojure_inner(
     use cljrs_value::Value;
     use cljrs_value::collections::vector::PersistentVector;
 
-    // Ensure the ANF namespace is loaded.
-    let require_form = cljrs_reader::Form::new(
-        cljrs_reader::form::FormKind::List(vec![
-            cljrs_reader::Form::new(
-                cljrs_reader::form::FormKind::Symbol("require".into()),
-                cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
-            ),
-            cljrs_reader::Form::new(
-                cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Symbol("cljrs.compiler.anf".into()),
-                    cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
-                ))),
-                cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
-            ),
-        ]),
-        cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
-    );
-    cljrs_eval::eval(&require_form, env).map_err(|e| AotError::Eval(format!("{e:?}")))?;
+    // Ensure the ANF and optimize namespaces are loaded.
+    let span = || cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1);
+    for ns_name in &["cljrs.compiler.anf", "cljrs.compiler.optimize"] {
+        let require_form = cljrs_reader::Form::new(
+            cljrs_reader::form::FormKind::List(vec![
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Symbol("require".into()),
+                    span(),
+                ),
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
+                        cljrs_reader::form::FormKind::Symbol((*ns_name).into()),
+                        span(),
+                    ))),
+                    span(),
+                ),
+            ]),
+            span(),
+        );
+        cljrs_eval::eval(&require_form, env).map_err(|e| AotError::Eval(format!("{e:?}")))?;
+    }
 
     // Look up the lower-fn-body function.
     let lower_fn = env
@@ -148,15 +151,27 @@ fn lower_via_clojure_inner(
         compilable_forms.iter().map(cljrs_eval::eval::form_to_value),
     )));
 
-    // Call the Clojure function.
-    let result = cljrs_eval::callback::invoke(
+    // Call the Clojure lowering function.
+    let ir_data = cljrs_eval::callback::invoke(
         &lower_fn_val,
         vec![fname_val, ns_val, params_val, body_forms_val],
     )
     .map_err(|e| AotError::Eval(format!("Clojure lowering failed: {e:?}")))?;
 
+    // Run the optimization pass (escape analysis → region allocation).
+    let optimize_fn = env
+        .globals
+        .lookup_var_in_ns("cljrs.compiler.optimize", "optimize")
+        .ok_or_else(|| {
+            AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string())
+        })?;
+    let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
+
+    let optimized = cljrs_eval::callback::invoke(&optimize_fn_val, vec![ir_data])
+        .map_err(|e| AotError::Eval(format!("Optimization failed: {e:?}")))?;
+
     // Convert the result Value → IrFunction.
-    ir_convert::value_to_ir_function(&result)
+    ir_convert::value_to_ir_function(&optimized)
         .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))
 }
 

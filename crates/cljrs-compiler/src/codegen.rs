@@ -15,7 +15,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, Terminator, VarId};
+use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -529,15 +529,47 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 }
             }
 
-            Inst::RegionStart(dst) | Inst::RegionAlloc(dst, _, _, _) => {
-                // TODO: implement region operations
+            Inst::RegionStart(dst) => {
+                // Region start is a no-op for now; define the var as nil so it's
+                // available as the region handle in RegionAlloc instructions.
                 let val = self.call_rt_0(self.rt.rt_const_nil)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
+            Inst::RegionAlloc(dst, _region, kind, operands) => {
+                // For now, delegate to normal allocation functions.
+                // A future bump-allocator backend can use the region handle.
+                let val = match kind {
+                    RegionAllocKind::Vector => {
+                        self.emit_alloc_collection(self.rt.rt_alloc_vector, operands)?
+                    }
+                    RegionAllocKind::Map => {
+                        // operands are flattened [k v k v ...] pairs
+                        self.emit_alloc_collection(self.rt.rt_alloc_map, operands)?
+                    }
+                    RegionAllocKind::Set => {
+                        self.emit_alloc_collection(self.rt.rt_alloc_set, operands)?
+                    }
+                    RegionAllocKind::List => {
+                        self.emit_alloc_collection(self.rt.rt_alloc_list, operands)?
+                    }
+                    RegionAllocKind::Cons => {
+                        if operands.len() == 2 {
+                            let h = self.use_var(operands[0]);
+                            let t = self.use_var(operands[1]);
+                            self.call_rt_2(self.rt.rt_alloc_cons, h, t)?
+                        } else {
+                            self.call_rt_0(self.rt.rt_const_nil)?
+                        }
+                    }
+                };
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, val);
+            }
+
             Inst::RegionEnd(_) => {
-                // TODO: implement region end
+                // No-op for now — future bump allocator will free the region here.
             }
         }
         Ok(())

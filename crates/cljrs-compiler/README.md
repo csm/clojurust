@@ -28,6 +28,7 @@ src/
     known.cljrs   — Known function symbol → keyword resolution table
     anf.cljrs     — ANF lowering (Clojure): Form values → IR data maps
     escape.cljrs  — Escape analysis (Clojure): operates on plain IR data
+    optimize.cljrs — Optimization passes (Clojure): escape analysis → region allocation rewriting
 ```
 
 ---
@@ -96,7 +97,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 ```
 
-Pipeline: read source → parse → macro-expand → ANF lower (Clojure) → IR convert → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → macro-expand → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
 
 ---
 
@@ -113,6 +114,9 @@ ANF lowering: converts Clojure form values (from `form_to_value`) into IR data m
 
 ### `cljrs.compiler.escape`
 Escape analysis on IR data maps. Determines allocation escape states and detects collection operation chains.
+
+### `cljrs.compiler.optimize`
+Optimization passes on IR data maps. Currently implements region allocation: rewrites non-escaping allocations (identified by escape analysis) into `region-start`/`region-alloc`/`region-end` instructions. Recursively optimizes subfunctions.
 
 ---
 
