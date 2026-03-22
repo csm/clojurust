@@ -654,8 +654,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 all_ptrs.push(box_val(arg.clone()));
             }
 
-            let result_ptr =
-                unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
+            let result_ptr = unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
             Ok(unsafe { val_ref(result_ptr) }.clone())
         }),
     };

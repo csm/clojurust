@@ -394,8 +394,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     self.builder.def_var(var, val);
                 } else {
                     // Emit the function name as a data constant.
-                    let name_str =
-                        template.name.as_deref().unwrap_or(&template.arity_fn_names[0]);
+                    let name_str = template
+                        .name
+                        .as_deref()
+                        .unwrap_or(&template.arity_fn_names[0]);
                     let name_data = self.module.declare_anonymous_data(false, false)?;
                     let mut name_desc = cranelift_module::DataDescription::new();
                     name_desc.define(name_str.as_bytes().to_vec().into_boxed_slice());
@@ -476,8 +478,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                             let func_ref = self
                                 .module
                                 .declare_func_in_func(arity_func_id, self.builder.func);
-                            let fn_ptr =
-                                self.builder.ins().func_addr(self.ptr_type, func_ref);
+                            let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
                             self.builder
                                 .ins()
                                 .stack_store(fn_ptr, fn_ptrs_slot, (i * 8) as i32);
@@ -501,11 +502,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                                 .ins()
                                 .stack_store(pc_val, pc_slot, (i * 8) as i32);
                         }
-                        let pc_addr =
-                            self.builder.ins().stack_addr(self.ptr_type, pc_slot, 0);
+                        let pc_addr = self.builder.ins().stack_addr(self.ptr_type, pc_slot, 0);
 
-                        let n_arities_val =
-                            self.builder.ins().iconst(types::I64, n_arities as i64);
+                        let n_arities_val = self.builder.ins().iconst(types::I64, n_arities as i64);
 
                         // Call rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts,
                         //                      n_arities, captures, ncaptures)

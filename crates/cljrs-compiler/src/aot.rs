@@ -162,9 +162,7 @@ fn lower_via_clojure_inner(
     let optimize_fn = env
         .globals
         .lookup_var_in_ns("cljrs.compiler.optimize", "optimize")
-        .ok_or_else(|| {
-            AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string())
-        })?;
+        .ok_or_else(|| AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string()))?;
     let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
 
     let optimized = cljrs_eval::callback::invoke(&optimize_fn_val, vec![ir_data])
