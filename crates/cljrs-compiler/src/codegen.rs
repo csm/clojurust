@@ -81,6 +81,7 @@ struct RuntimeFuncs {
     rt_load_global: FuncId,
     rt_def_var: FuncId,
     rt_make_fn: FuncId,
+    rt_make_fn_multi: FuncId,
     rt_throw: FuncId,
     rt_try: FuncId,
     rt_dissoc: FuncId,
@@ -386,28 +387,15 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
 
             Inst::AllocClosure(dst, template, captures) => {
-                // Get the first arity's compiled function name and param count.
-                // For now we support single-arity closures; multi-arity TBD.
                 if template.arity_fn_names.is_empty() {
                     // No compiled arities — fall back to nil.
                     let val = self.call_rt_0(self.rt.rt_const_nil)?;
                     let var = self.ensure_var(*dst);
                     self.builder.def_var(var, val);
                 } else {
-                    let arity_fn_name = &template.arity_fn_names[0];
-                    let param_count = template.param_counts[0];
-
-                    // Get the FuncId for the compiled arity function.
-                    let arity_func_id = self.user_funcs[arity_fn_name];
-
-                    // Get a function pointer to the compiled function.
-                    let func_ref = self
-                        .module
-                        .declare_func_in_func(arity_func_id, self.builder.func);
-                    let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
-
                     // Emit the function name as a data constant.
-                    let name_str = template.name.as_deref().unwrap_or(arity_fn_name);
+                    let name_str =
+                        template.name.as_deref().unwrap_or(&template.arity_fn_names[0]);
                     let name_data = self.module.declare_anonymous_data(false, false)?;
                     let mut name_desc = cranelift_module::DataDescription::new();
                     name_desc.define(name_str.as_bytes().to_vec().into_boxed_slice());
@@ -417,8 +405,6 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         .declare_data_in_func(name_data, self.builder.func);
                     let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
                     let name_len = self.builder.ins().iconst(types::I64, name_str.len() as i64);
-
-                    let param_count_val = self.builder.ins().iconst(types::I64, param_count as i64);
 
                     // Spill captures to stack.
                     let ncaptures = captures.len();
@@ -445,22 +431,101 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         (slot_addr, n)
                     };
 
-                    // Call rt_make_fn(name_ptr, name_len, fn_ptr, param_count, captures, ncaptures)
-                    let func_ref = self.import_func(self.rt.rt_make_fn);
-                    let call = self.builder.ins().call(
-                        func_ref,
-                        &[
-                            name_ptr,
-                            name_len,
-                            fn_ptr,
-                            param_count_val,
-                            captures_ptr,
-                            ncaptures_val,
-                        ],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    let var = self.ensure_var(*dst);
-                    self.builder.def_var(var, result);
+                    let n_arities = template.arity_fn_names.len();
+                    if n_arities == 1 {
+                        // Single arity — use rt_make_fn (simpler path).
+                        let arity_fn_name = &template.arity_fn_names[0];
+                        let param_count = template.param_counts[0];
+                        let arity_func_id = self.user_funcs[arity_fn_name];
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(arity_func_id, self.builder.func);
+                        let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
+                        let param_count_val =
+                            self.builder.ins().iconst(types::I64, param_count as i64);
+
+                        let rt_ref = self.import_func(self.rt.rt_make_fn);
+                        let call = self.builder.ins().call(
+                            rt_ref,
+                            &[
+                                name_ptr,
+                                name_len,
+                                fn_ptr,
+                                param_count_val,
+                                captures_ptr,
+                                ncaptures_val,
+                            ],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        let var = self.ensure_var(*dst);
+                        self.builder.def_var(var, result);
+                    } else {
+                        // Multi-arity — spill fn_ptrs and param_counts arrays,
+                        // then call rt_make_fn_multi.
+
+                        // Stack-spill function pointers array.
+                        let fn_ptrs_slot = self.builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (n_arities * 8) as u32,
+                                3,
+                            ),
+                        );
+                        for (i, arity_fn_name) in template.arity_fn_names.iter().enumerate() {
+                            let arity_func_id = self.user_funcs[arity_fn_name];
+                            let func_ref = self
+                                .module
+                                .declare_func_in_func(arity_func_id, self.builder.func);
+                            let fn_ptr =
+                                self.builder.ins().func_addr(self.ptr_type, func_ref);
+                            self.builder
+                                .ins()
+                                .stack_store(fn_ptr, fn_ptrs_slot, (i * 8) as i32);
+                        }
+                        let fn_ptrs_addr =
+                            self.builder
+                                .ins()
+                                .stack_addr(self.ptr_type, fn_ptrs_slot, 0);
+
+                        // Stack-spill param_counts array (as i64 values).
+                        let pc_slot = self.builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (n_arities * 8) as u32,
+                                3,
+                            ),
+                        );
+                        for (i, &pc) in template.param_counts.iter().enumerate() {
+                            let pc_val = self.builder.ins().iconst(types::I64, pc as i64);
+                            self.builder
+                                .ins()
+                                .stack_store(pc_val, pc_slot, (i * 8) as i32);
+                        }
+                        let pc_addr =
+                            self.builder.ins().stack_addr(self.ptr_type, pc_slot, 0);
+
+                        let n_arities_val =
+                            self.builder.ins().iconst(types::I64, n_arities as i64);
+
+                        // Call rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts,
+                        //                      n_arities, captures, ncaptures)
+                        let rt_ref = self.import_func(self.rt.rt_make_fn_multi);
+                        let call = self.builder.ins().call(
+                            rt_ref,
+                            &[
+                                name_ptr,
+                                name_len,
+                                fn_ptrs_addr,
+                                pc_addr,
+                                n_arities_val,
+                                captures_ptr,
+                                ncaptures_val,
+                            ],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        let var = self.ensure_var(*dst);
+                        self.builder.def_var(var, result);
+                    }
                 }
             }
 
@@ -1118,6 +1183,13 @@ fn declare_runtime_funcs(
             module,
             "rt_make_fn",
             &[ptr, types::I64, ptr, types::I64, ptr, types::I64],
+            ptr,
+        )?,
+        // rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts, n_arities, captures, ncaptures)
+        rt_make_fn_multi: declare_rt(
+            module,
+            "rt_make_fn_multi",
+            &[ptr, types::I64, ptr, ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
         rt_throw: declare_rt(module, "rt_throw", &[ptr], ptr)?,

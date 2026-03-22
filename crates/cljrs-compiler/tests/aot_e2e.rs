@@ -388,7 +388,6 @@ fn test_map_destructuring() {
 }
 
 #[test]
-#[ignore = "fn param destructuring not yet implemented in AOT"]
 fn test_fn_param_destructuring() {
     assert_output(
         "fn_destructure",
@@ -574,7 +573,6 @@ fn test_str_concat() {
 // ── Multi-arity functions ──────────────────────────────────────────────────
 
 #[test]
-#[ignore = "multi-arity dispatch not yet implemented in AOT codegen"]
 fn test_multi_arity_fn() {
     assert_output(
         "multi_arity",

@@ -505,9 +505,16 @@
    arity-params: vector of parameter name symbols.
    body-forms: vector of body forms."
   [parent-ctx arity-name ns capture-names arity-params body-forms]
-  (let [;; Build param list: captures first, then real params
+  (let [;; For each user param, if it's a symbol use it directly;
+        ;; if it's a destructuring pattern, generate a gensym name.
+        param-info (mapv (fn [p]
+                           (if (symbol? p)
+                             {:name (str p) :pattern nil}
+                             {:name (str "__destructure_" (gensym)) :pattern p}))
+                         arity-params)
+        ;; Build param list: captures first, then real params (using gensym names for patterns)
         all-param-names (into (vec capture-names)
-                              (mapv str arity-params))
+                              (mapv :name param-info))
         sub-ctx (ir/make-ctx arity-name ns all-param-names)]
     ;; Bind params
     (let [param-pairs (reduce (fn [acc pname]
@@ -517,6 +524,11 @@
                               []
                               all-param-names)]
       (swap! sub-ctx assoc :params param-pairs))
+    ;; Emit destructuring bindings for pattern params
+    (doseq [info param-info]
+      (when (:pattern info)
+        (let [gensym-var (ir/lookup-local sub-ctx (:name info))]
+          (lower-destructure-binding sub-ctx (:pattern info) gensym-var))))
     ;; Lower body
     (let [result (lower-body sub-ctx body-forms)]
       (ir/finish-block! sub-ctx (ir/term-return result))
@@ -934,24 +946,23 @@
               (recur (next pairs)
                      (conj predecessors [false-exit false-val])))))))))
 
-(defn emit-str-concat
-  "Emit (str a b c ...) as repeated binary str calls concatenated."
-  [ctx arg-vars]
-  (let [nargs (count arg-vars)]
-    (cond
-      (= nargs 0) (ir/emit-const! ctx {:type :string :val ""})
-      (= nargs 1) (let [dst (ir/fresh-var! ctx)]
-                     (ir/emit! ctx (ir/inst-call-known dst :str [(first arg-vars)]))
-                     dst)
-      :else
-      ;; Stringify each arg, then concatenate.
-      ;; Strategy: stringify first, then for each remaining, stringify and concat
-      ;; via a runtime concat helper. Since we don't have rt_str_concat yet,
-      ;; we can build a vector of stringified args and use apply str... but that
-      ;; creates circularity. Instead, let's emit a call through rt_call to the
-      ;; global `str` function.
-      ;; Simpler approach: just fall through to a generic call for multi-arg str.
-      nil)))
+;; Expected argument counts for known functions that map directly to rt_* calls.
+;; Functions not listed here are either:
+;; - binary-foldable (handled separately)
+;; - variadic collection constructors (handled in codegen via stack-spill)
+;; - special (atom-swap, with-bindings — handled in codegen specially)
+;; A nil value means "any arity is fine" (variadic in codegen).
+(def known-fn-arities
+  {:get 2, :count 1, :first 1, :rest 1, :next 1,
+   :assoc 3, :conj 2, :dissoc 2, :disj 2, :nth 2, :contains 2,
+   :cons 2, :seq 1, :lazy-seq 1,
+   :deref 1, :atom-deref 1, :atom-reset 2,
+   :is-nil 1, :is-vector 1, :is-map 1, :is-seq 1, :identical 2,
+   :str 1, :println 1, :pr 1,
+   :apply 2,
+   :transient 1, :assoc! 3, :conj! 2, :persistent! 1,
+   :set!-var 2,
+   :try-catch-finally 3})
 
 (defn lower-call
   "Lower a function call."
@@ -960,22 +971,38 @@
            (known/resolve-known-fn (str callee-form)))
     ;; Known function call
     (let [known-kw (known/resolve-known-fn (str callee-form))
-          arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)
-]
+          arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)]
       (if-let [info (get binary-foldable known-kw)]
         ;; Binary-reducible: fold args
         (emit-binary-fold ctx known-kw arg-vars info)
-        ;; Check for multi-arg functions that need generic dispatch
-        (if (and (contains? #{:str :println :pr} known-kw) (> (count arg-vars) 1))
-          ;; Multi-arg str/println/pr: fall through to generic call
-          (let [callee (lower-form ctx callee-form)
-                dst (ir/fresh-var! ctx)]
-            (ir/emit! ctx (ir/inst-call dst callee arg-vars))
-            dst)
-          ;; Standard known call (correct arity or variadic like vector/hash-map)
-          (let [dst (ir/fresh-var! ctx)]
-            (ir/emit! ctx (ir/inst-call-known dst known-kw arg-vars))
-            dst))))
+        ;; Check if arg count matches expected arity for this known fn
+        (let [expected (get known-fn-arities known-kw)
+              argc (count arg-vars)]
+          (if (and expected (not= argc expected))
+            ;; Arity mismatch — special-case str/println/pr for 0-args,
+            ;; otherwise fall through to generic call
+            (cond
+              ;; (str) → constant empty string
+              (and (= known-kw :str) (= argc 0))
+              (ir/emit-const! ctx {:type :string :val ""})
+
+              ;; (println) / (pr) with 0 args → print empty string
+              (and (contains? #{:println :pr} known-kw) (= argc 0))
+              (let [empty-str (ir/emit-const! ctx {:type :string :val ""})
+                    dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst known-kw [empty-str]))
+                dst)
+
+              ;; Everything else: fall through to generic dynamic call
+              :else
+              (let [callee (lower-form ctx callee-form)
+                    dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call dst callee arg-vars))
+                dst))
+            ;; Arity matches (or no restriction) — emit known call
+            (let [dst (ir/fresh-var! ctx)]
+              (ir/emit! ctx (ir/inst-call-known dst known-kw arg-vars))
+              dst)))))
     ;; Unknown call
     (let [callee (lower-form ctx callee-form)
           arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)

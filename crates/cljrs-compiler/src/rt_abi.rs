@@ -569,6 +569,100 @@ pub unsafe extern "C" fn rt_make_fn(
     box_val(Value::NativeFunction(GcPtr::new(native_fn)))
 }
 
+/// Create a multi-arity compiled function value.
+///
+/// `fn_ptrs` is an array of `n_arities` function pointers (one per arity).
+/// `param_counts` is an array of `n_arities` parameter counts (user params, not including captures).
+/// The dispatch closure selects the right function pointer based on the argument count.
+///
+/// # Safety
+/// All pointer parameters must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_make_fn_multi(
+    name_ptr: *const u8,
+    name_len: u64,
+    fn_ptrs: *const *const u8,
+    param_counts_ptr: *const u64,
+    n_arities: u64,
+    captures: *const *const Value,
+    ncaptures: u64,
+) -> *const Value {
+    let name_str = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+    let name: Arc<str> = Arc::from(name_str);
+    let n_arities = n_arities as usize;
+    let ncaptures = ncaptures as usize;
+
+    // Build arity table: Vec<(fn_addr, user_param_count)>
+    let fn_ptr_slice = unsafe { std::slice::from_raw_parts(fn_ptrs, n_arities) };
+    let param_count_slice = unsafe { std::slice::from_raw_parts(param_counts_ptr, n_arities) };
+    let arity_table: Vec<(usize, usize)> = fn_ptr_slice
+        .iter()
+        .zip(param_count_slice.iter())
+        .map(|(&fp, &pc)| (fp as usize, pc as usize))
+        .collect();
+
+    // Clone captured values.
+    let captured_values: Vec<Value> = if ncaptures > 0 {
+        let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
+        capture_slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Determine arity info for the NativeFn.
+    let min_params = arity_table.iter().map(|(_, pc)| *pc).min().unwrap_or(0);
+    let max_params = arity_table.iter().map(|(_, pc)| *pc).max().unwrap_or(0);
+    let arity = if min_params == max_params {
+        cljrs_value::Arity::Fixed(min_params)
+    } else {
+        cljrs_value::Arity::Variadic { min: min_params }
+    };
+
+    let fn_name = name.clone();
+    let native_fn = cljrs_value::NativeFn {
+        name,
+        arity,
+        func: Arc::new(move |args: &[Value]| {
+            let argc = args.len();
+            // Find matching arity.
+            let matched = arity_table.iter().find(|(_, pc)| *pc == argc);
+            let (fn_addr, _user_pc) = match matched {
+                Some(entry) => *entry,
+                None => {
+                    let counts: Vec<String> =
+                        arity_table.iter().map(|(_, pc)| pc.to_string()).collect();
+                    return Err(cljrs_value::ValueError::ArityError {
+                        name: fn_name.to_string(),
+                        expected: counts.join(" or "),
+                        got: argc,
+                    });
+                }
+            };
+            let total_params = ncaptures + argc;
+
+            // Build: captures + args
+            let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
+            for cap in &captured_values {
+                all_ptrs.push(box_val(cap.clone()));
+            }
+            for arg in args {
+                all_ptrs.push(box_val(arg.clone()));
+            }
+
+            let result_ptr =
+                unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
+            Ok(unsafe { val_ref(result_ptr) }.clone())
+        }),
+    };
+
+    box_val(Value::NativeFunction(GcPtr::new(native_fn)))
+}
+
 /// Call a compiled function by passing arguments through a pointer array.
 ///
 /// This is a trampoline: the compiled function expects individual pointer-sized
@@ -1529,6 +1623,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_identical as *const () as usize);
     std::hint::black_box(rt_str as *const () as usize);
     std::hint::black_box(rt_make_fn as *const () as usize);
+    std::hint::black_box(rt_make_fn_multi as *const () as usize);
     std::hint::black_box(rt_throw as *const () as usize);
     std::hint::black_box(rt_try as *const () as usize);
     std::hint::black_box(rt_dissoc as *const () as usize);
