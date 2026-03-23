@@ -9,3 +9,5 @@ cljrs-gc    = { workspace = true }
 cljrs-value = { workspace = true }
 cljrs-eval  = { workspace = true }
 cljrs-reader = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "sync", "rt-multi-thread"] }
+lazy_static = "1.5.0"

@@ -1,0 +1,6 @@
+;; clojure.core.async -- asynchronous operations via CSP
+(ns clojure.core.async)
+
+(defmacro go
+  [& body]
+  (list (list 'enter-async) 'try body (list 'finally (list 'exit-async))))
