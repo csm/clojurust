@@ -9,7 +9,7 @@ ANF lowering and escape analysis are written in Clojure (`cljrs.compiler.anf`,
 layer (`ir_convert.rs`) translates these back to the `IrFunction` structs that the
 Cranelift codegen backend consumes.
 
-**Phase:** 8.1 (optimization) + 11 (AOT compilation) — end-to-end AOT working for simple programs.
+**Phase:** 8.1 (optimization) + 11 (AOT compilation) — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs (map/filter/reduce/mapv/filterv/some/every?/into), sequence ops (range/take/drop/concat/reverse/sort), collection ops (keys/vals/merge/update/get-in/assoc-in), type predicates, atom constructor, and inline expansions (inc/dec/not/not=/zero?/pos?/neg?/even?/odd?/max/min/empty?).
 
 ---
 
@@ -43,7 +43,7 @@ pub struct Block { id, phis, insts, terminator }
 pub enum Inst { Const, LoadLocal, LoadGlobal, AllocVector, AllocMap, AllocSet, AllocList, AllocCons, AllocClosure, CallKnown, Call, Deref, DefVar, SetBang, Throw, Phi, Recur, SourceLoc, RegionStart, RegionAlloc, RegionEnd }
 pub enum RegionAllocKind { Vector, Map, Set, List, Cons }
 pub enum Terminator { Jump, Branch, Return, RecurJump, Unreachable }
-pub enum KnownFn { Vector, HashMap, Assoc, Conj, Get, Count, Add, Sub, ... }
+pub enum KnownFn { Vector, HashMap, Assoc, Conj, Get, Count, Add, Sub, Apply, Reduce2, Map, Filter, Mapv, Range1, Take, Drop, Concat, Sort, Keys, Vals, Merge, Update, Atom, ... }
 pub enum Effect { Pure, Alloc, HeapRead, HeapWrite, IO, UnknownCall }
 ```
 
@@ -97,7 +97,9 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 ```
 
-Pipeline: read source → parse → macro-expand → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble (ns/require/defmacro) → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → Cranelift codegen → generate Cargo harness (with bundled dependency sources) → `cargo build --release` → copy binary.
+
+Multi-file support: when the source file uses `(ns ... (:require [...]))`, the required namespaces are loaded during compilation. Their source files are discovered from `src_dirs`, bundled into the harness as builtin sources, and made available at runtime so the binary is self-contained.
 
 ---
 

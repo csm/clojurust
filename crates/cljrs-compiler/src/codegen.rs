@@ -81,6 +81,7 @@ struct RuntimeFuncs {
     rt_load_global: FuncId,
     rt_def_var: FuncId,
     rt_make_fn: FuncId,
+    rt_make_fn_variadic: FuncId,
     rt_make_fn_multi: FuncId,
     rt_throw: FuncId,
     rt_try: FuncId,
@@ -100,6 +101,53 @@ struct RuntimeFuncs {
     rt_set_bang: FuncId,
     rt_with_bindings: FuncId,
     rt_load_var: FuncId,
+    rt_reduce2: FuncId,
+    rt_reduce3: FuncId,
+    rt_map: FuncId,
+    rt_filter: FuncId,
+    rt_mapv: FuncId,
+    rt_filterv: FuncId,
+    rt_some: FuncId,
+    rt_every: FuncId,
+    rt_into: FuncId,
+    rt_into3: FuncId,
+    rt_group_by: FuncId,
+    rt_partition2: FuncId,
+    rt_partition3: FuncId,
+    rt_partition4: FuncId,
+    rt_frequencies: FuncId,
+    rt_keep: FuncId,
+    rt_remove: FuncId,
+    rt_map_indexed: FuncId,
+    rt_zipmap: FuncId,
+    rt_juxt: FuncId,
+    rt_comp: FuncId,
+    rt_partial: FuncId,
+    rt_complement: FuncId,
+    rt_concat: FuncId,
+    rt_range1: FuncId,
+    rt_range2: FuncId,
+    rt_range3: FuncId,
+    rt_take: FuncId,
+    rt_drop: FuncId,
+    rt_reverse: FuncId,
+    rt_sort: FuncId,
+    rt_sort_by: FuncId,
+    rt_keys: FuncId,
+    rt_vals: FuncId,
+    rt_merge: FuncId,
+    rt_update: FuncId,
+    rt_get_in: FuncId,
+    rt_assoc_in: FuncId,
+    rt_is_number: FuncId,
+    rt_is_string: FuncId,
+    rt_is_keyword: FuncId,
+    rt_is_symbol: FuncId,
+    rt_is_bool: FuncId,
+    rt_is_int: FuncId,
+    rt_prn: FuncId,
+    rt_print: FuncId,
+    rt_atom: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -345,6 +393,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 self.builder.def_var(var, val);
             }
 
+            Inst::CallDirect(dst, fn_name, args) => {
+                let val = self.emit_direct_call(fn_name, args)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, val);
+            }
+
             Inst::Deref(dst, src) => {
                 let s = self.use_var(*src);
                 let val = self.call_rt_1(self.rt.rt_deref, s)?;
@@ -434,8 +488,8 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     };
 
                     let n_arities = template.arity_fn_names.len();
-                    if n_arities == 1 {
-                        // Single arity — use rt_make_fn (simpler path).
+                    if n_arities == 1 && !template.is_variadic[0] {
+                        // Single fixed arity — use rt_make_fn (simpler path).
                         let arity_fn_name = &template.arity_fn_names[0];
                         let param_count = template.param_counts[0];
                         let arity_func_id = self.user_funcs[arity_fn_name];
@@ -461,8 +515,35 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         let result = self.builder.inst_results(call)[0];
                         let var = self.ensure_var(*dst);
                         self.builder.def_var(var, result);
+                    } else if n_arities == 1 && template.is_variadic[0] {
+                        // Single variadic arity — use rt_make_fn_variadic.
+                        let arity_fn_name = &template.arity_fn_names[0];
+                        let param_count = template.param_counts[0];
+                        let arity_func_id = self.user_funcs[arity_fn_name];
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(arity_func_id, self.builder.func);
+                        let fn_ptr = self.builder.ins().func_addr(self.ptr_type, func_ref);
+                        let param_count_val =
+                            self.builder.ins().iconst(types::I64, param_count as i64);
+
+                        let rt_ref = self.import_func(self.rt.rt_make_fn_variadic);
+                        let call = self.builder.ins().call(
+                            rt_ref,
+                            &[
+                                name_ptr,
+                                name_len,
+                                fn_ptr,
+                                param_count_val,
+                                captures_ptr,
+                                ncaptures_val,
+                            ],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        let var = self.ensure_var(*dst);
+                        self.builder.def_var(var, result);
                     } else {
-                        // Multi-arity — spill fn_ptrs and param_counts arrays,
+                        // Multi-arity — spill fn_ptrs, param_counts, and is_variadic arrays,
                         // then call rt_make_fn_multi.
 
                         // Stack-spill function pointers array.
@@ -504,10 +585,28 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         }
                         let pc_addr = self.builder.ins().stack_addr(self.ptr_type, pc_slot, 0);
 
+                        // Stack-spill is_variadic array (as u8 values, 1 byte each).
+                        let var_slot = self.builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                n_arities as u32,
+                                0,
+                            ),
+                        );
+                        for (i, &v) in template.is_variadic.iter().enumerate() {
+                            let v_val =
+                                self.builder.ins().iconst(types::I8, if v { 1 } else { 0 });
+                            self.builder
+                                .ins()
+                                .stack_store(v_val, var_slot, i as i32);
+                        }
+                        let var_addr =
+                            self.builder.ins().stack_addr(self.ptr_type, var_slot, 0);
+
                         let n_arities_val = self.builder.ins().iconst(types::I64, n_arities as i64);
 
                         // Call rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts,
-                        //                      n_arities, captures, ncaptures)
+                        //                      is_variadic, n_arities, captures, ncaptures)
                         let rt_ref = self.import_func(self.rt.rt_make_fn_multi);
                         let call = self.builder.ins().call(
                             rt_ref,
@@ -516,6 +615,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                                 name_len,
                                 fn_ptrs_addr,
                                 pc_addr,
+                                var_addr,
                                 n_arities_val,
                                 captures_ptr,
                                 ncaptures_val,
@@ -901,6 +1001,11 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::List => return self.emit_alloc_collection(self.rt.rt_alloc_list, args),
             KnownFn::AtomSwap => return self.emit_atom_swap(args),
             KnownFn::WithBindings => return self.emit_with_bindings(args),
+            KnownFn::Concat => return self.emit_alloc_collection(self.rt.rt_concat, args),
+            KnownFn::Merge => return self.emit_alloc_collection(self.rt.rt_merge, args),
+            KnownFn::Juxt => return self.emit_alloc_collection(self.rt.rt_juxt, args),
+            KnownFn::Comp => return self.emit_alloc_collection(self.rt.rt_comp, args),
+            KnownFn::Partial => return self.emit_alloc_collection(self.rt.rt_partial, args),
             _ => {}
         }
 
@@ -945,6 +1050,48 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::AtomReset => self.rt.rt_atom_reset,
             KnownFn::Apply => self.rt.rt_apply,
             KnownFn::SetBangVar => self.rt.rt_set_bang,
+            KnownFn::Reduce2 => self.rt.rt_reduce2,
+            KnownFn::Reduce3 => self.rt.rt_reduce3,
+            KnownFn::Map => self.rt.rt_map,
+            KnownFn::Filter => self.rt.rt_filter,
+            KnownFn::Mapv => self.rt.rt_mapv,
+            KnownFn::Filterv => self.rt.rt_filterv,
+            KnownFn::Some => self.rt.rt_some,
+            KnownFn::Every => self.rt.rt_every,
+            KnownFn::Into => self.rt.rt_into,
+            KnownFn::Into3 => self.rt.rt_into3,
+            KnownFn::Range1 => self.rt.rt_range1,
+            KnownFn::Range2 => self.rt.rt_range2,
+            KnownFn::Range3 => self.rt.rt_range3,
+            KnownFn::Take => self.rt.rt_take,
+            KnownFn::Drop => self.rt.rt_drop,
+            KnownFn::Reverse => self.rt.rt_reverse,
+            KnownFn::Sort => self.rt.rt_sort,
+            KnownFn::SortBy => self.rt.rt_sort_by,
+            KnownFn::Keys => self.rt.rt_keys,
+            KnownFn::Vals => self.rt.rt_vals,
+            KnownFn::Update => self.rt.rt_update,
+            KnownFn::GetIn => self.rt.rt_get_in,
+            KnownFn::AssocIn => self.rt.rt_assoc_in,
+            KnownFn::IsNumber => self.rt.rt_is_number,
+            KnownFn::IsString => self.rt.rt_is_string,
+            KnownFn::IsKeyword => self.rt.rt_is_keyword,
+            KnownFn::IsSymbol => self.rt.rt_is_symbol,
+            KnownFn::IsBool => self.rt.rt_is_bool,
+            KnownFn::IsInt => self.rt.rt_is_int,
+            KnownFn::Prn => self.rt.rt_prn,
+            KnownFn::Print => self.rt.rt_print,
+            KnownFn::Atom => self.rt.rt_atom,
+            KnownFn::GroupBy => self.rt.rt_group_by,
+            KnownFn::Partition2 => self.rt.rt_partition2,
+            KnownFn::Partition3 => self.rt.rt_partition3,
+            KnownFn::Partition4 => self.rt.rt_partition4,
+            KnownFn::Frequencies => self.rt.rt_frequencies,
+            KnownFn::Keep => self.rt.rt_keep,
+            KnownFn::Remove => self.rt.rt_remove,
+            KnownFn::MapIndexed => self.rt.rt_map_indexed,
+            KnownFn::Zipmap => self.rt.rt_zipmap,
+            KnownFn::Complement => self.rt.rt_complement,
             _ => {
                 return self.emit_unknown_call_from_args(args);
             }
@@ -1035,6 +1182,22 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             .builder
             .ins()
             .call(func_ref, &[bindings_ptr, npairs_val, body_val]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Emit a direct function call (bypasses rt_call dynamic dispatch).
+    fn emit_direct_call(
+        &mut self,
+        fn_name: &str,
+        args: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let func_id = self
+            .user_funcs
+            .get(fn_name)
+            .ok_or_else(|| CodegenError::Codegen(format!("CallDirect: unknown function {fn_name}")))?;
+        let func_ref = self.import_func(*func_id);
+        let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1216,11 +1379,18 @@ fn declare_runtime_funcs(
             &[ptr, types::I64, ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
-        // rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts, n_arities, captures, ncaptures)
+        // rt_make_fn_variadic(name_ptr, name_len, fn_ptr, fixed_param_count, captures, ncaptures)
+        rt_make_fn_variadic: declare_rt(
+            module,
+            "rt_make_fn_variadic",
+            &[ptr, types::I64, ptr, types::I64, ptr, types::I64],
+            ptr,
+        )?,
+        // rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts, is_variadic, n_arities, captures, ncaptures)
         rt_make_fn_multi: declare_rt(
             module,
             "rt_make_fn_multi",
-            &[ptr, types::I64, ptr, ptr, types::I64, ptr, types::I64],
+            &[ptr, types::I64, ptr, ptr, ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
         rt_throw: declare_rt(module, "rt_throw", &[ptr], ptr)?,
@@ -1246,6 +1416,53 @@ fn declare_runtime_funcs(
             &[ptr, types::I64, ptr, types::I64],
             ptr,
         )?,
+        rt_reduce2: declare_rt(module, "rt_reduce2", &[ptr, ptr], ptr)?,
+        rt_reduce3: declare_rt(module, "rt_reduce3", &[ptr, ptr, ptr], ptr)?,
+        rt_map: declare_rt(module, "rt_map", &[ptr, ptr], ptr)?,
+        rt_filter: declare_rt(module, "rt_filter", &[ptr, ptr], ptr)?,
+        rt_mapv: declare_rt(module, "rt_mapv", &[ptr, ptr], ptr)?,
+        rt_filterv: declare_rt(module, "rt_filterv", &[ptr, ptr], ptr)?,
+        rt_some: declare_rt(module, "rt_some", &[ptr, ptr], ptr)?,
+        rt_every: declare_rt(module, "rt_every", &[ptr, ptr], ptr)?,
+        rt_into: declare_rt(module, "rt_into", &[ptr, ptr], ptr)?,
+        rt_into3: declare_rt(module, "rt_into3", &[ptr, ptr, ptr], ptr)?,
+        rt_group_by: declare_rt(module, "rt_group_by", &[ptr, ptr], ptr)?,
+        rt_partition2: declare_rt(module, "rt_partition2", &[ptr, ptr], ptr)?,
+        rt_partition3: declare_rt(module, "rt_partition3", &[ptr, ptr, ptr], ptr)?,
+        rt_partition4: declare_rt(module, "rt_partition4", &[ptr, ptr, ptr, ptr], ptr)?,
+        rt_frequencies: declare_rt(module, "rt_frequencies", &[ptr], ptr)?,
+        rt_keep: declare_rt(module, "rt_keep", &[ptr, ptr], ptr)?,
+        rt_remove: declare_rt(module, "rt_remove", &[ptr, ptr], ptr)?,
+        rt_map_indexed: declare_rt(module, "rt_map_indexed", &[ptr, ptr], ptr)?,
+        rt_zipmap: declare_rt(module, "rt_zipmap", &[ptr, ptr], ptr)?,
+        rt_juxt: declare_rt(module, "rt_juxt", &[ptr, types::I64], ptr)?,
+        rt_comp: declare_rt(module, "rt_comp", &[ptr, types::I64], ptr)?,
+        rt_partial: declare_rt(module, "rt_partial", &[ptr, types::I64], ptr)?,
+        rt_complement: declare_rt(module, "rt_complement", &[ptr], ptr)?,
+        rt_concat: declare_rt(module, "rt_concat", &[ptr, types::I64], ptr)?,
+        rt_range1: declare_rt(module, "rt_range1", &[ptr], ptr)?,
+        rt_range2: declare_rt(module, "rt_range2", &[ptr, ptr], ptr)?,
+        rt_range3: declare_rt(module, "rt_range3", &[ptr, ptr, ptr], ptr)?,
+        rt_take: declare_rt(module, "rt_take", &[ptr, ptr], ptr)?,
+        rt_drop: declare_rt(module, "rt_drop", &[ptr, ptr], ptr)?,
+        rt_reverse: declare_rt(module, "rt_reverse", &[ptr], ptr)?,
+        rt_sort: declare_rt(module, "rt_sort", &[ptr], ptr)?,
+        rt_sort_by: declare_rt(module, "rt_sort_by", &[ptr, ptr], ptr)?,
+        rt_keys: declare_rt(module, "rt_keys", &[ptr], ptr)?,
+        rt_vals: declare_rt(module, "rt_vals", &[ptr], ptr)?,
+        rt_merge: declare_rt(module, "rt_merge", &[ptr, types::I64], ptr)?,
+        rt_update: declare_rt(module, "rt_update", &[ptr, ptr, ptr], ptr)?,
+        rt_get_in: declare_rt(module, "rt_get_in", &[ptr, ptr], ptr)?,
+        rt_assoc_in: declare_rt(module, "rt_assoc_in", &[ptr, ptr, ptr], ptr)?,
+        rt_is_number: declare_rt(module, "rt_is_number", &[ptr], ptr)?,
+        rt_is_string: declare_rt(module, "rt_is_string", &[ptr], ptr)?,
+        rt_is_keyword: declare_rt(module, "rt_is_keyword", &[ptr], ptr)?,
+        rt_is_symbol: declare_rt(module, "rt_is_symbol", &[ptr], ptr)?,
+        rt_is_bool: declare_rt(module, "rt_is_bool", &[ptr], ptr)?,
+        rt_is_int: declare_rt(module, "rt_is_int", &[ptr], ptr)?,
+        rt_prn: declare_rt(module, "rt_prn", &[ptr], ptr)?,
+        rt_print: declare_rt(module, "rt_print", &[ptr], ptr)?,
+        rt_atom: declare_rt(module, "rt_atom", &[ptr], ptr)?,
     })
 }
 

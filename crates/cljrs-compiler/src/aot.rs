@@ -173,6 +173,163 @@ fn lower_via_clojure_inner(
         .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))
 }
 
+// ── Direct call optimization ────────────────────────────────────────────────
+
+/// Information about a compiled function arity.
+#[derive(Debug, Clone)]
+struct ArityInfo {
+    fn_name: Arc<str>,
+    param_count: usize,
+    is_variadic: bool,
+}
+
+/// Collect top-level function definitions from an IR function.
+///
+/// Scans for `AllocClosure(...) + DefVar(_, ns, name, closure_var)` patterns
+/// and returns a map from `(ns, name)` → list of arity infos.
+fn collect_defn_arities(
+    ir_func: &IrFunction,
+) -> std::collections::HashMap<(Arc<str>, Arc<str>), Vec<ArityInfo>> {
+    use crate::ir::{ClosureTemplate, Inst, VarId};
+    use std::collections::HashMap;
+
+    let mut closure_templates: HashMap<VarId, ClosureTemplate> = HashMap::new();
+    let mut defns: HashMap<(Arc<str>, Arc<str>), Vec<ArityInfo>> = HashMap::new();
+
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            match inst {
+                Inst::AllocClosure(dst, template, captures) => {
+                    // Only consider zero-capture closures (top-level defns).
+                    if captures.is_empty() {
+                        closure_templates.insert(*dst, template.clone());
+                    }
+                }
+                Inst::DefVar(_, ns, name, val) => {
+                    if let Some(template) = closure_templates.get(val) {
+                        let arities: Vec<ArityInfo> = template
+                            .arity_fn_names
+                            .iter()
+                            .zip(template.param_counts.iter())
+                            .zip(template.is_variadic.iter())
+                            .map(|((fn_name, &param_count), &is_variadic)| ArityInfo {
+                                fn_name: fn_name.clone(),
+                                param_count,
+                                is_variadic,
+                            })
+                            .collect();
+                        defns.insert((ns.clone(), name.clone()), arities);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    defns
+}
+
+/// Find the arity function name that matches a given argument count.
+///
+/// Only matches fixed arities — variadic functions cannot be called directly
+/// because the runtime needs to pack extra args into a rest list.
+fn find_matching_arity(arities: &[ArityInfo], arg_count: usize) -> Option<&ArityInfo> {
+    arities
+        .iter()
+        .find(|arity| !arity.is_variadic && arity.param_count == arg_count)
+}
+
+/// Rewrite `LoadGlobal + Call` sequences to `CallDirect` for functions
+/// defined in the same compilation unit.
+///
+/// This is a perf optimization: instead of going through `rt_call` (which
+/// looks up the var in the interpreter and dispatches dynamically), we call
+/// the compiled function pointer directly.
+fn optimize_direct_calls(ir_func: &mut IrFunction) {
+    // Collect defn arities from this function AND all subfunctions (recursively).
+    let mut all_defns = collect_defn_arities(ir_func);
+    for sub in &ir_func.subfunctions {
+        // Subfunctions don't typically DefVar, but recurse just in case.
+        all_defns.extend(collect_defn_arities(sub));
+    }
+
+    if all_defns.is_empty() {
+        return;
+    }
+
+    let rewrites = rewrite_calls_to_direct(ir_func, &all_defns);
+    if rewrites > 0 {
+        eprintln!("[aot] optimized {rewrites} call(s) to direct function calls");
+    }
+
+    // Recursively optimize subfunctions too.
+    // Subfunctions can call top-level defns, so pass the defn map down.
+    for sub in &mut ir_func.subfunctions {
+        optimize_direct_calls_with_defns(sub, &all_defns);
+    }
+}
+
+/// Like `optimize_direct_calls` but uses a pre-built defn map (for subfunctions).
+fn optimize_direct_calls_with_defns(
+    ir_func: &mut IrFunction,
+    defns: &std::collections::HashMap<(Arc<str>, Arc<str>), Vec<ArityInfo>>,
+) {
+    // Merge parent defns with any defns from this function.
+    let mut all_defns = defns.clone();
+    all_defns.extend(collect_defn_arities(ir_func));
+
+    if all_defns.is_empty() {
+        return;
+    }
+
+    let rewrites = rewrite_calls_to_direct(ir_func, &all_defns);
+    if rewrites > 0 {
+        eprintln!("[aot] optimized {rewrites} direct call(s) in subfunction");
+    }
+
+    for sub in &mut ir_func.subfunctions {
+        optimize_direct_calls_with_defns(sub, &all_defns);
+    }
+}
+
+/// Rewrite `LoadGlobal + Call` → `CallDirect` in a single IR function.
+/// Returns the number of rewrites performed.
+fn rewrite_calls_to_direct(
+    ir_func: &mut IrFunction,
+    defns: &std::collections::HashMap<(Arc<str>, Arc<str>), Vec<ArityInfo>>,
+) -> usize {
+    use crate::ir::{Inst, VarId};
+    use std::collections::HashMap;
+
+    // Build a map of VarId → (ns, name) for LoadGlobal instructions that load known defns.
+    let mut loadglobal_targets: HashMap<VarId, (Arc<str>, Arc<str>)> = HashMap::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            if let Inst::LoadGlobal(dst, ns, name) = inst
+                && defns.contains_key(&(ns.clone(), name.clone()))
+            {
+                loadglobal_targets.insert(*dst, (ns.clone(), name.clone()));
+            }
+        }
+    }
+
+    let mut rewrites = 0;
+    for block in &mut ir_func.blocks {
+        for inst in &mut block.insts {
+            if let Inst::Call(dst, callee, args) = inst
+                && let Some((ns, name)) = loadglobal_targets.get(callee)
+                && let Some(arities) = defns.get(&(ns.clone(), name.clone()))
+                && let Some(arity_info) = find_matching_arity(arities, args.len())
+            {
+                *inst = Inst::CallDirect(*dst, arity_info.fn_name.clone(), args.clone());
+                rewrites += 1;
+            }
+        }
+    }
+
+    rewrites
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Compile a `.cljrs` / `.cljc` source file to a standalone native binary.
@@ -199,14 +356,42 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
     };
     let mut env = cljrs_eval::Env::new(globals, "user");
 
+    // Snapshot loaded namespaces before expansion so we can detect
+    // which user namespaces were pulled in by require.
+    let pre_loaded: std::collections::HashSet<Arc<str>> =
+        env.globals.loaded.lock().unwrap().clone();
+
     let mut expanded = Vec::with_capacity(forms.len());
     for form in &forms {
+        // For forms that need the interpreter (ns, require, defmacro, etc.),
+        // evaluate them immediately so that required namespaces get loaded
+        // and macros from dependencies are available for later forms.
+        if needs_interpreter(form) {
+            match cljrs_eval::eval(form, &mut env) {
+                Ok(_) => {}
+                Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
+            }
+        }
         match cljrs_eval::macros::macroexpand_all(form, &mut env) {
             Ok(f) => expanded.push(f),
             Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
         }
     }
     eprintln!("[aot] macro-expanded {} form(s)", expanded.len());
+
+    // Discover user namespaces loaded during expansion (transitive deps).
+    let bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    if !bundled_sources.is_empty() {
+        eprintln!(
+            "[aot] bundling {} required namespace(s): {}",
+            bundled_sources.len(),
+            bundled_sources
+                .iter()
+                .map(|(ns, _)| ns.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // ── 2b. Partition: interpreted preamble vs compiled body ─────────
     // Forms that define functions (defn, defmacro) or require interpreter
@@ -246,9 +431,11 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
         compilable
     };
 
-    let ir_func = lower_via_clojure(
+    // Use the current namespace (may have been changed by ns form in preamble).
+    let current_ns = env.current_ns.to_string();
+    let mut ir_func = lower_via_clojure(
         Some("__cljrs_main"),
-        "user",
+        &current_ns,
         &params,
         &compilable_forms,
         &mut env,
@@ -258,6 +445,11 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
         ir_func.blocks.len(),
         ir_func.next_var
     );
+
+    // ── 3b. Direct call optimization ────────────────────────────────────
+    // Rewrite `LoadGlobal + Call` → `CallDirect` for functions defined in
+    // the same compilation unit. This avoids going through rt_call.
+    optimize_direct_calls(&mut ir_func);
 
     // ── 4. Cranelift codegen → .o ───────────────────────────────────────
     let mut compiler = Compiler::new()?;
@@ -274,7 +466,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
 
     // ── 5. Generate harness project & build ─────────────────────────────
-    let harness_dir = build_harness(out_path, &obj_bytes, &interpreted_source)?;
+    let harness_dir = build_harness(out_path, &obj_bytes, &interpreted_source, &bundled_sources)?;
     link_with_cargo(&harness_dir, out_path)?;
 
     eprintln!("[aot] wrote {}", out_path.display());
@@ -336,6 +528,54 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
     Ok(())
 }
 
+// ── Bundled source discovery ─────────────────────────────────────────────────
+
+/// Discover user namespaces loaded during macro expansion that need to be
+/// bundled into the compiled binary.
+///
+/// Compares the set of loaded namespaces before and after expansion. For each
+/// newly loaded namespace that isn't a builtin source, resolves and reads
+/// its source file from `src_dirs`.
+fn discover_bundled_sources(
+    globals: &Arc<cljrs_eval::env::GlobalEnv>,
+    pre_loaded: &std::collections::HashSet<Arc<str>>,
+    src_dirs: &[PathBuf],
+) -> Vec<(Arc<str>, String)> {
+    let post_loaded = globals.loaded.lock().unwrap().clone();
+    let mut bundled = Vec::new();
+
+    for ns in post_loaded.difference(pre_loaded) {
+        // Skip namespaces that are already available as builtins at runtime.
+        if globals.builtin_source(ns).is_some() {
+            continue;
+        }
+        // Skip compiler-internal namespaces.
+        if ns.starts_with("cljrs.compiler.") {
+            continue;
+        }
+        // Resolve the source file from src_dirs.
+        let rel_path = ns.replace('.', "/").replace('-', "_");
+        if let Some(src) = find_user_source(&rel_path, src_dirs) {
+            bundled.push((ns.clone(), src));
+        }
+    }
+
+    bundled
+}
+
+/// Find and read a user source file from the given directories.
+fn find_user_source(rel: &str, src_dirs: &[PathBuf]) -> Option<String> {
+    for dir in src_dirs {
+        for ext in &[".cljrs", ".cljc"] {
+            let path = dir.join(format!("{rel}{ext}"));
+            if path.exists() {
+                return std::fs::read_to_string(&path).ok();
+            }
+        }
+    }
+    None
+}
+
 // ── Harness generation ──────────────────────────────────────────────────────
 
 /// Create a temporary Cargo project that links the compiled object code with
@@ -344,6 +584,7 @@ fn build_harness(
     out_path: &Path,
     obj_bytes: &[u8],
     interpreted_source: &str,
+    bundled_sources: &[(Arc<str>, String)],
 ) -> AotResult<PathBuf> {
     // Place the harness in a temp dir next to the output.
     let harness_dir = out_path
@@ -409,16 +650,35 @@ cc = "1"
         std::fs::write(harness_dir.join("src/preamble.cljrs"), interpreted_source)?;
     }
 
+    // Write bundled dependency sources.
+    for (i, (ns, src)) in bundled_sources.iter().enumerate() {
+        let filename = format!("bundled_{i}.cljrs");
+        std::fs::write(harness_dir.join("src").join(&filename), src)?;
+        eprintln!("[aot] bundled {ns} → src/{filename}");
+    }
+
+    // Generate registration code for bundled sources.
+    let mut bundled_registration = String::new();
+    for (i, (ns, _)) in bundled_sources.iter().enumerate() {
+        bundled_registration.push_str(&format!(
+            "    globals.register_builtin_source(\"{ns}\", \
+             include_str!(\"bundled_{i}.cljrs\"));\n"
+        ));
+    }
+
     // Write main.rs — calls into the compiled __cljrs_main.
     let preamble_code = if has_preamble {
         r#"
-    // Evaluate interpreted preamble (defn, defmacro, etc.).
+    // Evaluate interpreted preamble (ns, require, defn, defmacro, etc.).
     let preamble = include_str!("preamble.cljrs");
     let mut parser = cljrs_reader::Parser::new(preamble.to_string(), "<preamble>".to_string());
     let forms = parser.parse_all().expect("preamble parse error");
     for form in &forms {
         cljrs_eval::eval(form, &mut env).expect("preamble eval error");
     }
+    // Re-push eval context with updated namespace (ns form may have changed it).
+    cljrs_eval::callback::pop_eval_context();
+    cljrs_eval::callback::push_eval_context(&env);
 "#
     } else {
         ""
@@ -444,6 +704,10 @@ fn main() {{
     // Initialize the standard environment so that rt_call and other
     // runtime bridge functions can look up builtins.
     let globals = cljrs_stdlib::standard_env();
+
+    // Register bundled dependency sources so require can find them
+    // without needing source files on disk.
+{bundled}
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
@@ -456,7 +720,8 @@ fn main() {{
     cljrs_eval::callback::pop_eval_context();
 }}
 "#,
-        preamble = preamble_code
+        preamble = preamble_code,
+        bundled = bundled_registration
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
 

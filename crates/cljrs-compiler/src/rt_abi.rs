@@ -1,3 +1,4 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 //! C-ABI runtime bridge for AOT-compiled clojurust code.
 //!
 //! Every function here is `extern "C"` with `#[unsafe(no_mangle)]` so the compiled
@@ -569,10 +570,90 @@ pub unsafe extern "C" fn rt_make_fn(
     box_val(Value::NativeFunction(GcPtr::new(native_fn)))
 }
 
+/// Create a single-arity variadic compiled function value.
+///
+/// The compiled function takes `fixed_param_count` fixed params + 1 rest param (a list).
+/// At call time, extra arguments beyond `fixed_param_count` are packed into a list.
+///
+/// # Safety
+/// All pointer parameters must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_make_fn_variadic(
+    name_ptr: *const u8,
+    name_len: u64,
+    fn_ptr: *const u8,
+    fixed_param_count: u64,
+    captures: *const *const Value,
+    ncaptures: u64,
+) -> *const Value {
+    let name_str = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+    let name: Arc<str> = Arc::from(name_str);
+    let fixed_count = fixed_param_count as usize;
+    let ncaptures = ncaptures as usize;
+
+    let captured_values: Vec<Value> = if ncaptures > 0 {
+        let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
+        capture_slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let fn_addr = fn_ptr as usize;
+    // Compiled function receives: captures + fixed_params + 1 (rest list)
+    let total_compiled_params = ncaptures + fixed_count + 1;
+
+    let native_fn = cljrs_value::NativeFn {
+        name: name.clone(),
+        arity: cljrs_value::Arity::Variadic { min: fixed_count },
+        func: Arc::new(move |args: &[Value]| {
+            if args.len() < fixed_count {
+                return Err(cljrs_value::ValueError::ArityError {
+                    name: "compiled-fn".to_string(),
+                    expected: format!("{fixed_count}+"),
+                    got: args.len(),
+                });
+            }
+
+            let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_compiled_params);
+
+            // Add captured values
+            for cap in &captured_values {
+                all_ptrs.push(box_val(cap.clone()));
+            }
+
+            // Add fixed args
+            for arg in &args[..fixed_count] {
+                all_ptrs.push(box_val(arg.clone()));
+            }
+
+            // Pack remaining args into a list for the rest parameter
+            let rest_args: Vec<Value> = args[fixed_count..].to_vec();
+            let rest_list = if rest_args.is_empty() {
+                Value::Nil
+            } else {
+                Value::List(GcPtr::new(PersistentList::from_iter(rest_args)))
+            };
+            all_ptrs.push(box_val(rest_list));
+
+            let result_ptr =
+                unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled_params) };
+            Ok(unsafe { val_ref(result_ptr) }.clone())
+        }),
+    };
+
+    box_val(Value::NativeFunction(GcPtr::new(native_fn)))
+}
+
 /// Create a multi-arity compiled function value.
 ///
 /// `fn_ptrs` is an array of `n_arities` function pointers (one per arity).
-/// `param_counts` is an array of `n_arities` parameter counts (user params, not including captures).
+/// `param_counts` is an array of `n_arities` parameter counts (fixed user params, not including captures).
+/// `is_variadic_ptr` is an array of `n_arities` booleans (1 = variadic, 0 = fixed).
 /// The dispatch closure selects the right function pointer based on the argument count.
 ///
 /// # Safety
@@ -583,6 +664,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     name_len: u64,
     fn_ptrs: *const *const u8,
     param_counts_ptr: *const u64,
+    is_variadic_ptr: *const u8,
     n_arities: u64,
     captures: *const *const Value,
     ncaptures: u64,
@@ -594,13 +676,15 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     let n_arities = n_arities as usize;
     let ncaptures = ncaptures as usize;
 
-    // Build arity table: Vec<(fn_addr, user_param_count)>
+    // Build arity table: Vec<(fn_addr, fixed_param_count, is_variadic)>
     let fn_ptr_slice = unsafe { std::slice::from_raw_parts(fn_ptrs, n_arities) };
     let param_count_slice = unsafe { std::slice::from_raw_parts(param_counts_ptr, n_arities) };
-    let arity_table: Vec<(usize, usize)> = fn_ptr_slice
+    let variadic_slice = unsafe { std::slice::from_raw_parts(is_variadic_ptr, n_arities) };
+    let arity_table: Vec<(usize, usize, bool)> = fn_ptr_slice
         .iter()
         .zip(param_count_slice.iter())
-        .map(|(&fp, &pc)| (fp as usize, pc as usize))
+        .zip(variadic_slice.iter())
+        .map(|((&fp, &pc), &v)| (fp as usize, pc as usize, v != 0))
         .collect();
 
     // Clone captured values.
@@ -615,9 +699,12 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     };
 
     // Determine arity info for the NativeFn.
-    let min_params = arity_table.iter().map(|(_, pc)| *pc).min().unwrap_or(0);
-    let max_params = arity_table.iter().map(|(_, pc)| *pc).max().unwrap_or(0);
-    let arity = if min_params == max_params {
+    let has_variadic = arity_table.iter().any(|(_, _, v)| *v);
+    let min_params = arity_table.iter().map(|(_, pc, _)| *pc).min().unwrap_or(0);
+    let max_params = arity_table.iter().map(|(_, pc, _)| *pc).max().unwrap_or(0);
+    let arity = if has_variadic {
+        cljrs_value::Arity::Variadic { min: min_params }
+    } else if min_params == max_params {
         cljrs_value::Arity::Fixed(min_params)
     } else {
         cljrs_value::Arity::Variadic { min: min_params }
@@ -629,33 +716,67 @@ pub unsafe extern "C" fn rt_make_fn_multi(
         arity,
         func: Arc::new(move |args: &[Value]| {
             let argc = args.len();
-            // Find matching arity.
-            let matched = arity_table.iter().find(|(_, pc)| *pc == argc);
-            let (fn_addr, _user_pc) = match matched {
-                Some(entry) => *entry,
-                None => {
-                    let counts: Vec<String> =
-                        arity_table.iter().map(|(_, pc)| pc.to_string()).collect();
-                    return Err(cljrs_value::ValueError::ArityError {
-                        name: fn_name.to_string(),
-                        expected: counts.join(" or "),
-                        got: argc,
-                    });
+            // Try exact match on fixed arities first.
+            let matched = arity_table
+                .iter()
+                .find(|(_, pc, v)| !v && *pc == argc);
+            if let Some(&(fn_addr, _pc, _v)) = matched {
+                let total_params = ncaptures + argc;
+                let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
+                for cap in &captured_values {
+                    all_ptrs.push(box_val(cap.clone()));
                 }
-            };
-            let total_params = ncaptures + argc;
-
-            // Build: captures + args
-            let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
-            for cap in &captured_values {
-                all_ptrs.push(box_val(cap.clone()));
-            }
-            for arg in args {
-                all_ptrs.push(box_val(arg.clone()));
+                for arg in args {
+                    all_ptrs.push(box_val(arg.clone()));
+                }
+                let result_ptr =
+                    unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
+                return Ok(unsafe { val_ref(result_ptr) }.clone());
             }
 
-            let result_ptr = unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
-            Ok(unsafe { val_ref(result_ptr) }.clone())
+            // Try variadic arity (argc >= fixed_count).
+            let variadic_match = arity_table
+                .iter()
+                .find(|(_, pc, v)| *v && argc >= *pc);
+            if let Some(&(fn_addr, fixed_count, _)) = variadic_match {
+                // Compiled function receives: captures + fixed_params + 1 (rest list)
+                let total_compiled = ncaptures + fixed_count + 1;
+                let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_compiled);
+                for cap in &captured_values {
+                    all_ptrs.push(box_val(cap.clone()));
+                }
+                for arg in &args[..fixed_count] {
+                    all_ptrs.push(box_val(arg.clone()));
+                }
+                // Pack remaining args into a list
+                let rest_args: Vec<Value> = args[fixed_count..].to_vec();
+                let rest_list = if rest_args.is_empty() {
+                    Value::Nil
+                } else {
+                    Value::List(GcPtr::new(PersistentList::from_iter(rest_args)))
+                };
+                all_ptrs.push(box_val(rest_list));
+                let result_ptr =
+                    unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled) };
+                return Ok(unsafe { val_ref(result_ptr) }.clone());
+            }
+
+            // No matching arity found.
+            let counts: Vec<String> = arity_table
+                .iter()
+                .map(|(_, pc, v)| {
+                    if *v {
+                        format!("{pc}+")
+                    } else {
+                        pc.to_string()
+                    }
+                })
+                .collect();
+            Err(cljrs_value::ValueError::ArityError {
+                name: fn_name.to_string(),
+                expected: counts.join(" or "),
+                got: argc,
+            })
         }),
     };
 
@@ -790,6 +911,12 @@ pub unsafe extern "C" fn rt_load_global(
     if let Some((globals, current_ns)) = cljrs_eval::callback::capture_eval_context() {
         // Try the specified namespace first.
         if let Some(val) = globals.lookup_in_ns(ns, name) {
+            return box_val(val);
+        }
+        // Try resolving ns as an alias in the current namespace.
+        if let Some(resolved_ns) = globals.resolve_alias(&current_ns, ns)
+            && let Some(val) = globals.lookup_in_ns(&resolved_ns, name)
+        {
             return box_val(val);
         }
         // If ns is the current namespace, also check refers (e.g. clojure.core).
@@ -1401,6 +1528,119 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
     }
 }
 
+// ── Higher-order functions ───────────────────────────────────────────────────
+
+/// Helper: look up a global function by namespace and name, then call it.
+fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
+    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() {
+        if let Some(val) = globals.lookup_in_ns(ns, name) {
+            match cljrs_eval::callback::invoke(&val, args) {
+                Ok(result) => return box_val(result),
+                Err(cljrs_value::ValueError::Thrown(v)) => {
+                    PENDING_EXCEPTION.with(|cell| {
+                        *cell.borrow_mut() = Some(box_val(v));
+                    });
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            }
+        }
+    }
+    rt_const_nil()
+}
+
+/// `(reduce f coll)` or `(reduce f init coll)`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_reduce2(f: *const Value, coll: *const Value) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "reduce", vec![f, coll])
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_reduce3(
+    f: *const Value,
+    init: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let init = unsafe { val_ref(init) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "reduce", vec![f, init, coll])
+}
+
+/// `(map f coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_map(f: *const Value, coll: *const Value) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "map", vec![f, coll])
+}
+
+/// `(filter pred coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_filter(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred = unsafe { val_ref(pred) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "filter", vec![pred, coll])
+}
+
+/// `(mapv f coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_mapv(f: *const Value, coll: *const Value) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "mapv", vec![f, coll])
+}
+
+/// `(filterv pred coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_filterv(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred = unsafe { val_ref(pred) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "filterv", vec![pred, coll])
+}
+
+/// `(some pred coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_some(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred = unsafe { val_ref(pred) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "some", vec![pred, coll])
+}
+
+/// `(every? pred coll)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred = unsafe { val_ref(pred) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "every?", vec![pred, coll])
+}
+
+/// `(into to from)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const Value {
+    let to = unsafe { val_ref(to) }.clone();
+    let from = unsafe { val_ref(from) }.clone();
+    call_global_fn("clojure.core", "into", vec![to, from])
+}
+
+/// `(into to xform from)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into3(
+    to: *const Value,
+    xform: *const Value,
+    from: *const Value,
+) -> *const Value {
+    let to = unsafe { val_ref(to) }.clone();
+    let xform = unsafe { val_ref(xform) }.clone();
+    let from = unsafe { val_ref(from) }.clone();
+    call_global_fn("clojure.core", "into", vec![to, xform, from])
+}
+
 // ── set! ─────────────────────────────────────────────────────────────────────
 
 /// `(set! var val)` — set a dynamic var's thread-local or root binding.
@@ -1568,6 +1808,342 @@ pub unsafe extern "C" fn rt_try(
     ret
 }
 
+// ── More HOFs ───────────────────────────────────────────────────────────────
+
+/// `(group-by f coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_group_by(f: *const Value, coll: *const Value) -> *const Value {
+    let fv = unsafe { val_ref(f) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "group-by", vec![fv, cv])
+}
+
+/// `(partition n coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_partition2(n: *const Value, coll: *const Value) -> *const Value {
+    let nv = unsafe { val_ref(n) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "partition", vec![nv, cv])
+}
+
+/// `(partition n step coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_partition3(
+    n: *const Value,
+    step: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let nv = unsafe { val_ref(n) }.clone();
+    let sv = unsafe { val_ref(step) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "partition", vec![nv, sv, cv])
+}
+
+/// `(partition n step pad coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_partition4(
+    n: *const Value,
+    step: *const Value,
+    pad: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let nv = unsafe { val_ref(n) }.clone();
+    let sv = unsafe { val_ref(step) }.clone();
+    let pv = unsafe { val_ref(pad) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "partition", vec![nv, sv, pv, cv])
+}
+
+/// `(frequencies coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_frequencies(coll: *const Value) -> *const Value {
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "frequencies", vec![cv])
+}
+
+/// `(keep f coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_keep(f: *const Value, coll: *const Value) -> *const Value {
+    let fv = unsafe { val_ref(f) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "keep", vec![fv, cv])
+}
+
+/// `(remove pred coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_remove(pred: *const Value, coll: *const Value) -> *const Value {
+    let pv = unsafe { val_ref(pred) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "remove", vec![pv, cv])
+}
+
+/// `(map-indexed f coll)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_map_indexed(f: *const Value, coll: *const Value) -> *const Value {
+    let fv = unsafe { val_ref(f) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "map-indexed", vec![fv, cv])
+}
+
+/// `(zipmap keys vals)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Value {
+    let kv = unsafe { val_ref(keys) }.clone();
+    let vv = unsafe { val_ref(vals) }.clone();
+    call_global_fn("clojure.core", "zipmap", vec![kv, vv])
+}
+
+/// `(juxt f1 f2 ...)` — variadic, stack-spilled
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_juxt(
+    elems: *const *const Value,
+    n: i64,
+) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    call_global_fn("clojure.core", "juxt", args)
+}
+
+/// `(comp f1 f2 ...)` — variadic, stack-spilled
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_comp(
+    elems: *const *const Value,
+    n: i64,
+) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    call_global_fn("clojure.core", "comp", args)
+}
+
+/// `(partial f arg1 arg2 ...)` — variadic, stack-spilled
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_partial(
+    elems: *const *const Value,
+    n: i64,
+) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    call_global_fn("clojure.core", "partial", args)
+}
+
+/// `(complement f)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
+    let fv = unsafe { val_ref(f) }.clone();
+    call_global_fn("clojure.core", "complement", vec![fv])
+}
+
+// ── Sequence operations ──────────────────────────────────────────────────────
+
+/// `(concat & colls)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_concat(
+    elems: *const *const Value,
+    n: i64,
+) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    call_global_fn("clojure.core", "concat", args)
+}
+
+/// `(range end)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_range1(end: *const Value) -> *const Value {
+    let e = unsafe { val_ref(end) }.clone();
+    call_global_fn("clojure.core", "range", vec![e])
+}
+
+/// `(range start end)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_range2(start: *const Value, end: *const Value) -> *const Value {
+    let s = unsafe { val_ref(start) }.clone();
+    let e = unsafe { val_ref(end) }.clone();
+    call_global_fn("clojure.core", "range", vec![s, e])
+}
+
+/// `(range start end step)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_range3(
+    start: *const Value,
+    end: *const Value,
+    step: *const Value,
+) -> *const Value {
+    let s = unsafe { val_ref(start) }.clone();
+    let e = unsafe { val_ref(end) }.clone();
+    let st = unsafe { val_ref(step) }.clone();
+    call_global_fn("clojure.core", "range", vec![s, e, st])
+}
+
+/// `(take n coll)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_take(n: *const Value, coll: *const Value) -> *const Value {
+    let nv = unsafe { val_ref(n) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "take", vec![nv, cv])
+}
+
+/// `(drop n coll)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_drop(n: *const Value, coll: *const Value) -> *const Value {
+    let nv = unsafe { val_ref(n) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "drop", vec![nv, cv])
+}
+
+/// `(reverse coll)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_reverse(coll: *const Value) -> *const Value {
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "reverse", vec![cv])
+}
+
+/// `(sort coll)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_sort(coll: *const Value) -> *const Value {
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "sort", vec![cv])
+}
+
+/// `(sort-by keyfn coll)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_sort_by(keyfn: *const Value, coll: *const Value) -> *const Value {
+    let kf = unsafe { val_ref(keyfn) }.clone();
+    let cv = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "sort-by", vec![kf, cv])
+}
+
+// ── Collection operations ───────────────────────────────────────────────────
+
+/// `(keys m)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_keys(m: *const Value) -> *const Value {
+    let mv = unsafe { val_ref(m) }.clone();
+    call_global_fn("clojure.core", "keys", vec![mv])
+}
+
+/// `(vals m)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
+    let mv = unsafe { val_ref(m) }.clone();
+    call_global_fn("clojure.core", "vals", vec![mv])
+}
+
+/// `(merge & maps)` — variadic, stack-spilled
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_merge(
+    elems: *const *const Value,
+    n: i64,
+) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    call_global_fn("clojure.core", "merge", args)
+}
+
+/// `(update m k f)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_update(
+    m: *const Value,
+    k: *const Value,
+    f: *const Value,
+) -> *const Value {
+    let mv = unsafe { val_ref(m) }.clone();
+    let kv = unsafe { val_ref(k) }.clone();
+    let fv = unsafe { val_ref(f) }.clone();
+    call_global_fn("clojure.core", "update", vec![mv, kv, fv])
+}
+
+/// `(get-in m ks)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_get_in(m: *const Value, ks: *const Value) -> *const Value {
+    let mv = unsafe { val_ref(m) }.clone();
+    let kv = unsafe { val_ref(ks) }.clone();
+    call_global_fn("clojure.core", "get-in", vec![mv, kv])
+}
+
+/// `(assoc-in m ks v)`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_assoc_in(
+    m: *const Value,
+    ks: *const Value,
+    v: *const Value,
+) -> *const Value {
+    let mv = unsafe { val_ref(m) }.clone();
+    let kv = unsafe { val_ref(ks) }.clone();
+    let vv = unsafe { val_ref(v) }.clone();
+    call_global_fn("clojure.core", "assoc-in", vec![mv, kv, vv])
+}
+
+// ── Type predicates ─────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Long(_) | Value::Double(_))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_string(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Str(_))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_keyword(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Keyword(_))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_symbol(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Symbol(_))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_bool(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Bool(_))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    box_val(Value::Bool(matches!(val, Value::Long(_))))
+}
+
+// ── Additional I/O ──────────────────────────────────────────────────────────
+
+/// `(prn x)` — print readably + newline
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    println!("{}", PrintValue(val));
+    box_val(Value::Nil)
+}
+
+/// `(print x)` — print without newline
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_print(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) };
+    print!("{val}");
+    box_val(Value::Nil)
+}
+
+// ── Atom construction ───────────────────────────────────────────────────────
+
+/// `(atom x)`
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_atom(v: *const Value) -> *const Value {
+    let val = unsafe { val_ref(v) }.clone();
+    call_global_fn("clojure.core", "atom", vec![val])
+}
+
+// ── Helper: collect stack-spilled args ───────────────────────────────────────
+
+unsafe fn collect_args(elems: *const *const Value, n: i64) -> Vec<Value> {
+    let mut args = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        let ptr = unsafe { *elems.add(i) };
+        args.push(unsafe { val_ref(ptr) }.clone());
+    }
+    args
+}
+
 // ── Symbol anchor ────────────────────────────────────────────────────────────
 
 /// Force the linker to include all `rt_*` symbols.
@@ -1622,6 +2198,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_identical as *const () as usize);
     std::hint::black_box(rt_str as *const () as usize);
     std::hint::black_box(rt_make_fn as *const () as usize);
+    std::hint::black_box(rt_make_fn_variadic as *const () as usize);
     std::hint::black_box(rt_make_fn_multi as *const () as usize);
     std::hint::black_box(rt_throw as *const () as usize);
     std::hint::black_box(rt_try as *const () as usize);
@@ -1638,9 +2215,56 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_atom_reset as *const () as usize);
     std::hint::black_box(rt_atom_swap as *const () as usize);
     std::hint::black_box(rt_apply as *const () as usize);
+    std::hint::black_box(rt_reduce2 as *const () as usize);
+    std::hint::black_box(rt_reduce3 as *const () as usize);
+    std::hint::black_box(rt_map as *const () as usize);
+    std::hint::black_box(rt_filter as *const () as usize);
+    std::hint::black_box(rt_mapv as *const () as usize);
+    std::hint::black_box(rt_filterv as *const () as usize);
+    std::hint::black_box(rt_some as *const () as usize);
+    std::hint::black_box(rt_every as *const () as usize);
+    std::hint::black_box(rt_into as *const () as usize);
+    std::hint::black_box(rt_into3 as *const () as usize);
     std::hint::black_box(rt_set_bang as *const () as usize);
     std::hint::black_box(rt_with_bindings as *const () as usize);
     std::hint::black_box(rt_load_var as *const () as usize);
+    std::hint::black_box(rt_concat as *const () as usize);
+    std::hint::black_box(rt_range1 as *const () as usize);
+    std::hint::black_box(rt_range2 as *const () as usize);
+    std::hint::black_box(rt_range3 as *const () as usize);
+    std::hint::black_box(rt_take as *const () as usize);
+    std::hint::black_box(rt_drop as *const () as usize);
+    std::hint::black_box(rt_reverse as *const () as usize);
+    std::hint::black_box(rt_sort as *const () as usize);
+    std::hint::black_box(rt_sort_by as *const () as usize);
+    std::hint::black_box(rt_keys as *const () as usize);
+    std::hint::black_box(rt_vals as *const () as usize);
+    std::hint::black_box(rt_merge as *const () as usize);
+    std::hint::black_box(rt_update as *const () as usize);
+    std::hint::black_box(rt_get_in as *const () as usize);
+    std::hint::black_box(rt_assoc_in as *const () as usize);
+    std::hint::black_box(rt_is_number as *const () as usize);
+    std::hint::black_box(rt_is_string as *const () as usize);
+    std::hint::black_box(rt_is_keyword as *const () as usize);
+    std::hint::black_box(rt_is_symbol as *const () as usize);
+    std::hint::black_box(rt_is_bool as *const () as usize);
+    std::hint::black_box(rt_is_int as *const () as usize);
+    std::hint::black_box(rt_prn as *const () as usize);
+    std::hint::black_box(rt_print as *const () as usize);
+    std::hint::black_box(rt_atom as *const () as usize);
+    std::hint::black_box(rt_group_by as *const () as usize);
+    std::hint::black_box(rt_partition2 as *const () as usize);
+    std::hint::black_box(rt_partition3 as *const () as usize);
+    std::hint::black_box(rt_partition4 as *const () as usize);
+    std::hint::black_box(rt_frequencies as *const () as usize);
+    std::hint::black_box(rt_keep as *const () as usize);
+    std::hint::black_box(rt_remove as *const () as usize);
+    std::hint::black_box(rt_map_indexed as *const () as usize);
+    std::hint::black_box(rt_zipmap as *const () as usize);
+    std::hint::black_box(rt_juxt as *const () as usize);
+    std::hint::black_box(rt_comp as *const () as usize);
+    std::hint::black_box(rt_partial as *const () as usize);
+    std::hint::black_box(rt_complement as *const () as usize);
 }
 
 #[cfg(test)]

@@ -156,8 +156,22 @@
           (throw (str "unsupported: " s " (should be expanded before IR)"))
           ;; Fall through to function call
           (lower-call ctx head (vec args))))
-      ;; Non-symbol head: regular function call
-      (lower-call ctx head (vec args)))))
+      ;; Keyword-as-function: (:key m) → (get m :key)
+      (if (keyword? head)
+        (let [arg-vec (vec args)]
+          (if (= (count arg-vec) 1)
+            ;; (:key m) → (get m :key)
+            (let [m-var (lower-form ctx (first arg-vec))
+                  k-var (ir/emit-const! ctx {:type :keyword :val (name head)})
+                  dst (ir/fresh-var! ctx)]
+              (ir/emit! ctx (ir/inst-call-known dst :get [m-var k-var]))
+              dst)
+            (if (= (count arg-vec) 2)
+              ;; (:key m default) — fall through to dynamic call for now
+              (lower-call ctx head arg-vec)
+              (throw (str "keyword lookup expects 1 or 2 arguments, got " (count arg-vec))))))
+        ;; Non-symbol, non-keyword head: regular function call
+        (lower-call ctx head (vec args))))))
 
 ;; ── Special form lowering ───────────────────────────────────────────────────
 
@@ -499,12 +513,28 @@
     (ir/emit! ctx (ir/inst-def-var dst (ir/current-ns ctx) (str name-sym) fn-val))
     dst))
 
+(defn parse-params
+  "Parse a parameter vector, handling & rest params.
+   Returns {:fixed [param-symbols] :rest rest-symbol-or-nil}."
+  [params-vec]
+  (loop [i 0 fixed [] rest-param nil]
+    (if (>= i (count params-vec))
+      {:fixed fixed :rest rest-param}
+      (let [p (nth params-vec i)]
+        (if (and (symbol? p) (= "&" (str p)))
+          ;; Next symbol is the rest param
+          (if (< (inc i) (count params-vec))
+            {:fixed fixed :rest (nth params-vec (inc i))}
+            (throw "& must be followed by a parameter name"))
+          (recur (inc i) (conj fixed p) rest-param))))))
+
 (defn lower-fn-arity
   "Lower a single function arity body, returning an IrFunction data map.
    capture-names: vector of captured variable name strings (prepended as params).
-   arity-params: vector of parameter name symbols.
+   arity-params: vector of parameter name symbols (fixed params only).
+   rest-param: nil or the rest parameter symbol.
    body-forms: vector of body forms."
-  [parent-ctx arity-name ns capture-names arity-params body-forms]
+  [parent-ctx arity-name ns capture-names arity-params rest-param body-forms]
   (let [;; For each user param, if it's a symbol use it directly;
         ;; if it's a destructuring pattern, generate a gensym name.
         param-info (mapv (fn [p]
@@ -512,9 +542,16 @@
                              {:name (str p) :pattern nil}
                              {:name (str "__destructure_" (gensym)) :pattern p}))
                          arity-params)
-        ;; Build param list: captures first, then real params (using gensym names for patterns)
-        all-param-names (into (vec capture-names)
-                              (mapv :name param-info))
+        ;; Handle rest param the same way
+        rest-info (when rest-param
+                    (if (symbol? rest-param)
+                      {:name (str rest-param) :pattern nil}
+                      {:name (str "__destructure_rest_" (gensym)) :pattern rest-param}))
+        ;; Build param list: captures first, then fixed params, then rest param (if any)
+        base-param-names (into (vec capture-names) (mapv :name param-info))
+        all-param-names (if rest-info
+                          (conj base-param-names (:name rest-info))
+                          base-param-names)
         sub-ctx (ir/make-ctx arity-name ns all-param-names)]
     ;; Bind params
     (let [param-pairs (reduce (fn [acc pname]
@@ -529,6 +566,10 @@
       (when (:pattern info)
         (let [gensym-var (ir/lookup-local sub-ctx (:name info))]
           (lower-destructure-binding sub-ctx (:pattern info) gensym-var))))
+    ;; Emit destructuring for rest param if needed
+    (when (and rest-info (:pattern rest-info))
+      (let [gensym-var (ir/lookup-local sub-ctx (:name rest-info))]
+        (lower-destructure-binding sub-ctx (:pattern rest-info) gensym-var)))
     ;; Lower body
     (let [result (lower-body sub-ctx body-forms)]
       (ir/finish-block! sub-ctx (ir/term-return result))
@@ -547,32 +588,41 @@
         ns (ir/current-ns ctx)
         ;; Parse arities: either single [params] body... or multi ([params] body...) ...
         rest-args (subvec (vec args) body-start)
-        arities (if (and (not (empty? rest-args)) (vector? (first rest-args)))
-                  ;; Single arity: [params] body...
-                  [[(first rest-args) (vec (rest rest-args))]]
-                  ;; Multi arity: ([params] body...) ([params] body...) ...
-                  (mapv (fn [arity-form]
-                          (let [arity-seq (vec arity-form)]
-                            [(first arity-seq) (vec (rest arity-seq))]))
-                        rest-args))
+        raw-arities (if (and (not (empty? rest-args)) (vector? (first rest-args)))
+                      ;; Single arity: [params] body...
+                      [[(first rest-args) (vec (rest rest-args))]]
+                      ;; Multi arity: ([params] body...) ([params] body...) ...
+                      (mapv (fn [arity-form]
+                              (let [arity-seq (vec arity-form)]
+                                [(first arity-seq) (vec (rest arity-seq))]))
+                            rest-args))
+        ;; Parse each arity's params to separate fixed params from & rest
+        parsed-arities (mapv (fn [[params body]]
+                               (let [parsed (parse-params params)]
+                                 {:fixed (:fixed parsed) :rest (:rest parsed) :body body}))
+                             raw-arities)
         ;; Generate a unique base name for the compiled functions
         base-name (or fn-name (str "__cljrs_anon_" (ir/fresh-var! ctx)))
-        ;; Lower each arity
+        ;; Lower each arity — param-counts is the fixed param count only
         arity-fn-names (vec (map-indexed
-                              (fn [i [params _body]]
-                                (str "__cljrs_fn_" ns "_" base-name "_arity" (count params)))
-                              arities))
-        param-counts (mapv (fn [[params _body]] (count params)) arities)]
+                              (fn [i arity]
+                                (str "__cljrs_fn_" ns "_" base-name "_arity" (count (:fixed arity))
+                                     (if (:rest arity) "_va" "")))
+                              parsed-arities))
+        param-counts (mapv (fn [arity] (count (:fixed arity))) parsed-arities)
+        is-variadic (mapv (fn [arity] (some? (:rest arity))) parsed-arities)]
     ;; Compile each arity as a subfunction
-    (doseq [i (range (count arities))]
-      (let [[params body] (nth arities i)
+    (doseq [i (range (count parsed-arities))]
+      (let [arity (nth parsed-arities i)
             arity-name (nth arity-fn-names i)
-            subfn (lower-fn-arity ctx arity-name ns capture-name-list params body)]
+            subfn (lower-fn-arity ctx arity-name ns capture-name-list
+                                  (:fixed arity) (:rest arity) (:body arity))]
         (ir/emit-subfunction! ctx subfn)))
     ;; Emit AllocClosure
     (let [dst (ir/fresh-var! ctx)]
       (ir/emit! ctx (ir/inst-alloc-closure dst fn-name capture-vars
-                                           arity-fn-names param-counts capture-name-list))
+                                           arity-fn-names param-counts capture-name-list
+                                           is-variadic))
       dst)))
 
 (defn lower-throw
@@ -617,38 +667,38 @@
         ncaptures (count capture-name-list)
         ;; Build the body closure (zero-arg fn, captures passed as extra params)
         body-name (str "__cljrs_try_body_" (ir/fresh-var! ctx))
-        body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] body-forms)
+        body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] nil body-forms)
         _ (ir/emit-subfunction! ctx body-fn-ir)
         body-closure (ir/fresh-var! ctx)
         _ (ir/emit! ctx (ir/inst-alloc-closure body-closure nil capture-vars
                                                 [body-name] [ncaptures]
-                                                capture-name-list))
+                                                capture-name-list nil))
         ;; Build the catch closure (one-arg fn, captures + exception param)
         catch-closure (if catch-sym
                         (let [catch-name (str "__cljrs_try_catch_" (ir/fresh-var! ctx))
                               catch-params [(symbol catch-sym)]
                               catch-fn-ir (lower-fn-arity ctx catch-name ns
                                                            capture-name-list catch-params
-                                                           catch-body)
+                                                           nil catch-body)
                               _ (ir/emit-subfunction! ctx catch-fn-ir)
                               dst (ir/fresh-var! ctx)]
                           (ir/emit! ctx (ir/inst-alloc-closure dst nil capture-vars
                                                                 [catch-name]
                                                                 [(+ ncaptures 1)]
-                                                                capture-name-list))
+                                                                capture-name-list nil))
                           dst)
                         (ir/emit-const! ctx (ir/const-nil)))
         ;; Build the finally closure (zero-arg fn)
         finally-closure (if finally-body
                           (let [fin-name (str "__cljrs_try_finally_" (ir/fresh-var! ctx))
                                 fin-fn-ir (lower-fn-arity ctx fin-name ns
-                                                           capture-name-list [] finally-body)
+                                                           capture-name-list [] nil finally-body)
                                 _ (ir/emit-subfunction! ctx fin-fn-ir)
                                 dst (ir/fresh-var! ctx)]
                             (ir/emit! ctx (ir/inst-alloc-closure dst nil capture-vars
                                                                   [fin-name]
                                                                   [ncaptures]
-                                                                  capture-name-list))
+                                                                  capture-name-list nil))
                             dst)
                           (ir/emit-const! ctx (ir/const-nil)))
         ;; Emit CallKnown :try-catch-finally with the three closures
@@ -693,12 +743,12 @@
           ncaptures (count capture-name-list)
           body-name (str "__cljrs_binding_body_" (ir/fresh-var! ctx))
           body-forms (vec (rest args))
-          body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] body-forms)
+          body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] nil body-forms)
           _ (ir/emit-subfunction! ctx body-fn-ir)
           body-closure (ir/fresh-var! ctx)
           _ (ir/emit! ctx (ir/inst-alloc-closure body-closure nil capture-vars
                                                   [body-name] [ncaptures]
-                                                  capture-name-list))
+                                                  capture-name-list nil))
           ;; Build args: [var0 val0 var1 val1 ... body-closure]
           flat-bindings (vec (apply concat binding-pairs))
           all-args (conj flat-bindings body-closure)
@@ -962,53 +1012,359 @@
    :apply 2,
    :transient 1, :assoc! 3, :conj! 2, :persistent! 1,
    :set!-var 2,
-   :try-catch-finally 3})
+   :try-catch-finally 3,
+   :reduce2 2, :reduce3 3,
+   :map 2, :filter 2,
+   :mapv 2, :filterv 2,
+   :some 2, :every? 2,
+   :into 2, :into3 3,
+   :range1 1, :range2 2, :range3 3,
+   :take 2, :drop 2,
+   :reverse 1, :sort 1, :sort-by 2,
+   :keys 1, :vals 1,
+   :update 3, :get-in 2, :assoc-in 3,
+   :number? 1, :string? 1, :keyword? 1, :symbol? 1, :boolean? 1, :int? 1,
+   :prn 1, :print 1, :atom 1,
+   :group-by 2, :frequencies 1,
+   :keep 2, :remove 2, :map-indexed 2,
+   :zipmap 2, :complement 1,
+   :partition2 2, :partition3 3, :partition4 4})
+
+(defn lower-apply-call
+  "Lower (apply f args...) — handles multi-arg apply by prepending fixed args
+   to the final arglist via cons."
+  [ctx arg-forms]
+  (when (< (count arg-forms) 2)
+    (throw "apply requires at least 2 arguments"))
+  (let [arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)]
+    (if (= 2 (count arg-vars))
+      ;; Simple (apply f arglist) — direct rt_apply call
+      (let [dst (ir/fresh-var! ctx)]
+        (ir/emit! ctx (ir/inst-call-known dst :apply arg-vars))
+        dst)
+      ;; Multi-arg (apply f a b c arglist) — prepend fixed args to arglist
+      ;; via cons, then call rt_apply(f, combined)
+      (let [f-var (first arg-vars)
+            fixed-args (subvec arg-vars 1 (- (count arg-vars) 1))
+            arglist-var (last arg-vars)
+            ;; Build combined list by consing fixed args in reverse onto arglist
+            combined (reduce (fn [tail fixed]
+                               (let [dst (ir/fresh-var! ctx)]
+                                 (ir/emit! ctx (ir/inst-call-known dst :cons [fixed tail]))
+                                 dst))
+                             arglist-var
+                             (reverse fixed-args))
+            dst (ir/fresh-var! ctx)]
+        (ir/emit! ctx (ir/inst-call-known dst :apply [f-var combined]))
+        dst))))
+
+;; ── Inline expansions for common utility functions ──────────────────────────
+;; These are expanded to existing known operations at lowering time,
+;; avoiding the need for dedicated runtime bridges.
+
+(def inline-expansions
+  {"inc"    (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  one (ir/emit-const! ctx {:type :long :val 1})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :+ [x one]))
+                              dst))
+   "dec"    (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  one (ir/emit-const! ctx {:type :long :val 1})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :- [x one]))
+                              dst))
+   "not"    (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  dst (ir/fresh-var! ctx)
+                                  then-block (ir/fresh-block! ctx)
+                                  else-block (ir/fresh-block! ctx)
+                                  join-block (ir/fresh-block! ctx)]
+                              (ir/finish-block! ctx (ir/term-branch x then-block else-block))
+                              (ir/start-block! ctx then-block)
+                              (let [false-val (ir/emit-const! ctx {:type :bool :val false})
+                                    then-exit (ir/current-block-id ctx)]
+                                (ir/finish-block! ctx (ir/term-jump join-block))
+                                (ir/start-block! ctx else-block)
+                                (let [true-val (ir/emit-const! ctx {:type :bool :val true})
+                                      else-exit (ir/current-block-id ctx)]
+                                  (ir/finish-block! ctx (ir/term-jump join-block))
+                                  (ir/start-block! ctx join-block)
+                                  (ir/emit-phi! ctx dst [[then-exit false-val] [else-exit true-val]])
+                                  dst))))
+   "not="   (fn [ctx args] (let [a (lower-form ctx (first args))
+                                  b (lower-form ctx (second args))
+                                  eq-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known eq-dst := [a b]))
+                              ;; not the result
+                              (let [dst (ir/fresh-var! ctx)
+                                    then-block (ir/fresh-block! ctx)
+                                    else-block (ir/fresh-block! ctx)
+                                    join-block (ir/fresh-block! ctx)]
+                                (ir/finish-block! ctx (ir/term-branch eq-dst then-block else-block))
+                                (ir/start-block! ctx then-block)
+                                (let [false-val (ir/emit-const! ctx {:type :bool :val false})
+                                      then-exit (ir/current-block-id ctx)]
+                                  (ir/finish-block! ctx (ir/term-jump join-block))
+                                  (ir/start-block! ctx else-block)
+                                  (let [true-val (ir/emit-const! ctx {:type :bool :val true})
+                                        else-exit (ir/current-block-id ctx)]
+                                    (ir/finish-block! ctx (ir/term-jump join-block))
+                                    (ir/start-block! ctx join-block)
+                                    (ir/emit-phi! ctx dst [[then-exit false-val] [else-exit true-val]])
+                                    dst)))))
+   "zero?"  (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  zero (ir/emit-const! ctx {:type :long :val 0})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst := [x zero]))
+                              dst))
+   "pos?"   (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  zero (ir/emit-const! ctx {:type :long :val 0})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :> [x zero]))
+                              dst))
+   "neg?"   (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  zero (ir/emit-const! ctx {:type :long :val 0})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :< [x zero]))
+                              dst))
+   "even?"  (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  two (ir/emit-const! ctx {:type :long :val 2})
+                                  rem-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known rem-dst :rem [x two]))
+                              (let [zero (ir/emit-const! ctx {:type :long :val 0})
+                                    dst (ir/fresh-var! ctx)]
+                                (ir/emit! ctx (ir/inst-call-known dst := [rem-dst zero]))
+                                dst)))
+   "odd?"   (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  two (ir/emit-const! ctx {:type :long :val 2})
+                                  rem-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known rem-dst :rem [x two]))
+                              (let [zero (ir/emit-const! ctx {:type :long :val 0})
+                                    eq-dst (ir/fresh-var! ctx)]
+                                (ir/emit! ctx (ir/inst-call-known eq-dst := [rem-dst zero]))
+                                ;; not the equality result
+                                (let [dst (ir/fresh-var! ctx)
+                                      then-block (ir/fresh-block! ctx)
+                                      else-block (ir/fresh-block! ctx)
+                                      join-block (ir/fresh-block! ctx)]
+                                  (ir/finish-block! ctx (ir/term-branch eq-dst then-block else-block))
+                                  (ir/start-block! ctx then-block)
+                                  (let [false-val (ir/emit-const! ctx {:type :bool :val false})
+                                        then-exit (ir/current-block-id ctx)]
+                                    (ir/finish-block! ctx (ir/term-jump join-block))
+                                    (ir/start-block! ctx else-block)
+                                    (let [true-val (ir/emit-const! ctx {:type :bool :val true})
+                                          else-exit (ir/current-block-id ctx)]
+                                      (ir/finish-block! ctx (ir/term-jump join-block))
+                                      (ir/start-block! ctx join-block)
+                                      (ir/emit-phi! ctx dst [[then-exit false-val] [else-exit true-val]])
+                                      dst))))))
+   "true?"  (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  t (ir/emit-const! ctx {:type :bool :val true})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :identical [x t]))
+                              dst))
+   "false?" (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  f (ir/emit-const! ctx {:type :bool :val false})
+                                  dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known dst :identical [x f]))
+                              dst))
+   "max"    (fn [ctx args] (let [a (lower-form ctx (first args))
+                                  b (lower-form ctx (second args))
+                                  cmp-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known cmp-dst :> [a b]))
+                              (let [dst (ir/fresh-var! ctx)
+                                    then-block (ir/fresh-block! ctx)
+                                    else-block (ir/fresh-block! ctx)
+                                    join-block (ir/fresh-block! ctx)]
+                                (ir/finish-block! ctx (ir/term-branch cmp-dst then-block else-block))
+                                (ir/start-block! ctx then-block)
+                                (let [then-exit (ir/current-block-id ctx)]
+                                  (ir/finish-block! ctx (ir/term-jump join-block))
+                                  (ir/start-block! ctx else-block)
+                                  (let [else-exit (ir/current-block-id ctx)]
+                                    (ir/finish-block! ctx (ir/term-jump join-block))
+                                    (ir/start-block! ctx join-block)
+                                    (ir/emit-phi! ctx dst [[then-exit a] [else-exit b]])
+                                    dst)))))
+   "min"    (fn [ctx args] (let [a (lower-form ctx (first args))
+                                  b (lower-form ctx (second args))
+                                  cmp-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known cmp-dst :< [a b]))
+                              (let [dst (ir/fresh-var! ctx)
+                                    then-block (ir/fresh-block! ctx)
+                                    else-block (ir/fresh-block! ctx)
+                                    join-block (ir/fresh-block! ctx)]
+                                (ir/finish-block! ctx (ir/term-branch cmp-dst then-block else-block))
+                                (ir/start-block! ctx then-block)
+                                (let [then-exit (ir/current-block-id ctx)]
+                                  (ir/finish-block! ctx (ir/term-jump join-block))
+                                  (ir/start-block! ctx else-block)
+                                  (let [else-exit (ir/current-block-id ctx)]
+                                    (ir/finish-block! ctx (ir/term-jump join-block))
+                                    (ir/start-block! ctx join-block)
+                                    (ir/emit-phi! ctx dst [[then-exit a] [else-exit b]])
+                                    dst)))))
+   "empty?" (fn [ctx args] (let [x (lower-form ctx (first args))
+                                  seq-dst (ir/fresh-var! ctx)]
+                              (ir/emit! ctx (ir/inst-call-known seq-dst :seq [x]))
+                              (let [dst (ir/fresh-var! ctx)]
+                                (ir/emit! ctx (ir/inst-call-known dst :nil? [seq-dst]))
+                                dst)))})
+
+(defn try-inline-expansion
+  "Try to expand a call as an inline expansion. Returns the result VarId or nil."
+  [ctx callee-name arg-forms]
+  (when-let [expander (get inline-expansions (known/strip-ns-prefix callee-name))]
+    (expander ctx arg-forms)))
 
 (defn lower-call
   "Lower a function call."
   [ctx callee-form arg-forms]
+  ;; Try inline expansion first (inc, dec, not, zero?, etc.)
+  (if-let [result (and (symbol? callee-form)
+                       (try-inline-expansion ctx (str callee-form) arg-forms))]
+    result
   (if (and (symbol? callee-form)
            (known/resolve-known-fn (str callee-form)))
     ;; Known function call
     (let [known-kw (known/resolve-known-fn (str callee-form))
           arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)]
-      (if-let [info (get binary-foldable known-kw)]
-        ;; Binary-reducible: fold args
-        (emit-binary-fold ctx known-kw arg-vars info)
-        ;; Check if arg count matches expected arity for this known fn
-        (let [expected (get known-fn-arities known-kw)
-              argc (count arg-vars)]
-          (if (and expected (not= argc expected))
-            ;; Arity mismatch — special-case str/println/pr for 0-args,
-            ;; otherwise fall through to generic call
+      ;; Special-case: multi-arg apply
+      (if (= known-kw :apply)
+        (lower-apply-call ctx arg-forms)
+        ;; Arity-dispatch for reduce (2→:reduce2, 3→:reduce3)
+        ;; and into (2→:into, 3→:into3)
+        (if (= known-kw :reduce)
+          (let [argc (count arg-vars)]
             (cond
-              ;; (str) → constant empty string
-              (and (= known-kw :str) (= argc 0))
-              (ir/emit-const! ctx {:type :string :val ""})
-
-              ;; (println) / (pr) with 0 args → print empty string
-              (and (contains? #{:println :pr} known-kw) (= argc 0))
-              (let [empty-str (ir/emit-const! ctx {:type :string :val ""})
-                    dst (ir/fresh-var! ctx)]
-                (ir/emit! ctx (ir/inst-call-known dst known-kw [empty-str]))
+              (= argc 2)
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst :reduce2 arg-vars))
                 dst)
-
-              ;; Everything else: fall through to generic dynamic call
+              (= argc 3)
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst :reduce3 arg-vars))
+                dst)
               :else
               (let [callee (lower-form ctx callee-form)
                     dst (ir/fresh-var! ctx)]
                 (ir/emit! ctx (ir/inst-call dst callee arg-vars))
-                dst))
-            ;; Arity matches (or no restriction) — emit known call
-            (let [dst (ir/fresh-var! ctx)]
-              (ir/emit! ctx (ir/inst-call-known dst known-kw arg-vars))
-              dst)))))
+                dst)))
+          (if (= known-kw :into)
+            (let [argc (count arg-vars)]
+              (cond
+                (= argc 2)
+                (let [dst (ir/fresh-var! ctx)]
+                  (ir/emit! ctx (ir/inst-call-known dst :into arg-vars))
+                  dst)
+                (= argc 3)
+                (let [dst (ir/fresh-var! ctx)]
+                  (ir/emit! ctx (ir/inst-call-known dst :into3 arg-vars))
+                  dst)
+                :else
+                (let [callee (lower-form ctx callee-form)
+                      dst (ir/fresh-var! ctx)]
+                  (ir/emit! ctx (ir/inst-call dst callee arg-vars))
+                  dst)))
+            (if (= known-kw :every?)
+              ;; every? maps to :every in the IR
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst :every? arg-vars))
+                dst)
+            (if (= known-kw :range)
+              ;; range: 1→:range1, 2→:range2, 3→:range3
+              (let [argc (count arg-vars)]
+                (cond
+                  (= argc 1)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :range1 arg-vars))
+                    dst)
+                  (= argc 2)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :range2 arg-vars))
+                    dst)
+                  (= argc 3)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :range3 arg-vars))
+                    dst)
+                  :else
+                  (let [callee (lower-form ctx callee-form)
+                        dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call dst callee arg-vars))
+                    dst)))
+            (if (= known-kw :concat)
+              ;; concat is variadic — emit as known call, codegen uses stack-spill
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst :concat arg-vars))
+                dst)
+            (if (= known-kw :merge)
+              ;; merge is variadic — emit as known call, codegen uses stack-spill
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst :merge arg-vars))
+                dst)
+            (if (= known-kw :partition)
+              ;; partition: 2→:partition2, 3→:partition3, 4→:partition4
+              (let [argc (count arg-vars)]
+                (cond
+                  (= argc 2)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :partition2 arg-vars))
+                    dst)
+                  (= argc 3)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :partition3 arg-vars))
+                    dst)
+                  (= argc 4)
+                  (let [dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call-known dst :partition4 arg-vars))
+                    dst)
+                  :else
+                  (let [callee (lower-form ctx callee-form)
+                        dst (ir/fresh-var! ctx)]
+                    (ir/emit! ctx (ir/inst-call dst callee arg-vars))
+                    dst)))
+            ;; Variadic function combinators
+            (if (contains? #{:juxt :comp :partial} known-kw)
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst known-kw arg-vars))
+                dst)
+          (if-let [info (get binary-foldable known-kw)]
+          ;; Binary-reducible: fold args
+          (emit-binary-fold ctx known-kw arg-vars info)
+          ;; Check if arg count matches expected arity for this known fn
+          (let [expected (get known-fn-arities known-kw)
+                argc (count arg-vars)]
+            (if (and expected (not= argc expected))
+              ;; Arity mismatch — special-case str/println/pr for 0-args,
+              ;; otherwise fall through to generic call
+              (cond
+                ;; (str) → constant empty string
+                (and (= known-kw :str) (= argc 0))
+                (ir/emit-const! ctx {:type :string :val ""})
+
+                ;; (println) / (pr) with 0 args → print empty string
+                (and (contains? #{:println :pr} known-kw) (= argc 0))
+                (let [empty-str (ir/emit-const! ctx {:type :string :val ""})
+                      dst (ir/fresh-var! ctx)]
+                  (ir/emit! ctx (ir/inst-call-known dst known-kw [empty-str]))
+                  dst)
+
+                ;; Everything else: fall through to generic dynamic call
+                :else
+                (let [callee (lower-form ctx callee-form)
+                      dst (ir/fresh-var! ctx)]
+                  (ir/emit! ctx (ir/inst-call dst callee arg-vars))
+                  dst))
+              ;; Arity matches (or no restriction) — emit known call
+              (let [dst (ir/fresh-var! ctx)]
+                (ir/emit! ctx (ir/inst-call-known dst known-kw arg-vars))
+                dst))))))))))))))
     ;; Unknown call
     (let [callee (lower-form ctx callee-form)
           arg-vars (mapv (fn [a] (lower-form ctx a)) arg-forms)
           dst (ir/fresh-var! ctx)]
       (ir/emit! ctx (ir/inst-call dst callee arg-vars))
-      dst)))
+      dst))))
 
 ;; ── Quote lowering ──────────────────────────────────────────────────────────
 

@@ -319,10 +319,23 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
             } else {
                 vec![]
             };
+            // Parse variadic flags (defaults to all false if not present)
+            let is_variadic = if let Some(v) = get_field_opt(map, "is-variadic") {
+                as_vec(&v)?
+                    .iter()
+                    .map(|b| match b {
+                        Value::Bool(v) => Ok(*v),
+                        _ => Err(ConvertError::TypeError("expected bool for is-variadic".into())),
+                    })
+                    .collect::<ConvertResult<Vec<_>>>()?
+            } else {
+                vec![false; param_counts.len()]
+            };
             let tmpl = ClosureTemplate {
                 name,
                 arity_fn_names,
                 param_counts,
+                is_variadic,
                 capture_names,
             };
             Ok(Inst::AllocClosure(dst, tmpl, captures))
@@ -565,6 +578,53 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn> {
         "try-catch-finally" => Some(KnownFn::TryCatchFinally),
         "set!-var" => Some(KnownFn::SetBangVar),
         "with-bindings" => Some(KnownFn::WithBindings),
+        "reduce2" => Some(KnownFn::Reduce2),
+        "reduce3" => Some(KnownFn::Reduce3),
+        "map" => Some(KnownFn::Map),
+        "filter" => Some(KnownFn::Filter),
+        "mapv" => Some(KnownFn::Mapv),
+        "filterv" => Some(KnownFn::Filterv),
+        "some" => Some(KnownFn::Some),
+        "every?" => Some(KnownFn::Every),
+        "into" => Some(KnownFn::Into),
+        "into3" => Some(KnownFn::Into3),
+        "group-by" => Some(KnownFn::GroupBy),
+        "partition2" => Some(KnownFn::Partition2),
+        "partition3" => Some(KnownFn::Partition3),
+        "partition4" => Some(KnownFn::Partition4),
+        "frequencies" => Some(KnownFn::Frequencies),
+        "keep" => Some(KnownFn::Keep),
+        "remove" => Some(KnownFn::Remove),
+        "map-indexed" => Some(KnownFn::MapIndexed),
+        "zipmap" => Some(KnownFn::Zipmap),
+        "juxt" => Some(KnownFn::Juxt),
+        "comp" => Some(KnownFn::Comp),
+        "partial" => Some(KnownFn::Partial),
+        "complement" => Some(KnownFn::Complement),
+        "concat" => Some(KnownFn::Concat),
+        "range1" => Some(KnownFn::Range1),
+        "range2" => Some(KnownFn::Range2),
+        "range3" => Some(KnownFn::Range3),
+        "take" => Some(KnownFn::Take),
+        "drop" => Some(KnownFn::Drop),
+        "reverse" => Some(KnownFn::Reverse),
+        "sort" => Some(KnownFn::Sort),
+        "sort-by" => Some(KnownFn::SortBy),
+        "keys" => Some(KnownFn::Keys),
+        "vals" => Some(KnownFn::Vals),
+        "merge" => Some(KnownFn::Merge),
+        "update" => Some(KnownFn::Update),
+        "get-in" => Some(KnownFn::GetIn),
+        "assoc-in" => Some(KnownFn::AssocIn),
+        "number?" => Some(KnownFn::IsNumber),
+        "string?" => Some(KnownFn::IsString),
+        "keyword?" => Some(KnownFn::IsKeyword),
+        "symbol?" => Some(KnownFn::IsSymbol),
+        "boolean?" => Some(KnownFn::IsBool),
+        "int?" => Some(KnownFn::IsInt),
+        "prn" => Some(KnownFn::Prn),
+        "print" => Some(KnownFn::Print),
+        "atom" => Some(KnownFn::Atom),
         _ => None,
     }
 }

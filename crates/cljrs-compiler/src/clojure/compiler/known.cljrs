@@ -43,7 +43,49 @@
    "deref" :deref
    "println" :println
    "pr" :pr
-   "apply" :apply})
+   "apply" :apply
+   "reduce" :reduce
+   "map" :map
+   "filter" :filter
+   "mapv" :mapv
+   "filterv" :filterv
+   "some" :some
+   "every?" :every?
+   "into" :into
+   "concat" :concat
+   "range" :range
+   "take" :take
+   "drop" :drop
+   "reverse" :reverse
+   "sort" :sort
+   "sort-by" :sort-by
+   "keys" :keys
+   "vals" :vals
+   "merge" :merge
+   "update" :update
+   "get-in" :get-in
+   "assoc-in" :assoc-in
+   "number?" :number?
+   "string?" :string?
+   "keyword?" :keyword?
+   "symbol?" :symbol?
+   "boolean?" :boolean?
+   "int?" :int?
+   "prn" :prn
+   "print" :print
+   "atom" :atom
+   "make-lazy-seq" :lazy-seq
+   "group-by" :group-by
+   "partition" :partition
+   "frequencies" :frequencies
+   "keep" :keep
+   "remove" :remove
+   "map-indexed" :map-indexed
+   "zipmap" :zipmap
+   "juxt" :juxt
+   "comp" :comp
+   "partial" :partial
+   "complement" :complement})
 
 (defn strip-ns-prefix
   [s]
