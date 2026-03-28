@@ -459,6 +459,67 @@ fn test_try_no_exception() {
     );
 }
 
+#[test]
+fn test_ex_info_throw_catch() {
+    assert_output(
+        "ex_info_throw_catch",
+        r#"
+(println
+  (try
+    (throw (ex-info "something went wrong" {:code 42}))
+    (catch Exception e
+      (str (ex-message e) " / " (:code (ex-data e))))))
+"#,
+        "something went wrong / 42",
+    );
+}
+
+#[test]
+fn test_ex_info_data_only() {
+    assert_output(
+        "ex_info_data_only",
+        r#"
+(let [e (ex-info "oops" {:x 1 :y 2})]
+  (println (ex-message e))
+  (println (:x (ex-data e)))
+  (println (:y (ex-data e))))
+"#,
+        "oops\n1\n2",
+    );
+}
+
+#[test]
+fn test_try_catch_finally() {
+    assert_output(
+        "try_catch_finally",
+        r#"
+(println
+  (try
+    (throw (ex-info "fail" {}))
+    (catch Exception e
+      (ex-message e))
+    (finally
+      (println "cleanup"))))
+"#,
+        "cleanup\nfail",
+    );
+}
+
+#[test]
+fn test_try_no_exception_finally() {
+    assert_output(
+        "try_no_exception_finally",
+        r#"
+(println
+  (try
+    "ok"
+    (finally
+      (println "done"))))
+"#,
+        "done\nok",
+    );
+}
+
 // ── Dynamic vars & binding ─────────────────────────────────────────────────
 
 #[test]
@@ -1319,6 +1380,54 @@ fn test_atom_constructor() {
     );
 }
 
+#[test]
+fn test_atom_reset() {
+    assert_output(
+        "atom_reset",
+        r#"
+(def a (atom 0))
+(println @a)
+(reset! a 42)
+(println @a)
+(reset! a "hello")
+(println @a)
+"#,
+        "0\n42\nhello",
+    );
+}
+
+#[test]
+fn test_atom_swap_with_args() {
+    assert_output(
+        "atom_swap_args",
+        r#"
+(def a (atom 10))
+(swap! a + 5)
+(println @a)
+(swap! a * 2)
+(println @a)
+(swap! a - 3)
+(println @a)
+"#,
+        "15\n30\n27",
+    );
+}
+
+#[test]
+fn test_atom_swap_extra_args() {
+    assert_output(
+        "atom_swap_extra",
+        r#"
+(def a (atom []))
+(swap! a conj 1)
+(swap! a conj 2)
+(swap! a conj 3)
+(println @a)
+"#,
+        "[1 2 3]",
+    );
+}
+
 // ── Keyword-as-function tests ───────────────────────────────────────────────
 
 #[test]
@@ -1526,6 +1635,186 @@ fn test_juxt() {
     );
 }
 
+// ── Multi-arity str/println ──────────────────────────────────────────────────
+
+#[test]
+fn test_str_multi_arity() {
+    assert_output(
+        "str_multi_arity",
+        r#"
+(println (str "hello" " " "world"))
+(println (str 1 "-" 2 "-" 3))
+(println (str))
+(println (str "only"))
+"#,
+        "hello world\n1-2-3\n\nonly",
+    );
+}
+
+#[test]
+fn test_println_multi_arity() {
+    assert_output(
+        "println_multi_arity",
+        r#"
+(println "a" "b" "c")
+(println 1 2 3)
+(println)
+"#,
+        "a b c\n1 2 3\n",
+    );
+}
+
+#[test]
+fn test_str_in_expression() {
+    assert_output(
+        "str_in_expr",
+        r#"
+(defn greet [first last]
+  (str "Hello, " first " " last "!"))
+(println (greet "John" "Doe"))
+"#,
+        "Hello, John Doe!",
+    );
+}
+
+// ── with-out-str ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_with_out_str_basic() {
+    assert_output(
+        "with_out_str_basic",
+        r#"
+(let [s (with-out-str (println "hello") (println "world"))]
+  (println (str "captured: " s)))
+"#,
+        "captured: hello\nworld\n",
+    );
+}
+
+#[test]
+fn test_with_out_str_nested() {
+    assert_output(
+        "with_out_str_nested",
+        r#"
+(let [s (with-out-str
+          (print "a")
+          (let [inner (with-out-str (print "b"))]
+            (print inner))
+          (print "c"))]
+  (println s))
+"#,
+        "abc",
+    );
+}
+
+#[test]
+fn test_with_out_str_empty() {
+    assert_output(
+        "with_out_str_empty",
+        r#"
+(let [s (with-out-str)]
+  (println (str "got:" s ":")))
+"#,
+        "got::",
+    );
+}
+
+// ── Recur in defn (non-loop) ─────────────────────────────────────────────────
+
+#[test]
+fn test_recur_in_defn() {
+    assert_output(
+        "recur_in_defn",
+        r#"
+(defn countdown [n]
+  (if (> n 0)
+    (recur (- n 1))
+    n))
+(println (countdown 10))
+"#,
+        "0",
+    );
+}
+
+#[test]
+fn test_recur_in_defn_accumulator() {
+    assert_output(
+        "recur_defn_acc",
+        r#"
+(defn sum-to [n acc]
+  (if (= n 0)
+    acc
+    (recur (- n 1) (+ acc n))))
+(println (sum-to 100 0))
+"#,
+        "5050",
+    );
+}
+
+// ── Let destructuring ───────────────────────────────────────────────────────
+
+#[test]
+fn test_let_vector_destructuring() {
+    assert_output(
+        "let_vec_destr",
+        r#"
+(let [[a b c] [1 2 3]]
+  (println a b c))
+"#,
+        "1 2 3",
+    );
+}
+
+#[test]
+fn test_let_map_destructuring() {
+    assert_output(
+        "let_map_destr",
+        r#"
+(let [{:keys [x y]} {:x 10 :y 20}]
+  (println (+ x y)))
+"#,
+        "30",
+    );
+}
+
+#[test]
+fn test_let_nested_destructuring() {
+    assert_output(
+        "let_nested_destr",
+        r#"
+(let [[a [b c]] [1 [2 3]]]
+  (println a b c))
+"#,
+        "1 2 3",
+    );
+}
+
+#[test]
+fn test_let_rest_destructuring() {
+    assert_output(
+        "let_rest_destr",
+        r#"
+(let [[head & tail] [1 2 3 4 5]]
+  (println head)
+  (println (into [] tail)))
+"#,
+        "1\n[2 3 4 5]",
+    );
+}
+
+#[test]
+fn test_let_map_as_destructuring() {
+    assert_output(
+        "let_map_as_destr",
+        r#"
+(let [{:keys [a b] :as m} {:a 1 :b 2 :c 3}]
+  (println a b)
+  (println (count m)))
+"#,
+        "1 2\n3",
+    );
+}
+
 // ── Direct inter-function calls ─────────────────────────────────────────────
 
 #[test]
@@ -1583,4 +1872,49 @@ fn test_direct_call_with_variadic_fallback() {
 "#,
         "7\n6",
     );
+}
+
+// ── clojure.test integration ─────────────────────────────────────────────────
+
+#[test]
+fn test_clojure_test_basic() {
+    assert_output(
+        "clojure_test_basic",
+        r#"
+(ns test-basic
+  (:require [clojure.test :refer [deftest is testing run-tests]]))
+
+(deftest test-math
+  (testing "addition"
+    (is (= 4 (+ 2 2)))
+    (is (= 0 (+ 0 0))))
+  (testing "subtraction"
+    (is (= 2 (- 4 2)))))
+
+(deftest test-strings
+  (is (= "hello world" (str "hello" " " "world"))))
+
+(run-tests)
+"#,
+        "\nTesting test-basic\n\nRan 2 tests containing 4 assertions.\n0 failures, 0 errors.",
+    );
+}
+
+#[test]
+fn test_clojure_test_with_failure() {
+    // We only check that the binary runs and reports the failure correctly.
+    let output = compile_and_run(
+        "clojure_test_failure",
+        r#"
+(ns test-fail
+  (:require [clojure.test :refer [deftest is run-tests]]))
+
+(deftest test-wrong
+  (is (= 5 (+ 2 2))))
+
+(run-tests)
+"#,
+    );
+    assert!(output.contains("1 failures"), "expected failure report, got: {output}");
+    assert!(output.contains("FAIL in"), "expected FAIL message, got: {output}");
 }

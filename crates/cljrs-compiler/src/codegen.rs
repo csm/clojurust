@@ -148,6 +148,9 @@ struct RuntimeFuncs {
     rt_prn: FuncId,
     rt_print: FuncId,
     rt_atom: FuncId,
+    rt_str_n: FuncId,
+    rt_println_n: FuncId,
+    rt_with_out_str: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -1002,6 +1005,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::AtomSwap => return self.emit_atom_swap(args),
             KnownFn::WithBindings => return self.emit_with_bindings(args),
             KnownFn::Concat => return self.emit_alloc_collection(self.rt.rt_concat, args),
+            KnownFn::Str if args.len() != 1 => {
+                return self.emit_alloc_collection(self.rt.rt_str_n, args)
+            }
+            KnownFn::Println if args.len() != 1 => {
+                return self.emit_alloc_collection(self.rt.rt_println_n, args)
+            }
             KnownFn::Merge => return self.emit_alloc_collection(self.rt.rt_merge, args),
             KnownFn::Juxt => return self.emit_alloc_collection(self.rt.rt_juxt, args),
             KnownFn::Comp => return self.emit_alloc_collection(self.rt.rt_comp, args),
@@ -1092,6 +1101,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::MapIndexed => self.rt.rt_map_indexed,
             KnownFn::Zipmap => self.rt.rt_zipmap,
             KnownFn::Complement => self.rt.rt_complement,
+            KnownFn::WithOutStr => self.rt.rt_with_out_str,
             _ => {
                 return self.emit_unknown_call_from_args(args);
             }
@@ -1463,6 +1473,9 @@ fn declare_runtime_funcs(
         rt_prn: declare_rt(module, "rt_prn", &[ptr], ptr)?,
         rt_print: declare_rt(module, "rt_print", &[ptr], ptr)?,
         rt_atom: declare_rt(module, "rt_atom", &[ptr], ptr)?,
+        rt_str_n: declare_rt(module, "rt_str_n", &[ptr, types::I64], ptr)?,
+        rt_println_n: declare_rt(module, "rt_println_n", &[ptr, types::I64], ptr)?,
+        rt_with_out_str: declare_rt(module, "rt_with_out_str", &[ptr], ptr)?,
     })
 }
 

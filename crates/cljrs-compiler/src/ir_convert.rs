@@ -578,6 +578,7 @@ pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn> {
         "try-catch-finally" => Some(KnownFn::TryCatchFinally),
         "set!-var" => Some(KnownFn::SetBangVar),
         "with-bindings" => Some(KnownFn::WithBindings),
+        "with-out-str" => Some(KnownFn::WithOutStr),
         "reduce2" => Some(KnownFn::Reduce2),
         "reduce3" => Some(KnownFn::Reduce3),
         "map" => Some(KnownFn::Map),

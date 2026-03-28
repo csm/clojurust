@@ -180,6 +180,9 @@ pub enum KnownFn {
     // Dynamic binding
     SetBangVar,
     WithBindings,
+
+    // Output capture
+    WithOutStr,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -659,7 +662,7 @@ impl KnownFn {
 
             // Dynamic binding
             KnownFn::SetBangVar => Effect::HeapWrite,
-            KnownFn::WithBindings => Effect::UnknownCall,
+            KnownFn::WithBindings | KnownFn::WithOutStr => Effect::UnknownCall,
         }
     }
 }

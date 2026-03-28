@@ -97,6 +97,17 @@
 (defn term-unreachable []
   {:op :unreachable})
 
+;; ── Global unique name counter ─────────────────────────────────────────────
+
+(def ^:dynamic *global-name-counter* (atom 0))
+
+(defn fresh-name-id!
+  "Allocate a globally unique ID for subfunction names."
+  []
+  (let [id @*global-name-counter*]
+    (swap! *global-name-counter* inc)
+    id))
+
 ;; ── Builder context (mutable via atom) ──────────────────────────────────────
 
 (defn make-ctx

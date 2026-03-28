@@ -4663,13 +4663,15 @@ fn print_vals(args: &[Value], sep: &str, readably: bool) -> String {
         .join(sep)
 }
 
-fn emit_output(s: &str) {
+/// Write to the output capture buffer if active, otherwise to stdout (no newline).
+pub fn emit_output(s: &str) {
     if !capture_or_print(s) {
         print!("{}", s);
     }
 }
 
-fn emit_output_ln(s: &str) {
+/// Write to the output capture buffer if active, otherwise to stdout (with newline).
+pub fn emit_output_ln(s: &str) {
     if !capture_or_print(&format!("{s}\n")) {
         println!("{}", s);
     }

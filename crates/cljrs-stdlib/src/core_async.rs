@@ -1,10 +1,12 @@
-use std::any::Any;
-use std::sync::{Arc, Mutex};
+/*use std::any::Any;
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::runtime;
 use cljrs_value::{Arity, NativeObject, NativeObjectBox, Value, ValueError, ValueResult};
 use lazy_static::lazy_static;
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use crate::register_fns;
+ */
 
 /*
  * Sketch of the overall design:
@@ -17,6 +19,7 @@ use crate::register_fns;
  * Use native tokio channels as channels.
  */
 
+/* TODO, fix this.
 #[derive(Clone, Debug)]
 enum Buffer {
     Fixed(u16),
@@ -45,8 +48,8 @@ impl NativeObject for BufferWrapper {
 
 #[derive(Debug, Clone)]
 struct ManyToOneChannel {
-    sender: Arc<Mutex<tokio::sync::mpsc::Sender<Value>>>,
-    receiver: Arc<Mutex<tokio::sync::mpsc::Receiver<Value>>>,
+    sender: Arc<RefCell<tokio::sync::mpsc::Sender<Value>>>,
+    receiver: Arc<RefCell<tokio::sync::mpsc::Receiver<Value>>>,
     buffer: Buffer,
     closed: Arc<Mutex<bool>>,
 }
@@ -58,14 +61,14 @@ enum PromiseState {
     Closed
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PromiseChannel {
-    sender: Arc<Mutex<tokio::sync::oneshot::Sender<Value>>>,
-    receiver: Arc<Mutex<tokio::sync::oneshot::Receiver<Value>>>,
+    sender: Arc<RefCell<tokio::sync::oneshot::Sender<Value>>>,
+    receiver: Arc<RefCell<tokio::sync::oneshot::Receiver<Value>>>,
     state: Arc<Mutex<PromiseState>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Channel {
     ManyToOne(ManyToOneChannel),
     Promise(PromiseChannel),
@@ -104,7 +107,7 @@ pub fn register(globals: &Arc<cljrs_eval::GlobalEnv>, ns: &str) {
     );
 }
 
-lazy_static!{
+lazy_static! {
     static ref RUNTIME: runtime::Runtime = runtime::Runtime::new().unwrap();
 }
 
@@ -149,8 +152,8 @@ pub fn chan(args: &[Value]) -> ValueResult<Value> {
             GcPtr::new(
                 NativeObjectBox::new(
                     Channel::ManyToOne(ManyToOneChannel {
-                        sender: Arc::new(Mutex::new(sender)),
-                        receiver: Arc::new(Mutex::new(receiver)),
+                        sender: Arc::new(RwLock::new(sender)),
+                        receiver: Arc::new(RwLock::new(receiver)),
                         buffer,
                         closed: Arc::new(Mutex::new(false)),
                     })
@@ -167,8 +170,8 @@ pub fn promise_chan(_args: &[Value]) -> ValueResult<Value> {
             GcPtr::new(
                 NativeObjectBox::new(
                     Channel::Promise(PromiseChannel {
-                        sender: Arc::new(Mutex::new(sender)),
-                        receiver: Arc::new(Mutex::new(receiver)),
+                        sender: Arc::new(RwLock::new(sender)),
+                        receiver: Arc::new(RwLock::new(receiver)),
                         state: Arc::new(Mutex::new(PromiseState::Open))
                     })
                 )
@@ -222,54 +225,50 @@ pub fn dropping_buffer(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-pub fn put_bang(args: &[Value]) -> ValueResult<Value> {
-    let arg = match &args[1] {
-        Value::Nil => return Err(ValueError::Other("attempt to put nil on a channel".to_string())),
-        v => v.clone()
-    };
-    let callback = if args.len() >= 3 {
-        Some(args[2].clone())
-    } else {
-        None
-    };
-    match &args[0] {
-        Value::NativeObject(obj) if obj.get().type_tag() == "ManyToOneChannel" || obj.get().type_tag() == "PromiseChannel" => {
-            let channel: &Channel = obj.get().downcast_ref::<Channel>().ok_or_else(|| ValueError::Other("not a channel".to_string()))?;
-            let open = match channel {
-                Channel::ManyToOne(ch) =>
-                    !ch.closed.lock().unwrap().clone(),
-                Channel::Promise(ch) =>
-                    matches!(*ch.state.lock().unwrap(), PromiseState::Open),
+fn put<F>(channel: &Channel, value: &Value, continuation: F)
+    where F: FnOnce(ValueResult<bool>) + Send + 'static
+{
+    match channel {
+        Channel::ManyToOne(channel) => {
+            let closed = {
+                let closed = channel.closed.lock().unwrap();
+                *closed
             };
-            if open {
-                let channel = channel.clone();
-                tokio::spawn(async move {
-                    match channel {
-                        Channel::ManyToOne(ch) => {
-                            let sender = ch.sender.lock().unwrap();
-                            sender.capacity();
-                            let _ = sender.send(arg).await;
-                        }
-                        Channel::Promise(ch) => {
-                            let state = ch.state.lock().unwrap();
-                            if matches!(*state, PromiseState::Open) {
-                                let sender = ch.sender.lock().unwrap();
-                                let _ = sender.send(arg);
-                            };
-                        },
-                    };
-                    if let Some(callback) = callback {
-                        let _ = cljrs_eval::callback::invoke(&callback, vec![]);
+            let value = value.clone();
+            tokio::spawn(async move {
+                if closed {
+                    continuation(Ok(false));
+                } else {
+                    let sender = *channel.sender;
+                    let mut sender = sender.get_mut();
+                    let result = sender.send(value).await;
+                    match result {
+                        Ok(_) => continuation(Ok(true)),
+                        Err(e) => continuation(Err(ValueError::Other(e.to_string()))),
                     }
-                });
-                Ok(Value::Bool(true))
+                }
+            });
+        }
+        Channel::Promise(channel) => {
+            let mut state = channel.state.lock().unwrap();
+            if matches!(*state, PromiseState::Open) {
+                let mut sender = channel.sender;
+                let sender = sender.take();
+                match sender {
+                    Some(sender) => {
+                        let result = sender.send(value.clone());
+                        match result {
+                            Ok(_) => continuation(Ok(false)),
+                            Err(e) => continuation(Err(ValueError::Other(e.to_string()))),
+                        }
+                    }
+                    None => continuation(Ok(false)),
+                }
             } else {
-                Ok(Value::Bool(false))
+                continuation(Ok(false));
             }
         }
-        v => Err(ValueError::WrongType {
-            expected: "channel",
-            got: v.type_name().to_string(),
-        })
     }
 }
+
+ */

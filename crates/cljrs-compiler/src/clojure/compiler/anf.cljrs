@@ -148,9 +148,7 @@
           "try" (lower-try ctx (vec args))
           "binding" (lower-binding ctx (vec args))
           "letfn" (lower-letfn ctx (vec args))
-          ;; Interpreter-only
-          ("with-out-str")
-          (throw (str "unsupported: " s " (not yet in IR)"))
+          "with-out-str" (lower-with-out-str ctx (vec args))
           ;; defmacro/defonce
           ("defmacro" "defonce")
           (throw (str "unsupported: " s " (should be expanded before IR)"))
@@ -561,19 +559,52 @@
                               []
                               all-param-names)]
       (swap! sub-ctx assoc :params param-pairs))
-    ;; Emit destructuring bindings for pattern params
-    (doseq [info param-info]
-      (when (:pattern info)
-        (let [gensym-var (ir/lookup-local sub-ctx (:name info))]
-          (lower-destructure-binding sub-ctx (:pattern info) gensym-var))))
-    ;; Emit destructuring for rest param if needed
-    (when (and rest-info (:pattern rest-info))
-      (let [gensym-var (ir/lookup-local sub-ctx (:name rest-info))]
-        (lower-destructure-binding sub-ctx (:pattern rest-info) gensym-var)))
-    ;; Lower body
-    (let [result (lower-body sub-ctx body-forms)]
-      (ir/finish-block! sub-ctx (ir/term-return result))
-      (ir/build-ir-function sub-ctx))))
+    ;; Set up implicit loop header for recur support.
+    ;; The recur target is the user params (not captures).
+    ;; Entry block → jump to header → phi nodes → body → (recur jumps back to header)
+    (let [user-param-names (if rest-info
+                             (conj (mapv :name param-info) (:name rest-info))
+                             (mapv :name param-info))
+          init-block (ir/current-block-id sub-ctx)
+          ;; Get initial values for user params (the VarIds bound above)
+          init-vals (mapv (fn [n] (ir/lookup-local sub-ctx n)) user-param-names)
+          header (ir/fresh-block! sub-ctx)]
+      (ir/finish-block! sub-ctx (ir/term-jump header))
+      (ir/start-block! sub-ctx header)
+      (ir/push-scope! sub-ctx)
+      ;; Create phi nodes for each user param
+      (let [phi-vars (mapv (fn [i]
+                             (let [pname (nth user-param-names i)
+                                   init-val (nth init-vals i)
+                                   phi-var (ir/fresh-var! sub-ctx)]
+                               (ir/emit-phi! sub-ctx phi-var [[init-block init-val]])
+                               (ir/bind-local! sub-ctx pname phi-var)
+                               phi-var))
+                           (range (count user-param-names)))]
+        ;; Emit destructuring bindings for pattern params
+        (doseq [info param-info]
+          (when (:pattern info)
+            (let [gensym-var (ir/lookup-local sub-ctx (:name info))]
+              (lower-destructure-binding sub-ctx (:pattern info) gensym-var))))
+        ;; Emit destructuring for rest param if needed
+        (when (and rest-info (:pattern rest-info))
+          (let [gensym-var (ir/lookup-local sub-ctx (:name rest-info))]
+            (lower-destructure-binding sub-ctx (:pattern rest-info) gensym-var)))
+        ;; Push loop header so recur can find it
+        (ir/push-loop-header! sub-ctx header phi-vars)
+        ;; Lower body
+        (let [result (lower-body sub-ctx body-forms)
+              body-exit (ir/current-block-id sub-ctx)]
+          (ir/pop-loop-header! sub-ctx)
+          ;; Exit block
+          (let [exit-block (ir/fresh-block! sub-ctx)]
+            (ir/finish-block! sub-ctx (ir/term-jump exit-block))
+            (ir/pop-scope! sub-ctx)
+            (ir/start-block! sub-ctx exit-block)
+            (let [exit-result (ir/fresh-var! sub-ctx)]
+              (ir/emit-phi! sub-ctx exit-result [[body-exit result]])
+              (ir/finish-block! sub-ctx (ir/term-return exit-result))
+              (ir/build-ir-function sub-ctx))))))))
 
 (defn lower-fn
   "Lower (fn* name? [params] body...) or (fn* name? ([params] body...) ...)."
@@ -602,11 +633,13 @@
                                  {:fixed (:fixed parsed) :rest (:rest parsed) :body body}))
                              raw-arities)
         ;; Generate a unique base name for the compiled functions
-        base-name (or fn-name (str "__cljrs_anon_" (ir/fresh-var! ctx)))
+        base-name (or fn-name (str "__cljrs_anon_" (ir/fresh-name-id!)))
         ;; Lower each arity — param-counts is the fixed param count only
+        fn-uid (ir/fresh-name-id!)
         arity-fn-names (vec (map-indexed
                               (fn [i arity]
-                                (str "__cljrs_fn_" ns "_" base-name "_arity" (count (:fixed arity))
+                                (str "__cljrs_fn_" ns "_" base-name "_" fn-uid
+                                     "_arity" (count (:fixed arity))
                                      (if (:rest arity) "_va" "")))
                               parsed-arities))
         param-counts (mapv (fn [arity] (count (:fixed arity))) parsed-arities)
@@ -666,7 +699,7 @@
         ns (ir/current-ns ctx)
         ncaptures (count capture-name-list)
         ;; Build the body closure (zero-arg fn, captures passed as extra params)
-        body-name (str "__cljrs_try_body_" (ir/fresh-var! ctx))
+        body-name (str "__cljrs_try_body_" (ir/fresh-name-id!))
         body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] nil body-forms)
         _ (ir/emit-subfunction! ctx body-fn-ir)
         body-closure (ir/fresh-var! ctx)
@@ -675,7 +708,7 @@
                                                 capture-name-list nil))
         ;; Build the catch closure (one-arg fn, captures + exception param)
         catch-closure (if catch-sym
-                        (let [catch-name (str "__cljrs_try_catch_" (ir/fresh-var! ctx))
+                        (let [catch-name (str "__cljrs_try_catch_" (ir/fresh-name-id!))
                               catch-params [(symbol catch-sym)]
                               catch-fn-ir (lower-fn-arity ctx catch-name ns
                                                            capture-name-list catch-params
@@ -690,7 +723,7 @@
                         (ir/emit-const! ctx (ir/const-nil)))
         ;; Build the finally closure (zero-arg fn)
         finally-closure (if finally-body
-                          (let [fin-name (str "__cljrs_try_finally_" (ir/fresh-var! ctx))
+                          (let [fin-name (str "__cljrs_try_finally_" (ir/fresh-name-id!))
                                 fin-fn-ir (lower-fn-arity ctx fin-name ns
                                                            capture-name-list [] nil finally-body)
                                 _ (ir/emit-subfunction! ctx fin-fn-ir)
@@ -705,6 +738,26 @@
         result (ir/fresh-var! ctx)]
     (ir/emit! ctx (ir/inst-call-known result :try-catch-finally
                                        [body-closure catch-closure finally-closure]))
+    result))
+
+(defn lower-with-out-str
+  "Lower (with-out-str body...).
+   Compiles body as a zero-arg closure, then emits CallKnown :with-out-str."
+  [ctx body-forms]
+  (let [all-locals (ir/get-all-locals ctx)
+        capture-name-list (vec (keys all-locals))
+        capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
+        ns (ir/current-ns ctx)
+        ncaptures (count capture-name-list)
+        body-name (str "__cljrs_with_out_str_" (ir/fresh-name-id!))
+        body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] nil body-forms)
+        _ (ir/emit-subfunction! ctx body-fn-ir)
+        body-closure (ir/fresh-var! ctx)
+        _ (ir/emit! ctx (ir/inst-alloc-closure body-closure nil capture-vars
+                                                [body-name] [ncaptures]
+                                                capture-name-list nil))
+        result (ir/fresh-var! ctx)]
+    (ir/emit! ctx (ir/inst-call-known result :with-out-str [body-closure]))
     result))
 
 (defn lower-binding
@@ -741,7 +794,7 @@
           capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
           ns (ir/current-ns ctx)
           ncaptures (count capture-name-list)
-          body-name (str "__cljrs_binding_body_" (ir/fresh-var! ctx))
+          body-name (str "__cljrs_binding_body_" (ir/fresh-name-id!))
           body-forms (vec (rest args))
           body-fn-ir (lower-fn-arity ctx body-name ns capture-name-list [] nil body-forms)
           _ (ir/emit-subfunction! ctx body-fn-ir)
@@ -1008,11 +1061,12 @@
    :cons 2, :seq 1, :lazy-seq 1,
    :deref 1, :atom-deref 1, :atom-reset 2,
    :is-nil 1, :is-vector 1, :is-map 1, :is-seq 1, :identical 2,
-   :str 1, :println 1, :pr 1,
+   :pr 1,
    :apply 2,
    :transient 1, :assoc! 3, :conj! 2, :persistent! 1,
    :set!-var 2,
    :try-catch-finally 3,
+   :with-out-str 1,
    :reduce2 2, :reduce3 3,
    :map 2, :filter 2,
    :mapv 2, :filterv 2,
@@ -1338,12 +1392,8 @@
               ;; Arity mismatch — special-case str/println/pr for 0-args,
               ;; otherwise fall through to generic call
               (cond
-                ;; (str) → constant empty string
-                (and (= known-kw :str) (= argc 0))
-                (ir/emit-const! ctx {:type :string :val ""})
-
-                ;; (println) / (pr) with 0 args → print empty string
-                (and (contains? #{:println :pr} known-kw) (= argc 0))
+                ;; (pr) with 0 args → print empty string
+                (and (= known-kw :pr) (= argc 0))
                 (let [empty-str (ir/emit-const! ctx {:type :string :val ""})
                       dst (ir/fresh-var! ctx)]
                   (ir/emit! ctx (ir/inst-call-known dst known-kw [empty-str]))
