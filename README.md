@@ -13,9 +13,9 @@ that runs natively on Rust. Source files use the `.cljrs` extension (native) or
 
 Current capabilities:
 
-- **Interpret** `.cljrs` and `.cljc` source files via `cljx run <file>`
-- **REPL** — interactive read-eval-print loop via `cljx repl`
-- **Eval** — evaluate expressions from the shell via `cljx eval '<expr>'`
+- **Interpret** `.cljrs` and `.cljc` source files via `cljrs run <file>`
+- **REPL** — interactive read-eval-print loop via `cljrs repl`
+- **Eval** — evaluate expressions from the shell via `cljrs eval '<expr>'`
 - **Reader conditionals** — `.cljc` files use `#?(:rust ... :clj ... :default ...)`
 - **Persistent collections** — HAMT-backed maps/sets, RRB vectors, sorted maps/sets (via rpds)
 - **Tracing GC** — non-moving mark-and-sweep garbage collector with `GcPtr<T>`
@@ -32,7 +32,7 @@ Planned:
 
 - **Rust interop** — call Rust functions from Clojure with defined type marshalling
 - **JIT compilation** — hot code compiled to native via Cranelift
-- **AOT compilation** — `cljx compile` produces a standalone binary
+- **AOT compilation** — `cljrs compile` produces a standalone binary
 
 ---
 
@@ -70,16 +70,16 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`cljx-types`](crates/cljx-types) | Shared foundational types: `Span`, `CljxError`, `CljxResult` | complete |
-| [`cljx-reader`](crates/cljx-reader) | Lexer + recursive-descent parser; produces `Form` AST with source spans | complete |
-| [`cljx-value`](crates/cljx-value) | `Value` enum; persistent collections (rpds-backed maps, sets, vectors, sorted variants); Clojure-compatible hashing | complete |
-| [`cljx-gc`](crates/cljx-gc) | Non-moving mark-and-sweep GC; `GcPtr<T>` smart pointer; `Trace` trait | complete |
-| [`cljx-eval`](crates/cljx-eval) | Tree-walking interpreter; special forms; macros; namespace/environment; destructuring; dynamic vars | complete |
-| [`cljx-stdlib`](crates/cljx-stdlib) | Embedded stdlib: clojure.string, clojure.set, clojure.test (native + Clojure source) | complete |
-| [`cljx-runtime`](crates/cljx-runtime) | Runtime support (Phase 6+) | stub |
-| [`cljx-compiler`](crates/cljx-compiler) | IR lowering; JIT (Cranelift) and AOT code generation | stub |
-| [`cljx-interop`](crates/cljx-interop) | Rust ↔ Clojure FFI; type marshalling | stub |
-| [`cljx`](crates/cljx) | `cljx` CLI binary: `run`, `repl`, `eval` subcommands (clap-based) | functional |
+| [`cljrs-types`](crates/cljrs-types) | Shared foundational types: `Span`, `CljxError`, `CljxResult` | complete |
+| [`cljrs-reader`](crates/cljrs-reader) | Lexer + recursive-descent parser; produces `Form` AST with source spans | complete |
+| [`cljrs-value`](crates/cljrs-value) | `Value` enum; persistent collections (rpds-backed maps, sets, vectors, sorted variants); Clojure-compatible hashing | complete |
+| [`cljrs-gc`](crates/cljrs-gc) | Non-moving mark-and-sweep GC; `GcPtr<T>` smart pointer; `Trace` trait | complete |
+| [`cljrs-eval`](crates/cljrs-eval) | Tree-walking interpreter; special forms; macros; namespace/environment; destructuring; dynamic vars | complete |
+| [`cljrs-stdlib`](crates/cljrs-stdlib) | Embedded stdlib: clojure.string, clojure.set, clojure.test (native + Clojure source) | complete |
+| [`cljrs-runtime`](crates/cljrs-runtime) | Runtime support (Phase 6+) | stub |
+| [`cljrs-compiler`](crates/cljrs-compiler) | IR lowering; JIT (Cranelift) and AOT code generation | stub |
+| [`cljrs-interop`](crates/cljrs-interop) | Rust ↔ Clojure FFI; type marshalling | stub |
+| [`cljrs`](crates/cljrs) | `cljrs` CLI binary: `run`, `repl`, `eval` subcommands (clap-based) | functional |
 
 Each crate has its own `README.md` with purpose, status, file layout, and public API.
 
@@ -97,10 +97,11 @@ cargo fmt --check          # format check
 ## Usage
 
 ```bash
-cljx run <file.cljrs>           # interpret a source file
-cljx run --src-path lib/ <file>  # with additional source paths
-cljx repl                       # start interactive REPL
-cljx eval '(+ 1 2 3)'           # evaluate expression from shell
+cljrs run <file.cljrs>           # interpret a source file
+cljrs run --src-path lib/ <file>  # with additional source paths
+cljrs repl                       # start interactive REPL
+cljrs eval '(+ 1 2 3)'           # evaluate expression from shell
+cljrs test --src-path ...        # run clojure.test test cases from src-path
 ```
 
 ---
@@ -110,16 +111,16 @@ cljx eval '(+ 1 2 3)'           # evaluate expression from shell
 ```
 Cargo.toml              # workspace manifest (resolver=2)
 crates/
-  cljx-types/           # foundational types (Phase 1)
-  cljx-reader/          # lexer + parser (Phase 2)
-  cljx-value/           # Value enum, collections, types (Phase 3)
-  cljx-gc/              # tracing GC (Phase 8)
-  cljx-eval/            # evaluator, builtins, macros (Phase 4-5)
-  cljx-stdlib/          # embedded stdlib (Phase 8-ext-4)
-  cljx-runtime/         # runtime stub (Phase 6+)
-  cljx-compiler/        # JIT/AOT stub (Phase 10/11)
-  cljx-interop/         # FFI stub (Phase 9)
-  cljx/                 # CLI binary (Phase 12)
+  cljrs-types/           # foundational types (Phase 1)
+  cljrs-reader/          # lexer + parser (Phase 2)
+  cljrs-value/           # Value enum, collections, types (Phase 3)
+  cljrs-gc/              # tracing GC (Phase 8)
+  cljrs-eval/            # evaluator, builtins, macros (Phase 4-5)
+  cljrs-stdlib/          # embedded stdlib (Phase 8-ext-4)
+  cljrs-runtime/         # runtime stub (Phase 6+)
+  cljrs-compiler/        # JIT/AOT stub (Phase 10/11)
+  cljrs-interop/         # FFI stub (Phase 9)
+  cljrs/                 # CLI binary (Phase 12)
 tests/
   fixtures/             # .cljrs / .cljc source files for integration tests
 TODO.md                 # phased implementation roadmap

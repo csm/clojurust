@@ -35,7 +35,7 @@ enum Commands {
     },
     /// AOT-compile a source file to a native binary.
     Compile {
-        /// Path to the source file.
+        /// Path to the source file, or directory when --test is used.
         file: PathBuf,
         /// Output binary path.
         #[arg(short, long)]
@@ -43,6 +43,9 @@ enum Commands {
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
+        /// Compile a test harness that runs all tests in the given file/directory.
+        #[arg(long)]
+        test: bool,
     },
     /// Evaluate a single Clojure expression and print the result.
     Eval {
@@ -95,9 +98,16 @@ fn run(cli: Cli) -> miette::Result<()> {
             file,
             out,
             src_paths,
+            test,
         } => {
-            cljrs_compiler::aot::compile_file(&file, &out, &src_paths)
-                .map_err(|e| miette::miette!("{e}"))?;
+            if test {
+                // For test mode, the file is a directory containing test files
+                cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
+                    .map_err(|e| miette::miette!("{e}"))?;
+            } else {
+                cljrs_compiler::aot::compile_file(&file, &out, &src_paths)
+                    .map_err(|e| miette::miette!("{e}"))?;
+            }
         }
         Commands::Eval { expr } => {
             let result = eval_source(&expr, "<eval>")?;

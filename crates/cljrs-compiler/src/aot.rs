@@ -400,7 +400,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
     let mut interpreted_source = String::new();
     let mut compilable = Vec::new();
     for (i, form) in expanded.iter().enumerate() {
-        if needs_interpreter(&forms[i]) {
+        if needs_interpreter(&forms[i]) || expanded_needs_interpreter(form) {
             // Extract the original source text using span byte offsets.
             let span = &forms[i].span;
             let src_text = &source[span.start..span.end];
@@ -501,6 +501,40 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
             }
             false
         }
+        _ => false,
+    }
+}
+
+/// Check if a symbol name (possibly namespace-qualified) refers to an
+/// interpreter-only function.
+fn is_interpreter_only_sym(s: &str) -> bool {
+    // Strip namespace prefix if present (e.g. "clojure.core/alter-meta!" → "alter-meta!")
+    let base = s.rsplit('/').next().unwrap_or(s);
+    matches!(
+        base,
+        "alter-meta!" | "vary-meta" | "reset-meta!" | "with-meta"
+    )
+}
+
+/// Check the macro-expanded form for constructs that the AOT compiler
+/// cannot handle (e.g. alter-meta!, vary-meta). This recurses
+/// into the form tree so that e.g. `(do (def x ...) (alter-meta! ...))` is caught.
+fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
+    use cljrs_reader::form::FormKind;
+    match &form.kind {
+        FormKind::List(parts) => {
+            if let Some(head) = parts.first()
+                && let FormKind::Symbol(s) = &head.kind
+                && is_interpreter_only_sym(s)
+            {
+                return true;
+            }
+            parts.iter().any(expanded_needs_interpreter)
+        }
+        FormKind::Vector(elems) | FormKind::Set(elems) => {
+            elems.iter().any(expanded_needs_interpreter)
+        }
+        FormKind::Map(elems) => elems.iter().any(expanded_needs_interpreter),
         _ => false,
     }
 }
@@ -758,6 +792,37 @@ fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
     Ok(())
 }
 
+/// Build the harness with Cargo and copy the resulting binary to `out_path`.
+/// Keeps the harness directory for debugging test harnesses.
+fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
+    eprintln!("[aot] building harness with cargo...");
+
+    let output = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .current_dir(harness_dir)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AotError::Link(format!("cargo build failed:\n{stderr}")));
+    }
+
+    // The binary is at target/release/cljrs-aot-harness.
+    let bin_name = if cfg!(target_os = "windows") {
+        "cljrs-aot-harness.exe"
+    } else {
+        "cljrs-aot-harness"
+    };
+    let built = harness_dir.join("target/release").join(bin_name);
+    std::fs::copy(&built, out_path)?;
+
+    // Keep the harness directory for debugging
+    eprintln!("[aot] harness directory kept at {}", harness_dir.display());
+
+    Ok(())
+}
+
 /// Walk up from the current directory to find the workspace root
 /// (the directory containing Cargo.toml with [workspace]).
 fn find_workspace_root() -> AotResult<PathBuf> {
@@ -776,4 +841,268 @@ fn find_workspace_root() -> AotResult<PathBuf> {
             ));
         }
     }
+}
+
+// ── Test harness generation ─────────────────────────────────────────────────
+
+/// Discover test namespaces from a directory of test files.
+/// Returns a sorted list of namespace names.
+fn discover_test_namespaces(test_dir: &Path, src_dirs: &[PathBuf]) -> AotResult<Vec<String>> {
+    let mut namespaces = Vec::new();
+
+    // First, try to discover from the test directory directly
+    if test_dir.is_dir() {
+        discover_in_dir(test_dir, test_dir, &mut namespaces);
+    }
+
+    // If no tests found in test_dir, also search src_dirs
+    if namespaces.is_empty() {
+        for dir in src_dirs {
+            if dir.is_dir() {
+                discover_in_dir(dir, dir, &mut namespaces);
+            }
+        }
+    }
+
+    namespaces.sort();
+    Ok(namespaces)
+}
+
+/// Discover all namespace names from `.cljc` / `.cljrs` files in the given source paths.
+fn discover_in_dir(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_in_dir(root, &path, out);
+        } else if let Some(ext) = path.extension()
+            && (ext == "cljc" || ext == "cljrs")
+            && let Some(ns) = file_to_namespace(root, &path)
+        {
+            out.push(ns);
+        }
+    }
+}
+
+/// Convert a file path relative to the source root into a Clojure namespace name.
+/// e.g. `test/clojure/core_test/juxt.cljc` relative to `test/` → `clojure.core-test.juxt`
+fn file_to_namespace(root: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let stem = rel.with_extension(""); // remove .cljc / .cljrs
+    let ns = stem
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, ".")
+        .replace('_', "-");
+    Some(ns)
+}
+
+/// Generate the Rust test harness code.
+fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str) -> String {
+    let mut code = String::new();
+
+    // Generate the namespace strings array inline
+    let ns_strings: Vec<String> = namespaces.iter().map(|s| format!("\"{}\".to_string()", s)).collect();
+
+    code.push_str(r#"//! Auto-generated AOT test harness for clojurust.
+//!
+//! Discovers and runs all clojure.test tests in the bundled namespaces.
+
+use cljrs_value::Value;
+
+fn main() {
+    // Initialize the standard environment.
+    let globals = cljrs_stdlib::standard_env();
+
+    // Register bundled dependency sources so require can find them
+    // without needing source files on disk.
+"#);
+
+    code.push_str(bundled_registration);
+    code.push_str(r#"    let mut env = cljrs_eval::Env::new(globals, "user");
+
+    // Push an eval context so rt_call can dispatch through the interpreter.
+    cljrs_eval::callback::push_eval_context(&env);
+
+    // Load clojure.test if not already loaded
+    let _ = cljrs_eval::eval(
+        &cljrs_reader::Parser::new(
+            "(require 'clojure.test)".to_string(),
+            "<test-harness>".to_string()
+        ).parse_all().unwrap()[0],
+        &mut env
+    );
+
+    // Load all test namespaces
+    (|| {
+"#);
+
+    for ns in namespaces.iter() {
+        code.push_str(&format!(
+            "        let _ = cljrs_eval::eval(&cljrs_reader::Parser::new(\n            \"(require '{})\".to_string(),\n            \"<test-harness>\".to_string()\n        ).parse_all().unwrap()[0], &mut env);\n",
+            ns
+        ));
+    }
+
+    code.push_str(r#"    })();
+
+    // Run tests for each namespace separately
+    let mut total_pass = 0i64;
+    let mut total_fail = 0i64;
+    let mut total_error = 0i64;
+    let mut total_test_count = 0i64;
+
+    for ns_str in vec![
+"#);
+
+    for ns_str in ns_strings.iter() {
+        code.push_str(&format!("        {},\n", ns_str));
+    }
+
+    code.push_str(r#"    ].iter() {
+        let run_result = cljrs_eval::eval(
+            &cljrs_reader::Parser::new(
+                format!("(clojure.test/run-tests '{})", ns_str)
+                    .to_string(),
+                "<run-tests>".to_string()
+            ).parse_all().unwrap()[0],
+            &mut env
+        );
+        if let Ok(Value::Map(m)) = run_result {
+            let mut pass = 0i64;
+            let mut fail = 0i64;
+            let mut error = 0i64;
+            let mut test_count = 0i64;
+            m.for_each(|k, v| {
+                if let (Value::Keyword(kw), Value::Long(count)) = (k, v) {
+                    match kw.get().name.as_ref() {
+                        "pass" => pass = *count,
+                        "fail" => fail = *count,
+                        "error" => error = *count,
+                        "test" => test_count = *count,
+                        _ => {}
+                    }
+                }
+            });
+            total_pass += pass;
+            total_fail += fail;
+            total_error += error;
+            total_test_count += test_count;
+        }
+    }
+
+    // Flush output before exiting
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    println!("Ran {} tests containing {} assertions.", total_test_count, total_pass + total_fail + total_error);
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    println!("{} passed, {} failed, {} errors.", total_pass, total_fail, total_error);
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    if total_fail > 0 || total_error > 0 {
+        std::process::exit(1);
+    }
+
+    // Pop the eval context.
+    cljrs_eval::callback::pop_eval_context();
+}"#);
+
+    code
+}
+
+/// Compile a directory of test files to a standalone native binary.
+/// The resulting binary will discover and run all clojure.test tests found.
+pub fn compile_test_harness(
+    test_dir: &Path,
+    out_path: &Path,
+    src_dirs: &[PathBuf],
+) -> AotResult<()> {
+    eprintln!("[aot] discovering tests in {}", test_dir.display());
+
+    // Discover test namespaces
+    let namespaces = discover_test_namespaces(test_dir, src_dirs)?;
+    if namespaces.is_empty() {
+        return Err(AotError::Eval(format!(
+            "No test files found in {}",
+            test_dir.display()
+        )));
+    }
+    eprintln!("[aot] discovered {} test namespace(s)", namespaces.len());
+
+    // Generate registration code for bundled sources
+    let mut bundled_registration = String::new();
+    for (i, ns) in namespaces.iter().enumerate() {
+        bundled_registration.push_str(&format!(
+            "    globals.register_builtin_source(\"{ns}\", include_str!(\"bundled_{i}.cljrs\"));\n"
+        ));
+    }
+
+    // Create the harness directory
+    let harness_dir = out_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(".cljrs-aot-test-harness");
+
+    // Clean any previous harness.
+    if harness_dir.exists() {
+        std::fs::remove_dir_all(&harness_dir)?;
+    }
+    std::fs::create_dir_all(harness_dir.join("src"))?;
+
+    // Generate the main.rs file
+    let main_rs = generate_test_harness_code(&namespaces, &bundled_registration);
+    std::fs::write(harness_dir.join("src/main.rs"), &main_rs)?;
+
+    // Write the test namespace sources for bundling
+    // Include test_dir as a search path for test sources
+    let mut search_dirs = src_dirs.to_vec();
+    search_dirs.push(test_dir.to_path_buf());
+
+    for (i, ns) in namespaces.iter().enumerate() {
+        let rel_path = ns.replace('.', "/").replace('-', "_");
+        if let Some(src) = find_user_source(&rel_path, &search_dirs) {
+            std::fs::write(harness_dir.join("src").join(format!("bundled_{i}.cljrs")), &src)?;
+            eprintln!("[aot] bundled {ns} → src/bundled_{i}.cljrs");
+        } else {
+            return Err(AotError::Eval(format!(
+                "Could not find source for namespace {ns}"
+            )));
+        }
+    }
+
+    // Write Cargo.toml
+    let workspace_root = find_workspace_root()?;
+    let cargo_toml = format!(
+        r#"[package]
+name = "cljrs-aot-harness"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
+cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
+cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
+cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
+cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
+cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
+cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
+"#,
+        ws = workspace_root.display()
+    );
+    std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
+
+    // Write build.rs - minimal, no object file linking needed
+    let build_rs = r#"fn main() {
+    // No special linking needed for test harness
+}"#;
+    std::fs::write(harness_dir.join("build.rs"), build_rs)?;
+
+    // Build with cargo
+    link_with_cargo_test_harness(&harness_dir, out_path)?;
+
+    eprintln!("[aot] wrote {}", out_path.display());
+    Ok(())
 }
