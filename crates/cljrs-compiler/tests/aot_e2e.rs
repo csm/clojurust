@@ -1105,20 +1105,12 @@ fn test_fizzbuzz() {
 
 #[test]
 fn test_apply_basic() {
-    assert_output(
-        "apply_basic",
-        r#"(println (apply + [1 2 3]))"#,
-        "6",
-    );
+    assert_output("apply_basic", r#"(println (apply + [1 2 3]))"#, "6");
 }
 
 #[test]
 fn test_apply_multi_arg() {
-    assert_output(
-        "apply_multi_arg",
-        r#"(println (apply + 1 2 [3 4]))"#,
-        "10",
-    );
+    assert_output("apply_multi_arg", r#"(println (apply + 1 2 [3 4]))"#, "10");
 }
 
 // ── HOF tests ───────────────────────────────────────────────────────────────
@@ -1149,11 +1141,7 @@ fn test_filter_basic() {
 
 #[test]
 fn test_reduce_2arg() {
-    assert_output(
-        "reduce_2arg",
-        r#"(println (reduce + [1 2 3 4 5]))"#,
-        "15",
-    );
+    assert_output("reduce_2arg", r#"(println (reduce + [1 2 3 4 5]))"#, "15");
 }
 
 #[test]
@@ -1915,6 +1903,12 @@ fn test_clojure_test_with_failure() {
 (run-tests)
 "#,
     );
-    assert!(output.contains("1 failures"), "expected failure report, got: {output}");
-    assert!(output.contains("FAIL in"), "expected FAIL message, got: {output}");
+    assert!(
+        output.contains("1 failures"),
+        "expected failure report, got: {output}"
+    );
+    assert!(
+        output.contains("FAIL in"),
+        "expected FAIL message, got: {output}"
+    );
 }

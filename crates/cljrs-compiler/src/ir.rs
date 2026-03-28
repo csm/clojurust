@@ -637,10 +637,9 @@ impl KnownFn {
             | KnownFn::MapIndexed => Effect::UnknownCall,
 
             // Function combinators (return new fns, call unknown fns)
-            KnownFn::Juxt
-            | KnownFn::Comp
-            | KnownFn::Partial
-            | KnownFn::Complement => Effect::UnknownCall,
+            KnownFn::Juxt | KnownFn::Comp | KnownFn::Partial | KnownFn::Complement => {
+                Effect::UnknownCall
+            }
 
             // Pure collection ops
             KnownFn::Frequencies | KnownFn::Zipmap => Effect::Alloc,

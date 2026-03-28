@@ -325,7 +325,9 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
                     .iter()
                     .map(|b| match b {
                         Value::Bool(v) => Ok(*v),
-                        _ => Err(ConvertError::TypeError("expected bool for is-variadic".into())),
+                        _ => Err(ConvertError::TypeError(
+                            "expected bool for is-variadic".into(),
+                        )),
                     })
                     .collect::<ConvertResult<Vec<_>>>()?
             } else {

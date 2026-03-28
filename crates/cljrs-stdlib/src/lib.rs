@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use cljrs_eval::GlobalEnv;
 
+mod core_async;
 mod edn;
 pub mod io;
 mod set;
 mod string;
-mod core_async;
 // ── Embedded sources ──────────────────────────────────────────────────────────
 
 const CLOJURE_TEST_SRC: &str = include_str!("clojure/test.cljrs");

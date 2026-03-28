@@ -905,9 +905,13 @@ fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str)
     let mut code = String::new();
 
     // Generate the namespace strings array inline
-    let ns_strings: Vec<String> = namespaces.iter().map(|s| format!("\"{}\".to_string()", s)).collect();
+    let ns_strings: Vec<String> = namespaces
+        .iter()
+        .map(|s| format!("\"{}\".to_string()", s))
+        .collect();
 
-    code.push_str(r#"//! Auto-generated AOT test harness for clojurust.
+    code.push_str(
+        r#"//! Auto-generated AOT test harness for clojurust.
 //!
 //! Discovers and runs all clojure.test tests in the bundled namespaces.
 
@@ -919,10 +923,12 @@ fn main() {
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
-"#);
+"#,
+    );
 
     code.push_str(bundled_registration);
-    code.push_str(r#"    let mut env = cljrs_eval::Env::new(globals, "user");
+    code.push_str(
+        r#"    let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
     cljrs_eval::callback::push_eval_context(&env);
@@ -938,7 +944,8 @@ fn main() {
 
     // Load all test namespaces
     (|| {
-"#);
+"#,
+    );
 
     for ns in namespaces.iter() {
         code.push_str(&format!(
@@ -947,7 +954,8 @@ fn main() {
         ));
     }
 
-    code.push_str(r#"    })();
+    code.push_str(
+        r#"    })();
 
     // Run tests for each namespace separately
     let mut total_pass = 0i64;
@@ -956,7 +964,8 @@ fn main() {
     let mut total_test_count = 0i64;
 
     for ns_str in vec![
-"#);
+"#,
+    );
 
     for ns_str in ns_strings.iter() {
         code.push_str(&format!("        {},\n", ns_str));
@@ -1062,7 +1071,10 @@ pub fn compile_test_harness(
     for (i, ns) in namespaces.iter().enumerate() {
         let rel_path = ns.replace('.', "/").replace('-', "_");
         if let Some(src) = find_user_source(&rel_path, &search_dirs) {
-            std::fs::write(harness_dir.join("src").join(format!("bundled_{i}.cljrs")), &src)?;
+            std::fs::write(
+                harness_dir.join("src").join(format!("bundled_{i}.cljrs")),
+                &src,
+            )?;
             eprintln!("[aot] bundled {ns} → src/bundled_{i}.cljrs");
         } else {
             return Err(AotError::Eval(format!(

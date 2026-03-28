@@ -597,14 +597,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                             ),
                         );
                         for (i, &v) in template.is_variadic.iter().enumerate() {
-                            let v_val =
-                                self.builder.ins().iconst(types::I8, if v { 1 } else { 0 });
-                            self.builder
-                                .ins()
-                                .stack_store(v_val, var_slot, i as i32);
+                            let v_val = self.builder.ins().iconst(types::I8, if v { 1 } else { 0 });
+                            self.builder.ins().stack_store(v_val, var_slot, i as i32);
                         }
-                        let var_addr =
-                            self.builder.ins().stack_addr(self.ptr_type, var_slot, 0);
+                        let var_addr = self.builder.ins().stack_addr(self.ptr_type, var_slot, 0);
 
                         let n_arities_val = self.builder.ins().iconst(types::I64, n_arities as i64);
 
@@ -1006,10 +1002,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::WithBindings => return self.emit_with_bindings(args),
             KnownFn::Concat => return self.emit_alloc_collection(self.rt.rt_concat, args),
             KnownFn::Str if args.len() != 1 => {
-                return self.emit_alloc_collection(self.rt.rt_str_n, args)
+                return self.emit_alloc_collection(self.rt.rt_str_n, args);
             }
             KnownFn::Println if args.len() != 1 => {
-                return self.emit_alloc_collection(self.rt.rt_println_n, args)
+                return self.emit_alloc_collection(self.rt.rt_println_n, args);
             }
             KnownFn::Merge => return self.emit_alloc_collection(self.rt.rt_merge, args),
             KnownFn::Juxt => return self.emit_alloc_collection(self.rt.rt_juxt, args),
@@ -1201,10 +1197,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         fn_name: &str,
         args: &[VarId],
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
-        let func_id = self
-            .user_funcs
-            .get(fn_name)
-            .ok_or_else(|| CodegenError::Codegen(format!("CallDirect: unknown function {fn_name}")))?;
+        let func_id = self.user_funcs.get(fn_name).ok_or_else(|| {
+            CodegenError::Codegen(format!("CallDirect: unknown function {fn_name}"))
+        })?;
         let func_ref = self.import_func(*func_id);
         let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
         let call = self.builder.ins().call(func_ref, &arg_vals);

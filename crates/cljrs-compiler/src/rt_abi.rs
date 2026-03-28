@@ -742,9 +742,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
         func: Arc::new(move |args: &[Value]| {
             let argc = args.len();
             // Try exact match on fixed arities first.
-            let matched = arity_table
-                .iter()
-                .find(|(_, pc, v)| !v && *pc == argc);
+            let matched = arity_table.iter().find(|(_, pc, v)| !v && *pc == argc);
             if let Some(&(fn_addr, _pc, _v)) = matched {
                 let total_params = ncaptures + argc;
                 let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
@@ -760,9 +758,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
             }
 
             // Try variadic arity (argc >= fixed_count).
-            let variadic_match = arity_table
-                .iter()
-                .find(|(_, pc, v)| *v && argc >= *pc);
+            let variadic_match = arity_table.iter().find(|(_, pc, v)| *v && argc >= *pc);
             if let Some(&(fn_addr, fixed_count, _)) = variadic_match {
                 // Compiled function receives: captures + fixed_params + 1 (rest list)
                 let total_compiled = ncaptures + fixed_count + 1;
@@ -789,13 +785,11 @@ pub unsafe extern "C" fn rt_make_fn_multi(
             // No matching arity found.
             let counts: Vec<String> = arity_table
                 .iter()
-                .map(|(_, pc, v)| {
-                    if *v {
-                        format!("{pc}+")
-                    } else {
-                        pc.to_string()
-                    }
-                })
+                .map(
+                    |(_, pc, v)| {
+                        if *v { format!("{pc}+") } else { pc.to_string() }
+                    },
+                )
                 .collect();
             Err(cljrs_value::ValueError::ArityError {
                 name: fn_name.to_string(),
@@ -1602,7 +1596,9 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
 
 /// Helper: look up a global function by namespace and name, then call it.
 fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
-    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() && let Some(val) = globals.lookup_in_ns(ns, name) {
+    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context()
+        && let Some(val) = globals.lookup_in_ns(ns, name)
+    {
         match cljrs_eval::callback::invoke(&val, args) {
             Ok(result) => box_val(result),
             Err(cljrs_value::ValueError::Thrown(v)) => {
@@ -1996,10 +1992,7 @@ pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Va
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_juxt(
-    elems: *const *const Value,
-    n: i64,
-) -> *const Value {
+pub unsafe extern "C" fn rt_juxt(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "juxt", args)
 }
@@ -2008,10 +2001,7 @@ pub unsafe extern "C" fn rt_juxt(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_comp(
-    elems: *const *const Value,
-    n: i64,
-) -> *const Value {
+pub unsafe extern "C" fn rt_comp(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "comp", args)
 }
@@ -2020,10 +2010,7 @@ pub unsafe extern "C" fn rt_comp(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_partial(
-    elems: *const *const Value,
-    n: i64,
-) -> *const Value {
+pub unsafe extern "C" fn rt_partial(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "partial", args)
 }
@@ -2044,10 +2031,7 @@ pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_concat(
-    elems: *const *const Value,
-    n: i64,
-) -> *const Value {
+pub unsafe extern "C" fn rt_concat(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "concat", args)
 }
@@ -2158,10 +2142,7 @@ pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_merge(
-    elems: *const *const Value,
-    n: i64,
-) -> *const Value {
+pub unsafe extern "C" fn rt_merge(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "merge", args)
 }
@@ -2213,7 +2194,10 @@ pub unsafe extern "C" fn rt_assoc_in(
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Long(_) | Value::Double(_))))
+    box_val(Value::Bool(matches!(
+        val,
+        Value::Long(_) | Value::Double(_)
+    )))
 }
 
 /// # Safety
