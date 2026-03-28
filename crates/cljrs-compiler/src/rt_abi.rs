@@ -12,7 +12,9 @@
 use cljrs_gc::GcPtr;
 use cljrs_value::keyword::Keyword;
 use cljrs_value::value::{MapValue, PrintValue, SetValue};
-use cljrs_value::{CljxCons, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value};
+use cljrs_value::{
+    CljxCons, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value,
+};
 
 use std::sync::Arc;
 
@@ -26,6 +28,20 @@ use std::sync::Arc;
 #[inline]
 unsafe fn val_ref<'a>(ptr: *const Value) -> &'a Value {
     unsafe { &*ptr }
+}
+
+/// Helper: collect stack-spilled arguments into a Vec.
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[inline]
+unsafe fn collect_args(elems: *const *const Value, n: i64) -> Vec<Value> {
+    let mut args = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        let ptr = unsafe { *elems.add(i) };
+        args.push(unsafe { val_ref(ptr) }.clone());
+    }
+    args
 }
 
 /// Box a `Value` on the GC heap and return a raw pointer.
@@ -365,6 +381,7 @@ pub unsafe extern "C" fn rt_get(coll: *const Value, key: *const Value) -> *const
     let key = unsafe { val_ref(key) };
     let result = match coll {
         Value::Map(m) => m.get(key),
+        Value::TypeInstance(ti) => ti.get().fields.get(key),
         Value::Vector(v) => {
             if let Value::Long(i) = key {
                 v.get().nth(*i as *const () as usize).cloned()
@@ -457,6 +474,14 @@ pub unsafe extern "C" fn rt_assoc(
         Value::Map(map) => {
             let new_map = map.assoc(k, v);
             box_val(Value::Map(new_map))
+        }
+        Value::TypeInstance(ti) => {
+            let mut fields = ti.get().fields.clone();
+            fields = fields.assoc(k, v);
+            box_val(Value::TypeInstance(GcPtr::new(TypeInstance {
+                type_tag: ti.get().type_tag.clone(),
+                fields,
+            })))
         }
         _ => rt_const_nil(),
     }
@@ -1050,8 +1075,7 @@ pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
-    // PrintValue uses non-readable format (like Clojure's print/println).
-    println!("{}", PrintValue(v));
+    cljrs_eval::builtins::emit_output_ln(&format!("{}", PrintValue(v)));
     rt_const_nil()
 }
 
@@ -1062,8 +1086,7 @@ pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_pr(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
-    // Value's Display impl uses readable format (like Clojure's pr).
-    print!("{v}");
+    cljrs_eval::builtins::emit_output(&format!("{v}"));
     rt_const_nil()
 }
 
@@ -1126,6 +1149,53 @@ pub unsafe extern "C" fn rt_str(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
     let s = format!("{}", PrintValue(v));
     box_val(Value::Str(GcPtr::new(s)))
+}
+
+/// `(str a b c ...)` — variadic str, concatenates PrintValue representations.
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_str_n(elems: *const *const Value, n: i64) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    let mut result = String::new();
+    for v in &args {
+        if !matches!(v, Value::Nil) {
+            result.push_str(&format!("{}", PrintValue(v)));
+        }
+    }
+    box_val(Value::Str(GcPtr::new(result)))
+}
+
+/// `(println a b c ...)` — variadic println, space-separated PrintValue representations.
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *const Value {
+    let args = unsafe { collect_args(elems, n) };
+    let s: String = args
+        .iter()
+        .map(|v| format!("{}", PrintValue(v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    cljrs_eval::builtins::emit_output_ln(&s);
+    rt_const_nil()
+}
+
+// ── Output capture ──────────────────────────────────────────────────────────
+
+/// `(with-out-str body-closure)` — push capture, call closure, pop capture, return string.
+///
+/// # Safety
+/// `body_fn` must be a valid pointer to a Value (a callable).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_with_out_str(body_fn: *const Value) -> *const Value {
+    let f = unsafe { val_ref(body_fn) }.clone();
+    cljrs_eval::builtins::push_output_capture();
+    let _result = cljrs_eval::callback::invoke(&f, vec![]);
+    let captured = cljrs_eval::builtins::pop_output_capture().unwrap_or_default();
+    box_val(Value::Str(GcPtr::new(captured)))
 }
 
 // ── Collection operations (extended) ─────────────────────────────────────────
@@ -1532,24 +1602,23 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
 
 /// Helper: look up a global function by namespace and name, then call it.
 fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
-    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() {
-        if let Some(val) = globals.lookup_in_ns(ns, name) {
-            match cljrs_eval::callback::invoke(&val, args) {
-                Ok(result) => return box_val(result),
-                Err(cljrs_value::ValueError::Thrown(v)) => {
-                    PENDING_EXCEPTION.with(|cell| {
-                        *cell.borrow_mut() = Some(box_val(v));
-                    });
-                    return rt_const_nil();
-                }
-                Err(_) => return rt_const_nil(),
+    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() && let Some(val) = globals.lookup_in_ns(ns, name) {
+        match cljrs_eval::callback::invoke(&val, args) {
+            Ok(result) => box_val(result),
+            Err(cljrs_value::ValueError::Thrown(v)) => {
+                PENDING_EXCEPTION.with(|cell| {
+                    *cell.borrow_mut() = Some(box_val(v));
+                });
+                rt_const_nil()
             }
+            Err(_) => rt_const_nil(),
         }
+    } else {
+        rt_const_nil()
     }
-    rt_const_nil()
 }
 
-/// `(reduce f coll)` or `(reduce f init coll)`.
+/// `(reduce f coll)`.
 ///
 /// # Safety
 /// All pointers must be valid.
@@ -1560,6 +1629,10 @@ pub unsafe extern "C" fn rt_reduce2(f: *const Value, coll: *const Value) -> *con
     call_global_fn("clojure.core", "reduce", vec![f, coll])
 }
 
+/// `(reduce f init coll)`.
+///
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_reduce3(
     f: *const Value,
@@ -1573,6 +1646,8 @@ pub unsafe extern "C" fn rt_reduce3(
 }
 
 /// `(map f coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_map(f: *const Value, coll: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
@@ -1581,6 +1656,8 @@ pub unsafe extern "C" fn rt_map(f: *const Value, coll: *const Value) -> *const V
 }
 
 /// `(filter pred coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_filter(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
@@ -1589,6 +1666,8 @@ pub unsafe extern "C" fn rt_filter(pred: *const Value, coll: *const Value) -> *c
 }
 
 /// `(mapv f coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_mapv(f: *const Value, coll: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
@@ -1597,6 +1676,8 @@ pub unsafe extern "C" fn rt_mapv(f: *const Value, coll: *const Value) -> *const 
 }
 
 /// `(filterv pred coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_filterv(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
@@ -1605,6 +1686,8 @@ pub unsafe extern "C" fn rt_filterv(pred: *const Value, coll: *const Value) -> *
 }
 
 /// `(some pred coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_some(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
@@ -1613,6 +1696,8 @@ pub unsafe extern "C" fn rt_some(pred: *const Value, coll: *const Value) -> *con
 }
 
 /// `(every? pred coll)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
@@ -1621,6 +1706,8 @@ pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *co
 }
 
 /// `(into to from)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const Value {
     let to = unsafe { val_ref(to) }.clone();
@@ -1629,6 +1716,8 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
 }
 
 /// `(into to xform from)`.
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_into3(
     to: *const Value,
@@ -1855,6 +1944,8 @@ pub extern "C" fn rt_partition4(
 }
 
 /// `(frequencies coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_frequencies(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
@@ -1862,6 +1953,8 @@ pub extern "C" fn rt_frequencies(coll: *const Value) -> *const Value {
 }
 
 /// `(keep f coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_keep(f: *const Value, coll: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
@@ -1870,6 +1963,8 @@ pub extern "C" fn rt_keep(f: *const Value, coll: *const Value) -> *const Value {
 }
 
 /// `(remove pred coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_remove(pred: *const Value, coll: *const Value) -> *const Value {
     let pv = unsafe { val_ref(pred) }.clone();
@@ -1878,6 +1973,8 @@ pub extern "C" fn rt_remove(pred: *const Value, coll: *const Value) -> *const Va
 }
 
 /// `(map-indexed f coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_map_indexed(f: *const Value, coll: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
@@ -1886,6 +1983,8 @@ pub extern "C" fn rt_map_indexed(f: *const Value, coll: *const Value) -> *const 
 }
 
 /// `(zipmap keys vals)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Value {
     let kv = unsafe { val_ref(keys) }.clone();
@@ -1894,6 +1993,8 @@ pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Va
 }
 
 /// `(juxt f1 f2 ...)` — variadic, stack-spilled
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_juxt(
     elems: *const *const Value,
@@ -1904,6 +2005,8 @@ pub unsafe extern "C" fn rt_juxt(
 }
 
 /// `(comp f1 f2 ...)` — variadic, stack-spilled
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_comp(
     elems: *const *const Value,
@@ -1914,6 +2017,8 @@ pub unsafe extern "C" fn rt_comp(
 }
 
 /// `(partial f arg1 arg2 ...)` — variadic, stack-spilled
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_partial(
     elems: *const *const Value,
@@ -1924,6 +2029,9 @@ pub unsafe extern "C" fn rt_partial(
 }
 
 /// `(complement f)`
+///
+/// # Safety
+/// `f` must be a valid pointer to a callable Value.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
@@ -1933,6 +2041,8 @@ pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
 // ── Sequence operations ──────────────────────────────────────────────────────
 
 /// `(concat & colls)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_concat(
     elems: *const *const Value,
@@ -1943,6 +2053,8 @@ pub unsafe extern "C" fn rt_concat(
 }
 
 /// `(range end)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_range1(end: *const Value) -> *const Value {
     let e = unsafe { val_ref(end) }.clone();
@@ -1950,6 +2062,8 @@ pub unsafe extern "C" fn rt_range1(end: *const Value) -> *const Value {
 }
 
 /// `(range start end)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_range2(start: *const Value, end: *const Value) -> *const Value {
     let s = unsafe { val_ref(start) }.clone();
@@ -1958,6 +2072,8 @@ pub unsafe extern "C" fn rt_range2(start: *const Value, end: *const Value) -> *c
 }
 
 /// `(range start end step)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_range3(
     start: *const Value,
@@ -1971,6 +2087,8 @@ pub unsafe extern "C" fn rt_range3(
 }
 
 /// `(take n coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_take(n: *const Value, coll: *const Value) -> *const Value {
     let nv = unsafe { val_ref(n) }.clone();
@@ -1979,6 +2097,8 @@ pub unsafe extern "C" fn rt_take(n: *const Value, coll: *const Value) -> *const 
 }
 
 /// `(drop n coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_drop(n: *const Value, coll: *const Value) -> *const Value {
     let nv = unsafe { val_ref(n) }.clone();
@@ -1987,6 +2107,8 @@ pub unsafe extern "C" fn rt_drop(n: *const Value, coll: *const Value) -> *const 
 }
 
 /// `(reverse coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_reverse(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
@@ -1994,6 +2116,8 @@ pub unsafe extern "C" fn rt_reverse(coll: *const Value) -> *const Value {
 }
 
 /// `(sort coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_sort(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
@@ -2001,6 +2125,8 @@ pub unsafe extern "C" fn rt_sort(coll: *const Value) -> *const Value {
 }
 
 /// `(sort-by keyfn coll)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_sort_by(keyfn: *const Value, coll: *const Value) -> *const Value {
     let kf = unsafe { val_ref(keyfn) }.clone();
@@ -2011,6 +2137,8 @@ pub unsafe extern "C" fn rt_sort_by(keyfn: *const Value, coll: *const Value) -> 
 // ── Collection operations ───────────────────────────────────────────────────
 
 /// `(keys m)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_keys(m: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
@@ -2018,6 +2146,8 @@ pub unsafe extern "C" fn rt_keys(m: *const Value) -> *const Value {
 }
 
 /// `(vals m)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
@@ -2025,6 +2155,8 @@ pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
 }
 
 /// `(merge & maps)` — variadic, stack-spilled
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_merge(
     elems: *const *const Value,
@@ -2035,6 +2167,8 @@ pub unsafe extern "C" fn rt_merge(
 }
 
 /// `(update m k f)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_update(
     m: *const Value,
@@ -2048,6 +2182,8 @@ pub unsafe extern "C" fn rt_update(
 }
 
 /// `(get-in m ks)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_get_in(m: *const Value, ks: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
@@ -2056,6 +2192,8 @@ pub unsafe extern "C" fn rt_get_in(m: *const Value, ks: *const Value) -> *const 
 }
 
 /// `(assoc-in m ks v)`
+/// # Safety
+/// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_assoc_in(
     m: *const Value,
@@ -2070,36 +2208,48 @@ pub unsafe extern "C" fn rt_assoc_in(
 
 // ── Type predicates ─────────────────────────────────────────────────────────
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     box_val(Value::Bool(matches!(val, Value::Long(_) | Value::Double(_))))
 }
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_string(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     box_val(Value::Bool(matches!(val, Value::Str(_))))
 }
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_keyword(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     box_val(Value::Bool(matches!(val, Value::Keyword(_))))
 }
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_symbol(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     box_val(Value::Bool(matches!(val, Value::Symbol(_))))
 }
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_bool(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     box_val(Value::Bool(matches!(val, Value::Bool(_))))
 }
 
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
@@ -2109,39 +2259,37 @@ pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
 // ── Additional I/O ──────────────────────────────────────────────────────────
 
 /// `(prn x)` — print readably + newline
+///
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    println!("{}", PrintValue(val));
+    cljrs_eval::builtins::emit_output_ln(&format!("{val}"));
     box_val(Value::Nil)
 }
 
 /// `(print x)` — print without newline
+///
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_print(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    print!("{val}");
+    cljrs_eval::builtins::emit_output(&format!("{}", PrintValue(val)));
     box_val(Value::Nil)
 }
 
 // ── Atom construction ───────────────────────────────────────────────────────
 
 /// `(atom x)`
+///
+/// # Safety
+/// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_atom(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) }.clone();
     call_global_fn("clojure.core", "atom", vec![val])
-}
-
-// ── Helper: collect stack-spilled args ───────────────────────────────────────
-
-unsafe fn collect_args(elems: *const *const Value, n: i64) -> Vec<Value> {
-    let mut args = Vec::with_capacity(n as usize);
-    for i in 0..n as usize {
-        let ptr = unsafe { *elems.add(i) };
-        args.push(unsafe { val_ref(ptr) }.clone());
-    }
-    args
 }
 
 // ── Symbol anchor ────────────────────────────────────────────────────────────
@@ -2197,6 +2345,9 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_is_seq as *const () as usize);
     std::hint::black_box(rt_identical as *const () as usize);
     std::hint::black_box(rt_str as *const () as usize);
+    std::hint::black_box(rt_str_n as *const () as usize);
+    std::hint::black_box(rt_println_n as *const () as usize);
+    std::hint::black_box(rt_with_out_str as *const () as usize);
     std::hint::black_box(rt_make_fn as *const () as usize);
     std::hint::black_box(rt_make_fn_variadic as *const () as usize);
     std::hint::black_box(rt_make_fn_multi as *const () as usize);
