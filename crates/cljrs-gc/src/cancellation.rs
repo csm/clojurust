@@ -49,6 +49,23 @@ pub fn check_cancellation() -> Result<(), GcParked> {
     CONFIG_CANCELLATION.check()
 }
 
+/// GC safepoint: if a collection is in progress, park this thread until
+/// it completes.  This is a blocking call suitable for use at allocation
+/// sites and other places where returning an error is not practical.
+///
+/// The implementation spin-yields to avoid busy-waiting.
+pub fn safepoint() {
+    if !CONFIG_CANCELLATION.in_progress() {
+        return;
+    }
+    // GC is in progress — park and wait.
+    CONFIG_CANCELLATION.park();
+    while CONFIG_CANCELLATION.in_progress() {
+        std::thread::yield_now();
+    }
+    CONFIG_CANCELLATION.unpark();
+}
+
 /// A helper that wraps a function with cancellation checking.
 ///
 /// The wrapped function is called periodically, and if a GC is in progress,

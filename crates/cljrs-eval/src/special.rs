@@ -522,6 +522,11 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     loop {
+        // GC safepoint: check on every loop iteration so tight recur
+        // loops don't starve the collector.
+        cljrs_gc::check_cancellation()
+            .map_err(|_| EvalError::Runtime("GC in progress, operation cancelled".to_string()))?;
+
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
             if let Err(e) = bind_pattern(pat, val.clone(), env) {

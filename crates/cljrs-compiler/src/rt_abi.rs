@@ -57,6 +57,17 @@ fn box_val(v: Value) -> *const Value {
     ptr.get() as *const Value
 }
 
+// ── Safepoint ───────────────────────────────────────────────────────────────
+
+/// GC safepoint for AOT-compiled code.
+///
+/// Emitted at function entry and before recur jumps so that compiled
+/// tight loops cooperate with the garbage collector.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_safepoint() {
+    cljrs_gc::safepoint();
+}
+
 // ── Constants ───────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]

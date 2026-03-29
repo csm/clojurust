@@ -37,6 +37,7 @@ pub type CodegenResult<T> = Result<T, CodegenError>;
 
 /// Cached `FuncId`s for runtime bridge functions.
 struct RuntimeFuncs {
+    rt_safepoint: FuncId,
     rt_const_nil: FuncId,
     rt_const_true: FuncId,
     rt_const_false: FuncId,
@@ -288,6 +289,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             let param_val = self.builder.block_params(entry_block)[i];
             self.builder.def_var(var, param_val);
         }
+
+        // GC safepoint at function entry.
+        self.emit_safepoint();
 
         // Translate each block.
         for (block_idx, ir_block) in ir_func.blocks.iter().enumerate() {
@@ -708,6 +712,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
 
             Terminator::RecurJump { target, args } => {
+                // GC safepoint before looping back, so tight recur
+                // loops cooperate with the collector.
+                self.emit_safepoint();
                 let clif_block = self.block_map[target];
                 let arg_vals: Vec<BlockArg> = args
                     .iter()
@@ -757,6 +764,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
+
+    /// Emit a call to `rt_safepoint()`.
+    fn emit_safepoint(&mut self) {
+        let func_ref = self.import_func(self.rt.rt_safepoint);
+        self.builder.ins().call(func_ref, &[]);
+    }
 
     fn ensure_var(&mut self, var_id: VarId) -> Variable {
         if let Some(&var) = self.var_map.get(&var_id) {
@@ -1324,7 +1337,16 @@ fn declare_runtime_funcs(
     module: &mut ObjectModule,
     ptr: types::Type,
 ) -> CodegenResult<RuntimeFuncs> {
+    // Declare rt_safepoint: void -> void.  We declare it as returning ptr
+    // (ignored) to keep the signature uniform with declare_rt.
+    let rt_safepoint = {
+        let mut sig = module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        module.declare_function("rt_safepoint", Linkage::Import, &sig)?
+    };
+
     Ok(RuntimeFuncs {
+        rt_safepoint,
         rt_const_nil: declare_rt(module, "rt_const_nil", &[], ptr)?,
         rt_const_true: declare_rt(module, "rt_const_true", &[], ptr)?,
         rt_const_false: declare_rt(module, "rt_const_false", &[], ptr)?,

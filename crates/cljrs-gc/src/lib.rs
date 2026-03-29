@@ -35,7 +35,9 @@ pub mod config;
 pub mod region;
 
 // Re-export cancellation types for convenience
-pub use cancellation::{CancellableGuard, check_cancellation, park_thread, unpark_thread};
+pub use cancellation::{
+    CancellableGuard, check_cancellation, park_thread, safepoint, unpark_thread,
+};
 
 use std::cell::Cell;
 use std::ptr::NonNull;
@@ -238,6 +240,9 @@ impl GcHeap {
 
     /// Allocate a new GC-managed value and register it in the heap.
     pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
+        // Safepoint: if a GC is in progress, park until it completes.
+        cancellation::safepoint();
+
         // Estimate memory usage
         let estimated_size = ESTIMATED_OBJECT_SIZE;
 

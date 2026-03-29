@@ -328,8 +328,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
 
     let mut current_args = args;
     loop {
-        // Check for GC cancellation before entering function body
-        // Check for GC cancellation before entering function body
+        // GC safepoint: check before entering function body
         check_cancellation()
             .map_err(|_| EvalError::Runtime("GC in progress, operation cancelled".to_string()))?;
 
