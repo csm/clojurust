@@ -1,0 +1,3 @@
+vec![
+  "/Users/csm/src/clojurust/.cljrs-aot-test-harness/target/release/build/cranelift-assembler-x64-6e6a0fb70e1d275d/out/assembler.rs".into(),
+]

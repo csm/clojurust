@@ -1,0 +1,18 @@
+(let [
+            arange (range 1 100) ;; enough to cross nodes
+            avec (into [] arange)
+            alist (into () arange)
+            obj-array (into-array arange)
+            int-array (into-array (int-array 100) (map int arange))
+            long-array (into-array (long-array 100) arange)
+            float-array (into-array (float-array 100) arange)
+            double-array (into-array (double-array 100) arange)]
+  (println {:range [(reduce + arange) (= 4950 (reduce + arange))]
+            :list [(reduce + alist) (= 4950 (reduce + alist))]
+            :vec  [(reduce + alist) (= 4950 (reduce + avec))]
+            :obj-array [(reduce + obj-array) (= 4950 (reduce + obj-array))]
+            :int-array [(reduce + int-array) (= 4950 (reduce + int-array))]
+            :long-array [(reduce + long-array) (= 4950 (reduce + long-array))]
+            :float-array [(reduce + float-array) (= 4950 (reduce + float-array))]
+            :double-array [(reduce + double-array) (= 4950 (reduce + double-array))]}))
+

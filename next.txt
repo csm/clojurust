@@ -1,0 +1,19 @@
+  Critical Gaps
+
+  1. swap!/reset! not lowered as KnownFn — they work via interpreter sentinel dispatch but bypass the known-fn fast path. Very common operations.
+  2. Destructuring in let — vector/map destructuring in let bindings happens at macro-expansion time (the interpreter expands let with destructuring into let* with explicit gets). Should work, but untested in
+  AOT.
+  3. Recur in defn (non-loop recur) — (defn foo [x] (if (> x 0) (recur (dec x)) x)) — untested.
+
+  Medium Gaps
+
+  4. Concurrency — future, delay, promise, agent, volatile! all interpreter-only. Work via preamble/rt_call but no fast path.
+  5. Transducers — full interpreter support exists, but transduce/sequence/xform arities aren't in the known-fn table. Work via rt_call.
+  6. Math builtins — abs, bit-and, bit-or, bit-shift-left, etc. not in known table.
+  7. with-out-str — marked "not yet in IR" in anf.cljrs. Blocks test harness patterns.
+
+  Low Priority
+
+  8. Regex literals — #"pattern" not handled in lowering
+  9. More builtins as KnownFn — ex-info/ex-data/ex-message, compare-and-set!, etc. (all work via rt_call already)
+

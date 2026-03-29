@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
@@ -98,7 +98,10 @@ enum Commands {
 /// Build GC config from CLI flags, or use defaults if not specified.
 fn build_gc_config(soft_limit_mb: Option<usize>, hard_limit_mb: Option<usize>) -> Arc<GcConfig> {
     match (soft_limit_mb, hard_limit_mb) {
-        (Some(soft), Some(hard)) => Arc::new(GcConfig::with_limits(soft * 1024 * 1024, hard * 1024 * 1024)),
+        (Some(soft), Some(hard)) => Arc::new(GcConfig::with_limits(
+            soft * 1024 * 1024,
+            hard * 1024 * 1024,
+        )),
         (Some(soft), None) => Arc::new(GcConfig::with_hard_limit(soft * 1024 * 1024)),
         (None, Some(hard)) => Arc::new(GcConfig::with_hard_limit(hard * 1024 * 1024)),
         (None, None) => Arc::new(GcConfig::new()),
@@ -121,14 +124,23 @@ fn main() -> miette::Result<()> {
 
 fn run(cli: Cli) -> miette::Result<()> {
     match cli.command {
-        Commands::Run { file, src_paths, gc_soft_limit_mb, gc_hard_limit_mb } => {
+        Commands::Run {
+            file,
+            src_paths,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
+        } => {
             let src = std::fs::read_to_string(&file)
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             run_source(&src, &filename, src_paths, gc_config)?;
         }
-        Commands::Repl { src_paths, gc_soft_limit_mb, gc_hard_limit_mb } => {
+        Commands::Repl {
+            src_paths,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
+        } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             run_repl(src_paths, gc_config);
         }
@@ -166,7 +178,13 @@ fn run(cli: Cli) -> miette::Result<()> {
             gc_soft_limit_mb,
             gc_hard_limit_mb,
         } => {
-            run_tests_command(namespaces, src_paths, verbose, gc_soft_limit_mb, gc_hard_limit_mb)?;
+            run_tests_command(
+                namespaces,
+                src_paths,
+                verbose,
+                gc_soft_limit_mb,
+                gc_hard_limit_mb,
+            )?;
         }
     }
     Ok(())
@@ -182,7 +200,12 @@ fn eval_source(src: &str, filename: &str, gc_config: Arc<GcConfig>) -> miette::R
 }
 
 /// Run a source file: evaluate all top-level forms, print nothing on success.
-fn run_source(src: &str, filename: &str, src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) -> miette::Result<()> {
+fn run_source(
+    src: &str,
+    filename: &str,
+    src_paths: Vec<PathBuf>,
+    gc_config: Arc<GcConfig>,
+) -> miette::Result<()> {
     let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)?;

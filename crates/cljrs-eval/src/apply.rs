@@ -213,9 +213,8 @@ pub fn resolve_type_tag(sym: &str) -> Arc<str> {
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Check for GC cancellation at function application boundary
-    check_cancellation().map_err(|_| {
-        EvalError::Runtime("GC in progress, operation cancelled".to_string())
-    })?;
+    check_cancellation()
+        .map_err(|_| EvalError::Runtime("GC in progress, operation cancelled".to_string()))?;
 
     match callee {
         Value::NativeFunction(nf) => {
@@ -331,9 +330,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
     loop {
         // Check for GC cancellation before entering function body
         // Check for GC cancellation before entering function body
-        check_cancellation().map_err(|_| {
-            EvalError::Runtime("GC in progress, operation cancelled".to_string())
-        })?;
+        check_cancellation()
+            .map_err(|_| EvalError::Runtime("GC in progress, operation cancelled".to_string()))?;
 
         env.push_frame();
 
@@ -351,9 +349,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
         env.pop_frame();
 
         // Check for GC cancellation after function body (before recur)
-        check_cancellation().map_err(|_| {
-            EvalError::Runtime("GC in progress, operation cancelled".to_string())
-        })?;
+        check_cancellation()
+            .map_err(|_| EvalError::Runtime("GC in progress, operation cancelled".to_string()))?;
 
         match result {
             Ok(v) => return Ok(v),
