@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "JIT (Cranelift) and AOT compiler backend for clojurust"
 
+[features]
+aot_full_test = []
+
 [dependencies]
 cljrs-types  = { workspace = true }
 cljrs-gc     = { workspace = true }

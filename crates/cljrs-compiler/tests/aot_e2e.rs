@@ -2,6 +2,13 @@
 //!
 //! Each test writes a `.cljrs` source file, compiles it to a binary via
 //! `compile_file`, runs the binary, and asserts on stdout.
+//!
+//! A core subset (~20 tests) always runs.  The full suite (~120 tests) is
+//! gated behind the `aot_full_test` feature:
+//!
+//! ```sh
+//! cargo test -p cljrs-compiler --features aot_full_test
+//! ```
 
 use std::process::Command;
 use std::sync::Mutex;
@@ -127,6 +134,7 @@ fn test_if_expression() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_when_macro() {
     assert_output(
         "when_macro",
@@ -143,6 +151,7 @@ fn test_when_macro() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_cond_macro() {
     assert_output(
         "cond_macro",
@@ -161,6 +170,7 @@ fn test_cond_macro() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_and_or() {
     assert_output(
         "and_or",
@@ -193,6 +203,7 @@ fn test_let_binding() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_nested_let() {
     assert_output(
         "nested_let",
@@ -285,6 +296,7 @@ fn test_closure_capture() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_higher_order_function() {
     assert_output(
         "higher_order",
@@ -347,6 +359,7 @@ fn test_map_ops() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_collection_literals() {
     assert_output(
         "collection_literals",
@@ -362,6 +375,7 @@ fn test_collection_literals() {
 // ── Destructuring ──────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_vector_destructuring() {
     assert_output(
         "vec_destructure",
@@ -376,6 +390,7 @@ fn test_vector_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_map_destructuring() {
     assert_output(
         "map_destructure",
@@ -388,6 +403,7 @@ fn test_map_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_fn_param_destructuring() {
     assert_output(
         "fn_destructure",
@@ -403,6 +419,7 @@ fn test_fn_param_destructuring() {
 // ── Threading macros ───────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_thread_first() {
     assert_output(
         "thread_first",
@@ -414,6 +431,7 @@ fn test_thread_first() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_thread_last() {
     assert_output(
         "thread_last",
@@ -445,6 +463,7 @@ fn test_try_catch() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_try_no_exception() {
     assert_output(
         "try_no_exception",
@@ -460,6 +479,7 @@ fn test_try_no_exception() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_ex_info_throw_catch() {
     assert_output(
         "ex_info_throw_catch",
@@ -475,6 +495,7 @@ fn test_ex_info_throw_catch() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_ex_info_data_only() {
     assert_output(
         "ex_info_data_only",
@@ -489,6 +510,7 @@ fn test_ex_info_data_only() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_try_catch_finally() {
     assert_output(
         "try_catch_finally",
@@ -506,6 +528,7 @@ fn test_try_catch_finally() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_try_no_exception_finally() {
     assert_output(
         "try_no_exception_finally",
@@ -523,6 +546,7 @@ fn test_try_no_exception_finally() {
 // ── Dynamic vars & binding ─────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_binding() {
     assert_output(
         "binding",
@@ -539,6 +563,7 @@ fn test_binding() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_set_bang() {
     assert_output(
         "set_bang",
@@ -556,6 +581,7 @@ fn test_set_bang() {
 // ── Letfn ──────────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_letfn_self_recursion() {
     assert_output(
         "letfn_self",
@@ -571,6 +597,7 @@ fn test_letfn_self_recursion() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_letfn_mutual_recursion() {
     assert_output(
         "letfn_mutual",
@@ -587,6 +614,7 @@ fn test_letfn_mutual_recursion() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_letfn_with_captures() {
     assert_output(
         "letfn_capture",
@@ -634,6 +662,7 @@ fn test_str_concat() {
 // ── Multi-arity functions ──────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multi_arity_fn() {
     assert_output(
         "multi_arity",
@@ -651,6 +680,7 @@ fn test_multi_arity_fn() {
 // ── Nested macros ──────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_nested_macros() {
     assert_output(
         "nested_macros",
@@ -673,6 +703,7 @@ fn test_nested_macros() {
 // ── If-let macro ───────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_if_let() {
     assert_output(
         "if_let",
@@ -722,6 +753,7 @@ fn test_first_rest() {
 // ── Protocols & multimethods ──────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_basic() {
     assert_output(
         "protocol_basic",
@@ -740,6 +772,7 @@ fn test_protocol_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_multi_method() {
     assert_output(
         "protocol_multi",
@@ -758,6 +791,7 @@ fn test_protocol_multi_method() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_defmulti_basic() {
     assert_output(
         "defmulti_basic",
@@ -775,6 +809,7 @@ fn test_defmulti_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_in_defn() {
     assert_output(
         "protocol_in_defn",
@@ -797,6 +832,7 @@ fn test_protocol_in_defn() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_defrecord() {
     assert_output(
         "defrecord",
@@ -811,6 +847,7 @@ fn test_defrecord() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_defrecord_with_protocol() {
     assert_output(
         "defrecord_proto",
@@ -831,6 +868,7 @@ fn test_defrecord_with_protocol() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_with_defn_impl() {
     // Protocol function called from a compiled defn, with the impl also
     // calling other compiled functions
@@ -854,6 +892,7 @@ fn test_protocol_with_defn_impl() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multimethod_keyword_dispatch() {
     assert_output(
         "multimethod_keyword",
@@ -871,6 +910,7 @@ fn test_multimethod_keyword_dispatch() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multimethod_type_dispatch() {
     // type returns symbols, so dispatch values must be symbols too
     assert_output(
@@ -893,6 +933,7 @@ fn test_multimethod_type_dispatch() {
 // ── Variadic functions ────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_variadic_basic() {
     assert_output(
         "variadic_basic",
@@ -911,6 +952,7 @@ fn test_variadic_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_variadic_with_fixed() {
     assert_output(
         "variadic_fixed",
@@ -925,6 +967,7 @@ fn test_variadic_with_fixed() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_variadic_multi_arity() {
     assert_output(
         "variadic_multi",
@@ -945,6 +988,7 @@ fn test_variadic_multi_arity() {
 
 /// Compile a multi-file program. `deps` is a list of (filename, source) pairs
 /// for dependency files. The main file requires them via `ns`/`require`.
+#[cfg(feature = "aot_full_test")]
 fn compile_and_run_multi(name: &str, main_source: &str, deps: &[(&str, &str)]) -> String {
     let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -995,6 +1039,7 @@ fn compile_and_run_multi(name: &str, main_source: &str, deps: &[(&str, &str)]) -
     String::from_utf8(output.stdout).unwrap()
 }
 
+#[cfg(feature = "aot_full_test")]
 fn assert_output_multi(name: &str, main_source: &str, deps: &[(&str, &str)], expected: &str) {
     let actual = compile_and_run_multi(name, main_source, deps);
     assert_eq!(
@@ -1005,6 +1050,7 @@ fn assert_output_multi(name: &str, main_source: &str, deps: &[(&str, &str)], exp
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multi_file_basic() {
     assert_output_multi(
         "multi_basic",
@@ -1026,6 +1072,7 @@ fn test_multi_file_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multi_file_transitive() {
     assert_output_multi(
         "multi_transitive",
@@ -1058,6 +1105,7 @@ fn test_multi_file_transitive() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_multi_file_refer() {
     assert_output_multi(
         "multi_refer",
@@ -1109,6 +1157,7 @@ fn test_apply_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_apply_multi_arg() {
     assert_output("apply_multi_arg", r#"(println (apply + 1 2 [3 4]))"#, "10");
 }
@@ -1145,6 +1194,7 @@ fn test_reduce_2arg() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_reduce_3arg() {
     assert_output(
         "reduce_3arg",
@@ -1154,6 +1204,7 @@ fn test_reduce_3arg() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_mapv_basic() {
     assert_output(
         "mapv_basic",
@@ -1166,6 +1217,7 @@ fn test_mapv_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_filterv_basic() {
     assert_output(
         "filterv_basic",
@@ -1178,6 +1230,7 @@ fn test_filterv_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_some_basic() {
     assert_output(
         "some_basic",
@@ -1190,6 +1243,7 @@ fn test_some_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_every_basic() {
     assert_output(
         "every_basic",
@@ -1203,6 +1257,7 @@ fn test_every_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_into_basic() {
     assert_output(
         "into_basic",
@@ -1232,6 +1287,7 @@ fn test_not() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_not_eq() {
     assert_output(
         "not_eq",
@@ -1241,6 +1297,7 @@ fn test_not_eq() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_predicates() {
     assert_output(
         "predicates",
@@ -1259,6 +1316,7 @@ fn test_predicates() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_max_min() {
     assert_output(
         "max_min",
@@ -1270,6 +1328,7 @@ fn test_max_min() {
 // ── Sequence operation tests ────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_range() {
     assert_output(
         "range_ops",
@@ -1283,6 +1342,7 @@ fn test_range() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_take_drop() {
     assert_output(
         "take_drop",
@@ -1295,6 +1355,7 @@ fn test_take_drop() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_reverse() {
     assert_output(
         "reverse_op",
@@ -1304,6 +1365,7 @@ fn test_reverse() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_sort() {
     assert_output(
         "sort_op",
@@ -1313,6 +1375,7 @@ fn test_sort() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_keys_vals() {
     assert_output(
         "keys_vals",
@@ -1325,6 +1388,7 @@ fn test_keys_vals() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_concat() {
     assert_output(
         "concat_op",
@@ -1336,6 +1400,7 @@ fn test_concat() {
 // ── Type predicate tests ────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_type_predicates() {
     assert_output(
         "type_preds",
@@ -1355,6 +1420,7 @@ fn test_type_predicates() {
 // ── Atom constructor test ───────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_atom_constructor() {
     assert_output(
         "atom_ctor",
@@ -1369,6 +1435,7 @@ fn test_atom_constructor() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_atom_reset() {
     assert_output(
         "atom_reset",
@@ -1385,6 +1452,7 @@ fn test_atom_reset() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_atom_swap_with_args() {
     assert_output(
         "atom_swap_args",
@@ -1402,6 +1470,7 @@ fn test_atom_swap_with_args() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_atom_swap_extra_args() {
     assert_output(
         "atom_swap_extra",
@@ -1419,6 +1488,7 @@ fn test_atom_swap_extra_args() {
 // ── Keyword-as-function tests ───────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_keyword_as_function() {
     assert_output(
         "kw_as_fn",
@@ -1433,6 +1503,7 @@ fn test_keyword_as_function() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_keyword_as_function_nested() {
     assert_output(
         "kw_as_fn_nested",
@@ -1447,6 +1518,7 @@ fn test_keyword_as_function_nested() {
 // ── Lazy sequence tests ─────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_lazy_seq_basic() {
     assert_output(
         "lazy_seq_basic",
@@ -1464,6 +1536,7 @@ fn test_lazy_seq_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_lazy_seq_infinite() {
     assert_output(
         "lazy_seq_infinite",
@@ -1479,6 +1552,7 @@ fn test_lazy_seq_infinite() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_lazy_seq_fibonacci() {
     assert_output(
         "lazy_seq_fib",
@@ -1496,6 +1570,7 @@ fn test_lazy_seq_fibonacci() {
 // ── More HOF tests ──────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_group_by() {
     assert_output(
         "group_by",
@@ -1510,6 +1585,7 @@ fn test_group_by() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_frequencies() {
     assert_output(
         "frequencies",
@@ -1519,6 +1595,7 @@ fn test_frequencies() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_keep() {
     assert_output(
         "keep_fn",
@@ -1531,6 +1608,7 @@ fn test_keep() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_remove() {
     assert_output(
         "remove_fn",
@@ -1543,6 +1621,7 @@ fn test_remove() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_map_indexed() {
     assert_output(
         "map_indexed_fn",
@@ -1555,6 +1634,7 @@ fn test_map_indexed() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_partition() {
     assert_output(
         "partition_fn",
@@ -1564,6 +1644,7 @@ fn test_partition() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_zipmap() {
     assert_output(
         "zipmap_fn",
@@ -1573,6 +1654,7 @@ fn test_zipmap() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_comp() {
     assert_output(
         "comp_fn",
@@ -1586,6 +1668,7 @@ fn test_comp() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_partial() {
     assert_output(
         "partial_fn",
@@ -1599,6 +1682,7 @@ fn test_partial() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_complement() {
     assert_output(
         "complement_fn",
@@ -1612,6 +1696,7 @@ fn test_complement() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_juxt() {
     assert_output(
         "juxt_fn",
@@ -1626,6 +1711,7 @@ fn test_juxt() {
 // ── Multi-arity str/println ──────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_str_multi_arity() {
     assert_output(
         "str_multi_arity",
@@ -1640,6 +1726,7 @@ fn test_str_multi_arity() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_println_multi_arity() {
     assert_output(
         "println_multi_arity",
@@ -1653,6 +1740,7 @@ fn test_println_multi_arity() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_str_in_expression() {
     assert_output(
         "str_in_expr",
@@ -1668,6 +1756,7 @@ fn test_str_in_expression() {
 // ── with-out-str ────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_with_out_str_basic() {
     assert_output(
         "with_out_str_basic",
@@ -1680,6 +1769,7 @@ fn test_with_out_str_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_with_out_str_nested() {
     assert_output(
         "with_out_str_nested",
@@ -1696,6 +1786,7 @@ fn test_with_out_str_nested() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_with_out_str_empty() {
     assert_output(
         "with_out_str_empty",
@@ -1710,6 +1801,7 @@ fn test_with_out_str_empty() {
 // ── Recur in defn (non-loop) ─────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_recur_in_defn() {
     assert_output(
         "recur_in_defn",
@@ -1725,6 +1817,7 @@ fn test_recur_in_defn() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_recur_in_defn_accumulator() {
     assert_output(
         "recur_defn_acc",
@@ -1742,6 +1835,7 @@ fn test_recur_in_defn_accumulator() {
 // ── Let destructuring ───────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_vector_destructuring() {
     assert_output(
         "let_vec_destr",
@@ -1754,6 +1848,7 @@ fn test_let_vector_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_map_destructuring() {
     assert_output(
         "let_map_destr",
@@ -1766,6 +1861,7 @@ fn test_let_map_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_nested_destructuring() {
     assert_output(
         "let_nested_destr",
@@ -1778,6 +1874,7 @@ fn test_let_nested_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_rest_destructuring() {
     assert_output(
         "let_rest_destr",
@@ -1791,6 +1888,7 @@ fn test_let_rest_destructuring() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_map_as_destructuring() {
     assert_output(
         "let_map_as_destr",
@@ -1806,6 +1904,7 @@ fn test_let_map_as_destructuring() {
 // ── Direct inter-function calls ─────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_direct_call_basic() {
     assert_output(
         "direct_call_basic",
@@ -1819,6 +1918,7 @@ fn test_direct_call_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_direct_call_mutual() {
     assert_output(
         "direct_call_mutual",
@@ -1833,6 +1933,7 @@ fn test_direct_call_mutual() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_direct_call_multi_arity() {
     assert_output(
         "direct_call_multi_arity",
@@ -1848,6 +1949,7 @@ fn test_direct_call_multi_arity() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_direct_call_with_variadic_fallback() {
     // Variadic calls should still go through rt_call (not direct call).
     assert_output(
@@ -1865,6 +1967,7 @@ fn test_direct_call_with_variadic_fallback() {
 // ── clojure.test integration ─────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_clojure_test_basic() {
     assert_output(
         "clojure_test_basic",
@@ -1889,6 +1992,7 @@ fn test_clojure_test_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_clojure_test_with_failure() {
     // We only check that the binary runs and reports the failure correctly.
     let output = compile_and_run(
