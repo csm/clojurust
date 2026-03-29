@@ -10,6 +10,7 @@ use crate::config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcParked};
 ///
 /// When dropped, the thread is marked as no longer cancellable.
 /// This allows the GC to know which threads are safe to interrupt.
+#[derive(Default)]
 pub struct CancellableGuard {
     cancelled: bool,
 }
