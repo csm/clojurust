@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cljrs_gc::GcPtr;
+use cljrs_gc::{GcPtr, check_cancellation};
 use cljrs_reader::Form;
 use cljrs_value::{
     AgentFn, AgentMsg, Arity, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
@@ -212,6 +212,11 @@ pub fn resolve_type_tag(sym: &str) -> Arc<str> {
 
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    // Check for GC cancellation at function application boundary
+    check_cancellation().map_err(|_| {
+        EvalError::Runtime("GC in progress, operation cancelled".to_string())
+    })?;
+
     match callee {
         Value::NativeFunction(nf) => {
             check_arity(&nf.get().arity, args.len(), &nf.get().name)?;
@@ -256,6 +261,10 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
         Value::MultiFn(mf) => {
             let mf_ref = mf.get();
             let dispatch_val = apply_value(&mf_ref.dispatch_fn, args.clone(), env)?;
+            // Check for GC cancellation after dispatch
+            check_cancellation().map_err(|_| {
+                EvalError::Runtime("GC in progress, operation cancelled".to_string())
+            })?;
             let key = format!("{}", dispatch_val);
             let methods = mf_ref.methods.lock().unwrap();
             let impl_fn = methods
@@ -320,6 +329,12 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
 
     let mut current_args = args;
     loop {
+        // Check for GC cancellation before entering function body
+        // Check for GC cancellation before entering function body
+        check_cancellation().map_err(|_| {
+            EvalError::Runtime("GC in progress, operation cancelled".to_string())
+        })?;
+
         env.push_frame();
 
         // Bind params.
@@ -334,6 +349,11 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
         // Eval body, catching Recur.
         let result = eval_body_recur_fn(&arity.body, &mut env);
         env.pop_frame();
+
+        // Check for GC cancellation after function body (before recur)
+        check_cancellation().map_err(|_| {
+            EvalError::Runtime("GC in progress, operation cancelled".to_string())
+        })?;
 
         match result {
             Ok(v) => return Ok(v),

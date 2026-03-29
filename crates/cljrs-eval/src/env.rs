@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use cljrs_gc::GcPtr;
+use cljrs_gc::{GcConfig, GcPtr};
 use cljrs_value::{CljxFn, Namespace, Value, Var};
 
 // ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
@@ -74,6 +74,8 @@ pub struct GlobalEnv {
     /// Built-in namespace sources embedded in the binary.
     /// Checked by `load_ns` before falling back to source-path search.
     pub builtin_sources: RwLock<HashMap<Arc<str>, &'static str>>,
+    /// GC configuration for automatic collection based on memory pressure.
+    pub gc_config: RwLock<Option<Arc<GcConfig>>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -90,6 +92,7 @@ impl GlobalEnv {
             loaded: Mutex::new(HashSet::new()),
             loading: Mutex::new(HashSet::new()),
             builtin_sources: RwLock::new(HashMap::new()),
+            gc_config: RwLock::new(None),
         })
     }
 
@@ -119,6 +122,16 @@ impl GlobalEnv {
     /// True if the namespace has already been loaded from a file.
     pub fn is_loaded(&self, ns: &str) -> bool {
         self.loaded.lock().unwrap().contains(ns)
+    }
+
+    /// Set the GC configuration for automatic memory pressure management.
+    pub fn set_gc_config(&self, config: Arc<GcConfig>) {
+        *self.gc_config.write().unwrap() = Some(config);
+    }
+
+    /// Get the GC configuration, if one has been set.
+    pub fn gc_config(&self) -> Option<Arc<GcConfig>> {
+        self.gc_config.read().unwrap().clone()
     }
 
     /// Resolve a short alias to a full namespace name in `current_ns`.

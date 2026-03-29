@@ -1,12 +1,14 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
 
 use cljrs_eval::{Env, EvalError, eval};
-use cljrs_stdlib::{standard_env, standard_env_with_paths};
+use cljrs_gc::GcConfig;
+use cljrs_stdlib::{self as cljrs_stdlib};
 use cljrs_value::Value;
 
 /// clojurust — a Rust-hosted dialect of the Clojure programming language.
@@ -26,12 +28,24 @@ enum Commands {
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
     },
     /// Start an interactive REPL.
     Repl {
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
     },
     /// AOT-compile a source file to a native binary.
     Compile {
@@ -46,6 +60,12 @@ enum Commands {
         /// Compile a test harness that runs all tests in the given file/directory.
         #[arg(long)]
         test: bool,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
     },
     /// Evaluate a single Clojure expression and print the result.
     Eval {
@@ -66,7 +86,23 @@ enum Commands {
         /// Print each passing assertion (helps identify which test hangs).
         #[arg(long, short)]
         verbose: bool,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
     },
+}
+
+/// Build GC config from CLI flags, or use defaults if not specified.
+fn build_gc_config(soft_limit_mb: Option<usize>, hard_limit_mb: Option<usize>) -> Arc<GcConfig> {
+    match (soft_limit_mb, hard_limit_mb) {
+        (Some(soft), Some(hard)) => Arc::new(GcConfig::with_limits(soft * 1024 * 1024, hard * 1024 * 1024)),
+        (Some(soft), None) => Arc::new(GcConfig::with_hard_limit(soft * 1024 * 1024)),
+        (None, Some(hard)) => Arc::new(GcConfig::with_hard_limit(hard * 1024 * 1024)),
+        (None, None) => Arc::new(GcConfig::new()),
+    }
 }
 
 fn main() -> miette::Result<()> {
@@ -85,21 +121,27 @@ fn main() -> miette::Result<()> {
 
 fn run(cli: Cli) -> miette::Result<()> {
     match cli.command {
-        Commands::Run { file, src_paths } => {
+        Commands::Run { file, src_paths, gc_soft_limit_mb, gc_hard_limit_mb } => {
             let src = std::fs::read_to_string(&file)
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
-            run_source(&src, &filename, src_paths)?;
+            let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+            run_source(&src, &filename, src_paths, gc_config)?;
         }
-        Commands::Repl { src_paths } => {
-            run_repl(src_paths);
+        Commands::Repl { src_paths, gc_soft_limit_mb, gc_hard_limit_mb } => {
+            let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+            run_repl(src_paths, gc_config);
         }
         Commands::Compile {
             file,
             out,
             src_paths,
             test,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
         } => {
+            // GC config is for the compiled binary, not the compilation process
+            let _gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             if test {
                 // For test mode, the file is a directory containing test files
                 cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
@@ -110,7 +152,9 @@ fn run(cli: Cli) -> miette::Result<()> {
             }
         }
         Commands::Eval { expr } => {
-            let result = eval_source(&expr, "<eval>")?;
+            // Eval uses default GC config
+            let gc_config = Arc::new(GcConfig::new());
+            let result = eval_source(&expr, "<eval>", gc_config)?;
             if result != Value::Nil {
                 println!("{}", result);
             }
@@ -119,8 +163,10 @@ fn run(cli: Cli) -> miette::Result<()> {
             namespaces,
             src_paths,
             verbose,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
         } => {
-            run_tests_command(namespaces, src_paths, verbose)?;
+            run_tests_command(namespaces, src_paths, verbose, gc_soft_limit_mb, gc_hard_limit_mb)?;
         }
     }
     Ok(())
@@ -129,15 +175,15 @@ fn run(cli: Cli) -> miette::Result<()> {
 // ── Source evaluation ─────────────────────────────────────────────────────────
 
 /// Evaluate all forms in `src`, printing nothing. Returns the last value.
-fn eval_source(src: &str, filename: &str) -> miette::Result<Value> {
-    let globals = standard_env();
+fn eval_source(src: &str, filename: &str, gc_config: Arc<GcConfig>) -> miette::Result<Value> {
+    let globals = cljrs_stdlib::standard_env_with_paths_and_config(Vec::new(), gc_config);
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)
 }
 
 /// Run a source file: evaluate all top-level forms, print nothing on success.
-fn run_source(src: &str, filename: &str, src_paths: Vec<PathBuf>) -> miette::Result<()> {
-    let globals = standard_env_with_paths(src_paths);
+fn run_source(src: &str, filename: &str, src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) -> miette::Result<()> {
+    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)?;
     Ok(())
@@ -188,6 +234,8 @@ fn run_tests_command(
     namespaces: Vec<String>,
     src_paths: Vec<PathBuf>,
     verbose: bool,
+    gc_soft_limit_mb: Option<usize>,
+    gc_hard_limit_mb: Option<usize>,
 ) -> miette::Result<()> {
     let namespaces = if namespaces.is_empty() {
         let discovered = discover_namespaces(&src_paths);
@@ -201,7 +249,8 @@ fn run_tests_command(
         namespaces
     };
 
-    let globals = standard_env_with_paths(src_paths);
+    let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
 
     // Ensure clojure.test is loaded.
@@ -399,11 +448,11 @@ fn file_to_namespace(root: &PathBuf, file: &Path) -> Option<String> {
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
 
-fn run_repl(src_paths: Vec<PathBuf>) {
+fn run_repl(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) {
     println!("clojurust REPL (type :quit to exit)");
     println!();
 
-    let globals = standard_env_with_paths(src_paths);
+    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
 
     let stdin = io::stdin();

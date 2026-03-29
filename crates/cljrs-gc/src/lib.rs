@@ -4,6 +4,12 @@
 //! object in the global [`HEAP`].  Memory is freed only during
 //! [`GcHeap::collect`]; [`GcPtr::drop`] is a no-op.
 //!
+//! # Automatic GC
+//!
+//! By default, the GC operates with automatic memory pressure management:
+//! - Soft limit: GC is triggered when memory exceeds this threshold
+//! - Hard limit: GC is forced when memory exceeds this absolute limit
+//!
 //! # Usage
 //! ```ignore
 //! // Allocate.
@@ -24,11 +30,21 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod cancellation;
+pub mod config;
 pub mod region;
+
+// Re-export cancellation types for convenience
+pub use cancellation::{CancellableGuard, check_cancellation, park_thread, unpark_thread};
 
 use std::cell::Cell;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+// ── GcConfig type alias for convenience ───────────────────────────────────────
+
+pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
 
 // ── GcPtr forward declaration ─────────────────────────────────────────────────
 
@@ -170,9 +186,19 @@ impl GcHeapInner {
 
 // ── GcHeap ────────────────────────────────────────────────────────────────────
 
+/// Estimated size of a GC object (bytes).
+/// Used to estimate memory usage before allocation.
+const ESTIMATED_OBJECT_SIZE: usize = 48;
+
 /// The global GC heap: allocates and collects GC-managed objects.
 pub struct GcHeap {
     inner: Mutex<GcHeapInner>,
+    /// Config for soft/hard memory limits.
+    config: Mutex<Option<Arc<GcConfig>>>,
+    /// Estimated bytes of memory currently in use by GC objects.
+    memory_in_use: AtomicUsize,
+    /// Total estimated bytes allocated since startup.
+    total_allocated_bytes: AtomicUsize,
 }
 
 // SAFETY: `Mutex<GcHeapInner>` is `Sync` because `GcHeapInner: Send`.
@@ -188,11 +214,33 @@ impl GcHeap {
     pub const fn new() -> Self {
         Self {
             inner: Mutex::new(GcHeapInner::new()),
+            config: Mutex::new(None),
+            memory_in_use: AtomicUsize::new(0),
+            total_allocated_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Set the GC configuration for this heap.
+    pub fn set_config(&self, config: Arc<GcConfig>) {
+        *self.config.lock().unwrap() = Some(config);
+    }
+
+    /// Get the estimated memory usage in bytes.
+    pub fn memory_in_use(&self) -> usize {
+        self.memory_in_use.load(Ordering::Relaxed)
+    }
+
+    /// Set the estimated memory usage (for tests).
+    #[cfg(test)]
+    pub fn set_memory_in_use(&self, bytes: usize) {
+        self.memory_in_use.store(bytes, Ordering::Relaxed);
     }
 
     /// Allocate a new GC-managed value and register it in the heap.
     pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
+        // Estimate memory usage
+        let estimated_size = ESTIMATED_OBJECT_SIZE;
+
         let gc_box = Box::new(GcBox {
             header: GcBoxHeader::new::<T>(),
             value,
@@ -210,6 +258,12 @@ impl GcHeap {
             inner.count += 1;
             inner.total_allocated += 1;
         }
+        // Update memory tracking before returning
+        self.total_allocated_bytes
+            .fetch_add(estimated_size, Ordering::Relaxed);
+        self.memory_in_use
+            .fetch_add(estimated_size, Ordering::Relaxed);
+
         // SAFETY: `raw` is non-null (from Box).
         GcPtr(unsafe { NonNull::new_unchecked(raw) })
     }
@@ -244,7 +298,8 @@ impl GcHeap {
             current = next;
         }
 
-        // Free unreachable objects.
+        // Free unreachable objects and update memory tracking.
+        let freed_count = dead.len();
         for ptr in dead {
             let header = unsafe { &*ptr };
             unsafe { (header.drop_fn)(ptr) };
@@ -259,6 +314,10 @@ impl GcHeap {
             header.next.set(inner.head);
             inner.head = ptr;
         }
+
+        // Estimate memory freed (rough approximation)
+        let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
+        self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
     }
 
     /// Number of currently live GC allocations.
@@ -274,6 +333,19 @@ impl GcHeap {
     /// Total objects freed by collection since startup.
     pub fn total_freed(&self) -> usize {
         self.inner.lock().unwrap().total_freed
+    }
+
+    /// Collect if memory usage exceeds the soft limit.
+    ///
+    /// Returns `true` if collection was triggered.
+    pub fn collect_if_needed(&self) -> bool {
+        if let Some(config) = self.config.lock().unwrap().as_ref()
+            && config.soft_limit_exceeded(self.memory_in_use())
+        {
+            self.collect(|_| {});
+            return true;
+        }
+        false
     }
 }
 
@@ -414,7 +486,11 @@ mod tests {
     }
 
     fn fresh_heap() -> GcHeap {
-        GcHeap::new()
+        let heap = GcHeap::new();
+        // Set a small hard limit for testing
+        let config = Arc::new(GcConfig::with_limits(10000, 50000));
+        heap.set_config(config);
+        heap
     }
 
     #[test]

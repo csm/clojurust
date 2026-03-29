@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use cljrs_eval::GlobalEnv;
+use cljrs_gc::GcConfig;
 
 mod core_async;
 mod edn;
@@ -108,6 +109,19 @@ pub fn standard_env() -> Arc<GlobalEnv> {
 pub fn standard_env_with_paths(source_paths: Vec<std::path::PathBuf>) -> Arc<GlobalEnv> {
     let globals = standard_env();
     globals.set_source_paths(source_paths);
+    globals
+}
+
+/// Like [`standard_env_with_paths()`] but also sets GC configuration.
+pub fn standard_env_with_paths_and_config(
+    source_paths: Vec<std::path::PathBuf>,
+    gc_config: Arc<GcConfig>,
+) -> Arc<GlobalEnv> {
+    let globals = standard_env();
+    globals.set_source_paths(source_paths);
+    globals.set_gc_config(gc_config.clone());
+    // Also configure the global GC heap with the same limits
+    cljrs_gc::HEAP.set_config(gc_config);
     globals
 }
 
