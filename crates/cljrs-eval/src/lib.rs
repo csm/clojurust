@@ -38,6 +38,72 @@ pub use loader::load_ns;
 
 use std::sync::Arc;
 
+/// Interpreter-level GC safepoint.
+///
+/// Called at function entry, loop heads, and application boundaries.
+/// If a GC collection is in progress, blocks until it completes.
+/// If a GC has been requested (memory pressure), this thread becomes
+/// the collector: initiates STW, traces roots, collects, then resumes.
+pub fn gc_safepoint(env: &Env) {
+    // Fast path: no GC activity at all.
+    if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        return;
+    }
+
+    // If a GC is already in progress (another thread is collecting), just park.
+    if cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        cljrs_gc::safepoint();
+        return;
+    }
+
+    // A GC was requested (memory pressure). Try to become the collector.
+    if !cljrs_gc::take_gc_request() {
+        // Another thread took the request; if collection started, park.
+        cljrs_gc::safepoint();
+        return;
+    }
+
+    // We won the request. Initiate STW collection.
+    let Some(_stw_guard) = cljrs_gc::begin_stw() else {
+        // Race: another thread started collecting between our take and begin.
+        cljrs_gc::safepoint();
+        return;
+    };
+
+    // All other threads are now parked. Collect with registered roots
+    // plus this thread's local environment.
+    cljrs_gc::HEAP.collect(|visitor| {
+        // Trace globally registered roots (GlobalEnv, etc.)
+        cljrs_gc::HEAP.trace_registered_roots(visitor);
+        // Trace this thread's local bindings
+        trace_env_roots(env, visitor);
+    });
+    // _stw_guard drop clears in_progress, waking parked threads.
+}
+
+/// Trace all GcPtr values reachable from an Env's local frames.
+fn trace_env_roots(env: &Env, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    // Trace local frame bindings
+    for frame in &env.frames {
+        for (_name, val) in &frame.bindings {
+            val.trace(visitor);
+        }
+    }
+    // Trace the globals (namespaces, vars) — these are also registered
+    // as root tracers, but it's safe to trace twice (idempotent marking).
+    trace_globals(&env.globals, visitor);
+}
+
+/// Trace all namespaces and their contents.
+fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::GcVisitor as _;
+    let namespaces = globals.namespaces.read().unwrap();
+    for (_name, ns_ptr) in namespaces.iter() {
+        visitor.visit(ns_ptr);
+    }
+}
+
 /// Create a minimal `GlobalEnv` with `clojure.core` builtins and bootstrap
 /// HOFs, but without any stdlib namespaces pre-loaded.
 ///

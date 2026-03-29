@@ -28,7 +28,7 @@ pub struct RequireSpec {
 
 /// One stack frame of local bindings (a single `let*`, `fn`, or `loop*` scope).
 pub struct Frame {
-    bindings: Vec<(Arc<str>, Value)>,
+    pub(crate) bindings: Vec<(Arc<str>, Value)>,
 }
 
 impl Default for Frame {
@@ -280,7 +280,7 @@ impl GlobalEnv {
 
 /// The full execution environment: a stack of local frames plus the global env.
 pub struct Env {
-    frames: Vec<Frame>,
+    pub(crate) frames: Vec<Frame>,
     pub current_ns: Arc<str>,
     pub globals: Arc<GlobalEnv>,
 }

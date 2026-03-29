@@ -120,8 +120,18 @@ pub fn standard_env_with_paths_and_config(
     let globals = standard_env();
     globals.set_source_paths(source_paths);
     globals.set_gc_config(gc_config.clone());
-    // Also configure the global GC heap with the same limits
+    // Configure the global GC heap with the same limits
     cljrs_gc::HEAP.set_config(gc_config);
+    // Register GlobalEnv namespaces as GC roots so automatic collection
+    // can trace all live values reachable from namespace bindings.
+    let roots_globals = globals.clone();
+    cljrs_gc::HEAP.register_root_tracer(move |visitor| {
+        use cljrs_gc::GcVisitor as _;
+        let namespaces = roots_globals.namespaces.read().unwrap();
+        for (_name, ns_ptr) in namespaces.iter() {
+            visitor.visit(ns_ptr);
+        }
+    });
     globals
 }
 

@@ -158,15 +158,20 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
-/// Thread-local GC cancellation flag.
+/// Coordination state for stop-the-world GC.
 ///
-/// When set to `true`, long-running operations should check this flag
-/// and park if a GC is in progress.
+/// Tracks how many mutator threads are registered, how many have parked
+/// at safepoints, and whether a GC has been requested or is in progress.
 pub struct GcCancellation {
-    /// Whether a GC is currently in progress.
+    /// Whether a GC collection is currently in progress (STW phase).
     in_progress: AtomicBool,
-    /// Number of threads currently parked waiting for GC.
+    /// Number of threads currently parked at a safepoint.
     parked_threads: AtomicUsize,
+    /// Number of mutator threads registered with the GC.
+    registered_threads: AtomicUsize,
+    /// Flag set by the allocator when memory pressure is high.
+    /// The next thread to hit an interpreter safepoint will initiate collection.
+    gc_requested: AtomicBool,
 }
 
 impl GcCancellation {
@@ -175,6 +180,8 @@ impl GcCancellation {
         Self {
             in_progress: AtomicBool::new(false),
             parked_threads: AtomicUsize::new(0),
+            registered_threads: AtomicUsize::new(0),
+            gc_requested: AtomicBool::new(false),
         }
     }
 
@@ -201,6 +208,47 @@ impl GcCancellation {
     /// Set whether GC is in progress.
     pub fn set_in_progress(&self, value: bool) {
         self.in_progress.store(value, Ordering::SeqCst);
+    }
+
+    /// Atomically try to set `in_progress` from `false` to `true`.
+    /// Returns `true` if this thread won the race, `false` if another
+    /// thread is already collecting.
+    pub fn try_begin_collection(&self) -> bool {
+        self.in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Register a mutator thread. Must be called before the thread begins
+    /// executing Clojure code (interpreter or AOT).
+    pub fn register_thread(&self) {
+        self.registered_threads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Unregister a mutator thread. Must be called when the thread is done
+    /// executing Clojure code.
+    pub fn unregister_thread(&self) {
+        self.registered_threads.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Get the number of registered mutator threads.
+    pub fn registered_threads(&self) -> usize {
+        self.registered_threads.load(Ordering::SeqCst)
+    }
+
+    /// Request a GC collection. The next interpreter safepoint will initiate it.
+    pub fn request_gc(&self) {
+        self.gc_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Check and clear the GC request flag. Returns true if a GC was requested.
+    pub fn take_gc_request(&self) -> bool {
+        self.gc_requested.swap(false, Ordering::SeqCst)
+    }
+
+    /// Check if a GC has been requested but not yet started.
+    pub fn gc_requested(&self) -> bool {
+        self.gc_requested.load(Ordering::SeqCst)
     }
 }
 

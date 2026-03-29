@@ -36,7 +36,9 @@ pub mod region;
 
 // Re-export cancellation types for convenience
 pub use cancellation::{
-    CancellableGuard, check_cancellation, park_thread, safepoint, unpark_thread,
+    CancellableGuard, MutatorGuard, StwGuard, begin_stw, check_cancellation, gc_requested,
+    park_thread, register_mutator, registered_threads, request_gc, safepoint, take_gc_request,
+    unpark_thread, wait_for_threads_to_park,
 };
 
 use std::cell::Cell;
@@ -192,6 +194,9 @@ impl GcHeapInner {
 /// Used to estimate memory usage before allocation.
 const ESTIMATED_OBJECT_SIZE: usize = 48;
 
+/// A type-erased root tracer: called during collection to mark all live roots.
+type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
+
 /// The global GC heap: allocates and collects GC-managed objects.
 pub struct GcHeap {
     inner: Mutex<GcHeapInner>,
@@ -201,6 +206,8 @@ pub struct GcHeap {
     memory_in_use: AtomicUsize,
     /// Total estimated bytes allocated since startup.
     total_allocated_bytes: AtomicUsize,
+    /// Registered root tracers (e.g. GlobalEnv).  Called during automatic collection.
+    root_tracers: Mutex<Vec<RootTracer>>,
 }
 
 // SAFETY: `Mutex<GcHeapInner>` is `Sync` because `GcHeapInner: Send`.
@@ -219,12 +226,27 @@ impl GcHeap {
             config: Mutex::new(None),
             memory_in_use: AtomicUsize::new(0),
             total_allocated_bytes: AtomicUsize::new(0),
+            root_tracers: Mutex::new(Vec::new()),
         }
     }
 
     /// Set the GC configuration for this heap.
     pub fn set_config(&self, config: Arc<GcConfig>) {
         *self.config.lock().unwrap() = Some(config);
+    }
+
+    /// Register a root tracer that will be called during automatic collection
+    /// to mark all live roots reachable from the registered source.
+    pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + Send + Sync + 'static) {
+        self.root_tracers.lock().unwrap().push(Box::new(tracer));
+    }
+
+    /// Trace all registered roots into the given visitor.
+    pub fn trace_registered_roots(&self, visitor: &mut MarkVisitor) {
+        let tracers = self.root_tracers.lock().unwrap();
+        for tracer in tracers.iter() {
+            tracer(visitor);
+        }
     }
 
     /// Get the estimated memory usage in bytes.
@@ -266,8 +288,19 @@ impl GcHeap {
         // Update memory tracking before returning
         self.total_allocated_bytes
             .fetch_add(estimated_size, Ordering::Relaxed);
-        self.memory_in_use
-            .fetch_add(estimated_size, Ordering::Relaxed);
+        let current_usage = self
+            .memory_in_use
+            .fetch_add(estimated_size, Ordering::Relaxed)
+            + estimated_size;
+
+        // Check memory pressure: if soft limit exceeded, request a GC.
+        // The actual collection will happen at the next interpreter safepoint
+        // where the thread has access to proper root tracing.
+        if let Some(config) = self.config.lock().unwrap().as_ref()
+            && config.soft_limit_exceeded(current_usage)
+        {
+            cancellation::request_gc();
+        }
 
         // SAFETY: `raw` is non-null (from Box).
         GcPtr(unsafe { NonNull::new_unchecked(raw) })
@@ -340,17 +373,26 @@ impl GcHeap {
         self.inner.lock().unwrap().total_freed
     }
 
-    /// Collect if memory usage exceeds the soft limit.
+    /// Run a full stop-the-world collection using registered root tracers.
     ///
-    /// Returns `true` if collection was triggered.
-    pub fn collect_if_needed(&self) -> bool {
-        if let Some(config) = self.config.lock().unwrap().as_ref()
-            && config.soft_limit_exceeded(self.memory_in_use())
-        {
-            self.collect(|_| {});
-            return true;
-        }
-        false
+    /// This initiates the STW protocol: sets `in_progress`, waits for all
+    /// other registered mutator threads to park at safepoints, traces all
+    /// registered roots, sweeps, then clears `in_progress` (waking parked
+    /// threads).
+    ///
+    /// Returns `true` if collection ran, `false` if another thread is
+    /// already collecting.
+    pub fn collect_auto(&self) -> bool {
+        let Some(_stw_guard) = cancellation::begin_stw() else {
+            // Another thread is already collecting — just return.
+            return false;
+        };
+        // All other threads are now parked.  Run collection with registered roots.
+        self.collect(|visitor| {
+            self.trace_registered_roots(visitor);
+        });
+        // _stw_guard drop clears in_progress, waking parked threads.
+        true
     }
 }
 

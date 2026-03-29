@@ -42,16 +42,13 @@ impl Drop for CancellableGuard {
 ///
 /// This function checks the global GC cancellation flag. If a GC is in
 /// progress, it returns an error indicating the thread should park.
-///
-/// This is a "soft" cancellation check - operations should periodically
-/// call this to yield control if needed.
 pub fn check_cancellation() -> Result<(), GcParked> {
     CONFIG_CANCELLATION.check()
 }
 
 /// GC safepoint: if a collection is in progress, park this thread until
 /// it completes.  This is a blocking call suitable for use at allocation
-/// sites and other places where returning an error is not practical.
+/// sites, function entry, and loop heads.
 ///
 /// The implementation spin-yields to avoid busy-waiting.
 pub fn safepoint() {
@@ -66,10 +63,91 @@ pub fn safepoint() {
     CONFIG_CANCELLATION.unpark();
 }
 
-/// A helper that wraps a function with cancellation checking.
+/// Register the current thread as a GC mutator thread.
+/// Must be called before the thread begins executing Clojure code.
+/// Returns a [`MutatorGuard`] that unregisters on drop.
+pub fn register_mutator() -> MutatorGuard {
+    CONFIG_CANCELLATION.register_thread();
+    MutatorGuard { _private: () }
+}
+
+/// RAII guard that unregisters a mutator thread on drop.
+pub struct MutatorGuard {
+    _private: (),
+}
+
+impl Drop for MutatorGuard {
+    fn drop(&mut self) {
+        CONFIG_CANCELLATION.unregister_thread();
+    }
+}
+
+/// Request a GC collection at the next interpreter safepoint.
+pub fn request_gc() {
+    CONFIG_CANCELLATION.request_gc();
+}
+
+/// Check if a GC has been requested (memory pressure).
+pub fn gc_requested() -> bool {
+    CONFIG_CANCELLATION.gc_requested()
+}
+
+/// Atomically check and clear the GC request flag.
+pub fn take_gc_request() -> bool {
+    CONFIG_CANCELLATION.take_gc_request()
+}
+
+/// Wait for all registered mutator threads (except this one, the collector)
+/// to park at safepoints.  The caller must have already set `in_progress`.
 ///
-/// The wrapped function is called periodically, and if a GC is in progress,
-/// it returns early with an error.
+/// Returns the number of threads that parked (for diagnostics).
+pub fn wait_for_threads_to_park() -> usize {
+    let expected = CONFIG_CANCELLATION.registered_threads().saturating_sub(1);
+    if expected == 0 {
+        return 0;
+    }
+    // Spin-yield until all other threads have parked.
+    loop {
+        let parked = CONFIG_CANCELLATION.parked_threads();
+        if parked >= expected {
+            return parked;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Begin a stop-the-world collection phase.
+///
+/// Sets the `in_progress` flag and waits for all other mutator threads
+/// to park.  Returns a [`StwGuard`] that clears the flag on drop
+/// (allowing parked threads to resume).
+///
+/// Only one thread may call this at a time.  Uses compare-and-swap to
+/// ensure mutual exclusion; returns `None` if another thread is already
+/// collecting.
+pub fn begin_stw() -> Option<StwGuard> {
+    // Try to become the collector (atomic CAS: false → true).
+    if !CONFIG_CANCELLATION.try_begin_collection() {
+        // Another thread is already collecting.
+        return None;
+    }
+    // Wait for all other mutator threads to park.
+    wait_for_threads_to_park();
+    Some(StwGuard { _private: () })
+}
+
+/// RAII guard that ends the STW phase on drop.
+pub struct StwGuard {
+    _private: (),
+}
+
+impl Drop for StwGuard {
+    fn drop(&mut self) {
+        CONFIG_CANCELLATION.set_in_progress(false);
+    }
+}
+
+/// A helper that wraps a function with cancellation checking.
 pub fn with_cancellation_check<T, E: std::fmt::Debug>(
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, GcParked> {
@@ -78,9 +156,6 @@ pub fn with_cancellation_check<T, E: std::fmt::Debug>(
 }
 
 /// Mark the current thread as parked during GC.
-///
-/// This should be called when a thread needs to wait for GC to complete.
-/// Threads should park at safe points when they detect a GC is in progress.
 pub fn park_thread() {
     CONFIG_CANCELLATION.park();
 }
@@ -93,6 +168,11 @@ pub fn unpark_thread() {
 /// Get the number of threads currently parked waiting for GC.
 pub fn parked_threads() -> usize {
     CONFIG_CANCELLATION.parked_threads()
+}
+
+/// Get the number of registered mutator threads.
+pub fn registered_threads() -> usize {
+    CONFIG_CANCELLATION.registered_threads()
 }
 
 // Extension trait for GcCancellation

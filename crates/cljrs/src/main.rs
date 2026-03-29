@@ -123,6 +123,10 @@ fn main() -> miette::Result<()> {
 }
 
 fn run(cli: Cli) -> miette::Result<()> {
+    // Register the main thread as a GC mutator so the collector knows
+    // how many threads to wait for during stop-the-world collection.
+    let _mutator = cljrs_gc::register_mutator();
+
     match cli.command {
         Commands::Run {
             file,
