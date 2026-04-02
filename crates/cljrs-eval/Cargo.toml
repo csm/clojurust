@@ -6,6 +6,7 @@ description = "Tree-walking interpreter and macro expander for clojurust"
 
 [dependencies]
 cljrs-types   = { workspace = true }
+cljrs-ir      = { workspace = true }
 cljrs-gc      = { workspace = true }
 cljrs-reader  = { workspace = true }
 cljrs-value   = { workspace = true }

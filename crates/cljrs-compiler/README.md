@@ -18,7 +18,7 @@ Cranelift codegen backend consumes.
 ```
 src/
   lib.rs        — module declarations, embedded Clojure sources, register_compiler_sources()
-  ir.rs         — IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId, KnownFn, Effect, Const
+  ir.rs         — re-exports all types from cljrs-ir crate
   ir_convert.rs — Value → IrFunction conversion (Clojure data → Rust IR types)
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
   codegen.rs    — Cranelift code generator: IrFunction → native object code
@@ -73,6 +73,7 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul`, `rt_div`, `rt_rem`
 - **Comparison:** `rt_eq`, `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
+- **Region alloc:** `rt_region_start`, `rt_region_end`, `rt_region_alloc_vector`, `rt_region_alloc_map`, `rt_region_alloc_set`, `rt_region_alloc_list`, `rt_region_alloc_cons`
 - **Dispatch:** `rt_call(callee, args, nargs)`, `rt_deref(v)`, `rt_load_global(ns, ns_len, name, name_len)`
 - **Output:** `rt_println(v)`, `rt_pr(v)`, `rt_str(v)`
 - **Type checks:** `rt_is_nil`, `rt_is_vector`, `rt_is_map`, `rt_is_seq`, `rt_identical`
@@ -127,6 +128,7 @@ Optimization passes on IR data maps. Currently implements region allocation: rew
 | Crate | Role |
 |-------|------|
 | `cljrs-types` (workspace) | `Span`, `CljxError`, `CljxResult` |
+| `cljrs-ir` (workspace) | IR types: `IrFunction`, `Block`, `Inst`, `KnownFn`, etc. |
 | `cljrs-gc` (workspace) | `GcPtr<Value>` — GC interaction |
 | `cljrs-value` (workspace) | `Value`, collections, `NativeFn` — value types referenced by IR and rt_abi |
 | `cljrs-reader` (workspace) | `Form`, `FormKind` — input AST for lowering |

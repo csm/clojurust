@@ -1,0 +1,8 @@
+[package]
+name = "cljrs-ir"
+version = "0.1.0"
+edition = "2024"
+description = "Intermediate representation types for clojurust compiler and interpreter"
+
+[dependencies]
+cljrs-types = { workspace = true }

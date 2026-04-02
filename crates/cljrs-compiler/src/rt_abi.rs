@@ -301,6 +301,194 @@ pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Valu
     box_val(Value::Bool(result))
 }
 
+// ── Region allocation ───────────────────────────────────────────────────────
+
+use std::cell::RefCell;
+
+thread_local! {
+    /// Stack of boxed regions owned by the rt_abi layer.
+    /// Paired with entries on `cljrs_gc::region::REGION_STACK`.
+    /// Box is intentional: we hand out raw pointers via `push_region_raw`,
+    /// so the Region must not move if the Vec grows.
+    #[allow(clippy::vec_box)]
+    static RT_REGION_STACK: RefCell<Vec<Box<cljrs_gc::region::Region>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Begin a region scope — allocates a new bump region and activates it.
+///
+/// Returns nil (the region handle is implicit via the thread-local stack).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_region_start() -> *const Value {
+    let mut region = Box::new(cljrs_gc::region::Region::new());
+    // SAFETY: the Region lives in the Box on RT_REGION_STACK until
+    // rt_region_end pops it.
+    let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
+    unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
+    RT_REGION_STACK.with(|s| s.borrow_mut().push(region));
+    rt_const_nil()
+}
+
+/// End a region scope — pops the region, runs destructors, frees memory.
+///
+/// Returns nil.
+///
+/// # Safety
+/// Must be paired with a prior `rt_region_start` call.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_region_end(_handle: *const Value) -> *const Value {
+    cljrs_gc::region::pop_region_guard();
+    RT_REGION_STACK.with(|s| {
+        // Dropping the Box<Region> runs Region::drop which runs
+        // destructors and frees chunks.
+        s.borrow_mut().pop();
+    });
+    rt_const_nil()
+}
+
+/// Allocate a vector in the active region (falling back to GC heap).
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_region_alloc_vector(
+    _handle: *const Value,
+    elems: *const *const Value,
+    n: u64,
+) -> *const Value {
+    let n = n as usize;
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pv = PersistentVector::from_iter(items);
+    let ptr = if cljrs_gc::region::region_is_active() {
+        unsafe { cljrs_gc::region::try_alloc_in_region(pv).unwrap() }
+    } else {
+        GcPtr::new(pv)
+    };
+    box_val(Value::Vector(ptr))
+}
+
+/// Allocate a map in the active region (falling back to GC heap).
+///
+/// # Safety
+/// `pairs` must point to `2*n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_region_alloc_map(
+    _handle: *const Value,
+    pairs: *const *const Value,
+    n: u64,
+) -> *const Value {
+    let n = n as usize;
+    let kv_pairs: Vec<(Value, Value)> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(pairs, n * 2) };
+        (0..n)
+            .map(|i| {
+                let k = unsafe { val_ref(slice[i * 2]) }.clone();
+                let v = unsafe { val_ref(slice[i * 2 + 1]) }.clone();
+                (k, v)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    box_val(Value::Map(MapValue::from_pairs(kv_pairs)))
+}
+
+/// Allocate a set in the active region (falling back to GC heap).
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_region_alloc_set(
+    _handle: *const Value,
+    elems: *const *const Value,
+    n: u64,
+) -> *const Value {
+    let n = n as usize;
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let set = PersistentHashSet::from_iter(items);
+    box_val(Value::Set(SetValue::Hash(GcPtr::new(set))))
+}
+
+/// Allocate a list in the active region (falling back to GC heap).
+///
+/// # Safety
+/// `elems` must point to `n` valid `*const Value` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_region_alloc_list(
+    _handle: *const Value,
+    elems: *const *const Value,
+    n: u64,
+) -> *const Value {
+    let n = n as usize;
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let list = PersistentList::from_iter(items);
+    let ptr = if cljrs_gc::region::region_is_active() {
+        unsafe { cljrs_gc::region::try_alloc_in_region(list).unwrap() }
+    } else {
+        GcPtr::new(list)
+    };
+    box_val(Value::List(ptr))
+}
+
+/// Allocate a cons cell in the active region (falling back to GC heap).
+///
+/// # Safety
+/// Both pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_region_alloc_cons(
+    _handle: *const Value,
+    head: *const Value,
+    tail: *const Value,
+) -> *const Value {
+    let h = unsafe { val_ref(head) }.clone();
+    let t = unsafe { val_ref(tail) }.clone();
+    let cons = CljxCons { head: h, tail: t };
+    let ptr = if cljrs_gc::region::region_is_active() {
+        unsafe { cljrs_gc::region::try_alloc_in_region(cons).unwrap() }
+    } else {
+        GcPtr::new(cons)
+    };
+    box_val(Value::Cons(ptr))
+}
+
+/// Unwind the region stack to the given depth on exception.
+///
+/// Called by `rt_try` to clean up regions that were opened inside a
+/// try body that threw.
+fn unwind_regions_to(depth: usize) {
+    cljrs_gc::region::unwind_region_stack_to(depth);
+    RT_REGION_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        while stack.len() > depth {
+            stack.pop(); // Drop<Region> handles cleanup
+        }
+    });
+}
+
 // ── Collection construction ─────────────────────────────────────────────────
 
 /// Allocate a vector from `n` element pointers.
@@ -1860,11 +2048,16 @@ pub unsafe extern "C" fn rt_try(
     let catch = unsafe { val_ref(catch_fn) }.clone();
     let finally = unsafe { val_ref(finally_fn) }.clone();
 
+    // Save region stack depth so we can unwind on exception.
+    let region_depth = cljrs_gc::region::region_stack_depth();
+
     // Call the body.
     let body_result = cljrs_eval::callback::invoke(&body, vec![]);
 
     // Check for thrown exception (set by rt_throw in compiled code).
     let ret = if let Some(thrown_ptr) = take_pending_exception() {
+        // Unwind any regions opened inside the try body.
+        unwind_regions_to(region_depth);
         // Exception was thrown from compiled code.
         if !matches!(catch, Value::Nil) {
             let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
@@ -1879,6 +2072,8 @@ pub unsafe extern "C" fn rt_try(
         match body_result {
             Ok(val) => box_val(val),
             Err(val_err) => {
+                // Unwind any regions opened inside the try body.
+                unwind_regions_to(region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
                 if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {

@@ -21,6 +21,7 @@ pub mod dynamics;
 pub mod env;
 pub mod error;
 pub mod eval;
+pub mod ir_interp;
 pub mod loader;
 pub mod macros;
 pub mod special;

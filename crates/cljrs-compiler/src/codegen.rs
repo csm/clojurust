@@ -152,6 +152,14 @@ struct RuntimeFuncs {
     rt_str_n: FuncId,
     rt_println_n: FuncId,
     rt_with_out_str: FuncId,
+    // Region allocation
+    rt_region_start: FuncId,
+    rt_region_end: FuncId,
+    rt_region_alloc_vector: FuncId,
+    rt_region_alloc_map: FuncId,
+    rt_region_alloc_set: FuncId,
+    rt_region_alloc_list: FuncId,
+    rt_region_alloc_cons: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -632,35 +640,54 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
 
             Inst::RegionStart(dst) => {
-                // Region start is a no-op for now; define the var as nil so it's
-                // available as the region handle in RegionAlloc instructions.
-                let val = self.call_rt_0(self.rt.rt_const_nil)?;
+                // Allocate and activate a bump region on the thread-local stack.
+                let val = self.call_rt_0(self.rt.rt_region_start)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
-            Inst::RegionAlloc(dst, _region, kind, operands) => {
-                // For now, delegate to normal allocation functions.
-                // A future bump-allocator backend can use the region handle.
+            Inst::RegionAlloc(dst, region, kind, operands) => {
+                let region_handle = self.use_var(*region);
                 let val = match kind {
                     RegionAllocKind::Vector => {
-                        self.emit_alloc_collection(self.rt.rt_alloc_vector, operands)?
+                        self.emit_region_alloc_collection(
+                            self.rt.rt_region_alloc_vector,
+                            region_handle,
+                            operands,
+                        )?
                     }
                     RegionAllocKind::Map => {
-                        // operands are flattened [k v k v ...] pairs
-                        self.emit_alloc_collection(self.rt.rt_alloc_map, operands)?
+                        self.emit_region_alloc_collection(
+                            self.rt.rt_region_alloc_map,
+                            region_handle,
+                            operands,
+                        )?
                     }
                     RegionAllocKind::Set => {
-                        self.emit_alloc_collection(self.rt.rt_alloc_set, operands)?
+                        self.emit_region_alloc_collection(
+                            self.rt.rt_region_alloc_set,
+                            region_handle,
+                            operands,
+                        )?
                     }
                     RegionAllocKind::List => {
-                        self.emit_alloc_collection(self.rt.rt_alloc_list, operands)?
+                        self.emit_region_alloc_collection(
+                            self.rt.rt_region_alloc_list,
+                            region_handle,
+                            operands,
+                        )?
                     }
                     RegionAllocKind::Cons => {
                         if operands.len() == 2 {
                             let h = self.use_var(operands[0]);
                             let t = self.use_var(operands[1]);
-                            self.call_rt_2(self.rt.rt_alloc_cons, h, t)?
+                            let func_ref =
+                                self.import_func(self.rt.rt_region_alloc_cons);
+                            let call = self
+                                .builder
+                                .ins()
+                                .call(func_ref, &[region_handle, h, t]);
+                            self.builder.inst_results(call)[0]
                         } else {
                             self.call_rt_0(self.rt.rt_const_nil)?
                         }
@@ -670,8 +697,11 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 self.builder.def_var(var, val);
             }
 
-            Inst::RegionEnd(_) => {
-                // No-op for now — future bump allocator will free the region here.
+            Inst::RegionEnd(region) => {
+                // Pop and free the bump region.
+                let handle = self.use_var(*region);
+                let func_ref = self.import_func(self.rt.rt_region_end);
+                self.builder.ins().call(func_ref, &[handle]);
             }
         }
         Ok(())
@@ -996,6 +1026,55 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             .builder
             .ins()
             .call(func_ref, &[slot_addr, actual_count]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Emit a region-aware collection allocation call.
+    ///
+    /// Like `emit_alloc_collection` but prepends the region handle as the first
+    /// argument: `rt_region_alloc_*(handle, elems_ptr, count)`.
+    fn emit_region_alloc_collection(
+        &mut self,
+        func_id: FuncId,
+        region_handle: cranelift_codegen::ir::Value,
+        elems: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let n = elems.len();
+        if n == 0 {
+            let func_ref = self.import_func(func_id);
+            let null = self.builder.ins().iconst(self.ptr_type, 0);
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let call = self
+                .builder
+                .ins()
+                .call(func_ref, &[region_handle, null, zero]);
+            return Ok(self.builder.inst_results(call)[0]);
+        }
+
+        let slot = self
+            .builder
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (n * 8) as u32,
+                3,
+            ));
+
+        for (i, elem_var) in elems.iter().enumerate() {
+            let val = self.use_var(*elem_var);
+            self.builder.ins().stack_store(val, slot, (i * 8) as i32);
+        }
+
+        let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+        let func_ref = self.import_func(func_id);
+        let actual_count = if func_id == self.rt.rt_region_alloc_map {
+            self.builder.ins().iconst(types::I64, (n / 2) as i64)
+        } else {
+            self.builder.ins().iconst(types::I64, n as i64)
+        };
+        let call = self
+            .builder
+            .ins()
+            .call(func_ref, &[region_handle, slot_addr, actual_count]);
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1493,6 +1572,39 @@ fn declare_runtime_funcs(
         rt_str_n: declare_rt(module, "rt_str_n", &[ptr, types::I64], ptr)?,
         rt_println_n: declare_rt(module, "rt_println_n", &[ptr, types::I64], ptr)?,
         rt_with_out_str: declare_rt(module, "rt_with_out_str", &[ptr], ptr)?,
+        // Region allocation
+        rt_region_start: declare_rt(module, "rt_region_start", &[], ptr)?,
+        rt_region_end: declare_rt(module, "rt_region_end", &[ptr], ptr)?,
+        rt_region_alloc_vector: declare_rt(
+            module,
+            "rt_region_alloc_vector",
+            &[ptr, ptr, types::I64],
+            ptr,
+        )?,
+        rt_region_alloc_map: declare_rt(
+            module,
+            "rt_region_alloc_map",
+            &[ptr, ptr, types::I64],
+            ptr,
+        )?,
+        rt_region_alloc_set: declare_rt(
+            module,
+            "rt_region_alloc_set",
+            &[ptr, ptr, types::I64],
+            ptr,
+        )?,
+        rt_region_alloc_list: declare_rt(
+            module,
+            "rt_region_alloc_list",
+            &[ptr, ptr, types::I64],
+            ptr,
+        )?,
+        rt_region_alloc_cons: declare_rt(
+            module,
+            "rt_region_alloc_cons",
+            &[ptr, ptr, ptr],
+            ptr,
+        )?,
     })
 }
 

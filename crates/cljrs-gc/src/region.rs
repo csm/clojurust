@@ -283,9 +283,59 @@ pub unsafe fn try_alloc_in_region<T: Trace + 'static>(value: T) -> Option<GcPtr<
     })
 }
 
+/// Explicitly pop the top region from the thread-local stack.
+///
+/// This is used by the AOT runtime ABI where [`RegionGuard`]'s RAII `Drop`
+/// cannot be used across `extern "C"` boundaries.
+///
+/// # Safety
+/// The caller must ensure that the corresponding [`Region`] is cleaned up
+/// after this call.  No `GcPtr` allocated in that region may be used
+/// afterwards.
+pub fn pop_region_guard() {
+    REGION_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
+
 /// Returns `true` if a region is currently active on this thread.
 pub fn region_is_active() -> bool {
     REGION_STACK.with(|stack| !stack.borrow().is_empty())
+}
+
+/// Returns the current depth of the region stack (number of active regions).
+///
+/// Used by exception handling to save/restore region state on throw.
+pub fn region_stack_depth() -> usize {
+    REGION_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Pop regions until the stack depth matches `target_depth`.
+///
+/// Used by exception handling to unwind region scopes on throw.
+///
+/// # Safety
+/// The caller must ensure that the corresponding `Region` objects are
+/// also cleaned up (dropped/reset) for each popped entry.
+pub fn unwind_region_stack_to(target_depth: usize) {
+    REGION_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        while stack.len() > target_depth {
+            stack.pop();
+        }
+    });
+}
+
+/// Push a raw region pointer onto the thread-local stack.
+///
+/// This is the non-RAII equivalent of [`RegionGuard::new`], used by the
+/// AOT runtime ABI where the region's lifetime is managed explicitly.
+///
+/// # Safety
+/// The `Region` must remain valid until the corresponding
+/// [`pop_region_guard`] call.
+pub unsafe fn push_region_raw(region: *mut Region) {
+    REGION_STACK.with(|stack| stack.borrow_mut().push(region));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

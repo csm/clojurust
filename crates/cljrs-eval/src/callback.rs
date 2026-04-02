@@ -75,6 +75,35 @@ pub fn install_eval_context(globals: Arc<GlobalEnv>, ns: Arc<str>) {
 ///
 /// Returns `Err` if called outside an eval context, or if the callee raises
 /// an error.
+/// Execute a closure with access to a temporary `Env` constructed from the
+/// current eval context.
+///
+/// This is used by the IR interpreter for calling builtins that need an `Env`
+/// (e.g., for nested `apply_value` calls from inside a `NativeFunction`
+/// closure).
+///
+/// # Errors
+///
+/// Returns `Err` if called outside an eval context.
+pub fn with_eval_context<F, R>(f: F) -> Result<R, crate::error::EvalError>
+where
+    F: FnOnce(&mut Env) -> Result<R, crate::error::EvalError>,
+{
+    let (globals, ns) = EVAL_CONTEXT.with(|stack| {
+        let s = stack.borrow();
+        let ec = s
+            .last()
+            .ok_or_else(|| {
+                crate::error::EvalError::Runtime(
+                    "with_eval_context called outside eval context".to_string(),
+                )
+            })?;
+        Ok::<_, crate::error::EvalError>((ec.globals.clone(), ec.current_ns.clone()))
+    })?;
+    let mut env = Env::new(globals, &ns);
+    f(&mut env)
+}
+
 pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     let (globals, ns) = EVAL_CONTEXT.with(|stack| {
         let s = stack.borrow();

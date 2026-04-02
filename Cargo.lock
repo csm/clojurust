@@ -232,6 +232,7 @@ version = "0.1.0"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
+ "cljrs-ir",
  "cljrs-reader",
  "cljrs-stdlib",
  "cljrs-types",
@@ -250,6 +251,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "cljrs-gc",
+ "cljrs-ir",
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
@@ -279,6 +281,13 @@ dependencies = [
  "cljrs-types",
  "cljrs-value",
  "num-bigint",
+]
+
+[[package]]
+name = "cljrs-ir"
+version = "0.1.0"
+dependencies = [
+ "cljrs-types",
 ]
 
 [[package]]

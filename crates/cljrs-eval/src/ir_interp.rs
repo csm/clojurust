@@ -1,0 +1,974 @@
+//! Tier 1 IR interpreter: executes [`IrFunction`] over a VarId→Value register file.
+//!
+//! This replaces tree-walking of `Form` ASTs with interpretation of the
+//! ANF IR.  Benefits:
+//! - Escape analysis results are available (region allocation)
+//! - Same IR feeds both interpretation and JIT compilation
+//! - Optimization passes (constant folding, etc.) apply uniformly
+//!
+//! The interpreter maintains a dense register file (`Vec<Option<Value>>`)
+//! indexed by `VarId`.  Control flow follows the block graph via
+//! `Terminator`s.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cljrs_gc::GcPtr;
+use cljrs_ir::{
+    BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator,
+    VarId,
+};
+use cljrs_value::value::{MapValue, SetValue};
+use cljrs_value::{
+    CljxCons, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value,
+};
+
+use crate::apply::apply_value;
+use crate::env::{Env, GlobalEnv};
+use crate::error::{EvalError, EvalResult};
+
+// ── Register file ───────────────────────────────────────────────────────────
+
+/// Dense register file indexed by `VarId`.
+struct Registers {
+    values: Vec<Option<Value>>,
+}
+
+impl Registers {
+    fn new(capacity: u32) -> Self {
+        Self {
+            values: vec![None; capacity as usize],
+        }
+    }
+
+    fn get(&self, id: VarId) -> &Value {
+        self.values[id.0 as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!("IR interpreter: uninitialized register {id}"))
+    }
+
+    fn set(&mut self, id: VarId, val: Value) {
+        let idx = id.0 as usize;
+        if idx >= self.values.len() {
+            self.values.resize(idx + 1, None);
+        }
+        self.values[idx] = Some(val);
+    }
+
+    fn get_cloned(&self, id: VarId) -> Value {
+        self.get(id).clone()
+    }
+}
+
+// ── Region state ────────────────────────────────────────────────────────────
+
+/// A region entry in the interpreter's local region stack.
+struct RegionEntry {
+    _region: Box<cljrs_gc::region::Region>,
+    // The region is also pushed onto the cljrs_gc thread-local REGION_STACK
+    // via push_region_raw.  We track it here for cleanup.
+}
+
+impl Drop for RegionEntry {
+    fn drop(&mut self) {
+        // Pop from cljrs_gc's thread-local stack.
+        cljrs_gc::region::pop_region_guard();
+        // Box<Region> drop handles destructor execution and chunk freeing.
+    }
+}
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+/// Execute an IR function with the given arguments.
+///
+/// This is the Tier 1 execution path, called from `call_cljrs_fn` when
+/// a cached `IrFunction` is available.
+///
+/// # Arguments
+/// * `ir_func` — the IR function to execute
+/// * `args` — argument values (positional, already matched to the arity)
+/// * `globals` — the shared global environment
+/// * `ns` — the namespace context for global lookups
+/// * `env` — caller's Env (for calling back into `apply_value`)
+pub fn interpret_ir(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    // GC safepoint at function entry.
+    crate::gc_safepoint(env);
+
+    let mut regs = Registers::new(ir_func.next_var);
+    let mut region_stack: Vec<RegionEntry> = Vec::new();
+
+    // Bind parameters to registers.
+    for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
+        if i < args.len() {
+            regs.set(*var_id, args[i].clone());
+        } else {
+            regs.set(*var_id, Value::Nil);
+        }
+    }
+
+    // Build a block index for O(1) lookup.
+    let block_index: HashMap<BlockId, usize> = ir_func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // Start at block 0.
+    let mut current_block_idx: usize = 0;
+    let mut prev_block_id = BlockId(u32::MAX); // sentinel
+
+    loop {
+        let block = &ir_func.blocks[current_block_idx];
+
+        // Resolve phi nodes based on predecessor.
+        for phi in &block.phis {
+            if let Inst::Phi(dst, entries) = phi {
+                for (from_block, var_id) in entries {
+                    if *from_block == prev_block_id {
+                        regs.set(*dst, regs.get_cloned(*var_id));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Execute instructions.
+        for inst in &block.insts {
+            execute_inst(
+                inst,
+                &mut regs,
+                &mut region_stack,
+                ir_func,
+                globals,
+                ns,
+                env,
+            )?;
+        }
+
+        // Execute terminator.
+        match &block.terminator {
+            Terminator::Return(var_id) => {
+                return Ok(regs.get_cloned(*var_id));
+            }
+            Terminator::Jump(target) => {
+                prev_block_id = block.id;
+                current_block_idx = block_index[target];
+            }
+            Terminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                prev_block_id = block.id;
+                let cond_val = regs.get(*cond);
+                let truthy = is_truthy(cond_val);
+                let target = if truthy { then_block } else { else_block };
+                current_block_idx = block_index[target];
+            }
+            Terminator::RecurJump { target, args } => {
+                // GC safepoint at loop back-edge.
+                crate::gc_safepoint(env);
+
+                // Collect new arg values before rebinding (avoid aliasing).
+                let new_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+
+                // Rebind parameters.
+                for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
+                    if i < new_vals.len() {
+                        regs.set(*var_id, new_vals[i].clone());
+                    }
+                }
+
+                prev_block_id = block.id;
+                current_block_idx = block_index[target];
+            }
+            Terminator::Unreachable => {
+                return Err(EvalError::Runtime(
+                    "IR interpreter: reached unreachable".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+// ── Truthiness ──────────────────────────────────────────────────────────────
+
+/// Clojure truthiness: everything is truthy except `nil` and `false`.
+fn is_truthy(val: &Value) -> bool {
+    !matches!(val, Value::Nil | Value::Bool(false))
+}
+
+// ── Instruction execution ───────────────────────────────────────────────────
+
+fn execute_inst(
+    inst: &Inst,
+    regs: &mut Registers,
+    region_stack: &mut Vec<RegionEntry>,
+    ir_func: &IrFunction,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult<()> {
+    match inst {
+        Inst::Const(dst, c) => {
+            regs.set(*dst, const_to_value(c));
+        }
+
+        Inst::LoadLocal(dst, name) => {
+            // Look up in the caller's environment (captures, locals).
+            let val = env
+                .lookup(name)
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!("IR interpreter: unbound local '{name}'"))
+                })?
+                .clone();
+            regs.set(*dst, val);
+        }
+
+        Inst::LoadGlobal(dst, gns, name) => {
+            let val = load_global_value(globals, gns, name)?;
+            regs.set(*dst, val);
+        }
+
+        Inst::LoadVar(dst, gns, name) => {
+            let var = globals
+                .lookup_var_in_ns(gns, name)
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "IR interpreter: var not found {gns}/{name}"
+                    ))
+                })?;
+            regs.set(*dst, Value::Var(var));
+        }
+
+        Inst::AllocVector(dst, elems) => {
+            let items: Vec<Value> = elems.iter().map(|v| regs.get_cloned(*v)).collect();
+            let pv = PersistentVector::from_iter(items);
+            regs.set(*dst, Value::Vector(GcPtr::new(pv)));
+        }
+
+        Inst::AllocMap(dst, pairs) => {
+            let kv: Vec<(Value, Value)> = pairs
+                .iter()
+                .map(|(k, v)| (regs.get_cloned(*k), regs.get_cloned(*v)))
+                .collect();
+            regs.set(*dst, Value::Map(MapValue::from_pairs(kv)));
+        }
+
+        Inst::AllocSet(dst, elems) => {
+            let items: Vec<Value> = elems.iter().map(|v| regs.get_cloned(*v)).collect();
+            let set = PersistentHashSet::from_iter(items);
+            regs.set(*dst, Value::Set(SetValue::Hash(GcPtr::new(set))));
+        }
+
+        Inst::AllocList(dst, elems) => {
+            let items: Vec<Value> = elems.iter().map(|v| regs.get_cloned(*v)).collect();
+            regs.set(
+                *dst,
+                Value::List(GcPtr::new(PersistentList::from_iter(items))),
+            );
+        }
+
+        Inst::AllocCons(dst, head, tail) => {
+            let h = regs.get_cloned(*head);
+            let t = regs.get_cloned(*tail);
+            regs.set(
+                *dst,
+                Value::Cons(GcPtr::new(CljxCons { head: h, tail: t })),
+            );
+        }
+
+        Inst::AllocClosure(dst, template, captures) => {
+            let val = alloc_closure(template, captures, regs, ir_func, globals, ns)?;
+            regs.set(*dst, val);
+        }
+
+        Inst::CallKnown(dst, known_fn, args) => {
+            // GC safepoint before call.
+            crate::gc_safepoint(env);
+            let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            let result = dispatch_known_fn(known_fn, arg_vals, env)?;
+            regs.set(*dst, result);
+        }
+
+        Inst::Call(dst, callee, args) => {
+            // GC safepoint before call.
+            crate::gc_safepoint(env);
+            let callee_val = regs.get_cloned(*callee);
+            let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            let result = apply_value(&callee_val, arg_vals, env)?;
+            regs.set(*dst, result);
+        }
+
+        Inst::CallDirect(dst, name, args) => {
+            // Look up the function by name in globals and call it.
+            crate::gc_safepoint(env);
+            let callee = load_global_value(globals, ns, name)?;
+            let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            let result = apply_value(&callee, arg_vals, env)?;
+            regs.set(*dst, result);
+        }
+
+        Inst::Deref(dst, src) => {
+            let val = regs.get_cloned(*src);
+            let derefed = crate::eval::deref_value(val)?;
+            regs.set(*dst, derefed);
+        }
+
+        Inst::DefVar(dst, def_ns, name, val_var) => {
+            let val = regs.get_cloned(*val_var);
+            globals.intern(def_ns, name.clone(), val.clone());
+            let var = globals
+                .lookup_var_in_ns(def_ns, name)
+                .expect("just interned");
+            regs.set(*dst, Value::Var(var));
+        }
+
+        Inst::SetBang(var_id, val_id) => {
+            let var_val = regs.get(*var_id);
+            let new_val = regs.get_cloned(*val_id);
+            if let Value::Var(var) = var_val {
+                // Try dynamic binding first, then root.
+                if !crate::dynamics::set_thread_local(var, new_val.clone()) {
+                    var.get().bind(new_val);
+                }
+            } else {
+                return Err(EvalError::Runtime(
+                    "set! target is not a Var".to_string(),
+                ));
+            }
+        }
+
+        Inst::Throw(val_id) => {
+            let val = regs.get_cloned(*val_id);
+            return Err(EvalError::Thrown(val));
+        }
+
+        Inst::Phi(..) => {
+            // Phis are resolved at block entry, not here.
+        }
+
+        Inst::Recur(args) => {
+            let vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            return Err(EvalError::Recur(vals));
+        }
+
+        Inst::SourceLoc(_span) => {
+            // No-op — could update a "current span" for error reporting.
+        }
+
+        // ── Region allocation ───────────────────────────────────────────
+        Inst::RegionStart(dst) => {
+            let mut region = Box::new(cljrs_gc::region::Region::new());
+            let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
+            unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
+            region_stack.push(RegionEntry { _region: region });
+            regs.set(*dst, Value::Nil);
+        }
+
+        Inst::RegionAlloc(dst, _region, kind, operands) => {
+            let val = alloc_in_region(*kind, operands, regs)?;
+            regs.set(*dst, val);
+        }
+
+        Inst::RegionEnd(_region) => {
+            // Pop and drop the region entry (Drop impl handles cleanup).
+            region_stack.pop();
+        }
+    }
+
+    Ok(())
+}
+
+// ── Constant conversion ─────────────────────────────────────────────────────
+
+fn const_to_value(c: &Const) -> Value {
+    match c {
+        Const::Nil => Value::Nil,
+        Const::Bool(b) => Value::Bool(*b),
+        Const::Long(n) => Value::Long(*n),
+        Const::Double(d) => Value::Double(*d),
+        Const::Str(s) => Value::Str(GcPtr::new(s.to_string())),
+        Const::Keyword(k) => {
+            Value::Keyword(GcPtr::new(cljrs_value::keyword::Keyword::parse(k)))
+        }
+        Const::Symbol(s) => {
+            Value::Symbol(GcPtr::new(cljrs_value::Symbol {
+                namespace: None,
+                name: s.clone(),
+            }))
+        }
+        Const::Char(c) => Value::Char(*c),
+    }
+}
+
+// ── Global value lookup ─────────────────────────────────────────────────────
+
+fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str) -> EvalResult {
+    // Try dynamic var deref first (for thread-local bindings).
+    if let Some(var) = globals.lookup_var_in_ns(ns, name) {
+        if let Some(val) = crate::dynamics::deref_var(&var) {
+            return Ok(val);
+        }
+        return Err(EvalError::Runtime(format!(
+            "IR interpreter: unbound var {ns}/{name}"
+        )));
+    }
+    Err(EvalError::Runtime(format!(
+        "IR interpreter: var not found {ns}/{name}"
+    )))
+}
+
+// ── Region-aware allocation ─────────────────────────────────────────────────
+
+fn alloc_in_region(
+    kind: RegionAllocKind,
+    operands: &[VarId],
+    regs: &Registers,
+) -> EvalResult {
+    match kind {
+        RegionAllocKind::Vector => {
+            let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
+            let pv = PersistentVector::from_iter(items);
+            let ptr = if cljrs_gc::region::region_is_active() {
+                unsafe { cljrs_gc::region::try_alloc_in_region(pv).unwrap() }
+            } else {
+                GcPtr::new(pv)
+            };
+            Ok(Value::Vector(ptr))
+        }
+        RegionAllocKind::Map => {
+            // Operands are flattened [k, v, k, v, ...].
+            let kv: Vec<(Value, Value)> = operands
+                .chunks(2)
+                .map(|pair| (regs.get_cloned(pair[0]), regs.get_cloned(pair[1])))
+                .collect();
+            Ok(Value::Map(MapValue::from_pairs(kv)))
+        }
+        RegionAllocKind::Set => {
+            let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
+            let set = PersistentHashSet::from_iter(items);
+            Ok(Value::Set(SetValue::Hash(GcPtr::new(set))))
+        }
+        RegionAllocKind::List => {
+            let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
+            let list = PersistentList::from_iter(items);
+            let ptr = if cljrs_gc::region::region_is_active() {
+                unsafe { cljrs_gc::region::try_alloc_in_region(list).unwrap() }
+            } else {
+                GcPtr::new(list)
+            };
+            Ok(Value::List(ptr))
+        }
+        RegionAllocKind::Cons => {
+            if operands.len() == 2 {
+                let h = regs.get_cloned(operands[0]);
+                let t = regs.get_cloned(operands[1]);
+                let cons = CljxCons { head: h, tail: t };
+                let ptr = if cljrs_gc::region::region_is_active() {
+                    unsafe { cljrs_gc::region::try_alloc_in_region(cons).unwrap() }
+                } else {
+                    GcPtr::new(cons)
+                };
+                Ok(Value::Cons(ptr))
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+    }
+}
+
+// ── Closure construction ────────────────────────────────────────────────────
+
+fn alloc_closure(
+    template: &ClosureTemplate,
+    capture_vars: &[VarId],
+    regs: &Registers,
+    ir_func: &IrFunction,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+) -> EvalResult {
+    let captured_values: Vec<Value> = capture_vars
+        .iter()
+        .map(|v| regs.get_cloned(*v))
+        .collect();
+
+    // Build a CljxFn-like wrapper using NativeFunction.
+    // Each arity maps to a subfunction in ir_func.subfunctions.
+    let subfuncs: Vec<Arc<IrFunction>> = ir_func
+        .subfunctions
+        .iter()
+        .map(clone_ir_function)
+        .map(Arc::new)
+        .collect();
+
+    let param_counts = template.param_counts.clone();
+    let is_variadic = template.is_variadic.clone();
+    let fn_name = template.name.clone();
+    let closure_ns = ns.clone();
+    let closure_globals = globals.clone();
+
+    // Create a native function that dispatches to the IR interpreter.
+    let nf = NativeFn {
+        name: fn_name
+            .as_deref()
+            .unwrap_or("<ir-closure>")
+            .into(),
+        arity: if param_counts.len() == 1 && !is_variadic[0] {
+            cljrs_value::Arity::Fixed(param_counts[0])
+        } else {
+            cljrs_value::Arity::Variadic {
+                min: param_counts.iter().copied().min().unwrap_or(0),
+            }
+        },
+        func: Arc::new({
+            let captured_values = captured_values.clone();
+            let subfuncs = subfuncs.clone();
+            let param_counts = param_counts.clone();
+            let is_variadic = is_variadic.clone();
+            let closure_globals = closure_globals.clone();
+            let closure_ns = closure_ns.clone();
+            move |call_args: &[Value]| {
+                // Select the right arity.
+                let nargs = call_args.len();
+                let mut best_idx = None;
+                for (i, &pc) in param_counts.iter().enumerate() {
+                    if is_variadic[i] && nargs >= pc {
+                        // Variadic: accept pc or more.
+                        match best_idx {
+                            None => best_idx = Some(i),
+                            Some(prev) => {
+                                if pc > param_counts[prev] {
+                                    best_idx = Some(i);
+                                }
+                            }
+                        }
+                    } else if !is_variadic[i] && nargs == pc {
+                        best_idx = Some(i);
+                        break;
+                    }
+                }
+
+                let idx = best_idx.ok_or_else(|| {
+                    cljrs_value::ValueError::Other(format!(
+                        "Wrong number of args ({nargs}) passed to IR closure"
+                    ))
+                })?;
+
+                let subfunc = &subfuncs[idx];
+
+                // Build full args: captures + call_args (+ rest list for variadic).
+                let mut full_args = captured_values.clone();
+                if is_variadic[idx] {
+                    let pc = param_counts[idx];
+                    // Fixed params.
+                    for a in call_args[..pc.min(nargs)].iter() {
+                        full_args.push(a.clone());
+                    }
+                    // Rest as a list.
+                    let rest: Vec<Value> = if nargs > pc {
+                        call_args[pc..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    full_args
+                        .push(Value::List(GcPtr::new(PersistentList::from_iter(rest))));
+                } else {
+                    full_args.extend_from_slice(call_args);
+                }
+
+                // Call back into the interpreter via callback::invoke infrastructure.
+                // We need an Env, which we get from the callback context.
+                let result = crate::callback::with_eval_context(|env| {
+                    interpret_ir(subfunc, full_args, &closure_globals, &closure_ns, env)
+                });
+                match result {
+                    Ok(v) => Ok(v),
+                    Err(EvalError::Runtime(msg)) => Err(cljrs_value::ValueError::Other(msg)),
+                    Err(EvalError::Thrown(v)) => Err(cljrs_value::ValueError::Thrown(v)),
+                    Err(EvalError::Recur(vals)) => Err(cljrs_value::ValueError::Other(
+                        format!("recur from non-tail position ({} values)", vals.len()),
+                    )),
+                    Err(other) => Err(cljrs_value::ValueError::Other(format!("{other}"))),
+                }
+            }
+        }),
+    };
+
+    Ok(Value::NativeFunction(GcPtr::new(nf)))
+}
+
+/// Deep clone an IrFunction (it doesn't implement Clone due to Debug derive).
+fn clone_ir_function(f: &IrFunction) -> IrFunction {
+    IrFunction {
+        name: f.name.clone(),
+        params: f.params.clone(),
+        blocks: f.blocks.clone(),
+        next_var: f.next_var,
+        next_block: f.next_block,
+        span: f.span.clone(),
+        subfunctions: f.subfunctions.iter().map(clone_ir_function).collect(),
+    }
+}
+
+// ── KnownFn dispatch ────────────────────────────────────────────────────────
+
+/// Dispatch a call to a known built-in function.
+///
+/// This maps each `KnownFn` variant to the corresponding Rust builtin
+/// from `builtins.rs`, or falls back to `apply_value` for complex cases.
+fn dispatch_known_fn(
+    known_fn: &KnownFn,
+    args: Vec<Value>,
+    env: &mut Env,
+) -> EvalResult {
+    match known_fn {
+        // ── Arithmetic ──────────────────────────────────────────────────
+        KnownFn::Add => builtin_arith(&args, "+"),
+        KnownFn::Sub => builtin_arith(&args, "-"),
+        KnownFn::Mul => builtin_arith(&args, "*"),
+        KnownFn::Div => builtin_arith(&args, "/"),
+        KnownFn::Rem => builtin_arith(&args, "rem"),
+
+        // ── Comparison ──────────────────────────────────────────────────
+        KnownFn::Eq => {
+            Ok(Value::Bool(args.len() == 2 && args[0] == args[1]))
+        }
+        KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte => {
+            builtin_compare(known_fn, &args)
+        }
+        KnownFn::Identical => {
+            Ok(Value::Bool(
+                args.len() == 2 && std::ptr::eq(&args[0] as *const _, &args[1] as *const _),
+            ))
+        }
+
+        // ── Type predicates ─────────────────────────────────────────────
+        KnownFn::IsNil => Ok(Value::Bool(matches!(args.first(), Some(Value::Nil)))),
+        KnownFn::IsSeq => Ok(Value::Bool(matches!(
+            args.first(),
+            Some(Value::List(_) | Value::Cons(_) | Value::LazySeq(_))
+        ))),
+        KnownFn::IsVector => Ok(Value::Bool(matches!(args.first(), Some(Value::Vector(_))))),
+        KnownFn::IsMap => Ok(Value::Bool(matches!(args.first(), Some(Value::Map(_))))),
+        KnownFn::IsNumber => Ok(Value::Bool(matches!(
+            args.first(),
+            Some(Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::Ratio(_) | Value::BigDecimal(_))
+        ))),
+        KnownFn::IsString => Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))))),
+        KnownFn::IsKeyword => Ok(Value::Bool(matches!(args.first(), Some(Value::Keyword(_))))),
+        KnownFn::IsSymbol => Ok(Value::Bool(matches!(args.first(), Some(Value::Symbol(_))))),
+        KnownFn::IsBool => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
+        KnownFn::IsInt => Ok(Value::Bool(matches!(
+            args.first(),
+            Some(Value::Long(_) | Value::BigInt(_))
+        ))),
+
+        // ── String ──────────────────────────────────────────────────────
+        KnownFn::Str => {
+            let s: String = args
+                .iter()
+                .map(|v| format!("{}", cljrs_value::value::PrintValue(v)))
+                .collect();
+            Ok(Value::Str(GcPtr::new(s)))
+        }
+
+        // ── Collection construction ─────────────────────────────────────
+        KnownFn::Vector => {
+            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(args))))
+        }
+        KnownFn::HashMap => {
+            let pairs: Vec<(Value, Value)> = args
+                .chunks(2)
+                .map(|c| (c[0].clone(), c.get(1).cloned().unwrap_or(Value::Nil)))
+                .collect();
+            Ok(Value::Map(MapValue::from_pairs(pairs)))
+        }
+        KnownFn::HashSet => {
+            Ok(Value::Set(SetValue::Hash(GcPtr::new(
+                PersistentHashSet::from_iter(args),
+            ))))
+        }
+        KnownFn::List => {
+            Ok(Value::List(GcPtr::new(PersistentList::from_iter(args))))
+        }
+
+        // ── Collection operations ───────────────────────────────────────
+        KnownFn::Get => {
+            let result = builtin_call_native("get", &args)?;
+            Ok(result)
+        }
+        KnownFn::Nth => builtin_call_native("nth", &args),
+        KnownFn::Count => builtin_call_native("count", &args),
+        KnownFn::Contains => builtin_call_native("contains?", &args),
+        KnownFn::Assoc => builtin_call_native("assoc", &args),
+        KnownFn::Dissoc => builtin_call_native("dissoc", &args),
+        KnownFn::Conj => builtin_call_native("conj", &args),
+        KnownFn::Disj => builtin_call_native("disj", &args),
+        KnownFn::First => builtin_call_native("first", &args),
+        KnownFn::Rest => builtin_call_native("rest", &args),
+        KnownFn::Next => builtin_call_native("next", &args),
+        KnownFn::Cons => builtin_call_native("cons", &args),
+        KnownFn::Seq => builtin_call_native("seq", &args),
+        KnownFn::Keys => builtin_call_native("keys", &args),
+        KnownFn::Vals => builtin_call_native("vals", &args),
+        KnownFn::Merge => builtin_call_native("merge", &args),
+        KnownFn::Update => builtin_call_native("update", &args),
+        KnownFn::GetIn => builtin_call_native("get-in", &args),
+        KnownFn::AssocIn => builtin_call_native("assoc-in", &args),
+        KnownFn::Concat => builtin_call_native("concat", &args),
+        KnownFn::Reverse => builtin_call_native("reverse", &args),
+        KnownFn::Frequencies => builtin_call_native("frequencies", &args),
+        KnownFn::Zipmap => builtin_call_native("zipmap", &args),
+
+        // ── Transient operations ────────────────────────────────────────
+        KnownFn::Transient => builtin_call_native("transient", &args),
+        KnownFn::AssocBang => builtin_call_native("assoc!", &args),
+        KnownFn::ConjBang => builtin_call_native("conj!", &args),
+        KnownFn::PersistentBang => builtin_call_native("persistent!", &args),
+
+        // ── Sequence operations ─────────────────────────────────────────
+        KnownFn::Take => builtin_call_native("take", &args),
+        KnownFn::Drop => builtin_call_native("drop", &args),
+        KnownFn::Range1 | KnownFn::Range2 | KnownFn::Range3 => {
+            builtin_call_native("range", &args)
+        }
+        KnownFn::LazySeq => {
+            // LazySeq takes a thunk function.
+            if let Some(f) = args.first() {
+                builtin_call_native("make-lazy-seq", std::slice::from_ref(f))
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+
+        // ── Atom operations ─────────────────────────────────────────────
+        KnownFn::Atom => builtin_call_native("atom", &args),
+        KnownFn::Deref | KnownFn::AtomDeref => {
+            if let Some(v) = args.into_iter().next() {
+                crate::eval::deref_value(v)
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+        KnownFn::AtomReset => builtin_call_native("reset!", &args),
+        KnownFn::AtomSwap => {
+            // swap! needs env for callback.
+            let callee = load_builtin(env, "swap!")?;
+            apply_value(&callee, args, env)
+        }
+
+        // ── I/O ─────────────────────────────────────────────────────────
+        KnownFn::Println => builtin_call_native("println", &args),
+        KnownFn::Pr => builtin_call_native("pr", &args),
+        KnownFn::Prn => builtin_call_native("prn", &args),
+        KnownFn::Print => builtin_call_native("print", &args),
+
+        // ── HOFs (need env for callbacks) ───────────────────────────────
+        KnownFn::Map
+        | KnownFn::Filter
+        | KnownFn::Mapv
+        | KnownFn::Filterv
+        | KnownFn::Reduce2
+        | KnownFn::Reduce3
+        | KnownFn::Some
+        | KnownFn::Every
+        | KnownFn::Into
+        | KnownFn::Into3
+        | KnownFn::Sort
+        | KnownFn::SortBy
+        | KnownFn::GroupBy
+        | KnownFn::Partition2
+        | KnownFn::Partition3
+        | KnownFn::Partition4
+        | KnownFn::Keep
+        | KnownFn::Remove
+        | KnownFn::MapIndexed
+        | KnownFn::Juxt
+        | KnownFn::Comp
+        | KnownFn::Partial
+        | KnownFn::Complement
+        | KnownFn::Apply => {
+            let fn_name = known_fn_to_name(known_fn);
+            let callee = load_builtin(env, fn_name)?;
+            apply_value(&callee, args, env)
+        }
+
+        // ── Dynamic binding / exception handling ────────────────────────
+        KnownFn::SetBangVar => builtin_call_native("set!", &args),
+        KnownFn::WithBindings | KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
+            let fn_name = known_fn_to_name(known_fn);
+            let callee = load_builtin(env, fn_name)?;
+            apply_value(&callee, args, env)
+        }
+    }
+}
+
+// ── Helpers for KnownFn dispatch ────────────────────────────────────────────
+
+/// Call a native builtin by name from the global environment.
+fn builtin_call_native(name: &str, args: &[Value]) -> EvalResult {
+    // Use the callback infrastructure to get an eval context.
+    crate::callback::with_eval_context(|env| {
+        let callee = load_builtin(env, name)?;
+        if let Value::NativeFunction(nf) = &callee {
+            (nf.get().func)(args).map_err(|e| EvalError::Runtime(e.to_string()))
+        } else {
+            apply_value(&callee, args.to_vec(), env)
+        }
+    })
+}
+
+/// Look up a builtin function by name in the global environment.
+fn load_builtin(env: &Env, name: &str) -> EvalResult {
+    env.globals
+        .lookup_in_ns("clojure.core", name)
+        .ok_or_else(|| {
+            EvalError::Runtime(format!("IR interpreter: builtin not found: {name}"))
+        })
+}
+
+/// Map KnownFn variants to their Clojure function names.
+fn known_fn_to_name(kf: &KnownFn) -> &'static str {
+    match kf {
+        KnownFn::Map => "map",
+        KnownFn::Filter => "filter",
+        KnownFn::Mapv => "mapv",
+        KnownFn::Filterv => "filterv",
+        KnownFn::Reduce2 | KnownFn::Reduce3 => "reduce",
+        KnownFn::Some => "some",
+        KnownFn::Every => "every?",
+        KnownFn::Into | KnownFn::Into3 => "into",
+        KnownFn::Sort => "sort",
+        KnownFn::SortBy => "sort-by",
+        KnownFn::GroupBy => "group-by",
+        KnownFn::Partition2 | KnownFn::Partition3 | KnownFn::Partition4 => "partition",
+        KnownFn::Keep => "keep",
+        KnownFn::Remove => "remove",
+        KnownFn::MapIndexed => "map-indexed",
+        KnownFn::Juxt => "juxt",
+        KnownFn::Comp => "comp",
+        KnownFn::Partial => "partial",
+        KnownFn::Complement => "complement",
+        KnownFn::Apply => "apply",
+        KnownFn::WithBindings => "with-bindings*",
+        KnownFn::WithOutStr => "with-out-str",
+        KnownFn::TryCatchFinally => "try",
+        KnownFn::SetBangVar => "set!",
+        _ => "unknown",
+    }
+}
+
+/// Arithmetic dispatch for +, -, *, /, rem.
+fn builtin_arith(args: &[Value], op: &str) -> EvalResult {
+    if args.len() != 2 {
+        return builtin_call_native(op, args);
+    }
+    let (a, b) = (&args[0], &args[1]);
+    match (a, b) {
+        (Value::Long(x), Value::Long(y)) => match op {
+            "+" => Ok(Value::Long(x.wrapping_add(*y))),
+            "-" => Ok(Value::Long(x.wrapping_sub(*y))),
+            "*" => Ok(Value::Long(x.wrapping_mul(*y))),
+            "/" => {
+                if *y == 0 {
+                    Err(EvalError::Runtime("Divide by zero".to_string()))
+                } else {
+                    Ok(Value::Long(x / y))
+                }
+            }
+            "rem" => {
+                if *y == 0 {
+                    Err(EvalError::Runtime("Divide by zero".to_string()))
+                } else {
+                    Ok(Value::Long(x % y))
+                }
+            }
+            _ => builtin_call_native(op, args),
+        },
+        (Value::Double(x), Value::Double(y)) => match op {
+            "+" => Ok(Value::Double(x + y)),
+            "-" => Ok(Value::Double(x - y)),
+            "*" => Ok(Value::Double(x * y)),
+            "/" => Ok(Value::Double(x / y)),
+            "rem" => Ok(Value::Double(x % y)),
+            _ => builtin_call_native(op, args),
+        },
+        (Value::Long(x), Value::Double(y)) => {
+            let x = *x as f64;
+            match op {
+                "+" => Ok(Value::Double(x + y)),
+                "-" => Ok(Value::Double(x - y)),
+                "*" => Ok(Value::Double(x * y)),
+                "/" => Ok(Value::Double(x / y)),
+                "rem" => Ok(Value::Double(x % y)),
+                _ => builtin_call_native(op, args),
+            }
+        }
+        (Value::Double(x), Value::Long(y)) => {
+            let y = *y as f64;
+            match op {
+                "+" => Ok(Value::Double(*x + y)),
+                "-" => Ok(Value::Double(*x - y)),
+                "*" => Ok(Value::Double(*x * y)),
+                "/" => Ok(Value::Double(*x / y)),
+                "rem" => Ok(Value::Double(*x % y)),
+                _ => builtin_call_native(op, args),
+            }
+        }
+        _ => builtin_call_native(op, args),
+    }
+}
+
+/// Comparison dispatch for <, >, <=, >=.
+fn builtin_compare(known_fn: &KnownFn, args: &[Value]) -> EvalResult {
+    if args.len() != 2 {
+        return Ok(Value::Bool(false));
+    }
+    let (a, b) = (&args[0], &args[1]);
+    let result = match (a, b) {
+        (Value::Long(x), Value::Long(y)) => match known_fn {
+            KnownFn::Lt => x < y,
+            KnownFn::Gt => x > y,
+            KnownFn::Lte => x <= y,
+            KnownFn::Gte => x >= y,
+            _ => false,
+        },
+        (Value::Double(x), Value::Double(y)) => match known_fn {
+            KnownFn::Lt => x < y,
+            KnownFn::Gt => x > y,
+            KnownFn::Lte => x <= y,
+            KnownFn::Gte => x >= y,
+            _ => false,
+        },
+        (Value::Long(x), Value::Double(y)) => {
+            let x = *x as f64;
+            match known_fn {
+                KnownFn::Lt => x < *y,
+                KnownFn::Gt => x > *y,
+                KnownFn::Lte => x <= *y,
+                KnownFn::Gte => x >= *y,
+                _ => false,
+            }
+        }
+        (Value::Double(x), Value::Long(y)) => {
+            let y = *y as f64;
+            match known_fn {
+                KnownFn::Lt => *x < y,
+                KnownFn::Gt => *x > y,
+                KnownFn::Lte => *x <= y,
+                KnownFn::Gte => *x >= y,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(result))
+}

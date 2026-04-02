@@ -7,6 +7,7 @@ members = [
     "crates/cljrs-eval",
     "crates/cljrs-stdlib",
     "crates/cljrs-runtime",
+    "crates/cljrs-ir",
     "crates/cljrs-compiler",
     "crates/cljrs-interop",
     "crates/cljrs",
@@ -22,6 +23,7 @@ cljrs-reader   = { path = "crates/cljrs-reader" }
 cljrs-eval     = { path = "crates/cljrs-eval" }
 cljrs-stdlib   = { path = "crates/cljrs-stdlib" }
 cljrs-runtime  = { path = "crates/cljrs-runtime" }
+cljrs-ir       = { path = "crates/cljrs-ir" }
 cljrs-compiler = { path = "crates/cljrs-compiler" }
 cljrs-interop  = { path = "crates/cljrs-interop" }
 
