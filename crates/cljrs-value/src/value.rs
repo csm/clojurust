@@ -504,10 +504,15 @@ fn seq_equal(a: &Value, b: &Value) -> bool {
 }
 
 fn value_to_seq_vec(v: &Value) -> Vec<Value> {
-    match v {
+    // Iteratively unwrap lazy seqs.
+    let mut v = v.clone();
+    while let Value::LazySeq(ls) = &v {
+        v = ls.get().realize();
+    }
+    match &v {
         Value::List(l) => l.get().iter().cloned().collect(),
         Value::Vector(v) => v.get().iter().cloned().collect(),
-        Value::LazySeq(ls) => value_to_seq_vec(&ls.get().realize()),
+        Value::LazySeq(_) => unreachable!("unwrapped above"),
         Value::Cons(c) => {
             let mut result = vec![c.get().head.clone()];
             let mut tail = c.get().tail.clone();

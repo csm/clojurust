@@ -17,8 +17,8 @@ use cljrs_value::value::SetValue;
 use cljrs_value::value::SetValue::Sorted;
 use cljrs_value::{
     Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, FutureState, Keyword,
-    MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentVector, SortedSet, Symbol, TypeInstance, Value, ValueError,
+    LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
+    PersistentList, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError,
     ValueResult, Volatile,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use crate::array_list::{builtin_array_list, builtin_array_list_length, builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array};
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -635,6 +636,13 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("bit-flip", Arity::Fixed(2), builtin_bit_flip),
         ("bit-set", Arity::Fixed(2), builtin_bit_set),
         ("bit-test", Arity::Fixed(2), builtin_bit_test),
+
+        // array-list extension
+        ("array-list", Arity::Variadic { min: 0 }, builtin_array_list),
+        ("array-list-push", Arity::Fixed(2), builtin_array_list_push),
+        ("array-list-remove", Arity::Fixed(2), builtin_array_list_remove),
+        ("array-list-length", Arity::Fixed(1), builtin_array_list_length),
+        ("array-list-to-array", Arity::Fixed(1), builtin_array_list_to_array),
     ];
 
     for (name, arity, func) in fns {
@@ -2736,22 +2744,23 @@ fn builtin_rseq(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
-    match args[0].unwrap_meta() {
-        Value::LazySeq(ls) => {
-            // Realize the lazy seq then apply seq to the result.
-            let realized = ls.get().realize();
-            if let Some(err) = crate::apply::take_lazy_seq_error() {
-                return Err(ValueError::Other(err));
-            }
-            builtin_seq(&[realized])
+    // Iteratively unwrap lazy seqs to avoid stack overflow.
+    let mut val = args[0].unwrap_meta().clone();
+    while let Value::LazySeq(ls) = &val {
+        let realized = ls.get().realize();
+        if let Some(err) = crate::apply::take_lazy_seq_error() {
+            return Err(ValueError::Other(err));
         }
-        Value::Cons(_) => Ok(args[0].clone()), // cons is always non-empty
+        val = realized;
+    }
+    match &val {
+        Value::Cons(_) => Ok(val), // cons is always non-empty
         Value::Nil => Ok(Value::Nil),
         Value::List(l) => {
             if l.get().is_empty() {
                 Ok(Value::Nil)
             } else {
-                Ok(args[0].clone())
+                Ok(val)
             }
         }
         Value::Vector(v) => {
@@ -3101,18 +3110,210 @@ fn builtin_reverse(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
-    let mut out = Vec::new();
-    for arg in args {
-        let mut iter = ValueIter::new(arg.clone());
-        out.extend(iter.by_ref());
-        if let Some(err) = iter.take_error() {
-            return Err(ValueError::Other(err));
+    // Collect the argument collections (unevaluated lazy seqs stay lazy).
+    let colls: Vec<Value> = args.to_vec();
+    Ok(concat_lazy(colls))
+}
+
+/// Build a lazy concat of the given collections.
+///
+/// Returns a lazy-seq that walks through each collection in order,
+/// producing cons cells on demand.
+fn concat_lazy(mut colls: Vec<Value>) -> Value {
+    // Skip leading nils and empty collections eagerly to find the first element.
+    loop {
+        if colls.is_empty() {
+            return Value::List(GcPtr::new(PersistentList::empty()));
+        }
+        let first_coll = &colls[0];
+        // Check if the first collection is nil or empty without fully realizing it.
+        match first_coll {
+            Value::Nil => {
+                colls.remove(0);
+                continue;
+            }
+            Value::List(l) if l.get().is_empty() => {
+                colls.remove(0);
+                continue;
+            }
+            _ => break,
         }
     }
-    if out.is_empty() {
-        Ok(Value::List(GcPtr::new(PersistentList::empty())))
-    } else {
-        Ok(Value::List(GcPtr::new(PersistentList::from_iter(out))))
+
+    // Return a lazy-seq thunk that produces cons(first, concat_lazy(rest)).
+    Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(ConcatThunk { colls }))))
+}
+
+/// Thunk for lazy concat: holds remaining collections to iterate.
+#[derive(Debug)]
+struct ConcatThunk {
+    colls: Vec<Value>,
+}
+
+impl cljrs_gc::Trace for ConcatThunk {
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        for c in &self.colls {
+            c.trace(visitor);
+        }
+    }
+}
+
+impl Thunk for ConcatThunk {
+    fn force(&self) -> Value {
+        let mut colls = self.colls.clone();
+        // Walk through collections iteratively (no recursion) to find the
+        // first element.  This avoids stack overflow on deeply nested
+        // lazy-seq chains.
+        loop {
+            if colls.is_empty() {
+                return Value::Nil;
+            }
+
+            // Peel through any lazy-seq wrappers on the head iteratively.
+            let mut head = colls[0].clone();
+            loop {
+                match &head {
+                    Value::LazySeq(ls) => {
+                        let realized = ls.get().realize();
+                        if crate::apply::take_lazy_seq_error().is_some() {
+                            return Value::Nil;
+                        }
+                        head = realized;
+                    }
+                    _ => break,
+                }
+            }
+
+            // Now head is a non-lazy value.
+            match &head {
+                Value::Nil => {
+                    colls.remove(0);
+                    continue;
+                }
+                Value::List(l) if l.get().is_empty() => {
+                    colls.remove(0);
+                    continue;
+                }
+                _ => {}
+            }
+
+            let (first, rest) = concat_first_rest(&head);
+            match first {
+                Some(f) => {
+                    colls[0] = rest;
+                    // Build the tail as a lazy-seq (no recursive call on the
+                    // Rust stack — the next element is produced when the tail
+                    // lazy-seq is realized later).
+                    let tail = concat_lazy(colls);
+                    return Value::Cons(GcPtr::new(CljxCons {
+                        head: f,
+                        tail,
+                    }));
+                }
+                None => {
+                    colls.remove(0);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// Extract first element and rest from a seq-like value without fully realizing it.
+/// Used by the lazy concat implementation.  Iteratively unwraps LazySeq to
+/// avoid stack overflow on deeply nested lazy chains.
+fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
+    // Iteratively unwrap lazy seqs first.
+    let mut current = val.clone();
+    loop {
+        match &current {
+            Value::LazySeq(ls) => {
+                current = ls.get().realize();
+            }
+            _ => break,
+        }
+    }
+    let val = &current;
+
+    match val {
+        Value::Nil => (None, Value::Nil),
+        Value::Cons(c) => {
+            let c = c.get();
+            (Some(c.head.clone()), c.tail.clone())
+        }
+        Value::List(l) => {
+            let l = l.get();
+            if l.is_empty() {
+                (None, Value::Nil)
+            } else {
+                let mut iter = l.iter();
+                let first = iter.next().cloned();
+                let rest: Vec<Value> = iter.cloned().collect();
+                let rest_val = if rest.is_empty() {
+                    Value::Nil
+                } else {
+                    Value::List(GcPtr::new(PersistentList::from_iter(rest)))
+                };
+                (first, rest_val)
+            }
+        }
+        Value::Vector(v) => {
+            let v = v.get();
+            if v.is_empty() {
+                (None, Value::Nil)
+            } else {
+                let first = v.iter().next().cloned();
+                let rest: Vec<Value> = v.iter().skip(1).cloned().collect();
+                let rest_val = if rest.is_empty() {
+                    Value::Nil
+                } else {
+                    Value::List(GcPtr::new(PersistentList::from_iter(rest)))
+                };
+                (first, rest_val)
+            }
+        }
+        Value::Map(m) => {
+            // seq on a map produces [k v] pairs.
+            let mut pairs = Vec::new();
+            m.for_each(|k, v| {
+                pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                    k.clone(),
+                    v.clone(),
+                ]))));
+            });
+            if pairs.is_empty() {
+                (None, Value::Nil)
+            } else {
+                let first = Some(pairs.remove(0));
+                let rest_val = if pairs.is_empty() {
+                    Value::Nil
+                } else {
+                    Value::List(GcPtr::new(PersistentList::from_iter(pairs)))
+                };
+                (first, rest_val)
+            }
+        }
+        Value::LazySeq(_) => {
+            // Should not reach here — LazySeq is unwrapped iteratively above.
+            unreachable!("LazySeq should have been unwrapped before concat_first_rest match")
+        }
+        Value::Str(s) => {
+            let s = s.get();
+            let mut chars = s.chars();
+            match chars.next() {
+                None => (None, Value::Nil),
+                Some(c) => {
+                    let rest: String = chars.collect();
+                    let rest_val = if rest.is_empty() {
+                        Value::Nil
+                    } else {
+                        Value::Str(GcPtr::new(rest))
+                    };
+                    (Some(Value::Char(c)), rest_val)
+                }
+            }
+        }
+        _ => (None, Value::Nil),
     }
 }
 
@@ -6350,6 +6551,10 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
         "clojure.lang.IPending" | "IPending" => matches!(
             val,
             Value::Promise(_) | Value::Future(_) | Value::Delay(_) | Value::LazySeq(_)
+        ),
+        "clojure.lang.IEditableCollection" => matches!(
+            val,
+            Value::List(_) | Value::Set(_) | Value::Map(_)
         ),
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),

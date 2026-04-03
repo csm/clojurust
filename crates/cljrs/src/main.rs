@@ -11,10 +11,24 @@ use cljrs_gc::GcConfig;
 use cljrs_stdlib::{self as cljrs_stdlib};
 use cljrs_value::Value;
 
+/// Default thread stack size: 64 MiB.
+const DEFAULT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 /// clojurust — a Rust-hosted dialect of the Clojure programming language.
 #[derive(Parser)]
 #[command(name = "cljrs", version, about, long_about = None)]
 struct Cli {
+    /// Thread stack size in megabytes (default: 64).
+    /// Increase if you hit stack overflows with deeply recursive code.
+    #[arg(long, global = true, value_name = "MB", help = "Set thread stack size (default 64MB)")]
+    stack_size_mb: Option<usize>,
+
+    #[arg(long, global = true, help = "Enable debug logging")]
+    debug: bool,
+
+    #[arg(long, global = true, help = "Enable trace logging (implies --debug)")]
+    trace: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -119,7 +133,32 @@ fn main() -> miette::Result<()> {
     .into_diagnostic()?;
 
     let cli = Cli::parse();
-    run(cli)
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(if cli.trace {
+            tracing::Level::TRACE
+        } else if cli.debug {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        }).try_init();
+
+    let stack_size = cli
+        .stack_size_mb
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_STACK_SIZE);
+
+    // Spawn the actual work on a thread with a larger stack to handle
+    // deeply recursive Clojure code (lazy-seq chains, recursive macros, etc.).
+    let builder = std::thread::Builder::new()
+        .name("cljrs-main".into())
+        .stack_size(stack_size);
+    let handle = builder
+        .spawn(move || run(cli))
+        .into_diagnostic()?;
+    handle.join().unwrap_or_else(|e| {
+        eprintln!("cljrs: thread panicked: {e:?}");
+        std::process::exit(1);
+    })
 }
 
 fn run(cli: Cli) -> miette::Result<()> {

@@ -30,6 +30,7 @@ pub mod taps;
 mod transients;
 mod util;
 mod virtualize;
+mod array_list;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};

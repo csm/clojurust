@@ -1,2 +1,3 @@
 /target
 .idea/
+.cljrs-aot-test-harness

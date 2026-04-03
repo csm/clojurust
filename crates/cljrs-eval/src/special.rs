@@ -34,6 +34,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "throw",
     "try",
     "defn",
+    "defn-",
     "defmacro",
     "defonce",
     "and",
@@ -71,7 +72,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "set!" => eval_set_bang(args, env),
         "throw" => eval_throw(args, env),
         "try" => eval_try(args, env),
-        "defn" => eval_defn(args, env),
+        "defn" | "defn-" => eval_defn(args, env),
         "defmacro" => eval_defmacro(args, env),
         "defonce" => eval_defonce(args, env),
         "and" => eval_and(args, env),
@@ -772,12 +773,16 @@ fn parse_try_args(args: &[Form]) -> (&[Form], Option<&str>, &[Form], &[Form]) {
 
 pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
     let name = require_sym(args, 0, "defn")?;
-    // Skip optional docstring.
-    let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
-        2
-    } else {
-        1
-    };
+    // Skip optional docstring and/or metadata map after the name.
+    // Valid orderings: (defn name body...), (defn name "doc" body...),
+    // (defn name {:meta ...} body...), (defn name "doc" {:meta ...} body...).
+    let mut rest_start = 1;
+    if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Str(_)) {
+        rest_start += 1;
+    }
+    if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Map(_)) {
+        rest_start += 1;
+    }
     // Build (fn* name ...)
     let mut fn_args = vec![Form::new(
         FormKind::Symbol(name.to_string()),
@@ -826,11 +831,13 @@ fn prepend_macro_params(form: &Form) -> Form {
 
 fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
     let name = require_sym(args, 0, "defmacro")?;
-    let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
-        2
-    } else {
-        1
-    };
+    let mut rest_start = 1;
+    if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Str(_)) {
+        rest_start += 1;
+    }
+    if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Map(_)) {
+        rest_start += 1;
+    }
     // Prepend implicit &form and &env params to each arity.
     let mut fn_args = vec![Form::new(
         FormKind::Symbol(name.to_string()),

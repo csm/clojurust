@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cljrs_gc::GcPtr;
-use cljrs_reader::Form;
+use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
     AgentFn, AgentMsg, Arity, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
     Symbol, Thunk, Value,
@@ -122,6 +122,15 @@ impl Thunk for ClosureThunk {
 /// - The `swap!` function (needs env to call the function).
 /// - Regular function calls.
 pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    // Interop: (.methodName target args...) — method call syntax.
+    if let FormKind::Symbol(s) = &func_form.kind
+        && let Some(method) = s.strip_prefix('.')
+        && !method.is_empty()
+        && method != "."
+    {
+        return eval_method_call(method, arg_forms, env);
+    }
+
     // Evaluate the callee first.
     let callee = eval(func_form, env)?;
 
@@ -166,6 +175,202 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
         .collect::<EvalResult<_>>()?;
 
     apply_value(&callee, args, env)
+}
+
+// ── Interop method calls ─────────────────────────────────────────────────────
+
+/// Evaluate `(.methodName target args...)` interop syntax.
+///
+/// Currently supports a small set of methods on built-in types:
+/// - `.indexOf` on strings and vectors
+/// - `.startsWith`, `.endsWith`, `.contains`, `.substring`, `.length`,
+///   `.charAt`, `.toUpperCase`, `.toLowerCase`, `.trim`, `.replace`,
+///   `.split` on strings
+fn eval_method_call(method: &str, arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Runtime(format!(
+            ".{method} requires a target object"
+        )));
+    }
+    let target = eval(&arg_forms[0], env)?;
+    let args: Vec<Value> = arg_forms[1..]
+        .iter()
+        .map(|f| eval(f, env))
+        .collect::<EvalResult<_>>()?;
+
+    dispatch_method(method, &target, &args)
+}
+
+fn dispatch_method(method: &str, target: &Value, args: &[Value]) -> EvalResult {
+    match target {
+        Value::Str(s) => dispatch_string_method(method, s.get(), args),
+        Value::Vector(v) => dispatch_vector_method(method, v, args),
+        Value::List(_) | Value::Cons(_) | Value::LazySeq(_) => {
+            dispatch_seq_method(method, target, args)
+        }
+        _ => Err(EvalError::Runtime(format!(
+            ".{method} not supported on type {}",
+            target.type_name()
+        ))),
+    }
+}
+
+fn dispatch_string_method(method: &str, s: &str, args: &[Value]) -> EvalResult {
+    match method {
+        "indexOf" => {
+            let needle = match args.first() {
+                Some(Value::Str(s)) => s.get().to_string(),
+                Some(Value::Char(c)) => c.to_string(),
+                Some(v) => {
+                    return Err(EvalError::Runtime(format!(
+                        ".indexOf expects string or char argument, got {}",
+                        v.type_name()
+                    )))
+                }
+                None => return Err(EvalError::Runtime(".indexOf requires an argument".into())),
+            };
+            match s.find(&needle) {
+                Some(pos) => Ok(Value::Long(pos as i64)),
+                None => Ok(Value::Long(-1)),
+            }
+        }
+        "lastIndexOf" => {
+            let needle = match args.first() {
+                Some(Value::Str(s)) => s.get().to_string(),
+                Some(Value::Char(c)) => c.to_string(),
+                _ => return Err(EvalError::Runtime(".lastIndexOf requires a string or char argument".into())),
+            };
+            match s.rfind(&needle) {
+                Some(pos) => Ok(Value::Long(pos as i64)),
+                None => Ok(Value::Long(-1)),
+            }
+        }
+        "startsWith" => {
+            let prefix = require_str_arg(args, ".startsWith")?;
+            Ok(Value::Bool(s.starts_with(&prefix)))
+        }
+        "endsWith" => {
+            let suffix = require_str_arg(args, ".endsWith")?;
+            Ok(Value::Bool(s.ends_with(&suffix)))
+        }
+        "contains" => {
+            let sub = require_str_arg(args, ".contains")?;
+            Ok(Value::Bool(s.contains(&sub)))
+        }
+        "length" => Ok(Value::Long(s.len() as i64)),
+        "isEmpty" => Ok(Value::Bool(s.is_empty())),
+        "charAt" => {
+            let idx = require_long_arg(args, ".charAt")? as usize;
+            s.chars()
+                .nth(idx)
+                .map(Value::Char)
+                .ok_or_else(|| EvalError::Runtime(format!(".charAt index {idx} out of bounds")))
+        }
+        "substring" => {
+            let start = require_long_arg(args, ".substring")? as usize;
+            let end = args
+                .get(1)
+                .map(|v| match v {
+                    Value::Long(n) => Ok(*n as usize),
+                    _ => Err(EvalError::Runtime(".substring end must be an integer".into())),
+                })
+                .transpose()?;
+            let result = match end {
+                Some(e) => &s[start..e.min(s.len())],
+                None => &s[start..],
+            };
+            Ok(Value::Str(GcPtr::new(result.to_string())))
+        }
+        "toUpperCase" => Ok(Value::Str(GcPtr::new(s.to_uppercase()))),
+        "toLowerCase" => Ok(Value::Str(GcPtr::new(s.to_lowercase()))),
+        "trim" => Ok(Value::Str(GcPtr::new(s.trim().to_string()))),
+        "replace" => {
+            let from = require_str_arg(args, ".replace")?;
+            let to = match args.get(1) {
+                Some(Value::Str(s)) => s.get().to_string(),
+                Some(Value::Char(c)) => c.to_string(),
+                _ => return Err(EvalError::Runtime(".replace requires two string arguments".into())),
+            };
+            Ok(Value::Str(GcPtr::new(s.replace(&from, &to))))
+        }
+        "split" => {
+            let sep = require_str_arg(args, ".split")?;
+            let parts: Vec<Value> = s
+                .split(&sep)
+                .map(|p| Value::Str(GcPtr::new(p.to_string())))
+                .collect();
+            Ok(Value::Vector(GcPtr::new(
+                cljrs_value::PersistentVector::from_iter(parts),
+            )))
+        }
+        _ => Err(EvalError::Runtime(format!(
+            ".{method} not supported on String"
+        ))),
+    }
+}
+
+fn dispatch_vector_method(
+    method: &str,
+    v: &GcPtr<cljrs_value::PersistentVector>,
+    args: &[Value],
+) -> EvalResult {
+    match method {
+        "indexOf" => {
+            let needle = args.first().ok_or_else(|| {
+                EvalError::Runtime(".indexOf requires an argument".into())
+            })?;
+            for (i, item) in v.get().iter().enumerate() {
+                if item == needle {
+                    return Ok(Value::Long(i as i64));
+                }
+            }
+            Ok(Value::Long(-1))
+        }
+        "size" | "count" => Ok(Value::Long(v.get().count() as i64)),
+        _ => Err(EvalError::Runtime(format!(
+            ".{method} not supported on Vector"
+        ))),
+    }
+}
+
+fn dispatch_seq_method(method: &str, target: &Value, args: &[Value]) -> EvalResult {
+    match method {
+        "indexOf" => {
+            let needle = args.first().ok_or_else(|| {
+                EvalError::Runtime(".indexOf requires an argument".into())
+            })?;
+            let items = crate::destructure::value_to_seq_vec(target);
+            for (i, item) in items.iter().enumerate() {
+                if item == needle {
+                    return Ok(Value::Long(i as i64));
+                }
+            }
+            Ok(Value::Long(-1))
+        }
+        _ => Err(EvalError::Runtime(format!(
+            ".{method} not supported on {}",
+            target.type_name()
+        ))),
+    }
+}
+
+fn require_str_arg(args: &[Value], method: &str) -> Result<String, EvalError> {
+    match args.first() {
+        Some(Value::Str(s)) => Ok(s.get().to_string()),
+        Some(Value::Char(c)) => Ok(c.to_string()),
+        _ => Err(EvalError::Runtime(format!(
+            "{method} requires a string argument"
+        ))),
+    }
+}
+
+fn require_long_arg(args: &[Value], method: &str) -> Result<i64, EvalError> {
+    match args.first() {
+        Some(Value::Long(n)) => Ok(*n),
+        _ => Err(EvalError::Runtime(format!(
+            "{method} requires an integer argument"
+        ))),
+    }
 }
 
 /// Return the canonical type tag for a value (used by protocol dispatch).
@@ -346,7 +551,31 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
         match result {
             Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_args)) => {
-                current_args = new_args;
+                // For variadic arities, recur provides n+1 values where the
+                // last value IS the rest collection (not spread args to be
+                // re-collected). Flatten it so bind_fn_params sees the right
+                // number of individual args.
+                if arity.rest_param.is_some() {
+                    let n = arity.params.len();
+                    if new_args.len() == n + 1 {
+                        let mut flat = new_args[..n].to_vec();
+                        // Spread the rest collection back into individual args.
+                        let rest_val = &new_args[n];
+                        match rest_val {
+                            Value::Nil => {} // no extra args
+                            _ => {
+                                let rest_items =
+                                    crate::destructure::value_to_seq_vec(rest_val);
+                                flat.extend(rest_items);
+                            }
+                        }
+                        current_args = flat;
+                    } else {
+                        current_args = new_args;
+                    }
+                } else {
+                    current_args = new_args;
+                }
             }
             Err(e) => return Err(e),
         }

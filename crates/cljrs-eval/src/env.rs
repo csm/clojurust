@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use cljrs_gc::{GcConfig, GcPtr};
 use cljrs_value::{CljxFn, Namespace, Value, Var};
-
+use log::trace;
 // ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
 
 /// How symbols should be referred into the requiring namespace.
@@ -51,6 +51,7 @@ impl Frame {
 
     pub fn lookup(&self, name: &str) -> Option<&Value> {
         // Search in reverse order so later bindings shadow earlier ones.
+        trace!("lookup {}", name);
         for (n, v) in self.bindings.iter().rev() {
             if n.as_ref() == name {
                 return Some(v);
@@ -325,6 +326,7 @@ impl Env {
 
     /// Look up `name`: local frames (innermost first), then the current namespace.
     pub fn lookup(&self, name: &str) -> Option<Value> {
+        trace!("lookup {} in {} frames", name, self.frames.len());
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.lookup(name) {
                 return Some(v.clone());
