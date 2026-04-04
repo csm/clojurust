@@ -90,7 +90,7 @@ pub fn builtin_array_list_length(args: &[Value]) -> ValueResult<Value> {
 pub fn builtin_array_list_remove(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::NativeObject(obj) if obj.get().type_tag() == NAME => {
-            let index = numeric_as_i64(&args[0])? as usize;
+            let index = numeric_as_i64(&args[1])? as usize;
             if let Some(array_list) = obj.get().downcast_ref::<ArrayList>() {
                 let mut elements = array_list.elements.lock().unwrap();
                 if index >= elements.len() {
