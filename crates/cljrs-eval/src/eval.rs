@@ -263,6 +263,7 @@ fn is_jvm_class_name(s: &str) -> bool {
             | "Error"
             | "clojure.lang.ExceptionInfo"
             | "clojure.lang.IEditableCollection"
+            | "Boolean"
     )
 }
 

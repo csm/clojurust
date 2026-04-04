@@ -51,7 +51,7 @@ pub fn builtin_array_list_push(args: &[Value]) -> ValueResult<Value> {
         Value::NativeObject(obj) if obj.get().type_tag() == NAME => {
             if let Some(array_list) = obj.get().downcast_ref::<ArrayList>() {
                 let mut elements = array_list.elements.lock().unwrap();
-                elements.push(args[0].clone());
+                elements.push(args[1].clone());
                 Ok(args[0].clone())
             } else {
                 Err(ValueError::WrongType {
@@ -130,3 +130,16 @@ pub fn builtin_array_list_to_array(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+pub fn builtin_array_list_clear(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::NativeObject(obj) if obj.get().type_tag() == NAME => {
+            let mut elements = obj.get().downcast_ref::<ArrayList>().unwrap().elements.lock().unwrap();
+            elements.clear();
+            Ok(args[0].clone())
+        }
+        v => Err(ValueError::WrongType {
+            expected: "array-list",
+            got: v.type_name().to_string(),
+        })
+    }
+}

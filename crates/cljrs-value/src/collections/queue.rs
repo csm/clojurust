@@ -23,6 +23,15 @@ impl PersistentQueue {
             count: 0,
         }
     }
+    
+    pub fn new(front: PersistentList, rear: PersistentVector) -> Self {
+        let count = &front.count() + &rear.count();
+        Self {
+            front: Arc::new(front.clone()),
+            rear: rear.clone(),
+            count,
+        }
+    }
 
     pub fn count(&self) -> usize {
         self.count

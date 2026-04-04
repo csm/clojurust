@@ -15,12 +15,7 @@ use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::value::SetValue::Sorted;
-use cljrs_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, FutureState, Keyword,
-    LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError,
-    ValueResult, Volatile,
-};
+use cljrs_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile};
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
@@ -34,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use crate::array_list::{builtin_array_list, builtin_array_list_length, builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array};
+use crate::array_list::{builtin_array_list, builtin_array_list_clear, builtin_array_list_length, builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array};
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -314,6 +309,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("map-keys", Arity::Fixed(2), builtin_map_keys_stub),
         ("map-vals", Arity::Fixed(2), builtin_map_vals_stub),
         ("shuffle", Arity::Fixed(1), builtin_shuffle),
+        ("queue", Arity::Variadic { min: 0 }, builtin_queue),
+
         // Atoms
         ("atom", Arity::Variadic { min: 1 }, builtin_atom),
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
@@ -643,6 +640,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("array-list-remove", Arity::Fixed(2), builtin_array_list_remove),
         ("array-list-length", Arity::Fixed(1), builtin_array_list_length),
         ("array-list-to-array", Arity::Fixed(1), builtin_array_list_to_array),
+        ("array-list-clear", Arity::Fixed(1), builtin_array_list_clear),
     ];
 
     for (name, arity, func) in fns {
@@ -1908,7 +1906,7 @@ fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
         (Value::Ratio(a), Value::Ratio(b)) => peq!(a, b),
         (Value::Str(a), Value::Str(b)) => peq!(a, b),
         (Value::Symbol(a), Value::Symbol(b)) => peq!(a, b),
-        (Value::Keyword(a), Value::Keyword(b)) => peq!(a, b),
+        (Value::Keyword(a), Value::Keyword(b)) => a.get() == b.get(),
         (Value::List(a), Value::List(b)) => peq!(a, b),
         (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
         (Value::Map(a), Value::Map(b)) => match (a, b) {
@@ -4639,6 +4637,29 @@ fn builtin_find(args: &[Value]) -> ValueResult<Value> {
                 Ok(Value::Nil)
             }
         }
+        Value::TransientMap(m) => {
+            if let Some((k, v)) = m.get().find(&args[1]) {
+                Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([k.clone(), v.clone()]))))
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+        Value::Vector(v) => {
+            if let Value::Long(idx) = &args[1] {
+                let idx = *idx;
+                if idx >= 0 && (idx as usize) < v.get().count() {
+                    let val = v.get().nth(idx as usize).cloned().unwrap();
+                    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                        args[1].clone(),
+                        val,
+                    ]))))
+                } else {
+                    Ok(Value::Nil)
+                }
+            } else {
+                Ok(Value::Nil)
+            }
+        }
         _ => Ok(Value::Nil),
     }
 }
@@ -4666,6 +4687,32 @@ fn builtin_shuffle(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
+}
+
+fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
+    let queue = if args.len() == 0 {
+        PersistentQueue::empty()
+    } else {
+        match &args[0] {
+            Value::WithMeta(_, ..) | Value::List(_) | Value::Vector(_) | Value::Set(_) | Value::Map(_)
+            | Value::LazySeq(_) | Value::Cons(_) | Value::ObjectArray(_)
+            | Value::BooleanArray(_) | Value::ByteArray(_) | Value::CharArray(_)
+            | Value::IntArray(_) | Value::LongArray(_) | Value::FloatArray(_)
+            | Value::DoubleArray(_) | Value::Str(_) => {
+                let iter = ValueIter::new(args[0].clone());
+                PersistentQueue::new(
+                    PersistentList::from_iter(iter),
+                    PersistentVector::empty()
+                )
+            }
+            Value::Nil => PersistentQueue::empty(),
+            v => return Err(ValueError::WrongType {
+                expected: "seqable",
+                got: v.type_name().to_string()
+            })
+        }
+    };
+    Ok(Value::Queue(GcPtr::new(queue)))
 }
 
 // ── Atoms ─────────────────────────────────────────────────────────────────────
