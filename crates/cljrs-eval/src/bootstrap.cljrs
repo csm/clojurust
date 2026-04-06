@@ -61,12 +61,12 @@
   "Coerces coll to a (possibly empty) sequence, if it is not already one.
   With a transducer, returns a lazy sequence of applications of the transform
   to the items in coll(s)."
-  ([coll] (seq coll))
+  ([coll] (or (seq coll) ()))
   ([xform coll]
    (let [rf (xform conj)
          result (reduce rf [] coll)
          result (rf result)]
-     (seq (if (reduced? result) (unreduced result) result)))))
+     (or (seq (if (reduced? result) (unreduced result) result)) ()))))
 
 (defn map
   ([f]

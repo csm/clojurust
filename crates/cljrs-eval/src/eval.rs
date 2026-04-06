@@ -264,6 +264,7 @@ fn is_jvm_class_name(s: &str) -> bool {
             | "clojure.lang.ExceptionInfo"
             | "clojure.lang.IEditableCollection"
             | "Boolean"
+            | "clojure.lang.PersistentQueue"
     )
 }
 
@@ -283,7 +284,7 @@ pub fn deref_value(v: Value) -> EvalResult {
             crate::dynamics::deref_var(&var).ok_or_else(|| EvalError::Runtime("unbound var".into()))
         }
         Value::Volatile(vol) => Ok(vol.get().deref()),
-        Value::Delay(d) => Ok(d.get().force()),
+        Value::Delay(d) => d.get().force().map_err(|e| EvalError::Runtime(e)),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
         Value::Future(f) => {

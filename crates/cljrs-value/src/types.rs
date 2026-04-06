@@ -441,7 +441,7 @@ impl cljrs_gc::Trace for BoundFn {
 
 /// A deferred computation that produces a `Value` when forced.
 pub trait Thunk: Send + Sync + std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Value;
+    fn force(&self) -> Result<Value, String>;
 }
 
 /// Internal state of a lazy sequence cell.
@@ -450,6 +450,8 @@ pub enum LazySeqState {
     Pending(Box<dyn Thunk>),
     /// Result cached after first force.
     Forced(Value),
+    /// Thunk evaluation failed; error message is cached.
+    Error(String),
 }
 
 /// A lazy sequence that forces its thunk exactly once and caches the result.
@@ -465,19 +467,39 @@ impl LazySeq {
     }
 
     /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
+    /// On error, returns `Value::Nil` and caches the error (retrievable via `error()`).
     pub fn realize(&self) -> Value {
         let mut guard = self.state.lock().unwrap();
-        if let LazySeqState::Forced(v) = &*guard {
-            return v.clone();
+        match &*guard {
+            LazySeqState::Forced(v) => return v.clone(),
+            LazySeqState::Error(_) => return Value::Nil,
+            LazySeqState::Pending(_) => {}
         }
         // Replace the pending state with a temporary Forced(Nil), then force the thunk.
         let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
         let LazySeqState::Pending(thunk) = prev else {
             unreachable!("state was not Pending")
         };
-        let result = thunk.force();
-        *guard = LazySeqState::Forced(result.clone());
-        result
+        match thunk.force() {
+            Ok(result) => {
+                *guard = LazySeqState::Forced(result.clone());
+                result
+            }
+            Err(msg) => {
+                *guard = LazySeqState::Error(msg);
+                Value::Nil
+            }
+        }
+    }
+
+    /// Return the cached error message, if the thunk failed.
+    pub fn error(&self) -> Option<String> {
+        let guard = self.state.lock().unwrap();
+        if let LazySeqState::Error(e) = &*guard {
+            Some(e.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -493,6 +515,7 @@ impl cljrs_gc::Trace for LazySeq {
         match &*state {
             LazySeqState::Pending(thunk) => thunk.trace(visitor),
             LazySeqState::Forced(v) => v.trace(visitor),
+            LazySeqState::Error(_) => {}
         }
     }
 }
@@ -573,18 +596,19 @@ impl Delay {
     }
 
     /// Force the delay and cache the result.
-    pub fn force(&self) -> Value {
+    /// Returns the value on success, or an error message on failure.
+    pub fn force(&self) -> Result<Value, String> {
         let mut guard = self.state.lock().unwrap();
         if let DelayState::Forced(v) = &*guard {
-            return v.clone();
+            return Ok(v.clone());
         }
         let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
         let DelayState::Pending(thunk) = prev else {
             unreachable!("state was not Pending")
         };
-        let result = thunk.force();
+        let result = thunk.force()?;
         *guard = DelayState::Forced(result.clone());
-        result
+        Ok(result)
     }
 
     /// True if the delay has already been forced.

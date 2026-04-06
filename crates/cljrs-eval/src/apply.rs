@@ -69,20 +69,6 @@ fn check_watch_error() -> EvalResult<()> {
     })
 }
 
-// ── Lazy seq error propagation ───────────────────────────────────────────────
-
-thread_local! {
-    /// Stash for errors from lazy seq thunk evaluation.
-    /// `Thunk::force` can only return `Value`, so errors are stored here
-    /// and checked by callers of `realize()`.
-    static LAZY_SEQ_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Check and take the last lazy seq error, if any.
-pub fn take_lazy_seq_error() -> Option<String> {
-    LAZY_SEQ_ERROR.with(|e| e.borrow_mut().take())
-}
-
 // ── ClosureThunk ──────────────────────────────────────────────────────────────
 
 /// A Thunk that calls a zero-arg Clojure closure when forced.
@@ -100,17 +86,9 @@ impl cljrs_gc::Trace for ClosureThunk {
 }
 
 impl Thunk for ClosureThunk {
-    fn force(&self) -> Value {
+    fn force(&self) -> Result<Value, String> {
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
-        match call_cljrs_fn(&self.f, vec![], &mut env) {
-            Ok(v) => v,
-            Err(e) => {
-                LAZY_SEQ_ERROR.with(|slot| {
-                    *slot.borrow_mut() = Some(format!("{e}"));
-                });
-                Value::Nil
-            }
-        }
+        call_cljrs_fn(&self.f, vec![], &mut env).map_err(|e| format!("{e}"))
     }
 }
 

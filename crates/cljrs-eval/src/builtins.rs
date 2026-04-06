@@ -697,8 +697,9 @@ impl Iterator for ValueIter {
                     self.current = inner.as_ref().clone();
                 }
                 Value::LazySeq(ls) => {
+                    let ls = ls.clone();
                     self.current = ls.get().realize();
-                    if let Some(err) = crate::apply::take_lazy_seq_error() {
+                    if let Some(err) = ls.get().error() {
                         self.error = Some(err);
                         self.current = Value::Nil;
                         return None;
@@ -825,6 +826,16 @@ impl Iterator for ValueIter {
                         .collect();
                     self.current = Value::List(GcPtr::new(PersistentList::from_iter(items)));
                 }
+                Value::TypeInstance(ti) => {
+                    let mut pairs = Vec::new();
+                    ti.get().fields.for_each(|k, v| {
+                        pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                            k.clone(),
+                            v.clone(),
+                        ]))));
+                    });
+                    self.current = Value::List(GcPtr::new(PersistentList::from_iter(pairs)));
+                }
                 _ => return None,
             }
         }
@@ -850,7 +861,8 @@ fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
         | Value::CharArray(_)
         | Value::FloatArray(_)
         | Value::DoubleArray(_)
-        | Value::Str(_) => {
+        | Value::Str(_)
+        | Value::TypeInstance(_) => {
             let mut iter = ValueIter::new(v.clone());
             let result: Vec<Value> = iter.by_ref().collect();
             if let Some(err) = iter.take_error() {
@@ -2746,7 +2758,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     let mut val = args[0].unwrap_meta().clone();
     while let Value::LazySeq(ls) = &val {
         let realized = ls.get().realize();
-        if let Some(err) = crate::apply::take_lazy_seq_error() {
+        if let Some(err) = ls.get().error() {
             return Err(ValueError::Other(err));
         }
         val = realized;
@@ -2870,6 +2882,20 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
                 Ok(cons_from_iter(array.iter().map(|f| Value::Double(*f))))
             }
         }
+        Value::TypeInstance(ti) => {
+            let mut pairs = Vec::new();
+            ti.get().fields.for_each(|k, v| {
+                pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                    k.clone(),
+                    v.clone(),
+                ]))));
+            });
+            if pairs.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(cons_from_iter(pairs))
+            }
+        }
         v => Err(ValueError::WrongType {
             expected: "seqable",
             got: v.type_name().to_string(),
@@ -2881,7 +2907,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
             let v = ls.get().realize();
-            if let Some(err) = crate::apply::take_lazy_seq_error() {
+            if let Some(err) = ls.get().error() {
                 return Err(ValueError::Other(err));
             }
             builtin_first(&[v])
@@ -2920,7 +2946,7 @@ fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
             let v = ls.get().realize();
-            if let Some(err) = crate::apply::take_lazy_seq_error() {
+            if let Some(err) = ls.get().error() {
                 return Err(ValueError::Other(err));
             }
             builtin_rest(&[v])
@@ -3157,14 +3183,14 @@ impl cljrs_gc::Trace for ConcatThunk {
 }
 
 impl Thunk for ConcatThunk {
-    fn force(&self) -> Value {
+    fn force(&self) -> Result<Value, String> {
         let mut colls = self.colls.clone();
         // Walk through collections iteratively (no recursion) to find the
         // first element.  This avoids stack overflow on deeply nested
         // lazy-seq chains.
         loop {
             if colls.is_empty() {
-                return Value::Nil;
+                return Ok(Value::Nil);
             }
 
             // Peel through any lazy-seq wrappers on the head iteratively.
@@ -3173,8 +3199,8 @@ impl Thunk for ConcatThunk {
                 match &head {
                     Value::LazySeq(ls) => {
                         let realized = ls.get().realize();
-                        if crate::apply::take_lazy_seq_error().is_some() {
-                            return Value::Nil;
+                        if let Some(err) = ls.get().error() {
+                            return Err(err);
                         }
                         head = realized;
                     }
@@ -3203,10 +3229,10 @@ impl Thunk for ConcatThunk {
                     // Rust stack — the next element is produced when the tail
                     // lazy-seq is realized later).
                     let tail = concat_lazy(colls);
-                    return Value::Cons(GcPtr::new(CljxCons {
+                    return Ok(Value::Cons(GcPtr::new(CljxCons {
                         head: f,
                         tail,
-                    }));
+                    })));
                 }
                 None => {
                     colls.remove(0);
@@ -4784,7 +4810,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().deref()),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
-        Value::Delay(d) => Ok(d.get().force()),
+        Value::Delay(d) => d.get().force().map_err(|e| ValueError::Other(e)),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Promise(p) => {
             if with_timeout {
@@ -6258,7 +6284,7 @@ fn builtin_volatile_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_force(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Delay(d) => Ok(d.get().force()),
+        Value::Delay(d) => d.get().force().map_err(|e| ValueError::Other(e)),
         other => Ok(other.clone()), // non-delay passes through
     }
 }
@@ -6602,6 +6628,10 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
         "clojure.lang.IEditableCollection" => matches!(
             val,
             Value::List(_) | Value::Set(_) | Value::Map(_)
+        ),
+        "clojure.lang.PersistentQueue" => matches!(
+            val,
+            Value::Queue(_)
         ),
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),

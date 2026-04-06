@@ -1541,11 +1541,8 @@ pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
     struct CompiledThunk(Value);
 
     impl Thunk for CompiledThunk {
-        fn force(&self) -> Value {
-            match cljrs_eval::callback::invoke(&self.0, vec![]) {
-                Ok(v) => v,
-                Err(_) => Value::Nil,
-            }
+        fn force(&self) -> Result<Value, String> {
+            cljrs_eval::callback::invoke(&self.0, vec![]).map_err(|e| format!("{e}"))
         }
     }
 

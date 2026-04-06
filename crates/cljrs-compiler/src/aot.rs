@@ -1030,18 +1030,38 @@ pub fn compile_test_harness(
     eprintln!("[aot] discovering tests in {}", test_dir.display());
 
     // Discover test namespaces
-    let namespaces = discover_test_namespaces(test_dir, src_dirs)?;
-    if namespaces.is_empty() {
+    let test_namespaces = discover_test_namespaces(test_dir, src_dirs)?;
+    if test_namespaces.is_empty() {
         return Err(AotError::Eval(format!(
             "No test files found in {}",
             test_dir.display()
         )));
     }
-    eprintln!("[aot] discovered {} test namespace(s)", namespaces.len());
+    eprintln!("[aot] discovered {} test namespace(s)", test_namespaces.len());
+
+    // Also discover source namespaces from src_dirs so they get bundled
+    let mut src_namespaces = Vec::new();
+    for dir in src_dirs {
+        if dir.is_dir() {
+            discover_in_dir(dir, dir, &mut src_namespaces);
+        }
+    }
+    src_namespaces.sort();
+    eprintln!("[aot] discovered {} source namespace(s)", src_namespaces.len());
+
+    // Combine: source namespaces first (so they're registered before tests require them),
+    // then test namespaces. Deduplicate in case of overlap.
+    let mut all_namespaces = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ns in src_namespaces.iter().chain(test_namespaces.iter()) {
+        if seen.insert(ns.clone()) {
+            all_namespaces.push(ns.clone());
+        }
+    }
 
     // Generate registration code for bundled sources
     let mut bundled_registration = String::new();
-    for (i, ns) in namespaces.iter().enumerate() {
+    for (i, ns) in all_namespaces.iter().enumerate() {
         bundled_registration.push_str(&format!(
             "    globals.register_builtin_source(\"{ns}\", include_str!(\"bundled_{i}.cljrs\"));\n"
         ));
@@ -1059,16 +1079,16 @@ pub fn compile_test_harness(
     }
     std::fs::create_dir_all(harness_dir.join("src"))?;
 
-    // Generate the main.rs file
-    let main_rs = generate_test_harness_code(&namespaces, &bundled_registration);
+    // Generate the main.rs file (only test namespaces get run-tests called)
+    let main_rs = generate_test_harness_code(&test_namespaces, &bundled_registration);
     std::fs::write(harness_dir.join("src/main.rs"), &main_rs)?;
 
-    // Write the test namespace sources for bundling
+    // Write all namespace sources for bundling
     // Include test_dir as a search path for test sources
     let mut search_dirs = src_dirs.to_vec();
     search_dirs.push(test_dir.to_path_buf());
 
-    for (i, ns) in namespaces.iter().enumerate() {
+    for (i, ns) in all_namespaces.iter().enumerate() {
         let rel_path = ns.replace('.', "/").replace('-', "_");
         if let Some(src) = find_user_source(&rel_path, &search_dirs) {
             std::fs::write(
