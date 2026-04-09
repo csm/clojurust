@@ -588,7 +588,16 @@ fn bind_fn_params(arity: &CljxFnArity, args: &[Value], env: &mut Env) -> EvalRes
         env.bind(rest.clone(), rest_val.clone());
         // Apply rest destructuring if present.
         if let Some(ref pattern) = arity.destructure_rest {
-            crate::destructure::bind_pattern(pattern, rest_val, env)?;
+            // When the rest pattern is a map destructure (e.g. `& {:keys [bar]}`),
+            // convert the rest args list into a map of alternating key-value pairs,
+            // matching Clojure's keyword-arguments convention.
+            let destructure_val = if matches!(pattern.kind, FormKind::Map(_)) {
+                let items = value_to_seq_vec(&rest_val);
+                Value::Map(MapValue::from_flat_entries(items))
+            } else {
+                rest_val
+            };
+            crate::destructure::bind_pattern(pattern, destructure_val, env)?;
         }
     }
     // Apply positional destructuring patterns.

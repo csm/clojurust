@@ -5,7 +5,7 @@ use std::sync::Arc;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{Keyword, PersistentList, Symbol, Value};
+use cljrs_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
 
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
@@ -127,6 +127,15 @@ pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
         Value::List(l) => l.get().iter().cloned().collect(),
         Value::Vector(v) => v.get().iter().cloned().collect(),
         Value::Set(s) => s.iter().cloned().collect(),
+        Value::Map(m) => {
+            let mut result = Vec::new();
+            m.for_each(|k, v| {
+                result.push(Value::Vector(GcPtr::new(
+                    PersistentVector::from_iter([k.clone(), v.clone()]),
+                )));
+            });
+            result
+        }
         _ => vec![],
     }
 }
