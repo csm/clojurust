@@ -130,9 +130,10 @@ pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
         Value::Map(m) => {
             let mut result = Vec::new();
             m.for_each(|k, v| {
-                result.push(Value::Vector(GcPtr::new(
-                    PersistentVector::from_iter([k.clone(), v.clone()]),
-                )));
+                result.push(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                    k.clone(),
+                    v.clone(),
+                ]))));
             });
             result
         }

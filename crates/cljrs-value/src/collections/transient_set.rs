@@ -48,7 +48,7 @@ impl TransientSet {
         *persisted = true;
         Ok(PersistentHashSet::from_set(set.clone()))
     }
-    
+
     pub fn count(&self) -> usize {
         let set = self.set.lock().unwrap();
         set.size()

@@ -64,7 +64,7 @@ impl TransientMap {
         let value = map.get(key);
         value.map(|v| (v.clone(), v.clone()))
     }
-    
+
     pub fn count(&self) -> usize {
         let map = self.map.lock().unwrap();
         map.size()

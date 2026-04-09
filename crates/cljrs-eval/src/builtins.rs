@@ -22,7 +22,6 @@ use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
-use cljrs_value::value::SetValue::Sorted;
 use cljrs_value::{
     Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo,
     FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap,
@@ -951,8 +950,7 @@ fn numeric_as_i32(v: &Value) -> ValueResult<i32> {
     }
 }
 
-fn numeric_as_bigint(v: &Value) -> ValueResult<num_bigint::BigInt> {
-    use num_bigint::BigInt;
+fn numeric_as_bigint(v: &Value) -> ValueResult<BigInt> {
     match v {
         Value::Long(n) => Ok(BigInt::from(*n)),
         Value::BigInt(n) => Ok(n.get().clone()),
@@ -964,8 +962,7 @@ fn numeric_as_bigint(v: &Value) -> ValueResult<num_bigint::BigInt> {
     }
 }
 
-fn numeric_as_bigdecimal(v: &Value) -> ValueResult<bigdecimal::BigDecimal> {
-    use bigdecimal::BigDecimal;
+fn numeric_as_bigdecimal(v: &Value) -> ValueResult<BigDecimal> {
     match v {
         Value::Long(n) => Ok(BigDecimal::from(*n)),
         Value::BigInt(n) => Ok(BigDecimal::from(n.get().clone())),
@@ -983,9 +980,7 @@ fn numeric_as_bigdecimal(v: &Value) -> ValueResult<bigdecimal::BigDecimal> {
     }
 }
 
-fn numeric_as_ratio(v: &Value) -> ValueResult<num_rational::Ratio<num_bigint::BigInt>> {
-    use num_bigint::BigInt;
-    use num_rational::Ratio;
+fn numeric_as_ratio(v: &Value) -> ValueResult<Ratio<BigInt>> {
     match v {
         Value::Long(n) => Ok(Ratio::from(BigInt::from(*n))),
         Value::BigInt(n) => Ok(Ratio::from(n.get().clone())),
@@ -1042,7 +1037,7 @@ fn widest_category(args: &[Value]) -> ValueResult<NumCat> {
 
 /// Simplify a Ratio: if denominator is 1, return Long or BigInt.
 /// If `preserve_bigint` is true, integer results stay as BigInt (for when an operand was BigInt).
-fn simplify_ratio_with(r: num_rational::Ratio<num_bigint::BigInt>, preserve_bigint: bool) -> Value {
+fn simplify_ratio_with(r: Ratio<BigInt>, preserve_bigint: bool) -> Value {
     if r.is_integer() {
         let n = r.to_integer();
         if preserve_bigint {
@@ -1058,13 +1053,13 @@ fn simplify_ratio_with(r: num_rational::Ratio<num_bigint::BigInt>, preserve_bigi
     }
 }
 
-fn simplify_ratio(r: num_rational::Ratio<num_bigint::BigInt>) -> Value {
+fn simplify_ratio(r: Ratio<BigInt>) -> Value {
     simplify_ratio_with(r, false)
 }
 
 /// Simplify a BigInt: if it fits in i64, return Long.
 /// Used only when Long arithmetic overflows — NOT when BigInt was explicitly requested.
-fn simplify_bigint(n: num_bigint::BigInt) -> Value {
+fn simplify_bigint(n: BigInt) -> Value {
     match n.to_i64() {
         Some(l) => Value::Long(l),
         None => Value::BigInt(GcPtr::new(n)),
@@ -1082,21 +1077,21 @@ fn builtin_add(args: &[Value]) -> ValueResult<Value> {
             Ok(Value::Double(sum))
         }
         NumCat::BigDecimal => {
-            let mut sum = bigdecimal::BigDecimal::from(0);
+            let mut sum = BigDecimal::from(0);
             for v in args {
                 sum += numeric_as_bigdecimal(v)?;
             }
             Ok(Value::BigDecimal(GcPtr::new(apply_precision(sum)?)))
         }
         NumCat::Ratio => {
-            let mut sum = num_rational::Ratio::from(num_bigint::BigInt::from(0));
+            let mut sum = Ratio::from(BigInt::from(0));
             for v in args {
                 sum += numeric_as_ratio(v)?;
             }
             Ok(simplify_ratio(sum))
         }
         NumCat::BigInt => {
-            let mut sum = num_bigint::BigInt::from(0);
+            let mut sum = BigInt::from(0);
             for v in args {
                 sum += numeric_as_bigint(v)?;
             }
@@ -1110,7 +1105,7 @@ fn builtin_add(args: &[Value]) -> ValueResult<Value> {
                     Some(s) => sum = s,
                     None => {
                         // Overflow: promote to BigInt for remaining args
-                        let mut big = num_bigint::BigInt::from(sum) + num_bigint::BigInt::from(n);
+                        let mut big = BigInt::from(sum) + BigInt::from(n);
                         for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
                         {
                             big += numeric_as_bigint(v2)?;
@@ -1168,7 +1163,7 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
         return match &args[0] {
             Value::Long(n) => match n.checked_neg() {
                 Some(r) => Ok(Value::Long(r)),
-                None => Ok(Value::BigInt(GcPtr::new(-num_bigint::BigInt::from(*n)))),
+                None => Ok(Value::BigInt(GcPtr::new(-BigInt::from(*n)))),
             },
             Value::Double(f) => Ok(Value::Double(-f)),
             Value::BigInt(n) => Ok(simplify_bigint(-n.get().clone())),
@@ -1217,8 +1212,7 @@ fn builtin_sub(args: &[Value]) -> ValueResult<Value> {
                 match result.checked_sub(n) {
                     Some(r) => result = r,
                     None => {
-                        let mut big =
-                            num_bigint::BigInt::from(result) - num_bigint::BigInt::from(n);
+                        let mut big = BigInt::from(result) - BigInt::from(n);
                         for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
                         {
                             big -= numeric_as_bigint(v2)?;
@@ -1311,21 +1305,21 @@ fn builtin_mul(args: &[Value]) -> ValueResult<Value> {
             Ok(Value::Double(result))
         }
         NumCat::BigDecimal => {
-            let mut result = bigdecimal::BigDecimal::from(1);
+            let mut result = BigDecimal::from(1);
             for v in args {
                 result *= numeric_as_bigdecimal(v)?;
             }
             Ok(Value::BigDecimal(GcPtr::new(apply_precision(result)?)))
         }
         NumCat::Ratio => {
-            let mut result = num_rational::Ratio::from(num_bigint::BigInt::from(1));
+            let mut result = Ratio::from(BigInt::from(1));
             for v in args {
                 result *= numeric_as_ratio(v)?;
             }
             Ok(simplify_ratio(result))
         }
         NumCat::BigInt => {
-            let mut result = num_bigint::BigInt::from(1);
+            let mut result = BigInt::from(1);
             for v in args {
                 result *= numeric_as_bigint(v)?;
             }
@@ -1338,8 +1332,7 @@ fn builtin_mul(args: &[Value]) -> ValueResult<Value> {
                 match result.checked_mul(n) {
                     Some(r) => result = r,
                     None => {
-                        let mut big =
-                            num_bigint::BigInt::from(result) * num_bigint::BigInt::from(n);
+                        let mut big = BigInt::from(result) * BigInt::from(n);
                         for v2 in &args[args.iter().position(|x| std::ptr::eq(x, v)).unwrap() + 1..]
                         {
                             big *= numeric_as_bigint(v2)?;
@@ -1457,10 +1450,9 @@ fn builtin_mod(args: &[Value]) -> ValueResult<Value> {
                 return Err(ValueError::Other("mod by zero".into()));
             }
             let r = &a % &b;
-            let result = if (r > num_rational::Ratio::from(BigInt::from(0i64))
-                && b < num_rational::Ratio::from(BigInt::from(0i64)))
-                || (r < num_rational::Ratio::from(BigInt::from(0i64))
-                    && b > num_rational::Ratio::from(BigInt::from(0i64)))
+            let result = if (r > Ratio::from(BigInt::from(0i64))
+                && b < Ratio::from(BigInt::from(0i64)))
+                || (r < Ratio::from(BigInt::from(0i64)) && b > Ratio::from(BigInt::from(0i64)))
             {
                 r + &b
             } else {
@@ -1848,7 +1840,7 @@ fn builtin_numeric_equiv(args: &[Value]) -> ValueResult<Value> {
                         | Value::Ratio(_)
                 ) =>
             {
-                num_compare(a, b)? == std::cmp::Ordering::Equal
+                num_compare(a, b)? == Ordering::Equal
             }
             // Fallback: structural equality
             (a, b) => a == b,
@@ -1867,13 +1859,13 @@ fn builtin_not_eq(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn num_compare(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
+fn num_compare(a: &Value, b: &Value) -> ValueResult<Ordering> {
     let cat = widest_category(&[a.clone(), b.clone()])?;
     let r = match cat {
         NumCat::Double => {
             let x = numeric_as_f64(a)?;
             let y = numeric_as_f64(b)?;
-            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
         }
         NumCat::BigDecimal => {
             let x = numeric_as_bigdecimal(a)?;
@@ -1892,7 +1884,7 @@ fn num_compare(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
 
 fn builtin_lt(args: &[Value]) -> ValueResult<Value> {
     for pair in args.windows(2) {
-        if num_compare(&pair[0], &pair[1])? != std::cmp::Ordering::Less {
+        if num_compare(&pair[0], &pair[1])? != Ordering::Less {
             return Ok(Value::Bool(false));
         }
     }
@@ -1901,7 +1893,7 @@ fn builtin_lt(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_gt(args: &[Value]) -> ValueResult<Value> {
     for pair in args.windows(2) {
-        if num_compare(&pair[0], &pair[1])? != std::cmp::Ordering::Greater {
+        if num_compare(&pair[0], &pair[1])? != Ordering::Greater {
             return Ok(Value::Bool(false));
         }
     }
@@ -1920,7 +1912,7 @@ fn builtin_lte(args: &[Value]) -> ValueResult<Value> {
         {
             return Ok(Value::Bool(false));
         }
-        if num_compare(&pair[0], &pair[1])? == std::cmp::Ordering::Greater {
+        if num_compare(&pair[0], &pair[1])? == Ordering::Greater {
             return Ok(Value::Bool(false));
         }
     }
@@ -1929,7 +1921,7 @@ fn builtin_lte(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_gte(args: &[Value]) -> ValueResult<Value> {
     for pair in args.windows(2) {
-        if num_compare(&pair[0], &pair[1])? == std::cmp::Ordering::Less {
+        if num_compare(&pair[0], &pair[1])? == Ordering::Less {
             return Ok(Value::Bool(false));
         }
     }
@@ -2381,8 +2373,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
         result = match result {
             Value::Nil => Value::List(GcPtr::new(PersistentList::from_iter([v.clone()]))),
             Value::List(l) => {
-                let tail_clone: std::sync::Arc<PersistentList> =
-                    std::sync::Arc::new((*l.get()).clone());
+                let tail_clone: Arc<PersistentList> = Arc::new((*l.get()).clone());
                 Value::List(GcPtr::new(PersistentList::cons(v.clone(), tail_clone)))
             }
             Value::Vector(vec) => Value::Vector(GcPtr::new(vec.get().conj(v.clone()))),
@@ -2472,12 +2463,10 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
         for pair in args[1..].chunks(2) {
             fields = fields.assoc(pair[0].clone(), pair[1].clone());
         }
-        return Ok(apply_meta(Value::TypeInstance(GcPtr::new(
-            cljrs_value::TypeInstance {
-                type_tag: ti.get().type_tag.clone(),
-                fields,
-            },
-        ))));
+        return Ok(apply_meta(Value::TypeInstance(GcPtr::new(TypeInstance {
+            type_tag: ti.get().type_tag.clone(),
+            fields,
+        }))));
     }
     let mut result = match coll {
         Value::Nil => MapValue::empty(),
@@ -3061,16 +3050,16 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
             tail: args[1].clone(),
         }))),
         Value::Nil => {
-            let new_list = PersistentList::cons(head, std::sync::Arc::new(PersistentList::empty()));
+            let new_list = PersistentList::cons(head, Arc::new(PersistentList::empty()));
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::List(l) => {
-            let new_list = PersistentList::cons(head, std::sync::Arc::new((*l.get()).clone()));
+            let new_list = PersistentList::cons(head, Arc::new((*l.get()).clone()));
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::Vector(v) => {
             let tail = PersistentList::from_iter(v.get().iter().cloned());
-            let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
+            let new_list = PersistentList::cons(head, Arc::new(tail));
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::Map(m) => {
@@ -3089,7 +3078,7 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
         }
         Value::Set(s) => {
             let tail = PersistentList::from_iter(s.iter().cloned());
-            let new_list = PersistentList::cons(head, std::sync::Arc::new(tail));
+            let new_list = PersistentList::cons(head, Arc::new(tail));
             Ok(Value::List(GcPtr::new(new_list)))
         }
         Value::Str(s) => {
@@ -6007,7 +5996,10 @@ fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_sorted_set_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(&args[0], Value::Set(Sorted(_)))))
+    Ok(Value::Bool(matches!(
+        &args[0],
+        Value::Set(SetValue::Sorted(_))
+    )))
 }
 
 fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
@@ -6698,14 +6690,14 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
             val,
             Value::Promise(_) | Value::Future(_) | Value::Delay(_) | Value::LazySeq(_)
         ),
-        "clojure.lang.IEditableCollection" => {
-            match val {
-                Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_) => true,
-                Value::WithMeta(inner, _) =>
-                    matches!(**inner, Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_)),
-                _ => false,
-            }
-        }
+        "clojure.lang.IEditableCollection" => match val {
+            Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_) => true,
+            Value::WithMeta(inner, _) => matches!(
+                **inner,
+                Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_)
+            ),
+            _ => false,
+        },
         "clojure.lang.PersistentQueue" => matches!(
             val,
             Value::Queue(_) | Value::List(_) // Compatibility with clojure

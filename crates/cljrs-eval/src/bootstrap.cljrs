@@ -488,7 +488,7 @@
   (list 'make-lazy-seq (list 'fn [] (cons 'do body))))
 
 (defn iterate [f x]
-  (lazy-seq (cons x (iterate f (f x)))))
+  (cons x (lazy-seq (iterate f (f x)))))
 
 (defn repeat
   ([x] (lazy-seq (cons x (repeat x))))
