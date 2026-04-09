@@ -74,7 +74,8 @@
      (fn
        ([] (rf))
        ([result] (rf result))
-       ([result input] (rf result (f input))))))
+       ([result input] (rf result (f input)))
+       ([result input & inputs] (rf result (apply f input inputs))))))
   ([f coll]
    (lazy-seq
      (when-let [s (seq coll)]

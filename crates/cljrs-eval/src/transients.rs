@@ -5,7 +5,7 @@ use cljrs_value::value::SetValue;
 use cljrs_value::{MapValue, Value, ValueError, ValueResult};
 
 pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
+    match &args[0].unwrap_meta() {
         Value::Map(MapValue::Array(m)) => {
             let map = TransientMap::new();
             for (k, v) in m.get().iter() {

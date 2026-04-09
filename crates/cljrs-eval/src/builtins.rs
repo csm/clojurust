@@ -2733,6 +2733,9 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().chars().count(),
         Value::TypeInstance(ti) => ti.get().fields.count(),
         Value::Queue(q) => q.get().count(),
+        Value::TransientVector(v) => v.get().count(),
+        Value::TransientMap(m) => m.get().count(),
+        Value::TransientSet(s) => s.get().count(),
         _ => {
             return Err(ValueError::WrongType {
                 expected: "collection",
@@ -4944,6 +4947,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
             }
         }
         Value::Volatile(v) => Ok(v.get().deref()),
+        Value::Reduced(inner) => Ok((**inner).clone()),
         v => Err(ValueError::WrongType {
             expected: "atom, var, delay, promise, future, or agent",
             got: v.type_name().to_string(),
@@ -6695,7 +6699,12 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
             Value::Promise(_) | Value::Future(_) | Value::Delay(_) | Value::LazySeq(_)
         ),
         "clojure.lang.IEditableCollection" => {
-            matches!(val, Value::List(_) | Value::Set(_) | Value::Map(_))
+            match val {
+                Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_) => true,
+                Value::WithMeta(inner, _) =>
+                    matches!(**inner, Value::List(_) | Value::Set(_) | Value::Map(_) | Value::Vector(_)),
+                _ => false,
+            }
         }
         "clojure.lang.PersistentQueue" => matches!(
             val,

@@ -292,6 +292,7 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Volatile(vol) => Ok(vol.get().deref()),
         Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
         Value::Agent(a) => Ok(a.get().get_state()),
+        Value::Reduced(inner) => Ok(*inner),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
         Value::Future(f) => {
             let mut guard = f.get().state.lock().unwrap();
