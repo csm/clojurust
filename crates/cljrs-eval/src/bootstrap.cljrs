@@ -1048,3 +1048,8 @@
       (if (empty? steps)
         g
         (last steps)))))
+
+(defn re-seq
+  [re s]
+  (let [matcher (re-matcher re s)]
+    ))

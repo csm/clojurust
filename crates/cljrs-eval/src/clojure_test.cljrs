@@ -65,8 +65,9 @@
 (defmacro is
   ([form] `(is ~form nil))
   ([form msg]
-   (if (and (seq? form) (= (first form) 'thrown?))
+   (cond
      ;; (is (thrown? ExClass expr)) or (is (thrown? expr)) — check that expr throws.
+     (and (seq? form) (= (first form) 'thrown?))
      (let [expr (if (= 3 (count form))
                   (nth form 2)
                   (nth form 1))]
@@ -77,7 +78,36 @@
           (catch Exception __is-e__
             (report {:type :pass :expected (quote ~form) :actual __is-e__ :message ~msg})
             true)))
-     ;; Normal assertion.
+
+     ;; (is (<cmp> a b ...)) — evaluate each arg once and report the values.
+     ;; So a failing (is (= (f) :bar)) reports actual as (not (= :got :bar))
+     ;; rather than just `false`.
+     (and (seq? form)
+          (contains? '#{= not= == < <= > >= identical?} (first form)))
+     (let [pred  (first form)
+           args  (rest form)
+           gsyms (map (fn [_] (gensym "__is-arg__")) args)
+           binds (vec (mapcat (fn [s a] [s a]) gsyms args))]
+       `(try
+          (let ~binds
+            (if (~pred ~@gsyms)
+              (do (report {:type :pass
+                           :expected (quote ~form)
+                           :actual   (list (quote ~pred) ~@gsyms)
+                           :message  ~msg})
+                  true)
+              (do (report {:type :fail
+                           :expected (quote ~form)
+                           :actual   (list (quote not)
+                                           (list (quote ~pred) ~@gsyms))
+                           :message  ~msg})
+                  false)))
+          (catch Exception __is-e__
+            (report {:type :error :expected (quote ~form) :actual __is-e__ :message ~msg})
+            false)))
+
+     ;; Normal assertion — no structural introspection available.
+     :else
      `(try
         (let [__is-result__ ~form]
           (if __is-result__

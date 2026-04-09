@@ -31,6 +31,8 @@ mod transients;
 mod util;
 mod virtualize;
 mod array_list;
+mod regex;
+mod new;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};

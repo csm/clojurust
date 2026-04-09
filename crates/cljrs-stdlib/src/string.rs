@@ -191,7 +191,6 @@ fn replace_first(args: &[Value]) -> ValueResult<Value> {
 /// `(split s delim)` or `(split s delim limit)`.
 fn split(args: &[Value]) -> ValueResult<Value> {
     let s = get_str(&args[0])?;
-    let delim = get_str(&args[1])?;
     let limit = if args.len() >= 3 {
         match &args[2] {
             Value::Long(n) => Some(*n as usize),
@@ -206,15 +205,33 @@ fn split(args: &[Value]) -> ValueResult<Value> {
         None
     };
 
-    let parts: Vec<Value> = match limit {
-        Some(n) => s
-            .splitn(n, delim.as_ref())
-            .map(|p| make_str(p.to_string()))
-            .collect(),
-        None => s
-            .split(delim.as_ref())
-            .map(|p| make_str(p.to_string()))
-            .collect(),
+    let parts: Vec<Value> = match &args[1] {
+        Value::Pattern(re) => {
+            let re = re.get();
+            match limit {
+                Some(n) => re
+                    .splitn(s.as_ref(), n)
+                    .map(|p| make_str(p.to_string()))
+                    .collect(),
+                None => re
+                    .split(s.as_ref())
+                    .map(|p| make_str(p.to_string()))
+                    .collect(),
+            }
+        }
+        _ => {
+            let delim = get_str(&args[1])?;
+            match limit {
+                Some(n) => s
+                    .splitn(n, delim.as_ref())
+                    .map(|p| make_str(p.to_string()))
+                    .collect(),
+                None => s
+                    .split(delim.as_ref())
+                    .map(|p| make_str(p.to_string()))
+                    .collect(),
+            }
+        }
     };
     Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
         parts,

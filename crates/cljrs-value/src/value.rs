@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-
-use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-
+use regex::Regex;
+use cljrs_gc::{GcPtr, GcVisitor, MarkVisitor, Trace};
 use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector,
@@ -15,12 +14,15 @@ use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
 };
 use crate::keyword::Keyword;
+use crate::regex::Matcher;
 use crate::resource::ResourceHandle;
 use crate::symbol::Symbol;
 use crate::types::{
     Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
     Namespace, NativeFn, Protocol, ProtocolFn, Var, Volatile,
 };
+use crate::{ValueError, ValueResult};
+use crate::error::ExceptionInfo;
 
 /// A GC-traced mutable array of Values (backs `object-array`).
 #[derive(Debug)]
@@ -58,6 +60,8 @@ pub enum Value {
     Char(char),
     Str(GcPtr<String>),
     Uuid(u128),
+    Pattern(GcPtr<Regex>),
+    Matcher(GcPtr<Matcher>),
 
     // ── Identifiers ───────────────────────────────────────────────────────────
     Symbol(GcPtr<Symbol>),
@@ -134,7 +138,11 @@ pub enum Value {
     // ── Metadata wrapper ─────────────────────────────────────────────────────
     /// A value with attached metadata. Transparent for equality, hashing, display.
     WithMeta(Box<Value>, Box<Value>),
+
+    // Errors
+    Error(GcPtr<ExceptionInfo>)
 }
+
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
 #[derive(Clone, Debug)]
@@ -454,6 +462,9 @@ impl PartialEq for Value {
             }
             // UUID equality: same u128 value.
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            // Regex pattern equality: compare source string (matches Clojure JVM behavior
+            // where two patterns are equal iff their source strings are equal).
+            (Value::Pattern(a), Value::Pattern(b)) => a.get().as_str() == b.get().as_str(),
             // NativeObject equality: pointer identity.
             (Value::NativeObject(a), Value::NativeObject(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
@@ -464,6 +475,9 @@ impl PartialEq for Value {
             (Value::TypeInstance(a), Value::TypeInstance(b)) => {
                 a.get().type_tag == b.get().type_tag && maps_equal(&a.get().fields, &b.get().fields)
             }
+            (Value::Error(a), Value::Error(b)) => {
+                std::ptr::eq(a.get() as *const _, b.get() as *const _)
+            },
             _ => false,
         }
     }
@@ -571,6 +585,8 @@ impl ClojureHash for Value {
             }
             Value::Char(c) => *c as u32,
             Value::Str(s) => hash_string(s.get()),
+            Value::Pattern(r) => hash_string(r.get().as_str()),
+            Value::Matcher(m) => hash_string(m.get().pattern.get().as_str()),
             Value::Keyword(k) => hash_string(&k.get().to_string()),
             Value::Symbol(s) => hash_string(&s.get().to_string()),
             Value::Uuid(u) => hash_u128(*u),
@@ -752,6 +768,7 @@ impl ClojureHash for Value {
                 });
                 hash_combine_ordered(tag_hash, fields_hash)
             }
+            Value::Error(e) => e.get().clojure_hash(),
         }
     }
 }
@@ -882,6 +899,16 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
                 write!(f, "{}", s.get())
             }
         }
+        Value::Pattern(r) => {
+            if readably {
+                write!(f, "#\"")?;
+                write!(f, "{}", r.get().as_str())?;
+                write!(f, "\"")
+            } else {
+                write!(f, "#<{}>", r.get())
+            }
+        }
+        Value::Matcher(_) => write!(f, "#<Matcher>"),
         Value::Symbol(s) => write!(f, "{}", s.get()),
         Value::Keyword(k) => write!(f, "{}", k.get()),
         Value::List(l) => {
@@ -1045,6 +1072,11 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::TransientMap(_) => write!(f, "#<TransientMap>"),
         Value::TransientSet(_) => write!(f, "#<TransientSet>"),
         Value::TransientVector(_) => write!(f, "#<TransientVector>"),
+        Value::Error(e) => {
+            write!(f, "#error ")?;
+            let map = e.get().to_map().map_err(|_| fmt::Error::default())?;
+            pr_str(&map, f, readably)
+        }
     }
 }
 
@@ -1093,6 +1125,8 @@ impl Value {
             Value::Ratio(_) => "ratio",
             Value::Char(_) => "char",
             Value::Str(_) => "string",
+            Value::Pattern(_) => "pattern",
+            Value::Matcher(_) => "matcher",
             Value::Symbol(_) => "symbol",
             Value::Keyword(_) => "keyword",
             Value::Uuid(_) => "uuid",
@@ -1133,6 +1167,7 @@ impl Value {
             Value::TransientMap(_) => "transient-map",
             Value::TransientSet(_) => "transient-set",
             Value::TransientVector(_) => "transient-vector",
+            Value::Error(_) => "error",
         }
     }
 
@@ -1197,6 +1232,8 @@ impl cljrs_gc::Trace for Value {
             Value::BigDecimal(p) => visitor.visit(p),
             Value::Ratio(p) => visitor.visit(p),
             Value::Str(p) => visitor.visit(p),
+            Value::Pattern(p) => visitor.visit(p),
+            Value::Matcher(m) => visitor.visit(m),
             Value::Symbol(p) => visitor.visit(p),
             Value::Keyword(p) => visitor.visit(p),
             Value::List(p) => visitor.visit(p),
@@ -1236,6 +1273,7 @@ impl cljrs_gc::Trace for Value {
             Value::TransientMap(m) => visitor.visit(m),
             Value::TransientVector(p) => visitor.visit(p),
             Value::TransientSet(m) => visitor.visit(m),
+            Value::Error(e) => visitor.visit(e),
         }
     }
 }
@@ -1665,5 +1703,8 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::TransientMap(_) => 40,
         Value::TransientSet(_) => 41,
         Value::TransientVector(_) => 42,
+        Value::Pattern(_) => 43,
+        Value::Matcher(_) => 44,
+        Value::Error(_) => 45,
     }
 }

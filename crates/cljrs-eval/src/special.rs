@@ -11,9 +11,10 @@ use crate::loader::load_ns;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
+use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
     CljxFn, CljxFnArity, Keyword, MapValue, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
-    TypeInstance, Value,
+    TypeInstance, Value, ValueError,
 };
 
 /// The set of names that trigger special-form dispatch.
@@ -629,77 +630,95 @@ fn eval_throw(args: &[Form], env: &mut Env) -> EvalResult {
         Some(f) => eval(f, env)?,
         None => Value::Nil,
     };
+    // Wrap non-error values in an ExceptionInfo so try/catch always sees a
+    // Value::Error and ex-message / ex-data work uniformly inside the handler.
+    let val = match val {
+        Value::Error(_) => val,
+        other => {
+            let msg = format!("{}", other);
+            Value::Error(GcPtr::new(ExceptionInfo::new(
+                ValueError::Other(msg.clone()),
+                msg,
+                None,
+                None,
+            )))
+        }
+    };
     Err(EvalError::Thrown(val))
 }
 
 // ── try ───────────────────────────────────────────────────────────────────────
 
-fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
-    // Split args into body, catch clauses, finally.
-    let mut body_forms: Vec<&Form> = Vec::new();
-    let mut _catch_clauses: Vec<(&str, &[Form])> = Vec::new(); // (binding_sym, handler_body)
-    let mut _finally_forms: Vec<&Form> = Vec::new();
-    let mut in_catch = false;
-    let mut in_finally = false;
+struct CatchClause<'a> {
+    type_sym: &'a str,
+    binding: &'a str,
+    body: &'a [Form],
+}
 
-    for form in args {
-        match &form.kind {
-            FormKind::List(parts) if !parts.is_empty() => {
-                match &parts[0].kind {
-                    FormKind::Symbol(s) if s == "catch" => {
-                        // (catch ExType sym handler...)
-                        // Phase 4: just one catch clause matching any thrown value.
-                        let _sym = match parts.get(2).map(|f| &f.kind) {
-                            Some(FormKind::Symbol(s)) => s.as_str(),
-                            _ => {
-                                return Err(EvalError::Runtime(
-                                    "catch requires a binding symbol".into(),
-                                ));
-                            }
-                        };
-                        // Store raw reference to form for later processing.
-                        // We'll process them as a slice after splitting.
-                        in_catch = true;
-                        in_finally = false;
-                        // Defer; collect whole forms.
-                        body_forms.push(form); // sentinel — handled below
-                        continue;
-                    }
-                    FormKind::Symbol(s) if s == "finally" => {
-                        in_catch = false;
-                        in_finally = true;
-                        body_forms.push(form); // sentinel
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        if !in_catch && !in_finally {
-            body_forms.push(form);
-        }
+/// Convert a non-Thrown EvalError into a `Value::Error` so it can be bound
+/// inside a catch clause and inspected with `ex-message` / `ex-data`.
+fn eval_error_to_value(err: &EvalError) -> Value {
+    let msg = err.to_string();
+    Value::Error(GcPtr::new(ExceptionInfo::new(
+        ValueError::Other(msg.clone()),
+        msg,
+        None,
+        None,
+    )))
+}
+
+/// Test whether the type symbol on a `(catch <Type> e ...)` clause matches a
+/// thrown value. Type names are matched by their last `.`-separated segment so
+/// fully-qualified names like `java.lang.Exception` work as well as bare ones.
+fn catch_type_matches(type_name: &str, val: &Value) -> bool {
+    let short = type_name.rsplit('.').next().unwrap_or(type_name);
+    match short {
+        // Catch-all (matches any value, error or not — back-compat).
+        "Object" | "Exception" | "Throwable" | "Error" => true,
+        // ExceptionInfo only matches actual ex-info / Exception values.
+        "ExceptionInfo" => matches!(val, Value::Error(_)),
+        _ => false,
     }
+}
 
-    // Re-parse cleanly.
-    let (true_body, catch_sym, catch_body, fin_body) = parse_try_args(args);
+fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
+    let (body, catches, fin_body) = parse_try_args(args);
 
-    // Eval body.
-    let mut result = eval_body(true_body, env);
+    let mut result = eval_body(body, env);
 
-    // Handle catch: catches Thrown values and any non-Recur EvalError.
-    let should_catch =
-        matches!(&result, Err(e) if !matches!(e, EvalError::Recur(_))) && catch_sym.is_some();
-    if should_catch {
-        let sym = catch_sym.unwrap();
-        let caught_val = match result.unwrap_err() {
-            EvalError::Thrown(val) => val,
-            other => Value::Str(cljrs_gc::GcPtr::new(other.to_string())),
+    // Handle catch: never intercept Recur (loop trampoline signal).
+    let err_opt = match std::mem::replace(&mut result, Ok(Value::Nil)) {
+        Ok(v) => {
+            result = Ok(v);
+            None
+        }
+        Err(EvalError::Recur(args)) => {
+            result = Err(EvalError::Recur(args));
+            None
+        }
+        Err(other) => Some(other),
+    };
+
+    if let Some(err) = err_opt {
+        let thrown_val = match err {
+            EvalError::Thrown(v) => v,
+            ref other => eval_error_to_value(other),
         };
-        env.push_frame();
-        env.bind(Arc::from(sym), caught_val);
-        result = eval_body(catch_body, env);
-        env.pop_frame();
+        let mut handled = false;
+        for c in &catches {
+            if catch_type_matches(c.type_sym, &thrown_val) {
+                env.push_frame();
+                env.bind(Arc::from(c.binding), thrown_val.clone());
+                result = eval_body(c.body, env);
+                env.pop_frame();
+                handled = true;
+                break;
+            }
+        }
+        if !handled {
+            // No matching catch — re-throw.
+            result = Err(EvalError::Thrown(thrown_val));
+        }
     }
 
     // Always run finally.
@@ -710,13 +729,11 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
     result
 }
 
-/// Split try args into (body, catch_sym, catch_body, finally_body).
-fn parse_try_args(args: &[Form]) -> (&[Form], Option<&str>, &[Form], &[Form]) {
+/// Split try args into (body, catch clauses, finally body).
+fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form]) {
     let mut body_end = args.len();
-    let mut catch_sym: Option<&str> = None;
-    let mut catch_start = args.len();
-    let mut _catch_end = args.len();
-    let mut fin_start = args.len();
+    let mut catches: Vec<CatchClause<'_>> = Vec::new();
+    let mut fin_body: &[Form] = &[];
 
     for (i, form) in args.iter().enumerate() {
         if let FormKind::List(parts) = &form.kind
@@ -726,47 +743,32 @@ fn parse_try_args(args: &[Form]) -> (&[Form], Option<&str>, &[Form], &[Form]) {
                 if i < body_end {
                     body_end = i;
                 }
-                catch_start = i;
-                _catch_end = i + 1;
-                // Extract sym — it's the third element (index 2).
-                if let Some(FormKind::Symbol(sym)) = parts.get(2).map(|f| &f.kind) {
-                    catch_sym = Some(sym.as_str());
-                }
+                let type_sym = match parts.get(1).map(|f| &f.kind) {
+                    Some(FormKind::Symbol(s)) => s.as_str(),
+                    _ => continue,
+                };
+                let binding = match parts.get(2).map(|f| &f.kind) {
+                    Some(FormKind::Symbol(s)) => s.as_str(),
+                    _ => continue,
+                };
+                catches.push(CatchClause {
+                    type_sym,
+                    binding,
+                    body: &parts[3..],
+                });
                 continue;
             }
             if s == "finally" {
                 if i < body_end {
                     body_end = i;
                 }
-                fin_start = i;
+                fin_body = &parts[1..];
                 continue;
             }
         }
     }
 
-    let body = &args[..body_end];
-    let catch_body = if catch_sym.is_some() {
-        // Extract body from the catch form.
-        if let Some(FormKind::List(parts)) = args.get(catch_start).map(|f| &f.kind) {
-            // skip (catch ExType sym ...) — body starts at index 3
-            &parts[3..]
-        } else {
-            &[]
-        }
-    } else {
-        &[]
-    };
-    let fin_body = if fin_start < args.len() {
-        if let FormKind::List(parts) = &args[fin_start].kind {
-            &parts[1..] // skip "finally"
-        } else {
-            &[]
-        }
-    } else {
-        &[]
-    };
-
-    (body, catch_sym, catch_body, fin_body)
+    (&args[..body_end], catches, fin_body)
 }
 
 // ── defn ──────────────────────────────────────────────────────────────────────

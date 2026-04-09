@@ -15,7 +15,7 @@ use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::value::SetValue::Sorted;
-use cljrs_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile};
+use cljrs_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile};
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
@@ -30,6 +30,8 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use crate::array_list::{builtin_array_list, builtin_array_list_clear, builtin_array_list_length, builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array};
+use crate::new::{builtin_exception_dot, builtin_new};
+use crate::regex::{builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern};
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -390,9 +392,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
             builtin_make_lazy_seq_sentinel,
         ),
         ("format", Arity::Variadic { min: 1 }, builtin_format),
-        ("re-find", Arity::Fixed(2), builtin_re_find_stub),
-        ("re-seq", Arity::Fixed(2), builtin_re_seq_stub),
-        ("re-matches", Arity::Fixed(2), builtin_re_matches_stub),
+        ("re-find", Arity::Variadic { min: 1 }, builtin_re_find),
+        ("re-matches", Arity::Fixed(2), builtin_re_matches),
+        ("re-groups", Arity::Fixed(1), builtin_re_groups),
+        ("re-pattern", Arity::Fixed(1), builtin_re_pattern),
+        ("re-matcher", Arity::Fixed(2), builtin_re_matcher),
         ("subs", Arity::Variadic { min: 2 }, builtin_subs),
         ("split", Arity::Variadic { min: 2 }, builtin_split_stub),
         ("join", Arity::Variadic { min: 1 }, builtin_join),
@@ -641,6 +645,10 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("array-list-length", Arity::Fixed(1), builtin_array_list_length),
         ("array-list-to-array", Arity::Fixed(1), builtin_array_list_to_array),
         ("array-list-clear", Arity::Fixed(1), builtin_array_list_clear),
+
+        // interop
+        ("new", Arity::Variadic { min: 1 }, builtin_new),
+        ("Exception.", Arity::Variadic { min: 1 }, builtin_exception_dot),
     ];
 
     for (name, arity, func) in fns {
@@ -2139,7 +2147,10 @@ fn builtin_case_eq(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(same_numeric_type && args[0] == args[1]))
 }
 fn builtin_map_q(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Bool(matches!(args[0].unwrap_meta(), Value::Map(_))))
+    Ok(Value::Bool(matches!(
+        args[0].unwrap_meta(),
+        Value::Map(_) | Value::TypeInstance(_)
+    )))
 }
 fn builtin_vector_q(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(matches!(
@@ -2187,6 +2198,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
             return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
+        Value::Queue(q) => q.get().count() == 0,
         _ => {
             return Err(ValueError::WrongType {
                 expected: "seqable",
@@ -2395,6 +2407,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                 head: v.clone(),
                 tail: result,
             })),
+            Value::Queue(q ) => Value::Queue(GcPtr::new(q.get().conj(v.clone()))),
             _ => {
                 return Err(ValueError::WrongType {
                     expected: "collection",
@@ -2692,6 +2705,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
         Value::Set(s) => s.count(),
         Value::Str(s) => s.get().chars().count(),
         Value::TypeInstance(ti) => ti.get().fields.count(),
+        Value::Queue(q) => q.get().count(),
         _ => {
             return Err(ValueError::WrongType {
                 expected: "collection",
@@ -2935,6 +2949,13 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
             .next()
             .map(Value::Char)
             .unwrap_or(Value::Nil)),
+        Value::Queue(q) => {
+            if let Some(result) = q.get().peek() {
+                Ok(result.clone())
+            } else {
+                Ok(Value::Nil)
+            }
+        }
         _ => Err(ValueError::WrongType {
             expected: "seqable",
             got: args[0].type_name().to_string(),
@@ -4303,6 +4324,7 @@ fn builtin_peek(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::List(l) => Ok(l.get().first().cloned().unwrap_or(Value::Nil)),
         Value::Vector(v) => Ok(v.get().peek().cloned().unwrap_or(Value::Nil)),
+        Value::Queue(q) => Ok(q.get().peek().cloned().unwrap_or(Value::Nil)),
         Value::Nil => Ok(Value::Nil),
         v => Err(ValueError::WrongType {
             expected: "stack",
@@ -4326,6 +4348,13 @@ fn builtin_pop(args: &[Value]) -> ValueResult<Value> {
                 Err(ValueError::Other("pop on empty vector".into()))
             } else {
                 Ok(Value::Vector(GcPtr::new(v.get().pop().unwrap())))
+            }
+        }
+        Value::Queue(q) => {
+            if let Some(result) = q.get().pop() {
+                Ok(Value::Queue(GcPtr::new(result)))
+            } else {
+                Ok(Value::Nil)
             }
         }
         Value::Nil => Ok(Value::Nil),
@@ -5114,25 +5143,36 @@ fn builtin_ex_info(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().clone(),
         v => format!("{}", v),
     };
-    let data = args
-        .get(1)
-        .cloned()
-        .unwrap_or(Value::Map(MapValue::empty()));
-    let cause = args.get(2).cloned().unwrap_or(Value::Nil);
-    let mut m = MapValue::empty();
-    m = m.assoc(
-        Value::keyword(Keyword::simple("message")),
-        Value::string(msg),
-    );
-    m = m.assoc(Value::keyword(Keyword::simple("data")), data);
-    if !matches!(cause, Value::Nil) {
-        m = m.assoc(Value::keyword(Keyword::simple("cause")), cause);
-    }
-    Ok(Value::Map(m))
+    let data = args.get(1).cloned();
+    let data = match data {
+        Some(Value::Map(m)) => Some(m),
+        None => None,
+        Some(v) => return Err(ValueError::WrongType {
+            expected: "associative",
+            got: v.type_name().to_string(),
+        })
+    };
+    let cause = match args.get(2).cloned() {
+        Some(Value::Error(e)) => Some(e),
+        None => None,
+        Some(v) => return Err(ValueError::WrongType {
+            expected: "error",
+            got: v.type_name().to_string(),
+        })
+    };
+    Ok(Value::Error(GcPtr::new(ExceptionInfo::new(ValueError::Other(msg.to_string()),
+                                                  msg.to_string(), data, cause))))
 }
 
 fn builtin_ex_data(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::Error(e) => Ok(
+            if let Some(data) = e.get().data() {
+                Value::Map(data)
+            } else {
+                Value::Nil
+            }
+        ),
         Value::Map(m) => Ok(m
             .get(&Value::keyword(Keyword::simple("data")))
             .unwrap_or(Value::Nil)),
@@ -5142,6 +5182,7 @@ fn builtin_ex_data(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_ex_message(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::Error(e) => Ok(Value::string(e.get().message())),
         Value::Map(m) => Ok(m
             .get(&Value::keyword(Keyword::simple("message")))
             .unwrap_or(Value::Nil)),
@@ -5151,6 +5192,13 @@ fn builtin_ex_message(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_ex_cause(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
+        Value::Error(e) => Ok(
+            if let Some(cause) = e.get().cause() {
+                Value::Error(cause.clone())
+            } else {
+                Value::Nil
+            }
+        ),
         Value::Map(m) => Ok(m
             .get(&Value::keyword(Keyword::simple("cause")))
             .unwrap_or(Value::Nil)),
@@ -6129,16 +6177,6 @@ fn builtin_clojure_version(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::string("cljrs-0.1.0"))
 }
 
-fn builtin_re_find_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_re_seq_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-fn builtin_re_matches_stub(_args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Nil)
-}
-
 // ── Protocol & Multimethod builtins ───────────────────────────────────────────
 
 fn builtin_satisfies_q(args: &[Value]) -> ValueResult<Value> {
@@ -6631,8 +6669,14 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
         ),
         "clojure.lang.PersistentQueue" => matches!(
             val,
-            Value::Queue(_)
+            Value::Queue(_) | Value::List(_)  // Compatibility with clojure
         ),
+        "java.util.regex.Pattern" => matches!(
+            val,
+            Value::Pattern(_)
+        ),
+        "ExceptionInfo" | "clojure.lang.ExceptionInfo" | "Exception" | "java.lang.Exception" =>
+            matches!(val, Value::Error(_)),
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),
             Value::NativeObject(obj) => obj.get().type_tag() == expected_tag.as_str(),

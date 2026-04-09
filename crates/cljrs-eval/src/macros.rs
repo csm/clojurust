@@ -311,6 +311,10 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
             return value_to_form(inner, span);
         }
 
+        Value::Pattern(p) => {
+            FormKind::Regex(p.get().as_str().to_string())
+        }
+
         // Non-data types: wrap in a symbol placeholder (best effort).
         other => FormKind::Symbol(format!("#<{}>", other.type_name())),
     };

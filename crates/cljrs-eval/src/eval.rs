@@ -15,6 +15,7 @@ use cljrs_value::{
     FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
     Value,
 };
+use regex::Regex;
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
@@ -30,9 +31,13 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         FormKind::BigInt(s) => parse_bigint(s),
         FormKind::BigDecimal(s) => parse_bigdecimal(s),
         FormKind::Ratio(s) => parse_ratio(s),
-        FormKind::Regex(_) => Err(EvalError::Runtime(
-            "regex literals not yet supported".into(),
-        )),
+        FormKind::Regex(s) => {
+            let r = Regex::new(s);
+            match r {
+                Ok(r) => Ok(Value::Pattern(GcPtr::new(r))),
+                Err(e) => Err(EvalError::Runtime(e.to_string()))
+            }
+        },
 
         // ── Identifiers ───────────────────────────────────────────────────
         FormKind::Symbol(s) => eval_symbol(s, env),
@@ -265,6 +270,7 @@ fn is_jvm_class_name(s: &str) -> bool {
             | "clojure.lang.IEditableCollection"
             | "Boolean"
             | "clojure.lang.PersistentQueue"
+            | "java.util.regex.Pattern"
     )
 }
 
@@ -338,7 +344,10 @@ pub fn form_to_value(form: &Form) -> Value {
         FormKind::Symbol(s) => Value::symbol(Symbol::parse(s)),
         FormKind::Keyword(s) => Value::keyword(Keyword::parse(s)),
         FormKind::AutoKeyword(s) => Value::keyword(Keyword::simple(s.as_str())),
-        FormKind::Regex(s) => Value::string(s.clone()),
+        FormKind::Regex(s) => match Regex::new(s.as_str()) {
+            Ok(pattern) => Value::Pattern(GcPtr::new(pattern)),
+            Err(_) => Value::Nil,  // should already have been caught
+        },
 
         FormKind::List(forms) => {
             let expanded = expand_reader_conds(forms);

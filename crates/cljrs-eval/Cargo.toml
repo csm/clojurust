@@ -19,3 +19,4 @@ rand         = { workspace = true }
 rpds         = { workspace = true }
 uuid         = { workspace = true, features = ["v4"] }
 log = "0.4.29"
+regex = "1.12.3"

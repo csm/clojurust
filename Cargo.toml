@@ -38,6 +38,7 @@ rand         = "0.10.0"
 rpds         = "1"
 uuid         = "1.22.0"
 tokio        = "1.50.0"
+regex        = "1.12.3"
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"
