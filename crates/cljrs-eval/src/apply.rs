@@ -203,7 +203,7 @@ fn dispatch_string_method(method: &str, s: &str, args: &[Value]) -> EvalResult {
                     return Err(EvalError::Runtime(format!(
                         ".indexOf expects string or char argument, got {}",
                         v.type_name()
-                    )))
+                    )));
                 }
                 None => return Err(EvalError::Runtime(".indexOf requires an argument".into())),
             };
@@ -216,7 +216,11 @@ fn dispatch_string_method(method: &str, s: &str, args: &[Value]) -> EvalResult {
             let needle = match args.first() {
                 Some(Value::Str(s)) => s.get().to_string(),
                 Some(Value::Char(c)) => c.to_string(),
-                _ => return Err(EvalError::Runtime(".lastIndexOf requires a string or char argument".into())),
+                _ => {
+                    return Err(EvalError::Runtime(
+                        ".lastIndexOf requires a string or char argument".into(),
+                    ));
+                }
             };
             match s.rfind(&needle) {
                 Some(pos) => Ok(Value::Long(pos as i64)),
@@ -250,7 +254,9 @@ fn dispatch_string_method(method: &str, s: &str, args: &[Value]) -> EvalResult {
                 .get(1)
                 .map(|v| match v {
                     Value::Long(n) => Ok(*n as usize),
-                    _ => Err(EvalError::Runtime(".substring end must be an integer".into())),
+                    _ => Err(EvalError::Runtime(
+                        ".substring end must be an integer".into(),
+                    )),
                 })
                 .transpose()?;
             let result = match end {
@@ -267,7 +273,11 @@ fn dispatch_string_method(method: &str, s: &str, args: &[Value]) -> EvalResult {
             let to = match args.get(1) {
                 Some(Value::Str(s)) => s.get().to_string(),
                 Some(Value::Char(c)) => c.to_string(),
-                _ => return Err(EvalError::Runtime(".replace requires two string arguments".into())),
+                _ => {
+                    return Err(EvalError::Runtime(
+                        ".replace requires two string arguments".into(),
+                    ));
+                }
             };
             Ok(Value::Str(GcPtr::new(s.replace(&from, &to))))
         }
@@ -294,9 +304,9 @@ fn dispatch_vector_method(
 ) -> EvalResult {
     match method {
         "indexOf" => {
-            let needle = args.first().ok_or_else(|| {
-                EvalError::Runtime(".indexOf requires an argument".into())
-            })?;
+            let needle = args
+                .first()
+                .ok_or_else(|| EvalError::Runtime(".indexOf requires an argument".into()))?;
             for (i, item) in v.get().iter().enumerate() {
                 if item == needle {
                     return Ok(Value::Long(i as i64));
@@ -314,9 +324,9 @@ fn dispatch_vector_method(
 fn dispatch_seq_method(method: &str, target: &Value, args: &[Value]) -> EvalResult {
     match method {
         "indexOf" => {
-            let needle = args.first().ok_or_else(|| {
-                EvalError::Runtime(".indexOf requires an argument".into())
-            })?;
+            let needle = args
+                .first()
+                .ok_or_else(|| EvalError::Runtime(".indexOf requires an argument".into()))?;
             let items = crate::destructure::value_to_seq_vec(target);
             for (i, item) in items.iter().enumerate() {
                 if item == needle {
@@ -542,8 +552,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> Eval
                         match rest_val {
                             Value::Nil => {} // no extra args
                             _ => {
-                                let rest_items =
-                                    crate::destructure::value_to_seq_vec(rest_val);
+                                let rest_items = crate::destructure::value_to_seq_vec(rest_val);
                                 flat.extend(rest_items);
                             }
                         }

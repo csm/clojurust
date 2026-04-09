@@ -91,13 +91,11 @@ where
 {
     let (globals, ns) = EVAL_CONTEXT.with(|stack| {
         let s = stack.borrow();
-        let ec = s
-            .last()
-            .ok_or_else(|| {
-                crate::error::EvalError::Runtime(
-                    "with_eval_context called outside eval context".to_string(),
-                )
-            })?;
+        let ec = s.last().ok_or_else(|| {
+            crate::error::EvalError::Runtime(
+                "with_eval_context called outside eval context".to_string(),
+            )
+        })?;
         Ok::<_, crate::error::EvalError>((ec.globals.clone(), ec.current_ns.clone()))
     })?;
     let mut env = Env::new(globals, &ns);

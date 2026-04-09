@@ -1,11 +1,19 @@
 //! All native (Rust) built-in functions registered in `clojure.core`.
 
+use crate::array_list::{
+    builtin_array_list, builtin_array_list_clear, builtin_array_list_length,
+    builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array,
+};
 use crate::bitops::{
     builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test,
 };
 use crate::callback::{capture_eval_context, install_eval_context};
 use crate::dynamics;
 use crate::env::GlobalEnv;
+use crate::new::{builtin_exception_dot, builtin_new};
+use crate::regex::{
+    builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern,
+};
 use crate::transients::{
     builtin_assoc_bang, builtin_conj_bang, builtin_disj_bang, builtin_dissoc_bang,
     builtin_persistent_bang, builtin_pop_bang, builtin_transient,
@@ -15,7 +23,12 @@ use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::value::SetValue::Sorted;
-use cljrs_value::{Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile};
+use cljrs_value::{
+    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo,
+    FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap,
+    PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk,
+    TypeInstance, Value, ValueError, ValueResult, Volatile,
+};
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
@@ -29,9 +42,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use crate::array_list::{builtin_array_list, builtin_array_list_clear, builtin_array_list_length, builtin_array_list_push, builtin_array_list_remove, builtin_array_list_to_array};
-use crate::new::{builtin_exception_dot, builtin_new};
-use crate::regex::{builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern};
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -312,7 +322,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("map-vals", Arity::Fixed(2), builtin_map_vals_stub),
         ("shuffle", Arity::Fixed(1), builtin_shuffle),
         ("queue", Arity::Variadic { min: 0 }, builtin_queue),
-
         // Atoms
         ("atom", Arity::Variadic { min: 1 }, builtin_atom),
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
@@ -637,18 +646,36 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("bit-flip", Arity::Fixed(2), builtin_bit_flip),
         ("bit-set", Arity::Fixed(2), builtin_bit_set),
         ("bit-test", Arity::Fixed(2), builtin_bit_test),
-
         // array-list extension
         ("array-list", Arity::Variadic { min: 0 }, builtin_array_list),
         ("array-list-push", Arity::Fixed(2), builtin_array_list_push),
-        ("array-list-remove", Arity::Fixed(2), builtin_array_list_remove),
-        ("array-list-length", Arity::Fixed(1), builtin_array_list_length),
-        ("array-list-to-array", Arity::Fixed(1), builtin_array_list_to_array),
-        ("array-list-clear", Arity::Fixed(1), builtin_array_list_clear),
-
+        (
+            "array-list-remove",
+            Arity::Fixed(2),
+            builtin_array_list_remove,
+        ),
+        (
+            "array-list-length",
+            Arity::Fixed(1),
+            builtin_array_list_length,
+        ),
+        (
+            "array-list-to-array",
+            Arity::Fixed(1),
+            builtin_array_list_to_array,
+        ),
+        (
+            "array-list-clear",
+            Arity::Fixed(1),
+            builtin_array_list_clear,
+        ),
         // interop
         ("new", Arity::Variadic { min: 1 }, builtin_new),
-        ("Exception.", Arity::Variadic { min: 1 }, builtin_exception_dot),
+        (
+            "Exception.",
+            Arity::Variadic { min: 1 },
+            builtin_exception_dot,
+        ),
     ];
 
     for (name, arity, func) in fns {
@@ -2407,7 +2434,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                 head: v.clone(),
                 tail: result,
             })),
-            Value::Queue(q ) => Value::Queue(GcPtr::new(q.get().conj(v.clone()))),
+            Value::Queue(q) => Value::Queue(GcPtr::new(q.get().conj(v.clone()))),
             _ => {
                 return Err(ValueError::WrongType {
                     expected: "collection",
@@ -3216,17 +3243,12 @@ impl Thunk for ConcatThunk {
 
             // Peel through any lazy-seq wrappers on the head iteratively.
             let mut head = colls[0].clone();
-            loop {
-                match &head {
-                    Value::LazySeq(ls) => {
-                        let realized = ls.get().realize();
-                        if let Some(err) = ls.get().error() {
-                            return Err(err);
-                        }
-                        head = realized;
-                    }
-                    _ => break,
+            while let Value::LazySeq(ls) = &head {
+                let realized = ls.get().realize();
+                if let Some(err) = ls.get().error() {
+                    return Err(err);
                 }
+                head = realized;
             }
 
             // Now head is a non-lazy value.
@@ -3250,10 +3272,7 @@ impl Thunk for ConcatThunk {
                     // Rust stack — the next element is produced when the tail
                     // lazy-seq is realized later).
                     let tail = concat_lazy(colls);
-                    return Ok(Value::Cons(GcPtr::new(CljxCons {
-                        head: f,
-                        tail,
-                    })));
+                    return Ok(Value::Cons(GcPtr::new(CljxCons { head: f, tail })));
                 }
                 None => {
                     colls.remove(0);
@@ -3270,13 +3289,8 @@ impl Thunk for ConcatThunk {
 fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
     // Iteratively unwrap lazy seqs first.
     let mut current = val.clone();
-    loop {
-        match &current {
-            Value::LazySeq(ls) => {
-                current = ls.get().realize();
-            }
-            _ => break,
-        }
+    while let Value::LazySeq(ls) = current {
+        current = ls.get().realize();
     }
     let val = &current;
 
@@ -4694,7 +4708,10 @@ fn builtin_find(args: &[Value]) -> ValueResult<Value> {
         }
         Value::TransientMap(m) => {
             if let Some((k, v)) = m.get().find(&args[1]) {
-                Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([k.clone(), v.clone()]))))
+                Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                    k.clone(),
+                    v.clone(),
+                ]))))
             } else {
                 Ok(Value::Nil)
             }
@@ -4745,26 +4762,36 @@ fn builtin_shuffle(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
-    let queue = if args.len() == 0 {
+    let queue = if args.is_empty() {
         PersistentQueue::empty()
     } else {
         match &args[0] {
-            Value::WithMeta(_, ..) | Value::List(_) | Value::Vector(_) | Value::Set(_) | Value::Map(_)
-            | Value::LazySeq(_) | Value::Cons(_) | Value::ObjectArray(_)
-            | Value::BooleanArray(_) | Value::ByteArray(_) | Value::CharArray(_)
-            | Value::IntArray(_) | Value::LongArray(_) | Value::FloatArray(_)
-            | Value::DoubleArray(_) | Value::Str(_) => {
+            Value::WithMeta(..)
+            | Value::List(_)
+            | Value::Vector(_)
+            | Value::Set(_)
+            | Value::Map(_)
+            | Value::LazySeq(_)
+            | Value::Cons(_)
+            | Value::ObjectArray(_)
+            | Value::BooleanArray(_)
+            | Value::ByteArray(_)
+            | Value::CharArray(_)
+            | Value::IntArray(_)
+            | Value::LongArray(_)
+            | Value::FloatArray(_)
+            | Value::DoubleArray(_)
+            | Value::Str(_) => {
                 let iter = ValueIter::new(args[0].clone());
-                PersistentQueue::new(
-                    PersistentList::from_iter(iter),
-                    PersistentVector::empty()
-                )
+                PersistentQueue::new(PersistentList::from_iter(iter), PersistentVector::empty())
             }
             Value::Nil => PersistentQueue::empty(),
-            v => return Err(ValueError::WrongType {
-                expected: "seqable",
-                got: v.type_name().to_string()
-            })
+            v => {
+                return Err(ValueError::WrongType {
+                    expected: "seqable",
+                    got: v.type_name().to_string(),
+                });
+            }
         }
     };
     Ok(Value::Queue(GcPtr::new(queue)))
@@ -4839,7 +4866,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().deref()),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
-        Value::Delay(d) => d.get().force().map_err(|e| ValueError::Other(e)),
+        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Promise(p) => {
             if with_timeout {
@@ -5147,32 +5174,38 @@ fn builtin_ex_info(args: &[Value]) -> ValueResult<Value> {
     let data = match data {
         Some(Value::Map(m)) => Some(m),
         None => None,
-        Some(v) => return Err(ValueError::WrongType {
-            expected: "associative",
-            got: v.type_name().to_string(),
-        })
+        Some(v) => {
+            return Err(ValueError::WrongType {
+                expected: "associative",
+                got: v.type_name().to_string(),
+            });
+        }
     };
     let cause = match args.get(2).cloned() {
         Some(Value::Error(e)) => Some(e),
         None => None,
-        Some(v) => return Err(ValueError::WrongType {
-            expected: "error",
-            got: v.type_name().to_string(),
-        })
+        Some(v) => {
+            return Err(ValueError::WrongType {
+                expected: "error",
+                got: v.type_name().to_string(),
+            });
+        }
     };
-    Ok(Value::Error(GcPtr::new(ExceptionInfo::new(ValueError::Other(msg.to_string()),
-                                                  msg.to_string(), data, cause))))
+    Ok(Value::Error(GcPtr::new(ExceptionInfo::new(
+        ValueError::Other(msg.to_string()),
+        msg.to_string(),
+        data,
+        cause,
+    ))))
 }
 
 fn builtin_ex_data(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Error(e) => Ok(
-            if let Some(data) = e.get().data() {
-                Value::Map(data)
-            } else {
-                Value::Nil
-            }
-        ),
+        Value::Error(e) => Ok(if let Some(data) = e.get().data() {
+            Value::Map(data)
+        } else {
+            Value::Nil
+        }),
         Value::Map(m) => Ok(m
             .get(&Value::keyword(Keyword::simple("data")))
             .unwrap_or(Value::Nil)),
@@ -5192,13 +5225,11 @@ fn builtin_ex_message(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_ex_cause(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Error(e) => Ok(
-            if let Some(cause) = e.get().cause() {
-                Value::Error(cause.clone())
-            } else {
-                Value::Nil
-            }
-        ),
+        Value::Error(e) => Ok(if let Some(cause) = e.get().cause() {
+            Value::Error(cause.clone())
+        } else {
+            Value::Nil
+        }),
         Value::Map(m) => Ok(m
             .get(&Value::keyword(Keyword::simple("cause")))
             .unwrap_or(Value::Nil)),
@@ -6322,7 +6353,7 @@ fn builtin_volatile_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_force(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Delay(d) => d.get().force().map_err(|e| ValueError::Other(e)),
+        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
         other => Ok(other.clone()), // non-delay passes through
     }
 }
@@ -6663,20 +6694,17 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
             val,
             Value::Promise(_) | Value::Future(_) | Value::Delay(_) | Value::LazySeq(_)
         ),
-        "clojure.lang.IEditableCollection" => matches!(
-            val,
-            Value::List(_) | Value::Set(_) | Value::Map(_)
-        ),
+        "clojure.lang.IEditableCollection" => {
+            matches!(val, Value::List(_) | Value::Set(_) | Value::Map(_))
+        }
         "clojure.lang.PersistentQueue" => matches!(
             val,
-            Value::Queue(_) | Value::List(_)  // Compatibility with clojure
+            Value::Queue(_) | Value::List(_) // Compatibility with clojure
         ),
-        "java.util.regex.Pattern" => matches!(
-            val,
-            Value::Pattern(_)
-        ),
-        "ExceptionInfo" | "clojure.lang.ExceptionInfo" | "Exception" | "java.lang.Exception" =>
-            matches!(val, Value::Error(_)),
+        "java.util.regex.Pattern" => matches!(val, Value::Pattern(_)),
+        "ExceptionInfo" | "clojure.lang.ExceptionInfo" | "Exception" | "java.lang.Exception" => {
+            matches!(val, Value::Error(_))
+        }
         _ => match val {
             Value::TypeInstance(ti) => ti.get().type_tag.as_ref() == expected_tag.as_str(),
             Value::NativeObject(obj) => obj.get().type_tag() == expected_tag.as_str(),

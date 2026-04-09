@@ -13,6 +13,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod apply;
+mod array_list;
 mod bitops;
 pub mod builtins;
 pub mod callback;
@@ -24,15 +25,14 @@ pub mod eval;
 pub mod ir_interp;
 pub mod loader;
 pub mod macros;
+mod new;
+mod regex;
 pub mod special;
 pub mod syntax_quote;
 pub mod taps;
 mod transients;
 mod util;
 mod virtualize;
-mod array_list;
-mod regex;
-mod new;
 
 pub use callback::invoke;
 pub use env::{Env, GlobalEnv};

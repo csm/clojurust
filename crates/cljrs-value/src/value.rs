@@ -2,14 +2,11 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use num_bigint::BigInt;
-use num_traits::ToPrimitive;
-use regex::Regex;
-use cljrs_gc::{GcPtr, GcVisitor, MarkVisitor, Trace};
 use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector,
 };
+use crate::error::ExceptionInfo;
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
 };
@@ -21,8 +18,10 @@ use crate::types::{
     Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
     Namespace, NativeFn, Protocol, ProtocolFn, Var, Volatile,
 };
-use crate::{ValueError, ValueResult};
-use crate::error::ExceptionInfo;
+use cljrs_gc::{GcPtr, MarkVisitor, Trace};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+use regex::Regex;
 
 /// A GC-traced mutable array of Values (backs `object-array`).
 #[derive(Debug)]
@@ -140,9 +139,8 @@ pub enum Value {
     WithMeta(Box<Value>, Box<Value>),
 
     // Errors
-    Error(GcPtr<ExceptionInfo>)
+    Error(GcPtr<ExceptionInfo>),
 }
-
 
 /// A map value: either a small array-map or a HAMT-based hash-map.
 #[derive(Clone, Debug)]
@@ -477,7 +475,7 @@ impl PartialEq for Value {
             }
             (Value::Error(a), Value::Error(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
-            },
+            }
             _ => false,
         }
     }
@@ -1074,7 +1072,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::TransientVector(_) => write!(f, "#<TransientVector>"),
         Value::Error(e) => {
             write!(f, "#error ")?;
-            let map = e.get().to_map().map_err(|_| fmt::Error::default())?;
+            let map = e.get().to_map().map_err(|_| fmt::Error {})?;
             pr_str(&map, f, readably)
         }
     }

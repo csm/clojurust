@@ -22,8 +22,9 @@ pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
         Value::Vector(v) => Ok(Value::TransientVector(GcPtr::new(
             TransientVector::new_from_vector(v.get().inner()),
         ))),
-        Value::TransientMap(_) | Value::TransientVector(_) | Value::TransientSet(_) =>
-            Ok(args[0].clone()),
+        Value::TransientMap(_) | Value::TransientVector(_) | Value::TransientSet(_) => {
+            Ok(args[0].clone())
+        }
         v => Err(ValueError::WrongType {
             expected: "editable",
             got: v.type_name().to_string(),

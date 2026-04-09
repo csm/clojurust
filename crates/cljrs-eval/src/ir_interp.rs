@@ -15,13 +15,10 @@ use std::sync::Arc;
 
 use cljrs_gc::GcPtr;
 use cljrs_ir::{
-    BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator,
-    VarId,
+    BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId,
 };
 use cljrs_value::value::{MapValue, SetValue};
-use cljrs_value::{
-    CljxCons, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value,
-};
+use cljrs_value::{CljxCons, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value};
 
 use crate::apply::apply_value;
 use crate::env::{Env, GlobalEnv};
@@ -238,13 +235,9 @@ fn execute_inst(
         }
 
         Inst::LoadVar(dst, gns, name) => {
-            let var = globals
-                .lookup_var_in_ns(gns, name)
-                .ok_or_else(|| {
-                    EvalError::Runtime(format!(
-                        "IR interpreter: var not found {gns}/{name}"
-                    ))
-                })?;
+            let var = globals.lookup_var_in_ns(gns, name).ok_or_else(|| {
+                EvalError::Runtime(format!("IR interpreter: var not found {gns}/{name}"))
+            })?;
             regs.set(*dst, Value::Var(var));
         }
 
@@ -279,10 +272,7 @@ fn execute_inst(
         Inst::AllocCons(dst, head, tail) => {
             let h = regs.get_cloned(*head);
             let t = regs.get_cloned(*tail);
-            regs.set(
-                *dst,
-                Value::Cons(GcPtr::new(CljxCons { head: h, tail: t })),
-            );
+            regs.set(*dst, Value::Cons(GcPtr::new(CljxCons { head: h, tail: t })));
         }
 
         Inst::AllocClosure(dst, template, captures) => {
@@ -340,9 +330,7 @@ fn execute_inst(
                     var.get().bind(new_val);
                 }
             } else {
-                return Err(EvalError::Runtime(
-                    "set! target is not a Var".to_string(),
-                ));
+                return Err(EvalError::Runtime("set! target is not a Var".to_string()));
             }
         }
 
@@ -396,15 +384,11 @@ fn const_to_value(c: &Const) -> Value {
         Const::Long(n) => Value::Long(*n),
         Const::Double(d) => Value::Double(*d),
         Const::Str(s) => Value::Str(GcPtr::new(s.to_string())),
-        Const::Keyword(k) => {
-            Value::Keyword(GcPtr::new(cljrs_value::keyword::Keyword::parse(k)))
-        }
-        Const::Symbol(s) => {
-            Value::Symbol(GcPtr::new(cljrs_value::Symbol {
-                namespace: None,
-                name: s.clone(),
-            }))
-        }
+        Const::Keyword(k) => Value::Keyword(GcPtr::new(cljrs_value::keyword::Keyword::parse(k))),
+        Const::Symbol(s) => Value::Symbol(GcPtr::new(cljrs_value::Symbol {
+            namespace: None,
+            name: s.clone(),
+        })),
         Const::Char(c) => Value::Char(*c),
     }
 }
@@ -428,11 +412,7 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str) -> EvalResult {
 
 // ── Region-aware allocation ─────────────────────────────────────────────────
 
-fn alloc_in_region(
-    kind: RegionAllocKind,
-    operands: &[VarId],
-    regs: &Registers,
-) -> EvalResult {
+fn alloc_in_region(kind: RegionAllocKind, operands: &[VarId], regs: &Registers) -> EvalResult {
     match kind {
         RegionAllocKind::Vector => {
             let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
@@ -495,10 +475,7 @@ fn alloc_closure(
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
 ) -> EvalResult {
-    let captured_values: Vec<Value> = capture_vars
-        .iter()
-        .map(|v| regs.get_cloned(*v))
-        .collect();
+    let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
     // Each arity maps to a subfunction in ir_func.subfunctions.
@@ -517,10 +494,7 @@ fn alloc_closure(
 
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
-        name: fn_name
-            .as_deref()
-            .unwrap_or("<ir-closure>")
-            .into(),
+        name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {
             cljrs_value::Arity::Fixed(param_counts[0])
         } else {
@@ -578,8 +552,7 @@ fn alloc_closure(
                     } else {
                         Vec::new()
                     };
-                    full_args
-                        .push(Value::List(GcPtr::new(PersistentList::from_iter(rest))));
+                    full_args.push(Value::List(GcPtr::new(PersistentList::from_iter(rest))));
                 } else {
                     full_args.extend_from_slice(call_args);
                 }
@@ -593,9 +566,10 @@ fn alloc_closure(
                     Ok(v) => Ok(v),
                     Err(EvalError::Runtime(msg)) => Err(cljrs_value::ValueError::Other(msg)),
                     Err(EvalError::Thrown(v)) => Err(cljrs_value::ValueError::Thrown(v)),
-                    Err(EvalError::Recur(vals)) => Err(cljrs_value::ValueError::Other(
-                        format!("recur from non-tail position ({} values)", vals.len()),
-                    )),
+                    Err(EvalError::Recur(vals)) => Err(cljrs_value::ValueError::Other(format!(
+                        "recur from non-tail position ({} values)",
+                        vals.len()
+                    ))),
                     Err(other) => Err(cljrs_value::ValueError::Other(format!("{other}"))),
                 }
             }
@@ -624,11 +598,7 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
 ///
 /// This maps each `KnownFn` variant to the corresponding Rust builtin
 /// from `builtins.rs`, or falls back to `apply_value` for complex cases.
-fn dispatch_known_fn(
-    known_fn: &KnownFn,
-    args: Vec<Value>,
-    env: &mut Env,
-) -> EvalResult {
+fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> EvalResult {
     match known_fn {
         // ── Arithmetic ──────────────────────────────────────────────────
         KnownFn::Add => builtin_arith(&args, "+"),
@@ -638,17 +608,11 @@ fn dispatch_known_fn(
         KnownFn::Rem => builtin_arith(&args, "rem"),
 
         // ── Comparison ──────────────────────────────────────────────────
-        KnownFn::Eq => {
-            Ok(Value::Bool(args.len() == 2 && args[0] == args[1]))
-        }
-        KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte => {
-            builtin_compare(known_fn, &args)
-        }
-        KnownFn::Identical => {
-            Ok(Value::Bool(
-                args.len() == 2 && std::ptr::eq(&args[0] as *const _, &args[1] as *const _),
-            ))
-        }
+        KnownFn::Eq => Ok(Value::Bool(args.len() == 2 && args[0] == args[1])),
+        KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte => builtin_compare(known_fn, &args),
+        KnownFn::Identical => Ok(Value::Bool(
+            args.len() == 2 && std::ptr::eq(&args[0] as *const _, &args[1] as *const _),
+        )),
 
         // ── Type predicates ─────────────────────────────────────────────
         KnownFn::IsNil => Ok(Value::Bool(matches!(args.first(), Some(Value::Nil)))),
@@ -660,7 +624,13 @@ fn dispatch_known_fn(
         KnownFn::IsMap => Ok(Value::Bool(matches!(args.first(), Some(Value::Map(_))))),
         KnownFn::IsNumber => Ok(Value::Bool(matches!(
             args.first(),
-            Some(Value::Long(_) | Value::Double(_) | Value::BigInt(_) | Value::Ratio(_) | Value::BigDecimal(_))
+            Some(
+                Value::Long(_)
+                    | Value::Double(_)
+                    | Value::BigInt(_)
+                    | Value::Ratio(_)
+                    | Value::BigDecimal(_)
+            )
         ))),
         KnownFn::IsString => Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))))),
         KnownFn::IsKeyword => Ok(Value::Bool(matches!(args.first(), Some(Value::Keyword(_))))),
@@ -681,9 +651,7 @@ fn dispatch_known_fn(
         }
 
         // ── Collection construction ─────────────────────────────────────
-        KnownFn::Vector => {
-            Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(args))))
-        }
+        KnownFn::Vector => Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(args)))),
         KnownFn::HashMap => {
             let pairs: Vec<(Value, Value)> = args
                 .chunks(2)
@@ -691,14 +659,10 @@ fn dispatch_known_fn(
                 .collect();
             Ok(Value::Map(MapValue::from_pairs(pairs)))
         }
-        KnownFn::HashSet => {
-            Ok(Value::Set(SetValue::Hash(GcPtr::new(
-                PersistentHashSet::from_iter(args),
-            ))))
-        }
-        KnownFn::List => {
-            Ok(Value::List(GcPtr::new(PersistentList::from_iter(args))))
-        }
+        KnownFn::HashSet => Ok(Value::Set(SetValue::Hash(GcPtr::new(
+            PersistentHashSet::from_iter(args),
+        )))),
+        KnownFn::List => Ok(Value::List(GcPtr::new(PersistentList::from_iter(args)))),
 
         // ── Collection operations ───────────────────────────────────────
         KnownFn::Get => {
@@ -737,9 +701,7 @@ fn dispatch_known_fn(
         // ── Sequence operations ─────────────────────────────────────────
         KnownFn::Take => builtin_call_native("take", &args),
         KnownFn::Drop => builtin_call_native("drop", &args),
-        KnownFn::Range1 | KnownFn::Range2 | KnownFn::Range3 => {
-            builtin_call_native("range", &args)
-        }
+        KnownFn::Range1 | KnownFn::Range2 | KnownFn::Range3 => builtin_call_native("range", &args),
         KnownFn::LazySeq => {
             // LazySeq takes a thunk function.
             if let Some(f) = args.first() {
@@ -830,9 +792,7 @@ fn builtin_call_native(name: &str, args: &[Value]) -> EvalResult {
 fn load_builtin(env: &Env, name: &str) -> EvalResult {
     env.globals
         .lookup_in_ns("clojure.core", name)
-        .ok_or_else(|| {
-            EvalError::Runtime(format!("IR interpreter: builtin not found: {name}"))
-        })
+        .ok_or_else(|| EvalError::Runtime(format!("IR interpreter: builtin not found: {name}")))
 }
 
 /// Map KnownFn variants to their Clojure function names.

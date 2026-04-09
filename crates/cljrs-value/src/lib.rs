@@ -3,17 +3,17 @@ pub mod error;
 pub mod hash;
 pub mod keyword;
 pub mod native_object;
+pub mod regex;
 pub mod resource;
 pub mod symbol;
 pub mod types;
 pub mod value;
-pub mod regex;
 
 pub use collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet,
 };
-pub use error::{ValueError, ValueResult, ExceptionInfo};
+pub use error::{ExceptionInfo, ValueError, ValueResult};
 pub use hash::ClojureHash;
 pub use keyword::Keyword;
 pub use native_object::{NativeObject, NativeObjectBox, gc_native_object};

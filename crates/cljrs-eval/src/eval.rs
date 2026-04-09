@@ -35,9 +35,9 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             let r = Regex::new(s);
             match r {
                 Ok(r) => Ok(Value::Pattern(GcPtr::new(r))),
-                Err(e) => Err(EvalError::Runtime(e.to_string()))
+                Err(e) => Err(EvalError::Runtime(e.to_string())),
             }
-        },
+        }
 
         // ── Identifiers ───────────────────────────────────────────────────
         FormKind::Symbol(s) => eval_symbol(s, env),
@@ -290,7 +290,7 @@ pub fn deref_value(v: Value) -> EvalResult {
             crate::dynamics::deref_var(&var).ok_or_else(|| EvalError::Runtime("unbound var".into()))
         }
         Value::Volatile(vol) => Ok(vol.get().deref()),
-        Value::Delay(d) => d.get().force().map_err(|e| EvalError::Runtime(e)),
+        Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
         Value::Future(f) => {
@@ -346,7 +346,7 @@ pub fn form_to_value(form: &Form) -> Value {
         FormKind::AutoKeyword(s) => Value::keyword(Keyword::simple(s.as_str())),
         FormKind::Regex(s) => match Regex::new(s.as_str()) {
             Ok(pattern) => Value::Pattern(GcPtr::new(pattern)),
-            Err(_) => Value::Nil,  // should already have been caught
+            Err(_) => Value::Nil, // should already have been caught
         },
 
         FormKind::List(forms) => {

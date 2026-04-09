@@ -20,7 +20,12 @@ const DEFAULT_STACK_SIZE: usize = 64 * 1024 * 1024;
 struct Cli {
     /// Thread stack size in megabytes (default: 64).
     /// Increase if you hit stack overflows with deeply recursive code.
-    #[arg(long, global = true, value_name = "MB", help = "Set thread stack size (default 64MB)")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "MB",
+        help = "Set thread stack size (default 64MB)"
+    )]
     stack_size_mb: Option<usize>,
 
     #[arg(long, global = true, help = "Enable debug logging")]
@@ -140,7 +145,8 @@ fn main() -> miette::Result<()> {
             tracing::Level::DEBUG
         } else {
             tracing::Level::INFO
-        }).try_init();
+        })
+        .try_init();
 
     let stack_size = cli
         .stack_size_mb
@@ -152,9 +158,7 @@ fn main() -> miette::Result<()> {
     let builder = std::thread::Builder::new()
         .name("cljrs-main".into())
         .stack_size(stack_size);
-    let handle = builder
-        .spawn(move || run(cli))
-        .into_diagnostic()?;
+    let handle = builder.spawn(move || run(cli)).into_diagnostic()?;
     handle.join().unwrap_or_else(|e| {
         eprintln!("cljrs: thread panicked: {e:?}");
         std::process::exit(1);

@@ -58,7 +58,7 @@ impl TransientMap {
         *persisted = true;
         Ok(PersistentHashMap::new(map.clone()))
     }
-    
+
     pub fn find(&self, key: &Value) -> Option<(Value, Value)> {
         let map = self.map.lock().unwrap();
         let value = map.get(key);

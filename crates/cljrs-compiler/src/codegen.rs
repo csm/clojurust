@@ -649,44 +649,32 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             Inst::RegionAlloc(dst, region, kind, operands) => {
                 let region_handle = self.use_var(*region);
                 let val = match kind {
-                    RegionAllocKind::Vector => {
-                        self.emit_region_alloc_collection(
-                            self.rt.rt_region_alloc_vector,
-                            region_handle,
-                            operands,
-                        )?
-                    }
-                    RegionAllocKind::Map => {
-                        self.emit_region_alloc_collection(
-                            self.rt.rt_region_alloc_map,
-                            region_handle,
-                            operands,
-                        )?
-                    }
-                    RegionAllocKind::Set => {
-                        self.emit_region_alloc_collection(
-                            self.rt.rt_region_alloc_set,
-                            region_handle,
-                            operands,
-                        )?
-                    }
-                    RegionAllocKind::List => {
-                        self.emit_region_alloc_collection(
-                            self.rt.rt_region_alloc_list,
-                            region_handle,
-                            operands,
-                        )?
-                    }
+                    RegionAllocKind::Vector => self.emit_region_alloc_collection(
+                        self.rt.rt_region_alloc_vector,
+                        region_handle,
+                        operands,
+                    )?,
+                    RegionAllocKind::Map => self.emit_region_alloc_collection(
+                        self.rt.rt_region_alloc_map,
+                        region_handle,
+                        operands,
+                    )?,
+                    RegionAllocKind::Set => self.emit_region_alloc_collection(
+                        self.rt.rt_region_alloc_set,
+                        region_handle,
+                        operands,
+                    )?,
+                    RegionAllocKind::List => self.emit_region_alloc_collection(
+                        self.rt.rt_region_alloc_list,
+                        region_handle,
+                        operands,
+                    )?,
                     RegionAllocKind::Cons => {
                         if operands.len() == 2 {
                             let h = self.use_var(operands[0]);
                             let t = self.use_var(operands[1]);
-                            let func_ref =
-                                self.import_func(self.rt.rt_region_alloc_cons);
-                            let call = self
-                                .builder
-                                .ins()
-                                .call(func_ref, &[region_handle, h, t]);
+                            let func_ref = self.import_func(self.rt.rt_region_alloc_cons);
+                            let call = self.builder.ins().call(func_ref, &[region_handle, h, t]);
                             self.builder.inst_results(call)[0]
                         } else {
                             self.call_rt_0(self.rt.rt_const_nil)?
@@ -1599,12 +1587,7 @@ fn declare_runtime_funcs(
             &[ptr, ptr, types::I64],
             ptr,
         )?,
-        rt_region_alloc_cons: declare_rt(
-            module,
-            "rt_region_alloc_cons",
-            &[ptr, ptr, ptr],
-            ptr,
-        )?,
+        rt_region_alloc_cons: declare_rt(module, "rt_region_alloc_cons", &[ptr, ptr, ptr], ptr)?,
     })
 }
 

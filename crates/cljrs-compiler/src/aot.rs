@@ -1037,7 +1037,10 @@ pub fn compile_test_harness(
             test_dir.display()
         )));
     }
-    eprintln!("[aot] discovered {} test namespace(s)", test_namespaces.len());
+    eprintln!(
+        "[aot] discovered {} test namespace(s)",
+        test_namespaces.len()
+    );
 
     // Also discover source namespaces from src_dirs so they get bundled
     let mut src_namespaces = Vec::new();
@@ -1047,7 +1050,10 @@ pub fn compile_test_harness(
         }
     }
     src_namespaces.sort();
-    eprintln!("[aot] discovered {} source namespace(s)", src_namespaces.len());
+    eprintln!(
+        "[aot] discovered {} source namespace(s)",
+        src_namespaces.len()
+    );
 
     // Combine: source namespaces first (so they're registered before tests require them),
     // then test namespaces. Deduplicate in case of overlap.
