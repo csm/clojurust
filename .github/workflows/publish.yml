@@ -68,6 +68,7 @@ jobs:
           # Publish order: leaves first, then dependents
           # Sleep between publishes to let crates.io index catch up
           CRATES=(
+            cljrs-logging
             cljrs-types
             cljrs-gc
             cljrs-ir
