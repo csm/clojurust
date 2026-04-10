@@ -87,6 +87,10 @@ impl cljrs_gc::Trace for ClosureThunk {
 
 impl Thunk for ClosureThunk {
     fn force(&self) -> Result<Value, String> {
+        // Root the closed-over values so they survive GC.  The thunk may live
+        // on the Rust stack outside any Env frame (e.g., after LazySeq::realize
+        // drops its Mutex guard), so GC wouldn't trace them otherwise.
+        let _closed_root = crate::root_values(&self.f.closed_over_vals);
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
         call_cljrs_fn(&self.f, vec![], &mut env).map_err(|e| format!("{e}"))
     }
@@ -111,6 +115,9 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // Evaluate the callee first.
     let callee = eval(func_form, env)?;
+
+    // Root the callee so it survives any GC triggered during argument evaluation.
+    let _callee_root = crate::root_value(&callee);
 
     // Macro check: expand then re-eval.
     if let Value::Macro(mfn) = &callee {
@@ -146,11 +153,14 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
         }
     }
 
-    // Evaluate arguments.
-    let args: Vec<Value> = arg_forms
-        .iter()
-        .map(|f| eval(f, env))
-        .collect::<EvalResult<_>>()?;
+    // Evaluate arguments one-at-a-time, rooting partial results so that
+    // previously-evaluated args survive any GC triggered during later evals.
+    let mut args: Vec<Value> = Vec::with_capacity(arg_forms.len());
+    for f in arg_forms {
+        // Root the already-evaluated args before each eval that could trigger GC.
+        let _args_root = crate::root_values(&args);
+        args.push(eval(f, env)?);
+    }
 
     apply_value(&callee, args, env)
 }
@@ -405,6 +415,11 @@ pub fn resolve_type_tag(sym: &str) -> Arc<str> {
 
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    // Root the callee and args so they survive any GC triggered at the safepoint.
+    // These values are on the Rust stack but not yet in any Env frame.
+    let _callee_root = crate::root_value(callee);
+    let _args_root = crate::root_values(&args);
+
     // GC safepoint at function application boundary — blocks if collection is in progress,
     // and initiates collection if one was requested (memory pressure).
     crate::gc_safepoint(env);
@@ -412,6 +427,10 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
     match callee {
         Value::NativeFunction(nf) => {
             check_arity(&nf.get().arity, args.len(), &nf.get().name)?;
+            // Register the caller's env as a GC root: native functions may
+            // call back into Clojure (via invoke()), which creates a fresh Env
+            // and may trigger GC.
+            let _caller_root = crate::push_env_root(env);
             crate::callback::push_eval_context(env);
             let result = (nf.get().func)(&args).map_err(|e| EvalError::Runtime(e.to_string()));
             crate::callback::pop_eval_context();
@@ -448,11 +467,13 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
                     ))
                 })?;
             drop(impls);
+            let _impl_root = crate::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }
         Value::MultiFn(mf) => {
             let mf_ref = mf.get();
             let dispatch_val = apply_value(&mf_ref.dispatch_fn, args.clone(), env)?;
+            let _dispatch_root = crate::root_value(&dispatch_val);
             cljrs_gc::safepoint();
             let key = format!("{}", dispatch_val);
             let methods = mf_ref.methods.lock().unwrap();
@@ -467,6 +488,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
                     ))
                 })?;
             drop(methods);
+            let _impl_root = crate::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }
         Value::Keyword(_kw) => {
@@ -512,12 +534,20 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
 pub fn call_cljrs_fn(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> EvalResult {
     let arity = select_arity(f, args.len())?;
 
+    // Register the caller's env as a GC root so its local bindings survive
+    // any collection triggered while we're executing the callee's body.
+    let _caller_root = crate::push_env_root(caller_env);
+
     // Create a fresh env with closure bindings, executing in the defining namespace.
     // This ensures macros qualify symbols relative to their definition site.
     let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
     let mut current_args = args;
     loop {
+        // Root current_args on the shadow stack so they survive GC.
+        // They haven't been bound into the env yet.
+        let _args_root = crate::root_values(&current_args);
+
         // GC safepoint before entering function body
         crate::gc_safepoint(&env);
 
@@ -709,10 +739,11 @@ fn macro_apply(
 
 /// Handle `(apply f arg1 ... last-coll)` — spread the last arg.
 fn handle_apply_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
-    let mut evaled: Vec<Value> = arg_forms
-        .iter()
-        .map(|f| eval(f, env))
-        .collect::<EvalResult<_>>()?;
+    let mut evaled: Vec<Value> = Vec::with_capacity(arg_forms.len());
+    for f in arg_forms {
+        let _root = crate::root_values(&evaled);
+        evaled.push(eval(f, env)?);
+    }
 
     if evaled.len() < 2 {
         return Err(EvalError::Arity {
@@ -724,6 +755,10 @@ fn handle_apply_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     let f = evaled.remove(0);
     let last = evaled.pop().unwrap();
+    // Root f, last, and remaining evaled args during spread (which may realize lazy seqs).
+    let _f_root = crate::root_value(&f);
+    let _last_root = crate::root_value(&last);
+    let _evaled_root = crate::root_values(&evaled);
     // Spread last arg.
     let spread = value_to_seq_vec(&last);
     evaled.extend(spread);

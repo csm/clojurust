@@ -39,10 +39,12 @@ impl Protocol {
 
 impl cljrs_gc::Trace for Protocol {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let impls = self.impls.lock().unwrap();
-        for method_map in impls.values() {
-            for v in method_map.values() {
-                v.trace(visitor);
+        {
+            let impls = self.impls.lock().unwrap();
+            for method_map in impls.values() {
+                for v in method_map.values() {
+                    v.trace(visitor);
+                }
             }
         }
     }
@@ -108,9 +110,11 @@ impl MultiFn {
 impl cljrs_gc::Trace for MultiFn {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.dispatch_fn.trace(visitor);
-        let methods = self.methods.lock().unwrap();
-        for v in methods.values() {
-            v.trace(visitor);
+        {
+            let methods = self.methods.lock().unwrap();
+            for v in methods.values() {
+                v.trace(visitor);
+            }
         }
     }
 }
@@ -168,15 +172,24 @@ impl Var {
 
 impl cljrs_gc::Trace for Var {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        if let Some(v) = self.value.lock().unwrap().as_ref() {
-            v.trace(visitor);
+        {
+            let value = self.value.lock().unwrap();
+            if let Some(v) = value.as_ref() {
+                v.trace(visitor);
+            }
         }
-        if let Some(m) = self.meta.lock().unwrap().as_ref() {
-            m.trace(visitor);
+        {
+            let meta = self.meta.lock().unwrap();
+            if let Some(m) = meta.as_ref() {
+                m.trace(visitor);
+            }
         }
-        for (key, f) in self.watches.lock().unwrap().iter() {
-            key.trace(visitor);
-            f.trace(visitor);
+        {
+            let watches = self.watches.lock().unwrap();
+            for (key, f) in watches.iter() {
+                key.trace(visitor);
+                f.trace(visitor);
+            }
         }
     }
 }
@@ -231,16 +244,28 @@ impl Atom {
 
 impl cljrs_gc::Trace for Atom {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        self.value.lock().unwrap().trace(visitor);
-        if let Some(m) = self.meta.lock().unwrap().as_ref() {
-            m.trace(visitor);
+        {
+            let value = self.value.lock().unwrap();
+            value.trace(visitor);
         }
-        if let Some(vf) = self.validator.lock().unwrap().as_ref() {
-            vf.trace(visitor);
+        {
+            let meta = self.meta.lock().unwrap();
+            if let Some(m) = meta.as_ref() {
+                m.trace(visitor);
+            }
         }
-        for (key, f) in self.watches.lock().unwrap().iter() {
-            key.trace(visitor);
-            f.trace(visitor);
+        {
+            let validator = self.validator.lock().unwrap();
+            if let Some(vf) = validator.as_ref() {
+                vf.trace(visitor);
+            }
+        }
+        {
+            let watches = self.watches.lock().unwrap();
+            for (key, f) in watches.iter() {
+                key.trace(visitor);
+                f.trace(visitor);
+            }
         }
     }
 }
@@ -469,24 +494,30 @@ impl LazySeq {
     /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
     /// On error, returns `Value::Nil` and caches the error (retrievable via `error()`).
     pub fn realize(&self) -> Value {
-        let mut guard = self.state.lock().unwrap();
-        match &*guard {
-            LazySeqState::Forced(v) => return v.clone(),
-            LazySeqState::Error(_) => return Value::Nil,
-            LazySeqState::Pending(_) => {}
-        }
-        // Replace the pending state with a temporary Forced(Nil), then force the thunk.
-        let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
-        let LazySeqState::Pending(thunk) = prev else {
-            unreachable!("state was not Pending")
+        let thunk = {
+            let mut guard = self.state.lock().unwrap();
+            match &*guard {
+                LazySeqState::Forced(v) => return v.clone(),
+                LazySeqState::Error(_) => return Value::Nil,
+                LazySeqState::Pending(_) => {}
+            }
+            // Replace the pending state with a temporary Forced(Nil), extract the thunk.
+            let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
+            let LazySeqState::Pending(thunk) = prev else {
+                unreachable!("state was not Pending")
+            };
+            thunk
+            // guard dropped here — lock released before forcing
         };
+        // Force the thunk WITHOUT holding the lock. This ensures GC's
+        // lock().unwrap() in LazySeq::trace() will not deadlock.
         match thunk.force() {
             Ok(result) => {
-                *guard = LazySeqState::Forced(result.clone());
+                *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 result
             }
             Err(msg) => {
-                *guard = LazySeqState::Error(msg);
+                *self.state.lock().unwrap() = LazySeqState::Error(msg);
                 Value::Nil
             }
         }
@@ -511,11 +542,15 @@ impl std::fmt::Debug for LazySeq {
 
 impl cljrs_gc::Trace for LazySeq {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let state = self.state.lock().unwrap();
-        match &*state {
-            LazySeqState::Pending(thunk) => thunk.trace(visitor),
-            LazySeqState::Forced(v) => v.trace(visitor),
-            LazySeqState::Error(_) => {}
+        // Safe to lock unconditionally: realize() drops the lock before entering
+        // eval (thunk.force()), so the lock is never held across a GC safepoint.
+        {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                LazySeqState::Pending(thunk) => thunk.trace(visitor),
+                LazySeqState::Forced(v) => v.trace(visitor),
+                LazySeqState::Error(_) => {}
+            }
         }
     }
 }
@@ -571,7 +606,10 @@ impl std::fmt::Debug for Volatile {
 
 impl cljrs_gc::Trace for Volatile {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        self.value.lock().unwrap().trace(visitor);
+        {
+            let value = self.value.lock().unwrap();
+            value.trace(visitor);
+        }
     }
 }
 
@@ -598,16 +636,22 @@ impl Delay {
     /// Force the delay and cache the result.
     /// Returns the value on success, or an error message on failure.
     pub fn force(&self) -> Result<Value, String> {
-        let mut guard = self.state.lock().unwrap();
-        if let DelayState::Forced(v) = &*guard {
-            return Ok(v.clone());
-        }
-        let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
-        let DelayState::Pending(thunk) = prev else {
-            unreachable!("state was not Pending")
+        let thunk = {
+            let mut guard = self.state.lock().unwrap();
+            if let DelayState::Forced(v) = &*guard {
+                return Ok(v.clone());
+            }
+            let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
+            let DelayState::Pending(thunk) = prev else {
+                unreachable!("state was not Pending")
+            };
+            thunk
+            // guard dropped here — lock released before forcing
         };
+        // Force the thunk WITHOUT holding the lock so GC's lock().unwrap() in
+        // Delay::trace() will not deadlock.
         let result = thunk.force()?;
-        *guard = DelayState::Forced(result.clone());
+        *self.state.lock().unwrap() = DelayState::Forced(result.clone());
         Ok(result)
     }
 
@@ -625,10 +669,14 @@ impl std::fmt::Debug for Delay {
 
 impl cljrs_gc::Trace for Delay {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let state = self.state.lock().unwrap();
-        match &*state {
-            DelayState::Pending(thunk) => thunk.trace(visitor),
-            DelayState::Forced(v) => v.trace(visitor),
+        // Safe to lock unconditionally: force() drops the lock before entering
+        // eval (thunk.force()), so the lock is never held across a GC safepoint.
+        {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                DelayState::Pending(thunk) => thunk.trace(visitor),
+                DelayState::Forced(v) => v.trace(visitor),
+            }
         }
     }
 }
@@ -687,8 +735,11 @@ impl std::fmt::Debug for CljxPromise {
 
 impl cljrs_gc::Trace for CljxPromise {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        if let Some(v) = self.value.lock().unwrap().as_ref() {
-            v.trace(visitor);
+        {
+            let value = self.value.lock().unwrap();
+            if let Some(v) = value.as_ref() {
+                v.trace(visitor);
+            }
         }
     }
 }
@@ -742,9 +793,11 @@ impl std::fmt::Debug for CljxFuture {
 
 impl cljrs_gc::Trace for CljxFuture {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let state = self.state.lock().unwrap();
-        if let FutureState::Done(v) = &*state {
-            v.trace(visitor);
+        {
+            let state = self.state.lock().unwrap();
+            if let FutureState::Done(v) = &*state {
+                v.trace(visitor);
+            }
         }
     }
 }
@@ -793,13 +846,22 @@ impl std::fmt::Debug for Agent {
 
 impl cljrs_gc::Trace for Agent {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        self.state.lock().unwrap().trace(visitor);
-        if let Some(e) = self.error.lock().unwrap().as_ref() {
-            e.trace(visitor);
+        {
+            let state = self.state.lock().unwrap();
+            state.trace(visitor);
         }
-        for (key, f) in self.watches.lock().unwrap().iter() {
-            key.trace(visitor);
-            f.trace(visitor);
+        {
+            let error = self.error.lock().unwrap();
+            if let Some(e) = error.as_ref() {
+                e.trace(visitor);
+            }
+        }
+        {
+            let watches = self.watches.lock().unwrap();
+            for (key, f) in watches.iter() {
+                key.trace(visitor);
+                f.trace(visitor);
+            }
         }
     }
 }

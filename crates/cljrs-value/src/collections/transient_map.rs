@@ -95,10 +95,12 @@ impl ClojureHash for TransientMap {
 
 impl cljrs_gc::Trace for TransientMap {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let map = self.map.lock().unwrap();
-        for (k, v) in map.iter() {
-            k.trace(visitor);
-            v.trace(visitor);
+        {
+            let map = self.map.lock().unwrap();
+            for (k, v) in map.iter() {
+                k.trace(visitor);
+                v.trace(visitor);
+            }
         }
     }
 }

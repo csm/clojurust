@@ -95,9 +95,11 @@ impl Clone for TransientVector {
 
 impl cljrs_gc::Trace for TransientVector {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        let vec = self.vector.lock().unwrap();
-        for v in vec.iter() {
-            v.trace(visitor);
+        {
+            let vec = self.vector.lock().unwrap();
+            for v in vec.iter() {
+                v.trace(visitor);
+            }
         }
     }
 }

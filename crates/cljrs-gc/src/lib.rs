@@ -29,6 +29,7 @@
 //!   `visitor.visit` during collection or it will be freed.
 
 #![allow(clippy::missing_safety_doc)]
+#![allow(private_interfaces)] // mark_header intentionally uses pub(crate) GcBoxHeader in public API
 
 pub mod cancellation;
 pub mod config;
@@ -41,7 +42,7 @@ pub use cancellation::{
     unpark_thread, wait_for_threads_to_park,
 };
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -114,8 +115,14 @@ pub trait GcVisitor {
 /// from a `*const GcBoxHeader` to `*const GcBox<T>`.
 #[repr(C)]
 pub(crate) struct GcBoxHeader {
-    /// `true` iff this object was reached during the current mark phase.
-    marked: Cell<bool>,
+    /// Magic number to detect use-after-free (debug builds only).
+    #[cfg(debug_assertions)]
+    magic: Cell<u64>,
+    /// Survival counter: objects start at `GC_INITIAL_LIVES`.  During sweep,
+    /// marked objects reset to `GC_INITIAL_LIVES`; unmarked objects decrement.
+    /// Objects at 0 are freed.  This gives transient stack values time to be
+    /// stored in a root-traceable location before being collected.
+    lives: Cell<u8>,
     /// Intrusive singly-linked list: next allocation in [`GcHeapInner::head`].
     next: Cell<*mut GcBoxHeader>,
     /// Type-erased: calls `T::trace` on the enclosing `GcBox<T>`.
@@ -124,11 +131,32 @@ pub(crate) struct GcBoxHeader {
     drop_fn: unsafe fn(*mut GcBoxHeader),
 }
 
+/// Number of GC cycles a newly-allocated (or marked) object survives without
+/// being traced before it becomes eligible for collection.  Higher values
+/// increase memory usage but reduce the chance of collecting objects that are
+/// transiently on the Rust stack but not yet in a root-traceable location.
+const GC_INITIAL_LIVES: u8 = 10;
+
+#[cfg(debug_assertions)]
+const GC_MAGIC_ALIVE: u64 = 0xCAFE_BABE_DEAD_BEEF;
+#[cfg(debug_assertions)]
+const GC_MAGIC_FREED: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+
 impl GcBoxHeader {
     /// Create a header for a `GcBox<T>`.  Used by both the GC heap and regions.
+    ///
+    /// New objects are allocated with `lives = GC_INITIAL_LIVES - 1`.
+    /// This is intentionally BELOW the "marked this cycle" threshold so
+    /// that `process_alloc_roots` can distinguish freshly-allocated objects
+    /// from objects that were explicitly marked during GC tracing.
+    /// The alloc-root system protects new allocations from premature
+    /// collection; the sub-threshold lives value ensures they survive
+    /// several additional cycles even after leaving the alloc-root set.
     pub(crate) fn new<T: Trace + 'static>() -> Self {
         Self {
-            marked: Cell::new(false),
+            #[cfg(debug_assertions)]
+            magic: Cell::new(GC_MAGIC_ALIVE),
+            lives: Cell::new(GC_INITIAL_LIVES - 1),
             next: Cell::new(std::ptr::null_mut()),
             trace_fn: trace_gc_box::<T>,
             drop_fn: drop_gc_box::<T>,
@@ -164,6 +192,10 @@ pub(crate) unsafe fn trace_gc_box<T: Trace + 'static>(
 unsafe fn drop_gc_box<T: Trace + 'static>(header: *mut GcBoxHeader) {
     // SAFETY: same cast; `Box::from_raw` takes ownership and runs Drop.
     unsafe {
+        #[cfg(debug_assertions)]
+        {
+            (*header).magic.set(GC_MAGIC_FREED);
+        }
         let gc_box = header as *mut GcBox<T>;
         drop(Box::from_raw(gc_box));
     }
@@ -212,6 +244,11 @@ pub struct GcHeap {
     total_allocated_bytes: AtomicUsize,
     /// Registered root tracers (e.g. GlobalEnv).  Called during automatic collection.
     root_tracers: Mutex<Vec<RootTracer>>,
+    /// Suppresses GC requests when the last collection freed nothing.
+    /// Cleared when the alloc root frame shrinks (indicating a scope exit).
+    gc_suppressed: std::sync::atomic::AtomicBool,
+    /// Alloc root length at last collection — used to detect scope exit.
+    last_alloc_root_len: AtomicUsize,
 }
 
 // SAFETY: `Mutex<GcHeapInner>` is `Sync` because `GcHeapInner: Send`.
@@ -231,6 +268,8 @@ impl GcHeap {
             memory_in_use: AtomicUsize::new(0),
             total_allocated_bytes: AtomicUsize::new(0),
             root_tracers: Mutex::new(Vec::new()),
+            gc_suppressed: std::sync::atomic::AtomicBool::new(false),
+            last_alloc_root_len: AtomicUsize::new(0),
         }
     }
 
@@ -300,11 +339,32 @@ impl GcHeap {
         // Check memory pressure: if soft limit exceeded, request a GC.
         // The actual collection will happen at the next interpreter safepoint
         // where the thread has access to proper root tracing.
+        //
+        // If GC is suppressed (last collection freed nothing), check if the
+        // alloc root frame has shrunk — that means a scope exited and GC may
+        // now be able to collect.
         if let Some(config) = self.config.lock().unwrap().as_ref()
             && config.soft_limit_exceeded(current_usage)
         {
-            cancellation::request_gc();
+            if self.gc_suppressed.load(Ordering::Relaxed) {
+                // Check if alloc roots have shrunk (scope exit).
+                let current_roots = ALLOC_ROOTS.with(|r| r.borrow().len());
+                let last = self.last_alloc_root_len.load(Ordering::Relaxed);
+                if current_roots < last {
+                    // Scope exited — GC may be productive now.
+                    self.gc_suppressed.store(false, Ordering::Relaxed);
+                    cancellation::request_gc();
+                }
+                // Otherwise: stay suppressed, don't request GC.
+            } else {
+                cancellation::request_gc();
+            }
         }
+
+        // Register in the current thread's allocation root frame so that
+        // in-flight values survive GC even before they're stored in a traced
+        // structure (Env, namespace, collection).
+        register_alloc(raw as *mut GcBoxHeader);
 
         // SAFETY: `raw` is non-null (from Box).
         GcPtr(unsafe { NonNull::new_unchecked(raw) })
@@ -330,6 +390,11 @@ impl GcHeap {
         // Mark phase: populate grey set from roots, then drain it.
         let mut visitor = MarkVisitor::new();
         trace_roots(&mut visitor);
+        cljrs_logging::feat_debug!(
+            "gc",
+            "starting drain with {} grey objects",
+            visitor.grey.len()
+        );
         visitor.drain();
 
         let mark_elapsed = mark_start.elapsed();
@@ -345,10 +410,18 @@ impl GcHeap {
             // SAFETY: every pointer in our list is a valid `GcBoxHeader`.
             let header = unsafe { &*current };
             let next = header.next.get();
-            if header.marked.get() {
-                header.marked.set(false); // reset for next collection
+            let lives = header.lives.get();
+            if lives >= GC_INITIAL_LIVES {
+                // Object was marked during this cycle (or newly allocated).
+                // Reset lives for next cycle — it starts "unmarked" again.
+                header.lives.set(GC_INITIAL_LIVES - 1);
+                live.push(current);
+            } else if lives > 0 {
+                // Not marked, but still has remaining lives. Decrement.
+                header.lives.set(lives - 1);
                 live.push(current);
             } else {
+                // No lives left — eligible for collection.
                 dead.push(current);
             }
             current = next;
@@ -387,6 +460,17 @@ impl GcHeap {
             mark_elapsed,
             sweep_elapsed
         );
+
+        // If nothing was freed, suppress further GC requests until the alloc
+        // root frame shrinks (indicating a scope exit that makes more objects
+        // eligible for collection).
+        if freed_count == 0 {
+            let root_len = ALLOC_ROOTS.with(|r| r.borrow().len());
+            self.last_alloc_root_len.store(root_len, Ordering::Relaxed);
+            self.gc_suppressed.store(true, Ordering::Relaxed);
+        } else {
+            self.gc_suppressed.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Number of currently live GC allocations.
@@ -456,13 +540,36 @@ impl MarkVisitor {
         Self { grey: Vec::new() }
     }
 
+    /// Number of objects currently in the grey stack (for diagnostics).
+    pub fn grey_len(&self) -> usize {
+        self.grey.len()
+    }
+
     /// Process all grey objects (their children are discovered and added to
     /// grey), repeating until the grey set is empty.
     fn drain(&mut self) {
+        let mut visited = 0usize;
         while let Some(header) = self.grey.pop() {
+            visited += 1;
             // SAFETY: grey objects are always valid live allocations.
             let h = unsafe { &*header };
             unsafe { (h.trace_fn)(header as *const GcBoxHeader, self) };
+        }
+        cljrs_logging::feat_debug!("gc", "drain visited {} objects", visited);
+    }
+}
+
+impl MarkVisitor {
+    /// Type-erased mark: mark a raw GcBoxHeader pointer as live and push to
+    /// grey stack for tracing.  Used by the allocation root frame system.
+    ///
+    /// # Safety
+    /// `header` must point to a valid, live GcBoxHeader.
+    pub unsafe fn mark_header(&mut self, header: *mut GcBoxHeader) {
+        let h = unsafe { &*header };
+        if h.lives.get() < GC_INITIAL_LIVES {
+            h.lives.set(GC_INITIAL_LIVES);
+            self.grey.push(header);
         }
     }
 }
@@ -471,8 +578,9 @@ impl GcVisitor for MarkVisitor {
     fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
         // SAFETY: `GcPtr` is always a valid live pointer (stop-the-world).
         let header = unsafe { &(*ptr.0.as_ptr()).header };
-        if !header.marked.get() {
-            header.marked.set(true);
+        if header.lives.get() < GC_INITIAL_LIVES {
+            // Mark: set lives to GC_INITIAL_LIVES to indicate "reached this cycle".
+            header.lives.set(GC_INITIAL_LIVES);
             self.grey.push(ptr.0.as_ptr() as *mut GcBoxHeader);
         }
     }
@@ -504,10 +612,30 @@ impl<T: Trace + 'static> GcPtr<T> {
     /// object.  Never hold it across a GC safepoint.
     pub fn get(&self) -> &T {
         // SAFETY: valid live pointer (stop-the-world invariant).
+        #[cfg(debug_assertions)]
+        {
+            let header = unsafe { &(*self.0.as_ptr()).header };
+            assert_eq!(
+                header.magic.get(),
+                GC_MAGIC_ALIVE,
+                "GcPtr::get() on freed object (use-after-free)! magic={:#x}",
+                header.magic.get(),
+            );
+        }
         unsafe { &(*self.0.as_ptr()).value }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
+        #[cfg(debug_assertions)]
+        {
+            let header = unsafe { &(*self.0.as_ptr()).header };
+            assert_eq!(
+                header.magic.get(),
+                GC_MAGIC_ALIVE,
+                "GcPtr::get_mut() on freed object (use-after-free)! magic={:#x}",
+                header.magic.get(),
+            );
+        }
         unsafe { &mut (*self.0.as_ptr()).value }
     }
 
@@ -534,6 +662,76 @@ impl<T: Trace + 'static + std::fmt::Debug> std::fmt::Debug for GcPtr<T> {
 /// Drop is intentionally a no-op: the GC heap owns all memory.
 impl<T: Trace + 'static> Drop for GcPtr<T> {
     fn drop(&mut self) {}
+}
+
+// ── Thread-local allocation roots ────────────────────────────────────────────
+//
+// Every thread maintains a flat Vec of raw GcBoxHeader pointers for all
+// allocations made on this thread.  `GcHeap::alloc()` appends here
+// automatically.  Entries are NEVER removed by user code.
+//
+// During GC, `process_alloc_roots` (called by `collect()` after normal root
+// tracing + drain) classifies each entry:
+//
+//   * **Already marked** (reachable via namespace/env tracing): removed from
+//     the Vec (the object doesn't need alloc-root protection).
+//   * **Not yet marked** (stack-only): marked as live and kept in the Vec.
+//
+// This keeps the Vec bounded to objects that are ONLY reachable from the
+// Rust call stack, while ensuring they survive collection.
+
+thread_local! {
+    /// Flat list of GcBoxHeader pointers for all allocations on this thread.
+    /// `alloc()` appends here; `AllocRootGuard::drop` truncates on frame exit.
+    /// During GC, all entries are marked as live (surviving collection).
+    static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard returned by [`push_alloc_frame`].  On drop, truncates the
+/// thread-local allocation root list back to the length recorded at push time.
+pub struct AllocRootGuard {
+    saved_len: usize,
+}
+
+impl Drop for AllocRootGuard {
+    fn drop(&mut self) {
+        ALLOC_ROOTS.with(|roots| {
+            roots.borrow_mut().truncate(self.saved_len);
+        });
+    }
+}
+
+/// Push a new allocation root frame.  All `GcPtr::new` / `HEAP.alloc` calls
+/// on this thread will be recorded until the returned guard is dropped.
+///
+/// Place this at interpreter function boundaries so that mid-function GC
+/// can trace all in-flight allocations.
+pub fn push_alloc_frame() -> AllocRootGuard {
+    let saved_len = ALLOC_ROOTS.with(|roots| roots.borrow().len());
+    AllocRootGuard { saved_len }
+}
+
+/// Record a newly-allocated GcBoxHeader in the current thread's allocation
+/// root list.  Called automatically by `GcHeap::alloc`.
+fn register_alloc(header: *mut GcBoxHeader) {
+    ALLOC_ROOTS.with(|roots| {
+        roots.borrow_mut().push(header);
+    });
+}
+
+/// Trace all allocation roots on the current thread into the given visitor.
+/// Called during GC collection to mark in-flight allocations as live.
+pub fn trace_thread_alloc_roots(visitor: &mut MarkVisitor) {
+    ALLOC_ROOTS.with(|roots| {
+        let roots = roots.borrow();
+        for &header in roots.iter() {
+            // SAFETY: headers are valid — they were allocated on this thread
+            // and haven't been freed (we're in STW, no sweep has happened yet).
+            unsafe {
+                visitor.mark_header(header);
+            }
+        }
+    });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -605,6 +803,21 @@ mod tests {
             dropped: dropped.clone(),
         });
         assert_eq!(heap.count(), 1);
+        // Objects start with lives = GC_INITIAL_LIVES - 1 (= 9).
+        // Each collection without marking decrements lives by 1.
+        // The sweep logic keeps objects alive when lives > 0 (decrementing),
+        // and only frees when lives == 0.  So:
+        //   9 collections: lives goes 9→8→...→1→0 (object survives each)
+        //   10th collection: lives=0, object is freed.
+        for i in 0..GC_INITIAL_LIVES - 1 {
+            heap.collect(|_| {});
+            assert_eq!(
+                heap.count(),
+                1,
+                "object survives while lives > 0 (cycle {i})"
+            );
+        }
+        // Final collection: lives was decremented to 0 last cycle, now freed.
         heap.collect(|_| {});
         assert_eq!(heap.count(), 0);
         assert!(*dropped.lock().unwrap(), "object should have been dropped");
@@ -654,7 +867,9 @@ mod tests {
             value: 2,
             dropped: d2.clone(),
         });
-        heap.collect(|_| {});
+        for _ in 0..GC_INITIAL_LIVES {
+            heap.collect(|_| {});
+        }
         assert!(*d1.lock().unwrap());
         assert!(*d2.lock().unwrap());
         assert_eq!(heap.count(), 0);
@@ -666,7 +881,9 @@ mod tests {
         let p = heap.alloc(1i64);
         let _q = heap.alloc(2i64);
         assert_eq!(heap.total_allocated(), 2);
-        heap.collect(|vis| vis.visit(&p));
+        for _ in 0..GC_INITIAL_LIVES {
+            heap.collect(|vis| vis.visit(&p));
+        }
         assert_eq!(heap.count(), 1);
         assert_eq!(heap.total_freed(), 1);
     }

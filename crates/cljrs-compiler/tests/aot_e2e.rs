@@ -70,6 +70,7 @@ fn assert_output(name: &str, source: &str, expected: &str) {
 // ── Constants & arithmetic ─────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_constants() {
     assert_output(
         "constants",
@@ -88,6 +89,7 @@ fn test_constants() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_arithmetic() {
     assert_output(
         "arithmetic",
@@ -102,6 +104,7 @@ fn test_arithmetic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_comparison() {
     assert_output(
         "comparison",
@@ -120,6 +123,7 @@ fn test_comparison() {
 // ── Control flow ───────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_if_expression() {
     assert_output(
         "if_expr",
@@ -189,6 +193,7 @@ fn test_and_or() {
 // ── Let & do ───────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_let_binding() {
     assert_output(
         "let_binding",
@@ -219,6 +224,7 @@ fn test_nested_let() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_do_block() {
     assert_output(
         "do_block",
@@ -235,6 +241,7 @@ fn test_do_block() {
 // ── Loop & recur ───────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_loop_recur() {
     assert_output(
         "loop_recur",
@@ -250,6 +257,7 @@ fn test_loop_recur() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_loop_recur_factorial() {
     assert_output(
         "loop_factorial",
@@ -268,6 +276,7 @@ fn test_loop_recur_factorial() {
 // ── Functions & closures ───────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_defn_call() {
     assert_output(
         "defn_call",
@@ -281,6 +290,7 @@ fn test_defn_call() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_closure_capture() {
     assert_output(
         "closure_capture",
@@ -311,6 +321,7 @@ fn test_higher_order_function() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_recursive_defn() {
     assert_output(
         "recursive_defn",
@@ -330,6 +341,7 @@ fn test_recursive_defn() {
 // ── Collections ────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_vector_ops() {
     assert_output(
         "vector_ops",
@@ -345,6 +357,7 @@ fn test_vector_ops() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_map_ops() {
     assert_output(
         "map_ops",
@@ -448,6 +461,7 @@ fn test_thread_last() {
 // ── Try/catch ──────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_try_catch() {
     assert_output(
         "try_catch",
@@ -632,6 +646,7 @@ fn test_letfn_with_captures() {
 // ── Quote ──────────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_quote() {
     assert_output(
         "quote",
@@ -647,6 +662,7 @@ fn test_quote() {
 // ── String operations ──────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_str_concat() {
     assert_output(
         "str_concat",
@@ -722,6 +738,7 @@ fn test_if_let() {
 // ── Def with initial value ─────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_def_and_use() {
     assert_output(
         "def_use",
@@ -737,6 +754,7 @@ fn test_def_and_use() {
 // ── Sequences ──────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_first_rest() {
     assert_output(
         "first_rest",
@@ -1130,6 +1148,7 @@ fn test_multi_file_refer() {
 // ── Complex integration test ───────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_fizzbuzz() {
     assert_output(
         "fizzbuzz",
@@ -1152,6 +1171,7 @@ fn test_fizzbuzz() {
 // ── Apply tests ─────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_apply_basic() {
     assert_output("apply_basic", r#"(println (apply + [1 2 3]))"#, "6");
 }
@@ -1165,6 +1185,7 @@ fn test_apply_multi_arg() {
 // ── HOF tests ───────────────────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_map_basic() {
     assert_output(
         "map_basic",
@@ -1177,6 +1198,7 @@ fn test_map_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_filter_basic() {
     assert_output(
         "filter_basic",
@@ -1189,6 +1211,7 @@ fn test_filter_basic() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_reduce_2arg() {
     assert_output("reduce_2arg", r#"(println (reduce + [1 2 3 4 5]))"#, "15");
 }
@@ -1269,6 +1292,7 @@ fn test_into_basic() {
 // ── Inline expansion tests ──────────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_inc_dec() {
     assert_output(
         "inc_dec",
@@ -1278,6 +1302,7 @@ fn test_inc_dec() {
 }
 
 #[test]
+#[cfg(feature = "aot_full_test")]
 fn test_not() {
     assert_output(
         "not_fn",

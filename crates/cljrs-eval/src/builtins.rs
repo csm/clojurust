@@ -732,6 +732,9 @@ impl Iterator for ValueIter {
                 }
                 Value::LazySeq(ls) => {
                     let ls = ls.clone();
+                    // Root self.current so the LazySeq (and the entire chain
+                    // it's part of) survives any GC triggered during realize().
+                    let _current_root = crate::root_value(&self.current);
                     self.current = ls.get().realize();
                     if let Some(err) = ls.get().error() {
                         self.error = Some(err);
@@ -3224,6 +3227,8 @@ impl cljrs_gc::Trace for ConcatThunk {
 
 impl Thunk for ConcatThunk {
     fn force(&self) -> Result<Value, String> {
+        // Root the collections so they survive GC while we iterate.
+        let _colls_root = crate::root_values(&self.colls);
         let mut colls = self.colls.clone();
         // Walk through collections iteratively (no recursion) to find the
         // first element.  This avoids stack overflow on deeply nested

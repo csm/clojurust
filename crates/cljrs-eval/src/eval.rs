@@ -50,10 +50,11 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         // ── Collections ───────────────────────────────────────────────────
         FormKind::List(forms) => eval_list(forms, env),
         FormKind::Vector(forms) => {
-            let vals: Vec<Value> = forms
-                .iter()
-                .map(|f| eval(f, env))
-                .collect::<EvalResult<Vec<_>>>()?;
+            let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
+            for f in forms {
+                let _root = crate::root_values(&vals);
+                vals.push(eval(f, env)?);
+            }
             Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))))
         }
         FormKind::Map(forms) => {
@@ -62,24 +63,23 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
                     "map literal must have an even number of forms".into(),
                 ));
             }
-            // Evaluate all key-value pairs, then build the map in one shot.
-            // This avoids N intermediate GcPtr allocations that the old
-            // empty()+assoc+assoc chain would create.
-            let mut pairs = Vec::with_capacity(forms.len() / 2);
-            for pair in forms.chunks(2) {
-                let k = eval(&pair[0], env)?;
-                let v = eval(&pair[1], env)?;
-                pairs.push((k, v));
+            let mut pairs: Vec<Value> = Vec::with_capacity(forms.len());
+            for f in forms {
+                let _root = crate::root_values(&pairs);
+                pairs.push(eval(f, env)?);
             }
-            Ok(Value::Map(MapValue::from_pairs(pairs)))
+            let kv_pairs: Vec<(Value, Value)> = pairs
+                .chunks(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect();
+            Ok(Value::Map(MapValue::from_pairs(kv_pairs)))
         }
         FormKind::Set(forms) => {
-            // Evaluate all elements, then build the set in one shot using
-            // FromIterator (uses insert_mut internally, single allocation).
-            let vals: Vec<Value> = forms
-                .iter()
-                .map(|f| eval(f, env))
-                .collect::<EvalResult<Vec<_>>>()?;
+            let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
+            for f in forms {
+                let _root = crate::root_values(&vals);
+                vals.push(eval(f, env)?);
+            }
             Ok(Value::Set(SetValue::Hash(GcPtr::new(
                 PersistentHashSet::from_iter(vals),
             ))))
