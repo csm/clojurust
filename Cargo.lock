@@ -227,6 +227,7 @@ dependencies = [
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-interop",
+ "cljrs-logging",
  "cljrs-reader",
  "cljrs-runtime",
  "cljrs-stdlib",
@@ -282,6 +283,7 @@ name = "cljrs-gc"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "cljrs-logging",
  "num-bigint",
  "num-rational",
  "regex",
@@ -303,6 +305,10 @@ version = "0.1.0"
 dependencies = [
  "cljrs-types",
 ]
+
+[[package]]
+name = "cljrs-logging"
+version = "0.1.0"
 
 [[package]]
 name = "cljrs-reader"

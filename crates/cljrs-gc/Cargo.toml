@@ -11,3 +11,4 @@ num-bigint   = { workspace = true }
 bigdecimal   = { workspace = true }
 num-rational = { workspace = true }
 regex        = { workspace = true }
+cljrs-logging = { workspace = true }

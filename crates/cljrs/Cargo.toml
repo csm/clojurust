@@ -20,6 +20,7 @@ cljrs-stdlib   = { workspace = true }
 cljrs-runtime  = { workspace = true }
 cljrs-compiler = { workspace = true }
 cljrs-interop  = { workspace = true }
+cljrs-logging  = { workspace = true }
 clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"

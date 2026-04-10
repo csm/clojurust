@@ -10,6 +10,7 @@ members = [
     "crates/cljrs-ir",
     "crates/cljrs-compiler",
     "crates/cljrs-interop",
+    "crates/cljrs-logging",
     "crates/cljrs",
     "examples/rust-interop",
 ]
@@ -30,6 +31,7 @@ cljrs-runtime  = { path = "crates/cljrs-runtime" }
 cljrs-ir       = { path = "crates/cljrs-ir" }
 cljrs-compiler = { path = "crates/cljrs-compiler" }
 cljrs-interop  = { path = "crates/cljrs-interop" }
+cljrs-logging  = { path = "crates/cljrs-logging" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
