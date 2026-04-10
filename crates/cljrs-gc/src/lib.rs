@@ -316,12 +316,26 @@ impl GcHeap {
     /// Must only be called when no other thread is creating or dereferencing
     /// `GcPtr` values.  `trace_roots` must visit every live root.
     pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F) {
+        let pre_count = self.inner.lock().unwrap().count;
+        let pre_memory = self.memory_in_use.load(Ordering::Relaxed);
+        cljrs_logging::feat_debug!(
+            "gc",
+            "starting collection: {} objects, ~{} bytes in use",
+            pre_count,
+            pre_memory
+        );
+
+        let mark_start = std::time::Instant::now();
+
         // Mark phase: populate grey set from roots, then drain it.
         let mut visitor = MarkVisitor::new();
         trace_roots(&mut visitor);
         visitor.drain();
 
+        let mark_elapsed = mark_start.elapsed();
+
         // Sweep phase: partition into live and dead, then free dead objects.
+        let sweep_start = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap();
         let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
         let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
@@ -360,6 +374,19 @@ impl GcHeap {
         // Estimate memory freed (rough approximation)
         let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
         self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
+
+        let sweep_elapsed = sweep_start.elapsed();
+        let post_memory = self.memory_in_use.load(Ordering::Relaxed);
+        cljrs_logging::feat_debug!(
+            "gc",
+            "collection complete: freed {} objects (~{} bytes), {} objects remaining (~{} bytes), mark={:.2?} sweep={:.2?}",
+            freed_count,
+            freed_bytes,
+            inner.count,
+            post_memory,
+            mark_elapsed,
+            sweep_elapsed
+        );
     }
 
     /// Number of currently live GC allocations.
@@ -387,10 +414,19 @@ impl GcHeap {
     /// Returns `true` if collection ran, `false` if another thread is
     /// already collecting.
     pub fn collect_auto(&self) -> bool {
+        cljrs_logging::feat_debug!("gc", "automatic collection requested");
         let Some(_stw_guard) = cancellation::begin_stw() else {
-            // Another thread is already collecting — just return.
+            cljrs_logging::feat_debug!(
+                "gc",
+                "automatic collection skipped: another thread is already collecting"
+            );
             return false;
         };
+        cljrs_logging::feat_debug!(
+            "gc",
+            "stop-the-world acquired, {} mutator thread(s) parked",
+            cancellation::registered_threads()
+        );
         // All other threads are now parked.  Run collection with registered roots.
         self.collect(|visitor| {
             self.trace_registered_roots(visitor);

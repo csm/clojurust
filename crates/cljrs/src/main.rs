@@ -34,6 +34,13 @@ struct Cli {
     #[arg(long, global = true, help = "Enable trace logging (implies --debug)")]
     trace: bool,
 
+    /// Feature-level logging flags: -X debug:gc,jit or -X trace:reader
+    ///
+    /// Format: <level>:<feature1>,<feature2>,...
+    /// Levels: debug, trace
+    #[arg(short = 'X', global = true, value_name = "LEVEL:FEATURES")]
+    x_flags: Vec<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -147,6 +154,11 @@ fn main() -> miette::Result<()> {
             tracing::Level::INFO
         })
         .try_init();
+
+    // Parse -X feature logging flags
+    for flag in &cli.x_flags {
+        cljrs_logging::parse_x_flag(flag).map_err(|e| miette::miette!("invalid -X flag: {e}"))?;
+    }
 
     let stack_size = cli
         .stack_size_mb
