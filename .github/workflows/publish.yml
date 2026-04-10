@@ -84,7 +84,7 @@ jobs:
 
           for crate in "${CRATES[@]}"; do
             echo "::group::Publishing $crate"
-            cargo publish -p "$crate"
+            cargo publish --allow-dirty -p "$crate"
             echo "::endgroup::"
             # Wait for crates.io index to update before publishing dependents
             sleep 30
