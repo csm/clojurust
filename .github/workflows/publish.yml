@@ -1,0 +1,90 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE_VERSION: "0.1"
+
+jobs:
+  ci:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Clojure Tests
+        run: cargo run -p cljrs compile -o test-suite --test ./clojure-test-suite/test && ./test-suite
+
+  publish:
+    name: Publish to crates.io
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set crate versions
+        run: |
+          VERSION="${BASE_VERSION}.${{ github.run_number }}"
+          echo "Publishing version: $VERSION"
+
+          # Update workspace dependency versions so inter-crate deps use the new version
+          for toml in crates/*/Cargo.toml; do
+            sed -i "s/^version.*=.*\"0\.1\.0\"/version = \"$VERSION\"/" "$toml"
+          done
+
+          # Update workspace dependency table to use the new version
+          CRATES=(cljrs-types cljrs-gc cljrs-ir cljrs-reader cljrs-value cljrs-eval cljrs-interop cljrs-runtime cljrs-stdlib cljrs-compiler cljrs)
+          for crate in "${CRATES[@]}"; do
+            sed -i "s/^${crate}.*=.*{.*path/${crate} = { version = \"=$VERSION\", path/" Cargo.toml
+          done
+
+          echo "--- Workspace Cargo.toml ---"
+          cat Cargo.toml
+          echo ""
+          echo "--- Sample crate Cargo.toml ---"
+          cat crates/cljrs-types/Cargo.toml
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish order: leaves first, then dependents
+          # Sleep between publishes to let crates.io index catch up
+          CRATES=(
+            cljrs-types
+            cljrs-gc
+            cljrs-ir
+            cljrs-reader
+            cljrs-value
+            cljrs-eval
+            cljrs-interop
+            cljrs-runtime
+            cljrs-stdlib
+            cljrs-compiler
+            cljrs
+          )
+
+          for crate in "${CRATES[@]}"; do
+            echo "::group::Publishing $crate"
+            cargo publish -p "$crate"
+            echo "::endgroup::"
+            # Wait for crates.io index to update before publishing dependents
+            sleep 30
+          done
