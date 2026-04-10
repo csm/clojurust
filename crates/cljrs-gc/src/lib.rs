@@ -390,9 +390,12 @@ impl GcHeap {
         // Mark phase: populate grey set from roots, then drain it.
         let mut visitor = MarkVisitor::new();
         trace_roots(&mut visitor);
-        cljrs_logging::feat_debug!("gc", "starting drain with {} grey objects", visitor.grey.len());
+        cljrs_logging::feat_debug!(
+            "gc",
+            "starting drain with {} grey objects",
+            visitor.grey.len()
+        );
         visitor.drain();
-
 
         let mark_elapsed = mark_start.elapsed();
 
@@ -808,7 +811,11 @@ mod tests {
         //   10th collection: lives=0, object is freed.
         for i in 0..GC_INITIAL_LIVES - 1 {
             heap.collect(|_| {});
-            assert_eq!(heap.count(), 1, "object survives while lives > 0 (cycle {i})");
+            assert_eq!(
+                heap.count(),
+                1,
+                "object survives while lives > 0 (cycle {i})"
+            );
         }
         // Final collection: lives was decremented to 0 last cycle, now freed.
         heap.collect(|_| {});
