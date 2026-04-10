@@ -416,7 +416,10 @@ impl GcHeap {
     pub fn collect_auto(&self) -> bool {
         cljrs_logging::feat_debug!("gc", "automatic collection requested");
         let Some(_stw_guard) = cancellation::begin_stw() else {
-            cljrs_logging::feat_debug!("gc", "automatic collection skipped: another thread is already collecting");
+            cljrs_logging::feat_debug!(
+                "gc",
+                "automatic collection skipped: another thread is already collecting"
+            );
             return false;
         };
         cljrs_logging::feat_debug!(

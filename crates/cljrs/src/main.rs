@@ -157,8 +157,7 @@ fn main() -> miette::Result<()> {
 
     // Parse -X feature logging flags
     for flag in &cli.x_flags {
-        cljrs_logging::parse_x_flag(flag)
-            .map_err(|e| miette::miette!("invalid -X flag: {e}"))?;
+        cljrs_logging::parse_x_flag(flag).map_err(|e| miette::miette!("invalid -X flag: {e}"))?;
     }
 
     let stack_size = cli

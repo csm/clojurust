@@ -69,7 +69,11 @@ pub fn parse_x_flag(value: &str) -> Result<(), String> {
     let level = match level_str {
         "debug" => Level::Debug,
         "trace" => Level::Trace,
-        other => return Err(format!("unknown level '{other}', expected 'debug' or 'trace'")),
+        other => {
+            return Err(format!(
+                "unknown level '{other}', expected 'debug' or 'trace'"
+            ));
+        }
     };
 
     for feature in features_str.split(',') {
