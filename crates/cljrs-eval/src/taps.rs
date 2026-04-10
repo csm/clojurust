@@ -114,6 +114,19 @@ pub fn builtin_remove_tap(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
 
+/// Trace all GcPtr values in the tap system as GC roots.
+pub fn trace_roots(visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    let (lock, _) = &*TAP;
+    let state = lock.lock().unwrap();
+    for val in &state.fns {
+        val.trace(visitor);
+    }
+    for val in &state.queue {
+        val.trace(visitor);
+    }
+}
+
 /// (tap> val) — enqueue a value. Returns true if enqueued, false if dropped.
 pub fn builtin_tap_send(args: &[Value]) -> ValueResult<Value> {
     let val = args[0].clone();

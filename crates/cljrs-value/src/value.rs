@@ -35,9 +35,11 @@ impl ObjectArray {
 
 impl Trace for ObjectArray {
     fn trace(&self, visitor: &mut MarkVisitor) {
-        let guard = self.0.lock().unwrap();
-        for v in guard.iter() {
-            v.trace(visitor);
+        {
+            let guard = self.0.lock().unwrap();
+            for v in guard.iter() {
+                v.trace(visitor);
+            }
         }
     }
 }

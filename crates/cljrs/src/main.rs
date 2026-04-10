@@ -278,6 +278,7 @@ fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
 
     let mut result = Value::Nil;
     for form in forms {
+        let _alloc_frame = cljrs_gc::push_alloc_frame();
         result = eval(&form, env).map_err(format_eval_error)?;
     }
     Ok(result)

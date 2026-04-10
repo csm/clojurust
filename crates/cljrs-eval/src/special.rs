@@ -524,6 +524,9 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     loop {
+        // Root current_vals so they survive GC — they're not yet bound in env.
+        let _vals_root = crate::root_values(&current_vals);
+
         // GC safepoint on every loop iteration so tight recur loops
         // don't starve the collector.
         crate::gc_safepoint(env);
@@ -1139,6 +1142,7 @@ fn eval_load_file(args: &[Form], env: &mut Env) -> EvalResult {
         .map_err(|e| EvalError::Runtime(format!("load-file parse error: {e}")))?;
     let mut result = Value::Nil;
     for form in forms {
+        let _alloc_frame = cljrs_gc::push_alloc_frame();
         result = eval(&form, env)?;
     }
     Ok(result)

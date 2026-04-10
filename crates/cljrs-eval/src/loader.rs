@@ -54,6 +54,10 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
             let mut parser = cljrs_reader::Parser::new(src, file_path);
             let forms = parser.parse_all().map_err(EvalError::Read)?;
             for form in forms {
+                // Alloc frame per top-level form: all allocations during this
+                // form's evaluation are rooted.  Frame pops between forms,
+                // allowing GC to collect temporaries from previous forms.
+                let _alloc_frame = cljrs_gc::push_alloc_frame();
                 eval::eval(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
             }
         }
