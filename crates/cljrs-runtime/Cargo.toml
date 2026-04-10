@@ -3,6 +3,8 @@ name = "cljrs-runtime"
 version = "0.1.0"
 edition = "2024"
 description = "Core standard library (clojure.core equivalent) for clojurust"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 cljrs-types = { workspace = true }

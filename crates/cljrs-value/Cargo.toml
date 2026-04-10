@@ -3,6 +3,8 @@ name = "cljrs-value"
 version = "0.1.0"
 edition = "2024"
 description = "Runtime Value type and persistent collections for clojurust"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 cljrs-types   = { workspace = true }

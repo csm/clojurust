@@ -3,6 +3,8 @@ name = "cljrs-reader"
 version = "0.1.0"
 edition = "2024"
 description = "Lexer and parser producing Form AST nodes for clojurust"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 cljrs-types = { workspace = true }

@@ -3,6 +3,8 @@ name = "cljrs-gc"
 version = "0.1.0"
 edition = "2024"
 description = "Tracing garbage collector for clojurust"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 num-bigint   = { workspace = true }

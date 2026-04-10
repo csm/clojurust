@@ -15,6 +15,10 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "EPL-1.0"
+repository = "https://github.com/csm/clojurust"
+
 [workspace.dependencies]
 cljrs-types    = { path = "crates/cljrs-types" }
 cljrs-gc       = { path = "crates/cljrs-gc" }

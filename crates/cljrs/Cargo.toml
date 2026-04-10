@@ -3,6 +3,8 @@ name = "cljrs"
 version = "0.1.0"
 edition = "2024"
 description = "clojurust CLI — run, repl, compile, and eval"
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "cljrs"

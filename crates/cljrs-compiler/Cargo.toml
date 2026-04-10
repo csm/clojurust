@@ -3,6 +3,8 @@ name = "cljrs-compiler"
 version = "0.1.0"
 edition = "2024"
 description = "JIT (Cranelift) and AOT compiler backend for clojurust"
+license.workspace = true
+repository.workspace = true
 
 [features]
 aot_full_test = []

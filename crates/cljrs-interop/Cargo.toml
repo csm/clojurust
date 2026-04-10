@@ -3,6 +3,8 @@ name = "cljrs-interop"
 version = "0.1.0"
 edition = "2024"
 description = "Rust<->Clojure FFI, type marshalling, and NativeObject support"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 cljrs-types = { workspace = true }
