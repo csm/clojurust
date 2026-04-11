@@ -230,13 +230,16 @@ fn execute_inst(
         }
 
         Inst::LoadGlobal(dst, gns, name) => {
-            let val = load_global_value(globals, gns, name)?;
+            let val = load_global_value(globals, gns, name, ns)?;
             regs.set(*dst, val);
         }
 
         Inst::LoadVar(dst, gns, name) => {
-            let var = globals.lookup_var_in_ns(gns, name).ok_or_else(|| {
-                EvalError::Runtime(format!("IR interpreter: var not found {gns}/{name}"))
+            let resolved_ns = globals
+                .resolve_alias(ns, gns)
+                .unwrap_or_else(|| Arc::from(&**gns));
+            let var = globals.lookup_var_in_ns(&resolved_ns, name).ok_or_else(|| {
+                EvalError::Runtime(format!("IR interpreter: var not found {resolved_ns}/{name}"))
             })?;
             regs.set(*dst, Value::Var(var));
         }
@@ -300,7 +303,7 @@ fn execute_inst(
         Inst::CallDirect(dst, name, args) => {
             // Look up the function by name in globals and call it.
             crate::gc_safepoint(env);
-            let callee = load_global_value(globals, ns, name)?;
+            let callee = load_global_value(globals, ns, name, ns)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = apply_value(&callee, arg_vals, env)?;
             regs.set(*dst, result);
@@ -395,18 +398,22 @@ fn const_to_value(c: &Const) -> Value {
 
 // ── Global value lookup ─────────────────────────────────────────────────────
 
-fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str) -> EvalResult {
-    // Try dynamic var deref first (for thread-local bindings).
-    if let Some(var) = globals.lookup_var_in_ns(ns, name) {
+fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &str) -> EvalResult {
+    // Try direct namespace lookup first, then resolve as alias.
+    let resolved_ns = globals
+        .resolve_alias(defining_ns, ns)
+        .unwrap_or_else(|| Arc::from(ns));
+
+    if let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name) {
         if let Some(val) = crate::dynamics::deref_var(&var) {
             return Ok(val);
         }
         return Err(EvalError::Runtime(format!(
-            "IR interpreter: unbound var {ns}/{name}"
+            "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
     Err(EvalError::Runtime(format!(
-        "IR interpreter: var not found {ns}/{name}"
+        "IR interpreter: var not found {resolved_ns}/{name}"
     )))
 }
 

@@ -22,8 +22,11 @@ pub mod dynamics;
 pub mod env;
 pub mod error;
 pub mod eval;
+pub mod ir_cache;
+pub mod ir_convert;
 pub mod ir_interp;
 pub mod loader;
+pub mod lower;
 pub mod macros;
 mod new;
 mod regex;
@@ -279,6 +282,74 @@ pub fn standard_env_minimal() -> Arc<GlobalEnv> {
     globals
 }
 
+/// Register the Clojure compiler source files as builtin sources so that
+/// `require` can load them without filesystem access.
+pub fn register_compiler_sources(globals: &Arc<GlobalEnv>) {
+    globals.register_builtin_source("cljrs.compiler.ir", cljrs_ir::COMPILER_IR_SOURCE);
+    globals.register_builtin_source("cljrs.compiler.known", cljrs_ir::COMPILER_KNOWN_SOURCE);
+    globals.register_builtin_source("cljrs.compiler.anf", cljrs_ir::COMPILER_ANF_SOURCE);
+    globals.register_builtin_source("cljrs.compiler.escape", cljrs_ir::COMPILER_ESCAPE_SOURCE);
+    globals.register_builtin_source("cljrs.compiler.optimize", cljrs_ir::COMPILER_OPTIMIZE_SOURCE);
+}
+
+/// Load the Clojure compiler namespaces and mark the compiler as ready
+/// for IR lowering.  Called lazily on first lowering attempt.
+pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
+    // Already loaded?
+    if globals
+        .compiler_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return true;
+    }
+
+    // Don't load if CLJRS_NO_IR is set.
+    if std::env::var("CLJRS_NO_IR").is_ok() {
+        return false;
+    }
+
+    // Prevent concurrent loading attempts.
+    static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOADING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false; // Another thread is loading.
+    }
+
+    let span = || cljrs_types::span::Span::new(Arc::new("<compiler-load>".to_string()), 0, 0, 1, 1);
+    for ns_name in &[
+        "cljrs.compiler.ir",
+        "cljrs.compiler.known",
+        "cljrs.compiler.anf",
+    ] {
+        let require_form = cljrs_reader::Form::new(
+            cljrs_reader::form::FormKind::List(vec![
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Symbol("require".into()),
+                    span(),
+                ),
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
+                        cljrs_reader::form::FormKind::Symbol((*ns_name).into()),
+                        span(),
+                    ))),
+                    span(),
+                ),
+            ]),
+            span(),
+        );
+        if let Err(e) = eval::eval(&require_form, env) {
+            eprintln!("[compiler-load warning] failed to load {ns_name}: {e:?}");
+            LOADING.store(false, std::sync::atomic::Ordering::Release);
+            return false;
+        }
+    }
+
+    globals
+        .compiler_ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    LOADING.store(false, std::sync::atomic::Ordering::Release);
+    true
+}
+
 /// Create a `GlobalEnv` pre-populated with `clojure.core` built-ins,
 /// bootstrap HOFs, and `clojure.test` (eagerly loaded so eval-crate tests
 /// can use `(require '[clojure.test ...])` without a source path).
@@ -287,6 +358,9 @@ pub fn standard_env_minimal() -> Arc<GlobalEnv> {
 /// `clojure.test` and other stdlib namespaces lazily via the registry.
 pub fn standard_env() -> Arc<GlobalEnv> {
     let globals = standard_env_minimal();
+
+    // Register compiler sources so they're available for require.
+    register_compiler_sources(&globals);
 
     // Eagerly load clojure.test so eval-crate tests can `require` it.
     {
@@ -307,7 +381,21 @@ pub fn standard_env() -> Arc<GlobalEnv> {
         globals.mark_loaded("clojure.test");
     }
 
-    // Restore *ns* to "user" — loading clojure.test leaves it as "clojure.test".
+    // Load the Clojure compiler namespaces on a thread with a large stack
+    // so IR lowering is available for functions defined after this point.
+    // (The deeply-recursive Clojure eval can overflow the default 8MB stack.)
+    {
+        let g = globals.clone();
+        let _ = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut env = Env::new(g.clone(), "user");
+                ensure_compiler_loaded(&g, &mut env);
+            })
+            .and_then(|h| h.join().map_err(|_| std::io::Error::other("join failed")));
+    }
+
+    // Restore *ns* to "user" — loading above may change it.
     {
         let mut env = Env::new(globals.clone(), "user");
         special::sync_star_ns(&mut env);

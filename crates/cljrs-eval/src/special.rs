@@ -210,14 +210,73 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
 
     let cljrs_fn = CljxFn::new(
-        name,
+        name.clone(),
         arities,
         closed_over_names,
         closed_over_vals,
         false,
         Arc::clone(&env.current_ns),
     );
+
+    // Eagerly lower each arity to IR if the compiler is ready.
+    eager_lower_fn(&cljrs_fn, env);
+
     Ok(Value::Fn(GcPtr::new(cljrs_fn)))
+}
+
+/// Eagerly lower all arities of a function to IR, storing the results
+/// in the IR cache.  Failures are silently recorded as `Unsupported`.
+///
+/// Only lowers if the compiler is already loaded (`compiler_ready` is true).
+/// Compiler loading is triggered separately (e.g., by the binary at startup).
+fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
+    use crate::apply::IR_LOWERING_ACTIVE;
+
+    // Don't lower macros (they operate on forms, not values).
+    if f.is_macro {
+        return;
+    }
+
+    // Only lower if compiler is already ready (don't trigger loading).
+    if !env
+        .globals
+        .compiler_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+
+    // Don't nest lowering calls.
+    if IR_LOWERING_ACTIVE.with(|c| c.get()) {
+        return;
+    }
+
+    IR_LOWERING_ACTIVE.with(|c| c.set(true));
+
+    for arity in &f.arities {
+        let arity_id = arity.ir_arity_id;
+        if !crate::ir_cache::should_attempt(arity_id) {
+            continue;
+        }
+
+        match crate::lower::lower_arity(
+            f.name.as_deref(),
+            &arity.params,
+            arity.rest_param.as_ref(),
+            &arity.body,
+            &f.defining_ns,
+            env,
+        ) {
+            Ok(ir_func) => {
+                crate::ir_cache::store_cached(arity_id, std::sync::Arc::new(ir_func));
+            }
+            Err(_) => {
+                crate::ir_cache::store_unsupported(arity_id);
+            }
+        }
+    }
+
+    IR_LOWERING_ACTIVE.with(|c| c.set(false));
 }
 
 /// Parse one arity: params-form and body forms.
@@ -278,6 +337,7 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         body: body.to_vec(),
         destructure_params,
         destructure_rest,
+        ir_arity_id: crate::ir_cache::fresh_arity_id(),
     })
 }
 
@@ -1678,6 +1738,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
             destructure_params: vec![],
             destructure_rest: None,
+            ir_arity_id: crate::ir_cache::fresh_arity_id(),
         };
         let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
         let ctor = CljxFn::new(
@@ -1712,6 +1773,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
             destructure_params: vec![],
             destructure_rest: None,
+            ir_arity_id: crate::ir_cache::fresh_arity_id(),
         };
         let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
         let ctor = CljxFn::new(

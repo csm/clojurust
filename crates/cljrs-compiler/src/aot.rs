@@ -17,7 +17,7 @@ use cljrs_reader::Parser;
 
 use crate::codegen::Compiler;
 use crate::ir::IrFunction;
-use crate::ir_convert;
+use cljrs_eval::ir_convert;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 

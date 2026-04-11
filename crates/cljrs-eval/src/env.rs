@@ -77,6 +77,9 @@ pub struct GlobalEnv {
     pub builtin_sources: RwLock<HashMap<Arc<str>, &'static str>>,
     /// GC configuration for automatic collection based on memory pressure.
     pub gc_config: RwLock<Option<Arc<GcConfig>>>,
+    /// True once the Clojure compiler namespaces have been loaded and IR
+    /// lowering is available.  Before this, all functions use tree-walking.
+    pub compiler_ready: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -94,6 +97,7 @@ impl GlobalEnv {
             loading: Mutex::new(HashSet::new()),
             builtin_sources: RwLock::new(HashMap::new()),
             gc_config: RwLock::new(None),
+            compiler_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
