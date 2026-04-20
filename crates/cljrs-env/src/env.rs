@@ -405,7 +405,7 @@ impl Env {
         let mut child = Self::new(self.globals.clone(), &self.current_ns);
         if !names.is_empty() {
             child.push_frame();
-            for (n, v) in names.into_iter().zip(vals.into_iter()) {
+            for (n, v) in names.into_iter().zip(vals) {
                 child.bind(n, v);
             }
         }
