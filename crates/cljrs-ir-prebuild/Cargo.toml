@@ -1,0 +1,15 @@
+[package]
+name = "cljrs-ir-prebuild"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+cljrs-env = { workspace = true }
+cljrs-eval = { workspace = true }
+cljrs-ir = { workspace = true }
+cljrs-reader = { workspace = true }
+cljrs-types = { workspace = true }
+cljrs-value = { workspace = true }

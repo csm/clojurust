@@ -1,15 +1,14 @@
 //! Sequential and associative destructuring for `let*`, `fn*`, and `loop*`.
 
 use std::sync::Arc;
-
+use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
 
-use crate::env::Env;
-use crate::error::{EvalError, EvalResult};
-use crate::eval::form_to_value;
+use cljrs_env::env::Env;
+use cljrs_env::error::{EvalError, EvalResult};
 
 /// Bind a destructuring pattern `pattern` against `val` in `env`.
 ///

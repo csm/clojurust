@@ -254,7 +254,7 @@ fn join(args: &[Value]) -> ValueResult<Value> {
         let s = get_str(&args[0])?;
         (s.to_string(), &args[1])
     };
-    let items = cljrs_eval::destructure::value_to_seq_vec(coll);
+    let items = cljrs_interp::destructure::value_to_seq_vec(coll);
     let result = items
         .iter()
         .map(|v| match v {

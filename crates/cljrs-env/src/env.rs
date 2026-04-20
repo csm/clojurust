@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use cljrs_gc::{GcConfig, GcPtr};
+use cljrs_reader::Form;
 use cljrs_value::{CljxFn, Namespace, Value, Var};
-use log::trace;
+use cljrs_logging::feat_trace;
+use crate::error::EvalResult;
 // ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
 
 /// How symbols should be referred into the requiring namespace.
@@ -28,7 +30,7 @@ pub struct RequireSpec {
 
 /// One stack frame of local bindings (a single `let*`, `fn`, or `loop*` scope).
 pub struct Frame {
-    pub(crate) bindings: Vec<(Arc<str>, Value)>,
+    pub bindings: Vec<(Arc<str>, Value)>,
 }
 
 impl Default for Frame {
@@ -51,7 +53,7 @@ impl Frame {
 
     pub fn lookup(&self, name: &str) -> Option<&Value> {
         // Search in reverse order so later bindings shadow earlier ones.
-        trace!("lookup {}", name);
+        feat_trace!("env", "lookup {}", name);
         for (n, v) in self.bindings.iter().rev() {
             if n.as_ref() == name {
                 return Some(v);
@@ -80,6 +82,12 @@ pub struct GlobalEnv {
     /// True once the Clojure compiler namespaces have been loaded and IR
     /// lowering is available.  Before this, all functions use tree-walking.
     pub compiler_ready: std::sync::atomic::AtomicBool,
+    /// Evaluator function. Evaluates form given env, produces an EvalResult.
+    pub eval_fn: fn(&Form, &mut Env) -> EvalResult,
+    /// Call a cljrs function.
+    pub call_cljrs_fn: fn(&CljxFn, &[Value], &mut Env) -> EvalResult,
+    /// Hook for customization when a new fn* is defined.
+    on_fn_defined: Option<fn(&CljxFn, &mut Env)>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -89,7 +97,11 @@ impl std::fmt::Debug for GlobalEnv {
 }
 
 impl GlobalEnv {
-    pub fn new() -> Arc<Self> {
+    pub fn new(
+        eval_fn: fn(&Form, &mut Env) -> EvalResult,
+        call_cljrs_fn: fn(&CljxFn, &[Value], &mut Env) -> EvalResult,
+        on_fn_defined: Option<fn(&CljxFn, &mut Env)>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             namespaces: RwLock::new(HashMap::new()),
             source_paths: RwLock::new(Vec::new()),
@@ -98,6 +110,9 @@ impl GlobalEnv {
             builtin_sources: RwLock::new(HashMap::new()),
             gc_config: RwLock::new(None),
             compiler_ready: std::sync::atomic::AtomicBool::new(false),
+            eval_fn,
+            call_cljrs_fn,
+            on_fn_defined,
         })
     }
 
@@ -279,13 +294,38 @@ impl GlobalEnv {
         let mut aliases = ns_ptr.get().aliases.lock().unwrap();
         aliases.insert(Arc::from(alias), Arc::from(full_ns));
     }
+
+    /// Evaluate form given env.
+    #[inline(always)]
+    pub fn eval(&self, form: &Form, env: &mut Env) -> EvalResult {
+        (self.eval_fn)(form, env)
+    }
+
+    /// Call the given cljrs function.
+    #[inline(always)]
+    pub fn call_cljrs_fn(&self, func: &CljxFn, args: &[Value], env: &mut Env) -> EvalResult {
+        (self.call_cljrs_fn)(func, args, env)
+    }
+
+    /// Callback hook for new functions defined.
+    #[inline(always)]
+    pub fn on_fn_defined(&self, f: &CljxFn, env: &mut Env) {
+        if let Some(hook) = self.on_fn_defined {
+            hook(f, env);
+        }
+    }
+
+    /// Sets the on-new-function-defined hook.
+    pub fn set_on_fn_defined(&mut self, hook: fn(&CljxFn, &mut Env)) {
+        self.on_fn_defined = Some(hook);
+    }
 }
 
 // ── Env ───────────────────────────────────────────────────────────────────────
 
 /// The full execution environment: a stack of local frames plus the global env.
 pub struct Env {
-    pub(crate) frames: Vec<Frame>,
+    pub frames: Vec<Frame>,
     pub current_ns: Arc<str>,
     pub globals: Arc<GlobalEnv>,
 }
@@ -330,7 +370,7 @@ impl Env {
 
     /// Look up `name`: local frames (innermost first), then the current namespace.
     pub fn lookup(&self, name: &str) -> Option<Value> {
-        trace!("lookup {} in {} frames", name, self.frames.len());
+        feat_trace!("env", "lookup {} in {} frames", name, self.frames.len());
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.lookup(name) {
                 return Some(v.clone());
@@ -370,5 +410,23 @@ impl Env {
             }
         }
         child
+    }
+    
+    #[inline(always)]
+    pub fn eval(&mut self, form: &Form) -> EvalResult {
+        let globals = self.globals.clone();
+        globals.eval(form, self)
+    }
+
+    #[inline(always)]
+    pub fn call_cljrs_fn(&mut self, func: &CljxFn, args: &[Value]) -> EvalResult {
+        let globals = self.globals.clone();
+        globals.call_cljrs_fn(func, args, self)
+    }
+    
+    #[inline(always)]
+    pub fn on_fn_defined(&mut self, func: &CljxFn) {
+        let globals = self.globals.clone();
+        globals.on_fn_defined(func, self);
     }
 }

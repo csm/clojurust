@@ -50,11 +50,16 @@ cargo fmt
 
 Once the CLI exists:
 ```bash
-cljx run <file.cljrs>      # interpret a source file
-cljx repl                   # start interactive REPL
-cljx compile <file> -o <bin> # AOT compile to binary
-cljx eval '<expr>'          # evaluate expression from shell
+cljrs run <file.cljrs>      # interpret a source file
+cljrs repl                   # start interactive REPL
+cljrs compile <file> -o <bin> # AOT compile to binary
+cljrs eval '<expr>'          # evaluate expression from shell
+cljrs test --src-path ...  # run clojure.test namespaces
 ```
+
+## Tooling
+
+Use LSP whenever possible to navigate the code base.
 
 ## Architecture
 

@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::env::Env;
-use crate::error::{EvalError, EvalResult};
+use cljrs_builtins::form::form_to_value;
+use cljrs_builtins::SPECIAL_FORMS;
+use cljrs_env::env::Env;
+use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -132,12 +133,12 @@ fn sq_form(
 
         // #(...) anonymous function: expand to (fn* [...] ...) then syntax-quote.
         FormKind::AnonFn(body) => {
-            let expanded = crate::eval::expand_anon_fn(body, form.span.clone());
+            let expanded = cljrs_builtins::form::expand_anon_fn(body, form.span.clone());
             sq_form(&expanded, env, gensyms)
         }
 
         // Everything else: wrap as literal data.
-        _other => Ok(crate::eval::form_to_value(form)),
+        _other => Ok(form_to_value(form)),
     }
 }
 
@@ -199,7 +200,7 @@ fn qualify_symbol(
         return generated.as_ref().to_string();
     }
     // Special forms and try-related tokens: never qualify.
-    if crate::special::SPECIAL_FORMS.contains(&s)
+    if SPECIAL_FORMS.contains(&s)
         || matches!(s, "catch" | "finally" | "Exception" | "Throwable" | "Error")
     {
         return s.to_string();

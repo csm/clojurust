@@ -8,3 +8,5 @@ repository.workspace = true
 
 [dependencies]
 cljrs-types = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+postcard = { workspace = true, features = ["alloc"] }

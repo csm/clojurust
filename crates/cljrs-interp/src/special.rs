@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::destructure::bind_pattern;
-use crate::env::{Env, RequireRefer, RequireSpec};
-use crate::error::{EvalError, EvalResult};
-use crate::eval::{eval, eval_body, form_to_value, is_special_form};
-use crate::loader::load_ns;
+use cljrs_env::env::{Env, RequireRefer, RequireSpec};
+use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_builtins::form::{expand_reader_conds, form_to_value, select_reader_cond};
+use crate::eval::{eval, eval_body, is_special_form};
+use cljrs_env::loader::load_ns;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -17,46 +18,6 @@ use cljrs_value::{
     TypeInstance, Value, ValueError,
 };
 
-/// The set of names that trigger special-form dispatch.
-pub const SPECIAL_FORMS: &[&str] = &[
-    "def",
-    "fn*",
-    "fn",
-    "if",
-    "do",
-    "let*",
-    "let",
-    "loop*",
-    "loop",
-    "recur",
-    "quote",
-    "var",
-    "set!",
-    "throw",
-    "try",
-    "defn",
-    "defn-",
-    "defmacro",
-    "defonce",
-    "and",
-    "or",
-    ".",
-    "ns",
-    "require",
-    "letfn",
-    "in-ns",
-    "alias",
-    "defprotocol",
-    "extend-type",
-    "extend-protocol",
-    "defmulti",
-    "defmethod",
-    "defrecord",
-    "reify",
-    "load-file",
-    "binding",
-    "with-out-str",
-];
 
 /// Dispatch to the right special-form handler.
 pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
@@ -218,66 +179,14 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
         Arc::clone(&env.current_ns),
     );
 
+    env.on_fn_defined(&cljrs_fn);
+
     // Eagerly lower each arity to IR if the compiler is ready.
-    eager_lower_fn(&cljrs_fn, env);
+    //eager_lower_fn(&cljrs_fn, env);
 
     Ok(Value::Fn(GcPtr::new(cljrs_fn)))
 }
 
-/// Eagerly lower all arities of a function to IR, storing the results
-/// in the IR cache.  Failures are silently recorded as `Unsupported`.
-///
-/// Only lowers if the compiler is already loaded (`compiler_ready` is true).
-/// Compiler loading is triggered separately (e.g., by the binary at startup).
-fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
-    use crate::apply::IR_LOWERING_ACTIVE;
-
-    // Don't lower macros (they operate on forms, not values).
-    if f.is_macro {
-        return;
-    }
-
-    // Only lower if compiler is already ready (don't trigger loading).
-    if !env
-        .globals
-        .compiler_ready
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return;
-    }
-
-    // Don't nest lowering calls.
-    if IR_LOWERING_ACTIVE.with(|c| c.get()) {
-        return;
-    }
-
-    IR_LOWERING_ACTIVE.with(|c| c.set(true));
-
-    for arity in &f.arities {
-        let arity_id = arity.ir_arity_id;
-        if !crate::ir_cache::should_attempt(arity_id) {
-            continue;
-        }
-
-        match crate::lower::lower_arity(
-            f.name.as_deref(),
-            &arity.params,
-            arity.rest_param.as_ref(),
-            &arity.body,
-            &f.defining_ns,
-            env,
-        ) {
-            Ok(ir_func) => {
-                crate::ir_cache::store_cached(arity_id, std::sync::Arc::new(ir_func));
-            }
-            Err(_) => {
-                crate::ir_cache::store_unsupported(arity_id);
-            }
-        }
-    }
-
-    IR_LOWERING_ACTIVE.with(|c| c.set(false));
-}
 
 /// Parse one arity: params-form and body forms.
 pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity> {
@@ -337,7 +246,7 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         body: body.to_vec(),
         destructure_params,
         destructure_rest,
-        ir_arity_id: crate::ir_cache::fresh_arity_id(),
+        ir_arity_id: crate::arity::fresh_arity_id(),
     })
 }
 
@@ -472,7 +381,7 @@ fn eval_virtualized_chain(
     pairs: &[&[Form]],
     env: &mut Env,
 ) -> Result<(), EvalError> {
-    use crate::transients::{
+    use cljrs_builtins::transients::{
         builtin_assoc_bang, builtin_conj_bang, builtin_persistent_bang, builtin_transient,
     };
 
@@ -585,11 +494,11 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
 
     loop {
         // Root current_vals so they survive GC — they're not yet bound in env.
-        let _vals_root = crate::root_values(&current_vals);
+        let _vals_root = cljrs_env::gc_roots::root_values(&current_vals);
 
         // GC safepoint on every loop iteration so tight recur loops
         // don't starve the collector.
-        crate::gc_safepoint(env);
+        cljrs_env::gc_roots::gc_safepoint(env);
 
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
@@ -680,7 +589,7 @@ fn eval_set_bang(args: &[Form], env: &mut Env) -> EvalResult {
         .lookup_var_in_ns(ns, &parsed.name)
         .ok_or_else(|| EvalError::UnboundSymbol(sym))?;
     // Prefer updating the thread-local binding if one exists.
-    if !crate::dynamics::set_thread_local(&var, val.clone()) {
+    if !cljrs_env::dynamics::set_thread_local(&var, val.clone()) {
         var.get().bind(val.clone());
     }
     Ok(val)
@@ -1058,22 +967,6 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
     }
 }
 
-/// Resolve a `#?(...)` reader conditional to the selected branch form, or
-/// `None` if no `:rust` or `:default` clause is present.
-pub fn select_reader_cond(clauses: &[Form]) -> Option<&Form> {
-    let mut default: Option<&Form> = None;
-    let mut i = 0;
-    while i + 1 < clauses.len() {
-        match &clauses[i].kind {
-            FormKind::Keyword(k) if k == "rust" => return Some(&clauses[i + 1]),
-            FormKind::Keyword(k) if k == "default" => default = Some(&clauses[i + 1]),
-            _ => {}
-        }
-        i += 2;
-    }
-    default
-}
-
 /// Parse a `RequireSpec` from a raw `Form` (unevaluated, used in `ns` macro).
 fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
     match &form.kind {
@@ -1159,7 +1052,7 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
             match items.first().map(|f| &f.kind) {
                 Some(FormKind::Keyword(k)) if k == "require" => {
                     // Expand reader conditionals among require specs
-                    let expanded = crate::eval::expand_reader_conds(&items[1..]);
+                    let expanded = expand_reader_conds(&items[1..]);
                     for spec_form in &expanded {
                         let spec =
                             parse_require_spec_form(spec_form).map_err(EvalError::Runtime)?;
@@ -1410,7 +1303,7 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
     };
     let type_tag = crate::apply::resolve_type_tag(&type_sym);
 
-    let mut current_proto: Option<GcPtr<cljrs_value::Protocol>> = None;
+    let mut current_proto: Option<GcPtr<Protocol>> = None;
 
     for form in &args[1..] {
         match &form.kind {
@@ -1660,10 +1553,10 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
             .lookup_var_in_ns(ns_part, &parsed.name)
             .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
         let val = eval(&pair[1], env)?;
-        frame.insert(crate::dynamics::var_key_of(&var_ptr), val);
+        frame.insert(cljrs_env::dynamics::var_key_of(&var_ptr), val);
     }
 
-    let _guard = crate::dynamics::push_frame(frame);
+    let _guard = cljrs_env::dynamics::push_frame(frame);
     eval_body(&args[1..], env)
     // _guard drops here → pop_frame()
 }
@@ -1738,7 +1631,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
             destructure_params: vec![],
             destructure_rest: None,
-            ir_arity_id: crate::ir_cache::fresh_arity_id(),
+            ir_arity_id: crate::arity::fresh_arity_id(),
         };
         let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
         let ctor = CljxFn::new(
@@ -1773,7 +1666,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             body,
             destructure_params: vec![],
             destructure_rest: None,
-            ir_arity_id: crate::ir_cache::fresh_arity_id(),
+            ir_arity_id: crate::arity::fresh_arity_id(),
         };
         let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
         let ctor = CljxFn::new(
@@ -1803,7 +1696,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
 fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
     // (reify Proto1 (method [this] body) ...)
     // Generate a unique type tag for this instance.
-    let n = crate::builtins::GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = cljrs_builtins::builtins::GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
 
     // Register protocol implementations.
@@ -1886,9 +1779,9 @@ fn require_sym<'a>(args: &'a [Form], idx: usize, form_name: &str) -> EvalResult<
 // ── with-out-str ──────────────────────────────────────────────────────────────
 
 fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
-    crate::builtins::push_output_capture();
+    cljrs_builtins::builtins::push_output_capture();
     let result = eval_body(body, env);
-    let captured = crate::builtins::pop_output_capture().unwrap_or_default();
+    let captured = cljrs_builtins::builtins::pop_output_capture().unwrap_or_default();
     // Propagate errors but still pop the capture buffer
     result?;
     Ok(Value::string(captured))

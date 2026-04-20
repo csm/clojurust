@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 /// A half-open byte range `[start, end)` within a named source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     /// File path on disk, or `"<repl>"` for interactive input.
     pub file: Arc<String>,

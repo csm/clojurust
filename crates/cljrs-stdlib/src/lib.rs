@@ -94,6 +94,12 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     globals.register_builtin_source("clojure.zip", COLJURE_ZIP_SRC);
 }
 
+/// Prebuilt IR bundle for clojure.core (generated at build time).
+/// When the `prebuild-ir` feature is enabled, this contains serialized IR
+/// for all lowerable functions; otherwise it's an empty slice.
+#[cfg(feature = "prebuild-ir")]
+static PREBUILT_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_ir.bin"));
+
 /// Create a `GlobalEnv` with all built-ins and stdlib registered.
 ///
 /// Prefer this over `cljrs_eval::standard_env()` in the `cljrs` binary so that
@@ -102,6 +108,52 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 pub fn standard_env() -> Arc<GlobalEnv> {
     let globals = cljrs_eval::standard_env_minimal();
     register(&globals);
+
+    // Try loading prebuilt IR first (skips compiler loading entirely).
+    #[cfg(feature = "prebuild-ir")]
+    {
+        match cljrs_ir::deserialize_bundle(PREBUILT_IR) {
+            Ok(bundle) if !bundle.is_empty() => {
+                // Register compiler sources (needed for any functions not in the
+                // prebuilt bundle, and for user code that triggers IR lowering).
+                cljrs_eval::register_compiler_sources(&globals);
+
+                let loaded = cljrs_eval::load_prebuilt_ir(&globals, &bundle);
+                cljrs_logging::feat_debug!("ir", "loaded {loaded} prebuilt IR arities from bundle ({} entries)", bundle.len());
+
+                // Still load the compiler on a background thread so new user
+                // functions can be eagerly lowered at definition time.
+                let g = globals.clone();
+                let _ = std::thread::Builder::new()
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let mut env = cljrs_eval::Env::new(g.clone(), "user");
+                        cljrs_eval::ensure_compiler_loaded(&g, &mut env);
+                    });
+
+                return globals;
+            }
+            _ => {
+                // Empty or corrupt bundle — fall through to runtime lowering.
+            }
+        }
+    }
+
+    // Fallback: register and load compiler namespaces so IR lowering is
+    // available at runtime. Loading runs on a thread with a large stack
+    // because the Clojure compiler sources are deeply recursive.
+    cljrs_eval::register_compiler_sources(&globals);
+    {
+        let g = globals.clone();
+        let _ = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut env = cljrs_eval::Env::new(g.clone(), "user");
+                cljrs_eval::ensure_compiler_loaded(&g, &mut env);
+            })
+            .and_then(|h| h.join().map_err(|_| std::io::Error::other("join failed")));
+    }
+
     globals
 }
 
@@ -325,15 +377,25 @@ mod tests {
 
     #[test]
     fn test_clojure_test_lazy_load() {
-        let (_, mut env) = make_env();
-        // clojure.test is NOT pre-loaded in standard_env_minimal();
-        // it should load lazily from the registry.
-        run(
-            "(require '[clojure.test :refer [is deftest run-tests]])",
-            &mut env,
-        )
-        .unwrap();
-        let v = run("(is (= 1 1))", &mut env).unwrap();
-        assert_eq!(v, Value::Bool(true));
+        // Run on a thread with adequate stack: the `is` macro expansion
+        // triggers eager IR lowering, which calls the Clojure compiler
+        // (deeply recursive — needs more than the default 2MB test thread stack).
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (_, mut env) = make_env();
+                // clojure.test is NOT pre-loaded in standard_env_minimal();
+                // it should load lazily from the registry.
+                run(
+                    "(require '[clojure.test :refer [is deftest run-tests]])",
+                    &mut env,
+                )
+                .unwrap();
+                let v = run("(is (= 1 1))", &mut env).unwrap();
+                assert_eq!(v, Value::Bool(true));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

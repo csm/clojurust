@@ -1,0 +1,15 @@
+[package]
+name = "cljrs-env"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-types   = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-reader  = { workspace = true }
+cljrs-value   = { workspace = true }
+cljrs-logging = { workspace = true }
+log = "0.4.29"
+thiserror = "2.0.18"

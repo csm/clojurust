@@ -6,10 +6,25 @@ description = "Built-in standard library namespaces for clojurust (clojure.strin
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["prebuild-ir"]
+prebuild-ir = []
+
 [dependencies]
-cljrs-gc    = { workspace = true }
-cljrs-value = { workspace = true }
-cljrs-eval  = { workspace = true }
-cljrs-reader = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-logging  = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-ir       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-interp   = { workspace = true }
 tokio        = { workspace = true, features = ["rt", "sync", "rt-multi-thread"] }
 lazy_static = "1.5.0"
+
+[build-dependencies]
+cljrs-ir       = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-interp   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }

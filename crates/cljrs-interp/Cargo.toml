@@ -1,0 +1,16 @@
+[package]
+name = "cljrs-interp"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-env = { workspace = true }
+cljrs-types = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-value = { workspace = true }
+cljrs-gc = { workspace = true }
+cljrs-reader = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

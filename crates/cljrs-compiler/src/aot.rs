@@ -81,12 +81,19 @@ pub fn lower_via_clojure(
     crate::register_compiler_sources(&env.globals);
 
     // Push eval context so callback::invoke can work.
-    cljrs_eval::callback::push_eval_context(env);
+    cljrs_env::callback::push_eval_context(env);
+
+    // Set IR_LOWERING_ACTIVE to prevent eager lowering of closures
+    // created inside the Clojure compiler during this lowering call.
+    use cljrs_eval::apply::IR_LOWERING_ACTIVE;
+    let was_active = IR_LOWERING_ACTIVE.with(|c| c.get());
+    IR_LOWERING_ACTIVE.with(|c| c.set(true));
 
     let result = lower_via_clojure_inner(name, ns, params, compilable_forms, env);
 
-    // Always pop eval context, regardless of success or failure.
-    cljrs_eval::callback::pop_eval_context();
+    // Restore lowering flag and pop eval context.
+    IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
+    cljrs_env::callback::pop_eval_context();
 
     result
 }
@@ -148,11 +155,11 @@ fn lower_via_clojure_inner(
 
     // 4. body-forms (vector of form values)
     let body_forms_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        compilable_forms.iter().map(cljrs_eval::eval::form_to_value),
+        compilable_forms.iter().map(cljrs_builtins::form::form_to_value),
     )));
 
     // Call the Clojure lowering function.
-    let ir_data = cljrs_eval::callback::invoke(
+    let ir_data = cljrs_env::callback::invoke(
         &lower_fn_val,
         vec![fname_val, ns_val, params_val, body_forms_val],
     )
@@ -165,7 +172,7 @@ fn lower_via_clojure_inner(
         .ok_or_else(|| AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string()))?;
     let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
 
-    let optimized = cljrs_eval::callback::invoke(&optimize_fn_val, vec![ir_data])
+    let optimized = cljrs_env::callback::invoke(&optimize_fn_val, vec![ir_data])
         .map_err(|e| AotError::Eval(format!("Optimization failed: {e:?}")))?;
 
     // Convert the result Value → IrFunction.
@@ -372,7 +379,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
                 Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
             }
         }
-        match cljrs_eval::macros::macroexpand_all(form, &mut env) {
+        match cljrs_interp::macros::macroexpand_all(form, &mut env) {
             Ok(f) => expanded.push(f),
             Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
         }
@@ -571,7 +578,7 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
 /// newly loaded namespace that isn't a builtin source, resolves and reads
 /// its source file from `src_dirs`.
 fn discover_bundled_sources(
-    globals: &Arc<cljrs_eval::env::GlobalEnv>,
+    globals: &Arc<cljrs_env::env::GlobalEnv>,
     pre_loaded: &std::collections::HashSet<Arc<str>>,
     src_dirs: &[PathBuf],
 ) -> Vec<(Arc<str>, String)> {

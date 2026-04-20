@@ -19,7 +19,7 @@ pub mod rt_abi;
 
 /// Register all compiler Clojure source files as builtin sources in the
 /// given `GlobalEnv`, so that `require` can load them without filesystem access.
-pub fn register_compiler_sources(globals: &std::sync::Arc<cljrs_eval::env::GlobalEnv>) {
+pub fn register_compiler_sources(globals: &std::sync::Arc<cljrs_env::env::GlobalEnv>) {
     globals.register_builtin_source("cljrs.compiler.ir", cljrs_ir::COMPILER_IR_SOURCE);
     globals.register_builtin_source("cljrs.compiler.known", cljrs_ir::COMPILER_KNOWN_SOURCE);
     globals.register_builtin_source("cljrs.compiler.anf", cljrs_ir::COMPILER_ANF_SOURCE);

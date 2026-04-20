@@ -100,6 +100,6 @@ fn new_matcher(args: &[Value], match_all: bool) -> ValueResult<Matcher> {
     }
 }
 
-pub(crate) fn builtin_re_matcher(args: &[Value]) -> ValueResult<Value> {
+pub fn builtin_re_matcher(args: &[Value]) -> ValueResult<Value> {
     new_matcher(args, false).map(|m| Value::Matcher(GcPtr::new(m)))
 }

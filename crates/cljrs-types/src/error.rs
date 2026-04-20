@@ -27,6 +27,11 @@ pub enum CljxError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    
+    #[error("Serialization error: {message}")]
+    SerializationError {
+        message: String,
+    }
 }
 
 pub type CljxResult<T> = Result<T, CljxError>;
