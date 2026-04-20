@@ -1,13 +1,16 @@
-pub mod builtins;
-pub mod transients;
-mod regex;
-mod bitops;
+#![allow(clippy::result_large_err)]
+#![allow(clippy::type_complexity)]
+
 mod array_list;
-mod new;
-mod taps;
-pub mod util;
-pub mod special;
+mod bitops;
+pub mod builtins;
 pub mod form;
+mod new;
+mod regex;
+pub mod special;
+mod taps;
+pub mod transients;
+pub mod util;
 
 pub use special::*;
 pub use util::*;

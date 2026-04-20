@@ -81,10 +81,7 @@ fn lower_arity_inner(
         .ok_or_else(|| {
             LowerError::LowerFailed("cljrs.compiler.anf/lower-fn-body not found".to_string())
         })?;
-    let lower_fn_val = lower_fn
-        .get()
-        .deref()
-        .unwrap_or(Value::Nil);
+    let lower_fn_val = lower_fn.get().deref().unwrap_or(Value::Nil);
 
     // Build arguments:
     // 1. fname (string or nil)
@@ -97,7 +94,10 @@ fn lower_arity_inner(
     let ns_val = Value::string(ns.to_string());
 
     // 3. params (vector of strings) — includes rest param if present
-    let mut param_strs: Vec<Value> = params.iter().map(|p| Value::string(p.to_string())).collect();
+    let mut param_strs: Vec<Value> = params
+        .iter()
+        .map(|p| Value::string(p.to_string()))
+        .collect();
     if let Some(rest) = rest_param {
         // The Clojure lowerer expects all params including rest as a flat list.
         // The last param in a variadic arity is the rest param.
@@ -129,8 +129,7 @@ fn lower_arity_inner(
     IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
     cljrs_env::callback::pop_eval_context();
 
-    let ir_data =
-        ir_data.map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
+    let ir_data = ir_data.map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
 
     // Convert the result Value → IrFunction.
     crate::ir_convert::value_to_ir_function(&ir_data)

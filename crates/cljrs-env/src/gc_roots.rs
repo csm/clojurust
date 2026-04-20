@@ -1,6 +1,6 @@
-use std::cell::RefCell;
 use crate::dynamics;
 use crate::env::{Env, GlobalEnv};
+use std::cell::RefCell;
 
 // ── Thread-local Env root registry ──────────────────────────────────────────
 //

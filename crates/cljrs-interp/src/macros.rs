@@ -1,11 +1,11 @@
 //! Macro expansion pipeline.
 
-use std::sync::Arc;
 use cljrs_builtins::form::form_to_value;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_types::span::Span;
 use cljrs_value::{Symbol, Value};
+use std::sync::Arc;
 
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};

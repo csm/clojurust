@@ -1,18 +1,21 @@
-use std::sync::Arc;
+#![allow(clippy::result_large_err)]
+#![allow(clippy::type_complexity)]
+
 use cljrs_builtins::builtins;
 use cljrs_env::env::{Env, GlobalEnv};
 use cljrs_env::error::EvalResult;
 use cljrs_reader::Form;
 use cljrs_value::{CljxFn, Value};
+use std::sync::Arc;
 
-pub mod eval;
 pub mod apply;
-pub mod special;
-pub mod macros;
-pub mod syntax_quote;
-pub mod destructure;
-mod virtualize;
 mod arity;
+pub mod destructure;
+pub mod eval;
+pub mod macros;
+pub mod special;
+pub mod syntax_quote;
+mod virtualize;
 
 /// Create a minimal `GlobalEnv` with `clojure.core` builtins and bootstrap
 /// HOFs, but without any stdlib namespaces pre-loaded.
@@ -71,7 +74,6 @@ pub fn standard_env_minimal(
     globals
 }
 
-
 /// Create a `GlobalEnv` pre-populated with `clojure.core` built-ins,
 /// bootstrap HOFs, and `clojure.test` (eagerly loaded so eval-crate tests
 /// can use `(require '[clojure.test ...])` without a source path).
@@ -123,7 +125,7 @@ pub fn standard_env_with_paths(
     eval_fn: Option<fn(&Form, &mut Env) -> EvalResult>,
     call_cljrs_fn: Option<fn(&CljxFn, &[Value], &mut Env) -> EvalResult>,
     on_fn_defined: Option<fn(&CljxFn, &mut Env)>,
-    source_paths: Vec<std::path::PathBuf>
+    source_paths: Vec<std::path::PathBuf>,
 ) -> Arc<GlobalEnv> {
     let globals = standard_env(eval_fn, call_cljrs_fn, on_fn_defined);
     globals.set_source_paths(source_paths);

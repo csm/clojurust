@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::destructure::bind_pattern;
+use crate::eval::{eval, eval_body, is_special_form};
+use cljrs_builtins::form::{expand_reader_conds, form_to_value, select_reader_cond};
 use cljrs_env::env::{Env, RequireRefer, RequireSpec};
 use cljrs_env::error::{EvalError, EvalResult};
-use cljrs_builtins::form::{expand_reader_conds, form_to_value, select_reader_cond};
-use crate::eval::{eval, eval_body, is_special_form};
 use cljrs_env::loader::load_ns;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
@@ -17,7 +17,6 @@ use cljrs_value::{
     CljxFn, CljxFnArity, Keyword, MapValue, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
     TypeInstance, Value, ValueError,
 };
-
 
 /// Dispatch to the right special-form handler.
 pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
@@ -186,7 +185,6 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
 
     Ok(Value::Fn(GcPtr::new(cljrs_fn)))
 }
-
 
 /// Parse one arity: params-form and body forms.
 pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity> {
@@ -1696,7 +1694,8 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
 fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
     // (reify Proto1 (method [this] body) ...)
     // Generate a unique type tag for this instance.
-    let n = cljrs_builtins::builtins::GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n =
+        cljrs_builtins::builtins::GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
 
     // Register protocol implementations.

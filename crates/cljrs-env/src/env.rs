@@ -3,11 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::error::EvalResult;
 use cljrs_gc::{GcConfig, GcPtr};
+use cljrs_logging::feat_trace;
 use cljrs_reader::Form;
 use cljrs_value::{CljxFn, Namespace, Value, Var};
-use cljrs_logging::feat_trace;
-use crate::error::EvalResult;
 // ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
 
 /// How symbols should be referred into the requiring namespace.
@@ -411,7 +411,7 @@ impl Env {
         }
         child
     }
-    
+
     #[inline(always)]
     pub fn eval(&mut self, form: &Form) -> EvalResult {
         let globals = self.globals.clone();
@@ -423,7 +423,7 @@ impl Env {
         let globals = self.globals.clone();
         globals.call_cljrs_fn(func, args, self)
     }
-    
+
     #[inline(always)]
     pub fn on_fn_defined(&mut self, func: &CljxFn) {
         let globals = self.globals.clone();

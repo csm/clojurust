@@ -17,7 +17,9 @@ use cljrs_ir::{
     BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId,
 };
 use cljrs_value::value::{MapValue, SetValue};
-use cljrs_value::{CljxCons, CljxFn, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value};
+use cljrs_value::{
+    CljxCons, CljxFn, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value,
+};
 
 use cljrs_env::apply::apply_value;
 use cljrs_env::env::{Env, GlobalEnv};
@@ -235,9 +237,13 @@ fn execute_inst(
             let resolved_ns = globals
                 .resolve_alias(ns, gns)
                 .unwrap_or_else(|| Arc::from(&**gns));
-            let var = globals.lookup_var_in_ns(&resolved_ns, name).ok_or_else(|| {
-                EvalError::Runtime(format!("IR interpreter: var not found {resolved_ns}/{name}"))
-            })?;
+            let var = globals
+                .lookup_var_in_ns(&resolved_ns, name)
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "IR interpreter: var not found {resolved_ns}/{name}"
+                    ))
+                })?;
             regs.set(*dst, Value::Var(var));
         }
 

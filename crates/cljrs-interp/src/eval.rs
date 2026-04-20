@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use crate::apply::eval_call;
-use cljrs_env::env::Env;
-use cljrs_env::error::{EvalError, EvalResult};
-use cljrs_builtins::special::SPECIAL_FORMS;
-use cljrs_builtins::form::expand_reader_conds;
 use crate::special::eval_special;
 use crate::syntax_quote::syntax_quote;
+use cljrs_builtins::form::expand_reader_conds;
+use cljrs_builtins::special::SPECIAL_FORMS;
+use cljrs_env::env::Env;
+use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -246,9 +246,8 @@ pub fn is_special_form(s: &str) -> bool {
 pub fn deref_value(v: Value) -> EvalResult {
     match v {
         Value::Atom(a) => Ok(a.get().deref()),
-        Value::Var(var) => {
-            cljrs_env::dynamics::deref_var(&var).ok_or_else(|| EvalError::Runtime("unbound var".into()))
-        }
+        Value::Var(var) => cljrs_env::dynamics::deref_var(&var)
+            .ok_or_else(|| EvalError::Runtime("unbound var".into())),
         Value::Volatile(vol) => Ok(vol.get().deref()),
         Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
         Value::Agent(a) => Ok(a.get().get_state()),
@@ -343,8 +342,8 @@ fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use cljrs_env::env::GlobalEnv;
+    use std::sync::Arc;
 
     fn make_env() -> (Arc<GlobalEnv>, Env) {
         let globals = crate::standard_env(None, None, None);

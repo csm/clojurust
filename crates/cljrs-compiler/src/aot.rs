@@ -155,7 +155,9 @@ fn lower_via_clojure_inner(
 
     // 4. body-forms (vector of form values)
     let body_forms_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        compilable_forms.iter().map(cljrs_builtins::form::form_to_value),
+        compilable_forms
+            .iter()
+            .map(cljrs_builtins::form::form_to_value),
     )));
 
     // Call the Clojure lowering function.

@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use cljrs_value::{Arity, Value};
 use crate::env::Env;
 use crate::error::{EvalError, EvalResult};
+use cljrs_value::{Arity, Value};
+use std::sync::Arc;
 
 fn check_arity(arity: &Arity, argc: usize, name: &str) -> EvalResult<()> {
     match arity {
@@ -78,9 +78,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             crate::callback::pop_eval_context();
             result
         }
-        Value::Fn(f) => {
-            env.call_cljrs_fn(f.get(), &*args)
-        },
+        Value::Fn(f) => env.call_cljrs_fn(f.get(), &args),
         Value::BoundFn(bf) => {
             let bf_ref = bf.get();
             // Push captured bindings as a frame on top of the current stack.

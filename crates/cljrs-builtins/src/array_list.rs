@@ -1,5 +1,4 @@
 /// ArrayList-like operations. Uses a backing Vec.
-
 use crate::util::numeric_as_i64;
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_value::{NativeObject, NativeObjectBox, ObjectArray, Value, ValueError, ValueResult};

@@ -1,19 +1,19 @@
 //! Function application and the recur trampoline.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
-    AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
-    Symbol, Thunk, Value,
+    AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList, Symbol,
+    Thunk, Value,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::destructure::value_to_seq_vec;
+use crate::eval::eval;
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
-use crate::eval::eval;
 
 /// Convert an EvalError to a Value for storage (e.g. agent errors).
 /// Preserves Thrown values (ex-info); other errors become strings.
@@ -385,13 +385,8 @@ pub fn resolve_type_tag(sym: &str) -> Arc<str> {
     Arc::from(sym)
 }
 
-
 /// Tree-walking execution path (original implementation).
-pub fn call_cljrs_fn(
-    f: &CljxFn,
-    args: &[Value],
-    caller_env: &mut Env,
-) -> EvalResult {
+pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
     let arity = select_arity(f, args.len())?;
 
     // Register the caller's env as a GC root so its local bindings survive
@@ -721,8 +716,8 @@ fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
                 let mut call_args = vec![state.clone()];
                 call_args.extend(extra);
                 let mut call_env = Env::new(globals, &ns);
-                let new_val =
-                    cljrs_env::apply::apply_value(&f, call_args, &mut call_env).map_err(eval_error_to_value)?;
+                let new_val = cljrs_env::apply::apply_value(&f, call_args, &mut call_env)
+                    .map_err(eval_error_to_value)?;
                 // Fire watches (agent watches fire on the agent thread)
                 fire_watches(
                     &agent_clone.get().watches,

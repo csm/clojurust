@@ -1,10 +1,12 @@
 // ── form_to_value ─────────────────────────────────────────────────────────────
 
-use regex::Regex;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
-use cljrs_value::{Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value};
 use cljrs_value::value::SetValue;
+use cljrs_value::{
+    Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value,
+};
+use regex::Regex;
 
 // ── anon fn expansion ─────────────────────────────────────────────────────────
 

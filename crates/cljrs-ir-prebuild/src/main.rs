@@ -11,7 +11,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use cljrs_env::env::{Env, GlobalEnv};
-use cljrs_ir::{serialize_bundle, IrBundle};
+use cljrs_ir::{IrBundle, serialize_bundle};
 use cljrs_value::{CljxFn, Value};
 
 /// Pre-lower Clojure namespaces to serialized IR bundles.
@@ -124,14 +124,13 @@ fn run_prebuild(
     }
 
     if verbose {
-        eprintln!(
-            "Lowering complete: {lowered} functions lowered, {unsupported} unsupported."
-        );
+        eprintln!("Lowering complete: {lowered} functions lowered, {unsupported} unsupported.");
     }
 
     // 5. Serialize and write to output file.
     let bytes = serialize_bundle(&bundle).map_err(|e| format!("serialization failed: {e}"))?;
-    std::fs::write(output, &bytes).map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+    std::fs::write(output, &bytes)
+        .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
 
     if verbose {
         eprintln!("Wrote {} bytes to {}", bytes.len(), output.display());
@@ -155,13 +154,7 @@ fn load_namespace(
         eprintln!("Loading namespace: {ns_name}");
     }
 
-    let span = cljrs_types::span::Span::new(
-        Arc::new("<prebuild>".to_string()),
-        0,
-        0,
-        1,
-        1,
-    );
+    let span = cljrs_types::span::Span::new(Arc::new("<prebuild>".to_string()), 0, 0, 1, 1);
     let require_form = cljrs_reader::Form::new(
         cljrs_reader::form::FormKind::List(vec![
             cljrs_reader::Form::new(
@@ -183,7 +176,9 @@ fn load_namespace(
         .map_err(|e| format!("failed to load namespace {ns_name}: {e:?}"))?;
 
     if !globals.is_loaded(ns_name) {
-        return Err(format!("namespace {ns_name} was not marked as loaded after require"));
+        return Err(format!(
+            "namespace {ns_name} was not marked as loaded after require"
+        ));
     }
 
     Ok(())
@@ -207,9 +202,9 @@ fn lower_namespace(
         let interns = ns.get().interns.lock().unwrap();
         interns
             .iter()
-            .filter_map(|(name, var)| {
+            .map(|(name, var)| {
                 let val = var.get().deref().unwrap_or(Value::Nil);
-                Some((name.clone(), val))
+                (name.clone(), val)
             })
             .collect()
     };

@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use cljrs_value::Value;
 use crate::callback::{capture_eval_context, install_eval_context};
 use crate::dynamics;
 use crate::env::GlobalEnv;
+use cljrs_value::Value;
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 const TAP_QUEUE_CAPACITY: usize = 1024;
 

@@ -119,7 +119,11 @@ pub fn standard_env() -> Arc<GlobalEnv> {
                 cljrs_eval::register_compiler_sources(&globals);
 
                 let loaded = cljrs_eval::load_prebuilt_ir(&globals, &bundle);
-                cljrs_logging::feat_debug!("ir", "loaded {loaded} prebuilt IR arities from bundle ({} entries)", bundle.len());
+                cljrs_logging::feat_debug!(
+                    "ir",
+                    "loaded {loaded} prebuilt IR arities from bundle ({} entries)",
+                    bundle.len()
+                );
 
                 // Still load the compiler on a background thread so new user
                 // functions can be eagerly lowered at definition time.

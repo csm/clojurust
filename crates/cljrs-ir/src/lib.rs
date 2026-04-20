@@ -9,13 +9,15 @@
 //! 2. **IR interpreter** (Tier 1 execution)
 //! 3. **Cranelift-based JIT/AOT code generation** (Tier 2 execution)
 
+#![allow(clippy::result_large_err)]
+
+use cljrs_types::error::CljxError::SerializationError;
+use cljrs_types::error::CljxResult;
+use cljrs_types::span::Span;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
-use cljrs_types::error::CljxResult;
-use cljrs_types::error::CljxError::SerializationError;
-use cljrs_types::span::Span;
 
 // ── Variable IDs ─────────────────────────────────────────────────────────────
 
@@ -471,11 +473,15 @@ impl IrFunction {
     }
 
     pub fn serialize(&self) -> CljxResult<Vec<u8>> {
-        postcard::to_allocvec(self).map_err(|e| SerializationError { message: e.to_string() })
+        postcard::to_allocvec(self).map_err(|e| SerializationError {
+            message: e.to_string(),
+        })
     }
 
     pub fn deserialize(bytes: &[u8]) -> CljxResult<Self> {
-        postcard::from_bytes(bytes).map_err(|e| SerializationError { message: e.to_string() })
+        postcard::from_bytes(bytes).map_err(|e| SerializationError {
+            message: e.to_string(),
+        })
     }
 }
 
@@ -529,12 +535,16 @@ impl Default for IrBundle {
 
 /// Serialize an [`IrBundle`] to bytes.
 pub fn serialize_bundle(bundle: &IrBundle) -> CljxResult<Vec<u8>> {
-    postcard::to_allocvec(bundle).map_err(|e| SerializationError { message: e.to_string() })
+    postcard::to_allocvec(bundle).map_err(|e| SerializationError {
+        message: e.to_string(),
+    })
 }
 
 /// Deserialize an [`IrBundle`] from bytes.
 pub fn deserialize_bundle(bytes: &[u8]) -> CljxResult<IrBundle> {
-    postcard::from_bytes(bytes).map_err(|e| SerializationError { message: e.to_string() })
+    postcard::from_bytes(bytes).map_err(|e| SerializationError {
+        message: e.to_string(),
+    })
 }
 
 // ── Effect classification ────────────────────────────────────────────────────
@@ -965,16 +975,32 @@ mod tests {
         let mut bundle = IrBundle::new();
         bundle.insert("clojure.core/inc:1".to_string(), make_test_fn("inc", 1));
         bundle.insert("clojure.core/dec:1".to_string(), make_test_fn("dec", -1));
-        bundle.insert("clojure.core/identity:1".to_string(), make_test_fn("identity", 0));
+        bundle.insert(
+            "clojure.core/identity:1".to_string(),
+            make_test_fn("identity", 0),
+        );
         assert_eq!(bundle.len(), 3);
 
         let bytes = serialize_bundle(&bundle).unwrap();
         let bundle2 = deserialize_bundle(&bytes).unwrap();
         assert_eq!(bundle2.len(), 3);
 
-        assert_eq!(bundle2.get("clojure.core/inc:1").unwrap().name.as_deref(), Some("inc"));
-        assert_eq!(bundle2.get("clojure.core/dec:1").unwrap().name.as_deref(), Some("dec"));
-        assert_eq!(bundle2.get("clojure.core/identity:1").unwrap().name.as_deref(), Some("identity"));
+        assert_eq!(
+            bundle2.get("clojure.core/inc:1").unwrap().name.as_deref(),
+            Some("inc")
+        );
+        assert_eq!(
+            bundle2.get("clojure.core/dec:1").unwrap().name.as_deref(),
+            Some("dec")
+        );
+        assert_eq!(
+            bundle2
+                .get("clojure.core/identity:1")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("identity")
+        );
         assert!(bundle2.get("nonexistent").is_none());
     }
 
@@ -1040,7 +1066,11 @@ mod tests {
 
         // Verify branch terminator survived roundtrip
         match &f2.blocks[0].terminator {
-            Terminator::Branch { cond, then_block, else_block } => {
+            Terminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 assert_eq!(*cond, cond_dst);
                 assert_eq!(*then_block, then_bb);
                 assert_eq!(*else_block, else_bb);

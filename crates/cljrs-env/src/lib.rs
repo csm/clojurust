@@ -1,11 +1,13 @@
+#![allow(clippy::result_large_err)]
+
+pub mod apply;
+pub mod callback;
+pub mod dynamics;
 pub mod env;
 pub mod error;
-pub mod dynamics;
-pub mod callback;
-pub mod loader;
 pub mod gc_roots;
+pub mod loader;
 pub mod taps;
-pub mod apply;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

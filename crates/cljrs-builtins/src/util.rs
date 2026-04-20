@@ -1,12 +1,12 @@
 // Utility functions.
 
 use bigdecimal::BigDecimal;
+use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_gc::GcPtr;
 use cljrs_value::{Value, ValueError, ValueResult};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
 use std::ops::{Div, Mul};
-use cljrs_env::error::{EvalError, EvalResult};
-use cljrs_gc::GcPtr;
 
 pub fn bigdec_to_i64(d: &BigDecimal) -> ValueResult<i64> {
     let (num, exp) = d.as_bigint_and_exponent();

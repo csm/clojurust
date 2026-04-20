@@ -17,27 +17,30 @@
 // Namespace/GlobalEnv use Mutex<HashMap<Arc<str>, GcPtr<Var>>> — intentionally verbose for clarity.
 #![allow(clippy::type_complexity)]
 
+pub mod apply;
 pub mod ir_cache;
 pub mod ir_convert;
 pub mod ir_interp;
 pub mod lower;
-pub mod apply;
 
 pub use cljrs_env::callback::invoke;
 pub use cljrs_env::env::{Env, GlobalEnv};
 pub use cljrs_env::error::{EvalError, EvalResult};
-pub use cljrs_interp::eval::eval;
 pub use cljrs_env::loader::load_ns;
+pub use cljrs_interp::eval::eval;
 
-use std::sync::Arc;
 use crate::ir_interp::eager_lower_fn;
+use std::sync::Arc;
 
 pub fn register_compiler_sources(globals: &Arc<GlobalEnv>) {
     globals.register_builtin_source("cljrs.compiler.ir", cljrs_ir::COMPILER_IR_SOURCE);
     globals.register_builtin_source("cljrs.compiler.known", cljrs_ir::COMPILER_KNOWN_SOURCE);
     globals.register_builtin_source("cljrs.compiler.anf", cljrs_ir::COMPILER_ANF_SOURCE);
     globals.register_builtin_source("cljrs.compiler.escape", cljrs_ir::COMPILER_ESCAPE_SOURCE);
-    globals.register_builtin_source("cljrs.compiler.optimize", cljrs_ir::COMPILER_OPTIMIZE_SOURCE);
+    globals.register_builtin_source(
+        "cljrs.compiler.optimize",
+        cljrs_ir::COMPILER_OPTIMIZE_SOURCE,
+    );
 }
 
 /// Load the Clojure compiler namespaces and mark the compiler as ready

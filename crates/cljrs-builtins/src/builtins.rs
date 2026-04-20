@@ -7,9 +7,6 @@ use crate::array_list::{
 use crate::bitops::{
     builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test,
 };
-use cljrs_env::callback::{capture_eval_context, install_eval_context};
-use cljrs_env::dynamics;
-use cljrs_env::env::GlobalEnv;
 use crate::new::{builtin_exception_dot, builtin_new};
 use crate::regex::{
     builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern,
@@ -20,6 +17,9 @@ use crate::transients::{
 };
 use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
+use cljrs_env::callback::{capture_eval_context, install_eval_context};
+use cljrs_env::dynamics;
+use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
@@ -5110,8 +5110,7 @@ fn builtin_make_lazy_seq_sentinel(_args: &[Value]) -> ValueResult<Value> {
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
-pub static GENSYM_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static GENSYM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn builtin_gensym(args: &[Value]) -> ValueResult<Value> {
     let prefix = match args.first() {

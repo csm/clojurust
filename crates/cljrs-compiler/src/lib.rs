@@ -24,5 +24,8 @@ pub fn register_compiler_sources(globals: &std::sync::Arc<cljrs_env::env::Global
     globals.register_builtin_source("cljrs.compiler.known", cljrs_ir::COMPILER_KNOWN_SOURCE);
     globals.register_builtin_source("cljrs.compiler.anf", cljrs_ir::COMPILER_ANF_SOURCE);
     globals.register_builtin_source("cljrs.compiler.escape", cljrs_ir::COMPILER_ESCAPE_SOURCE);
-    globals.register_builtin_source("cljrs.compiler.optimize", cljrs_ir::COMPILER_OPTIMIZE_SOURCE);
+    globals.register_builtin_source(
+        "cljrs.compiler.optimize",
+        cljrs_ir::COMPILER_OPTIMIZE_SOURCE,
+    );
 }

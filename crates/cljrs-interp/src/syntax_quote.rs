@@ -3,10 +3,8 @@
 //! Syntax-quote is evaluated directly to a `Value`, rather than being
 //! expanded to intermediate AST and then evaluated.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use cljrs_builtins::form::form_to_value;
 use cljrs_builtins::SPECIAL_FORMS;
+use cljrs_builtins::form::form_to_value;
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
@@ -14,6 +12,8 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::value::SetValue;
 use cljrs_value::{Keyword, PersistentList, PersistentVector, Symbol, Value};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 

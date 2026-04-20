@@ -33,7 +33,9 @@ fn main() {
             // Don't fail the build — just warn. The runtime will fall back to
             // eager lowering or tree-walking if no prebuilt IR is available.
             eprintln!("cljrs-stdlib build.rs: IR pre-lowering failed: {e}");
-            eprintln!("cljrs-stdlib build.rs: writing empty bundle (runtime will use tree-walking)");
+            eprintln!(
+                "cljrs-stdlib build.rs: writing empty bundle (runtime will use tree-walking)"
+            );
             let empty = cljrs_ir::IrBundle::new();
             let bytes = cljrs_ir::serialize_bundle(&empty).unwrap();
             std::fs::write(out_dir.join("core_ir.bin"), &bytes).unwrap();
@@ -72,9 +74,9 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
         let interns = ns.get().interns.lock().unwrap();
         interns
             .iter()
-            .filter_map(|(name, var)| {
+            .map(|(name, var)| {
                 let val = var.get().deref().unwrap_or(cljrs_value::Value::Nil);
-                Some((name.clone(), val))
+                (name.clone(), val)
             })
             .collect()
     };

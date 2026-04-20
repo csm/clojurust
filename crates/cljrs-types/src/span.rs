@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A half-open byte range `[start, end)` within a named source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

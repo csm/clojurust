@@ -1,5 +1,4 @@
-///! Extended apply routines, tries IR evaluation and falls back to tree-walking.
-
+//! Extended apply routines, tries IR evaluation and falls back to tree-walking.
 use cljrs_env::env::Env;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
@@ -24,7 +23,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 
     // Try IR path if this isn't a macro and IR is cached (e.g. prebuilt).
     if !f.is_macro
-        && let Some(result) = try_ir_path(f, arity, &args, caller_env)
+        && let Some(result) = try_ir_path(f, arity, args, caller_env)
     {
         return result;
     }
