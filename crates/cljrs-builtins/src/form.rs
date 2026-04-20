@@ -44,10 +44,8 @@ pub fn expand_anon_fn(body: &[Form], span: cljrs_types::span::Span) -> Form {
 fn find_pct_refs(forms: &[Form], max_pos: &mut usize, has_rest: &mut bool) {
     for form in forms {
         match &form.kind {
-            FormKind::Symbol(s) if s == "%" || s == "%1" => {
-                if *max_pos < 1 {
-                    *max_pos = 1;
-                }
+            FormKind::Symbol(s) if (s == "%" || s == "%1") && *max_pos < 1 => {
+                *max_pos = 1;
             }
             FormKind::Symbol(s) if s == "%&" => {
                 *has_rest = true;
