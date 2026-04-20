@@ -213,7 +213,8 @@ fn collect_defn_arities(
                     closure_templates.insert(*dst, template.clone());
                 }
                 Inst::DefVar(_, ns, name, val)
-                    if let Some(template) = closure_templates.get(val) => {
+                    if let Some(template) = closure_templates.get(val) =>
+                {
                     let arities: Vec<ArityInfo> = template
                         .arity_fn_names
                         .iter()
