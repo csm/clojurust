@@ -208,14 +208,12 @@ fn collect_defn_arities(
     for block in &ir_func.blocks {
         for inst in &block.insts {
             match inst {
-                Inst::AllocClosure(dst, template, captures) => {
+                Inst::AllocClosure(dst, template, captures) if captures.is_empty() => {
                     // Only consider zero-capture closures (top-level defns).
-                    if captures.is_empty() {
-                        closure_templates.insert(*dst, template.clone());
-                    }
+                    closure_templates.insert(*dst, template.clone());
                 }
                 Inst::DefVar(_, ns, name, val) => {
-                    if let Some(template) = closure_templates.get(val) {
+                    if let it Some(template) = closure_templates.get(val) {
                         let arities: Vec<ArityInfo> = template
                             .arity_fn_names
                             .iter()
