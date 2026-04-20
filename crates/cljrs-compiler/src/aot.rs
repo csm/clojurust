@@ -212,21 +212,19 @@ fn collect_defn_arities(
                     // Only consider zero-capture closures (top-level defns).
                     closure_templates.insert(*dst, template.clone());
                 }
-                Inst::DefVar(_, ns, name, val) => {
-                    if let it Some(template) = closure_templates.get(val) {
-                        let arities: Vec<ArityInfo> = template
-                            .arity_fn_names
-                            .iter()
-                            .zip(template.param_counts.iter())
-                            .zip(template.is_variadic.iter())
-                            .map(|((fn_name, &param_count), &is_variadic)| ArityInfo {
-                                fn_name: fn_name.clone(),
-                                param_count,
-                                is_variadic,
-                            })
-                            .collect();
-                        defns.insert((ns.clone(), name.clone()), arities);
-                    }
+                Inst::DefVar(_, ns, name, val) if let Some(template) = closure_templates.get(val) => {
+                    let arities: Vec<ArityInfo> = template
+                        .arity_fn_names
+                        .iter()
+                        .zip(template.param_counts.iter())
+                        .zip(template.is_variadic.iter())
+                        .map(|((fn_name, &param_count), &is_variadic)| ArityInfo {
+                            fn_name: fn_name.clone(),
+                            param_count,
+                            is_variadic,
+                        })
+                        .collect();
+                    defns.insert((ns.clone(), name.clone()), arities);
                 }
                 _ => {}
             }
