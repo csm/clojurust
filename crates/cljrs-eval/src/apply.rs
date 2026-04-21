@@ -3,7 +3,7 @@ use cljrs_env::env::Env;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_interp::apply::select_arity;
-use cljrs_value::{CljxFn, Value};
+use cljrs_value::{CljxFn, PersistentList, Value};
 
 /// Whether eager IR lowering at function definition time is enabled.
 ///
@@ -84,9 +84,22 @@ fn execute_ir(
     // call back into the interpreter.
     cljrs_env::callback::push_eval_context(&env);
 
-    // Build IR args: the IR function's params are the positional params
-    // (and rest param if variadic). These map to VarIds in the IR.
-    let ir_args = args.to_vec();
+    // Build IR args: positional params map 1:1, but the rest param (if any)
+    // must receive a list of the remaining args, not individual values.
+    let ir_args = if arity.rest_param.is_some() {
+        let n = arity.params.len();
+        let mut ir_args = args[..n.min(args.len())].to_vec();
+        let rest_items: Vec<Value> = args[n.min(args.len())..].to_vec();
+        let rest_val = if rest_items.is_empty() {
+            Value::Nil
+        } else {
+            Value::List(GcPtr::new(PersistentList::from_iter(rest_items)))
+        };
+        ir_args.push(rest_val);
+        ir_args
+    } else {
+        args.to_vec()
+    };
 
     let result = crate::ir_interp::interpret_ir(
         ir_func,
