@@ -766,11 +766,26 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         | KnownFn::Juxt
         | KnownFn::Comp
         | KnownFn::Partial
-        | KnownFn::Complement
-        | KnownFn::Apply => {
+        | KnownFn::Complement => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
+        }
+
+        KnownFn::Apply => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity {
+                    name: "apply".into(),
+                    expected: "2+".into(),
+                    got: args.len(),
+                });
+            }
+            let mut args = args;
+            let f = args.remove(0);
+            let last = args.pop().unwrap();
+            let spread = cljrs_interp::destructure::value_to_seq_vec(&last);
+            args.extend(spread);
+            apply_value(&f, args, env)
         }
 
         // ── Dynamic binding / exception handling ────────────────────────
