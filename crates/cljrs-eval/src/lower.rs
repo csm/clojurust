@@ -89,10 +89,7 @@ fn lower_arity_inner(
     // expansions rather than unresolvable function calls at runtime.
     let expanded_body: Vec<Form> = body
         .iter()
-        .map(|f| {
-            cljrs_interp::macros::macroexpand_all(f, env)
-                .unwrap_or_else(|_| f.clone())
-        })
+        .map(|f| cljrs_interp::macros::macroexpand_all(f, env).unwrap_or_else(|_| f.clone()))
         .collect();
     let body = expanded_body.as_slice();
 
