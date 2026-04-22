@@ -2,6 +2,7 @@
 name = "cljrs-ir-prebuild"
 version = "0.1.0"
 edition = "2024"
+description = "Pre-compilation tool that serialises standard library forms to IR for clojurust"
 license.workspace = true
 repository.workspace = true
 

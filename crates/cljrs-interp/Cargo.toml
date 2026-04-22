@@ -2,6 +2,7 @@
 name = "cljrs-interp"
 version = "0.1.0"
 edition = "2024"
+description = "Tree-walking interpreter for clojurust (special forms, macros, destructuring)"
 license.workspace = true
 repository.workspace = true
 
