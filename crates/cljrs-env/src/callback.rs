@@ -112,6 +112,8 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     let mut env = Env::new(globals, &ns);
     // Fast path for Clojure functions: call directly through the GlobalEnv
     // function pointer, bypassing the large apply_value stack frame.
+    // Unwrap metadata so a WithMeta-wrapped fn is callable.
+    let f = f.unwrap_meta();
     let result = if let Value::Fn(cljx_fn) = f {
         env.call_cljrs_fn(cljx_fn.get(), &args)
     } else {
