@@ -24,6 +24,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check
+        run: cargo check --workspace
+
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
