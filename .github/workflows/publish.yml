@@ -50,7 +50,7 @@ jobs:
           done
 
           # Update workspace dependency table to use the new version
-          CRATES=(cljrs-logging cljrs-types cljrs-gc cljrs-ir cljrs-reader cljrs-value cljrs-eval cljrs-interop cljrs-runtime cljrs-stdlib cljrs-compiler cljrs)
+          CRATES=(cljrs-logging cljrs-types cljrs-gc cljrs-ir cljrs-reader cljrs-value cljrs-env cljrs-interop cljrs-builtins cljrs-interp cljrs-eval cljrs-ir-prebuild cljrs-runtime cljrs-stdlib cljrs-compiler cljrs)
           for crate in "${CRATES[@]}"; do
             sed -i "s/^${crate} *= *{.*path/${crate} = { version = \"=$VERSION\", path/" Cargo.toml
           done
@@ -74,8 +74,12 @@ jobs:
             cljrs-ir
             cljrs-reader
             cljrs-value
-            cljrs-eval
+            cljrs-env
             cljrs-interop
+            cljrs-builtins
+            cljrs-interp
+            cljrs-eval
+            cljrs-ir-prebuild
             cljrs-runtime
             cljrs-stdlib
             cljrs-compiler
