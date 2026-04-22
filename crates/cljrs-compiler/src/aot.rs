@@ -662,6 +662,7 @@ cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
 cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
+cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
@@ -718,8 +719,8 @@ cc = "1"
         cljrs_eval::eval(form, &mut env).expect("preamble eval error");
     }
     // Re-push eval context with updated namespace (ns form may have changed it).
-    cljrs_eval::callback::pop_eval_context();
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::pop_eval_context();
+    cljrs_env::callback::push_eval_context(&env);
 "#
     } else {
         ""
@@ -752,13 +753,13 @@ fn main() {{
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::push_eval_context(&env);
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
 
     // Pop the eval context.
-    cljrs_eval::callback::pop_eval_context();
+    cljrs_env::callback::pop_eval_context();
 }}
 "#,
         preamble = preamble_code,
@@ -938,7 +939,7 @@ fn main() {
         r#"    let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::push_eval_context(&env);
 
     // Load clojure.test if not already loaded
     let _ = cljrs_eval::eval(
@@ -1021,7 +1022,7 @@ fn main() {
     }
 
     // Pop the eval context.
-    cljrs_eval::callback::pop_eval_context();
+    cljrs_env::callback::pop_eval_context();
 }"#);
 
     code
@@ -1131,6 +1132,7 @@ cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
 cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
+cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
