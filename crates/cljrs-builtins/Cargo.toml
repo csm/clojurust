@@ -2,6 +2,7 @@
 name = "cljrs-builtins"
 version = "0.1.0"
 edition = "2024"
+description = "Built-in function implementations for clojurust (arithmetic, collections, I/O, regex)"
 license.workspace = true
 repository.workspace = true
 
