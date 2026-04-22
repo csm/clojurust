@@ -1,5 +1,7 @@
 # clojurust
 
+[![crates.io](https://img.shields.io/crates/v/cljrs.svg)](https://crates.io/crates/cljrs)
+
 A Rust-hosted dialect of the Clojure programming language.
 
 ---
@@ -77,22 +79,22 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`cljrs-types`](crates/cljrs-types) | Shared foundational types: `Span`, `CljxError`, `CljxResult` | complete |
-| [`cljrs-reader`](crates/cljrs-reader) | Lexer + recursive-descent parser; produces `Form` AST with source spans | complete |
-| [`cljrs-value`](crates/cljrs-value) | `Value` enum; persistent collections (rpds-backed); Clojure-compatible hashing | complete |
-| [`cljrs-gc`](crates/cljrs-gc) | Non-moving mark-and-sweep GC; `GcPtr<T>` smart pointer; `Trace` trait | complete |
-| [`cljrs-env`](crates/cljrs-env) | Shared runtime environment: `GlobalEnv`, `Env`, dynamic bindings, namespace loader, GC roots | complete |
-| [`cljrs-builtins`](crates/cljrs-builtins) | Native Clojure core functions (~300 builtins), transients, regex, bitops | complete |
-| [`cljrs-interp`](crates/cljrs-interp) | Tree-walking Clojure interpreter: eval, special forms, macros, destructuring | complete |
-| [`cljrs-ir`](crates/cljrs-ir) | Intermediate representation types with serialization (postcard); `IrBundle` for prebuilt IR | complete |
-| [`cljrs-eval`](crates/cljrs-eval) | IR-accelerated evaluation: IR interpreter, IR cache, lowering bridge, prebuilt IR loading | complete |
-| [`cljrs-ir-prebuild`](crates/cljrs-ir-prebuild) | CLI tool to pre-lower Clojure namespaces to serialized IR bundles | complete |
-| [`cljrs-stdlib`](crates/cljrs-stdlib) | Embedded stdlib: clojure.string, clojure.set, clojure.test, clojure.walk, clojure.edn, clojure.zip, clojure.data | complete |
-| [`cljrs-logging`](crates/cljrs-logging) | Feature-gated logging (`-X debug:ir`, `-X trace:gc`, etc.) | complete |
-| [`cljrs-compiler`](crates/cljrs-compiler) | IR lowering; JIT (Cranelift) and AOT code generation | partial |
-| [`cljrs-interop`](crates/cljrs-interop) | Rust ↔ Clojure FFI; NativeObject, FromValue/IntoValue, type marshalling | in progress |
-| [`cljrs-runtime`](crates/cljrs-runtime) | Runtime support | stub |
-| [`cljrs`](crates/cljrs) | `cljrs` CLI binary: `run`, `repl`, `eval`, `test` subcommands (clap-based) | functional |
+| [`cljrs-types`](crates/cljrs-types) [![crates.io](https://img.shields.io/crates/v/cljrs-types.svg)](https://crates.io/crates/cljrs-types) | Shared foundational types: `Span`, `CljxError`, `CljxResult` | complete |
+| [`cljrs-reader`](crates/cljrs-reader) [![crates.io](https://img.shields.io/crates/v/cljrs-reader.svg)](https://crates.io/crates/cljrs-reader) | Lexer + recursive-descent parser; produces `Form` AST with source spans | complete |
+| [`cljrs-value`](crates/cljrs-value) [![crates.io](https://img.shields.io/crates/v/cljrs-value.svg)](https://crates.io/crates/cljrs-value) | `Value` enum; persistent collections (rpds-backed); Clojure-compatible hashing | complete |
+| [`cljrs-gc`](crates/cljrs-gc) [![crates.io](https://img.shields.io/crates/v/cljrs-gc.svg)](https://crates.io/crates/cljrs-gc) | Non-moving mark-and-sweep GC; `GcPtr<T>` smart pointer; `Trace` trait | complete |
+| [`cljrs-env`](crates/cljrs-env) [![crates.io](https://img.shields.io/crates/v/cljrs-env.svg)](https://crates.io/crates/cljrs-env) | Shared runtime environment: `GlobalEnv`, `Env`, dynamic bindings, namespace loader, GC roots | complete |
+| [`cljrs-builtins`](crates/cljrs-builtins) [![crates.io](https://img.shields.io/crates/v/cljrs-builtins.svg)](https://crates.io/crates/cljrs-builtins) | Native Clojure core functions (~300 builtins), transients, regex, bitops | complete |
+| [`cljrs-interp`](crates/cljrs-interp) [![crates.io](https://img.shields.io/crates/v/cljrs-interp.svg)](https://crates.io/crates/cljrs-interp) | Tree-walking Clojure interpreter: eval, special forms, macros, destructuring | complete |
+| [`cljrs-ir`](crates/cljrs-ir) [![crates.io](https://img.shields.io/crates/v/cljrs-ir.svg)](https://crates.io/crates/cljrs-ir) | Intermediate representation types with serialization (postcard); `IrBundle` for prebuilt IR | complete |
+| [`cljrs-eval`](crates/cljrs-eval) [![crates.io](https://img.shields.io/crates/v/cljrs-eval.svg)](https://crates.io/crates/cljrs-eval) | IR-accelerated evaluation: IR interpreter, IR cache, lowering bridge, prebuilt IR loading | complete |
+| [`cljrs-ir-prebuild`](crates/cljrs-ir-prebuild) [![crates.io](https://img.shields.io/crates/v/cljrs-ir-prebuild.svg)](https://crates.io/crates/cljrs-ir-prebuild) | CLI tool to pre-lower Clojure namespaces to serialized IR bundles | complete |
+| [`cljrs-stdlib`](crates/cljrs-stdlib) [![crates.io](https://img.shields.io/crates/v/cljrs-stdlib.svg)](https://crates.io/crates/cljrs-stdlib) | Embedded stdlib: clojure.string, clojure.set, clojure.test, clojure.walk, clojure.edn, clojure.zip, clojure.data | complete |
+| [`cljrs-logging`](crates/cljrs-logging) [![crates.io](https://img.shields.io/crates/v/cljrs-logging.svg)](https://crates.io/crates/cljrs-logging) | Feature-gated logging (`-X debug:ir`, `-X trace:gc`, etc.) | complete |
+| [`cljrs-compiler`](crates/cljrs-compiler) [![crates.io](https://img.shields.io/crates/v/cljrs-compiler.svg)](https://crates.io/crates/cljrs-compiler) | IR lowering; JIT (Cranelift) and AOT code generation | partial |
+| [`cljrs-interop`](crates/cljrs-interop) [![crates.io](https://img.shields.io/crates/v/cljrs-interop.svg)](https://crates.io/crates/cljrs-interop) | Rust ↔ Clojure FFI; NativeObject, FromValue/IntoValue, type marshalling | in progress |
+| [`cljrs-runtime`](crates/cljrs-runtime) [![crates.io](https://img.shields.io/crates/v/cljrs-runtime.svg)](https://crates.io/crates/cljrs-runtime) | Runtime support | stub |
+| [`cljrs`](crates/cljrs) [![crates.io](https://img.shields.io/crates/v/cljrs.svg)](https://crates.io/crates/cljrs) | `cljrs` CLI binary: `run`, `repl`, `eval`, `test` subcommands (clap-based) | functional |
 
 Each crate has its own `README.md` with purpose, status, file layout, and public API.
 
