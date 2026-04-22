@@ -1126,7 +1126,7 @@ pub unsafe extern "C" fn rt_load_global(
     };
 
     // Look up in the global environment via the thread-local eval context.
-    if let Some((globals, current_ns)) = cljrs_eval::callback::capture_eval_context() {
+    if let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() {
         // Try the specified namespace first.
         if let Some(val) = globals.lookup_in_ns(ns, name) {
             return box_val(val);
@@ -1167,7 +1167,7 @@ pub unsafe extern "C" fn rt_def_var(
     };
     let val = unsafe { val_ref(val) }.clone();
 
-    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context() {
+    if let Some((globals, _)) = cljrs_env::callback::capture_eval_context() {
         let var = globals.intern(ns, Arc::from(name), val);
         box_val(Value::Var(var))
     } else {
@@ -1195,7 +1195,7 @@ pub unsafe extern "C" fn rt_load_var(
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
 
-    if let Some((globals, current_ns)) = cljrs_eval::callback::capture_eval_context() {
+    if let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() {
         // Try the specified namespace (interns + refers).
         if let Some(var) = globals.lookup_var_in_ns(ns, name) {
             return box_val(Value::Var(var));
@@ -1233,7 +1233,7 @@ pub unsafe extern "C" fn rt_call(
         .map(|p| unsafe { val_ref(*p) }.clone())
         .collect();
 
-    match cljrs_eval::callback::invoke(callee, arg_values) {
+    match cljrs_env::callback::invoke(callee, arg_values) {
         Ok(result) => box_val(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
             // Store thrown exception in thread-local for rt_try to find.
@@ -1253,7 +1253,7 @@ pub unsafe extern "C" fn rt_call(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
-    match cljrs_eval::eval::deref_value(v) {
+    match cljrs_interp::eval::deref_value(v) {
         Ok(result) => box_val(result),
         Err(_) => rt_const_nil(),
     }
@@ -1268,7 +1268,7 @@ pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
-    cljrs_eval::builtins::emit_output_ln(&format!("{}", PrintValue(v)));
+    cljrs_builtins::builtins::emit_output_ln(&format!("{}", PrintValue(v)));
     rt_const_nil()
 }
 
@@ -1279,7 +1279,7 @@ pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_pr(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
-    cljrs_eval::builtins::emit_output(&format!("{v}"));
+    cljrs_builtins::builtins::emit_output(&format!("{v}"));
     rt_const_nil()
 }
 
@@ -1372,7 +1372,7 @@ pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *co
         .map(|v| format!("{}", PrintValue(v)))
         .collect::<Vec<_>>()
         .join(" ");
-    cljrs_eval::builtins::emit_output_ln(&s);
+    cljrs_builtins::builtins::emit_output_ln(&s);
     rt_const_nil()
 }
 
@@ -1385,9 +1385,9 @@ pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *co
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_with_out_str(body_fn: *const Value) -> *const Value {
     let f = unsafe { val_ref(body_fn) }.clone();
-    cljrs_eval::builtins::push_output_capture();
-    let _result = cljrs_eval::callback::invoke(&f, vec![]);
-    let captured = cljrs_eval::builtins::pop_output_capture().unwrap_or_default();
+    cljrs_builtins::builtins::push_output_capture();
+    let _result = cljrs_env::callback::invoke(&f, vec![]);
+    let captured = cljrs_builtins::builtins::pop_output_capture().unwrap_or_default();
     box_val(Value::Str(GcPtr::new(captured)))
 }
 
@@ -1542,8 +1542,8 @@ pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
 
     impl Thunk for CompiledThunk {
         fn force(&self) -> Result<Value, String> {
-            let _root = cljrs_eval::root_value(&self.0);
-            cljrs_eval::callback::invoke(&self.0, vec![]).map_err(|e| format!("{e}"))
+            let _root = cljrs_env::gc_roots::root_value(&self.0);
+            cljrs_env::callback::invoke(&self.0, vec![]).map_err(|e| format!("{e}"))
         }
     }
 
@@ -1720,7 +1720,7 @@ pub unsafe extern "C" fn rt_atom_swap(
                 let current = a.get().value.lock().unwrap().clone();
                 let mut args = vec![current.clone()];
                 args.extend(extra.iter().cloned());
-                match cljrs_eval::callback::invoke(&f, args) {
+                match cljrs_env::callback::invoke(&f, args) {
                     Ok(new_val) => {
                         let mut guard = a.get().value.lock().unwrap();
                         if *guard == current {
@@ -1777,7 +1777,7 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
         }
     }
 
-    match cljrs_eval::callback::invoke(&f, args) {
+    match cljrs_env::callback::invoke(&f, args) {
         Ok(result) => box_val(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
             PENDING_EXCEPTION.with(|cell| {
@@ -1793,10 +1793,10 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
 
 /// Helper: look up a global function by namespace and name, then call it.
 fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
-    if let Some((globals, _)) = cljrs_eval::callback::capture_eval_context()
+    if let Some((globals, _)) = cljrs_env::callback::capture_eval_context()
         && let Some(val) = globals.lookup_in_ns(ns, name)
     {
-        match cljrs_eval::callback::invoke(&val, args) {
+        match cljrs_env::callback::invoke(&val, args) {
             Ok(result) => box_val(result),
             Err(cljrs_value::ValueError::Thrown(v)) => {
                 PENDING_EXCEPTION.with(|cell| {
@@ -1939,7 +1939,7 @@ pub unsafe extern "C" fn rt_set_bang(var_ptr: *const Value, val_ptr: *const Valu
     match var_val {
         Value::Var(var) => {
             // Prefer updating thread-local binding if one exists.
-            if !cljrs_eval::dynamics::set_thread_local(var, val.clone()) {
+            if !cljrs_env::dynamics::set_thread_local(var, val.clone()) {
                 var.get().bind(val.clone());
             }
             box_val(val)
@@ -1976,14 +1976,14 @@ pub unsafe extern "C" fn rt_with_bindings(
         let var_val = unsafe { val_ref(binding_slice[i * 2]) };
         let val = unsafe { val_ref(binding_slice[i * 2 + 1]) }.clone();
         if let Value::Var(var) = var_val {
-            frame.insert(cljrs_eval::dynamics::var_key_of(var), val);
+            frame.insert(cljrs_env::dynamics::var_key_of(var), val);
         }
     }
 
-    let _guard = cljrs_eval::dynamics::push_frame(frame);
+    let _guard = cljrs_env::dynamics::push_frame(frame);
     let body = unsafe { val_ref(body_fn) }.clone();
 
-    match cljrs_eval::callback::invoke(&body, vec![]) {
+    match cljrs_env::callback::invoke(&body, vec![]) {
         Ok(result) => box_val(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
             PENDING_EXCEPTION.with(|cell| {
@@ -2050,7 +2050,7 @@ pub unsafe extern "C" fn rt_try(
     let region_depth = cljrs_gc::region::region_stack_depth();
 
     // Call the body.
-    let body_result = cljrs_eval::callback::invoke(&body, vec![]);
+    let body_result = cljrs_env::callback::invoke(&body, vec![]);
 
     // Check for thrown exception (set by rt_throw in compiled code).
     let ret = if let Some(thrown_ptr) = take_pending_exception() {
@@ -2059,7 +2059,7 @@ pub unsafe extern "C" fn rt_try(
         // Exception was thrown from compiled code.
         if !matches!(catch, Value::Nil) {
             let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
-            match cljrs_eval::callback::invoke(&catch, vec![thrown_val]) {
+            match cljrs_env::callback::invoke(&catch, vec![thrown_val]) {
                 Ok(v) => box_val(v),
                 Err(_) => rt_const_nil(),
             }
@@ -2078,7 +2078,7 @@ pub unsafe extern "C" fn rt_try(
                         cljrs_value::ValueError::Thrown(v) => v,
                         other => Value::Str(GcPtr::new(other.to_string())),
                     };
-                    match cljrs_eval::callback::invoke(&catch, vec![thrown_val]) {
+                    match cljrs_env::callback::invoke(&catch, vec![thrown_val]) {
                         Ok(v) => box_val(v),
                         Err(_) => rt_const_nil(),
                     }
@@ -2091,7 +2091,7 @@ pub unsafe extern "C" fn rt_try(
 
     // Always run finally.
     if !matches!(finally, Value::Nil) {
-        let _ = cljrs_eval::callback::invoke(&finally, vec![]);
+        let _ = cljrs_env::callback::invoke(&finally, vec![]);
     }
 
     ret
@@ -2453,7 +2453,7 @@ pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    cljrs_eval::builtins::emit_output_ln(&format!("{val}"));
+    cljrs_builtins::builtins::emit_output_ln(&format!("{val}"));
     box_val(Value::Nil)
 }
 
@@ -2464,7 +2464,7 @@ pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_print(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    cljrs_eval::builtins::emit_output(&format!("{}", PrintValue(val)));
+    cljrs_builtins::builtins::emit_output(&format!("{}", PrintValue(val)));
     box_val(Value::Nil)
 }
 

@@ -3,7 +3,7 @@ use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{Value, ValueError, ValueResult};
 
 // Work-alike for 'new' for a limited set of "classes"
-pub(crate) fn builtin_new(args: &[Value]) -> ValueResult<Value> {
+pub fn builtin_new(args: &[Value]) -> ValueResult<Value> {
     if let Value::Symbol(symbol) = &args[0] {
         match symbol.get().full_name().as_str() {
             "Exception" | "java.lang.Exception" => builtin_exception_dot(&args[1..]),
@@ -20,7 +20,7 @@ pub(crate) fn builtin_new(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-pub(crate) fn builtin_exception_dot(args: &[Value]) -> ValueResult<Value> {
+pub fn builtin_exception_dot(args: &[Value]) -> ValueResult<Value> {
     if args.is_empty() {
         Ok(Value::Error(GcPtr::new(ExceptionInfo::new(
             ValueError::Other("".to_string()),

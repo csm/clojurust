@@ -1,15 +1,14 @@
 //! Macro expansion pipeline.
 
-use std::sync::Arc;
-
+use cljrs_builtins::form::form_to_value;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_types::span::Span;
 use cljrs_value::{Symbol, Value};
+use std::sync::Arc;
 
-use crate::env::Env;
-use crate::error::{EvalError, EvalResult};
-use crate::eval::form_to_value;
+use cljrs_env::env::Env;
+use cljrs_env::error::{EvalError, EvalResult};
 
 /// Expand a form one step.  Returns the same form if it is not a macro call.
 pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
@@ -31,7 +30,7 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
         };
         let mut args = vec![form_val, env_val];
         args.extend(parts[1..].iter().map(form_to_value));
-        let expanded = crate::apply::call_cljrs_fn(&macro_fn, args, env)?;
+        let expanded = crate::apply::call_cljrs_fn(&macro_fn, &args, env)?;
         let dummy = Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
         return value_to_form(&expanded, dummy);
     }

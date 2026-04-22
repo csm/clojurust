@@ -1,4 +1,8 @@
+// Utility functions.
+
 use bigdecimal::BigDecimal;
+use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_gc::GcPtr;
 use cljrs_value::{Value, ValueError, ValueResult};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
@@ -57,5 +61,48 @@ pub fn numeric_as_i64(v: &Value) -> ValueResult<i64> {
             expected: "integer",
             got: v.type_name().to_string(),
         }),
+    }
+}
+
+// ── Numeric parsing ───────────────────────────────────────────────────────────
+
+pub fn parse_bigint(s: &str) -> EvalResult {
+    let s = s.trim_end_matches('N');
+    s.parse::<num_bigint::BigInt>()
+        .map(|n| Value::BigInt(GcPtr::new(n)))
+        .map_err(|e| EvalError::Runtime(format!("bad bigint: {e}")))
+}
+
+pub fn parse_bigdecimal(s: &str) -> EvalResult {
+    let s = s.trim_end_matches('M');
+    s.parse::<bigdecimal::BigDecimal>()
+        .map(|d| Value::BigDecimal(GcPtr::new(d)))
+        .map_err(|e| EvalError::Runtime(format!("bad bigdecimal: {e}")))
+}
+
+pub fn parse_ratio(s: &str) -> EvalResult {
+    use num_traits::{ToPrimitive, Zero};
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        return Err(EvalError::Runtime(format!("bad ratio: {s}")));
+    }
+    let numer: num_bigint::BigInt = parts[0]
+        .parse()
+        .map_err(|e| EvalError::Runtime(format!("bad ratio numer: {e}")))?;
+    let denom: num_bigint::BigInt = parts[1]
+        .parse()
+        .map_err(|e| EvalError::Runtime(format!("bad ratio denom: {e}")))?;
+    if denom.is_zero() {
+        return Err(EvalError::Runtime("ratio denominator is zero".into()));
+    }
+    let r = num_rational::Ratio::new(numer, denom);
+    if r.is_integer() {
+        let n = r.to_integer();
+        match n.to_i64() {
+            Some(i) => Ok(Value::Long(i)),
+            None => Ok(Value::BigInt(GcPtr::new(n))),
+        }
+    } else {
+        Ok(Value::Ratio(GcPtr::new(r)))
     }
 }

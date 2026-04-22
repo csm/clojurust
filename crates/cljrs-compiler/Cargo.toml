@@ -10,13 +10,16 @@ repository.workspace = true
 aot_full_test = []
 
 [dependencies]
-cljrs-types  = { workspace = true }
-cljrs-ir     = { workspace = true }
-cljrs-gc     = { workspace = true }
-cljrs-value  = { workspace = true }
-cljrs-reader = { workspace = true }
-cljrs-eval   = { workspace = true }
-cljrs-stdlib = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-types    = { workspace = true }
+cljrs-ir       = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-stdlib   = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-interp   = { workspace = true }
 
 cranelift-codegen  = { workspace = true }
 cranelift-frontend = { workspace = true }

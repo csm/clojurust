@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use cljrs_eval::eval::form_to_value;
+use cljrs_builtins::form::form_to_value;
 use cljrs_reader::Parser;
 use cljrs_value::{Arity, Keyword, ResourceHandle, Value, ValueError, ValueResult};
 

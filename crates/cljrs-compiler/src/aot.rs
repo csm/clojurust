@@ -17,7 +17,7 @@ use cljrs_reader::Parser;
 
 use crate::codegen::Compiler;
 use crate::ir::IrFunction;
-use crate::ir_convert;
+use cljrs_eval::ir_convert;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -81,12 +81,19 @@ pub fn lower_via_clojure(
     crate::register_compiler_sources(&env.globals);
 
     // Push eval context so callback::invoke can work.
-    cljrs_eval::callback::push_eval_context(env);
+    cljrs_env::callback::push_eval_context(env);
+
+    // Set IR_LOWERING_ACTIVE to prevent eager lowering of closures
+    // created inside the Clojure compiler during this lowering call.
+    use cljrs_eval::apply::IR_LOWERING_ACTIVE;
+    let was_active = IR_LOWERING_ACTIVE.with(|c| c.get());
+    IR_LOWERING_ACTIVE.with(|c| c.set(true));
 
     let result = lower_via_clojure_inner(name, ns, params, compilable_forms, env);
 
-    // Always pop eval context, regardless of success or failure.
-    cljrs_eval::callback::pop_eval_context();
+    // Restore lowering flag and pop eval context.
+    IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
+    cljrs_env::callback::pop_eval_context();
 
     result
 }
@@ -148,11 +155,13 @@ fn lower_via_clojure_inner(
 
     // 4. body-forms (vector of form values)
     let body_forms_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        compilable_forms.iter().map(cljrs_eval::eval::form_to_value),
+        compilable_forms
+            .iter()
+            .map(cljrs_builtins::form::form_to_value),
     )));
 
     // Call the Clojure lowering function.
-    let ir_data = cljrs_eval::callback::invoke(
+    let ir_data = cljrs_env::callback::invoke(
         &lower_fn_val,
         vec![fname_val, ns_val, params_val, body_forms_val],
     )
@@ -165,7 +174,7 @@ fn lower_via_clojure_inner(
         .ok_or_else(|| AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string()))?;
     let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
 
-    let optimized = cljrs_eval::callback::invoke(&optimize_fn_val, vec![ir_data])
+    let optimized = cljrs_env::callback::invoke(&optimize_fn_val, vec![ir_data])
         .map_err(|e| AotError::Eval(format!("Optimization failed: {e:?}")))?;
 
     // Convert the result Value → IrFunction.
@@ -199,11 +208,9 @@ fn collect_defn_arities(
     for block in &ir_func.blocks {
         for inst in &block.insts {
             match inst {
-                Inst::AllocClosure(dst, template, captures) => {
+                Inst::AllocClosure(dst, template, captures) if captures.is_empty() => {
                     // Only consider zero-capture closures (top-level defns).
-                    if captures.is_empty() {
-                        closure_templates.insert(*dst, template.clone());
-                    }
+                    closure_templates.insert(*dst, template.clone());
                 }
                 Inst::DefVar(_, ns, name, val) => {
                     if let Some(template) = closure_templates.get(val) {
@@ -372,7 +379,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
                 Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
             }
         }
-        match cljrs_eval::macros::macroexpand_all(form, &mut env) {
+        match cljrs_interp::macros::macroexpand_all(form, &mut env) {
             Ok(f) => expanded.push(f),
             Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
         }
@@ -571,7 +578,7 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
 /// newly loaded namespace that isn't a builtin source, resolves and reads
 /// its source file from `src_dirs`.
 fn discover_bundled_sources(
-    globals: &Arc<cljrs_eval::env::GlobalEnv>,
+    globals: &Arc<cljrs_env::env::GlobalEnv>,
     pre_loaded: &std::collections::HashSet<Arc<str>>,
     src_dirs: &[PathBuf],
 ) -> Vec<(Arc<str>, String)> {
@@ -655,6 +662,7 @@ cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
 cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
+cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
@@ -711,8 +719,8 @@ cc = "1"
         cljrs_eval::eval(form, &mut env).expect("preamble eval error");
     }
     // Re-push eval context with updated namespace (ns form may have changed it).
-    cljrs_eval::callback::pop_eval_context();
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::pop_eval_context();
+    cljrs_env::callback::push_eval_context(&env);
 "#
     } else {
         ""
@@ -745,13 +753,13 @@ fn main() {{
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::push_eval_context(&env);
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
 
     // Pop the eval context.
-    cljrs_eval::callback::pop_eval_context();
+    cljrs_env::callback::pop_eval_context();
 }}
 "#,
         preamble = preamble_code,
@@ -769,6 +777,7 @@ fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
     let output = std::process::Command::new("cargo")
         .arg("build")
         .arg("--release")
+        .arg("--offline")
         .current_dir(harness_dir)
         .output()?;
 
@@ -800,6 +809,7 @@ fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResul
     let output = std::process::Command::new("cargo")
         .arg("build")
         .arg("--release")
+        .arg("--offline")
         .current_dir(harness_dir)
         .output()?;
 
@@ -931,7 +941,7 @@ fn main() {
         r#"    let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_eval::callback::push_eval_context(&env);
+    cljrs_env::callback::push_eval_context(&env);
 
     // Load clojure.test if not already loaded
     let _ = cljrs_eval::eval(
@@ -1014,7 +1024,7 @@ fn main() {
     }
 
     // Pop the eval context.
-    cljrs_eval::callback::pop_eval_context();
+    cljrs_env::callback::pop_eval_context();
 }"#);
 
     code
@@ -1124,6 +1134,7 @@ cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
 cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
+cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}

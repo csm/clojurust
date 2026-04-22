@@ -1,3 +1,4 @@
+/// Bitwise operations.
 use crate::util::numeric_as_i64;
 use cljrs_value::{Value, ValueResult};
 

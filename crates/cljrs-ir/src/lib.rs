@@ -9,15 +9,20 @@
 //! 2. **IR interpreter** (Tier 1 execution)
 //! 3. **Cranelift-based JIT/AOT code generation** (Tier 2 execution)
 
+#![allow(clippy::result_large_err)]
+
+use cljrs_types::error::CljxError::SerializationError;
+use cljrs_types::error::CljxResult;
+use cljrs_types::span::Span;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-
-use cljrs_types::span::Span;
 
 // ── Variable IDs ─────────────────────────────────────────────────────────────
 
 /// A unique variable identifier within an IR function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VarId(pub u32);
 
 impl fmt::Display for VarId {
@@ -27,7 +32,7 @@ impl fmt::Display for VarId {
 }
 
 /// A basic block identifier within an IR function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
 impl fmt::Display for BlockId {
@@ -43,7 +48,7 @@ impl fmt::Display for BlockId {
 /// When the IR can identify a call target as a known function, it uses this
 /// enum instead of a generic `Call` — enabling escape analysis to reason
 /// precisely about argument flow and allocation behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KnownFn {
     // Collection constructors
     Vector,
@@ -212,7 +217,7 @@ pub enum Effect {
 
 /// A constant value in the IR. Kept separate from `Value` to avoid requiring
 /// GC allocation for IR analysis.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Const {
     Nil,
     Bool(bool),
@@ -231,7 +236,7 @@ pub enum Const {
 ///
 /// Instructions are in A-normal form: all operands are `VarId` references to
 /// previously computed values, never nested expressions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Inst {
     /// Load a constant value.
     Const(VarId, Const),
@@ -314,7 +319,7 @@ pub enum Inst {
 }
 
 /// The kind of object allocated in a region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionAllocKind {
     /// `[elem ...]` — vector from elements.
     Vector,
@@ -341,7 +346,7 @@ impl fmt::Display for RegionAllocKind {
 }
 
 /// Template for a closure — the static parts of an `fn*` form.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosureTemplate {
     /// Function name (if named).
     pub name: Option<Arc<str>>,
@@ -360,7 +365,7 @@ pub struct ClosureTemplate {
 // ── Terminators ──────────────────────────────────────────────────────────────
 
 /// A block terminator — controls flow between basic blocks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Terminator {
     /// Unconditional jump.
     Jump(BlockId),
@@ -385,7 +390,7 @@ pub enum Terminator {
 // ── Basic blocks and functions ───────────────────────────────────────────────
 
 /// A basic block: a linear sequence of instructions followed by a terminator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub id: BlockId,
     /// Phi nodes at the top of this block (only at join points).
@@ -397,7 +402,7 @@ pub struct Block {
 }
 
 /// An IR function — the unit of analysis.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IrFunction {
     /// Function name (for diagnostics).
     pub name: Option<Arc<str>>,
@@ -442,6 +447,104 @@ impl IrFunction {
         self.next_block += 1;
         id
     }
+
+    /// Build a block index: `block_id.0` → index in `self.blocks`.
+    ///
+    /// If block IDs are dense and match array indices (the common case from
+    /// the compiler), returns `None` — callers can use `block_id.0 as usize`
+    /// directly.  Otherwise returns a lookup table.
+    pub fn block_index(&self) -> Option<Vec<usize>> {
+        // Check if block IDs are dense and sequential (0, 1, 2, ...).
+        let is_identity = self
+            .blocks
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.id.0 as usize == i);
+        if is_identity {
+            return None; // Use block_id.0 directly as index.
+        }
+        // Sparse case: build a lookup table.
+        let max_id = self.blocks.iter().map(|b| b.id.0).max().unwrap_or(0);
+        let mut table = vec![0usize; max_id as usize + 1];
+        for (i, b) in self.blocks.iter().enumerate() {
+            table[b.id.0 as usize] = i;
+        }
+        Some(table)
+    }
+
+    pub fn serialize(&self) -> CljxResult<Vec<u8>> {
+        postcard::to_allocvec(self).map_err(|e| SerializationError {
+            message: e.to_string(),
+        })
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> CljxResult<Self> {
+        postcard::from_bytes(bytes).map_err(|e| SerializationError {
+            message: e.to_string(),
+        })
+    }
+}
+
+// ── IR Bundle ───────────────────────────────────────────────────────────────
+
+/// A bundle of pre-lowered IR functions, keyed by a string identifier.
+///
+/// Used to serialize multiple functions (e.g. an entire namespace) into a
+/// single blob that can be loaded at startup without running the Clojure
+/// compiler.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IrBundle {
+    /// Bundle entries keyed by identifier (typically `"ns/name:arity"` or
+    /// the arity ID as a string).
+    pub functions: HashMap<String, IrFunction>,
+}
+
+impl IrBundle {
+    pub fn new() -> Self {
+        Self {
+            functions: HashMap::new(),
+        }
+    }
+
+    /// Insert a function into the bundle.
+    pub fn insert(&mut self, key: String, func: IrFunction) {
+        self.functions.insert(key, func);
+    }
+
+    /// Look up a function by key.
+    pub fn get(&self, key: &str) -> Option<&IrFunction> {
+        self.functions.get(key)
+    }
+
+    /// Number of functions in the bundle.
+    pub fn len(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// Whether the bundle is empty.
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
+    }
+}
+
+impl Default for IrBundle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Serialize an [`IrBundle`] to bytes.
+pub fn serialize_bundle(bundle: &IrBundle) -> CljxResult<Vec<u8>> {
+    postcard::to_allocvec(bundle).map_err(|e| SerializationError {
+        message: e.to_string(),
+    })
+}
+
+/// Deserialize an [`IrBundle`] from bytes.
+pub fn deserialize_bundle(bytes: &[u8]) -> CljxResult<IrBundle> {
+    postcard::from_bytes(bytes).map_err(|e| SerializationError {
+        message: e.to_string(),
+    })
 }
 
 // ── Effect classification ────────────────────────────────────────────────────
@@ -750,5 +853,265 @@ impl fmt::Display for Terminator {
             }
             Terminator::Unreachable => write!(f, "unreachable"),
         }
+    }
+}
+
+// ── Embedded Clojure compiler sources ───────────────────────────────────────
+
+/// Clojure source for the IR builder namespace.
+pub const COMPILER_IR_SOURCE: &str = include_str!("clojure/compiler/ir.cljrs");
+
+/// Clojure source for the known function resolution namespace.
+pub const COMPILER_KNOWN_SOURCE: &str = include_str!("clojure/compiler/known.cljrs");
+
+/// Clojure source for the ANF lowering namespace.
+pub const COMPILER_ANF_SOURCE: &str = include_str!("clojure/compiler/anf.cljrs");
+
+/// Clojure source for the escape analysis namespace.
+pub const COMPILER_ESCAPE_SOURCE: &str = include_str!("clojure/compiler/escape.cljrs");
+
+/// Clojure source for the optimization pass namespace.
+pub const COMPILER_OPTIMIZE_SOURCE: &str = include_str!("clojure/compiler/optimize.cljrs");
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a simple IR function for testing: one block that returns a constant.
+    fn make_test_fn(name: &str, const_val: i64) -> IrFunction {
+        let mut f = IrFunction::new(Some(Arc::from(name)), None);
+        let dst = f.fresh_var();
+        let block_id = f.fresh_block();
+        f.blocks.push(Block {
+            id: block_id,
+            phis: vec![],
+            insts: vec![Inst::Const(dst, Const::Long(const_val))],
+            terminator: Terminator::Return(dst),
+        });
+        f
+    }
+
+    #[test]
+    fn test_ir_function_serialize_roundtrip() {
+        let f = make_test_fn("identity", 42);
+        let bytes = f.serialize().unwrap();
+        let f2 = IrFunction::deserialize(&bytes).unwrap();
+        assert_eq!(f2.name.as_deref(), Some("identity"));
+        assert_eq!(f2.blocks.len(), 1);
+        assert_eq!(f2.next_var, 1);
+        match &f2.blocks[0].insts[0] {
+            Inst::Const(_, Const::Long(v)) => assert_eq!(*v, 42),
+            other => panic!("expected Const(Long(42)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ir_function_with_closure_template() {
+        let mut f = IrFunction::new(Some(Arc::from("outer")), None);
+        let dst = f.fresh_var();
+        let capture = f.fresh_var();
+        let block_id = f.fresh_block();
+        f.blocks.push(Block {
+            id: block_id,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(capture, Const::Str(Arc::from("hello"))),
+                Inst::AllocClosure(
+                    dst,
+                    ClosureTemplate {
+                        name: Some(Arc::from("inner")),
+                        arity_fn_names: vec![Arc::from("inner__0")],
+                        param_counts: vec![1],
+                        is_variadic: vec![false],
+                        capture_names: vec![Arc::from("x")],
+                    },
+                    vec![capture],
+                ),
+            ],
+            terminator: Terminator::Return(dst),
+        });
+
+        let bytes = f.serialize().unwrap();
+        let f2 = IrFunction::deserialize(&bytes).unwrap();
+        match &f2.blocks[0].insts[1] {
+            Inst::AllocClosure(_, tmpl, captures) => {
+                assert_eq!(tmpl.name.as_deref(), Some("inner"));
+                assert_eq!(tmpl.param_counts, vec![1]);
+                assert_eq!(tmpl.is_variadic, vec![false]);
+                assert_eq!(captures.len(), 1);
+            }
+            other => panic!("expected AllocClosure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_empty_bundle_roundtrip() {
+        let bundle = IrBundle::new();
+        assert!(bundle.is_empty());
+        let bytes = serialize_bundle(&bundle).unwrap();
+        let bundle2 = deserialize_bundle(&bytes).unwrap();
+        assert!(bundle2.is_empty());
+        assert_eq!(bundle2.len(), 0);
+    }
+
+    #[test]
+    fn test_bundle_single_function() {
+        let mut bundle = IrBundle::new();
+        bundle.insert("clojure.core/inc:1".to_string(), make_test_fn("inc", 1));
+        assert_eq!(bundle.len(), 1);
+
+        let bytes = serialize_bundle(&bundle).unwrap();
+        let bundle2 = deserialize_bundle(&bytes).unwrap();
+        assert_eq!(bundle2.len(), 1);
+
+        let f = bundle2.get("clojure.core/inc:1").unwrap();
+        assert_eq!(f.name.as_deref(), Some("inc"));
+    }
+
+    #[test]
+    fn test_bundle_multiple_functions() {
+        let mut bundle = IrBundle::new();
+        bundle.insert("clojure.core/inc:1".to_string(), make_test_fn("inc", 1));
+        bundle.insert("clojure.core/dec:1".to_string(), make_test_fn("dec", -1));
+        bundle.insert(
+            "clojure.core/identity:1".to_string(),
+            make_test_fn("identity", 0),
+        );
+        assert_eq!(bundle.len(), 3);
+
+        let bytes = serialize_bundle(&bundle).unwrap();
+        let bundle2 = deserialize_bundle(&bytes).unwrap();
+        assert_eq!(bundle2.len(), 3);
+
+        assert_eq!(
+            bundle2.get("clojure.core/inc:1").unwrap().name.as_deref(),
+            Some("inc")
+        );
+        assert_eq!(
+            bundle2.get("clojure.core/dec:1").unwrap().name.as_deref(),
+            Some("dec")
+        );
+        assert_eq!(
+            bundle2
+                .get("clojure.core/identity:1")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("identity")
+        );
+        assert!(bundle2.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_bundle_with_complex_ir() {
+        let mut f = IrFunction::new(Some(Arc::from("complex")), None);
+        let p0 = f.fresh_var();
+        let p1 = f.fresh_var();
+        f.params = vec![(Arc::from("x"), p0), (Arc::from("y"), p1)];
+
+        // Entry block: branch on x
+        let entry = f.fresh_block();
+        let then_bb = f.fresh_block();
+        let else_bb = f.fresh_block();
+        let join_bb = f.fresh_block();
+
+        let cond_dst = f.fresh_var();
+        f.blocks.push(Block {
+            id: entry,
+            phis: vec![],
+            insts: vec![Inst::CallKnown(cond_dst, KnownFn::IsNil, vec![p0])],
+            terminator: Terminator::Branch {
+                cond: cond_dst,
+                then_block: then_bb,
+                else_block: else_bb,
+            },
+        });
+
+        // Then block: return y
+        f.blocks.push(Block {
+            id: then_bb,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Jump(join_bb),
+        });
+
+        // Else block: return x
+        f.blocks.push(Block {
+            id: else_bb,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Jump(join_bb),
+        });
+
+        // Join block: phi + return
+        let phi_dst = f.fresh_var();
+        f.blocks.push(Block {
+            id: join_bb,
+            phis: vec![Inst::Phi(phi_dst, vec![(then_bb, p1), (else_bb, p0)])],
+            insts: vec![],
+            terminator: Terminator::Return(phi_dst),
+        });
+
+        let mut bundle = IrBundle::new();
+        bundle.insert("test/complex:2".to_string(), f);
+
+        let bytes = serialize_bundle(&bundle).unwrap();
+        let bundle2 = deserialize_bundle(&bytes).unwrap();
+
+        let f2 = bundle2.get("test/complex:2").unwrap();
+        assert_eq!(f2.params.len(), 2);
+        assert_eq!(f2.blocks.len(), 4);
+
+        // Verify branch terminator survived roundtrip
+        match &f2.blocks[0].terminator {
+            Terminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                assert_eq!(*cond, cond_dst);
+                assert_eq!(*then_block, then_bb);
+                assert_eq!(*else_block, else_bb);
+            }
+            other => panic!("expected Branch, got {other:?}"),
+        }
+
+        // Verify phi survived roundtrip
+        assert_eq!(f2.blocks[3].phis.len(), 1);
+        match &f2.blocks[3].phis[0] {
+            Inst::Phi(dst, entries) => {
+                assert_eq!(*dst, phi_dst);
+                assert_eq!(entries.len(), 2);
+            }
+            other => panic!("expected Phi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bundle_with_subfunctions() {
+        let mut outer = make_test_fn("outer", 100);
+        let inner = make_test_fn("inner", 200);
+        outer.subfunctions.push(inner);
+
+        let mut bundle = IrBundle::new();
+        bundle.insert("test/outer:0".to_string(), outer);
+
+        let bytes = serialize_bundle(&bundle).unwrap();
+        let bundle2 = deserialize_bundle(&bytes).unwrap();
+
+        let f = bundle2.get("test/outer:0").unwrap();
+        assert_eq!(f.subfunctions.len(), 1);
+        assert_eq!(f.subfunctions[0].name.as_deref(), Some("inner"));
+    }
+
+    #[test]
+    fn test_deserialize_invalid_bytes() {
+        let result = IrFunction::deserialize(&[0xFF, 0xFE, 0xFD]);
+        assert!(result.is_err());
+
+        let result = deserialize_bundle(&[0xFF, 0xFE, 0xFD]);
+        assert!(result.is_err());
     }
 }

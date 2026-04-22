@@ -1,26 +1,20 @@
-//! Tap system: add-tap, remove-tap, tap>
-//!
-//! `tap>` enqueues a value (bounded queue, drops on overflow).
-//! A background drain thread delivers values to all registered tap fns.
-
 use crate::callback::{capture_eval_context, install_eval_context};
 use crate::dynamics;
-use cljrs_value::{Value, ValueResult};
+use crate::env::GlobalEnv;
+use cljrs_value::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::env::GlobalEnv;
-
 const TAP_QUEUE_CAPACITY: usize = 1024;
 
-struct TapState {
+pub struct TapState {
     fns: Vec<Value>,
     queue: VecDeque<Value>,
     draining: bool,
 }
 
-static TAP: std::sync::LazyLock<(Mutex<TapState>, Condvar)> = std::sync::LazyLock::new(|| {
+pub static TAP: std::sync::LazyLock<(Mutex<TapState>, Condvar)> = std::sync::LazyLock::new(|| {
     (
         Mutex::new(TapState {
             fns: Vec::new(),
@@ -79,9 +73,7 @@ fn needs_drain(state: &TapState) -> bool {
     !state.draining && !state.queue.is_empty() && !state.fns.is_empty()
 }
 
-/// (add-tap f) — register a tap fn. Returns nil.
-pub fn builtin_add_tap(args: &[Value]) -> ValueResult<Value> {
-    let f = args[0].clone();
+pub fn add_tap(f: Value) {
     let should_spawn = {
         let (lock, _) = &*TAP;
         let mut state = lock.lock().unwrap();
@@ -101,17 +93,13 @@ pub fn builtin_add_tap(args: &[Value]) -> ValueResult<Value> {
         let (_, cvar) = &*TAP;
         cvar.notify_one();
     }
-    Ok(Value::Nil)
 }
 
-/// (remove-tap f) — unregister a tap fn. Returns nil.
-pub fn builtin_remove_tap(args: &[Value]) -> ValueResult<Value> {
-    let f = &args[0];
+pub fn remove_tap(f: &Value) {
     let (lock, cvar) = &*TAP;
     let mut state = lock.lock().unwrap();
     state.fns.retain(|existing| existing != f);
     cvar.notify_one();
-    Ok(Value::Nil)
 }
 
 /// Trace all GcPtr values in the tap system as GC roots.
@@ -127,17 +115,15 @@ pub fn trace_roots(visitor: &mut cljrs_gc::MarkVisitor) {
     }
 }
 
-/// (tap> val) — enqueue a value. Returns true if enqueued, false if dropped.
-pub fn builtin_tap_send(args: &[Value]) -> ValueResult<Value> {
-    let val = args[0].clone();
+pub fn send(val: Value) -> bool {
     let should_spawn = {
         let (lock, _) = &*TAP;
         let mut state = lock.lock().unwrap();
         if state.fns.is_empty() {
-            return Ok(Value::Bool(false));
+            return false;
         }
         if state.queue.len() >= TAP_QUEUE_CAPACITY {
-            return Ok(Value::Bool(false));
+            return false;
         }
         state.queue.push_back(val);
         let spawn = needs_drain(&state);
@@ -151,5 +137,5 @@ pub fn builtin_tap_send(args: &[Value]) -> ValueResult<Value> {
     }
     let (_, cvar) = &*TAP;
     cvar.notify_one();
-    Ok(Value::Bool(true))
+    true
 }

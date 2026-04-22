@@ -10,7 +10,6 @@
 //! indexed by `VarId`.  Control flow follows the block graph via
 //! `Terminator`s.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use cljrs_gc::GcPtr;
@@ -18,11 +17,13 @@ use cljrs_ir::{
     BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId,
 };
 use cljrs_value::value::{MapValue, SetValue};
-use cljrs_value::{CljxCons, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value};
+use cljrs_value::{
+    CljxCons, CljxFn, NativeFn, PersistentHashSet, PersistentList, PersistentVector, Value,
+};
 
-use crate::apply::apply_value;
-use crate::env::{Env, GlobalEnv};
-use crate::error::{EvalError, EvalResult};
+use cljrs_env::apply::apply_value;
+use cljrs_env::env::{Env, GlobalEnv};
+use cljrs_env::error::{EvalError, EvalResult};
 
 // ── Register file ───────────────────────────────────────────────────────────
 
@@ -95,7 +96,7 @@ pub fn interpret_ir(
     env: &mut Env,
 ) -> EvalResult {
     // GC safepoint at function entry.
-    crate::gc_safepoint(env);
+    cljrs_env::gc_roots::gc_safepoint(env);
 
     let mut regs = Registers::new(ir_func.next_var);
     let mut region_stack: Vec<RegionEntry> = Vec::new();
@@ -110,12 +111,17 @@ pub fn interpret_ir(
     }
 
     // Build a block index for O(1) lookup.
-    let block_index: HashMap<BlockId, usize> = ir_func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.id, i))
-        .collect();
+    // In the common case (dense sequential IDs), this is None and we use
+    // block_id.0 directly as the index — no allocation at all.
+    let block_index = ir_func.block_index();
+
+    // Closure to resolve BlockId → index in ir_func.blocks.
+    let resolve = |bid: &BlockId| -> usize {
+        match &block_index {
+            Some(table) => table[bid.0 as usize],
+            None => bid.0 as usize,
+        }
+    };
 
     // Start at block 0.
     let mut current_block_idx: usize = 0;
@@ -156,7 +162,7 @@ pub fn interpret_ir(
             }
             Terminator::Jump(target) => {
                 prev_block_id = block.id;
-                current_block_idx = block_index[target];
+                current_block_idx = resolve(target);
             }
             Terminator::Branch {
                 cond,
@@ -167,24 +173,17 @@ pub fn interpret_ir(
                 let cond_val = regs.get(*cond);
                 let truthy = is_truthy(cond_val);
                 let target = if truthy { then_block } else { else_block };
-                current_block_idx = block_index[target];
+                current_block_idx = resolve(target);
             }
-            Terminator::RecurJump { target, args } => {
+            Terminator::RecurJump { target, args: _ } => {
                 // GC safepoint at loop back-edge.
-                crate::gc_safepoint(env);
+                cljrs_env::gc_roots::gc_safepoint(env);
 
-                // Collect new arg values before rebinding (avoid aliasing).
-                let new_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-
-                // Rebind parameters.
-                for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
-                    if i < new_vals.len() {
-                        regs.set(*var_id, new_vals[i].clone());
-                    }
-                }
-
+                // Jump to the target (loop header) block.
+                // Phi nodes at the target block entry will resolve the new
+                // loop variable values based on this block as predecessor.
                 prev_block_id = block.id;
-                current_block_idx = block_index[target];
+                current_block_idx = resolve(target);
             }
             Terminator::Unreachable => {
                 return Err(EvalError::Runtime(
@@ -230,14 +229,21 @@ fn execute_inst(
         }
 
         Inst::LoadGlobal(dst, gns, name) => {
-            let val = load_global_value(globals, gns, name)?;
+            let val = load_global_value(globals, gns, name, ns)?;
             regs.set(*dst, val);
         }
 
         Inst::LoadVar(dst, gns, name) => {
-            let var = globals.lookup_var_in_ns(gns, name).ok_or_else(|| {
-                EvalError::Runtime(format!("IR interpreter: var not found {gns}/{name}"))
-            })?;
+            let resolved_ns = globals
+                .resolve_alias(ns, gns)
+                .unwrap_or_else(|| Arc::from(&**gns));
+            let var = globals
+                .lookup_var_in_ns(&resolved_ns, name)
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "IR interpreter: var not found {resolved_ns}/{name}"
+                    ))
+                })?;
             regs.set(*dst, Value::Var(var));
         }
 
@@ -282,7 +288,7 @@ fn execute_inst(
 
         Inst::CallKnown(dst, known_fn, args) => {
             // GC safepoint before call.
-            crate::gc_safepoint(env);
+            cljrs_env::gc_roots::gc_safepoint(env);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_known_fn(known_fn, arg_vals, env)?;
             regs.set(*dst, result);
@@ -290,7 +296,7 @@ fn execute_inst(
 
         Inst::Call(dst, callee, args) => {
             // GC safepoint before call.
-            crate::gc_safepoint(env);
+            cljrs_env::gc_roots::gc_safepoint(env);
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = apply_value(&callee_val, arg_vals, env)?;
@@ -299,8 +305,8 @@ fn execute_inst(
 
         Inst::CallDirect(dst, name, args) => {
             // Look up the function by name in globals and call it.
-            crate::gc_safepoint(env);
-            let callee = load_global_value(globals, ns, name)?;
+            cljrs_env::gc_roots::gc_safepoint(env);
+            let callee = load_global_value(globals, ns, name, ns)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = apply_value(&callee, arg_vals, env)?;
             regs.set(*dst, result);
@@ -308,7 +314,7 @@ fn execute_inst(
 
         Inst::Deref(dst, src) => {
             let val = regs.get_cloned(*src);
-            let derefed = crate::eval::deref_value(val)?;
+            let derefed = cljrs_interp::eval::deref_value(val)?;
             regs.set(*dst, derefed);
         }
 
@@ -326,7 +332,7 @@ fn execute_inst(
             let new_val = regs.get_cloned(*val_id);
             if let Value::Var(var) = var_val {
                 // Try dynamic binding first, then root.
-                if !crate::dynamics::set_thread_local(var, new_val.clone()) {
+                if !cljrs_env::dynamics::set_thread_local(var, new_val.clone()) {
                     var.get().bind(new_val);
                 }
             } else {
@@ -395,18 +401,22 @@ fn const_to_value(c: &Const) -> Value {
 
 // ── Global value lookup ─────────────────────────────────────────────────────
 
-fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str) -> EvalResult {
-    // Try dynamic var deref first (for thread-local bindings).
-    if let Some(var) = globals.lookup_var_in_ns(ns, name) {
-        if let Some(val) = crate::dynamics::deref_var(&var) {
+fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &str) -> EvalResult {
+    // Try direct namespace lookup first, then resolve as alias.
+    let resolved_ns = globals
+        .resolve_alias(defining_ns, ns)
+        .unwrap_or_else(|| Arc::from(ns));
+
+    if let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name) {
+        if let Some(val) = cljrs_env::dynamics::deref_var(&var) {
             return Ok(val);
         }
         return Err(EvalError::Runtime(format!(
-            "IR interpreter: unbound var {ns}/{name}"
+            "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
     Err(EvalError::Runtime(format!(
-        "IR interpreter: var not found {ns}/{name}"
+        "IR interpreter: var not found {resolved_ns}/{name}"
     )))
 }
 
@@ -559,7 +569,7 @@ fn alloc_closure(
 
                 // Call back into the interpreter via callback::invoke infrastructure.
                 // We need an Env, which we get from the callback context.
-                let result = crate::callback::with_eval_context(|env| {
+                let result = cljrs_env::callback::with_eval_context(|env| {
                     interpret_ir(subfunc, full_args, &closure_globals, &closure_ns, env)
                 });
                 match result {
@@ -715,7 +725,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::Atom => builtin_call_native("atom", &args),
         KnownFn::Deref | KnownFn::AtomDeref => {
             if let Some(v) = args.into_iter().next() {
-                crate::eval::deref_value(v)
+                cljrs_interp::eval::deref_value(v)
             } else {
                 Ok(Value::Nil)
             }
@@ -756,11 +766,26 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         | KnownFn::Juxt
         | KnownFn::Comp
         | KnownFn::Partial
-        | KnownFn::Complement
-        | KnownFn::Apply => {
+        | KnownFn::Complement => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
+        }
+
+        KnownFn::Apply => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity {
+                    name: "apply".into(),
+                    expected: "2+".into(),
+                    got: args.len(),
+                });
+            }
+            let mut args = args;
+            let f = args.remove(0);
+            let last = args.pop().unwrap();
+            let spread = cljrs_interp::destructure::value_to_seq_vec(&last);
+            args.extend(spread);
+            apply_value(&f, args, env)
         }
 
         // ── Dynamic binding / exception handling ────────────────────────
@@ -778,7 +803,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 /// Call a native builtin by name from the global environment.
 fn builtin_call_native(name: &str, args: &[Value]) -> EvalResult {
     // Use the callback infrastructure to get an eval context.
-    crate::callback::with_eval_context(|env| {
+    cljrs_env::callback::with_eval_context(|env| {
         let callee = load_builtin(env, name)?;
         if let Value::NativeFunction(nf) = &callee {
             (nf.get().func)(args).map_err(|e| EvalError::Runtime(e.to_string()))
@@ -928,7 +953,80 @@ fn builtin_compare(known_fn: &KnownFn, args: &[Value]) -> EvalResult {
                 _ => false,
             }
         }
-        _ => false,
+        _ => {
+            // Delegate to the native comparison function for all other types
+            // (BigInt, Ratio, mixed, etc.) so they compare correctly.
+            let op = match known_fn {
+                KnownFn::Lt => "<",
+                KnownFn::Gt => ">",
+                KnownFn::Lte => "<=",
+                KnownFn::Gte => ">=",
+                _ => return Ok(Value::Bool(false)),
+            };
+            return builtin_call_native(op, args);
+        }
     };
     Ok(Value::Bool(result))
+}
+
+// IR lowering
+
+/// Eagerly lower all arities of a function to IR, storing the results
+/// in the IR cache.  Failures are silently recorded as `Unsupported`.
+///
+/// Only lowers if the compiler is already loaded (`compiler_ready` is true).
+/// Compiler loading is triggered separately (e.g., by the binary at startup).
+pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
+    use crate::apply::IR_LOWERING_ACTIVE;
+
+    // Skip if eager lowering is disabled.
+    if !crate::apply::eager_lower_enabled() {
+        return;
+    }
+
+    // Don't lower macros (they operate on forms, not values).
+    if f.is_macro {
+        return;
+    }
+
+    // Only lower if compiler is already ready (don't trigger loading).
+    if !env
+        .globals
+        .compiler_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+
+    // Don't nest lowering calls.
+    if IR_LOWERING_ACTIVE.get() {
+        return;
+    }
+
+    IR_LOWERING_ACTIVE.set(true);
+
+    for arity in &f.arities {
+        let arity_id = arity.ir_arity_id;
+        if !crate::ir_cache::should_attempt(arity_id) {
+            continue;
+        }
+
+        match crate::lower::lower_arity(
+            f.name.as_deref(),
+            &arity.params,
+            arity.rest_param.as_ref(),
+            &arity.body,
+            &f.defining_ns,
+            env,
+        ) {
+            Ok(ir_func) => {
+                crate::ir_cache::store_cached(arity_id, std::sync::Arc::new(ir_func));
+            }
+            Err(_) => {
+                crate::ir_cache::store_unsupported(arity_id);
+            }
+        }
+    }
+
+    IR_LOWERING_ACTIVE.set(false);
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use cljrs_types::span::Span;
 use cljrs_value::{Keyword, MapValue, Value};
 
-use crate::ir::*;
+use cljrs_ir::*;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 

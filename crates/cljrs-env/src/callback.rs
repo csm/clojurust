@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use cljrs_value::{Value, ValueError, ValueResult};
 
-use crate::apply::apply_value;
 use crate::env::{Env, GlobalEnv};
 
 // ── Thread-local context stack ───────────────────────────────────────────────
@@ -111,7 +110,16 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
         Ok((ec.globals.clone(), ec.current_ns.clone()))
     })?;
     let mut env = Env::new(globals, &ns);
-    apply_value(f, args, &mut env).map_err(|e| match e {
+    // Fast path for Clojure functions: call directly through the GlobalEnv
+    // function pointer, bypassing the large apply_value stack frame.
+    // Unwrap metadata so a WithMeta-wrapped fn is callable.
+    let f = f.unwrap_meta();
+    let result = if let Value::Fn(cljx_fn) = f {
+        env.call_cljrs_fn(cljx_fn.get(), &args)
+    } else {
+        crate::apply::apply_value(f, args, &mut env)
+    };
+    result.map_err(|e| match e {
         crate::error::EvalError::Thrown(v) => ValueError::Thrown(v),
         other => ValueError::Other(format!("{other}")),
     })

@@ -7,9 +7,6 @@ use crate::array_list::{
 use crate::bitops::{
     builtin_bit_and_not, builtin_bit_clear, builtin_bit_flip, builtin_bit_set, builtin_bit_test,
 };
-use crate::callback::{capture_eval_context, install_eval_context};
-use crate::dynamics;
-use crate::env::GlobalEnv;
 use crate::new::{builtin_exception_dot, builtin_new};
 use crate::regex::{
     builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern,
@@ -20,6 +17,9 @@ use crate::transients::{
 };
 use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
+use cljrs_env::callback::{capture_eval_context, install_eval_context};
+use cljrs_env::dynamics;
+use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
@@ -734,7 +734,7 @@ impl Iterator for ValueIter {
                     let ls = ls.clone();
                     // Root self.current so the LazySeq (and the entire chain
                     // it's part of) survives any GC triggered during realize().
-                    let _current_root = crate::root_value(&self.current);
+                    let _current_root = cljrs_env::gc_roots::root_value(&self.current);
                     self.current = ls.get().realize();
                     if let Some(err) = ls.get().error() {
                         self.error = Some(err);
@@ -2265,7 +2265,7 @@ fn builtin_sorted_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_special_symbol_q(args: &[Value]) -> ValueResult<Value> {
     let is_special = match &args[0] {
         Value::Symbol(sym) if sym.get().namespace.is_none() => {
-            crate::special::SPECIAL_FORMS.contains(&sym.get().name.as_ref())
+            crate::SPECIAL_FORMS.contains(&sym.get().name.as_ref())
         }
         _ => false,
     };
@@ -3228,7 +3228,7 @@ impl cljrs_gc::Trace for ConcatThunk {
 impl Thunk for ConcatThunk {
     fn force(&self) -> Result<Value, String> {
         // Root the collections so they survive GC while we iterate.
-        let _colls_root = crate::root_values(&self.colls);
+        let _colls_root = cljrs_env::gc_roots::root_values(&self.colls);
         let mut colls = self.colls.clone();
         // Walk through collections iteratively (no recursion) to find the
         // first element.  This avoids stack overflow on deeply nested
@@ -3494,12 +3494,12 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
             builtin_conj,
         )));
         // Apply xform to conj
-        let xf_rf = crate::callback::invoke(xform, vec![conj_rf])?;
+        let xf_rf = cljrs_env::callback::invoke(xform, vec![conj_rf])?;
         // Reduce over from with xf_rf
         let mut acc = to.clone();
         let mut iter = ValueIter::new(from.clone());
         for item in iter.by_ref() {
-            acc = crate::callback::invoke(&xf_rf, vec![acc, item])?;
+            acc = cljrs_env::callback::invoke(&xf_rf, vec![acc, item])?;
             if let Value::Reduced(inner) = acc {
                 acc = *inner;
                 break;
@@ -3509,7 +3509,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
             return Err(ValueError::Other(err));
         }
         // Call completion arity
-        acc = crate::callback::invoke(&xf_rf, vec![acc])?;
+        acc = cljrs_env::callback::invoke(&xf_rf, vec![acc])?;
         if let Value::Reduced(inner) = acc {
             acc = *inner;
         }
@@ -3555,11 +3555,11 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(args[1].clone());
             let Some(first) = iter.next() else {
                 // empty coll: call (f) for init
-                return crate::callback::invoke(f, vec![]);
+                return cljrs_env::callback::invoke(f, vec![]);
             };
             let mut acc = first;
             for item in iter.by_ref() {
-                acc = crate::callback::invoke(f, vec![acc, item])?;
+                acc = cljrs_env::callback::invoke(f, vec![acc, item])?;
                 if let Value::Reduced(inner) = acc {
                     return Ok(*inner);
                 }
@@ -3574,7 +3574,7 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
             let mut acc = args[1].clone();
             let mut iter = ValueIter::new(args[2].clone());
             for item in iter.by_ref() {
-                acc = crate::callback::invoke(f, vec![acc, item])?;
+                acc = cljrs_env::callback::invoke(f, vec![acc, item])?;
                 if let Value::Reduced(inner) = acc {
                     return Ok(*inner);
                 }
@@ -5044,7 +5044,7 @@ fn builtin_read_string(args: &[Value]) -> ValueResult<Value> {
             let src = s.get().clone();
             let mut parser = cljrs_reader::Parser::new(src, "<read-string>".into());
             match parser.parse_one() {
-                Ok(Some(form)) => Ok(crate::eval::form_to_value(&form)),
+                Ok(Some(form)) => Ok(crate::form::form_to_value(&form)),
                 Ok(None) => Ok(Value::Nil),
                 Err(e) => Err(ValueError::Other(e.to_string())),
             }
@@ -5110,8 +5110,7 @@ fn builtin_make_lazy_seq_sentinel(_args: &[Value]) -> ValueResult<Value> {
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
-pub(crate) static GENSYM_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static GENSYM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn builtin_gensym(args: &[Value]) -> ValueResult<Value> {
     let prefix = match args.first() {
@@ -5124,7 +5123,7 @@ fn builtin_gensym(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_type(args: &[Value]) -> ValueResult<Value> {
-    use crate::apply::type_tag_of;
+    use cljrs_env::apply::type_tag_of;
     let tag = type_tag_of(&args[0]);
     Ok(Value::symbol(Symbol::simple(tag.as_ref())))
 }
@@ -5991,7 +5990,7 @@ fn interpret_compare_result(v: &Value) -> ValueResult<std::cmp::Ordering> {
 
 /// Call a Clojure comparator function and interpret the result.
 fn invoke_compare(comp: &Value, a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
-    let result = crate::callback::invoke(comp, vec![a.clone(), b.clone()])?;
+    let result = cljrs_env::callback::invoke(comp, vec![a.clone(), b.clone()])?;
     interpret_compare_result(&result)
 }
 
@@ -6037,7 +6036,7 @@ fn builtin_sort_by(args: &[Value]) -> ValueResult<Value> {
     // Pre-compute keys to avoid calling keyfn O(n log n) times
     let mut keys: Vec<Value> = Vec::with_capacity(items.len());
     for item in &items {
-        keys.push(crate::callback::invoke(keyfn, vec![item.clone()])?);
+        keys.push(cljrs_env::callback::invoke(keyfn, vec![item.clone()])?);
     }
     // Build index array and sort by keys
     let mut indices: Vec<usize> = (0..items.len()).collect();
@@ -6212,7 +6211,7 @@ fn builtin_clojure_version(_args: &[Value]) -> ValueResult<Value> {
 // ── Protocol & Multimethod builtins ───────────────────────────────────────────
 
 fn builtin_satisfies_q(args: &[Value]) -> ValueResult<Value> {
-    use crate::apply::type_tag_of;
+    use cljrs_env::apply::type_tag_of;
     let proto = match &args[0] {
         Value::Protocol(p) => p.clone(),
         v => {
@@ -6228,7 +6227,6 @@ fn builtin_satisfies_q(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_extends_q(args: &[Value]) -> ValueResult<Value> {
-    use crate::apply::resolve_type_tag;
     let proto = match &args[0] {
         Value::Protocol(p) => p.clone(),
         v => {
@@ -6238,10 +6236,10 @@ fn builtin_extends_q(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let type_tag = match &args[1] {
-        Value::Symbol(s) => resolve_type_tag(s.get().name.as_ref()),
-        Value::Str(s) => resolve_type_tag(s.get().as_str()),
-        Value::Keyword(k) => resolve_type_tag(k.get().name.as_ref()),
+    let type_tag: Arc<str> = match &args[1] {
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        Value::Keyword(k) => Arc::from(k.get().name.as_ref()),
         v => {
             return Err(ValueError::WrongType {
                 expected: "symbol or string",
@@ -6492,7 +6490,7 @@ fn builtin_future_call_star(args: &[Value]) -> ValueResult<Value> {
     thread::spawn(move || {
         install_eval_context(env.0, env.1.clone());
         dynamics::install_frames(captured_bindings);
-        match crate::callback::invoke(&func, args) {
+        match cljrs_env::callback::invoke(&func, args) {
             Ok(result) => {
                 let mut state = thunk_ptr.get().state.lock().unwrap();
                 if matches!(&*state, FutureState::Running) {
@@ -6725,7 +6723,7 @@ fn builtin_instance_q(args: &[Value]) -> ValueResult<Value> {
 /// `(var-get v)` — return the current value of a var (dynamic bindings respected).
 fn builtin_var_get(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Var(vp) => Ok(crate::dynamics::deref_var(vp).unwrap_or(Value::Nil)),
+        Value::Var(vp) => Ok(cljrs_env::dynamics::deref_var(vp).unwrap_or(Value::Nil)),
         v => Err(ValueError::WrongType {
             expected: "var",
             got: v.type_name().to_string(),
@@ -6738,7 +6736,7 @@ fn builtin_var_set_bang(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => {
             let val = args[1].clone();
-            if !crate::dynamics::set_thread_local(vp, val.clone()) {
+            if !cljrs_env::dynamics::set_thread_local(vp, val.clone()) {
                 vp.get().bind(val.clone());
             }
             Ok(val)
@@ -6761,7 +6759,7 @@ fn builtin_alter_var_root_sentinel(_args: &[Value]) -> ValueResult<Value> {
 /// `(bound? v)` — true if var has any binding (thread-local or root).
 fn builtin_bound_q(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Var(vp) => Ok(Value::Bool(crate::dynamics::deref_var(vp).is_some())),
+        Value::Var(vp) => Ok(Value::Bool(cljrs_env::dynamics::deref_var(vp).is_some())),
         _ => Ok(Value::Bool(false)),
     }
 }
@@ -6769,7 +6767,7 @@ fn builtin_bound_q(args: &[Value]) -> ValueResult<Value> {
 /// `(thread-bound? v)` — true if var has a thread-local binding on this thread.
 fn builtin_thread_bound_q(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Var(vp) => Ok(Value::Bool(crate::dynamics::is_thread_bound(vp))),
+        Value::Var(vp) => Ok(Value::Bool(cljrs_env::dynamics::is_thread_bound(vp))),
         _ => Ok(Value::Bool(false)),
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "cljrs-builtins"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-env = { workspace = true }
+cljrs-value = { workspace = true }
+cljrs-types = { workspace = true }
+cljrs-gc = { workspace = true }
+cljrs-reader = { workspace = true }
+num-bigint = { workspace = true }
+num-rational = { workspace = true }
+bigdecimal = { workspace = true }
+num-traits = { workspace = true }
+rand = { workspace = true }
+rpds = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+regex = { workspace = true }

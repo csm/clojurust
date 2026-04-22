@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::env::{Env, GlobalEnv, RequireRefer, RequireSpec};
 use crate::error::{EvalError, EvalResult};
-use crate::eval;
 
 /// Find, load, and wire up the source file for `spec.ns`.
 ///
@@ -58,7 +57,9 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
                 // form's evaluation are rooted.  Frame pops between forms,
                 // allowing GC to collect temporaries from previous forms.
                 let _alloc_frame = cljrs_gc::push_alloc_frame();
-                eval::eval(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
+                (*globals)
+                    .eval(&form, &mut env)
+                    .map_err(|e| annotate(e, ns_name))?;
             }
         }
         // Restore *ns* to the caller's namespace.

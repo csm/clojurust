@@ -392,6 +392,8 @@ pub struct CljxFnArity {
     pub destructure_params: Vec<(usize, Form)>,
     /// If the rest param is destructured, the original form.
     pub destructure_rest: Option<Form>,
+    /// Unique ID for IR cache lookup (assigned by the evaluator).
+    pub ir_arity_id: u64,
 }
 
 // ── CljxFn ────────────────────────────────────────────────────────────────────

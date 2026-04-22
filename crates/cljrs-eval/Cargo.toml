@@ -2,23 +2,16 @@
 name = "cljrs-eval"
 version = "0.1.0"
 edition = "2024"
-description = "Tree-walking interpreter and macro expander for clojurust"
+description = "IR-accelerated evaluation for clojurust (tier-1 IR interpreter + lowering)"
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-cljrs-types   = { workspace = true }
-cljrs-ir      = { workspace = true }
-cljrs-gc      = { workspace = true }
-cljrs-reader  = { workspace = true }
-cljrs-value   = { workspace = true }
-thiserror    = { workspace = true }
-num-bigint   = { workspace = true }
-num-rational = { workspace = true }
-num-traits   = { workspace = true }
-bigdecimal   = { workspace = true }
-rand         = { workspace = true }
-rpds         = { workspace = true }
-uuid         = { workspace = true, features = ["v4"] }
-log = "0.4.29"
-regex = "1.12.3"
+cljrs-types    = { workspace = true }
+cljrs-ir       = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-interp   = { workspace = true }
