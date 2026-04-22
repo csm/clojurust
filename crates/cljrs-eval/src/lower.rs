@@ -83,6 +83,19 @@ fn lower_arity_inner(
         })?;
     let lower_fn_val = lower_fn.get().deref().unwrap_or(Value::Nil);
 
+    // Macro-expand the body forms before lowering to IR.
+    // The ANF compiler does not expand macros; we must do it here so that
+    // macro calls (e.g. `cond`, `when`, `and`) become their `if`-chain
+    // expansions rather than unresolvable function calls at runtime.
+    let expanded_body: Vec<Form> = body
+        .iter()
+        .map(|f| {
+            cljrs_interp::macros::macroexpand_all(f, env)
+                .unwrap_or_else(|_| f.clone())
+        })
+        .collect();
+    let body = expanded_body.as_slice();
+
     // Build arguments:
     // 1. fname (string or nil)
     let fname_val = match name {

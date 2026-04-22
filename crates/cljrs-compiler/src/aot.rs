@@ -777,6 +777,7 @@ fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
     let output = std::process::Command::new("cargo")
         .arg("build")
         .arg("--release")
+        .arg("--offline")
         .current_dir(harness_dir)
         .output()?;
 
@@ -808,6 +809,7 @@ fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResul
     let output = std::process::Command::new("cargo")
         .arg("build")
         .arg("--release")
+        .arg("--offline")
         .current_dir(harness_dir)
         .output()?;
 

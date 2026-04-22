@@ -953,7 +953,18 @@ fn builtin_compare(known_fn: &KnownFn, args: &[Value]) -> EvalResult {
                 _ => false,
             }
         }
-        _ => false,
+        _ => {
+            // Delegate to the native comparison function for all other types
+            // (BigInt, Ratio, mixed, etc.) so they compare correctly.
+            let op = match known_fn {
+                KnownFn::Lt => "<",
+                KnownFn::Gt => ">",
+                KnownFn::Lte => "<=",
+                KnownFn::Gte => ">=",
+                _ => return Ok(Value::Bool(false)),
+            };
+            return builtin_call_native(op, args);
+        }
     };
     Ok(Value::Bool(result))
 }
