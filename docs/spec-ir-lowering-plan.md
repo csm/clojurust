@@ -200,15 +200,6 @@ pub struct IrFunction {
 
 `spec_annotations` is populated by both the lowering pass (from fdef / literal type info) and the propagation pass (from flow analysis). It is the authoritative source of constraint information for later JIT passes.
 
-### 2.4 Serialization Versioning
-
-The IR format is `postcard`-based. Add a `FORMAT_VERSION: u32` constant to `IrBundle`. Bump the version whenever new variants are added. On deserialization, check the version and either:
-
-- Accept and deserialize (current or known-compatible version)
-- Return a `BundleError::VersionMismatch { found, expected }` so the caller can re-lower from source instead of crashing
-
-Because `postcard` uses compact integer encoding for enum discriminants, adding new variants at the end of `Inst` is backward-compatible for reading old bundles; new bundles are not readable by old binaries (which is fine — old binaries re-lower).
-
 ---
 
 ## Phase 3 — Spec-Aware ANF Lowering
@@ -515,7 +506,7 @@ done_label:
 | `cljrs-stdlib/src/clojure/spec/alpha.cljrs` | New: full spec library |
 | `cljrs-stdlib/src/clojure/spec/alpha/conformer.cljrs` | New: conformance engine (`s/cat` NFA, etc.) |
 | `cljrs-ir/src/spec.rs` | New: `SpecConstraint`, `FnSpec`, `SpecFailMode` types |
-| `cljrs-ir/src/lib.rs` | Add `SpecAnnotate`/`SpecCheck` to `Inst`; add `spec_annotations` and `fn_spec` to `IrFunction`; bump `FORMAT_VERSION` |
+| `cljrs-ir/src/lib.rs` | Add `SpecAnnotate`/`SpecCheck` to `Inst`; add `spec_annotations` and `fn_spec` to `IrFunction` |
 | `cljrs-ir/src/clojure/compiler/spec_query.cljrs` | New: spec registry query helpers for the lowering pass |
 | `cljrs-ir/src/clojure/compiler/anf.cljrs` | Extend call lowering, parameter binding, literal lowering, and `if` lowering to emit `SpecAnnotate`/`SpecCheck` |
 | `cljrs-eval/src/ir_convert.rs` | Convert new `SpecAnnotate`/`SpecCheck` Clojure data → Rust `Inst` |
@@ -527,7 +518,7 @@ done_label:
 ## Implementation Order
 
 1. **`clojure.spec.alpha`** — pure library, no IR dependency, can be tested independently with `s/valid?` / `s/conform` calls
-2. **IR type extensions** — add `spec.rs`, extend `Inst`/`IrFunction`, update serialization, bump version, update `ir_convert.rs`
+2. **IR type extensions** — add `spec.rs`, extend `Inst`/`IrFunction`, update `ir_convert.rs`
 3. **Interpreter no-op and check** — add `SpecAnnotate` (skip) and `SpecCheck` (call runtime) to the IR interpreter so all existing tests still pass
 4. **Spec-aware lowering** — add `spec_query.cljrs`, extend `anf.cljrs`; verify that functions with fdefs get annotated vars in the IR
 5. **Spec propagation pass** — implement the dataflow analysis and optimization transforms; gate behind a feature flag initially
