@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = ["prebuild-ir"]
 prebuild-ir = []
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-builtins/no-gc"]
 
 [dependencies]
 cljrs-builtins = { workspace = true }
