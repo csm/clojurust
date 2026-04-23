@@ -116,130 +116,148 @@ A `with-region` special form (or macro) for explicit control:
 
 ---
 
-## Layer 4 — `^:static` Metadata Routing
+## Layer 4 — Allocation Context Propagation
 
-In the evaluator (`cljrs-interp`/`cljrs-eval`), check for `^:static` metadata
-before evaluating any form:
+There is no user-visible annotation. The evaluator maintains a thread-local
+**allocation context stack**. Each entry is either a `Region` (bump allocator)
+or `Static` (the `StaticArena`). `GcPtr::new()` always allocates into the top
+of this stack.
 
-```rust
-fn eval_form(form: &Form, env: &Env) -> ValueResult<Value> {
-    #[cfg(feature = "no-gc")]
-    if form.meta().contains_key(keyword("static")) {
-        return eval_in_static_context(form, env);
-    }
-    // ... normal eval
-}
-```
+### Static context sources (automatic)
 
-`eval_in_static_context` swaps the active allocator to `StaticArena` for the
-duration of that expression's evaluation. All `GcPtr::new()` calls made during
-evaluation of that subexpression go to the static arena.
+The following forms push `Static` onto the context stack before evaluating
+their value expression, then pop it on exit:
 
-### Implicit `^:static` for top-level `def` / `defn`
+| Form | Reason |
+|---|---|
+| Top-level `def` / `defn` | interned into a `Namespace` for program lifetime |
+| `atom` / `agent` initial value | container outlives all regions |
+| `reset!` / `vreset!` new value | written into a static container |
+| Function passed to `swap!` / `vswap!` | return value written into a static container |
+| `Var` root binding (`def` with value) | same as top-level `def` |
 
-Top-level `def` and `defn` forms are **always** treated as static — no
-annotation required. They are interned into a `Namespace` which lives for the
-entire program, so any region-local allocation for their values would be a
-use-after-free. The evaluator detects "top-level" context (depth = 0, not
-inside a fn body or let block) and automatically routes through
-`eval_in_static_context`.
+Everything else runs under the `Region` pushed by the nearest enclosing scope
+(fn body, `let`, `loop` iteration).
+
+### Context propagates inward through calls
+
+When a function is called, it inherits the active allocation context from its
+call site. The called function does not push a new context — it allocates into
+whatever is currently active. A new `Region` is pushed only at scope boundaries
+(fn entry, `let`, `loop` iteration).
+
+This means a function called from a static context (`def`, `atom` init,
+`swap!`, etc.) allocates all of its intermediate and return values statically,
+without any annotation at the call site or inside the function.
 
 ```clojure
-; all of these are automatically static at the top level:
-(def config {:host "localhost" :port 8080})
-(defn greet [name] (str "hello " name))
-(def handlers {:get handle-get :post handle-post})
+(defn make-map [k v] {k v})   ; allocates wherever caller dictates
 
-; ^:static is still useful for values nested inside other forms:
-(atom ^:static {:state :running})
+(def config (make-map :host "localhost"))
+; ↑ static context: config and the {:host ...} map both go to StaticArena
+
+(defn process [data]
+  (let [m (make-map :key data)]
+    (use m)))
+; ↑ region context: m is region-local, freed when let exits
 ```
 
 ### Metadata follows its value's provenance
 
-A value's metadata map is allocated with the same provenance as the value
-itself. If the value is region-local, its metadata is region-local. If the
-value is static (via `^:static` or top-level `def`), its metadata is also
-allocated in the `StaticArena`.
-
-`with-meta` and `vary-meta` inherit the provenance of the value being
-annotated, not the metadata map argument. If a region-local metadata map is
-attached to a static value, it is deep-copied into the `StaticArena` at the
-point of attachment. This copy is the only case where provenance promotion
-occurs implicitly — and the compiler should warn when it happens.
+A value's metadata map is allocated in the same context as the value itself —
+the allocation context stack is not changed for metadata. `with-meta` and
+`vary-meta` inherit the active context of the value being annotated.
 
 ---
 
-## Layer 5 — Escape Analysis Enforcement
+## Layer 5 — Interprocedural Escape Analysis
 
 Extend the existing escape analysis pass (`cljrs-compiler/src/escape.rs`) with
-a `no-gc` mode check.
+a `no-gc` mode that tracks allocation context through the full call chain, not
+just within a single function.
 
-**Rule**: A value allocated in region R may not be stored into any container
-with a lifetime longer than R.
+### Escape signatures
 
-Violation patterns to detect and reject:
+Each function is annotated with an **escape signature** for its return value:
 
-1. Returning a region-local value from a function (unless `^:static`)
-2. Storing into a `Var`, `Atom`, `Agent`, or `Namespace` binding
-3. Capturing a region-local value in a closure that outlives the region
-4. Storing into a data structure owned by the calling scope
-5. An unrealized `LazySeq` escaping the region in which it was created (see
-   below)
+- `Local` — the return value is always consumed within the function's own
+  region (e.g., the value is returned only into a `doall`, `doseq`, etc. that
+  runs before the region resets).
+- `Caller` — the return value's lifetime is polymorphic: it is allocated in
+  whatever context is active at the call site, and may legitimately be returned
+  up the call chain.
 
-Emit a compile error pointing to the allocation site and the escape point, with
-a suggestion to add `^:static`. This extends the existing `EscapeInfo` /
-`AllocationSite` infrastructure — mark region-local sites as
-`Lifetime::Region(scope_id)` and flag any escape where `scope_id` of the
-destination outlives the source.
+Most functions are `Caller`. `Local` is only inferred when the analysis can
+prove the return value never leaves the function's scope.
 
-### `LazySeq` rules under `no-gc`
+### Error condition
 
-A `LazySeq` that is **fully realized within its creating scope** is legal:
-the thunk and all produced values live and die in the same region.
+A genuine escape error occurs only when the analysis conclusively shows that a
+value allocated in a specific, finite-lifetime region is stored into a
+container with a definitively longer lifetime **and** no static-context capture
+point exists anywhere in the call chain above it.
 
-A `LazySeq` that **escapes its creating scope** is a compiler error, because
-the thunk captures region-local state that will have been reset by the time
-the seq is forced. There is no implicit promotion.
+In practice this means:
 
 ```clojure
-; OK — realized in the same let block
-(let [xs (map inc [1 2 3])]
-  (doall xs))   ; forces all elements before region resets
+; fine — escapes upward, but caller is a static sink (def)
+(defn make-config [] {:host "localhost"})
+(def config (make-config))   ; static context captures the escape
 
-; COMPILER ERROR — lazy seq escapes the function's region
-(defn bad []
-  (map inc [1 2 3]))  ; returned unrealized; thunk is dangling
+; fine — escapes upward through two functions, still reaches a static sink
+(defn inner [] {:x 1})
+(defn outer [] (inner))
+(def result (outer))
 
-; OK — mark the result static so its thunk and elements go to StaticArena
-(defn ok []
-  ^:static (map inc [1 2 3]))
+; ERROR — escapes into a Var inside a non-static context with no capture path
+(defn bad [atom-ref]
+  (reset! atom-ref (java.util.Date.))   ; atom-ref is region-local, not static
+  nil)
 ```
 
-The escape analysis detects `LazySeq` escape the same way it detects any other
-region-local escape: if the `LazySeq` value's `scope_id` is shorter than the
-destination lifetime, it is an error. There is no special `LazySeq` path —
-the general escape rule covers it.
+The key difference from the previous local-only rule: **returning a
+region-local value from a function is never an error by itself**. The error is
+only emitted when the full upward chain of call sites shows no valid capture.
+
+### `LazySeq` under interprocedural analysis
+
+`LazySeq` requires no special treatment. A thunk captures bindings from the
+active allocation context at creation time. If created in a static context
+(because the call chain roots at a `def` or `atom` init), the thunk's closed-
+over values are static and the lazy seq may be returned and forced at any time.
+If created in a region context, the same escape rules apply as for any other
+value — the lazy seq may still be returned upward as long as the chain
+eventually reaches a static capture point.
+
+```clojure
+; fine — called from a static sink; thunk's captures are static
+(def evens (filter even? (range)))
+
+; fine — realized before the region resets
+(defn sum-evens [n]
+  (let [xs (filter even? (range n))]
+    (reduce + xs)))
+
+; ERROR — escapes into a region-local atom with no static capture path
+(defn bad []
+  (let [a (atom nil)]
+    (reset! a (map inc [1 2 3]))))   ; a is not a static sink
+```
 
 ---
 
-## Layer 6 — Mutable State Constraints
+## Layer 6 — Mutable State as Static Sinks
 
-Under `no-gc`, mutable containers must hold `^:static`-tagged values because
-they outlive any region:
+`Atom`, `Var`, `Agent`, and `Namespace` internment are **static sinks**: they
+push `Static` onto the allocation context stack before evaluating the value
+expression, so there is nothing for the user or the compiler to do specially.
+The evaluator handles this automatically as part of Layer 4.
 
-```rust
-#[cfg(feature = "no-gc")]
-impl Value {
-    pub fn make_atom(initial: Value) -> ValueResult<Value> {
-        assert_static(&initial)?;  // errors if initial came from a region
-        Ok(Value::Atom(GcPtr::static_alloc(Atom::new(initial))))
-    }
-}
-```
-
-Apply similarly to: `swap!`, `reset!`, `Var` root bindings, namespace interns.
-
-`assert_static` checks the provenance tag on the `GcPtr` (see Layer 7).
+The runtime provenance tag (Layer 7) is retained as a debug-mode assertion:
+in debug builds, the mutable-state constructors verify that the value being
+stored is tagged static and panic with a clear message if not. This catches any
+case where the compiler analysis missed an escape — it is not the primary
+enforcement mechanism.
 
 ---
 
@@ -271,11 +289,11 @@ This runtime tag acts as a safety net alongside compile-time escape analysis.
 |---|---|---|
 | 1 | Feature flag plumbing; conditional `GcBox`; compile-out GC machinery | `Cargo.toml`, `cljrs-gc/src/lib.rs` |
 | 2 | `StaticArena` implementation | `cljrs-gc/src/static_arena.rs` |
-| 3 | `GcPtr::new()` → region dispatch; tag-bit provenance | `cljrs-gc/src/lib.rs` |
-| 4 | Implicit `RegionGuard` in interpreter (fn body, `let`, `loop`) | `cljrs-interp/src/eval.rs` |
-| 5 | `^:static` metadata → `eval_in_static_context` | `cljrs-interp/src/eval.rs`, `cljrs-eval/src/apply.rs` |
-| 6 | Mutable state guards (`atom`, `var`, namespace interns) | `cljrs-value/src/types.rs` |
-| 7 | Escape analysis extension for region lifetimes | `cljrs-compiler/src/escape.rs` |
+| 3 | `GcPtr::new()` → context-stack dispatch; tag-bit provenance (debug) | `cljrs-gc/src/lib.rs` |
+| 4 | Allocation context stack; implicit `RegionGuard` (fn, `let`, `loop`) | `cljrs-interp/src/eval.rs` |
+| 5 | Static context push for `def`, `atom`, `swap!`, `reset!`, `Var` | `cljrs-interp/src/eval.rs`, `cljrs-eval/src/apply.rs` |
+| 6 | Interprocedural escape analysis with escape signatures | `cljrs-compiler/src/escape.rs` |
+| 7 | Debug-mode runtime provenance assertions in mutable state constructors | `cljrs-value/src/types.rs` |
 | 8 | `with-region` macro, docs, integration tests | `cljrs-stdlib`, `tests/` |
 
 ---
@@ -286,15 +304,6 @@ This runtime tag acts as a safety net alongside compile-time escape analysis.
 - **~10x faster allocation** — bump pointer vs GC heap with header overhead
 - **Deterministic memory** — region reset at scope exit, not "whenever GC fires"
 - **RAII-compatible** — all memory has lexically-scoped lifetimes
-- **`^:static` escape hatch** — for data that genuinely outlives a scope
+- **No user annotations** — allocation context is inferred from call chain; no
+  `^:static` or other markers required
 - **Backward compatible** — default build keeps GC; `no-gc` is opt-in
-
----
-
-## Open Questions
-
-1. **Accumulation pattern**: A persistent map built up over many `assoc` calls
-   across region boundaries — each intermediate allocation is region-local but
-   the final result needs to escape. The escape analysis needs to handle this
-   gracefully (e.g., promote the final result to the caller's region or require
-   `^:static`).
