@@ -1,5 +1,129 @@
 # Async Support Plan for clojurust
 
+## Feature Flag
+
+All async support is gated behind a `async` Cargo feature. Tokio is a substantial dependency
+(compile time, binary size, transitive deps) and embedders who only need the interpreter or AOT
+compiler should not pay for it. The feature is **off by default**.
+
+### Workspace `Cargo.toml`
+
+```toml
+[workspace.dependencies]
+# Mark tokio as optional at the workspace level
+tokio = { version = "1.50.0", optional = true, features = ["rt", "sync", "time", "task", "macros"] }
+futures-util = { version = "0.3", optional = true }  # needed for select_all in alts
+```
+
+### Per-crate feature declaration
+
+Every crate that touches async machinery declares the feature and gates tokio behind it:
+
+```toml
+# cljrs-value/Cargo.toml
+[features]
+async = ["dep:tokio"]
+
+[dependencies]
+tokio = { workspace = true, optional = true }
+```
+
+```toml
+# cljrs-interp/Cargo.toml
+[features]
+async = ["dep:tokio", "cljrs-value/async"]
+
+[dependencies]
+tokio = { workspace = true, optional = true }
+```
+
+```toml
+# cljrs-stdlib/Cargo.toml
+[features]
+async = ["dep:tokio", "dep:futures-util", "cljrs-interp/async"]
+```
+
+```toml
+# cljrs (CLI binary) — enables the feature for end-users who want it
+[features]
+default = []          # async off by default
+async = ["cljrs-interp/async", "cljrs-stdlib/async", "cljrs-value/async"]
+```
+
+The CLI binary can be built with `cargo build --features async` (or `cargo build -F async`). A
+future `cljrs-full` meta-crate or a `full` feature alias can bundle it for convenience.
+
+### Code-level gating
+
+All async-only types, impls, and functions are wrapped in `#[cfg(feature = "async")]`:
+
+```rust
+// cljrs-value/src/value.rs
+pub enum Value {
+    Future(GcPtr<CljxFuture>),     // always present; internals differ by feature
+    #[cfg(feature = "async")]
+    Channel(GcPtr<CljxChannel>),
+    // ...
+}
+```
+
+```rust
+// cljrs-value/src/types.rs
+pub struct CljxFuture {
+    #[cfg(not(feature = "async"))]
+    inner: FutureThreadBased,       // existing Mutex<FutureState> + Condvar
+
+    #[cfg(feature = "async")]
+    inner: Arc<FutureShared>,       // tokio OnceCell + Notify
+    #[cfg(feature = "async")]
+    cancel: Option<tokio::task::AbortHandle>,
+}
+```
+
+```rust
+// cljrs-interp/src/special_forms.rs
+#[cfg(feature = "async")]
+SpecialForm::Await => { ... }
+
+// Without the feature, `await` parses as an unknown symbol rather than a special form,
+// giving a clear error: "await requires the async feature"
+```
+
+```rust
+// cljrs/src/main.rs
+fn main() {
+    #[cfg(feature = "async")]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async_main()));
+        return;
+    }
+    #[cfg(not(feature = "async"))]
+    sync_main();
+}
+```
+
+### What works without the feature
+
+- All existing concurrency primitives (`future`, `promise`, `atom`, `agent`) keep their current
+  thread-based implementations untouched
+- `deref` on futures continues to work via `Mutex` + `Condvar`
+- No tokio dependency, no LocalSet, no extra compile time
+
+### What requires the feature
+
+- `^:async` function metadata (runtime error if used without the feature)
+- `await` special form
+- `alt` / `alts` / `timeout`
+- `chan`, `put!`, `take!`, `go`
+- Upgraded `CljxFuture` internals (tokio-native)
+- Upgraded `Agent` (tokio actor)
+- `async-pmap`, `join-all`
+
+---
+
 ## Current State
 
 The codebase already has solid groundwork:
@@ -92,14 +216,12 @@ pub struct CljxChannel {
 
 ## Phase A — Foundation
 
-**Crates**: `cljrs-value`, `cljrs-interp`, `cljrs-eval`, root `Cargo.toml`
+**Crates**: `cljrs-value`, `cljrs-interp`, `cljrs-eval`, `cljrs-stdlib`, `cljrs`, root `Cargo.toml`
 
-1. **Enable tokio** in `cljrs-value`, `cljrs-interp`, `cljrs-eval`:
-   ```toml
-   tokio = { workspace = true, features = ["rt", "sync", "time", "task", "macros"] }
-   ```
+1. **Add the `async` feature** to workspace and all affected crates as described in the Feature Flag
+   section above. Mark tokio and futures-util as `optional = true` at the workspace level.
 
-2. **Global runtime + LocalSet** in the CLI entry point (`cljrs`):
+2. **Global runtime + LocalSet** in the CLI entry point (`cljrs`), gated on `#[cfg(feature = "async")]`:
    ```rust
    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -116,14 +238,17 @@ pub struct CljxChannel {
    ```
    The same pattern (already sketched in `core_async.rs`) applies.
 
-3. **Upgrade `CljxFuture`** internals to `OnceCell<Result<Value,Value>>` + `Notify`. Keep the same
-   external API. Existing thread-pool futures (spawned by the `future` macro) write their result
-   into the new structure; `deref`/`await` behaviour is unchanged from the caller's perspective.
+3. **Upgrade `CljxFuture`** internals conditionally. Without the feature, the existing
+   `Mutex<FutureState>` + `Condvar` implementation is kept exactly as-is. With the feature, the
+   internals switch to `tokio::sync::OnceCell` + `Notify`. The external Rust API (`blocking_deref`,
+   `await_value`, `future-done?`, `future-cancel`) is identical in both cases; only the storage
+   changes.
 
 4. **Rename agent's `await`** to `await-agent` in `cljrs-stdlib` and `cljrs-builtins`. This frees
    the `await` name for the new async primitive.
 
-5. **Add `Value::Channel`** variant and `CljxChannel` type.
+5. **Add `Value::Channel`** variant (gated with `#[cfg(feature = "async")]`) and `CljxChannel`
+   type (in a `#[cfg(feature = "async")]` module block).
 
 ---
 
@@ -533,7 +658,7 @@ Once IR lowering tracks `is_async`, the compiler can:
 
 | Phase | Deliverable | Key Files |
 |---|---|---|
-| A | Tokio runtime init; upgrade `CljxFuture`; rename `await-agent` | `cljrs-value/types.rs`, `cljrs/main.rs`, `cljrs-builtins` |
+| A | `async` feature flag; optional tokio dep; upgrade `CljxFuture` (feature-conditional); rename `await-agent` | `Cargo.toml` (workspace + crates), `cljrs-value/types.rs`, `cljrs/main.rs`, `cljrs-builtins` |
 | B | `^:async` fn dispatch; dual eval path; `await` special form | `cljrs-interp/special_forms.rs`, `cljrs-interp/apply.rs` |
 | C | `deref` blocking await; async/sync context enforcement | `cljrs-builtins/deref.rs` |
 | D | `timeout`, `alts`, `alt` macro | `cljrs-stdlib/core_async.rs`, `cljrs-interp/macros.rs` |
