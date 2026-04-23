@@ -135,16 +135,37 @@ fn eval_form(form: &Form, env: &Env) -> ValueResult<Value> {
 duration of that expression's evaluation. All `GcPtr::new()` calls made during
 evaluation of that subexpression go to the static arena.
 
-### Appropriate uses of `^:static`
+### Implicit `^:static` for top-level `def` / `defn`
+
+Top-level `def` and `defn` forms are **always** treated as static — no
+annotation required. They are interned into a `Namespace` which lives for the
+entire program, so any region-local allocation for their values would be a
+use-after-free. The evaluator detects "top-level" context (depth = 0, not
+inside a fn body or let block) and automatically routes through
+`eval_in_static_context`.
 
 ```clojure
-^:static (def config {:host "localhost" :port 8080})
-^:static (defn handlers [...] ...)
-(atom ^:static {:state :running})  ; atom's initial value is static
+; all of these are automatically static at the top level:
+(def config {:host "localhost" :port 8080})
+(defn greet [name] (str "hello " name))
+(def handlers {:get handle-get :post handle-post})
+
+; ^:static is still useful for values nested inside other forms:
+(atom ^:static {:state :running})
 ```
 
-Top-level `def` forms should be treated as implicitly `^:static` by the
-compiler — they go into namespaces and must outlive all scopes.
+### Metadata follows its value's provenance
+
+A value's metadata map is allocated with the same provenance as the value
+itself. If the value is region-local, its metadata is region-local. If the
+value is static (via `^:static` or top-level `def`), its metadata is also
+allocated in the `StaticArena`.
+
+`with-meta` and `vary-meta` inherit the provenance of the value being
+annotated, not the metadata map argument. If a region-local metadata map is
+attached to a static value, it is deep-copied into the `StaticArena` at the
+point of attachment. This copy is the only case where provenance promotion
+occurs implicitly — and the compiler should warn when it happens.
 
 ---
 
@@ -162,12 +183,42 @@ Violation patterns to detect and reject:
 2. Storing into a `Var`, `Atom`, `Agent`, or `Namespace` binding
 3. Capturing a region-local value in a closure that outlives the region
 4. Storing into a data structure owned by the calling scope
+5. An unrealized `LazySeq` escaping the region in which it was created (see
+   below)
 
 Emit a compile error pointing to the allocation site and the escape point, with
 a suggestion to add `^:static`. This extends the existing `EscapeInfo` /
 `AllocationSite` infrastructure — mark region-local sites as
 `Lifetime::Region(scope_id)` and flag any escape where `scope_id` of the
 destination outlives the source.
+
+### `LazySeq` rules under `no-gc`
+
+A `LazySeq` that is **fully realized within its creating scope** is legal:
+the thunk and all produced values live and die in the same region.
+
+A `LazySeq` that **escapes its creating scope** is a compiler error, because
+the thunk captures region-local state that will have been reset by the time
+the seq is forced. There is no implicit promotion.
+
+```clojure
+; OK — realized in the same let block
+(let [xs (map inc [1 2 3])]
+  (doall xs))   ; forces all elements before region resets
+
+; COMPILER ERROR — lazy seq escapes the function's region
+(defn bad []
+  (map inc [1 2 3]))  ; returned unrealized; thunk is dangling
+
+; OK — mark the result static so its thunk and elements go to StaticArena
+(defn ok []
+  ^:static (map inc [1 2 3]))
+```
+
+The escape analysis detects `LazySeq` escape the same way it detects any other
+region-local escape: if the `LazySeq` value's `scope_id` is shorter than the
+destination lifetime, it is an error. There is no special `LazySeq` path —
+the general escape rule covers it.
 
 ---
 
@@ -242,19 +293,7 @@ This runtime tag acts as a safety net alongside compile-time escape analysis.
 
 ## Open Questions
 
-1. **`LazySeq` under `no-gc`**: A lazy seq captures a thunk; the realized value
-   may outlive the region. Should `LazySeq` require `^:static`? Or should
-   forcing a lazy seq promote the value to the caller's region?
-
-2. **Metadata maps**: Metadata maps are created inline and attached to values.
-   Should metadata allocation follow the value's provenance, or always be
-   static?
-
-3. **Implicit `^:static` for `def`**: Top-level `def` forms go into namespaces
-   (effectively static). Should the compiler automatically treat `def`-bound
-   values as `^:static` without requiring the annotation?
-
-4. **Accumulation pattern**: A persistent map built up over many `assoc` calls
+1. **Accumulation pattern**: A persistent map built up over many `assoc` calls
    across region boundaries — each intermediate allocation is region-local but
    the final result needs to escape. The escape analysis needs to handle this
    gracefully (e.g., promote the final result to the caller's region or require
