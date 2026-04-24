@@ -77,7 +77,10 @@ impl ScratchGuard {
         let mut region = Box::new(Region::new());
         let ptr = region.as_mut() as *mut Region;
         ALLOC_CTX.with(|ctx| ctx.borrow_mut().push(AllocCtx::Region(ptr)));
-        Self { region, in_ctx: true }
+        Self {
+            region,
+            in_ctx: true,
+        }
     }
 
     /// Remove the scratch region from the active allocation context.

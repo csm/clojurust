@@ -116,7 +116,13 @@ impl Region {
         // SAFETY: `raw` is properly aligned and sized for GcBox<T>.
         #[cfg(not(feature = "no-gc"))]
         unsafe {
-            ptr::write(gc_box, GcBox { header: GcBoxHeader::new::<T>(), value });
+            ptr::write(
+                gc_box,
+                GcBox {
+                    header: GcBoxHeader::new::<T>(),
+                    value,
+                },
+            );
         }
         #[cfg(feature = "no-gc")]
         unsafe {

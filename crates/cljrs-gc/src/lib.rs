@@ -13,9 +13,9 @@ pub mod cancellation;
 pub mod config;
 
 #[cfg(feature = "no-gc")]
-pub mod static_arena;
-#[cfg(feature = "no-gc")]
 pub mod alloc_ctx;
+#[cfg(feature = "no-gc")]
+pub mod static_arena;
 
 // ── Re-exports from active implementation ─────────────────────────────────────
 
@@ -28,16 +28,14 @@ pub use cancellation::{
 #[cfg(not(feature = "no-gc"))]
 pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
 
+#[cfg(not(feature = "no-gc"))]
+pub use gc_full::{AllocRootGuard, GcHeap, HEAP, push_alloc_frame, trace_thread_alloc_roots};
 #[cfg(feature = "no-gc")]
 pub use nogc_stubs::{
-    AllocRootGuard, CancellableGuard, GcConfig, GcHeap, GcParked, MutatorGuard, StwGuard,
-    begin_stw, check_cancellation, gc_requested, park_thread, push_alloc_frame, register_mutator,
-    registered_threads, request_gc, safepoint, take_gc_request, unpark_thread,
-    wait_for_threads_to_park, HEAP, CONFIG_CANCELLATION,
-};
-#[cfg(not(feature = "no-gc"))]
-pub use gc_full::{
-    AllocRootGuard, GcHeap, push_alloc_frame, trace_thread_alloc_roots, HEAP,
+    AllocRootGuard, CONFIG_CANCELLATION, CancellableGuard, GcConfig, GcHeap, GcParked, HEAP,
+    MutatorGuard, StwGuard, begin_stw, check_cancellation, gc_requested, park_thread,
+    push_alloc_frame, register_mutator, registered_threads, request_gc, safepoint, take_gc_request,
+    unpark_thread, wait_for_threads_to_park,
 };
 
 // ── Trace trait ───────────────────────────────────────────────────────────────
@@ -113,8 +111,8 @@ pub use self::gc_header::{GcBox, GcBoxHeader};
 
 #[cfg(not(feature = "no-gc"))]
 mod gc_header {
-    use std::cell::Cell;
     use crate::{MarkVisitor, Trace};
+    use std::cell::Cell;
 
     pub(crate) const GC_INITIAL_LIVES: u8 = 10;
 
@@ -216,7 +214,7 @@ impl MarkVisitor {
     }
 
     pub unsafe fn mark_header(&mut self, header: *mut GcBoxHeader) {
-        use gc_header::{GC_INITIAL_LIVES};
+        use gc_header::GC_INITIAL_LIVES;
         let h = unsafe { &*header };
         if h.lives.get() < GC_INITIAL_LIVES {
             h.lives.set(GC_INITIAL_LIVES);
@@ -249,7 +247,9 @@ impl GcVisitor for MarkVisitor {
 
 #[cfg(feature = "no-gc")]
 impl MarkVisitor {
-    pub fn grey_len(&self) -> usize { 0 }
+    pub fn grey_len(&self) -> usize {
+        0
+    }
     pub unsafe fn mark_header(&mut self, _: *mut u8) {}
 }
 
@@ -281,7 +281,7 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn get(&self) -> &T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
-            use gc_header::{GC_MAGIC_ALIVE};
+            use gc_header::GC_MAGIC_ALIVE;
             let header = unsafe { &(*self.0.as_ptr()).header };
             assert_eq!(
                 header.magic.get(),
@@ -296,7 +296,7 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn get_mut(&mut self) -> &mut T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
-            use gc_header::{GC_MAGIC_ALIVE};
+            use gc_header::GC_MAGIC_ALIVE;
             let header = unsafe { &(*self.0.as_ptr()).header };
             assert_eq!(
                 header.magic.get(),
@@ -340,9 +340,9 @@ mod gc_full {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
-    use crate::gc_header::{GC_INITIAL_LIVES, drop_gc_box};
     use crate::config::GcConfig;
+    use crate::gc_header::{GC_INITIAL_LIVES, drop_gc_box};
+    use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
     const ESTIMATED_OBJECT_SIZE: usize = 48;
     type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
@@ -368,14 +368,21 @@ mod gc_full {
 
     impl GcHeapInner {
         const fn new() -> Self {
-            Self { head: std::ptr::null_mut(), count: 0, total_allocated: 0, total_freed: 0 }
+            Self {
+                head: std::ptr::null_mut(),
+                count: 0,
+                total_allocated: 0,
+                total_freed: 0,
+            }
         }
     }
 
     unsafe impl Sync for GcHeap {}
 
     impl Default for GcHeap {
-        fn default() -> Self { Self::new() }
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl GcHeap {
@@ -434,8 +441,11 @@ mod gc_full {
                 inner.count += 1;
                 inner.total_allocated += 1;
             }
-            self.total_allocated_bytes.fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
-            let current_usage = self.memory_in_use.fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
+            self.total_allocated_bytes
+                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
+            let current_usage = self
+                .memory_in_use
+                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
                 + ESTIMATED_OBJECT_SIZE;
 
             if let Some(config) = self.config.lock().unwrap().as_ref()
@@ -461,12 +471,19 @@ mod gc_full {
             let pre_count = self.inner.lock().unwrap().count;
             let pre_memory = self.memory_in_use.load(Ordering::Relaxed);
             cljrs_logging::feat_debug!(
-                "gc", "starting collection: {} objects, ~{} bytes in use", pre_count, pre_memory
+                "gc",
+                "starting collection: {} objects, ~{} bytes in use",
+                pre_count,
+                pre_memory
             );
             let mark_start = std::time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
-            cljrs_logging::feat_debug!("gc", "starting drain with {} grey objects", visitor.grey.len());
+            cljrs_logging::feat_debug!(
+                "gc",
+                "starting drain with {} grey objects",
+                visitor.grey.len()
+            );
             visitor.drain();
             let mark_elapsed = mark_start.elapsed();
 
@@ -510,7 +527,12 @@ mod gc_full {
             cljrs_logging::feat_debug!(
                 "gc",
                 "collection complete: freed {} (~{} bytes), {} remaining (~{} bytes), mark={:.2?} sweep={:.2?}",
-                freed_count, freed_bytes, inner.count, post_memory, mark_elapsed, sweep_elapsed
+                freed_count,
+                freed_bytes,
+                inner.count,
+                post_memory,
+                mark_elapsed,
+                sweep_elapsed
             );
             if freed_count == 0 {
                 let root_len = ALLOC_ROOTS.with(|r| r.borrow().len());
@@ -521,9 +543,15 @@ mod gc_full {
             }
         }
 
-        pub fn count(&self) -> usize { self.inner.lock().unwrap().count }
-        pub fn total_allocated(&self) -> usize { self.inner.lock().unwrap().total_allocated }
-        pub fn total_freed(&self) -> usize { self.inner.lock().unwrap().total_freed }
+        pub fn count(&self) -> usize {
+            self.inner.lock().unwrap().count
+        }
+        pub fn total_allocated(&self) -> usize {
+            self.inner.lock().unwrap().total_allocated
+        }
+        pub fn total_freed(&self) -> usize {
+            self.inner.lock().unwrap().total_freed
+        }
 
         pub fn collect_auto(&self) -> bool {
             cljrs_logging::feat_debug!("gc", "automatic collection requested");
@@ -542,7 +570,9 @@ mod gc_full {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub struct AllocRootGuard { saved_len: usize }
+    pub struct AllocRootGuard {
+        saved_len: usize,
+    }
 
     impl Drop for AllocRootGuard {
         fn drop(&mut self) {
@@ -575,63 +605,109 @@ mod gc_full {
 
 #[cfg(feature = "no-gc")]
 mod nogc_stubs {
-    use std::sync::Arc;
     use crate::MarkVisitor;
+    use std::sync::Arc;
 
     #[derive(Debug, Clone)]
     pub struct GcConfig;
     impl GcConfig {
-        pub fn new() -> Self { Self }
-        pub fn with_hard_limit(_: usize) -> Self { Self }
-        pub fn with_limits(_: usize, _: usize) -> Self { Self }
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn with_hard_limit(_: usize) -> Self {
+            Self
+        }
+        pub fn with_limits(_: usize, _: usize) -> Self {
+            Self
+        }
     }
-    impl Default for GcConfig { fn default() -> Self { Self::new() } }
+    impl Default for GcConfig {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     pub struct GcHeap;
     impl GcHeap {
-        pub const fn new() -> Self { Self }
+        pub const fn new() -> Self {
+            Self
+        }
         pub fn set_config(&self, _: Arc<GcConfig>) {}
         pub fn register_root_tracer(&self, _: impl Fn(&mut MarkVisitor) + Send + Sync + 'static) {}
         pub fn trace_registered_roots(&self, _: &mut MarkVisitor) {}
-        pub fn memory_in_use(&self) -> usize { 0 }
-        pub fn count(&self) -> usize { 0 }
-        pub fn total_allocated(&self) -> usize { 0 }
-        pub fn total_freed(&self) -> usize { 0 }
+        pub fn memory_in_use(&self) -> usize {
+            0
+        }
+        pub fn count(&self) -> usize {
+            0
+        }
+        pub fn total_allocated(&self) -> usize {
+            0
+        }
+        pub fn total_freed(&self) -> usize {
+            0
+        }
         pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, _: F) {}
-        pub fn collect_auto(&self) -> bool { false }
+        pub fn collect_auto(&self) -> bool {
+            false
+        }
     }
     unsafe impl Sync for GcHeap {}
     pub static HEAP: GcHeap = GcHeap::new();
 
     pub struct MutatorGuard;
-    impl Drop for MutatorGuard { fn drop(&mut self) {} }
+    impl Drop for MutatorGuard {
+        fn drop(&mut self) {}
+    }
     pub struct StwGuard;
-    impl Drop for StwGuard { fn drop(&mut self) {} }
+    impl Drop for StwGuard {
+        fn drop(&mut self) {}
+    }
     pub struct GcParked;
     pub struct CancellableGuard;
 
     pub struct GcCancellationStub;
     impl GcCancellationStub {
-        pub const fn new() -> Self { Self }
-        pub fn in_progress(&self) -> bool { false }
+        pub const fn new() -> Self {
+            Self
+        }
+        pub fn in_progress(&self) -> bool {
+            false
+        }
     }
     pub static CONFIG_CANCELLATION: GcCancellationStub = GcCancellationStub::new();
 
     pub fn safepoint() {}
-    pub fn gc_requested() -> bool { false }
-    pub fn take_gc_request() -> bool { false }
-    pub fn begin_stw() -> Option<StwGuard> { None }
-    pub fn register_mutator() -> MutatorGuard { MutatorGuard }
-    pub fn registered_threads() -> usize { 0 }
+    pub fn gc_requested() -> bool {
+        false
+    }
+    pub fn take_gc_request() -> bool {
+        false
+    }
+    pub fn begin_stw() -> Option<StwGuard> {
+        None
+    }
+    pub fn register_mutator() -> MutatorGuard {
+        MutatorGuard
+    }
+    pub fn registered_threads() -> usize {
+        0
+    }
     pub fn request_gc() {}
-    pub fn check_cancellation() -> Result<(), GcParked> { Ok(()) }
+    pub fn check_cancellation() -> Result<(), GcParked> {
+        Ok(())
+    }
     pub fn park_thread() {}
     pub fn unpark_thread() {}
     pub fn wait_for_threads_to_park() {}
 
     pub struct AllocRootGuard;
-    impl Drop for AllocRootGuard { fn drop(&mut self) {} }
-    pub fn push_alloc_frame() -> AllocRootGuard { AllocRootGuard }
+    impl Drop for AllocRootGuard {
+        fn drop(&mut self) {}
+    }
+    pub fn push_alloc_frame() -> AllocRootGuard {
+        AllocRootGuard
+    }
 }
 
 // =============================================================================
@@ -644,14 +720,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
-    struct Tracked { value: i32, dropped: Arc<Mutex<bool>> }
-    impl Drop for Tracked { fn drop(&mut self) { *self.dropped.lock().unwrap() = true; } }
-    impl Trace for Tracked { fn trace(&self, _: &mut MarkVisitor) {} }
+    struct Tracked {
+        value: i32,
+        dropped: Arc<Mutex<bool>>,
+    }
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            *self.dropped.lock().unwrap() = true;
+        }
+    }
+    impl Trace for Tracked {
+        fn trace(&self, _: &mut MarkVisitor) {}
+    }
 
     #[derive(Debug)]
-    struct Parent { child: GcPtr<Tracked> }
+    struct Parent {
+        child: GcPtr<Tracked>,
+    }
     impl Trace for Parent {
-        fn trace(&self, visitor: &mut MarkVisitor) { visitor.visit(&self.child); }
+        fn trace(&self, visitor: &mut MarkVisitor) {
+            visitor.visit(&self.child);
+        }
     }
 
     fn fresh_heap() -> gc_full::GcHeap {
@@ -680,7 +769,10 @@ mod tests {
     fn collect_keeps_reachable() {
         let heap = fresh_heap();
         let dropped = Arc::new(Mutex::new(false));
-        let p = heap.alloc(Tracked { value: 2, dropped: dropped.clone() });
+        let p = heap.alloc(Tracked {
+            value: 2,
+            dropped: dropped.clone(),
+        });
         heap.collect(|vis| vis.visit(&p));
         assert_eq!(heap.count(), 1);
         assert!(!*dropped.lock().unwrap());

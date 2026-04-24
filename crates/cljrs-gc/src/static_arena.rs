@@ -38,7 +38,8 @@ impl Inner {
         let layout = Layout::from_size_align(CHUNK_SIZE, 16).unwrap();
         // SAFETY: non-zero size, valid layout.
         let data = unsafe {
-            NonNull::new(alloc::alloc(layout)).expect("StaticArena: initial chunk allocation failed")
+            NonNull::new(alloc::alloc(layout))
+                .expect("StaticArena: initial chunk allocation failed")
         };
         let base = data.as_ptr() as usize;
         Self {
@@ -86,7 +87,9 @@ unsafe impl Sync for StaticArena {}
 
 impl StaticArena {
     fn new() -> Self {
-        Self { inner: Mutex::new(Inner::new()) }
+        Self {
+            inner: Mutex::new(Inner::new()),
+        }
     }
 
     /// Allocate `value` into the arena. Its destructor will never be called.
