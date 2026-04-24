@@ -196,6 +196,7 @@ mod nogc_box {
 // =============================================================================
 
 #[cfg(not(feature = "no-gc"))]
+#[derive(Default)]
 pub struct MarkVisitor {
     pub(crate) grey: Vec<*mut GcBoxHeader>,
 }
@@ -206,7 +207,7 @@ pub struct MarkVisitor;
 #[cfg(not(feature = "no-gc"))]
 impl MarkVisitor {
     pub fn new() -> Self {
-        Self { grey: Vec::new() }
+        Self::default()
     }
 
     pub fn grey_len(&self) -> usize {
@@ -341,7 +342,7 @@ mod gc_full {
     use std::sync::{Arc, Mutex};
 
     use crate::config::GcConfig;
-    use crate::gc_header::{GC_INITIAL_LIVES, drop_gc_box};
+    use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
     const ESTIMATED_OBJECT_SIZE: usize = 48;
