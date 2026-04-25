@@ -648,6 +648,11 @@ mod nogc_stubs {
     }
 
     pub struct GcHeap;
+    impl Default for GcHeap {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
     impl GcHeap {
         pub const fn new() -> Self {
             Self

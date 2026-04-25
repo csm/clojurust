@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cljrs_ir::{IrFunction, Inst, KnownFn, Terminator, VarId};
+use cljrs_ir::{Inst, IrFunction, KnownFn, Terminator, VarId};
 
 // ── Violation type ───────────────────────────────────────────────────────────
 
@@ -221,10 +221,10 @@ fn collect_lazy_vars(func: &IrFunction) -> HashSet<VarId> {
     let mut lazy = HashSet::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            if let Inst::CallKnown(dst, kfn, _) = inst {
-                if is_lazy_producing(kfn) {
-                    lazy.insert(*dst);
-                }
+            if let Inst::CallKnown(dst, kfn, _) = inst
+                && is_lazy_producing(kfn)
+            {
+                lazy.insert(*dst);
             }
         }
     }
@@ -287,10 +287,7 @@ fn uses_in_inst(var: VarId, inst: &Inst) -> usize {
         Inst::AllocVector(_, elems) | Inst::AllocSet(_, elems) | Inst::AllocList(_, elems) => {
             elems.iter().filter(|&&e| e == var).count()
         }
-        Inst::AllocMap(_, pairs) => pairs
-            .iter()
-            .filter(|(k, v)| *k == var || *v == var)
-            .count(),
+        Inst::AllocMap(_, pairs) => pairs.iter().filter(|(k, v)| *k == var || *v == var).count(),
         Inst::AllocCons(_, head, tail) => {
             (if *head == var { 1 } else { 0 }) + (if *tail == var { 1 } else { 0 })
         }
@@ -341,13 +338,13 @@ pub fn check_function(func: &IrFunction) -> Vec<BlacklistViolation> {
     // within this function body.  In the AOT-compiled no-gc path the value
     // would have been placed in the scratch region and dangles after reset.
     for block in &func.blocks {
-        if let Terminator::Return(ret_var) = &block.terminator {
-            if is_alloc_derived(*ret_var, &alloc_vars, &phi_inputs) {
-                violations.push(BlacklistViolation::InteriorPointerReturn {
-                    function: func.name.clone(),
-                    var: *ret_var,
-                });
-            }
+        if let Terminator::Return(ret_var) = &block.terminator
+            && is_alloc_derived(*ret_var, &alloc_vars, &phi_inputs)
+        {
+            violations.push(BlacklistViolation::InteriorPointerReturn {
+                function: func.name.clone(),
+                var: *ret_var,
+            });
         }
     }
 
@@ -371,17 +368,17 @@ pub fn check_function(func: &IrFunction) -> Vec<BlacklistViolation> {
     // intermediate binding (not just the direct tail expression) and then
     // returned.  The thunk's captured pointers would dangle.
     for block in &func.blocks {
-        if let Terminator::Return(ret_var) = &block.terminator {
-            if lazy_vars.contains(ret_var) {
-                // Use-count > 1 means the var was used somewhere else too
-                // (e.g. printed, passed to another fn) before being returned,
-                // indicating it was an intermediate binding.
-                if count_uses(*ret_var, func) > 1 {
-                    violations.push(BlacklistViolation::LazySeqEscape {
-                        function: func.name.clone(),
-                        var: *ret_var,
-                    });
-                }
+        if let Terminator::Return(ret_var) = &block.terminator
+            && lazy_vars.contains(ret_var)
+        {
+            // Use-count > 1 means the var was used somewhere else too
+            // (e.g. printed, passed to another fn) before being returned,
+            // indicating it was an intermediate binding.
+            if count_uses(*ret_var, func) > 1 {
+                violations.push(BlacklistViolation::LazySeqEscape {
+                    function: func.name.clone(),
+                    var: *ret_var,
+                });
             }
         }
     }
@@ -419,16 +416,28 @@ mod tests {
     use cljrs_ir::{Block, BlockId, ClosureTemplate, IrFunction, Terminator, VarId};
 
     fn make_func(name: &str, blocks: Vec<Block>) -> IrFunction {
-        let max_var = blocks.iter().flat_map(|b| {
-            b.phis.iter().chain(b.insts.iter()).filter_map(|i| match i {
-                Inst::AllocVector(d, _) | Inst::AllocMap(d, _) | Inst::AllocSet(d, _)
-                | Inst::AllocList(d, _) | Inst::AllocClosure(d, _, _) | Inst::Const(d, _)
-                | Inst::LoadLocal(d, _) | Inst::LoadGlobal(d, _, _) | Inst::RegionAlloc(d, _, _, _)
-                | Inst::DefVar(d, _, _, _) | Inst::CallKnown(d, _, _) | Inst::Call(d, _, _) => Some(d.0 + 1),
-                Inst::AllocCons(d, _, _) => Some(d.0 + 1),
-                _ => None,
+        let max_var = blocks
+            .iter()
+            .flat_map(|b| {
+                b.phis.iter().chain(b.insts.iter()).filter_map(|i| match i {
+                    Inst::AllocVector(d, _)
+                    | Inst::AllocMap(d, _)
+                    | Inst::AllocSet(d, _)
+                    | Inst::AllocList(d, _)
+                    | Inst::AllocClosure(d, _, _)
+                    | Inst::Const(d, _)
+                    | Inst::LoadLocal(d, _)
+                    | Inst::LoadGlobal(d, _, _)
+                    | Inst::RegionAlloc(d, _, _, _)
+                    | Inst::DefVar(d, _, _, _)
+                    | Inst::CallKnown(d, _, _)
+                    | Inst::Call(d, _, _) => Some(d.0 + 1),
+                    Inst::AllocCons(d, _, _) => Some(d.0 + 1),
+                    _ => None,
+                })
             })
-        }).max().unwrap_or(0);
+            .max()
+            .unwrap_or(0);
         IrFunction {
             name: Some(Arc::from(name)),
             params: vec![],
@@ -441,7 +450,12 @@ mod tests {
     }
 
     fn simple_block(id: u32, insts: Vec<Inst>, term: Terminator) -> Block {
-        Block { id: BlockId(id), phis: vec![], insts, terminator: term }
+        Block {
+            id: BlockId(id),
+            phis: vec![],
+            insts,
+            terminator: term,
+        }
     }
 
     #[test]
@@ -458,7 +472,9 @@ mod tests {
         );
         let violations = check_function(&func);
         assert!(
-            violations.iter().any(|v| matches!(v, BlacklistViolation::InteriorPointerReturn { .. })),
+            violations
+                .iter()
+                .any(|v| matches!(v, BlacklistViolation::InteriorPointerReturn { .. })),
             "expected InteriorPointerReturn, got {violations:?}"
         );
     }
@@ -506,7 +522,9 @@ mod tests {
         );
         let violations = check_function(&func);
         assert!(
-            violations.iter().any(|v| matches!(v, BlacklistViolation::RegionToStaticStore { .. })),
+            violations
+                .iter()
+                .any(|v| matches!(v, BlacklistViolation::RegionToStaticStore { .. })),
             "expected RegionToStaticStore, got {violations:?}"
         );
     }
@@ -551,7 +569,9 @@ mod tests {
         );
         let violations = check_function(&func);
         assert!(
-            violations.iter().any(|v| matches!(v, BlacklistViolation::LazySeqEscape { .. })),
+            violations
+                .iter()
+                .any(|v| matches!(v, BlacklistViolation::LazySeqEscape { .. })),
             "expected LazySeqEscape, got {violations:?}"
         );
     }
@@ -581,7 +601,9 @@ mod tests {
         );
         let violations = check_function(&func);
         assert!(
-            violations.iter().any(|v| matches!(v, BlacklistViolation::EscapingClosure { .. })),
+            violations
+                .iter()
+                .any(|v| matches!(v, BlacklistViolation::EscapingClosure { .. })),
             "expected EscapingClosure, got {violations:?}"
         );
     }
