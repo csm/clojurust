@@ -411,6 +411,7 @@ dependencies = [
  "cljrs-ir",
  "cljrs-logging",
  "cljrs-reader",
+ "cljrs-types",
  "cljrs-value",
  "lazy_static",
  "tokio",

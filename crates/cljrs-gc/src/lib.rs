@@ -18,7 +18,7 @@ pub mod alloc_ctx;
 #[cfg(feature = "no-gc")]
 pub mod static_arena;
 
-pub use stats::{GC_STATS, GcStats, GcStatsSnapshot};
+pub use stats::{CLJRS_GC_STATS_ENV, GC_STATS, GcStats, GcStatsSnapshot, dump_stats_from_env};
 
 // ── Re-exports from active implementation ─────────────────────────────────────
 

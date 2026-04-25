@@ -138,6 +138,39 @@ impl fmt::Display for GcStatsSnapshot {
 /// Process-global GC statistics counters.
 pub static GC_STATS: GcStats = GcStats::new();
 
+/// Environment variable consulted by [`dump_stats_from_env`].
+pub const CLJRS_GC_STATS_ENV: &str = "CLJRS_GC_STATS";
+
+/// If `CLJRS_GC_STATS` is set in the environment, write a snapshot of
+/// [`GC_STATS`] to its target.  Intended to be called once at program exit
+/// from AOT-compiled binaries (and the AOT test harness), which have no CLI
+/// flag parsing of their own.
+///
+/// Target conventions:
+/// - unset → do nothing
+/// - empty string or `"-"` → write to stdout
+/// - any other value → treated as a filesystem path
+///
+/// I/O failures are reported on stderr; they never panic.
+pub fn dump_stats_from_env() {
+    let target = match std::env::var(CLJRS_GC_STATS_ENV) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let snapshot = GC_STATS.snapshot();
+    let result = if target.is_empty() || target == "-" {
+        println!("{snapshot}");
+        Ok(())
+    } else {
+        std::fs::write(&target, format!("{snapshot}\n"))
+    };
+
+    if let Err(e) = result {
+        eprintln!("cljrs: failed to write GC stats to {target:?}: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

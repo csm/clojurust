@@ -15,6 +15,8 @@ fn main() {
     println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/anf.cljrs");
     println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/ir.cljrs");
     println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/known.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/escape.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/optimize.cljrs");
 
     // The Clojure compiler uses deep recursion; run on a large-stack thread.
     let result = std::thread::Builder::new()
@@ -57,14 +59,41 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
 
     let mut env = cljrs_eval::Env::new(globals.clone(), "user");
 
-    // Load the compiler namespaces.
+    // Load the compiler namespaces (anf, ir, known).
     if !cljrs_eval::ensure_compiler_loaded(&globals, &mut env) {
         return Err("failed to load compiler namespaces".to_string());
+    }
+
+    // Also load the optimize namespace (which transitively requires escape) so
+    // we can run escape analysis on the lowered IR — that's what inserts the
+    // RegionStart/RegionAlloc instructions consumed by the IR interpreter.
+    {
+        let span = cljrs_types::span::Span::new(Arc::new("<prebuild>".to_string()), 0, 0, 1, 1);
+        let require_form = cljrs_reader::Form::new(
+            cljrs_reader::form::FormKind::List(vec![
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Symbol("require".into()),
+                    span.clone(),
+                ),
+                cljrs_reader::Form::new(
+                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
+                        cljrs_reader::form::FormKind::Symbol("cljrs.compiler.optimize".into()),
+                        span.clone(),
+                    ))),
+                    span,
+                ),
+            ]),
+            cljrs_types::span::Span::new(Arc::new("<prebuild>".to_string()), 0, 0, 1, 1),
+        );
+        cljrs_eval::eval(&require_form, &mut env)
+            .map_err(|e| format!("failed to require cljrs.compiler.optimize: {e:?}"))?;
     }
 
     // Walk clojure.core and lower every function arity.
     let mut bundle = cljrs_ir::IrBundle::new();
     let mut count = 0usize;
+    let mut fail_count = 0usize;
+    let mut first_failure: Option<String> = None;
 
     let var_entries: Vec<(Arc<str>, cljrs_value::Value)> = {
         let ns_map = globals.namespaces.read().unwrap();
@@ -98,7 +127,7 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
                 format!("clojure.core/{var_name}:{}", arity.params.len())
             };
 
-            match cljrs_eval::lower::lower_arity(
+            match cljrs_eval::lower::lower_and_optimize_arity(
                 f.name.as_deref(),
                 &arity.params,
                 arity.rest_param.as_ref(),
@@ -110,8 +139,11 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
                     bundle.insert(key, ir_func);
                     count += 1;
                 }
-                Err(_) => {
-                    // Skip unsupported — not an error.
+                Err(e) => {
+                    fail_count += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(format!("{key}: {e}"));
+                    }
                 }
             }
         }
@@ -121,6 +153,13 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
         cljrs_ir::serialize_bundle(&bundle).map_err(|e| format!("serialization failed: {e}"))?;
     std::fs::write(output, &bytes)
         .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+
+    if fail_count > 0 {
+        eprintln!(
+            "cljrs-stdlib build.rs: {fail_count} arities failed to lower+optimize (first: {})",
+            first_failure.as_deref().unwrap_or("?"),
+        );
+    }
 
     Ok(count)
 }

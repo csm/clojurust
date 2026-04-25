@@ -103,6 +103,10 @@ pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistV
 
 Pipeline: read source → parse → evaluate preamble → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
 
+The generated harness `main()` (and the `compile_test_harness` test runner)
+calls `cljrs_gc::dump_stats_from_env()` once at exit, so AOT binaries honor
+the `CLJRS_GC_STATS` env var (empty/`"-"` → stdout, otherwise a file path).
+
 ### No-GC blacklist (`escape.rs`, no-gc only)
 
 ```rust
