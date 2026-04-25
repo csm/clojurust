@@ -28,6 +28,10 @@ pub enum AotError {
     Codegen(crate::codegen::CodegenError),
     Eval(String),
     Link(String),
+    /// One or more no-gc memory-safety violations were found by the blacklist
+    /// analysis.  Only emitted when the `no-gc` Cargo feature is active.
+    #[cfg(feature = "no-gc")]
+    NoGcBlacklist(Vec<crate::escape::BlacklistViolation>),
 }
 
 impl std::fmt::Display for AotError {
@@ -38,6 +42,14 @@ impl std::fmt::Display for AotError {
             AotError::Codegen(e) => write!(f, "codegen error: {e:?}"),
             AotError::Eval(e) => write!(f, "eval/lowering error: {e}"),
             AotError::Link(e) => write!(f, "link error: {e}"),
+            #[cfg(feature = "no-gc")]
+            AotError::NoGcBlacklist(vs) => {
+                writeln!(f, "no-gc blacklist violations:")?;
+                for v in vs {
+                    writeln!(f, "  • {v}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -178,8 +190,20 @@ fn lower_via_clojure_inner(
         .map_err(|e| AotError::Eval(format!("Optimization failed: {e:?}")))?;
 
     // Convert the result Value → IrFunction.
-    ir_convert::value_to_ir_function(&optimized)
-        .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))
+    let ir_func = ir_convert::value_to_ir_function(&optimized)
+        .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))?;
+
+    // Under no-gc: run the blacklist analysis and reject programs that contain
+    // patterns the AOT code generator cannot safely compile.
+    #[cfg(feature = "no-gc")]
+    {
+        let violations = crate::escape::check(&ir_func);
+        if !violations.is_empty() {
+            return Err(AotError::NoGcBlacklist(violations));
+        }
+    }
+
+    Ok(ir_func)
 }
 
 // ── Direct call optimization ────────────────────────────────────────────────

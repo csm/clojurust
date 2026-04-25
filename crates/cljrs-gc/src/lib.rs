@@ -6,6 +6,7 @@
 use std::ptr::NonNull;
 
 pub mod region;
+pub mod stats;
 
 #[cfg(not(feature = "no-gc"))]
 pub mod cancellation;
@@ -16,6 +17,8 @@ pub mod config;
 pub mod alloc_ctx;
 #[cfg(feature = "no-gc")]
 pub mod static_arena;
+
+pub use stats::{GC_STATS, GcStats, GcStatsSnapshot};
 
 // ── Re-exports from active implementation ─────────────────────────────────────
 
@@ -37,6 +40,15 @@ pub use nogc_stubs::{
     push_alloc_frame, register_mutator, registered_threads, request_gc, safepoint, take_gc_request,
     unpark_thread, wait_for_threads_to_park,
 };
+
+/// Return `true` if `addr` was allocated by the global `StaticArena`.
+///
+/// Available only in `no-gc` debug builds.  Downstream crates (`cljrs-value`)
+/// use this to implement write-site provenance assertions.
+#[cfg(all(feature = "no-gc", debug_assertions))]
+pub fn is_static_addr(addr: usize) -> bool {
+    static_arena::is_static_addr(addr)
+}
 
 // ── Trace trait ───────────────────────────────────────────────────────────────
 
@@ -312,6 +324,16 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
     }
+
+    /// Return `true` if this pointer was allocated by the global `StaticArena`.
+    ///
+    /// Only meaningful (and only compiled) in `no-gc` debug builds.  Used by
+    /// write-site assertions in `Atom::reset` / `Var::bind` to catch
+    /// region-local values being stored in program-lifetime containers.
+    #[cfg(all(feature = "no-gc", debug_assertions))]
+    pub fn is_static_alloc(&self) -> bool {
+        static_arena::is_static_addr(self.0.as_ptr() as usize)
+    }
 }
 
 impl<T: Trace + 'static> Clone for GcPtr<T> {
@@ -444,6 +466,7 @@ mod gc_full {
             }
             self.total_allocated_bytes
                 .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
+            crate::stats::GC_STATS.record_gc_alloc(ESTIMATED_OBJECT_SIZE);
             let current_usage = self
                 .memory_in_use
                 .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
@@ -524,6 +547,11 @@ mod gc_full {
             let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
             self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
+            crate::stats::GC_STATS.record_gc_pause(
+                mark_elapsed + sweep_elapsed,
+                freed_count as u64,
+                freed_bytes as u64,
+            );
             let post_memory = self.memory_in_use.load(Ordering::Relaxed);
             cljrs_logging::feat_debug!(
                 "gc",
@@ -629,6 +657,11 @@ mod nogc_stubs {
     }
 
     pub struct GcHeap;
+    impl Default for GcHeap {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
     impl GcHeap {
         pub const fn new() -> Self {
             Self

@@ -134,6 +134,7 @@ impl Region {
             drop_fn: drop_gcbox_in_place::<T>,
         });
         self.object_count += 1;
+        crate::stats::GC_STATS.record_region_alloc(layout.size());
 
         // SAFETY: `gc_box` is non-null (from bump_alloc).
         GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
