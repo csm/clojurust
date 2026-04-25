@@ -248,7 +248,8 @@ impl Var {
             value_gcptr_is_static(&v),
             "no-gc: Var::bind({}/{}) received a region-local value — store violations \
              indicate a missing StaticCtxGuard around the value expression",
-            self.namespace, self.name
+            self.namespace,
+            self.name
         );
         *self.value.lock().unwrap() = Some(v);
     }
