@@ -418,7 +418,18 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         }
 
         // Eval body, catching Recur.
+        // Under no-gc: push a scratch region; evaluate all-but-last in it,
+        // then pop scratch before the tail expression so the return value
+        // lands in the caller's allocation context.
+        #[cfg(not(feature = "no-gc"))]
         let result = eval_body_recur_fn(&arity.body, &mut env);
+        #[cfg(feature = "no-gc")]
+        let result = {
+            let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let r = eval_body_with_scratch(&arity.body, &mut scratch, &mut env);
+            r
+            // scratch drops here: resets the region (frees intermediates)
+        };
         env.pop_frame();
 
         match result {
@@ -500,6 +511,28 @@ fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult 
         result = eval(form, env)?;
     }
     Ok(result)
+}
+
+/// Under `no-gc`: evaluate body forms with the scratch region active for all
+/// non-tail forms, then pop the scratch before the tail expression so the
+/// return value (or `recur` args) are allocated in the caller's context.
+#[cfg(feature = "no-gc")]
+fn eval_body_with_scratch(
+    body: &[cljrs_reader::Form],
+    scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
+    env: &mut Env,
+) -> EvalResult {
+    if body.is_empty() {
+        scratch.pop_for_return();
+        return Ok(Value::Nil);
+    }
+    // Eval all non-tail forms in the scratch region.
+    for form in &body[..body.len() - 1] {
+        eval(form, env)?;
+    }
+    // Pop scratch so the tail expression allocates in the caller's context.
+    scratch.pop_for_return();
+    eval(&body[body.len() - 1], env)
 }
 
 /// Select the matching arity for the given argument count.
@@ -758,6 +791,10 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             got: 0,
         });
     }
+    // Under no-gc: atom initial value must live in the StaticArena since the
+    // Atom container outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let initial = eval(&arg_forms[0], env)?;
 
     // Evaluate and parse keyword options; unknown keys / nil keys are ignored.
@@ -827,6 +864,10 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         });
     }
     let atom_val = eval(&arg_forms[0], env)?;
+    // Under no-gc: the new value written into the atom must live in the
+    // StaticArena since the atom outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = eval(&arg_forms[1], env)?;
 
     let atom = match &atom_val {

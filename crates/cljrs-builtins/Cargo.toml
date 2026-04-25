@@ -6,6 +6,9 @@ description = "Built-in function implementations for clojurust (arithmetic, coll
 license.workspace = true
 repository.workspace = true
 
+[features]
+no-gc = ["cljrs-gc/no-gc"]
+
 [dependencies]
 cljrs-env = { workspace = true }
 cljrs-value = { workspace = true }
