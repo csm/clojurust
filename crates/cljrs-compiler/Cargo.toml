@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 aot_full_test = []
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-stdlib/no-gc"]
 
 [dependencies]
 cljrs-builtins = { workspace = true }

@@ -41,6 +41,18 @@ struct Cli {
     #[arg(short = 'X', global = true, value_name = "LEVEL:FEATURES")]
     x_flags: Vec<String>,
 
+    /// Print GC statistics on exit. Pass a path to write them to a file;
+    /// pass the flag without a value to write them to stdout. Only the
+    /// `run`, `eval`, and `test` subcommands honour this flag.
+    #[arg(
+        long = "gc-stats",
+        global = true,
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "",
+    )]
+    gc_stats: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -171,18 +183,42 @@ fn main() -> miette::Result<()> {
         .name("cljrs-main".into())
         .stack_size(stack_size);
     let handle = builder.spawn(move || run(cli)).into_diagnostic()?;
-    handle.join().unwrap_or_else(|e| {
+    let result: miette::Result<i32> = handle.join().unwrap_or_else(|e| {
         eprintln!("cljrs: thread panicked: {e:?}");
         std::process::exit(1);
-    })
+    });
+    match result {
+        Ok(0) => Ok(()),
+        Ok(code) => std::process::exit(code),
+        Err(e) => Err(e),
+    }
 }
 
-fn run(cli: Cli) -> miette::Result<()> {
+fn run(cli: Cli) -> miette::Result<i32> {
     // Register the main thread as a GC mutator so the collector knows
     // how many threads to wait for during stop-the-world collection.
     let _mutator = cljrs_gc::register_mutator();
 
-    match cli.command {
+    let gc_stats_target = cli.gc_stats.clone();
+    let supports_gc_stats = matches!(
+        &cli.command,
+        Commands::Run { .. } | Commands::Eval { .. } | Commands::Test { .. },
+    );
+
+    let result = run_command(cli.command);
+
+    if supports_gc_stats
+        && let Some(target) = gc_stats_target.as_deref()
+        && let Err(e) = write_gc_stats(target)
+    {
+        eprintln!("cljrs: failed to write GC stats: {e}");
+    }
+
+    result
+}
+
+fn run_command(command: Commands) -> miette::Result<i32> {
+    match command {
         Commands::Run {
             file,
             src_paths,
@@ -194,6 +230,7 @@ fn run(cli: Cli) -> miette::Result<()> {
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             run_source(&src, &filename, src_paths, gc_config)?;
+            Ok(0)
         }
         Commands::Repl {
             src_paths,
@@ -202,6 +239,7 @@ fn run(cli: Cli) -> miette::Result<()> {
         } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             run_repl(src_paths, gc_config);
+            Ok(0)
         }
         Commands::Compile {
             file,
@@ -221,6 +259,7 @@ fn run(cli: Cli) -> miette::Result<()> {
                 cljrs_compiler::aot::compile_file(&file, &out, &src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             }
+            Ok(0)
         }
         Commands::Eval { expr } => {
             // Eval uses default GC config
@@ -229,6 +268,7 @@ fn run(cli: Cli) -> miette::Result<()> {
             if result != Value::Nil {
                 println!("{}", result);
             }
+            Ok(0)
         }
         Commands::Test {
             namespaces,
@@ -236,17 +276,28 @@ fn run(cli: Cli) -> miette::Result<()> {
             verbose,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
-        } => {
-            run_tests_command(
-                namespaces,
-                src_paths,
-                verbose,
-                gc_soft_limit_mb,
-                gc_hard_limit_mb,
-            )?;
-        }
+        } => run_tests_command(
+            namespaces,
+            src_paths,
+            verbose,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
+        ),
     }
-    Ok(())
+}
+
+/// Write a snapshot of `cljrs_gc::GC_STATS` to `target`.
+///
+/// An empty target (the flag was passed without a value) writes to stdout;
+/// any other value is treated as a filesystem path.
+fn write_gc_stats(target: &str) -> std::io::Result<()> {
+    let snapshot = cljrs_gc::GC_STATS.snapshot();
+    if target.is_empty() {
+        println!("{snapshot}");
+        Ok(())
+    } else {
+        std::fs::write(target, format!("{snapshot}\n"))
+    }
 }
 
 // ── Source evaluation ─────────────────────────────────────────────────────────
@@ -319,12 +370,12 @@ fn run_tests_command(
     verbose: bool,
     gc_soft_limit_mb: Option<usize>,
     gc_hard_limit_mb: Option<usize>,
-) -> miette::Result<()> {
+) -> miette::Result<i32> {
     let namespaces = if namespaces.is_empty() {
         let discovered = discover_namespaces(&src_paths);
         if discovered.is_empty() {
             eprintln!("cljrs test: no test namespaces found in source paths");
-            std::process::exit(2);
+            return Ok(2);
         }
         eprintln!("Discovered {} test namespace(s).\n", discovered.len());
         discovered
@@ -364,9 +415,10 @@ fn run_tests_command(
     let total_load_errors: usize = results.iter().filter(|r| r.load_error.is_some()).count();
 
     if total_fail > 0 || total_load_errors > 0 {
-        std::process::exit(1);
+        Ok(1)
+    } else {
+        Ok(0)
     }
-    Ok(())
 }
 
 fn run_single_ns_tests(env: &mut Env, ns: &str) -> NsTestResult {

@@ -1,5 +1,8 @@
+#[cfg(not(feature = "no-gc"))]
 use crate::dynamics;
-use crate::env::{Env, GlobalEnv};
+use crate::env::Env;
+#[cfg(not(feature = "no-gc"))]
+use crate::env::GlobalEnv;
 use std::cell::RefCell;
 
 // ── Thread-local Env root registry ──────────────────────────────────────────
@@ -82,10 +85,12 @@ pub fn root_values(vals: &[cljrs_value::Value]) -> ValueRootGuard {
 
 /// Interpreter-level GC safepoint.
 ///
-/// Called at function entry, loop heads, and application boundaries.
-/// If a GC collection is in progress, blocks until it completes.
-/// If a GC has been requested (memory pressure), this thread becomes
-/// the collector: initiates STW, traces roots, collects, then resumes.
+/// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection
+/// is in progress) or initiates a collection (if memory pressure was signalled).
+#[cfg(feature = "no-gc")]
+pub fn gc_safepoint(_env: &Env) {}
+
+#[cfg(not(feature = "no-gc"))]
 pub fn gc_safepoint(env: &Env) {
     // Fast path: no GC activity at all.
     if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
@@ -133,7 +138,10 @@ pub fn gc_safepoint(env: &Env) {
     // _stw_guard drop clears in_progress, waking parked threads.
 }
 
+// ── GC-only root tracing helpers ─────────────────────────────────────────────
+
 /// Trace all GcPtr values reachable from an Env's local frames.
+#[cfg(not(feature = "no-gc"))]
 fn trace_env_roots(env: &Env, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
     // Trace local frame bindings
@@ -148,6 +156,7 @@ fn trace_env_roots(env: &Env, visitor: &mut cljrs_gc::MarkVisitor) {
 }
 
 /// Trace all Values registered in the thread-local value shadow stack.
+#[cfg(not(feature = "no-gc"))]
 fn trace_value_roots(visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
     VALUE_ROOTS.with(|roots| {
@@ -164,6 +173,7 @@ fn trace_value_roots(visitor: &mut cljrs_gc::MarkVisitor) {
 }
 
 /// Trace all Envs registered in the thread-local root stack.
+#[cfg(not(feature = "no-gc"))]
 fn trace_thread_env_roots(visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
     ENV_ROOTS.with(|roots| {
@@ -181,6 +191,7 @@ fn trace_thread_env_roots(visitor: &mut cljrs_gc::MarkVisitor) {
 }
 
 /// Trace all namespaces and their contents.
+#[cfg(not(feature = "no-gc"))]
 fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::GcVisitor as _;
     let namespaces = globals.namespaces.read().unwrap();

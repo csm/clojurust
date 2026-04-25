@@ -9,7 +9,7 @@ ANF lowering and escape analysis are written in Clojure (`cljrs.compiler.anf`,
 layer (`ir_convert.rs`) translates these back to the `IrFunction` structs that the
 Cranelift codegen backend consumes.
 
-**Phase:** 8.1 (optimization) + 11 (AOT compilation) — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs (map/filter/reduce/mapv/filterv/some/every?/into), sequence ops (range/take/drop/concat/reverse/sort), collection ops (keys/vals/merge/update/get-in/assoc-in), type predicates, atom constructor, and inline expansions (inc/dec/not/not=/zero?/pos?/neg?/even?/odd?/max/min/empty?).
+**Phase:** 8.1 (optimization) + 11 (AOT compilation) + no-gc phases 6–7 — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs, sequence/collection ops, type predicates, atom constructor, and inline expansions.  Under the `no-gc` feature the AOT driver also runs the **blacklist analysis** (`escape.rs`) which rejects programs that cannot be safely compiled without a GC.
 
 ---
 
@@ -23,6 +23,7 @@ src/
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
   codegen.rs    — Cranelift code generator: IrFunction → native object code
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
+  escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
   clojure/compiler/
     ir.cljrs      — IR data constructors + mutable builder context (atom-based)
     known.cljrs   — Known function symbol → keyword resolution table
@@ -96,9 +97,25 @@ impl Compiler {
 ```rust
 pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()>;
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
+
+pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble (ns/require/defmacro) → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → Cranelift codegen → generate Cargo harness (with bundled dependency sources) → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+
+### No-GC blacklist (`escape.rs`, no-gc only)
+
+```rust
+pub enum BlacklistViolation { InteriorPointerReturn { .. }, RegionToStaticStore { .. }, LazySeqEscape { .. }, EscapingClosure { .. } }
+pub fn check(func: &IrFunction) -> Vec<BlacklistViolation>;
+pub fn check_function(func: &IrFunction) -> Vec<BlacklistViolation>;
+```
+
+Detects four classes of no-gc memory-safety violations in IR functions:
+1. **InteriorPointerReturn** — return var is (transitively via phi) an allocation from the function's scratch region.
+2. **RegionToStaticStore** — allocation result flows into `DefVar` / `SetBang` without the static context.
+3. **LazySeqEscape** — lazy-producing call result is bound as an intermediate and returned unrealized.
+4. **EscapingClosure** — `AllocClosure` stored in a static container.
 
 Multi-file support: when the source file uses `(ns ... (:require [...]))`, the required namespaces are loaded during compilation. Their source files are discovered from `src_dirs`, bundled into the harness as builtin sources, and made available at runtime so the binary is self-contained.
 

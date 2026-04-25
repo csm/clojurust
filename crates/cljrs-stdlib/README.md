@@ -67,5 +67,5 @@ pub fn standard_env_with_paths(source_paths: Vec<PathBuf>) -> Arc<GlobalEnv>;
 
 - `cljrs-stdlib` depends on `cljrs-eval` (for `GlobalEnv`, `standard_env_minimal`)
 - `cljrs-eval` does **not** depend on `cljrs-stdlib` (no circular dep)
-- The `cljx` binary depends on both; use `cljrs_stdlib::standard_env()` instead of
+- The `cljrs` binary depends on both; use `cljrs_stdlib::standard_env()` instead of
   `cljrs_eval::standard_env()` so that stdlib namespaces are available

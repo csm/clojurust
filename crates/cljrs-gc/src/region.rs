@@ -19,7 +19,9 @@ use std::alloc::{self, Layout};
 use std::cell::RefCell;
 use std::ptr::{self, NonNull};
 
-use crate::{GcBox, GcBoxHeader, GcPtr, Trace};
+#[cfg(not(feature = "no-gc"))]
+use crate::gc_header::GcBoxHeader;
+use crate::{GcBox, GcPtr, Trace};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -112,6 +114,7 @@ impl Region {
 
         let gc_box = raw as *mut GcBox<T>;
         // SAFETY: `raw` is properly aligned and sized for GcBox<T>.
+        #[cfg(not(feature = "no-gc"))]
         unsafe {
             ptr::write(
                 gc_box,
@@ -121,12 +124,17 @@ impl Region {
                 },
             );
         }
+        #[cfg(feature = "no-gc")]
+        unsafe {
+            ptr::write(gc_box, GcBox { value });
+        }
 
         self.drops.push(DropEntry {
             ptr: raw,
             drop_fn: drop_gcbox_in_place::<T>,
         });
         self.object_count += 1;
+        crate::stats::GC_STATS.record_region_alloc(layout.size());
 
         // SAFETY: `gc_box` is non-null (from bump_alloc).
         GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
@@ -340,7 +348,7 @@ pub unsafe fn push_region_raw(region: *mut Region) {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 mod tests {
     use super::*;
     use crate::MarkVisitor;
