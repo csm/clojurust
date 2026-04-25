@@ -70,7 +70,8 @@ impl GcStats {
             .fetch_add(pause.as_nanos() as u64, Ordering::Relaxed);
         self.gc_objects_freed
             .fetch_add(freed_objects, Ordering::Relaxed);
-        self.gc_bytes_freed.fetch_add(freed_bytes, Ordering::Relaxed);
+        self.gc_bytes_freed
+            .fetch_add(freed_bytes, Ordering::Relaxed);
     }
 
     /// Take a point-in-time snapshot of all counters.
@@ -128,11 +129,7 @@ impl fmt::Display for GcStatsSnapshot {
             self.region_allocations, self.region_alloc_bytes
         )?;
         writeln!(f, "  GC collections:        {}", self.gc_collections)?;
-        writeln!(
-            f,
-            "  Total GC pause time:   {:.3?}",
-            self.total_pause()
-        )?;
+        writeln!(f, "  Total GC pause time:   {:.3?}", self.total_pause())?;
         writeln!(f, "  Objects freed by GC:   {}", self.gc_objects_freed)?;
         write!(f, "  Bytes freed by GC:     {}", self.gc_bytes_freed)
     }
