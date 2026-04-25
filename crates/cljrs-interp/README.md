@@ -2,7 +2,7 @@
 
 Self-contained tree-walking interpreter for Clojure.
 
-**Phase:** Core interpreter — implemented.  `no-gc` region/static-sink support (phases 4–5 of `docs/no-gc-plan.md`) — implemented.
+**Phase:** Core interpreter — implemented.  `no-gc` region/static-sink support (Phases 4–5), blacklist integration (Phase 6), and integration tests (Phase 8) of `docs/no-gc-plan.md` — implemented.
 
 ---
 
@@ -37,6 +37,10 @@ src/
   macros.rs      — macro expansion helpers
   syntax_quote.rs — syntax-quote (backtick) expansion
   virtualize.rs  — let-chain virtualization: assoc/conj chains → transients
+tests/
+  no_gc_eval.rs  — (no-gc mode) integration tests: arithmetic, def/defn provenance,
+                   function-call region stack, loop/recur accumulation,
+                   atom/reset!/swap! static-sink correctness
 ```
 
 ---
