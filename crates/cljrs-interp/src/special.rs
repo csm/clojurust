@@ -802,6 +802,10 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
+    // Under no-gc: the Fn object must live in the StaticArena since the Var
+    // intern outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let fn_val = eval_fn(&fn_args, env)?;
     let var = env
         .globals
@@ -859,6 +863,10 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
     for form in &args[rest_start..] {
         fn_args.push(prepend_macro_params(form));
     }
+    // Under no-gc: the Macro object must live in the StaticArena since the Var
+    // intern outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let fn_val = eval_fn(&fn_args, env)?;
 
     // Convert Fn → Macro by setting is_macro = true.

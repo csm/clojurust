@@ -4,8 +4,8 @@ use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
-    AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList, Symbol,
-    Thunk, Value,
+    Agent, AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue,
+    PersistentList, Symbol, Thunk, Value, Volatile,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -132,6 +132,9 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             "atom" => return handle_atom_call(arg_forms, env),
             "reset!" => return handle_reset_bang(arg_forms, env),
             "swap!" => return handle_swap_call(arg_forms, env),
+            "volatile!" => return handle_volatile(arg_forms, env),
+            "vreset!" => return handle_vreset(arg_forms, env),
+            "agent" => return handle_agent_call(arg_forms, env),
             "make-lazy-seq" => return handle_make_lazy_seq(arg_forms, env),
             "make-delay" => return handle_make_delay(arg_forms, env),
             "vswap!" => return handle_vswap(arg_forms, env),
@@ -712,6 +715,10 @@ fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             let cur = v.get().deref();
             let mut call_args = vec![cur];
             call_args.extend(extra);
+            // Under no-gc: the value written into the volatile must live in the
+            // StaticArena since the volatile outlives all scratch regions.
+            #[cfg(feature = "no-gc")]
+            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let new_val = cljrs_env::apply::apply_value(&f, call_args, env)?;
             v.get().reset(new_val.clone());
             Ok(new_val)
@@ -721,6 +728,99 @@ fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             other.type_name()
         ))),
     }
+}
+
+// ── volatile! ────────────────────────────────────────────────────────────────
+
+/// Handle `(volatile! init-val)`.
+fn handle_volatile(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "volatile!".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    // Under no-gc: volatile initial value must live in the StaticArena since
+    // the Volatile container outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let initial = eval(&arg_forms[0], env)?;
+    Ok(Value::Volatile(GcPtr::new(Volatile::new(initial))))
+}
+
+// ── vreset! ──────────────────────────────────────────────────────────────────
+
+/// Handle `(vreset! vol new-val)`.
+fn handle_vreset(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vreset!".into(),
+            expected: "2".into(),
+            got: arg_forms.len(),
+        });
+    }
+    let vol_val = eval(&arg_forms[0], env)?;
+    // Under no-gc: the new value written into the volatile must live in the
+    // StaticArena since the volatile outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let new_val = eval(&arg_forms[1], env)?;
+    match &vol_val {
+        Value::Volatile(v) => {
+            v.get().reset(new_val.clone());
+            Ok(new_val)
+        }
+        other => Err(EvalError::Runtime(format!(
+            "vreset!: expected volatile, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+// ── agent ────────────────────────────────────────────────────────────────────
+
+/// Handle `(agent init-val & opts)`.
+fn handle_agent_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    if arg_forms.is_empty() {
+        return Err(EvalError::Arity {
+            name: "agent".into(),
+            expected: "1+".into(),
+            got: 0,
+        });
+    }
+    // Under no-gc: agent initial value must live in the StaticArena since the
+    // Agent container outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let init = eval(&arg_forms[0], env)?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AgentMsg>(1024);
+    let state_arc = std::sync::Arc::new(std::sync::Mutex::new(init));
+    let error_arc: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let worker_state = state_arc.clone();
+    let worker_error = error_arc.clone();
+    std::thread::spawn(move || {
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                AgentMsg::Update(f) => {
+                    let cur = worker_state.lock().unwrap().clone();
+                    match f(cur) {
+                        Ok(next) => *worker_state.lock().unwrap() = next,
+                        Err(e) => *worker_error.lock().unwrap() = Some(e),
+                    }
+                }
+                AgentMsg::Shutdown => break,
+            }
+        }
+    });
+    Ok(Value::Agent(GcPtr::new(Agent {
+        state: state_arc,
+        error: error_arc,
+        sender: std::sync::Mutex::new(tx),
+        watches: std::sync::Mutex::new(Vec::new()),
+    })))
 }
 
 /// Handle `(send agent f & extra)` / `(send-off agent f & extra)`.
@@ -933,6 +1033,10 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let old_val = atom.get().deref();
     let mut args = vec![old_val.clone()];
     args.extend(evaled);
+    // Under no-gc: the value written into the atom must live in the StaticArena
+    // since the atom outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = cljrs_env::apply::apply_value(&f, args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
     atom.get().reset(new_val.clone());
@@ -1004,6 +1108,10 @@ fn handle_alter_var_root(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let old_val = vp.get().deref().unwrap_or(Value::Nil);
     let mut call_args = vec![old_val.clone()];
     call_args.extend(extra);
+    // Under no-gc: the new Var root value must live in the StaticArena since
+    // Vars outlive all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = cljrs_env::apply::apply_value(&f, call_args, env)?;
     vp.get().bind(new_val.clone());
     fire_watches(&vp.get().watches, &var_val, &old_val, &new_val, env);
@@ -1304,6 +1412,10 @@ fn handle_intern(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     };
     let ns = ns.ok_or_else(|| EvalError::Runtime(format!("No namespace: {ns_name} found")))?;
     let var = if arg_forms.len() == 3 {
+        // Under no-gc: interned Var values live in the StaticArena since they
+        // are namespace-scoped and outlive all scratch regions.
+        #[cfg(feature = "no-gc")]
+        let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
         let val = eval(&arg_forms[2], env)?;
         let mut interns = ns.get().interns.lock().unwrap();
         if let Some(var) = interns.get(&var_name) {
