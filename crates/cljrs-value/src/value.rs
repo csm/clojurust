@@ -337,9 +337,10 @@ impl SetValue {
 
 impl cljrs_gc::Trace for SetValue {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        use cljrs_gc::GcVisitor as _;
         match self {
-            SetValue::Hash(s) => s.get().trace(visitor),
-            SetValue::Sorted(s) => s.get().trace(visitor),
+            SetValue::Hash(s) => visitor.visit(s),
+            SetValue::Sorted(s) => visitor.visit(s),
         }
     }
 }
