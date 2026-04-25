@@ -1,6 +1,6 @@
 # cljrs-types
 
-Core types shared across every cljx crate: source spans, the unified error/diagnostic
+Core types shared across every cljrs crate: source spans, the unified error/diagnostic
 type, and the `CljxResult` alias.
 
 **Phase:** 1 (Project Infrastructure) — fully implemented.
