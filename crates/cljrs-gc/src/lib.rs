@@ -6,6 +6,7 @@
 use std::ptr::NonNull;
 
 pub mod region;
+pub mod stats;
 
 #[cfg(not(feature = "no-gc"))]
 pub mod cancellation;
@@ -16,6 +17,8 @@ pub mod config;
 pub mod alloc_ctx;
 #[cfg(feature = "no-gc")]
 pub mod static_arena;
+
+pub use stats::{GC_STATS, GcStats, GcStatsSnapshot};
 
 // ── Re-exports from active implementation ─────────────────────────────────────
 
@@ -463,6 +466,7 @@ mod gc_full {
             }
             self.total_allocated_bytes
                 .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
+            crate::stats::GC_STATS.record_gc_alloc(ESTIMATED_OBJECT_SIZE);
             let current_usage = self
                 .memory_in_use
                 .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
@@ -543,6 +547,11 @@ mod gc_full {
             let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
             self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
+            crate::stats::GC_STATS.record_gc_pause(
+                mark_elapsed + sweep_elapsed,
+                freed_count as u64,
+                freed_bytes as u64,
+            );
             let post_memory = self.memory_in_use.load(Ordering::Relaxed);
             cljrs_logging::feat_debug!(
                 "gc",

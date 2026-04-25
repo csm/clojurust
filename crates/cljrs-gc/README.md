@@ -49,6 +49,8 @@ src/
   region.rs       — Region bump allocator, RegionGuard, thread-local region stack
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
   config.rs       — (GC mode) GcConfig, GcCancellation, GcParked
+  stats.rs        — process-global GcStats counters: GC allocations,
+                    region (bump) allocations, GC pauses + freed bytes/objects
 tests/
   no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
                     ScratchGuard, StaticCtxGuard, pop_for_return protocol,
@@ -169,6 +171,30 @@ Destructors run on `reset()` or `drop`.
 
 RAII guard that pushes a `Region` onto the thread-local stack. Use with
 `try_alloc_in_region()` for opportunistic region allocation.
+
+### `stats::GcStats` and `GC_STATS`
+
+```rust
+pub struct GcStats { /* AtomicU64 counters */ }
+
+impl GcStats {
+    pub const fn new() -> Self
+    pub fn record_gc_alloc(&self, bytes: usize)
+    pub fn record_region_alloc(&self, bytes: usize)
+    pub fn record_gc_pause(&self, pause: Duration, freed_objects: u64, freed_bytes: u64)
+    pub fn snapshot(&self) -> GcStatsSnapshot
+}
+
+pub struct GcStatsSnapshot { /* immutable view of counters */ }
+impl GcStatsSnapshot { pub fn total_pause(&self) -> Duration }
+impl std::fmt::Display for GcStatsSnapshot { /* multi-line summary */ }
+
+pub static GC_STATS: GcStats;
+```
+
+Process-global counters updated automatically by `GcHeap::alloc`,
+`GcHeap::collect`, and `Region::alloc`.  The `cljrs --gc-stats [FILE]` CLI
+flag prints a snapshot of these counters at program exit.
 
 ---
 

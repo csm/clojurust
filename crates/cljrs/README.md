@@ -29,6 +29,12 @@ Subcommands:
 `--src-path` may be repeated to add multiple source directories searched by
 `require` when resolving namespace names to files.
 
+`--gc-stats [FILE]` is a global flag honoured by the `run`, `eval`, and `test`
+subcommands.  At program exit, it prints a snapshot of `cljrs_gc::GC_STATS`
+(GC heap allocations, region/bump allocations, GC pause count and total
+duration, freed objects/bytes).  With no value the report goes to stdout;
+with a path it is written to that file.
+
 ### Examples
 
 ```bash
@@ -38,6 +44,11 @@ cljrs repl --src-path src
 cljrs compile app.cljrs -o app
 cljrs eval '(+ 1 2)'
 cljrs test --src-path src/ --src-path test/ my-ns.my-tests
+
+# GC stats:
+cljrs run main.cljrs --gc-stats              # → stdout
+cljrs eval '(reduce + (range 1e6))' --gc-stats stats.txt
+cljrs test --src-path test/ --gc-stats /tmp/test-gc.log
 ```
 
 ---
