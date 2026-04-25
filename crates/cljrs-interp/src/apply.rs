@@ -4,8 +4,8 @@ use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
-    Agent, AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue,
-    PersistentList, Symbol, Thunk, Value, Volatile,
+    Agent, AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
+    Symbol, Thunk, Value, Volatile,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
