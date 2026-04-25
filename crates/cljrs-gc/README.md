@@ -4,7 +4,7 @@ Non-moving, stop-the-world mark-and-sweep garbage collector for clojurust;
 or, with the `no-gc` Cargo feature, a region-based allocator with no GC pauses.
 
 **Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
-raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–7 of
+raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
 `docs/no-gc-plan.md`) — implemented.
 
 ---
@@ -49,6 +49,10 @@ src/
   region.rs       — Region bump allocator, RegionGuard, thread-local region stack
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
   config.rs       — (GC mode) GcConfig, GcCancellation, GcParked
+tests/
+  no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
+                    ScratchGuard, StaticCtxGuard, pop_for_return protocol,
+                    nested guards, destructor ordering
 ```
 
 ---
