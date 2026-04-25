@@ -204,7 +204,10 @@ fn scratch_region_runs_destructors_on_drop() {
         let _p = GcPtr::new(DropTracked {
             dropped: dropped.clone(),
         });
-        assert!(!*dropped.lock().unwrap(), "destructor should not run while region is alive");
+        assert!(
+            !*dropped.lock().unwrap(),
+            "destructor should not run while region is alive"
+        );
     }
     // ScratchGuard drops → region.reset() → destructor runs.
     assert!(
