@@ -6,6 +6,9 @@ description = "Tree-walking interpreter for clojurust (special forms, macros, de
 license.workspace = true
 repository.workspace = true
 
+[features]
+no-gc = ["cljrs-gc/no-gc", "cljrs-env/no-gc", "cljrs-value/no-gc", "cljrs-builtins/no-gc"]
+
 [dependencies]
 cljrs-env = { workspace = true }
 cljrs-types = { workspace = true }

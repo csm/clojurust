@@ -6,6 +6,10 @@ description = "Tracing garbage collector for clojurust"
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Replace GC machinery with region-based allocation (no pauses, no Trace overhead).
+no-gc = []
+
 [dependencies]
 num-bigint   = { workspace = true }
 bigdecimal   = { workspace = true }

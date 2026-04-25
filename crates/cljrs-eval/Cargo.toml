@@ -6,6 +6,9 @@ description = "IR-accelerated evaluation for clojurust (tier-1 IR interpreter + 
 license.workspace = true
 repository.workspace = true
 
+[features]
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-env/no-gc", "cljrs-builtins/no-gc", "cljrs-interp/no-gc"]
+
 [dependencies]
 cljrs-types    = { workspace = true }
 cljrs-ir       = { workspace = true }

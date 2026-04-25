@@ -1,10 +1,7 @@
-# cljx
+# cljrs (Clojurust CLI)
 
-The `cljx` binary — command-line interface for running, compiling, and
+The `cljrs` binary — command-line interface for running, compiling, and
 interactively exploring clojurust programs.
-
-**Phase:** 1 (CLI scaffold) — argument parsing and subcommand dispatch are
-implemented; all subcommand bodies are stubs pending downstream crates.
 
 ---
 
@@ -20,14 +17,14 @@ src/
 ## CLI reference
 
 ```
-cljx <SUBCOMMAND>
+cljrs <SUBCOMMAND>
 
 Subcommands:
-  run      <file> [--src-path DIR]...   Interpret a .cljrs or .cljc source file
-  repl     [--src-path DIR]...          Start an interactive REPL
-  compile  <file> -o <out>              AOT-compile a source file to a native binary
-  eval     <expr>                       Evaluate a single Clojure expression and print the result
-```
+  run      Interpret a .cljrs or .cljc source file
+  repl     Start an interactive REPL
+  compile  AOT-compile a source file to a native binary
+  eval     Evaluate a single Clojure expression and print the result
+  test     Run clojure.test tests for one or more namespaces```
 
 `--src-path` may be repeated to add multiple source directories searched by
 `require` when resolving namespace names to files.
@@ -35,11 +32,12 @@ Subcommands:
 ### Examples
 
 ```bash
-cljx run hello.cljrs
-cljx run main.cljrs --src-path src --src-path lib
-cljx repl --src-path src
-cljx compile app.cljrs -o app
-cljx eval '(+ 1 2)'
+cljrs run hello.cljrs
+cljrs run main.cljrs --src-path src --src-path lib
+cljrs repl --src-path src
+cljrs compile app.cljrs -o app
+cljrs eval '(+ 1 2)'
+cljrs test --src-path src/ --src-path test/ my-ns.my-tests
 ```
 
 ---

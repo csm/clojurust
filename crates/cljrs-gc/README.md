@@ -1,16 +1,29 @@
 # cljrs-gc
 
-Non-moving, stop-the-world mark-and-sweep garbage collector for clojurust.
+Non-moving, stop-the-world mark-and-sweep garbage collector for clojurust;
+or, with the `no-gc` Cargo feature, a region-based allocator with no GC pauses.
 
-**Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap raw-pointer implementation) — implemented.
+**Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
+raw-pointer implementation) — implemented.  `no-gc` mode (Phase 1–5 of
+`docs/no-gc-plan.md`) — implemented.
 
 ---
 
 ## Purpose
 
-Manages all Clojure runtime values.  Rust code owns the root set and triggers
-collection explicitly.  `GcPtr<T>` is a raw pointer into the GC heap; `clone`
-is O(1); `drop` is a no-op.  Memory is freed only during `GcHeap::collect`.
+Manages all Clojure runtime values.  `GcPtr<T>` is a raw pointer into either
+the GC heap or a bump-allocated region; `clone` is O(1); `drop` is a no-op.
+
+**Default build (GC mode):** memory is freed only during `GcHeap::collect`.
+
+**`no-gc` build:** every function call and every `loop` iteration pushes a
+scratch `Region`; intermediates are freed when the scope exits.  Return values
+and `recur` arguments are evaluated in the caller's context (the
+"return-expression-in-caller" mechanism).  Static-sink expressions (`def`,
+`defn`, `defmacro`, `atom`, `agent`, `volatile!`, `reset!`, `vreset!`,
+`swap!`, `vswap!`, `alter-var-root`, `intern`) go to the global `StaticArena`
+and live for the program lifetime.
+No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
 
 ---
 
@@ -18,9 +31,17 @@ is O(1); `drop` is a no-op.  Memory is freed only during `GcHeap::collect`.
 
 ```
 src/
-  lib.rs      — GcVisitor, Trace, GcBoxHeader, GcBox<T>, GcHeap, MarkVisitor,
-                HEAP singleton, GcPtr<T>, leaf Trace impls (i64, f64, BigInt, …)
-  region.rs   — Region bump allocator, RegionGuard, thread-local region stack
+  lib.rs          — GcVisitor, Trace, GcBox<T>, GcPtr<T>, MarkVisitor, HEAP,
+                    leaf Trace impls; conditional GC vs no-gc implementations
+  gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
+  gc_full         — (GC mode only) GcHeap, ALLOC_ROOTS, AllocRootGuard
+  nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
+  static_arena.rs — (no-gc mode) global program-lifetime bump allocator
+  alloc_ctx.rs    — (no-gc mode) thread-local allocation context stack;
+                    ScratchGuard, StaticCtxGuard
+  region.rs       — Region bump allocator, RegionGuard, thread-local region stack
+  cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
+  config.rs       — (GC mode) GcConfig, GcCancellation, GcParked
 ```
 
 ---

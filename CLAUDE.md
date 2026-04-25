@@ -10,8 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Reader conditionals**: `.cljc` files use `#?(:rust ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:rust`
 - **Rust interop**: Clojure code can call into Rust functions with defined conventions and type-marshalling
 - **Garbage collector**: a tracing GC manages all Clojure values; Rust owns the GC root
-- **JIT compilation**: hot code is compiled to native code at runtime (Cranelift backend preferred)
-- **AOT compilation**: `cljx compile` produces a standalone native binary
+- **AOT compilation**: `cljrs compile` produces a standalone native binary
 
 See `TODO.md` for the full phased implementation roadmap.
 
@@ -71,7 +70,7 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 | `types` | `Value` enum (all Clojure runtime types); persistent collections (HAMT-backed); GC smart pointer `GcPtr<T>` |
 | `gc` | Tracing garbage collector; safepoints; write barriers; weak refs |
 | `eval` | Tree-walking interpreter; special forms; macro expansion; namespace/environment |
-| `compiler` | IR lowering; JIT (Cranelift) and AOT code-gen; inline caches |
+| `compiler` | IR lowering; AOT code-gen; inline caches |
 | `runtime` | Core standard library (`clojure.core` equivalent); concurrency primitives (atom, ref/STM, agent, future) |
 | `interop` | Rust↔Clojure FFI; `#[cljx::export]` proc-macro; type marshalling; `NativeObject` |
 | `cli` | `cljx` command entry point; REPL; file runner; project tooling |
@@ -81,5 +80,4 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 - **All Clojure values live behind `GcPtr<Value>`** — never store `Value` directly on the Rust stack across a GC safepoint
 - **Persistent collections are the default** — mutability only via `atom`/`ref`/`agent` or transients
 - **Rust interop is safe-by-default** — unsafe Rust APIs accessible only through an explicit `cljx.rust/unsafe` boundary
-- **JIT and interpreter share the same `Value` representation** — no separate boxed/unboxed split at the API boundary (specialization is internal to the JIT)
 - **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:rust`

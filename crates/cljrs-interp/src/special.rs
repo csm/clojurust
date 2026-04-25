@@ -72,6 +72,10 @@ fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
         1
     };
     let val = if args.len() > val_idx {
+        // Under no-gc: def value expressions go to the StaticArena since the
+        // Var must outlive all scratch regions.
+        #[cfg(feature = "no-gc")]
+        let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
         eval(&args[val_idx], env)?
     } else {
         Value::Nil
@@ -498,6 +502,12 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         // don't starve the collector.
         cljrs_env::gc_roots::gc_safepoint(env);
 
+        // Under no-gc: push a fresh scratch region for this iteration.
+        // Intermediates allocated in the body land here and are freed
+        // after the iteration ends.
+        #[cfg(feature = "no-gc")]
+        let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
             if let Err(e) = bind_pattern(pat, val.clone(), env) {
@@ -506,8 +516,15 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
             }
         }
 
+        // Under no-gc: pop scratch before tail expression so the return value
+        // or recur args are allocated in the enclosing scope's context.
+        #[cfg(not(feature = "no-gc"))]
         let result = eval_body_recur(body, env);
+        #[cfg(feature = "no-gc")]
+        let result = eval_body_with_scratch_loop(body, &mut scratch, env);
+
         env.pop_frame();
+        // scratch drops here, resetting the region (freeing intermediates).
 
         match result {
             Ok(v) => return Ok(v),
@@ -519,6 +536,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
+                // new_vals were evaluated in the caller's context (scratch was
+                // popped before the tail form), so they survive the reset.
                 current_vals = new_vals;
             }
             Err(e) => return Err(e),
@@ -541,6 +560,28 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
         result = eval(form, env)?;
     }
     Ok(result)
+}
+
+/// Under `no-gc`: eval loop body with scratch-region semantics.
+///
+/// Evaluates all non-tail forms inside the scratch region, then pops the
+/// scratch before the tail (return/recur) expression so it lands in the
+/// caller's context.
+#[cfg(feature = "no-gc")]
+fn eval_body_with_scratch_loop(
+    body: &[Form],
+    scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
+    env: &mut Env,
+) -> EvalResult {
+    if body.is_empty() {
+        scratch.pop_for_return();
+        return Ok(Value::Nil);
+    }
+    for form in &body[..body.len() - 1] {
+        eval(form, env)?;
+    }
+    scratch.pop_for_return();
+    eval(&body[body.len() - 1], env)
 }
 
 // ── quote ─────────────────────────────────────────────────────────────────────
@@ -761,6 +802,10 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
+    // Under no-gc: the Fn object must live in the StaticArena since the Var
+    // intern outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let fn_val = eval_fn(&fn_args, env)?;
     let var = env
         .globals
@@ -818,6 +863,10 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
     for form in &args[rest_start..] {
         fn_args.push(prepend_macro_params(form));
     }
+    // Under no-gc: the Macro object must live in the StaticArena since the Var
+    // intern outlives all scratch regions.
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let fn_val = eval_fn(&fn_args, env)?;
 
     // Convert Fn → Macro by setting is_macro = true.

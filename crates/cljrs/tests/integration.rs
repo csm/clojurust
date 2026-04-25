@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
-    // crates/cljx is two levels below the workspace root.
+    // crates/cljrs is two levels below the workspace root.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("tests/fixtures")

@@ -6,6 +6,9 @@ description = "Namespace and environment management for clojurust"
 license.workspace = true
 repository.workspace = true
 
+[features]
+no-gc = ["cljrs-gc/no-gc"]
+
 [dependencies]
 cljrs-types   = { workspace = true }
 cljrs-gc      = { workspace = true }
