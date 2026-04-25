@@ -1,5 +1,8 @@
+#[cfg(not(feature = "no-gc"))]
 use crate::dynamics;
-use crate::env::{Env, GlobalEnv};
+use crate::env::Env;
+#[cfg(not(feature = "no-gc"))]
+use crate::env::GlobalEnv;
 use std::cell::RefCell;
 
 // ── Thread-local Env root registry ──────────────────────────────────────────

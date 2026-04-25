@@ -429,9 +429,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         #[cfg(feature = "no-gc")]
         let result = {
             let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
-            let r = eval_body_with_scratch(&arity.body, &mut scratch, &mut env);
-            r
             // scratch drops here: resets the region (frees intermediates)
+            eval_body_with_scratch(&arity.body, &mut scratch, &mut env)
         };
         env.pop_frame();
 
@@ -508,6 +507,7 @@ pub fn bind_fn_params(arity: &CljxFnArity, args: &[Value], env: &mut Env) -> Eva
 }
 
 /// Eval a function body, propagating Recur up (does not catch it).
+#[cfg(not(feature = "no-gc"))]
 fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Nil;
     for form in body {

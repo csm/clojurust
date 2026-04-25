@@ -7,6 +7,14 @@
 //! The arena is a thread-safe bump allocator backed by a chain of
 //! `Box<[u8]>`-backed chunks.  Destructors for allocated values are intentionally
 //! NOT run — values stored here are semantically immutable program-lifetime data.
+//!
+//! ## Debug provenance (Phase 7)
+//!
+//! Under `cfg(all(feature = "no-gc", debug_assertions))` the arena maintains a
+//! registry of all addresses it has ever allocated.  [`is_static_addr`] checks
+//! whether a raw pointer came from the arena, which lets the write-site
+//! assertions in `Atom::reset` / `Var::bind` catch region-local values being
+//! stored in program-lifetime containers.
 
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
@@ -75,6 +83,19 @@ impl Inner {
         self.chunks.push(Chunk { data, layout: cl });
         aligned as *mut u8
     }
+
+    /// Check whether `addr` falls inside any chunk owned by this arena.
+    #[cfg(debug_assertions)]
+    fn contains_addr(&self, addr: usize) -> bool {
+        for chunk in &self.chunks {
+            let base = chunk.data.as_ptr() as usize;
+            let end = base + chunk.layout.size();
+            if addr >= base && addr < end {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Thread-safe bump allocator whose memory is never reclaimed.
@@ -102,6 +123,15 @@ impl StaticArena {
         unsafe { std::ptr::write(gc_box, GcBox { value }) };
         GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
     }
+
+    /// Return `true` if `addr` was allocated by this arena.
+    ///
+    /// Used by debug-mode provenance assertions to distinguish static-arena
+    /// pointers from scratch-region pointers.
+    #[cfg(debug_assertions)]
+    pub fn contains_addr(&self, addr: usize) -> bool {
+        self.inner.lock().unwrap().contains_addr(addr)
+    }
 }
 
 static STATIC_ARENA: OnceLock<StaticArena> = OnceLock::new();
@@ -109,4 +139,18 @@ static STATIC_ARENA: OnceLock<StaticArena> = OnceLock::new();
 /// Return the global static arena singleton.
 pub fn static_arena() -> &'static StaticArena {
     STATIC_ARENA.get_or_init(StaticArena::new)
+}
+
+/// Return `true` if the raw pointer address was allocated by the static arena.
+///
+/// This is an O(chunks) scan (typically 1–2 chunks) and is only intended for
+/// use in `debug_assert!` write-site checks.
+#[cfg(debug_assertions)]
+pub fn is_static_addr(addr: usize) -> bool {
+    // If the arena has not been initialised yet, no allocation has ever been
+    // made, so the address cannot be static.
+    match STATIC_ARENA.get() {
+        Some(arena) => arena.contains_addr(addr),
+        None => false,
+    }
 }

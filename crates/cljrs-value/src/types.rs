@@ -11,6 +11,92 @@ use cljrs_reader::Form;
 
 use crate::Value;
 
+// ── No-GC debug provenance helper ────────────────────────────────────────────
+
+/// In `no-gc` debug builds: return `true` if the top-level `GcPtr` inside
+/// `value` (if any) was allocated by the global `StaticArena`.
+///
+/// Primitives (`Nil`, `Bool`, `Long`, `Double`, `Char`) contain no `GcPtr`
+/// and always return `true`.  `Resource` is Arc-managed and also returns
+/// `true`.  All other variants have a `GcPtr` that is checked against the
+/// static arena's chunk range.
+///
+/// This check is intentionally **shallow** (top-level pointer only).  If the
+/// value was produced inside a `StaticCtxGuard`, ALL allocations during its
+/// evaluation go to the static arena — so a static top-level pointer implies
+/// static contents.
+#[cfg(all(feature = "no-gc", debug_assertions))]
+pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
+    use crate::value::MapValue;
+    use crate::value::SetValue;
+    match value {
+        // Inline scalars — no GcPtr.
+        Value::Nil
+        | Value::Bool(_)
+        | Value::Long(_)
+        | Value::Double(_)
+        | Value::Char(_)
+        | Value::Uuid(_) => true,
+        // Arc-managed — not GcPtr.
+        Value::Resource(_) => true,
+        // GcPtr variants.
+        Value::BigInt(p) => p.is_static_alloc(),
+        Value::BigDecimal(p) => p.is_static_alloc(),
+        Value::Ratio(p) => p.is_static_alloc(),
+        Value::Str(p) => p.is_static_alloc(),
+        Value::Pattern(p) => p.is_static_alloc(),
+        Value::Matcher(p) => p.is_static_alloc(),
+        Value::Symbol(p) => p.is_static_alloc(),
+        Value::Keyword(p) => p.is_static_alloc(),
+        Value::List(p) => p.is_static_alloc(),
+        Value::Vector(p) => p.is_static_alloc(),
+        Value::Queue(p) => p.is_static_alloc(),
+        Value::Map(m) => match m {
+            MapValue::Array(p) => p.is_static_alloc(),
+            MapValue::Hash(p) => p.is_static_alloc(),
+            MapValue::Sorted(p) => p.is_static_alloc(),
+        },
+        Value::Set(s) => match s {
+            SetValue::Hash(p) => p.is_static_alloc(),
+            SetValue::Sorted(p) => p.is_static_alloc(),
+        },
+        Value::NativeFunction(p) => p.is_static_alloc(),
+        Value::Fn(p) | Value::Macro(p) => p.is_static_alloc(),
+        Value::BoundFn(p) => p.is_static_alloc(),
+        Value::Var(p) => p.is_static_alloc(),
+        Value::Atom(p) => p.is_static_alloc(),
+        Value::Namespace(p) => p.is_static_alloc(),
+        Value::LazySeq(p) => p.is_static_alloc(),
+        Value::Cons(p) => p.is_static_alloc(),
+        Value::Protocol(p) => p.is_static_alloc(),
+        Value::ProtocolFn(p) => p.is_static_alloc(),
+        Value::MultiFn(p) => p.is_static_alloc(),
+        Value::Volatile(p) => p.is_static_alloc(),
+        Value::Delay(p) => p.is_static_alloc(),
+        Value::Promise(p) => p.is_static_alloc(),
+        Value::Future(p) => p.is_static_alloc(),
+        Value::Agent(p) => p.is_static_alloc(),
+        Value::TypeInstance(p) => p.is_static_alloc(),
+        Value::ObjectArray(p) => p.is_static_alloc(),
+        Value::NativeObject(p) => p.is_static_alloc(),
+        Value::Error(p) => p.is_static_alloc(),
+        Value::TransientMap(p) => p.is_static_alloc(),
+        Value::TransientVector(p) => p.is_static_alloc(),
+        Value::TransientSet(p) => p.is_static_alloc(),
+        // Primitive arrays — no meaningful pointer check needed.
+        Value::BooleanArray(_)
+        | Value::ByteArray(_)
+        | Value::ShortArray(_)
+        | Value::IntArray(_)
+        | Value::LongArray(_)
+        | Value::FloatArray(_)
+        | Value::DoubleArray(_)
+        | Value::CharArray(_) => true,
+        // Wrapper variants.
+        Value::Reduced(inner) | Value::WithMeta(inner, _) => value_gcptr_is_static(inner),
+    }
+}
+
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
 /// Inner map type for protocol implementations: method_name → impl fn.
@@ -154,6 +240,17 @@ impl Var {
     }
 
     pub fn bind(&self, v: Value) {
+        // In no-gc debug builds: assert the value being stored in this
+        // program-lifetime Var came from the StaticArena, not a scratch region.
+        // A region-local pointer would dangle after the function returns.
+        #[cfg(all(feature = "no-gc", debug_assertions))]
+        debug_assert!(
+            value_gcptr_is_static(&v),
+            "no-gc: Var::bind({}/{}) received a region-local value — store violations \
+             indicate a missing StaticCtxGuard around the value expression",
+            self.namespace,
+            self.name
+        );
         *self.value.lock().unwrap() = Some(v);
     }
 
@@ -220,6 +317,14 @@ impl Atom {
     }
 
     pub fn reset(&self, v: Value) -> Value {
+        // In no-gc debug builds: assert the new value came from the StaticArena.
+        #[cfg(all(feature = "no-gc", debug_assertions))]
+        debug_assert!(
+            value_gcptr_is_static(&v),
+            "no-gc: Atom::reset() received a region-local value — the new-value \
+             expression must be computed inside a StaticCtxGuard (i.e. inside \
+             the swap! / reset! call) so it is allocated in the static arena"
+        );
         let mut guard = self.value.lock().unwrap();
         *guard = v.clone();
         v
@@ -595,6 +700,13 @@ impl Volatile {
     }
 
     pub fn reset(&self, v: Value) -> Value {
+        // In no-gc debug builds: assert the new value came from the StaticArena.
+        #[cfg(all(feature = "no-gc", debug_assertions))]
+        debug_assert!(
+            value_gcptr_is_static(&v),
+            "no-gc: Volatile::reset() received a region-local value — ensure the \
+             new-value expression is inside a StaticCtxGuard (vreset! handles this)"
+        );
         *self.value.lock().unwrap() = v.clone();
         v
     }

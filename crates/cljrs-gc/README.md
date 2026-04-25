@@ -4,7 +4,7 @@ Non-moving, stop-the-world mark-and-sweep garbage collector for clojurust;
 or, with the `no-gc` Cargo feature, a region-based allocator with no GC pauses.
 
 **Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
-raw-pointer implementation) — implemented.  `no-gc` mode (Phase 1–5 of
+raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–7 of
 `docs/no-gc-plan.md`) — implemented.
 
 ---
@@ -25,6 +25,12 @@ and `recur` arguments are evaluated in the caller's context (the
 and live for the program lifetime.
 No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
 
+**Phase 7 (debug provenance):** in `debug_assertions` builds with `no-gc`,
+`StaticArena` tracks chunk ranges and exposes `is_static_addr(usize) -> bool`.
+`GcPtr::is_static_alloc()` uses this to check pointer provenance at O(chunks)
+cost.  `Atom::reset`, `Var::bind`, and `Volatile::reset` use `debug_assert!`
+to catch region-local values being stored in program-lifetime containers.
+
 ---
 
 ## File layout
@@ -36,7 +42,8 @@ src/
   gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
   gc_full         — (GC mode only) GcHeap, ALLOC_ROOTS, AllocRootGuard
   nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
-  static_arena.rs — (no-gc mode) global program-lifetime bump allocator
+  static_arena.rs — (no-gc mode) global program-lifetime bump allocator;
+                    in debug builds, tracks chunk ranges for is_static_addr()
   alloc_ctx.rs    — (no-gc mode) thread-local allocation context stack;
                     ScratchGuard, StaticCtxGuard
   region.rs       — Region bump allocator, RegionGuard, thread-local region stack
@@ -81,12 +88,22 @@ Built-in leaf impls: `String`, `i64`, `f64`, `bool`,
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
 impl<T: Trace + 'static> GcPtr<T> {
-    pub fn new(value: T) -> Self        // allocates on HEAP
+    pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc)
     pub fn get(&self) -> &T             // borrow; invalid after collect frees it
     pub fn ptr_eq(a: &Self, b: &Self) -> bool
+
+    // no-gc + debug_assertions only:
+    pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena
 }
 impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
+```
+
+### Free functions (no-gc only)
+
+```rust
+// debug_assertions only:
+pub fn is_static_addr(addr: usize) -> bool;  // checks the StaticArena chunk registry
 ```
 
 ### `GcHeap`
