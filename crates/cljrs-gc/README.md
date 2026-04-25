@@ -19,8 +19,10 @@ the GC heap or a bump-allocated region; `clone` is O(1); `drop` is a no-op.
 **`no-gc` build:** every function call and every `loop` iteration pushes a
 scratch `Region`; intermediates are freed when the scope exits.  Return values
 and `recur` arguments are evaluated in the caller's context (the
-"return-expression-in-caller" mechanism).  Top-level `def`, `atom`, and `reset!`
-values go to the global `StaticArena` and live for the program lifetime.
+"return-expression-in-caller" mechanism).  Static-sink expressions (`def`,
+`defn`, `defmacro`, `atom`, `agent`, `volatile!`, `reset!`, `vreset!`,
+`swap!`, `vswap!`, `alter-var-root`, `intern`) go to the global `StaticArena`
+and live for the program lifetime.
 No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
 
 ---
