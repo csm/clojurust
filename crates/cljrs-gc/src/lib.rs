@@ -38,6 +38,15 @@ pub use nogc_stubs::{
     unpark_thread, wait_for_threads_to_park,
 };
 
+/// Return `true` if `addr` was allocated by the global `StaticArena`.
+///
+/// Available only in `no-gc` debug builds.  Downstream crates (`cljrs-value`)
+/// use this to implement write-site provenance assertions.
+#[cfg(all(feature = "no-gc", debug_assertions))]
+pub fn is_static_addr(addr: usize) -> bool {
+    static_arena::is_static_addr(addr)
+}
+
 // ── Trace trait ───────────────────────────────────────────────────────────────
 
 /// Implemented by every type that can be stored behind a [`GcPtr`].
@@ -311,6 +320,16 @@ impl<T: Trace + 'static> GcPtr<T> {
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
+    }
+
+    /// Return `true` if this pointer was allocated by the global `StaticArena`.
+    ///
+    /// Only meaningful (and only compiled) in `no-gc` debug builds.  Used by
+    /// write-site assertions in `Atom::reset` / `Var::bind` to catch
+    /// region-local values being stored in program-lifetime containers.
+    #[cfg(all(feature = "no-gc", debug_assertions))]
+    pub fn is_static_alloc(&self) -> bool {
+        static_arena::is_static_addr(self.0.as_ptr() as usize)
     }
 }
 
