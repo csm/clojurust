@@ -18,16 +18,23 @@
 ;; ── Collect allocating instructions ─────────────────────────────────────────
 
 (defn collect-allocs
-  "Return a set of VarIds that are produced by allocation instructions."
+  "Return a map of {alloc-var defining-block-id} for every allocation
+   instruction in the function.
+
+   The defining block is needed by `classify-escape` so that we can reject
+   allocations whose value flows out of its block via control flow — region
+   scopes today live for exactly one block (RegionStart at block head,
+   RegionEnd before the terminator), so any cross-block use would deref
+   freed memory."
   [ir-func]
   (reduce (fn [acc block]
             (reduce (fn [a inst]
                       (if (and (alloc-inst? inst) (:dst inst))
-                        (conj a (:dst inst))
+                        (assoc a (:dst inst) (:id block))
                         a))
                     acc
                     (concat (:phis block) (:insts block))))
-          #{}
+          {}
           (:blocks ir-func)))
 
 ;; ── Build def-use chains ────────────────────────────────────────────────────
@@ -174,8 +181,18 @@
 ;; ── Classify escape state ───────────────────────────────────────────────────
 
 (defn classify-escape
-  "Classify whether an allocation escapes."
-  [var uses ir-func]
+  "Classify whether an allocation escapes.
+
+   `alloc-block` is the block the allocation lives in.  Region scopes are
+   per-block today (RegionStart at the block head, RegionEnd before the
+   terminator), so any use of the allocation — or of a value derived from
+   it via known-fn call results / phi propagation — that occurs in a
+   different block must be classified as `:escapes`, even if the use
+   itself would otherwise look benign (e.g. a `:count` call on the phi
+   result).  Without this constraint the optimizer wraps the allocation
+   in a region that frees before the consumer block runs, producing a
+   use-after-free."
+  [var alloc-block uses ir-func]
   (loop [worklist [var]
          visited #{}
          result :no-escape]
@@ -193,8 +210,17 @@
               (let [check-result
                     (reduce
                      (fn [acc use-info]
-                       (if (= (:state acc) :escapes)
+                       (cond
+                         (= (:state acc) :escapes)
                          (reduced acc)
+
+                         ;; Same-block invariant: if the use is in a
+                         ;; different block from the allocation, the
+                         ;; per-block region scope cannot safely cover it.
+                         (not= (:block use-info) alloc-block)
+                         (reduced (assoc acc :state :escapes))
+
+                         :else
                          (let [kind (:kind use-info)
                                kt (:type kind)]
                            (case kt
@@ -218,16 +244,12 @@
                                acc)
 
                              :phi-input
-                             (let [block (first (filter (fn [b] (= (:id b) (:block use-info))) (:blocks ir-func)))]
-                               (if block
-                                 (reduce (fn [a phi]
-                                           (if (and (= (:op phi) :phi)
-                                                    (some (fn [[_ v]] (= v current)) (:entries phi)))
-                                             (update a :new-worklist conj (:dst phi))
-                                             a))
-                                         acc
-                                         (:phis block))
-                                 acc))
+                             ;; Always cross-block: a phi entry comes
+                             ;; from a predecessor, so phi block ≠
+                             ;; producer block.  The same-block check
+                             ;; above already handled this; we should
+                             ;; never reach here.
+                             (reduced (assoc acc :state :escapes))
 
                              ;; branch-cond, deref, call-callee — don't cause escape
                              acc))))
@@ -248,8 +270,9 @@
   [ir-func]
   (let [allocs (collect-allocs ir-func)
         uses (build-use-chains ir-func)
-        states (reduce (fn [acc alloc-var]
-                         (assoc acc alloc-var (classify-escape alloc-var uses ir-func)))
+        states (reduce (fn [acc [alloc-var alloc-block]]
+                         (assoc acc alloc-var
+                                (classify-escape alloc-var alloc-block uses ir-func)))
                        {}
                        allocs)]
     {:states states :uses uses}))

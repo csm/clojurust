@@ -127,15 +127,7 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
                 format!("clojure.core/{var_name}:{}", arity.params.len())
             };
 
-            // NOTE: we deliberately use `lower_arity` (no optimize pass) here
-            // even though `lower_and_optimize_arity` is available.  Running
-            // the escape-analysis/region-allocation optimizer on clojure.core
-            // produces IR for `min-key:3+` / `max-key:3+` that triggers a
-            // use-after-free in the IR interpreter's region handling.  Until
-            // that bug is fixed (it also reproduces under AOT, where the
-            // optimize pass is always run), the prebuilt bundle stays
-            // region-free.
-            match cljrs_eval::lower::lower_arity(
+            match cljrs_eval::lower::lower_and_optimize_arity(
                 f.name.as_deref(),
                 &arity.params,
                 arity.rest_param.as_ref(),

@@ -1,19 +1,33 @@
-//! Reproducer for the per-block region scoping bug surfaced by
-//! `clojure.core-test.min-key` once `lower_and_optimize_arity` produced
-//! `RegionStart` / `RegionAlloc` / `RegionEnd` instructions for the
-//! variadic `min-key:3+` arity.
+//! Lock-in test for the IR interpreter's per-block region scoping constraint.
 //!
-//! ## The bug
+//! ## What this test documents
 //!
-//! `cljrs.compiler.optimize` wraps every non-escaping allocation in a
-//! region scope **whose lifetime is the enclosing basic block** —
-//! `RegionStart` is inserted at the head of the block, `RegionEnd` is
-//! inserted just before the terminator.  When the allocation flows out of
-//! the block via control flow (a phi at a join point, or any subsequent
-//! block referencing the value), the region is freed before the consumer
-//! ever runs and the resulting `GcPtr` is dangling.
+//! `RegionStart` / `RegionAlloc` / `RegionEnd` instructions in the IR
+//! interpreter implement a region whose lifetime is exactly one basic
+//! block — `RegionStart` at the head, `RegionEnd` immediately before the
+//! terminator.  Any `GcPtr` allocated through that region is invalid the
+//! moment the producing block hands off control, because the `Drop` impl
+//! on the popped `RegionEntry` releases the chunk.
 //!
-//! ## The hand-rolled repro
+//! The optimizer pass (`cljrs.compiler.optimize`) used to produce IR that
+//! violated this constraint — it would wrap any non-escaping allocation in
+//! a per-block region scope, including allocations whose value flowed out
+//! of the block via a phi (`min-key:3+` was the canonical example).  That
+//! caused a use-after-free in `clojure.core-test.min-key` and a
+//! corresponding AOT panic.  The fix landed in the escape analysis
+//! (`cljrs.compiler.escape`): allocations are now classified `:escapes`
+//! whenever any transitive use lives in a different block from the
+//! definition, so the optimizer never produces this shape from real code.
+//!
+//! This Rust test bypasses the optimizer and hand-builds the dangerous
+//! shape directly.  The fix at the optimizer level does not — and cannot —
+//! help here: the IR interpreter still cannot safely execute IR with
+//! cross-block region scoping, and this test exists to (a) make that
+//! constraint explicit and (b) trip whoever later teaches the interpreter
+//! to merge / extend regions across control flow.  When that happens, flip
+//! the assertion to expect `Ok(Value::Long(1))`.
+//!
+//! ## The hand-rolled IR
 //!
 //! ```text
 //! fn(cond):
@@ -38,14 +52,10 @@
 //!     return %7
 //! ```
 //!
-//! Running this through `interpret_ir` reproduces the use-after-free
-//! deterministically.  In `debug_assertions` builds it panics in
-//! `GcPtr::get()` with `magic=…` mismatching `GC_MAGIC_ALIVE`; in release
-//! builds it returns garbage or segfaults.
-//!
-//! Marked `#[should_panic]` so the test fails (and alerts us to flip it
-//! back to expecting a successful result of `1`) when the underlying bug
-//! is fixed.
+//! In `debug_assertions` builds the panic comes from `GcPtr::get()`'s
+//! magic-word check; in release builds the same defective IR may segfault,
+//! return a stale value, or appear to succeed — none of which is a clean
+//! `should_panic` signal.  The test is therefore gated to debug builds.
 
 use std::sync::Arc;
 
