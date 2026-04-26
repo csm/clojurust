@@ -4,17 +4,31 @@
 
 ;; ── Region allocation optimization ──────────────────────────────────────────
 ;;
-;; Rewrites non-escaping allocations (alloc-vector, alloc-map, etc.) into
-;; region-backed allocations (region-start, region-alloc, region-end).
+;; Rewrites non-escaping allocations into region-backed allocations.  An
+;; allocation can be region-allocated only if there exists a contiguous
+;; subgraph of the CFG within which the allocation is born, used, and
+;; never reachable from blocks that may unwind out of it.  We implement
+;; that by computing, for each `:no-escape` allocation:
 ;;
-;; Strategy:
-;; - Run escape analysis on each IR function
-;; - For each block, identify non-escaping allocations
-;; - Group them into a region scope per block
-;; - Rewrite alloc instructions to region-alloc instructions
-;; - Insert region-start at block entry and region-end before terminator
+;;   start = lca-of-doms({def-block} ∪ use-blocks)
+;;   end   = lca-of-postdoms({def-block} ∪ use-blocks)
+;;
+;; If the path `start..end` is acyclic (no back-edges) and contains no
+;; throw-style terminators, we wrap it in a region: `RegionStart` at the
+;; head of `start`, `RegionEnd` at the head of `end`, and the alloc
+;; instruction is rewritten in place to `RegionAlloc`.
+;;
+;; Limitations of this first pass (deliberate; revisit later):
+;;
+;;   - one region per allocation (no grouping of allocations sharing a
+;;     start/end pair)
+;;   - allocations whose region would span a back-edge are skipped
+;;     (loops not optimized)
+;;   - allocations whose region would contain a `:throw` or
+;;     `:unreachable` terminator are skipped (no unwind-aware cleanup)
+;;   - if `start` or `end` cannot be determined, the allocation is left
+;;     as a regular `Alloc*`
 
-;; Map from allocation op to RegionAllocKind keyword.
 (def alloc-op-to-region-kind
   {:alloc-vector :vector
    :alloc-map    :map
@@ -31,67 +45,390 @@
     :alloc-cons [(:head inst) (:tail inst)]
     []))
 
-(defn rewrite-block
-  "Rewrite a single block, replacing non-escaping allocs with region allocs.
-   Returns the rewritten block (or the original if no non-escaping allocs exist)."
-  [block escape-states next-var-atom]
-  (let [;; Find non-escaping allocation instructions in this block
-        non-escaping-insts
-        (filterv (fn [inst]
-                   (and (contains? alloc-op-to-region-kind (:op inst))
-                        (let [state (get escape-states (:dst inst))]
-                          (= state :no-escape))))
-                 (:insts block))]
-    (if (empty? non-escaping-insts)
-      ;; No non-escaping allocs — return block unchanged
-      block
-      ;; Rewrite: wrap non-escaping allocs in a region
-      (let [region-var (let [v @next-var-atom] (swap! next-var-atom inc) v)
-            region-start (ir/inst-region-start region-var)
-            ;; Rewrite each instruction
-            new-insts
+;; ── CFG analysis ────────────────────────────────────────────────────────────
+
+(defn block-successors
+  "Return the successor block IDs for a block's terminator."
+  [block]
+  (let [t (:terminator block)]
+    (case (:op t)
+      :jump        [(:target t)]
+      :branch      [(:then-block t) (:else-block t)]
+      :recur-jump  [(:target t)]
+      ;; :return / :throw / :unreachable / nil have no successors
+      [])))
+
+(defn block-by-id-map
+  [ir-func]
+  (reduce (fn [m b] (assoc m (:id b) b)) {} (:blocks ir-func)))
+
+(defn predecessor-map
+  "Return {block-id #{pred-block-ids}} for the IR function."
+  [ir-func]
+  (reduce (fn [acc block]
+            (reduce (fn [a succ]
+                      (update a succ (fn [v] (conj (or v #{}) (:id block)))))
+                    acc
+                    (block-successors block)))
+          {}
+          (:blocks ir-func)))
+
+(defn reverse-postorder
+  "DFS from block 0; return blocks in reverse-postorder.  Unreachable
+   blocks are not included."
+  [ir-func]
+  (let [by-id (block-by-id-map ir-func)]
+    (loop [stack [[0 false]]
+           visited #{}
+           postorder []]
+      (if (empty? stack)
+        (vec (reverse postorder))
+        (let [[bid done?] (peek stack)
+              rest-stack (pop stack)]
+          (cond
+            done? (recur rest-stack visited (conj postorder bid))
+            (contains? visited bid) (recur rest-stack visited postorder)
+            :else
+            (let [block (get by-id bid)
+                  succs (if block (block-successors block) [])
+                  new-stack (reduce (fn [s succ] (conj s [succ false]))
+                                    (conj rest-stack [bid true])
+                                    succs)]
+              (recur new-stack (conj visited bid) postorder))))))))
+
+;; ── Dominator analysis (iterative fixed-point) ──────────────────────────────
+
+(defn- intersect-sets
+  "Intersect a non-empty seq of sets without requiring `clojure.set`."
+  [sets]
+  (reduce (fn [acc s]
+            (if (nil? acc)
+              s
+              (reduce (fn [a x] (if (contains? s x) a (disj a x))) acc acc)))
+          nil
+          sets))
+
+(defn- dom-iterate
+  "Generic iterative dominator computation.
+
+   `roots` — set of block IDs initialised to `#{root}` (their only
+            dominator); for forward dominators this is `#{0}`.
+   `block-ids` — all block IDs to consider (typically reverse-postorder).
+   `pred-fn` — `block-id → #{pred-block-ids}`.
+
+   Returns `{block-id #{dominators}}`."
+  [roots block-ids pred-fn]
+  (let [universe (set block-ids)
+        init (reduce (fn [m b]
+                       (assoc m b (if (contains? roots b) #{b} universe)))
+                     {}
+                     block-ids)]
+    (loop [doms init]
+      (let [next-doms
             (reduce
-             (fn [acc inst]
-               (if (and (contains? alloc-op-to-region-kind (:op inst))
-                        (= :no-escape (get escape-states (:dst inst))))
-                 ;; Replace with region-alloc
-                 (let [kind (get alloc-op-to-region-kind (:op inst))
-                       operands (alloc-operands inst)]
-                   (conj acc (ir/inst-region-alloc (:dst inst) region-var kind operands)))
-                 ;; Keep as-is
-                 (conj acc inst)))
-             []
-             (:insts block))
-            ;; Prepend region-start, append region-end
-            final-insts (into [region-start] new-insts)
-            region-end (ir/inst-region-end region-var)
-            final-insts (conj final-insts region-end)]
-        (assoc block :insts final-insts)))))
+             (fn [d b]
+               (if (contains? roots b)
+                 d
+                 (let [computed-preds (filter (fn [p] (contains? d p)) (pred-fn b))]
+                   (if (empty? computed-preds)
+                     d
+                     (let [intersected (intersect-sets (map (fn [p] (get d p)) computed-preds))
+                           new-set (conj (or intersected #{}) b)]
+                       (assoc d b new-set))))))
+             doms
+             block-ids)]
+        (if (= next-doms doms)
+          doms
+          (recur next-doms))))))
+
+(defn dominators
+  "Return `{block-id #{dominator-block-ids}}` for the function.  Block 0
+   dominates only itself; every other reachable block has at least block
+   0 in its dominator set."
+  [ir-func]
+  (let [rpo (reverse-postorder ir-func)
+        preds (predecessor-map ir-func)]
+    (dom-iterate #{0} rpo (fn [b] (get preds b #{})))))
+
+(defn- collect-exits
+  "Return the set of terminating block IDs (`:return` / `:throw` /
+   `:unreachable`)."
+  [ir-func]
+  (reduce (fn [acc b]
+            (let [op (-> b :terminator :op)]
+              (if (contains? #{:return :throw :unreachable} op)
+                (conj acc (:id b))
+                acc)))
+          #{}
+          (:blocks ir-func)))
+
+(defn post-dominators
+  "Return `{block-id #{post-dominator-block-ids}}`.  Post-dominator
+   analysis runs on the reversed CFG.  All exit blocks are roots — they
+   only post-dominate themselves; every reachable block reaches at least
+   one exit, so its post-dominator set is non-empty."
+  [ir-func]
+  (let [rpo (reverse-postorder ir-func)
+        by-id (block-by-id-map ir-func)
+        succ-fn (fn [b] (set (block-successors (get by-id b))))
+        exits (collect-exits ir-func)]
+    (dom-iterate exits rpo succ-fn)))
+
+;; ── Lowest-common-ancestor in a dominator-tree-shaped relation ──────────────
+;;
+;; `dom-of` is `{block #{dominators}}`.  The LCA of two blocks A and B is
+;; the dominator of both that is itself dominated by every other common
+;; dominator — equivalently, the largest element of `(∩ dom-of[A]
+;; dom-of[B])` under the dominator partial order.
+
+(defn lca-of
+  "Lowest common ancestor of `a` and `b` in the dominator-tree induced
+   by `dom-of`.  Returns nil if no common ancestor exists (e.g. one of
+   the blocks is unreachable)."
+  [dom-of a b]
+  (let [da (get dom-of a #{})
+        db (get dom-of b #{})
+        common (reduce (fn [acc x] (if (contains? db x) (conj acc x) acc)) #{} da)]
+    (when (seq common)
+      (reduce (fn [best d]
+                (cond
+                  (nil? best) d
+                  (contains? (get dom-of d) best) d
+                  :else best))
+              nil
+              common))))
+
+(defn lca-of-many
+  "Fold `lca-of` over a non-empty seq of blocks."
+  [dom-of blocks]
+  (let [bs (seq blocks)]
+    (when bs
+      (reduce (fn [acc b]
+                (if (nil? acc)
+                  nil
+                  (lca-of dom-of acc b)))
+              (first bs)
+              (rest bs)))))
+
+;; ── Reachability between two blocks (avoiding the end block) ───────────────
+
+(defn- blocks-on-path
+  "Return the set of block IDs reachable from `start` whose paths
+   terminate at `end`.  Includes `start` and `end`.  We stop expanding
+   past `end`, so its successors aren't part of the region.  Used to
+   scan for back-edges and throw blocks within the proposed region."
+  [ir-func start end]
+  (let [by-id (block-by-id-map ir-func)]
+    (loop [stack [start] seen #{}]
+      (if (empty? stack)
+        seen
+        (let [b (peek stack)]
+          (if (contains? seen b)
+            (recur (pop stack) seen)
+            (let [block (get by-id b)
+                  succs (if (or (nil? block) (= b end))
+                          []
+                          (block-successors block))]
+              (recur (into (pop stack) succs)
+                     (conj seen b)))))))))
+
+(defn- has-back-edge?
+  "True if any edge whose head is in `region-blocks` targets a block
+   that already dominates the source — i.e. the region contains a
+   loop."
+  [ir-func region-blocks doms]
+  (let [by-id (block-by-id-map ir-func)]
+    (boolean
+     (some (fn [b]
+             (some (fn [succ]
+                     (and (contains? region-blocks succ)
+                          (contains? (get doms b #{}) succ)))
+                   (block-successors (get by-id b))))
+           region-blocks))))
+
+(defn- region-contains-throw?
+  "True if any block in `region-blocks` could unwind out of the region
+   without running our `RegionEnd`.  We refuse to optimize anything
+   reachable from a `:throw` instruction or a `:throw` /
+   `:unreachable` terminator within the region — region cleanup today
+   has no exception-handling integration, so an unwind would leak the
+   bump-allocated chunk."
+  [ir-func region-blocks]
+  (let [by-id (block-by-id-map ir-func)]
+    (boolean
+     (some (fn [b]
+             (let [block (get by-id b)
+                   term-op (-> block :terminator :op)]
+               (or (contains? #{:throw :unreachable} term-op)
+                   (some (fn [inst] (= :throw (:op inst))) (:insts block)))))
+           region-blocks))))
+
+;; ── Use-block collection ───────────────────────────────────────────────────
+;;
+;; For an allocation, walk the same propagation chain as `classify-escape`
+;; — through phi nodes and through the results of escape-style known
+;; calls (e.g. `:assoc`) — and collect every block in which the
+;; allocation, or any value derived from it, has a use.  These blocks
+;; bound the region's required lifetime.
+
+(defn- collect-use-blocks
+  [alloc-var uses ir-func]
+  (loop [worklist [alloc-var]
+         visited #{}
+         use-blocks #{}]
+    (if (empty? worklist)
+      use-blocks
+      (let [current (first worklist)
+            rest-wl (rest worklist)]
+        (if (contains? visited current)
+          (recur rest-wl visited use-blocks)
+          (let [visited (conj visited current)
+                use-list (or (get uses current) [])
+                {:keys [extra-vars new-blocks]}
+                (reduce
+                 (fn [acc use-info]
+                   (let [kind (:kind use-info)
+                         kt (:type kind)
+                         acc (update acc :new-blocks conj (:block use-info))]
+                     (case kt
+                       :known-call-arg
+                       (if (escape/known-fn-arg-escapes? (:func kind) (:arg-index kind))
+                         (let [call-result (escape/find-call-result current (:func kind) ir-func (:block use-info))]
+                           (if call-result
+                             (update acc :extra-vars conj call-result)
+                             acc))
+                         acc)
+
+                       :phi-input
+                       (let [block (first (filter (fn [b] (= (:id b) (:block use-info)))
+                                                  (:blocks ir-func)))]
+                         (if block
+                           (reduce (fn [a phi]
+                                     (if (and (= (:op phi) :phi)
+                                              (some (fn [[_ v]] (= v current)) (:entries phi)))
+                                       (update a :extra-vars conj (:dst phi))
+                                       a))
+                                   acc
+                                   (:phis block))
+                           acc))
+
+                       acc)))
+                 {:extra-vars [] :new-blocks []}
+                 use-list)]
+            (recur (into (vec rest-wl) extra-vars)
+                   visited
+                   (into use-blocks new-blocks))))))))
+
+;; ── The pass ───────────────────────────────────────────────────────────────
+
+(defn- next-fresh-var!
+  [next-var-atom]
+  (let [v @next-var-atom]
+    (swap! next-var-atom inc)
+    v))
+
+(defn- insert-region-start
+  "Return `block` with `RegionStart` prepended to its instruction list."
+  [block region-var]
+  (assoc block :insts (into [(ir/inst-region-start region-var)] (:insts block))))
+
+(defn- insert-region-end
+  "Return `block` with `RegionEnd` appended to its instruction list.
+
+   The end block is the post-dominator of all uses, so any uses living
+   *inside* the end block (e.g. the `:count` call in min-key's join
+   block) need to run before cleanup.  Appending — i.e. placing
+   `RegionEnd` immediately before the terminator — is the only safe
+   placement."
+  [block region-var]
+  (assoc block :insts (conj (vec (:insts block)) (ir/inst-region-end region-var))))
+
+(defn- rewrite-alloc-in-block
+  "Replace the alloc instruction with `:dst alloc-var` in `block` with a
+   region-allocate counterpart targeting `region-var`."
+  [block alloc-var region-var]
+  (assoc block :insts
+         (mapv (fn [inst]
+                 (if (and (contains? alloc-op-to-region-kind (:op inst))
+                          (= (:dst inst) alloc-var))
+                   (let [kind (get alloc-op-to-region-kind (:op inst))
+                         operands (alloc-operands inst)]
+                     (ir/inst-region-alloc (:dst inst) region-var kind operands))
+                   inst))
+               (:insts block))))
+
+(defn- update-block-by-id
+  [ir-func block-id update-fn]
+  (assoc ir-func :blocks
+         (mapv (fn [b] (if (= (:id b) block-id) (update-fn b) b))
+               (:blocks ir-func))))
+
+(defn- emit-region-for-alloc
+  "Return an updated `ir-func` with one allocation rewritten into a
+   region.  No-op if the safety checks fail or the start/end can't be
+   determined."
+  [ir-func alloc-var alloc-block use-blocks doms postdoms next-var-atom]
+  (let [relevant (conj (set use-blocks) alloc-block)
+        start (lca-of-many doms relevant)
+        end (lca-of-many postdoms relevant)]
+    (cond
+      (or (nil? start) (nil? end))
+      ir-func
+
+      ;; Defining block must be dominated by `start` (start ≤ alloc-block
+      ;; in the dominator tree) — otherwise inserting RegionStart there
+      ;; doesn't actually precede the alloc.
+      (not (contains? (get doms alloc-block #{}) start))
+      ir-func
+
+      :else
+      (let [region (blocks-on-path ir-func start end)]
+        (cond
+          (has-back-edge? ir-func region doms)
+          ir-func
+
+          (region-contains-throw? ir-func region)
+          ir-func
+
+          :else
+          (let [region-var (next-fresh-var! next-var-atom)]
+            (-> ir-func
+                (update-block-by-id alloc-block
+                                    (fn [b] (rewrite-alloc-in-block b alloc-var region-var)))
+                (update-block-by-id start
+                                    (fn [b] (insert-region-start b region-var)))
+                (update-block-by-id end
+                                    (fn [b] (insert-region-end b region-var))))))))))
 
 (defn optimize-regions
-  "Run escape analysis and rewrite non-escaping allocations to use regions.
-   Takes an IR function data map, returns the optimized IR function data map."
+  "Walk all `:no-escape` allocations and rewrite each into a
+   region-allocate scoped over the dominator subgraph that covers the
+   allocation and all its (transitive) uses.  Allocations that don't
+   meet the safety constraints are left as regular allocations."
   [ir-func]
   (let [analysis (escape/analyze ir-func)
         states (:states analysis)
-        ;; Count non-escaping allocations
-        non-escaping-count (count (filterv (fn [[_ s]] (= s :no-escape)) states))]
-    (if (zero? non-escaping-count)
-      ;; Nothing to optimize
+        uses (:uses analysis)
+        alloc-blocks (:alloc-blocks analysis)
+        no-escape-allocs (filterv (fn [[v _]] (= :no-escape (get states v)))
+                                  alloc-blocks)]
+    (if (empty? no-escape-allocs)
       ir-func
-      ;; Rewrite blocks
-      (let [next-var-atom (atom (:next-var ir-func))
-            new-blocks (mapv (fn [block]
-                               (rewrite-block block states next-var-atom))
-                             (:blocks ir-func))]
-        (assoc ir-func
-               :blocks new-blocks
-               :next-var @next-var-atom)))))
+      (let [doms (dominators ir-func)
+            postdoms (post-dominators ir-func)
+            next-var-atom (atom (:next-var ir-func))
+            new-func (reduce (fn [acc-func [alloc-var alloc-block]]
+                               (let [use-blocks (collect-use-blocks alloc-var uses ir-func)]
+                                 (emit-region-for-alloc acc-func alloc-var alloc-block
+                                                        use-blocks doms postdoms
+                                                        next-var-atom)))
+                             ir-func
+                             no-escape-allocs)]
+        (assoc new-func :next-var @next-var-atom)))))
 
 (defn optimize
-  "Run all optimization passes on an IR function.
-   Currently only runs region allocation optimization.
-   Recursively optimizes subfunctions."
+  "Run all optimization passes on an IR function.  Currently only runs
+   region allocation optimization.  Recursively optimizes subfunctions."
   [ir-func]
   (let [optimized (optimize-regions ir-func)
         new-subs (mapv optimize (or (:subfunctions optimized) []))]

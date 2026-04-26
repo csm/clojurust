@@ -161,6 +161,34 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
         );
     }
 
+    // Diagnostic: count region instructions in the bundle so changes to
+    // the optimize pass have a visible effect at build time.
+    let mut region_inst_count = 0usize;
+    let mut fns_with_regions = 0usize;
+    for ir_func in bundle.functions.values() {
+        let mut had_region = false;
+        for block in &ir_func.blocks {
+            for inst in &block.insts {
+                if matches!(
+                    inst,
+                    cljrs_ir::Inst::RegionStart(..)
+                        | cljrs_ir::Inst::RegionAlloc(..)
+                        | cljrs_ir::Inst::RegionEnd(..)
+                ) {
+                    region_inst_count += 1;
+                    had_region = true;
+                }
+            }
+        }
+        if had_region {
+            fns_with_regions += 1;
+        }
+    }
+    eprintln!(
+        "cljrs-stdlib build.rs: bundle contains {region_inst_count} region instructions \
+         across {fns_with_regions} clojure.core functions",
+    );
+
     Ok(count)
 }
 

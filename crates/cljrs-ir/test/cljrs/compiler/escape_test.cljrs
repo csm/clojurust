@@ -180,13 +180,13 @@
       (is (= :escapes (get states 1)))
       (is (= :escapes (get states 2))))))
 
-(deftest test-phi-input-cross-block-escapes
-  ;; Even though the phi result is consumed by a non-escaping fn (:count),
-  ;; both alloc inputs cross a block boundary into the join block.  Region
-  ;; scopes today live for one block — RegionEnd would fire at the end of
-  ;; block 1 / 2, before block 3 ever runs — so any cross-block use must
-  ;; be classified as :escapes.  This was the underlying bug surfaced by
-  ;; clojure.core-test.min-key.
+(deftest test-phi-then-non-escaping-use-stays-no-escape
+  ;; Phi result is consumed by :count, which is non-escaping.  Both phi
+  ;; inputs are :no-escape — `cljrs.compiler.escape` is purely a
+  ;; semantic check (does the value leave the function frame?), it does
+  ;; not concern itself with control-flow lifetime.  The cross-block
+  ;; bookkeeping that picks a region scope wide enough to cover all
+  ;; uses lives in `cljrs.compiler.optimize`.
   (let [f {:name "test" :ns "user" :params []
            :next-var 0 :next-block 4 :subfunctions []
            :blocks [{:id 0 :phis []
@@ -203,23 +203,15 @@
                      :insts [(call-known 4 :count [3])]
                      :terminator (ret 4)}]}]
     (let [states (analyze-states f)]
-      (is (= :escapes (get states 1)))
-      (is (= :escapes (get states 2))))))
+      (is (= :no-escape (get states 1)))
+      (is (= :no-escape (get states 2))))))
 
-(deftest test-same-block-non-escaping-use-stays-no-escape
-  ;; The single-block analogue of the test above: alloc and the
-  ;; non-escaping :count use live in the same block, so the alloc can
-  ;; safely be region-allocated.
-  (let [f (ir-func [(alloc-vec 0 [])
-                    (call-known 1 :count [0])]
-                   (ret 1))]
-    (is (= :no-escape (get (analyze-states f) 0)))))
-
-(deftest test-call-result-used-cross-block-escapes
-  ;; The alloc is consumed by :assoc in block 1 (escaping known-fn arg
-  ;; → propagates to the call result), and the call result flows to
-  ;; block 2.  Even though :assoc itself is "fine" in-block, the chained
-  ;; cross-block use of its result means the alloc must escape.
+(deftest test-call-result-chain-non-escape
+  ;; The alloc is consumed by :assoc in block 0 (escaping known-fn arg
+  ;; → propagates to the call result), and the call result is consumed
+  ;; by :count in block 1 (non-escaping).  The chain stays inside the
+  ;; function so the alloc is :no-escape semantically; the optimizer
+  ;; will decide whether the dominator subgraph is region-allocatable.
   (let [f {:name "test" :ns "user" :params []
            :next-var 0 :next-block 3 :subfunctions []
            :blocks [{:id 0 :phis []
@@ -229,12 +221,11 @@
                     {:id 1 :phis []
                      :insts [(call-known 2 :count [1])]
                      :terminator (ret 2)}]}]
-    (is (= :escapes (get (analyze-states f) 0)))))
+    (is (= :no-escape (get (analyze-states f) 0)))))
 
-(deftest test-collect-allocs-tracks-defining-block
-  ;; Sanity check on the analyze internals: the helper now returns a map
-  ;; of {alloc-var defining-block} so classify-escape can enforce the
-  ;; same-block invariant.
+(deftest test-analyze-exposes-alloc-blocks
+  ;; `analyze` returns an `:alloc-blocks` map of {alloc-var defining-block}
+  ;; so downstream passes can compute region scopes.
   (let [f {:name "test" :ns "user" :params []
            :next-var 0 :next-block 3 :subfunctions []
            :blocks [{:id 0 :phis []
@@ -243,16 +234,12 @@
                     {:id 1 :phis []
                      :insts [(alloc-vec 1 [])]
                      :terminator (ret 1)}]}
-        states (analyze-states f)]
-    ;; Block 0's alloc flows to block 1 (via the next instruction's
-    ;; call?  no — there's no use; with no use, classify-escape returns
-    ;; :no-escape.  This test focuses on whether each alloc is tracked
-    ;; by its own block; mostly we just want analyze to handle multiple
-    ;; allocs in distinct blocks without crashing.)
-    (is (contains? states 0))
-    (is (contains? states 1))
+        result (escape/analyze f)
+        alloc-blocks (:alloc-blocks result)]
+    (is (= 0 (get alloc-blocks 0)) "alloc 0 lives in block 0")
+    (is (= 1 (get alloc-blocks 1)) "alloc 1 lives in block 1")
     ;; The alloc in block 1 is returned, so it must escape.
-    (is (= :escapes (get states 1)))))
+    (is (= :escapes (get (:states result) 1)))))
 
 ;; ── analyze: recur escapes ──────────────────────────────────────────────────
 
