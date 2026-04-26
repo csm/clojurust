@@ -12,11 +12,11 @@ fn main() {
 
     // Re-run if bootstrap sources change.
     println!("cargo::rerun-if-changed=../cljrs-builtins/src/bootstrap.cljrs");
-    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/anf.cljrs");
-    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/ir.cljrs");
-    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/known.cljrs");
-    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/escape.cljrs");
-    println!("cargo::rerun-if-changed=../cljrs-ir/src/clojure/compiler/optimize.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/cljrs/compiler/anf.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/cljrs/compiler/ir.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/cljrs/compiler/known.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/cljrs/compiler/escape.cljrs");
+    println!("cargo::rerun-if-changed=../cljrs-ir/src/cljrs/compiler/optimize.cljrs");
 
     // The Clojure compiler uses deep recursion; run on a large-stack thread.
     let result = std::thread::Builder::new()

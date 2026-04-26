@@ -24,7 +24,7 @@ src/
   codegen.rs    — Cranelift code generator: IrFunction → native object code
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
-  clojure/compiler/
+  cljrs/compiler/
     ir.cljrs      — IR data constructors + mutable builder context (atom-based)
     known.cljrs   — Known function symbol → keyword resolution table
     anf.cljrs     — ANF lowering (Clojure): Form values → IR data maps

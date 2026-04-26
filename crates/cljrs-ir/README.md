@@ -19,7 +19,7 @@ can depend on the same types without a circular dependency.
 src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
-  clojure/compiler/
+  cljrs/compiler/
     ir.cljrs       — IR data constructors + mutable builder context (atom-based)
     known.cljrs    — symbol-name → KnownFn keyword resolution
     anf.cljrs      — ANF lowering: Form values → IR data maps
