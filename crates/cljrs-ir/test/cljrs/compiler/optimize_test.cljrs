@@ -1,0 +1,170 @@
+(ns cljrs.compiler.optimize-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [cljrs.compiler.optimize :as opt]))
+
+;; ── Helpers ─────────────────────────────────────────────────────────────────
+
+(defn ir-func
+  [insts terminator next-var]
+  {:name "test"
+   :ns "user"
+   :params []
+   :blocks [{:id 0 :phis [] :insts insts :terminator terminator}]
+   :next-var next-var
+   :next-block 1
+   :subfunctions []})
+
+(defn alloc-vec [dst elems] {:op :alloc-vector :dst dst :elems elems})
+(defn call-known [dst func args] {:op :call-known :dst dst :func func :args args})
+(defn ret [v] {:op :return :var v})
+
+;; ── alloc-op-to-region-kind ────────────────────────────────────────────────
+
+(deftest test-alloc-op-to-region-kind-mapping
+  (is (= :vector (get opt/alloc-op-to-region-kind :alloc-vector)))
+  (is (= :map    (get opt/alloc-op-to-region-kind :alloc-map)))
+  (is (= :set    (get opt/alloc-op-to-region-kind :alloc-set)))
+  (is (= :list   (get opt/alloc-op-to-region-kind :alloc-list)))
+  (is (= :cons   (get opt/alloc-op-to-region-kind :alloc-cons)))
+  (testing "alloc-closure is intentionally absent — closures cannot be
+            region-allocated since they outlive the call frame"
+    (is (nil? (get opt/alloc-op-to-region-kind :alloc-closure))))
+  (testing "non-alloc ops have no mapping"
+    (is (nil? (get opt/alloc-op-to-region-kind :call-known)))
+    (is (nil? (get opt/alloc-op-to-region-kind :const)))))
+
+;; ── alloc-operands ─────────────────────────────────────────────────────────
+
+(deftest test-alloc-operands-vector-set-list
+  (is (= [1 2 3] (opt/alloc-operands {:op :alloc-vector :dst 0 :elems [1 2 3]})))
+  (is (= [1 2]   (opt/alloc-operands {:op :alloc-set    :dst 0 :elems [1 2]})))
+  (is (= [9 8]   (opt/alloc-operands {:op :alloc-list   :dst 0 :elems [9 8]}))))
+
+(deftest test-alloc-operands-map-flattens-pairs
+  ;; Pairs like [[k1 v1] [k2 v2]] become a flat operand list [k1 v1 k2 v2].
+  (is (= [1 2 3 4]
+         (opt/alloc-operands {:op :alloc-map :dst 0 :pairs [[1 2] [3 4]]}))))
+
+(deftest test-alloc-operands-cons
+  (is (= [7 8] (opt/alloc-operands {:op :alloc-cons :dst 0 :head 7 :tail 8}))))
+
+(deftest test-alloc-operands-non-alloc-returns-empty
+  (is (= [] (opt/alloc-operands (call-known 0 :+ [1 2]))))
+  (is (= [] (opt/alloc-operands {:op :const :dst 0 :value {}}))))
+
+;; ── optimize: leaves IR alone when nothing is non-escaping ──────────────────
+
+(deftest test-optimize-no-non-escaping-allocs-is-identity
+  ;; The alloc is returned, so it escapes — the optimizer must leave the
+  ;; function unchanged.
+  (let [f (ir-func [(alloc-vec 0 [])] (ret 0) 1)
+        out (opt/optimize f)]
+    (is (= f out))))
+
+(deftest test-optimize-no-allocs-is-identity
+  (let [f (ir-func [] (ret 0) 1)
+        out (opt/optimize f)]
+    (is (= f out))))
+
+;; ── optimize: rewrites a non-escaping alloc into a region scope ─────────────
+
+(defn region-insts-of-block-0 [func]
+  (-> func :blocks first :insts))
+
+(deftest test-optimize-rewrites-non-escaping-alloc
+  ;; var 0 is consumed only by :count (non-escaping) → it should be rewritten
+  ;; into region-alloc, with region-start at the block head and region-end
+  ;; at the tail.
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (call-known 1 :count [0])]
+                   (ret 1)
+                   2)
+        out (opt/optimize f)
+        insts (region-insts-of-block-0 out)]
+    (testing "shape: [region-start, region-alloc, call-known, region-end]"
+      (is (= 4 (count insts)))
+      (is (= :region-start (:op (nth insts 0))))
+      (is (= :region-alloc (:op (nth insts 1))))
+      (is (= :call-known   (:op (nth insts 2))))
+      (is (= :region-end   (:op (nth insts 3)))))
+    (testing "the rewritten region-alloc preserves dst, kind, and operands"
+      (let [ra (nth insts 1)]
+        (is (= 0 (:dst ra)))
+        (is (= :vector (:kind ra)))
+        (is (= [] (:operands ra)))))
+    (testing "the region-start dst matches the region argument of region-end and region-alloc"
+      (let [start-var (:dst (nth insts 0))
+            ra-region (:region (nth insts 1))
+            end-region (:region (nth insts 3))]
+        (is (= start-var ra-region))
+        (is (= start-var end-region))))
+    (testing ":next-var is bumped past the new region var"
+      (is (>= (:next-var out) 3)))))
+
+(deftest test-optimize-leaves-escaping-allocs-alone
+  ;; var 0 is non-escaping (only :count uses it); var 1 escapes (returned).
+  ;; Only var 0 should be rewritten.
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (call-known 1 :count [0])
+                    (alloc-vec 2 [1])]
+                   (ret 2)
+                   3)
+        out (opt/optimize f)
+        insts (region-insts-of-block-0 out)]
+    (testing "var 0 becomes region-alloc"
+      (is (some (fn [i] (and (= :region-alloc (:op i)) (= 0 (:dst i))))
+                insts)))
+    (testing "var 2 stays as alloc-vector (it escapes)"
+      (is (some (fn [i] (and (= :alloc-vector (:op i)) (= 2 (:dst i))))
+                insts)))))
+
+;; ── optimize: subfunctions ──────────────────────────────────────────────────
+
+(deftest test-optimize-recurses-into-subfunctions
+  ;; A subfunction with a non-escaping alloc should also be optimized.
+  (let [sub (ir-func [(alloc-vec 0 [])
+                      (call-known 1 :count [0])]
+                     (ret 1)
+                     2)
+        outer {:name "outer" :ns "user" :params []
+               :next-var 1 :next-block 1 :subfunctions [sub]
+               :blocks [{:id 0 :phis [] :insts []
+                         :terminator (ret 0)}]}
+        out (opt/optimize outer)
+        opt-sub (first (:subfunctions out))]
+    (let [insts (region-insts-of-block-0 opt-sub)]
+      (is (some (fn [i] (= :region-start (:op i))) insts))
+      (is (some (fn [i] (= :region-alloc (:op i))) insts))
+      (is (some (fn [i] (= :region-end   (:op i))) insts)))))
+
+(deftest test-optimize-handles-missing-subfunctions-key
+  ;; The optimizer's `(or (:subfunctions optimized) [])` guard means an IR
+  ;; without a :subfunctions key (legacy/data-from-elsewhere) must not crash.
+  (let [f {:name "x" :ns "user" :params []
+           :blocks [{:id 0 :phis [] :insts [] :terminator (ret 0)}]
+           :next-var 1 :next-block 1}
+        out (opt/optimize f)]
+    (is (= [] (:subfunctions out)))))
+
+;; ── optimize: per-block scoping ─────────────────────────────────────────────
+
+(deftest test-optimize-blocks-without-non-escaping-allocs-unchanged
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 4 :next-block 3 :subfunctions []
+           :blocks
+           [{:id 0 :phis []
+             :insts [{:op :load-local :dst 0 :name "x"}]
+             :terminator {:op :jump :target 1}}
+            {:id 1 :phis []
+             :insts [(alloc-vec 1 [])
+                     (call-known 2 :count [1])]
+             :terminator (ret 2)}]}
+        out (opt/optimize f)
+        blocks (:blocks out)]
+    (testing "block 0 is unchanged"
+      (is (= (-> f :blocks first) (first blocks))))
+    (testing "block 1 has region instructions inserted"
+      (let [insts (-> blocks second :insts)]
+        (is (some (fn [i] (= :region-start (:op i))) insts))
+        (is (some (fn [i] (= :region-alloc (:op i))) insts))
+        (is (some (fn [i] (= :region-end   (:op i))) insts))))))

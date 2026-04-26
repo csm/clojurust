@@ -1,0 +1,77 @@
+(ns cljrs.compiler.known-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [cljrs.compiler.known :as known]))
+
+;; ── strip-ns-prefix ─────────────────────────────────────────────────────────
+
+(deftest test-strip-ns-prefix-no-slash
+  (is (= "foo" (known/strip-ns-prefix "foo")))
+  (is (= "" (known/strip-ns-prefix ""))
+      "empty string is returned unchanged"))
+
+(deftest test-strip-ns-prefix-with-slash
+  (is (= "name" (known/strip-ns-prefix "ns/name")))
+  (is (= "name" (known/strip-ns-prefix "a.b.c/name")))
+  (is (= "+" (known/strip-ns-prefix "clojure.core/+"))))
+
+(deftest test-strip-ns-prefix-bare-slash-is-special
+  ;; The lone "/" symbol is the division function and must be returned as-is.
+  (is (= "/" (known/strip-ns-prefix "/"))))
+
+(deftest test-strip-ns-prefix-trailing-slash
+  ;; "ns/" — slash with empty name after.  The fn returns whatever follows
+  ;; the rightmost slash, so we get "".
+  (is (= "" (known/strip-ns-prefix "ns/"))))
+
+;; ── resolve-known-fn ────────────────────────────────────────────────────────
+
+(deftest test-resolve-known-fn-basic-arithmetic
+  (is (= :+ (known/resolve-known-fn "+")))
+  (is (= :- (known/resolve-known-fn "-")))
+  (is (= :* (known/resolve-known-fn "*")))
+  (is (= :/ (known/resolve-known-fn "/"))))
+
+(deftest test-resolve-known-fn-collection-ops
+  (is (= :vector (known/resolve-known-fn "vector")))
+  (is (= :hash-map (known/resolve-known-fn "hash-map")))
+  (is (= :assoc (known/resolve-known-fn "assoc")))
+  (is (= :conj (known/resolve-known-fn "conj")))
+  (is (= :get (known/resolve-known-fn "get"))))
+
+(deftest test-resolve-known-fn-predicates
+  (is (= :nil? (known/resolve-known-fn "nil?")))
+  (is (= :seq? (known/resolve-known-fn "seq?")))
+  (is (= :vector? (known/resolve-known-fn "vector?"))))
+
+(deftest test-resolve-known-fn-strips-ns-prefix
+  (testing "core qualified names resolve through their bare name"
+    (is (= :+ (known/resolve-known-fn "clojure.core/+")))
+    (is (= :map (known/resolve-known-fn "clojure.core/map")))
+    (is (= :assoc (known/resolve-known-fn "clojure.core/assoc")))))
+
+(deftest test-resolve-known-fn-mod-aliases-rem
+  (is (= :rem (known/resolve-known-fn "mod"))
+      "mod is intentionally aliased to :rem in the known table"))
+
+(deftest test-resolve-known-fn-unknown-returns-nil
+  (is (nil? (known/resolve-known-fn "this-fn-does-not-exist")))
+  (is (nil? (known/resolve-known-fn "")))
+  (is (nil? (known/resolve-known-fn "user/my-fn"))
+      "user-defined ns/name combos are not in the known table"))
+
+(deftest test-resolve-known-fn-bare-slash
+  ;; The bare division symbol resolves directly through the special-case
+  ;; branch in strip-ns-prefix.
+  (is (= :/ (known/resolve-known-fn "/")))
+  ;; Note: the qualified form `clojure.core//` is recognized at the *reader*
+  ;; level — by the time a symbol's name reaches `resolve-known-fn` as the
+  ;; string "clojure.core//", strip-ns-prefix sees a trailing slash and
+  ;; returns "", which doesn't appear in the known-fns table.  This is fine
+  ;; because the symbol name passed in here is always the bare symbol name,
+  ;; not the qualified form.
+  (is (nil? (known/resolve-known-fn "clojure.core//"))))
+
+(deftest test-known-fns-table-has-no-nil-values
+  ;; Every entry must map to a non-nil keyword — a nil value would silently
+  ;; turn a known fn into "unknown" at the call site.
+  (is (every? (fn [[_ v]] (some? v)) known/known-fns)))

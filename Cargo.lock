@@ -360,7 +360,12 @@ dependencies = [
 name = "cljrs-ir"
 version = "0.1.0"
 dependencies = [
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-stdlib",
  "cljrs-types",
+ "cljrs-value",
  "postcard",
  "serde",
 ]
