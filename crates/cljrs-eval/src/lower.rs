@@ -59,7 +59,32 @@ pub fn lower_arity(
         return Err(LowerError::NotReady);
     }
 
-    lower_arity_inner(name, params, rest_param, body, ns, env)
+    lower_arity_inner(name, params, rest_param, body, ns, env, false)
+}
+
+/// Like [`lower_arity`], but also runs the `cljrs.compiler.optimize/optimize`
+/// pass on the lowered IR — this is what inserts `RegionStart`/`RegionAlloc`/
+/// `RegionEnd` instructions for non-escaping allocations.
+///
+/// The caller is responsible for ensuring `cljrs.compiler.optimize` (and its
+/// transitive deps, e.g. `cljrs.compiler.escape`) have been required.
+pub fn lower_and_optimize_arity(
+    name: Option<&str>,
+    params: &[Arc<str>],
+    rest_param: Option<&Arc<str>>,
+    body: &[Form],
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> Result<IrFunction, LowerError> {
+    if !env
+        .globals
+        .compiler_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(LowerError::NotReady);
+    }
+
+    lower_arity_inner(name, params, rest_param, body, ns, env, true)
 }
 
 fn lower_arity_inner(
@@ -69,6 +94,7 @@ fn lower_arity_inner(
     body: &[Form],
     ns: &Arc<str>,
     env: &mut Env,
+    optimize: bool,
 ) -> Result<IrFunction, LowerError> {
     use cljrs_gc::GcPtr;
     use cljrs_value::collections::vector::PersistentVector;
@@ -140,6 +166,30 @@ fn lower_arity_inner(
     cljrs_env::callback::pop_eval_context();
 
     let ir_data = ir_data.map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
+
+    // Optionally run the optimize pass (escape analysis → region allocation).
+    let ir_data = if optimize {
+        let optimize_fn = env
+            .globals
+            .lookup_var_in_ns("cljrs.compiler.optimize", "optimize")
+            .ok_or_else(|| {
+                LowerError::LowerFailed(
+                    "cljrs.compiler.optimize/optimize not found (require it first)".to_string(),
+                )
+            })?;
+        let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
+
+        cljrs_env::callback::push_eval_context(env);
+        let was_active = IR_LOWERING_ACTIVE.get();
+        IR_LOWERING_ACTIVE.set(true);
+        let result = cljrs_env::callback::invoke(&optimize_fn_val, vec![ir_data]);
+        IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
+        cljrs_env::callback::pop_eval_context();
+
+        result.map_err(|e| LowerError::LowerFailed(format!("optimize pass failed: {e:?}")))?
+    } else {
+        ir_data
+    };
 
     // Convert the result Value → IrFunction.
     crate::ir_convert::value_to_ir_function(&ir_data)

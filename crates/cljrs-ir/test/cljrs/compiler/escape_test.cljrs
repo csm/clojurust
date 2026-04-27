@@ -1,0 +1,255 @@
+(ns cljrs.compiler.escape-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [cljrs.compiler.escape :as escape]))
+
+;; ── Helpers ─────────────────────────────────────────────────────────────────
+;;
+;; These tests build IR functions by hand as plain data so the escape
+;; analysis can run against them without invoking the ANF lowerer.
+
+(defn ir-func
+  "Build a single-block IR function with the given instructions and terminator."
+  [insts terminator]
+  {:name "test"
+   :ns "user"
+   :params []
+   :blocks [{:id 0 :phis [] :insts insts :terminator terminator}]
+   :next-var 0
+   :next-block 1
+   :subfunctions []})
+
+(defn alloc-vec [dst elems] {:op :alloc-vector :dst dst :elems elems})
+(defn alloc-map [dst pairs] {:op :alloc-map :dst dst :pairs pairs})
+(defn alloc-cons [dst h t]  {:op :alloc-cons :dst dst :head h :tail t})
+(defn alloc-closure [dst captures]
+  {:op :alloc-closure :dst dst :closure-name "f" :captures captures
+   :arity-fn-names [] :param-counts [] :capture-names [] :is-variadic []})
+(defn call-known [dst func args] {:op :call-known :dst dst :func func :args args})
+(defn call [dst callee args]      {:op :call :dst dst :callee callee :args args})
+(defn def-var [dst value]         {:op :def-var :dst dst :ns "user" :name "x" :value value})
+
+(defn ret [v]    {:op :return :var v})
+(defn br [c t e] {:op :branch :cond c :then-block t :else-block e})
+
+(defn analyze-states [func]
+  (:states (escape/analyze func)))
+
+;; ── alloc-inst? / alloc-ops table ───────────────────────────────────────────
+
+(deftest test-alloc-inst?
+  (is (escape/alloc-inst? (alloc-vec 0 [])))
+  (is (escape/alloc-inst? (alloc-map 0 [])))
+  (is (escape/alloc-inst? (alloc-cons 0 1 2)))
+  (is (escape/alloc-inst? {:op :alloc-set :dst 0 :elems []}))
+  (is (escape/alloc-inst? {:op :alloc-list :dst 0 :elems []}))
+  (is (escape/alloc-inst? (alloc-closure 0 [])))
+  (testing "non-alloc instructions are not allocations"
+    (is (not (escape/alloc-inst? (call-known 0 :+ [1 2]))))
+    (is (not (escape/alloc-inst? {:op :const :dst 0 :value {:type :nil}})))
+    (is (not (escape/alloc-inst? {:op :load-local :dst 0 :name "x"})))))
+
+;; ── analyze: basic shape ────────────────────────────────────────────────────
+
+(deftest test-analyze-returns-states-and-uses
+  (let [f (ir-func [(alloc-vec 0 [])] (ret 0))
+        result (escape/analyze f)]
+    (is (contains? result :states))
+    (is (contains? result :uses))))
+
+(deftest test-analyze-no-allocations
+  (let [f (ir-func [] (ret 0))]
+    (is (= {} (analyze-states f)))))
+
+;; ── analyze: escape via terminator/sinks ────────────────────────────────────
+
+(deftest test-return-escapes
+  (let [f (ir-func [(alloc-vec 0 [])] (ret 0))]
+    (is (= :escapes (get (analyze-states f) 0)))))
+
+(deftest test-def-var-escapes
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (def-var 1 0)]
+                   (ret 1))]
+    (is (= :escapes (get (analyze-states f) 0))
+        "a value bound into a global Var must escape into the static heap")))
+
+(deftest test-throw-escapes
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 1 :subfunctions []
+           :blocks [{:id 0 :phis [] :insts [(alloc-vec 0 [])]
+                     :terminator {:op :unreachable}}
+                    {:id 1 :phis [] :insts [{:op :throw :value 0}]
+                     :terminator {:op :unreachable}}]}]
+    (is (= :escapes (get (analyze-states f) 0)))))
+
+;; ── analyze: stored-in-heap escapes ─────────────────────────────────────────
+
+(deftest test-stored-in-vector-escapes
+  ;; var 0 is an inner alloc that gets put inside another alloc-vector.
+  ;; Since it's stored into a heap object, var 0 must be classified as :escapes.
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (alloc-vec 1 [0])]
+                   (ret 1))]
+    (let [states (analyze-states f)]
+      (is (= :escapes (get states 0)))
+      (is (= :escapes (get states 1))))))
+
+(deftest test-stored-in-map-escapes
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (alloc-vec 1 [])
+                    (alloc-map 2 [[0 1]])]
+                   (ret 2))]
+    (let [states (analyze-states f)]
+      (is (= :escapes (get states 0)))
+      (is (= :escapes (get states 1))))))
+
+(deftest test-stored-in-cons-escapes
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (alloc-vec 1 [])
+                    (alloc-cons 2 0 1)]
+                   (ret 2))]
+    (let [states (analyze-states f)]
+      (is (= :escapes (get states 0)))
+      (is (= :escapes (get states 1))))))
+
+;; ── analyze: closure capture escapes ────────────────────────────────────────
+
+(deftest test-closure-capture-escapes
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (alloc-closure 1 [0])]
+                   (ret 1))]
+    (is (= :escapes (get (analyze-states f) 0))
+        "captured into a closure → escapes the function frame")))
+
+;; ── analyze: known-fn calls ─────────────────────────────────────────────────
+
+(deftest test-known-non-escaping-fn-keeps-no-escape
+  ;; :count is in non-escaping-fns; passing the alloc to it does not propagate
+  ;; the value out.  The result of count is a number, so the chain dies there.
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (call-known 1 :count [0])]
+                   (ret 1))]
+    (is (= :no-escape (get (analyze-states f) 0)))))
+
+(deftest test-multiple-non-escaping-uses-stay-no-escape
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (call-known 1 :count [0])
+                    (call-known 2 :first [0])]
+                   (ret 1))]
+    (is (= :no-escape (get (analyze-states f) 0)))))
+
+(deftest test-mixed-escape-and-non-escape-uses-escapes
+  ;; Same alloc used non-escapingly AND returned — the escaping use wins.
+  (let [f (ir-func [(alloc-vec 0 [])
+                    (call-known 1 :count [0])]
+                   (ret 0))]
+    (is (= :escapes (get (analyze-states f) 0)))))
+
+;; ── analyze: unknown-call (function pointer) ────────────────────────────────
+
+(deftest test-unknown-call-arg-causes-arg-escape
+  ;; Passing the alloc to an unknown function (f.e. user-defined) flags it
+  ;; as :arg-escape — we don't know what the callee does with it.
+  (let [f (ir-func [{:op :load-global :dst 0 :ns "user" :name "f"}
+                    (alloc-vec 1 [])
+                    (call 2 0 [1])]
+                   (ret 2))]
+    (is (= :arg-escape (get (analyze-states f) 1)))))
+
+;; ── analyze: phi merging two allocs ─────────────────────────────────────────
+
+(deftest test-phi-then-return-escapes
+  ;; Both allocs flow through a phi to the merge block, which returns the
+  ;; phi result.  Both allocs must be classified :escapes.
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 4 :subfunctions []
+           :blocks [{:id 0 :phis []
+                     :insts [{:op :load-local :dst 0 :name "cond"}]
+                     :terminator (br 0 1 2)}
+                    {:id 1 :phis []
+                     :insts [(alloc-vec 1 [])]
+                     :terminator {:op :jump :target 3}}
+                    {:id 2 :phis []
+                     :insts [(alloc-vec 2 [])]
+                     :terminator {:op :jump :target 3}}
+                    {:id 3
+                     :phis [{:op :phi :dst 3 :entries [[1 1] [2 2]]}]
+                     :insts []
+                     :terminator (ret 3)}]}]
+    (let [states (analyze-states f)]
+      (is (= :escapes (get states 1)))
+      (is (= :escapes (get states 2))))))
+
+(deftest test-phi-then-non-escaping-use-stays-no-escape
+  ;; Phi result is consumed by :count, which is non-escaping.  Both phi
+  ;; inputs are :no-escape — `cljrs.compiler.escape` is purely a
+  ;; semantic check (does the value leave the function frame?), it does
+  ;; not concern itself with control-flow lifetime.  The cross-block
+  ;; bookkeeping that picks a region scope wide enough to cover all
+  ;; uses lives in `cljrs.compiler.optimize`.
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 4 :subfunctions []
+           :blocks [{:id 0 :phis []
+                     :insts [{:op :load-local :dst 0 :name "cond"}]
+                     :terminator (br 0 1 2)}
+                    {:id 1 :phis []
+                     :insts [(alloc-vec 1 [])]
+                     :terminator {:op :jump :target 3}}
+                    {:id 2 :phis []
+                     :insts [(alloc-vec 2 [])]
+                     :terminator {:op :jump :target 3}}
+                    {:id 3
+                     :phis [{:op :phi :dst 3 :entries [[1 1] [2 2]]}]
+                     :insts [(call-known 4 :count [3])]
+                     :terminator (ret 4)}]}]
+    (let [states (analyze-states f)]
+      (is (= :no-escape (get states 1)))
+      (is (= :no-escape (get states 2))))))
+
+(deftest test-call-result-chain-non-escape
+  ;; The alloc is consumed by :assoc in block 0 (escaping known-fn arg
+  ;; → propagates to the call result), and the call result is consumed
+  ;; by :count in block 1 (non-escaping).  The chain stays inside the
+  ;; function so the alloc is :no-escape semantically; the optimizer
+  ;; will decide whether the dominator subgraph is region-allocatable.
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 3 :subfunctions []
+           :blocks [{:id 0 :phis []
+                     :insts [(alloc-vec 0 [])
+                             (call-known 1 :assoc [0])]
+                     :terminator {:op :jump :target 1}}
+                    {:id 1 :phis []
+                     :insts [(call-known 2 :count [1])]
+                     :terminator (ret 2)}]}]
+    (is (= :no-escape (get (analyze-states f) 0)))))
+
+(deftest test-analyze-exposes-alloc-blocks
+  ;; `analyze` returns an `:alloc-blocks` map of {alloc-var defining-block}
+  ;; so downstream passes can compute region scopes.
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 3 :subfunctions []
+           :blocks [{:id 0 :phis []
+                     :insts [(alloc-vec 0 [])]
+                     :terminator {:op :jump :target 1}}
+                    {:id 1 :phis []
+                     :insts [(alloc-vec 1 [])]
+                     :terminator (ret 1)}]}
+        result (escape/analyze f)
+        alloc-blocks (:alloc-blocks result)]
+    (is (= 0 (get alloc-blocks 0)) "alloc 0 lives in block 0")
+    (is (= 1 (get alloc-blocks 1)) "alloc 1 lives in block 1")
+    ;; The alloc in block 1 is returned, so it must escape.
+    (is (= :escapes (get (:states result) 1)))))
+
+;; ── analyze: recur escapes ──────────────────────────────────────────────────
+
+(deftest test-recur-arg-escapes
+  ;; A loop-recur arg flows back into the loop header phi, which we
+  ;; conservatively treat as escaping (the value crosses an iteration
+  ;; boundary).
+  (let [f {:name "test" :ns "user" :params []
+           :next-var 0 :next-block 2 :subfunctions []
+           :blocks [{:id 0 :phis []
+                     :insts [(alloc-vec 0 [])]
+                     :terminator {:op :recur-jump :target 0 :args [0]}}]}]
+    (is (= :escapes (get (analyze-states f) 0)))))

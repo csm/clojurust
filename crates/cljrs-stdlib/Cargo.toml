@@ -29,3 +29,5 @@ cljrs-eval     = { workspace = true }
 cljrs-interp   = { workspace = true }
 cljrs-value    = { workspace = true }
 cljrs-env      = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-types    = { workspace = true }
