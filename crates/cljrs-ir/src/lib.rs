@@ -11,20 +11,20 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
 use cljrs_types::error::CljxError::SerializationError;
 use cljrs_types::error::CljxResult;
 use cljrs_types::span::Span;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::{Display, Write};
+use std::fmt::Display;
 use std::sync::Arc;
 
 // Display helpers
 
 thread_local! {
-    static INDENT: RefCell<i16> = RefCell::new(0)
+    static INDENT: RefCell<i16> = const { RefCell::new(0) }
 }
 
 fn indent() -> String {

@@ -88,7 +88,8 @@ fn main() {
 
         Commands::Dump { input } => {
             let bytes = std::fs::read(input).expect("failed to read input file");
-            let bundle = cljrs_ir::deserialize_bundle(&bytes).expect("failed to deserialize input file");
+            let bundle =
+                cljrs_ir::deserialize_bundle(&bytes).expect("failed to deserialize input file");
             println!("{}", bundle);
         }
     }

@@ -50,7 +50,11 @@ fn extract_counter(map: &Value, key: &str) -> i64 {
 fn run_clojure_compiler_tests() {
     // Source path so `(require 'cljrs.compiler.ir-test)` finds the test files.
     let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test");
-    assert!(test_dir.is_dir(), "test dir not found: {}", test_dir.display());
+    assert!(
+        test_dir.is_dir(),
+        "test dir not found: {}",
+        test_dir.display()
+    );
 
     let _mutator = cljrs_gc::register_mutator();
 
