@@ -317,11 +317,23 @@ fn execute_inst(
 
         Inst::DefVar(dst, def_ns, name, val_var) => {
             let val = regs.get_cloned(*val_var);
-            globals.intern(def_ns, name.clone(), val.clone());
-            let var = globals
-                .lookup_var_in_ns(def_ns, name)
-                .expect("just interned");
-            regs.set(*dst, Value::Var(var));
+            if globals.lookup_var_in_ns(def_ns, name).is_some() {
+                // Var already exists (e.g. a global like `clojure.core/cat`).
+                // letfn-emitted DefVars use a var as mutable indirection for
+                // mutual recursion — they must NOT overwrite the real global.
+                // Create a fresh anonymous Var with the same ns/name so that
+                // closures capturing it can Deref it after this function returns
+                // (lazy-seqs, etc.) and Set! on it won't corrupt the global.
+                let fresh = cljrs_value::Var::new(def_ns.clone(), name.clone());
+                fresh.bind(val);
+                regs.set(*dst, Value::Var(GcPtr::new(fresh)));
+            } else {
+                globals.intern(def_ns, name.clone(), val.clone());
+                let var = globals
+                    .lookup_var_in_ns(def_ns, name)
+                    .expect("just interned");
+                regs.set(*dst, Value::Var(var));
+            }
         }
 
         Inst::SetBang(var_id, val_id) => {
@@ -485,13 +497,37 @@ fn alloc_closure(
     let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
-    // Each arity maps to a subfunction in ir_func.subfunctions.
-    let subfuncs: Vec<Arc<IrFunction>> = ir_func
-        .subfunctions
-        .iter()
-        .map(clone_ir_function)
-        .map(Arc::new)
-        .collect();
+    // Each arity maps to a named subfunction in ir_func.subfunctions.
+    // We use arity_fn_names (when present) to match each arity slot to its
+    // correct subfunction by name, rather than relying on positional indexing.
+    // Positional indexing is wrong when the parent function has more
+    // subfunctions than arities (e.g. fnil has two inner lambdas but the
+    // returned closure is only the second one).
+    let subfuncs: Vec<Arc<IrFunction>> = if !template.arity_fn_names.is_empty() {
+        template
+            .arity_fn_names
+            .iter()
+            .map(|fn_name| {
+                let sf = ir_func
+                    .subfunctions
+                    .iter()
+                    .find(|sf| sf.name.as_deref() == Some(fn_name.as_ref()))
+                    .unwrap_or_else(|| {
+                        ir_func.subfunctions.first().unwrap_or_else(|| {
+                            panic!("IR closure: no subfunctions for '{fn_name}'")
+                        })
+                    });
+                Arc::new(clone_ir_function(sf))
+            })
+            .collect()
+    } else {
+        ir_func
+            .subfunctions
+            .iter()
+            .map(clone_ir_function)
+            .map(Arc::new)
+            .collect()
+    };
 
     let param_counts = template.param_counts.clone();
     let is_variadic = template.is_variadic.clone();
@@ -714,10 +750,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::IsKeyword => Ok(Value::Bool(matches!(args.first(), Some(Value::Keyword(_))))),
         KnownFn::IsSymbol => Ok(Value::Bool(matches!(args.first(), Some(Value::Symbol(_))))),
         KnownFn::IsBool => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
-        KnownFn::IsInt => Ok(Value::Bool(matches!(
-            args.first(),
-            Some(Value::Long(_) | Value::BigInt(_))
-        ))),
+        KnownFn::IsInt => Ok(Value::Bool(matches!(args.first(), Some(Value::Long(_))))),
 
         // ── String ──────────────────────────────────────────────────────
         KnownFn::Str => {
