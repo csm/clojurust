@@ -784,6 +784,9 @@ fn main() {{
 
     // Pop the eval context.
     cljrs_env::callback::pop_eval_context();
+
+    // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
+    cljrs_gc::dump_stats_from_env();
 }}
 "#,
         preamble = preamble_code,
@@ -1043,12 +1046,16 @@ fn main() {
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
     println!("{} passed, {} failed, {} errors.", total_pass, total_fail, total_error);
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    if total_fail > 0 || total_error > 0 {
-        std::process::exit(1);
-    }
 
     // Pop the eval context.
     cljrs_env::callback::pop_eval_context();
+
+    // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
+    cljrs_gc::dump_stats_from_env();
+
+    if total_fail > 0 || total_error > 0 {
+        std::process::exit(1);
+    }
 }"#);
 
     code

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use cljrs_env::env::{Env, GlobalEnv};
 use cljrs_ir::{IrBundle, serialize_bundle};
@@ -33,38 +33,64 @@ struct Cli {
     /// Print verbose progress information.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Subcommand, default is 'prebuild'
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    #[command(name = "prebuild")]
+    Prebuild,
+
+    Dump {
+        input: PathBuf,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let namespaces = if cli.ns.is_empty() {
-        vec!["clojure.core".to_string()]
-    } else {
-        cli.ns
-    };
+    let command = cli.command.unwrap_or(Commands::Prebuild);
 
-    // The compiler uses deep recursion; run on a large-stack thread.
-    let result = std::thread::Builder::new()
-        .name("prebuild-main".to_string())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(move || run_prebuild(&namespaces, &cli.output, &cli.src_path, cli.verbose))
-        .expect("failed to spawn prebuild thread")
-        .join()
-        .expect("prebuild thread panicked");
+    match command {
+        Commands::Prebuild => {
+            let namespaces = if cli.ns.is_empty() {
+                vec!["clojure.core".to_string()]
+            } else {
+                cli.ns
+            };
+            // The compiler uses deep recursion; run on a large-stack thread.
+            let result = std::thread::Builder::new()
+                .name("prebuild-main".to_string())
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || run_prebuild(&namespaces, &cli.output, &cli.src_path, cli.verbose))
+                .expect("failed to spawn prebuild thread")
+                .join()
+                .expect("prebuild thread panicked");
 
-    match result {
-        Ok(stats) => {
-            eprintln!(
-                "Wrote {} functions ({} unsupported) to {}",
-                stats.lowered,
-                stats.unsupported,
-                stats.output.display()
-            );
+            match result {
+                Ok(stats) => {
+                    eprintln!(
+                        "Wrote {} functions ({} unsupported) to {}",
+                        stats.lowered,
+                        stats.unsupported,
+                        stats.output.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+
+        Commands::Dump { input } => {
+            let bytes = std::fs::read(input).expect("failed to read input file");
+            let bundle =
+                cljrs_ir::deserialize_bundle(&bytes).expect("failed to deserialize input file");
+            println!("{}", bundle);
         }
     }
 }

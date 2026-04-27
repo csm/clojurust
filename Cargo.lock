@@ -333,6 +333,7 @@ dependencies = [
  "cljrs-interp",
  "cljrs-ir",
  "cljrs-reader",
+ "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
 ]
@@ -376,7 +377,13 @@ dependencies = [
 name = "cljrs-ir"
 version = "0.1.0"
 dependencies = [
+ "cljrs-env",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-stdlib",
  "cljrs-types",
+ "cljrs-value",
  "postcard",
  "serde",
 ]
@@ -427,6 +434,7 @@ dependencies = [
  "cljrs-ir",
  "cljrs-logging",
  "cljrs-reader",
+ "cljrs-types",
  "cljrs-value",
  "lazy_static",
  "tokio",

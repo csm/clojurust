@@ -26,6 +26,12 @@ src/
     string.cljrs          Clojure source for clojure.string (ns decl; natives pre-registered)
     set.cljrs             Clojure source for clojure.set   (ns decl; natives pre-registered)
     test.cljrs            Pure Clojure implementation of clojure.test
+build.rs                  Pre-lowers clojure.core to optimized IR (gated on the
+                          `prebuild-ir` feature) — runs the ANF lowerer *and*
+                          the escape-analysis/region-allocation optimize pass,
+                          so the resulting bundle includes the RegionStart/
+                          RegionAlloc instructions consumed by the IR
+                          interpreter.  Output: `$OUT_DIR/core_ir.bin`.
 ```
 
 ## Public API

@@ -68,6 +68,20 @@ pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool;
 /// Walks all namespaces, matches bundle keys to runtime arity IDs.
 /// Returns the number of arities loaded.
 pub fn load_prebuilt_ir(globals: &Arc<GlobalEnv>, bundle: &IrBundle) -> usize;
+
+/// IR lowering helpers (in module `lower`):
+///
+/// `lower_arity` — runs only `cljrs.compiler.anf/lower-fn-body`.
+/// `lower_and_optimize_arity` — also runs `cljrs.compiler.optimize/optimize`,
+///     which inserts `RegionStart`/`RegionAlloc`/`RegionEnd` instructions for
+///     non-escaping allocations.  Caller must have required
+///     `cljrs.compiler.optimize` first.  Used by `cljrs-stdlib`'s prebuild
+///     (`prebuild-ir` feature) and by AOT compilation, so prebuilt/AOT code
+///     gets bump-allocated regions.
+pub mod lower {
+    pub fn lower_arity(...) -> Result<IrFunction, LowerError>;
+    pub fn lower_and_optimize_arity(...) -> Result<IrFunction, LowerError>;
+}
 ```
 
 ---
