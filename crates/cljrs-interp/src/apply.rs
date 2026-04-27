@@ -1256,7 +1256,7 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             return Err(EvalError::Runtime(format!(
                 "swap! requires an atom, got {}",
                 v.type_name()
-            )))
+            )));
         }
     };
     let old_val = atom.get().deref();
@@ -1356,7 +1356,7 @@ pub fn make_delay_from_fn(
             return Err(EvalError::Runtime(format!(
                 "make-delay requires a fn, got {}",
                 other.type_name()
-            )))
+            )));
         }
     };
     let thunk = ClosureThunk { f, globals, ns };
@@ -1380,7 +1380,7 @@ pub fn eval_alter_var_root(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             return Err(EvalError::Runtime(format!(
                 "alter-var-root: expected var, got {}",
                 v.type_name()
-            )))
+            )));
         }
     };
     let old_val = vp.get().deref().unwrap_or(Value::Nil);

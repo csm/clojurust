@@ -615,10 +615,10 @@ fn dispatch_or_sentinel(
     ns: &Arc<str>,
     env: &mut Env,
 ) -> EvalResult {
-    if let Value::NativeFunction(nf) = &callee {
-        if is_sentinel(nf.get().name.as_ref()) {
-            return dispatch_sentinel_by_name(nf.get().name.as_ref(), args, globals, ns, env);
-        }
+    if let Value::NativeFunction(nf) = &callee
+        && is_sentinel(nf.get().name.as_ref())
+    {
+        return dispatch_sentinel_by_name(nf.get().name.as_ref(), args, globals, ns, env);
     }
     apply_value(&callee, args, env)
 }
