@@ -1,0 +1,307 @@
+(ns cljrs.compiler.ir-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [cljrs.compiler.ir :as ir]))
+
+;; ── Constant constructors ───────────────────────────────────────────────────
+
+(deftest test-const-constructors
+  (testing "const-nil"
+    (is (= {:type :nil} (ir/const-nil))))
+  (testing "const-bool"
+    (is (= {:type :bool :val true} (ir/const-bool true)))
+    (is (= {:type :bool :val false} (ir/const-bool false))))
+  (testing "const-long"
+    (is (= {:type :long :val 0} (ir/const-long 0)))
+    (is (= {:type :long :val -42} (ir/const-long -42))))
+  (testing "const-double"
+    (is (= {:type :double :val 3.14} (ir/const-double 3.14))))
+  (testing "const-string"
+    (is (= {:type :string :val "hi"} (ir/const-string "hi"))))
+  (testing "const-keyword"
+    (is (= {:type :keyword :val "foo"} (ir/const-keyword "foo"))))
+  (testing "const-symbol"
+    (is (= {:type :symbol :val "bar"} (ir/const-symbol "bar"))))
+  (testing "const-char"
+    (is (= {:type :char :val \a} (ir/const-char \a)))))
+
+;; ── Instruction constructors ────────────────────────────────────────────────
+
+(deftest test-inst-const
+  (let [c (ir/const-long 42)]
+    (is (= {:op :const :dst 7 :value c} (ir/inst-const 7 c)))))
+
+(deftest test-inst-load-local
+  (is (= {:op :load-local :dst 1 :name "x"}
+         (ir/inst-load-local 1 "x"))))
+
+(deftest test-inst-load-global
+  (is (= {:op :load-global :dst 2 :ns "user" :name "y"}
+         (ir/inst-load-global 2 "user" "y"))))
+
+(deftest test-inst-load-var
+  (is (= {:op :load-var :dst 3 :ns "user" :name "z"}
+         (ir/inst-load-var 3 "user" "z"))))
+
+(deftest test-inst-alloc-vector
+  (is (= {:op :alloc-vector :dst 4 :elems [1 2 3]}
+         (ir/inst-alloc-vector 4 [1 2 3])))
+  (is (= {:op :alloc-vector :dst 4 :elems []}
+         (ir/inst-alloc-vector 4 []))))
+
+(deftest test-inst-alloc-map
+  (is (= {:op :alloc-map :dst 5 :pairs [[1 2] [3 4]]}
+         (ir/inst-alloc-map 5 [[1 2] [3 4]]))))
+
+(deftest test-inst-alloc-set
+  (is (= {:op :alloc-set :dst 6 :elems [1 2]}
+         (ir/inst-alloc-set 6 [1 2]))))
+
+(deftest test-inst-alloc-list
+  (is (= {:op :alloc-list :dst 7 :elems [9 8]}
+         (ir/inst-alloc-list 7 [9 8]))))
+
+(deftest test-inst-alloc-cons
+  (is (= {:op :alloc-cons :dst 8 :head 1 :tail 2}
+         (ir/inst-alloc-cons 8 1 2))))
+
+(deftest test-inst-alloc-closure-defaults-is-variadic
+  (testing "is-variadic defaults to a vec of false matching param-counts"
+    (let [inst (ir/inst-alloc-closure 9 "f" [10] ["arity-0" "arity-1"]
+                                      [0 1] ["c"] nil)]
+      (is (= [false false] (:is-variadic inst)))))
+  (testing "explicit is-variadic is preserved"
+    (let [inst (ir/inst-alloc-closure 9 "f" [] ["a"] [2] [] [true])]
+      (is (= [true] (:is-variadic inst))))))
+
+(deftest test-inst-call-known
+  (is (= {:op :call-known :dst 10 :func :+ :args [1 2]}
+         (ir/inst-call-known 10 :+ [1 2]))))
+
+(deftest test-inst-call
+  (is (= {:op :call :dst 11 :callee 5 :args [1 2 3]}
+         (ir/inst-call 11 5 [1 2 3]))))
+
+(deftest test-inst-deref
+  (is (= {:op :deref :dst 12 :src 3}
+         (ir/inst-deref 12 3))))
+
+(deftest test-inst-def-var
+  (is (= {:op :def-var :dst 13 :ns "user" :name "x" :value 7}
+         (ir/inst-def-var 13 "user" "x" 7))))
+
+(deftest test-inst-set!
+  (is (= {:op :set! :var 1 :value 2}
+         (ir/inst-set! 1 2))))
+
+(deftest test-inst-throw
+  (is (= {:op :throw :value 4}
+         (ir/inst-throw 4))))
+
+(deftest test-inst-phi
+  (is (= {:op :phi :dst 14 :entries [[0 1] [2 3]]}
+         (ir/inst-phi 14 [[0 1] [2 3]]))))
+
+(deftest test-inst-recur
+  (is (= {:op :recur :args [1 2]}
+         (ir/inst-recur [1 2]))))
+
+;; ── Region instruction constructors ─────────────────────────────────────────
+
+(deftest test-region-instructions
+  (is (= {:op :region-start :dst 0} (ir/inst-region-start 0)))
+  (is (= {:op :region-alloc :dst 1 :region 0 :kind :vector :operands [2 3]}
+         (ir/inst-region-alloc 1 0 :vector [2 3])))
+  (is (= {:op :region-end :region 0} (ir/inst-region-end 0))))
+
+;; ── Terminator constructors ─────────────────────────────────────────────────
+
+(deftest test-terminators
+  (is (= {:op :jump :target 1} (ir/term-jump 1)))
+  (is (= {:op :branch :cond 5 :then-block 1 :else-block 2}
+         (ir/term-branch 5 1 2)))
+  (is (= {:op :return :var 7} (ir/term-return 7)))
+  (is (= {:op :recur-jump :target 0 :args [1 2]}
+         (ir/term-recur-jump 0 [1 2])))
+  (is (= {:op :unreachable} (ir/term-unreachable))))
+
+;; ── Builder context ─────────────────────────────────────────────────────────
+
+(deftest test-make-ctx-initial-state
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (is (= "f" (:name @ctx)))
+    (is (= "user" (:ns @ctx)))
+    (is (= [] (:params @ctx)))
+    (is (= [] (:blocks @ctx)))
+    (is (= 0 (:current-block @ctx)))
+    (is (= [] (:current-insts @ctx)))
+    (is (= [{}] (:locals @ctx)))
+    (is (= [] (:loop-headers @ctx)))
+    (is (= 0 (:next-var @ctx)))
+    (is (= 1 (:next-block @ctx)))
+    (is (= [] (:subfunctions @ctx)))))
+
+(deftest test-fresh-var-and-block
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (is (= 0 (ir/fresh-var! ctx)))
+    (is (= 1 (ir/fresh-var! ctx)))
+    (is (= 2 (ir/fresh-var! ctx)))
+    (is (= 3 (:next-var @ctx)))
+    (is (= 1 (ir/fresh-block! ctx)))
+    (is (= 2 (ir/fresh-block! ctx)))
+    (is (= 3 (:next-block @ctx)))))
+
+(deftest test-emit-and-finish-block
+  (let [ctx (ir/make-ctx "f" "user" [])
+        c (ir/const-long 42)]
+    (ir/emit! ctx (ir/inst-const 0 c))
+    (ir/emit! ctx (ir/inst-load-local 1 "x"))
+    (testing "emit appends to :current-insts"
+      (is (= 2 (count (:current-insts @ctx)))))
+    (ir/finish-block! ctx (ir/term-return 1))
+    (testing "finish-block moves insts into :blocks and clears :current-insts"
+      (is (= [] (:current-insts @ctx)))
+      (is (= 1 (count (:blocks @ctx))))
+      (let [blk (first (:blocks @ctx))]
+        (is (= 0 (:id blk)))
+        (is (= 2 (count (:insts blk))))
+        (is (= [] (:phis blk)))
+        (is (= {:op :return :var 1} (:terminator blk)))))))
+
+(deftest test-finish-block-separates-phis-from-insts
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/emit! ctx (ir/inst-phi 0 [[0 1]]))
+    (ir/emit! ctx (ir/inst-load-local 1 "x"))
+    (ir/emit! ctx (ir/inst-phi 2 [[0 3]]))
+    (ir/finish-block! ctx (ir/term-return 1))
+    (let [blk (first (:blocks @ctx))]
+      (is (= 2 (count (:phis blk))) ":phis collects all :phi instructions")
+      (is (= 1 (count (:insts blk))) ":insts contains everything else")
+      (is (= :load-local (:op (first (:insts blk))))))))
+
+(deftest test-emit-const-returns-fresh-var
+  (let [ctx (ir/make-ctx "f" "user" [])
+        v0 (ir/emit-const! ctx (ir/const-long 1))
+        v1 (ir/emit-const! ctx (ir/const-long 2))]
+    (is (= 0 v0))
+    (is (= 1 v1))
+    (is (= 2 (count (:current-insts @ctx))))
+    (is (= v0 (:dst (first (:current-insts @ctx)))))))
+
+(deftest test-start-block
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/start-block! ctx 7)
+    (is (= 7 (:current-block @ctx)))
+    (is (= 7 (ir/current-block-id ctx)))))
+
+;; ── Local scope management ──────────────────────────────────────────────────
+
+(deftest test-bind-and-lookup-local
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/bind-local! ctx "x" 0)
+    (is (= 0 (ir/lookup-local ctx "x")))
+    (is (nil? (ir/lookup-local ctx "missing")))))
+
+(deftest test-scope-shadowing
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/bind-local! ctx "x" 0)
+    (ir/push-scope! ctx)
+    (ir/bind-local! ctx "x" 5)
+    (testing "inner scope shadows outer"
+      (is (= 5 (ir/lookup-local ctx "x"))))
+    (ir/pop-scope! ctx)
+    (testing "outer binding is visible after pop"
+      (is (= 0 (ir/lookup-local ctx "x"))))))
+
+(deftest test-lookup-walks-scopes
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/bind-local! ctx "outer" 1)
+    (ir/push-scope! ctx)
+    (ir/bind-local! ctx "inner" 2)
+    (testing "outer-scope binding is reachable from inner scope"
+      (is (= 1 (ir/lookup-local ctx "outer")))
+      (is (= 2 (ir/lookup-local ctx "inner"))))))
+
+(deftest test-get-all-locals-prefers-outermost
+  ;; get-all-locals walks scopes outer→inner and only inserts a key the
+  ;; first time it's seen, so the *outermost* binding wins on collisions.
+  ;; This is the opposite of `lookup-local`, which returns the innermost
+  ;; (shadowed) binding — get-all-locals is used for closure capture and
+  ;; the outer-scope-wins ordering means a captured shadowed name resolves
+  ;; to the original (outer) value seen at definition time.
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (ir/bind-local! ctx "a" 1)
+    (ir/bind-local! ctx "b" 2)
+    (ir/push-scope! ctx)
+    (ir/bind-local! ctx "a" 99)
+    (ir/bind-local! ctx "c" 3)
+    (let [locals (ir/get-all-locals ctx)]
+      (is (= 1 (get locals "a")) "outer binding wins")
+      (is (= 2 (get locals "b")))
+      (is (= 3 (get locals "c"))))))
+
+;; ── Loop headers ─────────────────────────────────────────────────────────────
+
+(deftest test-loop-header-stack
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    (is (nil? (ir/current-loop-header ctx)))
+    (ir/push-loop-header! ctx 1 [10 11])
+    (is (= [1 [10 11]] (ir/current-loop-header ctx)))
+    (ir/push-loop-header! ctx 2 [20])
+    (is (= [2 [20]] (ir/current-loop-header ctx))
+        "current returns the topmost (innermost) loop")
+    (ir/pop-loop-header! ctx)
+    (is (= [1 [10 11]] (ir/current-loop-header ctx)))
+    (ir/pop-loop-header! ctx)
+    (is (nil? (ir/current-loop-header ctx)))))
+
+;; ── Phi-in-header update ────────────────────────────────────────────────────
+
+(deftest test-update-phi-in-header
+  (let [ctx (ir/make-ctx "f" "user" [])]
+    ;; Build header block with one phi at index 0.
+    (ir/emit! ctx (ir/inst-phi 0 [[1 5]]))
+    (ir/finish-block! ctx (ir/term-jump 2))
+    (testing "appends a new predecessor entry to the existing phi"
+      (ir/update-phi-in-header! ctx 0 0 3 7)
+      (let [blk (first (:blocks @ctx))
+            phi (first (:phis blk))]
+        (is (= 1 (count (:phis blk))))
+        (is (= [[1 5] [3 7]] (:entries phi)))))))
+
+;; ── Subfunctions and final IR ───────────────────────────────────────────────
+
+(deftest test-emit-subfunction
+  (let [ctx (ir/make-ctx "f" "user" [])
+        sub {:name "inner" :params [] :blocks [] :next-var 0 :next-block 1
+             :subfunctions []}]
+    (ir/emit-subfunction! ctx sub)
+    (is (= [sub] (:subfunctions @ctx)))))
+
+(deftest test-build-ir-function
+  (let [ctx (ir/make-ctx "f" "user" [])
+        v0  (ir/fresh-var! ctx)]
+    (ir/emit! ctx (ir/inst-load-local v0 "x"))
+    (ir/finish-block! ctx (ir/term-return v0))
+    (let [ir-fn (ir/build-ir-function ctx)]
+      (is (= "f" (:name ir-fn)))
+      (testing "build-ir-function does not propagate :ns"
+        ;; The output map deliberately omits :ns (the Rust IrFunction struct
+        ;; doesn't carry one); the context tracks it only for codegen lookups.
+        (is (not (contains? ir-fn :ns))))
+      (is (= 1 (count (:blocks ir-fn))))
+      (is (= 1 (:next-var ir-fn)))
+      (is (= 1 (:next-block ir-fn)))
+      (is (= [] (:subfunctions ir-fn))))))
+
+(deftest test-current-ns
+  (let [ctx (ir/make-ctx "f" "my.ns" [])]
+    (is (= "my.ns" (ir/current-ns ctx)))))
+
+(deftest test-fresh-name-id-is-monotonic
+  ;; *global-name-counter* is a mutable atom; consecutive calls must return
+  ;; strictly-increasing ids.
+  (let [a (ir/fresh-name-id!)
+        b (ir/fresh-name-id!)
+        c (ir/fresh-name-id!)]
+    (is (< a b))
+    (is (< b c))))

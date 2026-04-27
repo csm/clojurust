@@ -15,9 +15,29 @@ use cljrs_types::error::CljxError::SerializationError;
 use cljrs_types::error::CljxResult;
 use cljrs_types::span::Span;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Display;
 use std::sync::Arc;
+
+// Display helpers
+
+thread_local! {
+    static INDENT: RefCell<i16> = const { RefCell::new(0) }
+}
+
+fn indent() -> String {
+    INDENT.with(|indent| (0..*indent.borrow()).map(|_| " ").collect())
+}
+
+fn indent_inc() {
+    INDENT.with(|indent| *indent.borrow_mut() += 2);
+}
+
+fn indent_dec() {
+    INDENT.with(|indent| *indent.borrow_mut() -= 2);
+}
 
 // ── Variable IDs ─────────────────────────────────────────────────────────────
 
@@ -25,7 +45,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VarId(pub u32);
 
-impl fmt::Display for VarId {
+impl Display for VarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "v{}", self.0)
     }
@@ -499,6 +519,22 @@ pub struct IrBundle {
     pub functions: HashMap<String, IrFunction>,
 }
 
+impl Display for IrBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IrBundle {\n")?;
+        f.write_str("  functions: {\n")?;
+        indent_inc();
+        self.functions.iter().try_for_each(|(name, function)| {
+            f.write_fmt(format_args!("  \"{}\": {}", name, function))?;
+            Ok(())
+        })?;
+        indent_dec();
+        f.write_str("  }\n")?;
+        f.write_str("}\n")?;
+        Ok(())
+    }
+}
+
 impl IrBundle {
     pub fn new() -> Self {
         Self {
@@ -776,7 +812,8 @@ impl fmt::Display for IrFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "fn {}({}):",
+            "{}fn {}({}):",
+            indent(),
             self.name.as_deref().unwrap_or("<anon>"),
             self.params
                 .iter()
@@ -784,27 +821,29 @@ impl fmt::Display for IrFunction {
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
+        indent_inc();
         for block in &self.blocks {
-            writeln!(f, "  {block}")?;
+            writeln!(f, "{}  {block}", indent())?;
         }
+        indent_dec();
         Ok(())
     }
 }
 
-impl fmt::Display for Block {
+impl Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}:", self.id)?;
+        writeln!(f, "{}{}:", self.id, indent())?;
         for phi in &self.phis {
-            writeln!(f, "    {phi}")?;
+            writeln!(f, "{}    {phi}", indent())?;
         }
         for inst in &self.insts {
-            writeln!(f, "    {inst}")?;
+            writeln!(f, "{}    {inst}", indent())?;
         }
-        write!(f, "    {}", self.terminator)
+        write!(f, "{}    {}", indent(), self.terminator)
     }
 }
 
-impl fmt::Display for Inst {
+impl Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Inst::Const(dst, c) => write!(f, "{dst} = const {c:?}"),
@@ -859,19 +898,19 @@ impl fmt::Display for Terminator {
 // ── Embedded Clojure compiler sources ───────────────────────────────────────
 
 /// Clojure source for the IR builder namespace.
-pub const COMPILER_IR_SOURCE: &str = include_str!("clojure/compiler/ir.cljrs");
+pub const COMPILER_IR_SOURCE: &str = include_str!("cljrs/compiler/ir.cljrs");
 
 /// Clojure source for the known function resolution namespace.
-pub const COMPILER_KNOWN_SOURCE: &str = include_str!("clojure/compiler/known.cljrs");
+pub const COMPILER_KNOWN_SOURCE: &str = include_str!("cljrs/compiler/known.cljrs");
 
 /// Clojure source for the ANF lowering namespace.
-pub const COMPILER_ANF_SOURCE: &str = include_str!("clojure/compiler/anf.cljrs");
+pub const COMPILER_ANF_SOURCE: &str = include_str!("cljrs/compiler/anf.cljrs");
 
 /// Clojure source for the escape analysis namespace.
-pub const COMPILER_ESCAPE_SOURCE: &str = include_str!("clojure/compiler/escape.cljrs");
+pub const COMPILER_ESCAPE_SOURCE: &str = include_str!("cljrs/compiler/escape.cljrs");
 
 /// Clojure source for the optimization pass namespace.
-pub const COMPILER_OPTIMIZE_SOURCE: &str = include_str!("clojure/compiler/optimize.cljrs");
+pub const COMPILER_OPTIMIZE_SOURCE: &str = include_str!("cljrs/compiler/optimize.cljrs");
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 

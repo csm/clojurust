@@ -190,11 +190,19 @@ impl GcStatsSnapshot { pub fn total_pause(&self) -> Duration }
 impl std::fmt::Display for GcStatsSnapshot { /* multi-line summary */ }
 
 pub static GC_STATS: GcStats;
+
+pub const CLJRS_GC_STATS_ENV: &str;       // = "CLJRS_GC_STATS"
+pub fn dump_stats_from_env();
 ```
 
 Process-global counters updated automatically by `GcHeap::alloc`,
 `GcHeap::collect`, and `Region::alloc`.  The `cljrs --gc-stats [FILE]` CLI
 flag prints a snapshot of these counters at program exit.
+
+`dump_stats_from_env()` is the AOT-binary equivalent: it reads the
+`CLJRS_GC_STATS` environment variable and, if set, writes a snapshot to
+stdout (when the value is empty or `"-"`) or to the named file.  AOT-compiled
+programs and the AOT test harness call it once at exit.
 
 ---
 

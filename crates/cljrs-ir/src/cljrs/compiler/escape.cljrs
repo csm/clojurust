@@ -18,16 +18,23 @@
 ;; ── Collect allocating instructions ─────────────────────────────────────────
 
 (defn collect-allocs
-  "Return a set of VarIds that are produced by allocation instructions."
+  "Return a map of {alloc-var defining-block-id} for every allocation
+   instruction in the function.
+
+   The defining block is needed by `classify-escape` so that we can reject
+   allocations whose value flows out of its block via control flow — region
+   scopes today live for exactly one block (RegionStart at block head,
+   RegionEnd before the terminator), so any cross-block use would deref
+   freed memory."
   [ir-func]
   (reduce (fn [acc block]
             (reduce (fn [a inst]
                       (if (and (alloc-inst? inst) (:dst inst))
-                        (conj a (:dst inst))
+                        (assoc a (:dst inst) (:id block))
                         a))
                     acc
                     (concat (:phis block) (:insts block))))
-          #{}
+          {}
           (:blocks ir-func)))
 
 ;; ── Build def-use chains ────────────────────────────────────────────────────
@@ -174,7 +181,19 @@
 ;; ── Classify escape state ───────────────────────────────────────────────────
 
 (defn classify-escape
-  "Classify whether an allocation escapes."
+  "Classify whether an allocation escapes the function.
+
+   This is a *semantic* check: it asks whether the allocation's value
+   leaves the function frame (returned, stored in a Var, captured by a
+   closure, written into a heap-allocated container, etc.).  It does
+   *not* concern itself with control-flow lifetime — whether the value
+   is consumed in the same block as the allocation, or flows through
+   phi nodes / known-fn call results into descendant blocks.  That
+   decision lives in `cljrs.compiler.optimize`, which inspects the
+   dominator tree to choose a region scope wide enough to cover all
+   uses.
+
+   Returns `:no-escape`, `:arg-escape`, or `:escapes`."
   [var uses ir-func]
   (loop [worklist [var]
          visited #{}
@@ -218,6 +237,10 @@
                                acc)
 
                              :phi-input
+                             ;; The phi result inherits the alloc's
+                             ;; semantic-escape disposition: if the phi
+                             ;; result later escapes, so does the alloc.
+                             ;; Propagate to the phi's dst.
                              (let [block (first (filter (fn [b] (= (:id b) (:block use-info))) (:blocks ir-func)))]
                                (if block
                                  (reduce (fn [a phi]
@@ -243,16 +266,23 @@
 
 (defn analyze
   "Run escape analysis on an IR function (data map).
-   Returns {:states {var-id state} :uses {var-id [use-info]}}
-   where state is :no-escape, :arg-escape, or :escapes."
+
+   Returns `{:states {var-id state} :uses {var-id [use-info]}
+              :alloc-blocks {alloc-var defining-block-id}}`
+   where `state` is `:no-escape`, `:arg-escape`, or `:escapes`.
+
+   The `:alloc-blocks` map exposes where each allocation lives so that
+   downstream passes (notably `cljrs.compiler.optimize`) can compute
+   region scopes via the dominator tree."
   [ir-func]
-  (let [allocs (collect-allocs ir-func)
+  (let [alloc-blocks (collect-allocs ir-func)
         uses (build-use-chains ir-func)
         states (reduce (fn [acc alloc-var]
-                         (assoc acc alloc-var (classify-escape alloc-var uses ir-func)))
+                         (assoc acc alloc-var
+                                (classify-escape alloc-var uses ir-func)))
                        {}
-                       allocs)]
-    {:states states :uses uses}))
+                       (keys alloc-blocks))]
+    {:states states :uses uses :alloc-blocks alloc-blocks}))
 
 ;; ── Collection chain detection ──────────────────────────────────────────────
 

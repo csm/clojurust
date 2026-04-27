@@ -10,3 +10,11 @@ repository.workspace = true
 cljrs-types = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 postcard = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+cljrs-eval     = { workspace = true }
+cljrs-stdlib   = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-env      = { workspace = true }
