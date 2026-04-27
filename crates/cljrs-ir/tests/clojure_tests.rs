@@ -69,6 +69,12 @@ fn run_clojure_compiler_tests() {
 
     let mut env = Env::new(globals, "user");
 
+    // The IR-aware dispatch path expects an eval context to be active —
+    // some builtins (e.g. `make-lazy-seq`) reach back through
+    // `cljrs_env::callback::with_eval_context` to call back into the
+    // tree-walking interpreter, and panic if no context is set.
+    cljrs_env::callback::push_eval_context(&env);
+
     eval_str(&mut env, "(require 'clojure.test)");
 
     let mut total_pass = 0i64;
@@ -93,6 +99,8 @@ fn run_clojure_compiler_tests() {
             failures.push(format!("{ns}: {fail} fail, {error} error"));
         }
     }
+
+    cljrs_env::callback::pop_eval_context();
 
     eprintln!(
         "[clojure-tests] totals: {total_test} tests, {total_pass} pass, \
