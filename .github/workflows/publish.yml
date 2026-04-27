@@ -43,6 +43,7 @@ jobs:
         run: |
           VERSION="${BASE_VERSION}.${{ github.run_number }}"
           echo "Publishing version: $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
           # Update workspace dependency versions so inter-crate deps use the new version
           for toml in crates/*/Cargo.toml; do
@@ -65,8 +66,29 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          # Poll crates.io API until the given crate@version is indexed (max 5 min).
+          wait_for_crate() {
+            local crate="$1"
+            local version="$2"
+            local max_attempts=20
+            local sleep_sec=15
+            echo "Waiting for ${crate}@${version} to appear on crates.io..."
+            for i in $(seq 1 $max_attempts); do
+              http_status=$(curl -sf -o /dev/null -w "%{http_code}" \
+                -H "User-Agent: clojurust-publish-workflow" \
+                "https://crates.io/api/v1/crates/${crate}/${version}")
+              if [ "$http_status" = "200" ]; then
+                echo "${crate}@${version} is available."
+                return 0
+              fi
+              echo "Attempt ${i}/${max_attempts}: not yet available (HTTP ${http_status}), retrying in ${sleep_sec}s..."
+              sleep $sleep_sec
+            done
+            echo "ERROR: ${crate}@${version} did not appear on crates.io after $((max_attempts * sleep_sec))s"
+            return 1
+          }
+
           # Publish order: leaves first, then dependents
-          # Sleep between publishes to let crates.io index catch up
           CRATES=(
             cljrs-logging
             cljrs-types
@@ -90,6 +112,5 @@ jobs:
             echo "::group::Publishing $crate"
             cargo publish --allow-dirty -p "$crate"
             echo "::endgroup::"
-            # Wait for crates.io index to update before publishing dependents
-            sleep 30
+            wait_for_crate "$crate" "$VERSION"
           done
