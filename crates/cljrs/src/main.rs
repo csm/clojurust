@@ -587,6 +587,9 @@ fn run_repl(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) {
     println!("clojurust REPL (type :quit to exit)");
     println!();
 
+    #[cfg(feature = "enable-rustyline")]
+    let mut rl = rustyline::DefaultEditor::new().unwrap();
+
     let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
 
@@ -594,6 +597,34 @@ fn run_repl(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) {
     let mut input_buf = String::new();
     let mut depth: i32 = 0;
 
+    #[cfg(feature = "enable-rustyline")]
+    loop {
+        let readline = rl.readline("=> ");
+        match readline {
+            Ok(line) => {
+                rl.add_history_entry(line.as_str());
+                if line.is_empty() {
+                    continue;
+                } else if line.starts_with(":quit") {
+                    break;
+                } else {
+                    match eval_in(&mut env, &line, "<repl>") {
+                        Ok(Value::Nil) => println!("nil"),
+                        Ok(v) => println!("{}", v),
+                        Err(e) => println!("error: {}", e),
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(err) => {
+                eprintln!("error: {}", err);
+                break;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "enable-rustyline"))]
     loop {
         let prompt = if input_buf.is_empty() { "=> " } else { ".. " };
         print!("{}", prompt);

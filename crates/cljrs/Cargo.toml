@@ -16,6 +16,7 @@ no-gc = [
     "cljrs-runtime/no-gc",
     "cljrs-stdlib/no-gc",
 ]
+enable-rustyline = ["rustyline"]
 
 [[bin]]
 name = "cljrs"
@@ -36,3 +37,4 @@ clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"
 tracing = "0.1.44"
+rustyline = { workspace = true, optional = true }
