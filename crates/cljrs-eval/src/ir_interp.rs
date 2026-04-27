@@ -295,20 +295,17 @@ fn execute_inst(
         }
 
         Inst::Call(dst, callee, args) => {
-            // GC safepoint before call.
             cljrs_env::gc_roots::gc_safepoint(env);
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee_val, arg_vals, env)?;
+            let result = dispatch_or_sentinel(callee_val, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
         Inst::CallDirect(dst, name, args) => {
-            // Look up the function by name in globals and call it.
             cljrs_env::gc_roots::gc_safepoint(env);
-            let callee = load_global_value(globals, ns, name, ns)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee, arg_vals, env)?;
+            let result = dispatch_sentinel_by_name(name, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
@@ -602,6 +599,77 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
     }
 }
 
+// ── Sentinel-aware call dispatch ────────────────────────────────────────────
+
+/// Dispatch a generic callee value, intercepting sentinel `NativeFunction`s.
+///
+/// Several clojure.core entries (volatile!, vswap!, make-delay, etc.) are
+/// sentinel stubs that unconditionally error when called normally — the real
+/// work happens in `eval_call`'s special-form dispatch, which the IR
+/// interpreter bypasses.  We intercept those by name here so that IR code
+/// calling them works correctly.
+fn dispatch_or_sentinel(
+    callee: Value,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    if let Value::NativeFunction(nf) = &callee {
+        if is_sentinel(nf.get().name.as_ref()) {
+            return dispatch_sentinel_by_name(nf.get().name.as_ref(), args, globals, ns, env);
+        }
+    }
+    apply_value(&callee, args, env)
+}
+
+/// Dispatch a call to a sentinel operation by name, or fall through to a
+/// global lookup + `apply_value` for non-sentinel names.
+fn dispatch_sentinel_by_name(
+    name: &str,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    match name {
+        "volatile!" => cljrs_interp::apply::eval_volatile(args),
+        "vreset!" => cljrs_interp::apply::eval_vreset_bang(args),
+        "vswap!" => cljrs_interp::apply::eval_vswap_bang(args, env),
+        "make-delay" => {
+            let f = args.into_iter().next().ok_or_else(|| EvalError::Arity {
+                name: "make-delay".into(),
+                expected: "1".into(),
+                got: 0,
+            })?;
+            cljrs_interp::apply::make_delay_from_fn(&f, globals.clone(), ns.clone())
+        }
+        "alter-var-root" => cljrs_interp::apply::eval_alter_var_root(args, env),
+        "vary-meta" => cljrs_interp::apply::eval_vary_meta(args, env),
+        "with-bindings*" => cljrs_interp::apply::eval_with_bindings_star(args, env),
+        "send" | "send-off" => cljrs_interp::apply::eval_send_to_agent(args, env),
+        _ => {
+            let callee = load_global_value(globals, ns, name, ns)?;
+            apply_value(&callee, args, env)
+        }
+    }
+}
+
+fn is_sentinel(name: &str) -> bool {
+    matches!(
+        name,
+        "volatile!"
+            | "vreset!"
+            | "vswap!"
+            | "make-delay"
+            | "alter-var-root"
+            | "vary-meta"
+            | "with-bindings*"
+            | "send"
+            | "send-off"
+    )
+}
+
 // ── KnownFn dispatch ────────────────────────────────────────────────────────
 
 /// Dispatch a call to a known built-in function.
@@ -741,11 +809,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             }
         }
         KnownFn::AtomReset => builtin_call_native("reset!", &args),
-        KnownFn::AtomSwap => {
-            // swap! needs env for callback.
-            let callee = load_builtin(env, "swap!")?;
-            apply_value(&callee, args, env)
-        }
+        KnownFn::AtomSwap => cljrs_interp::apply::eval_swap_bang(args, env),
 
         // ── I/O ─────────────────────────────────────────────────────────
         KnownFn::Println => builtin_call_native("println", &args),
@@ -800,7 +864,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 
         // ── Dynamic binding / exception handling ────────────────────────
         KnownFn::SetBangVar => builtin_call_native("set!", &args),
-        KnownFn::WithBindings | KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
+        KnownFn::WithBindings => cljrs_interp::apply::eval_with_bindings_star(args, env),
+        KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)

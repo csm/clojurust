@@ -241,24 +241,19 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
         args.push(eval(f, env)?);
     }
 
-    // For Clojure functions, call directly to avoid the extra stack frames
-    // from cljrs_env::apply → env.call_cljrs_fn → globals.call_cljrs_fn → fn ptr.
+    // For Clojure functions, dispatch through the global hook so the IR
+    // interpreter (when active) gets a chance to run cached IR instead of
+    // always falling back to tree-walking.  `globals.call_cljrs_fn` is set
+    // to `cljrs_eval::apply::call_cljrs_fn` at startup when the IR tier is
+    // available, and to the plain tree-walking version otherwise.
     //
-    // NOTE: this also bypasses the IR cache lookup in
-    // `cljrs_eval::apply::call_cljrs_fn`, so prebuilt-IR / eagerly-lowered
-    // arities never run through the tier-1 IR interpreter on direct fn
-    // calls — they only fire via `apply_value` paths (e.g. higher-order
-    // calls in `apply` / `reduce` / callbacks).  The bypass exists because
-    // the IR interpreter currently has incomplete coverage of the
-    // syntax-level special operations that `eval_call` short-circuits
-    // (e.g. `swap!` / `vswap!` / `make-lazy-seq` / `make-delay` /
-    // `alter-var-root` / etc.) — when cached IR uses them transitively,
-    // dispatch hits a sentinel that intentionally errors, breaking
-    // anything as common as `(map …)` from inside a prebuilt arity.
+    // Extract the function pointer before the call so the borrow checker sees
+    // only one mutable borrow of `env` at the call site.
     if let Value::Fn(f) = &callee {
         let _args_root = cljrs_env::gc_roots::root_values(&args);
         cljrs_env::gc_roots::gc_safepoint(env);
-        return call_cljrs_fn(f.get(), &args, env);
+        let call_fn = env.globals.call_cljrs_fn;
+        return call_fn(f.get(), &args, env);
     }
 
     cljrs_env::apply::apply_value(&callee, args, env)
@@ -1236,6 +1231,268 @@ fn handle_vary_meta(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         vp.get().set_meta(new_meta);
     }
     Ok(obj)
+}
+
+// ── Value-level special form dispatch (used by IR interpreter) ───────────────
+//
+// These mirror the `handle_*` functions above but accept already-evaluated
+// `Vec<Value>` instead of `&[Form]`.  The IR interpreter calls these directly
+// to bypass the sentinel stubs registered in clojure.core.
+
+/// Execute `swap!` with already-evaluated args: `[atom, f, extra...]`.
+pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "swap!".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let atom_val = args.remove(0);
+    let f = args.remove(0);
+    let atom = match &atom_val {
+        Value::Atom(a) => a.clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "swap! requires an atom, got {}",
+                v.type_name()
+            )))
+        }
+    };
+    let old_val = atom.get().deref();
+    let mut call_args = vec![old_val.clone()];
+    call_args.extend(args);
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let new_val = cljrs_env::apply::apply_value(&f, call_args, env)?;
+    validate_atom_value(&atom, &new_val, env)?;
+    atom.get().reset(new_val.clone());
+    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+    check_watch_error()?;
+    Ok(new_val)
+}
+
+/// Execute `volatile!` with already-evaluated args: `[init-val]`.
+pub fn eval_volatile(args: Vec<Value>) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "volatile!".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    Ok(Value::Volatile(GcPtr::new(Volatile::new(
+        args.into_iter().next().unwrap(),
+    ))))
+}
+
+/// Execute `vreset!` with already-evaluated args: `[volatile, new-val]`.
+pub fn eval_vreset_bang(args: Vec<Value>) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vreset!".into(),
+            expected: "2".into(),
+            got: args.len(),
+        });
+    }
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let new_val = args[1].clone();
+    match &args[0] {
+        Value::Volatile(v) => {
+            v.get().reset(new_val.clone());
+            Ok(new_val)
+        }
+        other => Err(EvalError::Runtime(format!(
+            "vreset!: expected volatile, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Execute `vswap!` with already-evaluated args: `[volatile, f, extra...]`.
+pub fn eval_vswap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vswap!".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let vol_val = args.remove(0);
+    let f = args.remove(0);
+    match vol_val {
+        Value::Volatile(v) => {
+            let cur = v.get().deref();
+            let mut call_args = vec![cur];
+            call_args.extend(args);
+            #[cfg(feature = "no-gc")]
+            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            let new_val = cljrs_env::apply::apply_value(&f, call_args, env)?;
+            v.get().reset(new_val.clone());
+            Ok(new_val)
+        }
+        other => Err(EvalError::Runtime(format!(
+            "vswap!: expected volatile, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Wrap a zero-arg callable in a `Value::Delay`.
+///
+/// Analogous to [`make_lazy_seq_from_fn`] but produces a `Delay` instead of
+/// a `LazySeq`.
+pub fn make_delay_from_fn(
+    f_val: &Value,
+    globals: std::sync::Arc<cljrs_env::env::GlobalEnv>,
+    ns: std::sync::Arc<str>,
+) -> EvalResult {
+    let f = match f_val {
+        Value::Fn(f) => f.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "make-delay requires a fn, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let thunk = ClosureThunk { f, globals, ns };
+    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+}
+
+/// Execute `alter-var-root` with already-evaluated args: `[var, f, extra...]`.
+pub fn eval_alter_var_root(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "alter-var-root".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let var_val = args.remove(0);
+    let f = args.remove(0);
+    let vp = match &var_val {
+        Value::Var(vp) => vp.clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "alter-var-root: expected var, got {}",
+                v.type_name()
+            )))
+        }
+    };
+    let old_val = vp.get().deref().unwrap_or(Value::Nil);
+    let mut call_args = vec![old_val.clone()];
+    call_args.extend(args);
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let new_val = cljrs_env::apply::apply_value(&f, call_args, env)?;
+    vp.get().bind(new_val.clone());
+    fire_watches(&vp.get().watches, &var_val, &old_val, &new_val, env);
+    check_watch_error()?;
+    Ok(new_val)
+}
+
+/// Execute `vary-meta` with already-evaluated args: `[obj, f, extra...]`.
+pub fn eval_vary_meta(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "vary-meta".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let obj = args.remove(0);
+    let f = args.remove(0);
+    let current_meta = match &obj {
+        Value::Var(vp) => vp.get().get_meta().unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    };
+    let mut call_args = vec![current_meta];
+    call_args.extend(args);
+    let new_meta = cljrs_env::apply::apply_value(&f, call_args, env)?;
+    if let Value::Var(vp) = &obj {
+        vp.get().set_meta(new_meta);
+    }
+    Ok(obj)
+}
+
+/// Execute `with-bindings*` with already-evaluated args: `[bindings-map, f]`.
+pub fn eval_with_bindings_star(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "with-bindings*".into(),
+            expected: "2".into(),
+            got: args.len(),
+        });
+    }
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    if let Value::Map(m) = &args[0] {
+        m.for_each(|k, v| {
+            if let Value::Var(vp) = k {
+                frame.insert(cljrs_env::dynamics::var_key_of(vp), v.clone());
+            }
+        });
+    } else {
+        return Err(EvalError::Runtime(
+            "with-bindings*: first arg must be a map".into(),
+        ));
+    }
+    let _guard = cljrs_env::dynamics::push_frame(frame);
+    cljrs_env::apply::apply_value(&args[1], vec![], env)
+}
+
+/// Execute `send` / `send-off` with already-evaluated args: `[agent, f, extra...]`.
+pub fn eval_send_to_agent(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "send".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let agent_val = args.remove(0);
+    let f = args.remove(0);
+    let extra = args;
+    let globals = env.globals.clone();
+    let ns = env.current_ns.clone();
+    match &agent_val {
+        Value::Agent(a) => {
+            let agent_clone = a.clone();
+            let agent_val_clone = agent_val.clone();
+            let agent_fn: AgentFn = Box::new(move |state| {
+                let mut call_args = vec![state.clone()];
+                call_args.extend(extra);
+                let mut call_env = Env::new(globals, &ns);
+                let new_val = cljrs_env::apply::apply_value(&f, call_args, &mut call_env)
+                    .map_err(eval_error_to_value)?;
+                fire_watches(
+                    &agent_clone.get().watches,
+                    &agent_val_clone,
+                    &state,
+                    &new_val,
+                    &mut call_env,
+                );
+                if let Err(e) = check_watch_error() {
+                    return Err(eval_error_to_value(e));
+                }
+                Ok(new_val)
+            });
+            a.get()
+                .sender
+                .lock()
+                .unwrap()
+                .send(AgentMsg::Update(agent_fn))
+                .map_err(|_| EvalError::Runtime("send: agent is shut down".into()))?;
+            Ok(agent_val.clone())
+        }
+        other => Err(EvalError::Runtime(format!(
+            "send: expected agent, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 // ── Namespace reflection (env-needing) ────────────────────────────────────────
