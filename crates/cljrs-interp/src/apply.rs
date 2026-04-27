@@ -73,10 +73,86 @@ fn check_watch_error() -> EvalResult<()> {
 
 /// A Thunk that calls a zero-arg Clojure closure when forced.
 #[derive(Debug)]
-struct ClosureThunk {
-    f: CljxFn,
+pub struct ClosureThunk {
+    pub f: CljxFn,
+    pub globals: std::sync::Arc<cljrs_env::env::GlobalEnv>,
+    pub ns: std::sync::Arc<str>,
+}
+
+/// A Thunk that wraps any zero-arg callable `Value` (a `Value::Fn`, a
+/// `Value::NativeFunction`, etc.) and forces by routing through
+/// `apply_value`.  Used by [`make_lazy_seq_from_fn`] when the supplied
+/// value isn't a plain Clojure fn — for example the IR interpreter's
+/// `AllocClosure` produces a `NativeFunction` wrapping the IR closure.
+struct CallableValueThunk {
+    callee: Value,
     globals: std::sync::Arc<cljrs_env::env::GlobalEnv>,
     ns: std::sync::Arc<str>,
+}
+
+impl std::fmt::Debug for CallableValueThunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallableValueThunk")
+            .field("callee", &self.callee.type_name())
+            .field("ns", &self.ns)
+            .finish()
+    }
+}
+
+impl cljrs_gc::Trace for CallableValueThunk {
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        self.callee.trace(visitor);
+    }
+}
+
+impl Thunk for CallableValueThunk {
+    fn force(&self) -> Result<Value, String> {
+        let mut env = Env::new(self.globals.clone(), &self.ns);
+        cljrs_env::apply::apply_value(&self.callee, Vec::new(), &mut env)
+            .map_err(|e| format!("{e}"))
+    }
+}
+
+/// Wrap a zero-arg callable value in a `Value::LazySeq` whose `force`
+/// calls it.
+///
+/// Accepts any `Value` whose type-name is "fn" — `Value::Fn`,
+/// `Value::NativeFunction`, `Value::BoundFn`, etc. — and unwraps any
+/// surrounding `WithMeta`.  The fast path stays in `Value::Fn` (a direct
+/// `ClosureThunk`); other callables route through a thunk that dispatches
+/// via `apply_value` on force.
+///
+/// This is the value-level analogue of [`handle_make_lazy_seq`], usable
+/// from contexts that already have a `Value` (e.g. the IR interpreter)
+/// rather than a `Form`.
+pub fn make_lazy_seq_from_fn(
+    f_val: &Value,
+    globals: std::sync::Arc<cljrs_env::env::GlobalEnv>,
+    ns: std::sync::Arc<str>,
+) -> EvalResult {
+    let unwrapped = f_val.unwrap_meta();
+    if let Value::Fn(g) = unwrapped {
+        let thunk = ClosureThunk {
+            f: g.get().clone(),
+            globals,
+            ns,
+        };
+        return Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))));
+    }
+    // Anything else with type-name "fn" is acceptable; route through
+    // apply_value at force-time.  Reject non-callable values up front.
+    if unwrapped.type_name() != "fn" {
+        return Err(EvalError::Runtime(format!(
+            "make-lazy-seq requires a fn, got {}",
+            unwrapped.type_name(),
+        )));
+    }
+    let thunk = CallableValueThunk {
+        callee: unwrapped.clone(),
+        globals,
+        ns,
+    };
+    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
 }
 
 impl cljrs_gc::Trace for ClosureThunk {
@@ -167,6 +243,18 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // For Clojure functions, call directly to avoid the extra stack frames
     // from cljrs_env::apply → env.call_cljrs_fn → globals.call_cljrs_fn → fn ptr.
+    //
+    // NOTE: this also bypasses the IR cache lookup in
+    // `cljrs_eval::apply::call_cljrs_fn`, so prebuilt-IR / eagerly-lowered
+    // arities never run through the tier-1 IR interpreter on direct fn
+    // calls — they only fire via `apply_value` paths (e.g. higher-order
+    // calls in `apply` / `reduce` / callbacks).  The bypass exists because
+    // the IR interpreter currently has incomplete coverage of the
+    // syntax-level special operations that `eval_call` short-circuits
+    // (e.g. `swap!` / `vswap!` / `make-lazy-seq` / `make-delay` /
+    // `alter-var-root` / etc.) — when cached IR uses them transitively,
+    // dispatch hits a sentinel that intentionally errors, breaking
+    // anything as common as `(map …)` from inside a prebuilt arity.
     if let Value::Fn(f) = &callee {
         let _args_root = cljrs_env::gc_roots::root_values(&args);
         cljrs_env::gc_roots::gc_safepoint(env);

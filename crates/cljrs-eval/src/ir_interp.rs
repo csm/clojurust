@@ -713,9 +713,19 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::Drop => builtin_call_native("drop", &args),
         KnownFn::Range1 | KnownFn::Range2 | KnownFn::Range3 => builtin_call_native("range", &args),
         KnownFn::LazySeq => {
-            // LazySeq takes a thunk function.
+            // `(lazy-seq f)` wraps a zero-arg Clojure fn in a LazySeq.  The
+            // builtin `make-lazy-seq` registered in clojure.core is a
+            // sentinel that intentionally errors (it's only callable
+            // through eval_call's special dispatch); from the IR
+            // interpreter we need to construct the LazySeq directly.
             if let Some(f) = args.first() {
-                builtin_call_native("make-lazy-seq", std::slice::from_ref(f))
+                cljrs_env::callback::with_eval_context(|env| {
+                    cljrs_interp::apply::make_lazy_seq_from_fn(
+                        f,
+                        env.globals.clone(),
+                        env.current_ns.clone(),
+                    )
+                })
             } else {
                 Ok(Value::Nil)
             }

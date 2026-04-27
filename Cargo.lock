@@ -377,6 +377,7 @@ dependencies = [
 name = "cljrs-ir"
 version = "0.1.0"
 dependencies = [
+ "cljrs-env",
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-reader",
