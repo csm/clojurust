@@ -12,9 +12,9 @@ serde = { workspace = true, features = ["rc"] }
 postcard = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
-cljrs-eval     = { workspace = true }
-cljrs-stdlib   = { workspace = true }
-cljrs-reader   = { workspace = true }
-cljrs-value    = { workspace = true }
-cljrs-gc       = { workspace = true }
-cljrs-env      = { workspace = true }
+cljrs-eval     = { path = "../cljrs-eval" }
+cljrs-stdlib   = { path = "../cljrs-stdlib" }
+cljrs-reader   = { path = "../cljrs-reader" }
+cljrs-value    = { path = "../cljrs-value" }
+cljrs-gc       = { path = "../cljrs-gc" }
+cljrs-env      = { path = "../cljrs-env" }
