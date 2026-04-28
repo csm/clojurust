@@ -166,6 +166,20 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             None => Ok(Value::Nil),
         },
         Value::WithMeta(inner, _) => apply_value(inner, args, env),
+        Value::Var(v) => {
+            // Vars in function position are transparently deref'd (IFn on Var).
+            // The IR interpreter uses DefVar to create per-call mutable cells for
+            // letfn / named-fn self-recursion; those cells are captured as
+            // Value::Var and called directly.
+            let inner = crate::dynamics::deref_var(v).ok_or_else(|| {
+                EvalError::Runtime(format!(
+                    "unbound var {}/{} used as function",
+                    v.get().namespace,
+                    v.get().name,
+                ))
+            })?;
+            apply_value(&inner, args, env)
+        }
         other => Err(EvalError::NotCallable(format!(
             "<{}> is not callable",
             other.type_name()

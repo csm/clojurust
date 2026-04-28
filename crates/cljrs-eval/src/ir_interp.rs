@@ -316,24 +316,15 @@ fn execute_inst(
         }
 
         Inst::DefVar(dst, def_ns, name, val_var) => {
+            // Always create a fresh, call-local Var (not registered in globals).
+            // The ANF compiler uses DefVar as a mutable cell for letfn / named-fn
+            // self-recursion; the cell is accessed only via the register returned
+            // here, never via LoadGlobal, so name collisions with real globals are
+            // harmless and we never need to touch the global namespace.
             let val = regs.get_cloned(*val_var);
-            if globals.lookup_var_in_ns(def_ns, name).is_some() {
-                // Var already exists (e.g. a global like `clojure.core/cat`).
-                // letfn-emitted DefVars use a var as mutable indirection for
-                // mutual recursion — they must NOT overwrite the real global.
-                // Create a fresh anonymous Var with the same ns/name so that
-                // closures capturing it can Deref it after this function returns
-                // (lazy-seqs, etc.) and Set! on it won't corrupt the global.
-                let fresh = cljrs_value::Var::new(def_ns.clone(), name.clone());
-                fresh.bind(val);
-                regs.set(*dst, Value::Var(GcPtr::new(fresh)));
-            } else {
-                globals.intern(def_ns, name.clone(), val.clone());
-                let var = globals
-                    .lookup_var_in_ns(def_ns, name)
-                    .expect("just interned");
-                regs.set(*dst, Value::Var(var));
-            }
+            let fresh = cljrs_value::Var::new(def_ns.clone(), name.clone());
+            fresh.bind(val);
+            regs.set(*dst, Value::Var(GcPtr::new(fresh)));
         }
 
         Inst::SetBang(var_id, val_id) => {
