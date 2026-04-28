@@ -86,3 +86,27 @@ Each handler evaluates its key expressions under the correct allocation context:
 | `handle_agent_call` | initial value |
 | `handle_alter_var_root` | function return value |
 | `handle_intern` | value expression (3-arg form) |
+
+### Value-level special form helpers (IR interpreter API)
+
+The IR interpreter receives already-evaluated `Vec<Value>` arguments rather than
+`&[Form]` AST nodes.  These public functions mirror the `handle_*` form-level
+handlers but accept pre-evaluated args, allowing the IR interpreter to
+implement sentinel operations without hitting the stub errors registered in
+`clojure.core`:
+
+| Function | Operation |
+|---|---|
+| `eval_swap_bang(args, env)` | `swap!` — apply f to atom, store result |
+| `eval_volatile(args)` | `volatile!` — create a new volatile |
+| `eval_vreset_bang(args)` | `vreset!` — reset volatile value |
+| `eval_vswap_bang(args, env)` | `vswap!` — apply f to volatile value, store result |
+| `make_delay_from_fn(f, globals, ns)` | `make-delay` — wrap zero-arg fn in a `Delay` |
+| `eval_alter_var_root(args, env)` | `alter-var-root` — apply f to var root, store result |
+| `eval_vary_meta(args, env)` | `vary-meta` — apply f to obj metadata |
+| `eval_with_bindings_star(args, env)` | `with-bindings*` — push binding frame, call f |
+| `eval_send_to_agent(args, env)` | `send` / `send-off` — dispatch action to agent |
+
+`make_lazy_seq_from_fn(f, globals, ns)` (already public) creates a `LazySeq`
+from a zero-arg callable; the above `make_delay_from_fn` is the analogous
+helper for `Delay`.

@@ -295,20 +295,17 @@ fn execute_inst(
         }
 
         Inst::Call(dst, callee, args) => {
-            // GC safepoint before call.
             cljrs_env::gc_roots::gc_safepoint(env);
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee_val, arg_vals, env)?;
+            let result = dispatch_or_sentinel(callee_val, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
         Inst::CallDirect(dst, name, args) => {
-            // Look up the function by name in globals and call it.
             cljrs_env::gc_roots::gc_safepoint(env);
-            let callee = load_global_value(globals, ns, name, ns)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee, arg_vals, env)?;
+            let result = dispatch_sentinel_by_name(name, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
@@ -319,12 +316,15 @@ fn execute_inst(
         }
 
         Inst::DefVar(dst, def_ns, name, val_var) => {
+            // Always create a fresh, call-local Var (not registered in globals).
+            // The ANF compiler uses DefVar as a mutable cell for letfn / named-fn
+            // self-recursion; the cell is accessed only via the register returned
+            // here, never via LoadGlobal, so name collisions with real globals are
+            // harmless and we never need to touch the global namespace.
             let val = regs.get_cloned(*val_var);
-            globals.intern(def_ns, name.clone(), val.clone());
-            let var = globals
-                .lookup_var_in_ns(def_ns, name)
-                .expect("just interned");
-            regs.set(*dst, Value::Var(var));
+            let fresh = cljrs_value::Var::new(def_ns.clone(), name.clone());
+            fresh.bind(val);
+            regs.set(*dst, Value::Var(GcPtr::new(fresh)));
         }
 
         Inst::SetBang(var_id, val_id) => {
@@ -488,13 +488,37 @@ fn alloc_closure(
     let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
-    // Each arity maps to a subfunction in ir_func.subfunctions.
-    let subfuncs: Vec<Arc<IrFunction>> = ir_func
-        .subfunctions
-        .iter()
-        .map(clone_ir_function)
-        .map(Arc::new)
-        .collect();
+    // Each arity maps to a named subfunction in ir_func.subfunctions.
+    // We use arity_fn_names (when present) to match each arity slot to its
+    // correct subfunction by name, rather than relying on positional indexing.
+    // Positional indexing is wrong when the parent function has more
+    // subfunctions than arities (e.g. fnil has two inner lambdas but the
+    // returned closure is only the second one).
+    let subfuncs: Vec<Arc<IrFunction>> = if !template.arity_fn_names.is_empty() {
+        template
+            .arity_fn_names
+            .iter()
+            .map(|fn_name| {
+                let sf = ir_func
+                    .subfunctions
+                    .iter()
+                    .find(|sf| sf.name.as_deref() == Some(fn_name.as_ref()))
+                    .unwrap_or_else(|| {
+                        ir_func.subfunctions.first().unwrap_or_else(|| {
+                            panic!("IR closure: no subfunctions for '{fn_name}'")
+                        })
+                    });
+                Arc::new(clone_ir_function(sf))
+            })
+            .collect()
+    } else {
+        ir_func
+            .subfunctions
+            .iter()
+            .map(clone_ir_function)
+            .map(Arc::new)
+            .collect()
+    };
 
     let param_counts = template.param_counts.clone();
     let is_variadic = template.is_variadic.clone();
@@ -602,6 +626,77 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
     }
 }
 
+// ── Sentinel-aware call dispatch ────────────────────────────────────────────
+
+/// Dispatch a generic callee value, intercepting sentinel `NativeFunction`s.
+///
+/// Several clojure.core entries (volatile!, vswap!, make-delay, etc.) are
+/// sentinel stubs that unconditionally error when called normally — the real
+/// work happens in `eval_call`'s special-form dispatch, which the IR
+/// interpreter bypasses.  We intercept those by name here so that IR code
+/// calling them works correctly.
+fn dispatch_or_sentinel(
+    callee: Value,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    if let Value::NativeFunction(nf) = &callee
+        && is_sentinel(nf.get().name.as_ref())
+    {
+        return dispatch_sentinel_by_name(nf.get().name.as_ref(), args, globals, ns, env);
+    }
+    apply_value(&callee, args, env)
+}
+
+/// Dispatch a call to a sentinel operation by name, or fall through to a
+/// global lookup + `apply_value` for non-sentinel names.
+fn dispatch_sentinel_by_name(
+    name: &str,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    match name {
+        "volatile!" => cljrs_interp::apply::eval_volatile(args),
+        "vreset!" => cljrs_interp::apply::eval_vreset_bang(args),
+        "vswap!" => cljrs_interp::apply::eval_vswap_bang(args, env),
+        "make-delay" => {
+            let f = args.into_iter().next().ok_or_else(|| EvalError::Arity {
+                name: "make-delay".into(),
+                expected: "1".into(),
+                got: 0,
+            })?;
+            cljrs_interp::apply::make_delay_from_fn(&f, globals.clone(), ns.clone())
+        }
+        "alter-var-root" => cljrs_interp::apply::eval_alter_var_root(args, env),
+        "vary-meta" => cljrs_interp::apply::eval_vary_meta(args, env),
+        "with-bindings*" => cljrs_interp::apply::eval_with_bindings_star(args, env),
+        "send" | "send-off" => cljrs_interp::apply::eval_send_to_agent(args, env),
+        _ => {
+            let callee = load_global_value(globals, ns, name, ns)?;
+            apply_value(&callee, args, env)
+        }
+    }
+}
+
+fn is_sentinel(name: &str) -> bool {
+    matches!(
+        name,
+        "volatile!"
+            | "vreset!"
+            | "vswap!"
+            | "make-delay"
+            | "alter-var-root"
+            | "vary-meta"
+            | "with-bindings*"
+            | "send"
+            | "send-off"
+    )
+}
+
 // ── KnownFn dispatch ────────────────────────────────────────────────────────
 
 /// Dispatch a call to a known built-in function.
@@ -646,10 +741,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::IsKeyword => Ok(Value::Bool(matches!(args.first(), Some(Value::Keyword(_))))),
         KnownFn::IsSymbol => Ok(Value::Bool(matches!(args.first(), Some(Value::Symbol(_))))),
         KnownFn::IsBool => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
-        KnownFn::IsInt => Ok(Value::Bool(matches!(
-            args.first(),
-            Some(Value::Long(_) | Value::BigInt(_))
-        ))),
+        KnownFn::IsInt => Ok(Value::Bool(matches!(args.first(), Some(Value::Long(_))))),
 
         // ── String ──────────────────────────────────────────────────────
         KnownFn::Str => {
@@ -741,11 +833,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             }
         }
         KnownFn::AtomReset => builtin_call_native("reset!", &args),
-        KnownFn::AtomSwap => {
-            // swap! needs env for callback.
-            let callee = load_builtin(env, "swap!")?;
-            apply_value(&callee, args, env)
-        }
+        KnownFn::AtomSwap => cljrs_interp::apply::eval_swap_bang(args, env),
 
         // ── I/O ─────────────────────────────────────────────────────────
         KnownFn::Println => builtin_call_native("println", &args),
@@ -800,7 +888,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 
         // ── Dynamic binding / exception handling ────────────────────────
         KnownFn::SetBangVar => builtin_call_native("set!", &args),
-        KnownFn::WithBindings | KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
+        KnownFn::WithBindings => cljrs_interp::apply::eval_with_bindings_star(args, env),
+        KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
