@@ -1239,6 +1239,36 @@ fn handle_vary_meta(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 // `Vec<Value>` instead of `&[Form]`.  The IR interpreter calls these directly
 // to bypass the sentinel stubs registered in clojure.core.
 
+/// Execute `reset!` with already-evaluated args: `[atom, new-val]`.
+pub fn eval_reset_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "reset!".into(),
+            expected: "2".into(),
+            got: args.len(),
+        });
+    }
+    let atom_val = args[0].clone();
+    let new_val = args[1].clone();
+    let atom = match &atom_val {
+        Value::Atom(a) => a.clone(),
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "reset! requires an atom, got {}",
+                v.type_name()
+            )));
+        }
+    };
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    validate_atom_value(&atom, &new_val, env)?;
+    let old_val = atom.get().deref();
+    atom.get().reset(new_val.clone());
+    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+    check_watch_error()?;
+    Ok(new_val)
+}
+
 /// Execute `swap!` with already-evaluated args: `[atom, f, extra...]`.
 pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     if args.len() < 2 {

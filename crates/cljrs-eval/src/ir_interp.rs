@@ -661,6 +661,7 @@ fn dispatch_sentinel_by_name(
 ) -> EvalResult {
     match name {
         "volatile!" => cljrs_interp::apply::eval_volatile(args),
+        "reset!" => cljrs_interp::apply::eval_reset_bang(args, env),
         "vreset!" => cljrs_interp::apply::eval_vreset_bang(args),
         "vswap!" => cljrs_interp::apply::eval_vswap_bang(args, env),
         "make-delay" => {
@@ -686,6 +687,7 @@ fn is_sentinel(name: &str) -> bool {
     matches!(
         name,
         "volatile!"
+            | "reset!"
             | "vreset!"
             | "vswap!"
             | "make-delay"
@@ -832,7 +834,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
                 Ok(Value::Nil)
             }
         }
-        KnownFn::AtomReset => builtin_call_native("reset!", &args),
+        KnownFn::AtomReset => cljrs_interp::apply::eval_reset_bang(args, env),
         KnownFn::AtomSwap => cljrs_interp::apply::eval_swap_bang(args, env),
 
         // ── I/O ─────────────────────────────────────────────────────────
