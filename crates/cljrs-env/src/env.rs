@@ -1,7 +1,7 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::error::EvalResult;
 use cljrs_gc::{GcConfig, GcPtr};
@@ -71,9 +71,13 @@ pub struct GlobalEnv {
     /// Directories to search when resolving namespace names to files.
     pub source_paths: RwLock<Vec<std::path::PathBuf>>,
     /// Namespaces that have been fully loaded from a file (idempotent guard).
-    pub loaded: Mutex<HashSet<Arc<str>>>,
-    /// Namespaces currently being loaded (cycle detection).
-    pub loading: Mutex<HashSet<Arc<str>>>,
+    pub loaded: Mutex<std::collections::HashSet<Arc<str>>>,
+    /// Namespaces currently being loaded, mapped to the thread loading them.
+    /// Used to detect true circular requires (same thread) vs concurrent loads
+    /// (different thread — those wait on `loading_done` instead of erroring).
+    pub loading: Mutex<HashMap<Arc<str>, std::thread::ThreadId>>,
+    /// Signalled whenever a namespace finishes loading (or fails).
+    pub loading_done: Condvar,
     /// Built-in namespace sources embedded in the binary.
     /// Checked by `load_ns` before falling back to source-path search.
     pub builtin_sources: RwLock<HashMap<Arc<str>, &'static str>>,
@@ -105,8 +109,9 @@ impl GlobalEnv {
         Arc::new(Self {
             namespaces: RwLock::new(HashMap::new()),
             source_paths: RwLock::new(Vec::new()),
-            loaded: Mutex::new(HashSet::new()),
-            loading: Mutex::new(HashSet::new()),
+            loaded: Mutex::new(std::collections::HashSet::new()),
+            loading: Mutex::new(HashMap::new()),
+            loading_done: Condvar::new(),
             builtin_sources: RwLock::new(HashMap::new()),
             gc_config: RwLock::new(None),
             compiler_ready: std::sync::atomic::AtomicBool::new(false),

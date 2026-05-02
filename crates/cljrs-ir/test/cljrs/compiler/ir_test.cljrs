@@ -221,13 +221,12 @@
       (is (= 1 (ir/lookup-local ctx "outer")))
       (is (= 2 (ir/lookup-local ctx "inner"))))))
 
-(deftest test-get-all-locals-prefers-outermost
-  ;; get-all-locals walks scopes outer→inner and only inserts a key the
-  ;; first time it's seen, so the *outermost* binding wins on collisions.
-  ;; This is the opposite of `lookup-local`, which returns the innermost
-  ;; (shadowed) binding — get-all-locals is used for closure capture and
-  ;; the outer-scope-wins ordering means a captured shadowed name resolves
-  ;; to the original (outer) value seen at definition time.
+(deftest test-get-all-locals-prefers-innermost
+  ;; get-all-locals walks scopes outer→inner and lets inner bindings
+  ;; overwrite outer ones, so the *innermost* binding wins on collisions.
+  ;; This matches `lookup-local` and ensures that a closure formed inside
+  ;; a `let` that shadows a parameter captures the shadowed (inner) value,
+  ;; not the original (outer) parameter.
   (let [ctx (ir/make-ctx "f" "user" [])]
     (ir/bind-local! ctx "a" 1)
     (ir/bind-local! ctx "b" 2)
@@ -235,7 +234,7 @@
     (ir/bind-local! ctx "a" 99)
     (ir/bind-local! ctx "c" 3)
     (let [locals (ir/get-all-locals ctx)]
-      (is (= 1 (get locals "a")) "outer binding wins")
+      (is (= 99 (get locals "a")) "inner binding wins")
       (is (= 2 (get locals "b")))
       (is (= 3 (get locals "c"))))))
 
