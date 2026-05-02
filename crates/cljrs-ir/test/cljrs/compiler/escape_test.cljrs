@@ -376,6 +376,30 @@
     (is (= :no-escape (get (:states result) 2))
         "alloc passed to a defn that doesn't retain its arg stays :no-escape")))
 
+(deftest test-call-to-non-retaining-defn-via-load-global-direct
+  ;; Real lowering for `(my-count [x])` against `(defn my-count [c] ...)`
+  ;; emits `:load-global` directly as the callee — no separate `:deref`,
+  ;; because `:load-global` is already a value-load in this IR.
+  (let [helper-insts [(call-known 1 :count [0])]
+        helper-term (ret 1)
+        caller-insts [{:op :alloc-closure :dst 0 :closure-name "helper"
+                       :captures []
+                       :arity-fn-names ["helper-arity1"]
+                       :param-counts [1]
+                       :capture-names []
+                       :is-variadic [false]}
+                      (def-var-named 1 "user" "helper" 0)
+                      (alloc-vec 2 [])
+                      ;; Note: load-global is the callee directly.
+                      {:op :load-global :dst 3 :ns "user" :name "helper"}
+                      (call 4 3 [2])]
+        caller-term (ret 4)
+        root (caller-with-defn helper-insts helper-term caller-insts caller-term)
+        ctx (escape/make-context root)
+        result (escape/analyze root ctx)]
+    (is (= :no-escape (get (:states result) 2))
+        "alloc passed via the direct load-global → call shape stays :no-escape")))
+
 (deftest test-call-to-retaining-defn-escapes
   ;; Helper stores its arg in a global — alloc must be classified
   ;; :escapes (stronger than :arg-escape).

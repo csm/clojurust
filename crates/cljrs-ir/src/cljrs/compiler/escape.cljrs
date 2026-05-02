@@ -319,12 +319,19 @@
 
 (defn resolve-call-target
   "Try to resolve the callee of a `:call` instruction to a concrete
-   arity-fn-name.  Two patterns are recognised:
+   arity-fn-name.  Three patterns are recognised:
 
      1. Callee var was produced by an `:alloc-closure` directly
         (let-bound function).
-     2. Callee var was produced by `:deref` of `:load-global`, and the
-        global is in `defn-map` (top-level `defn`)."
+     2. Callee var was produced by `:load-global` (the IR's
+        `:load-global` op is already a value-load, not a Var-load —
+        the typical lowering of `(my-fn ...)` against a top-level
+        `defn`).
+     3. Callee var was produced by `:deref` of `:load-var` (the
+        explicit Var-deref shape, kept for completeness).
+
+   In cases 2 and 3 we look up the global's name in `defn-map` to find
+   the alloc-closure that defined it."
   [callee-var arg-count var-defs defn-map]
   (let [def-inst (get var-defs callee-var)]
     (when def-inst
@@ -335,10 +342,16 @@
                      :is-variadic (:is-variadic def-inst)}
                     arg-count)
 
+        :load-global
+        (pick-arity (get defn-map [(:ns def-inst) (:name def-inst)])
+                    arg-count)
+
         :deref
         (let [src (:src def-inst)
               src-def (get var-defs src)]
-          (when (and src-def (= (:op src-def) :load-global))
+          (when (and src-def
+                     (or (= (:op src-def) :load-global)
+                         (= (:op src-def) :load-var)))
             (pick-arity (get defn-map [(:ns src-def) (:name src-def)])
                         arg-count)))
 
