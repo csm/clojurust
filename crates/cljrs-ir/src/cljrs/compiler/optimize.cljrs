@@ -404,32 +404,48 @@
   "Walk all `:no-escape` allocations and rewrite each into a
    region-allocate scoped over the dominator subgraph that covers the
    allocation and all its (transitive) uses.  Allocations that don't
-   meet the safety constraints are left as regular allocations."
-  [ir-func]
-  (let [analysis (escape/analyze ir-func)
-        states (:states analysis)
-        uses (:uses analysis)
-        alloc-blocks (:alloc-blocks analysis)
-        no-escape-allocs (filterv (fn [[v _]] (= :no-escape (get states v)))
-                                  alloc-blocks)]
-    (if (empty? no-escape-allocs)
-      ir-func
-      (let [doms (dominators ir-func)
-            postdoms (post-dominators ir-func)
-            next-var-atom (atom (:next-var ir-func))
-            new-func (reduce (fn [acc-func [alloc-var alloc-block]]
-                               (let [use-blocks (collect-use-blocks alloc-var uses ir-func)]
-                                 (emit-region-for-alloc acc-func alloc-var alloc-block
-                                                        use-blocks doms postdoms
-                                                        next-var-atom)))
-                             ir-func
-                             no-escape-allocs)]
-        (assoc new-func :next-var @next-var-atom)))))
+   meet the safety constraints are left as regular allocations.
+
+   `ctx` is an inter-procedural analysis context (see
+   `escape/make-context`) — supplying one lets escape analysis
+   refine `:unknown-call-arg` uses against per-function summaries
+   instead of bailing with `:arg-escape`."
+  ([ir-func]
+   (optimize-regions ir-func {}))
+  ([ir-func ctx]
+   (let [analysis (escape/analyze ir-func ctx)
+         states (:states analysis)
+         uses (:uses analysis)
+         alloc-blocks (:alloc-blocks analysis)
+         no-escape-allocs (filterv (fn [[v _]] (= :no-escape (get states v)))
+                                   alloc-blocks)]
+     (if (empty? no-escape-allocs)
+       ir-func
+       (let [doms (dominators ir-func)
+             postdoms (post-dominators ir-func)
+             next-var-atom (atom (:next-var ir-func))
+             new-func (reduce (fn [acc-func [alloc-var alloc-block]]
+                                (let [use-blocks (collect-use-blocks alloc-var uses ir-func)]
+                                  (emit-region-for-alloc acc-func alloc-var alloc-block
+                                                         use-blocks doms postdoms
+                                                         next-var-atom)))
+                              ir-func
+                              no-escape-allocs)]
+         (assoc new-func :next-var @next-var-atom))))))
+
+(defn- optimize-tree
+  "Optimize `ir-func` and its subfunctions (recursively), threading
+   `ctx` through so summary lookups share state across the tree."
+  [ir-func ctx]
+  (let [optimized (optimize-regions ir-func ctx)
+        new-subs (mapv (fn [sub] (optimize-tree sub ctx))
+                       (or (:subfunctions optimized) []))]
+    (assoc optimized :subfunctions new-subs)))
 
 (defn optimize
   "Run all optimization passes on an IR function.  Currently only runs
-   region allocation optimization.  Recursively optimizes subfunctions."
+   region allocation optimization, recursing into subfunctions and
+   sharing inter-procedural escape summaries across the whole tree."
   [ir-func]
-  (let [optimized (optimize-regions ir-func)
-        new-subs (mapv optimize (or (:subfunctions optimized) []))]
-    (assoc optimized :subfunctions new-subs)))
+  (let [ctx (escape/make-context ir-func)]
+    (optimize-tree ir-func ctx)))

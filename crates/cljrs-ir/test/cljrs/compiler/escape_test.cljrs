@@ -275,3 +275,168 @@
                      :insts [(alloc-vec 0 [])]
                      :terminator {:op :recur-jump :target 0 :args [0]}}]}]
     (is (= :escapes (get (analyze-states f) 0)))))
+
+;; ── Inter-procedural summary computation ────────────────────────────────────
+
+(defn helper-fn
+  "Build a single-block IR function with one parameter (var 0) for
+   summary tests."
+  [arity-fn-name insts terminator]
+  {:name arity-fn-name
+   :ns "user"
+   :params [["x" 0]]
+   :blocks [{:id 0 :phis [] :insts insts :terminator terminator}]
+   :next-var 1
+   :next-block 1
+   :subfunctions []})
+
+(deftest test-summary-non-escaping-param
+  ;; Param is consumed by :count and the result is returned.  The param
+  ;; itself never leaves — summary is :no-escape.
+  (let [f (helper-fn "helper" [(call-known 1 :count [0])] (ret 1))
+        ctx (escape/make-context f)]
+    (is (= [:no-escape] (escape/compute-fn-summary f ctx)))))
+
+(deftest test-summary-returned-param
+  ;; Param is returned directly — summary is :returns, signalling to
+  ;; callers that the param's lifetime ties to the call result.
+  (let [f (helper-fn "helper" [] (ret 0))
+        ctx (escape/make-context f)]
+    (is (= [:returns] (escape/compute-fn-summary f ctx)))))
+
+(deftest test-summary-escaping-param
+  ;; Param is stored in a global Var — summary is :escapes.  Anything
+  ;; passed to this fn is permanently captured.
+  (let [f (helper-fn "helper" [(def-var 1 0)] (ret 1))
+        ctx (escape/make-context f)]
+    (is (= [:escapes] (escape/compute-fn-summary f ctx)))))
+
+(deftest test-summary-known-fn-arg-propagation
+  ;; Param flows through :assoc to the return value — summary is
+  ;; :returns (assoc retains its collection in the result).
+  (let [f (helper-fn "helper"
+                     [{:op :const :dst 1 :value {:type :keyword :ns nil :name "k"}}
+                      {:op :const :dst 2 :value {:type :int :value 1}}
+                      (call-known 3 :assoc [0 1 2])]
+                     (ret 3))
+        ctx (escape/make-context f)]
+    (is (= [:returns] (escape/compute-fn-summary f ctx)))))
+
+;; ── End-to-end: alloc passed to user-defined fn uses summary ────────────────
+
+(defn caller-with-defn
+  "Build an IR tree representing:
+     (defn helper [x] (count x))
+     ... helper(alloc-vec) ...
+   `helper-insts`/`helper-term` define the body of the helper subfunction."
+  [helper-insts helper-term caller-insts caller-term]
+  (let [helper {:name "helper-arity1"
+                :ns "user"
+                :params [["x" 0]]
+                :blocks [{:id 0 :phis [] :insts helper-insts :terminator helper-term}]
+                :next-var 10
+                :next-block 1
+                :subfunctions []}]
+    {:name "__cljrs_main"
+     :ns "user"
+     :params []
+     :blocks [{:id 0 :phis [] :insts caller-insts :terminator caller-term}]
+     :next-var 100
+     :next-block 1
+     :subfunctions [helper]}))
+
+(defn def-var-named
+  "Build a `:def-var` instruction with an explicit global name."
+  [dst ns name value]
+  {:op :def-var :dst dst :ns ns :name name :value value})
+
+(deftest test-call-to-non-retaining-defn-keeps-no-escape
+  ;; Caller allocs a vector and passes it to `helper`, which only
+  ;; counts it.  With inter-proc analysis the alloc must stay
+  ;; :no-escape (without it, this would be :arg-escape).
+  (let [helper-insts [(call-known 1 :count [0])]
+        helper-term (ret 1)
+        ;; Caller: alloc-closure for helper, def-var helper, alloc-vec,
+        ;; load-global helper, deref, call.
+        caller-insts [{:op :alloc-closure :dst 0 :closure-name "helper"
+                       :captures []
+                       :arity-fn-names ["helper-arity1"]
+                       :param-counts [1]
+                       :capture-names []
+                       :is-variadic [false]}
+                      (def-var-named 1 "user" "helper" 0)
+                      (alloc-vec 2 [])
+                      {:op :load-global :dst 3 :ns "user" :name "helper"}
+                      {:op :deref :dst 4 :src 3}
+                      (call 5 4 [2])]
+        caller-term (ret 5)
+        root (caller-with-defn helper-insts helper-term caller-insts caller-term)
+        ctx (escape/make-context root)
+        result (escape/analyze root ctx)]
+    (is (= :no-escape (get (:states result) 2))
+        "alloc passed to a defn that doesn't retain its arg stays :no-escape")))
+
+(deftest test-call-to-retaining-defn-escapes
+  ;; Helper stores its arg in a global — alloc must be classified
+  ;; :escapes (stronger than :arg-escape).
+  (let [helper-insts [(def-var-named 1 "user" "stored" 0)]
+        helper-term (ret 1)
+        caller-insts [{:op :alloc-closure :dst 0 :closure-name "helper"
+                       :captures []
+                       :arity-fn-names ["helper-arity1"]
+                       :param-counts [1]
+                       :capture-names []
+                       :is-variadic [false]}
+                      (def-var-named 1 "user" "helper" 0)
+                      (alloc-vec 2 [])
+                      {:op :load-global :dst 3 :ns "user" :name "helper"}
+                      {:op :deref :dst 4 :src 3}
+                      (call 5 4 [2])]
+        caller-term (ret 5)
+        root (caller-with-defn helper-insts helper-term caller-insts caller-term)
+        ctx (escape/make-context root)
+        result (escape/analyze root ctx)]
+    (is (= :escapes (get (:states result) 2))
+        "alloc passed to a defn that stores its arg statically must escape")))
+
+(deftest test-call-to-let-bound-closure-resolves
+  ;; The callee is a let-bound closure (resolved via :alloc-closure
+  ;; in the same function) rather than a top-level defn.
+  (let [helper {:name "helper-arity1"
+                :ns "user"
+                :params [["x" 0]]
+                :blocks [{:id 0 :phis []
+                          :insts [(call-known 1 :count [0])]
+                          :terminator (ret 1)}]
+                :next-var 2
+                :next-block 1
+                :subfunctions []}
+        caller-insts [{:op :alloc-closure :dst 0 :closure-name nil
+                       :captures []
+                       :arity-fn-names ["helper-arity1"]
+                       :param-counts [1]
+                       :capture-names []
+                       :is-variadic [false]}
+                      (alloc-vec 1 [])
+                      (call 2 0 [1])]
+        caller-term (ret 2)
+        root {:name "__cljrs_main"
+              :ns "user"
+              :params []
+              :blocks [{:id 0 :phis [] :insts caller-insts :terminator caller-term}]
+              :next-var 3
+              :next-block 1
+              :subfunctions [helper]}
+        ctx (escape/make-context root)
+        result (escape/analyze root ctx)]
+    (is (= :no-escape (get (:states result) 1))
+        "alloc passed to a let-bound closure that doesn't retain stays :no-escape")))
+
+(deftest test-no-context-falls-back-to-arg-escape
+  ;; Without a context, calls to user functions remain :arg-escape —
+  ;; verifies the legacy single-arg `analyze` is unchanged.
+  (let [f (ir-func [{:op :load-global :dst 0 :ns "user" :name "f"}
+                    (alloc-vec 1 [])
+                    (call 2 0 [1])]
+                   (ret 2))]
+    (is (= :arg-escape (get (analyze-states f) 1)))))
