@@ -1112,7 +1112,7 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             continue;
         }
 
-        match crate::lower::lower_arity(
+        match crate::lower::lower_and_optimize_arity(
             f.name.as_deref(),
             &arity.params,
             arity.rest_param.as_ref(),
