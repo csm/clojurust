@@ -612,11 +612,24 @@
   (let [[fn-name body-start] (if (symbol? (first args))
                                 [(str (first args)) 1]
                                 [nil 0])
-        ;; Capture all locals
+        ns (ir/current-ns ctx)
+        ;; For named functions: if the name is not already in scope as a local
+        ;; (e.g. from an enclosing letfn), create a fresh mutable var so the
+        ;; function can call itself recursively.  The var is captured by the
+        ;; closure and dereffed at call time, so lazy thunks work correctly.
+        self-var-reg (when (and fn-name (nil? (ir/lookup-local ctx fn-name)))
+                       (let [nil-val (ir/emit-const! ctx (ir/const-nil))
+                             def-dst (ir/fresh-var! ctx)]
+                         (ir/emit! ctx (ir/inst-def-var def-dst ns fn-name nil-val))
+                         (ir/push-scope! ctx)
+                         (ir/bind-local! ctx fn-name def-dst)
+                         def-dst))
+        ;; Capture all locals (includes fn-name as a var-ref when self-var-reg was set)
         all-locals (ir/get-all-locals ctx)
         capture-name-list (vec (keys all-locals))
         capture-vars (mapv (fn [n] (get all-locals n)) capture-name-list)
-        ns (ir/current-ns ctx)
+        ;; Pop the fn-name self-ref scope now that captures are computed
+        _ (when self-var-reg (ir/pop-scope! ctx))
         ;; Parse arities: either single [params] body... or multi ([params] body...) ...
         rest-args (subvec (vec args) body-start)
         raw-arities (if (and (not (empty? rest-args)) (vector? (first rest-args)))
@@ -656,6 +669,10 @@
       (ir/emit! ctx (ir/inst-alloc-closure dst fn-name capture-vars
                                            arity-fn-names param-counts capture-name-list
                                            is-variadic))
+      ;; If we created a self-ref var, point it at the closure so recursive
+      ;; calls (Deref of the captured var) find the right function.
+      (when self-var-reg
+        (ir/emit! ctx (ir/inst-set! self-var-reg dst)))
       dst)))
 
 (defn lower-throw
@@ -811,10 +828,11 @@
 
 (defn lower-letfn
   "Lower (letfn [(f [params] body...) ...] body...).
-   Uses global vars for indirection so that all letfn-bound functions
-   can reference each other (including self-recursion and mutual recursion).
-   Function bodies resolve names via load-global, which dereferences the
-   var at call time — by which point all closures have been assigned."
+   Each binding gets a fresh, call-local Var (DefVar) as a mutable cell.
+   The Vars are bound as locals so all closures capture them and can call
+   each other (and themselves) by dereffing the captured Var at call time.
+   After all closures are built, each Var is updated (Set!) to its closure,
+   then each name is re-bound to the dereffed value for the letfn body."
   [ctx args]
   (when (< (count args) 2)
     (throw "letfn requires a binding vector and body"))
@@ -833,33 +851,37 @@
                             :params (nth parts 1)
                             :body (vec (drop 2 parts))}))
                        bindings)
-          ;; 1. Define a global var for each binding name, initialized to nil.
-          ;;    The function bodies will find these via load-global.
-          _ (doseq [p parsed]
-              (let [nil-val (ir/emit-const! ctx (ir/const-nil))
-                    dst (ir/fresh-var! ctx)]
-                (ir/emit! ctx (ir/inst-def-var dst ns (:name p) nil-val))))
-          ;; 2. Compile each function body as fn*.
-          ;;    Inside the body, references to other letfn names fall through
-          ;;    lower-symbol → load-global → dereferences the var at call time.
+          ;; 1. Create a fresh mutable Var for each binding, initialised to nil.
+          ;;    DefVar always produces a call-local Var (not registered globally),
+          ;;    so repeated calls to the enclosing function each get their own
+          ;;    cell — essential for lazy-seq thunks that self-recurse.
+          var-regs (mapv (fn [p]
+                           (let [nil-val (ir/emit-const! ctx (ir/const-nil))
+                                 dst (ir/fresh-var! ctx)]
+                             (ir/emit! ctx (ir/inst-def-var dst ns (:name p) nil-val))
+                             dst))
+                         parsed)
+          ;; 2. Bind each name → its Var object so closures capture the cell.
+          ;;    lower-symbol will find these as locals; call position derefs
+          ;;    the Var transparently via apply_value.
+          _ (ir/push-scope! ctx)
+          _ (doseq [i (range (count parsed))]
+              (ir/bind-local! ctx (:name (nth parsed i)) (nth var-regs i)))
+          ;; 3. Compile each function body as fn* with the Var-refs in scope.
           closures (mapv (fn [p]
                            (lower-fn ctx [(symbol (:name p)) (:params p) (cons 'do (:body p))]))
                          parsed)
-          ;; 3. Set! each var to its closure value
+          ;; 4. Pop the Var-ref scope — the closures have already captured them.
+          _ (ir/pop-scope! ctx)
+          ;; 5. Fill each Var with its closure.
           _ (doseq [i (range (count parsed))]
-              (let [p (nth parsed i)
-                    closure-var (nth closures i)
-                    var-obj (let [dst (ir/fresh-var! ctx)]
-                              (ir/emit! ctx (ir/inst-load-var dst ns (:name p)))
-                              dst)]
-                (ir/emit! ctx (ir/inst-set! var-obj closure-var))))]
-      ;; 4. Push scope, bind each name locally for the body
+              (ir/emit! ctx (ir/inst-set! (nth var-regs i) (nth closures i))))]
+      ;; 6. Bind each name to the resolved function value for the letfn body.
       (ir/push-scope! ctx)
-      (doseq [p parsed]
-        (let [fn-val (let [dst (ir/fresh-var! ctx)]
-                       (ir/emit! ctx (ir/inst-load-global dst ns (:name p)))
-                       dst)]
-          (ir/bind-local! ctx (:name p) fn-val)))
+      (doseq [i (range (count parsed))]
+        (let [fn-val (ir/fresh-var! ctx)]
+          (ir/emit! ctx (ir/inst-deref fn-val (nth var-regs i)))
+          (ir/bind-local! ctx (:name (nth parsed i)) fn-val)))
       (let [result (lower-body ctx (vec (rest args)))]
         (ir/pop-scope! ctx)
         result))))
