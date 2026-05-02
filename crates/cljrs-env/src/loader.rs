@@ -91,14 +91,14 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
     // Clojure convention: dots → path separators, hyphens → underscores.
     let rel_path = ns_name.replace('.', "/").replace('-', "_");
     let src_paths = globals.source_paths.read().unwrap().clone();
-    let (src, file_path): (String, String) =
-        if let Some(builtin) = globals.builtin_source(ns_name) {
-            (builtin.to_owned(), format!("<builtin:{ns_name}>"))
-        } else {
-            find_source_file(&rel_path, &src_paths).ok_or_else(|| {
-                EvalError::Runtime(format!("Could not find namespace {ns_name} on source path"))
-            })?
-        };
+    let (src, file_path): (String, String) = if let Some(builtin) = globals.builtin_source(ns_name)
+    {
+        (builtin.to_owned(), format!("<builtin:{ns_name}>"))
+    } else {
+        find_source_file(&rel_path, &src_paths).ok_or_else(|| {
+            EvalError::Runtime(format!("Could not find namespace {ns_name} on source path"))
+        })?
+    };
 
     // Pre-refer clojure.core so code in the file can use core fns before (ns ...).
     if ns_name.as_ref() != "clojure.core" {
