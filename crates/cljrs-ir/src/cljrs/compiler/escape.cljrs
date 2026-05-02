@@ -146,11 +146,36 @@
 
 ;; ── Known function arg escape semantics ─────────────────────────────────────
 
-;; Known functions where no argument escapes.
+;; Known functions where no argument escapes — i.e. the function reads
+;; its arguments but does not retain a reference to them (or to anything
+;; reachable from them) past the call.  An alloc passed solely to such
+;; functions stays `:no-escape` and remains eligible for region
+;; allocation.
+;;
+;; When extending this set, only add functions whose return value cannot
+;; alias the argument or its contents.  Predicates and arithmetic are
+;; safe because they return a fresh primitive.  Pretty-printers
+;; (`println`/`pr`/`prn`/`print`) are safe because they format and
+;; discard.  Lookups like `:get`/`:nth`/`:first` are safe because the
+;; element they return is itself an independently-allocated `GcPtr`,
+;; not a pointer into the argument's storage — freeing the container
+;; does not invalidate elements pulled out of it.
 (def non-escaping-fns
-  #{:get :nth :first :count :contains :+ :- :* :/ :rem
-    := :< :> :<= :>= :nil? :seq? :vector? :map? :identical?
-    :str :deref :atom-deref :println :pr})
+  #{;; Lookups (return an element, which is independently allocated)
+    :get :nth :first :count :contains
+    ;; Arithmetic (return fresh primitive)
+    :+ :- :* :/ :rem
+    ;; Comparison (return bool)
+    := :< :> :<= :>=
+    ;; Type predicates (return bool)
+    :nil? :seq? :vector? :map? :identical?
+    :number? :string? :keyword? :symbol? :boolean? :int?
+    ;; String formatting (consume, discard)
+    :str
+    ;; Reads
+    :deref :atom-deref
+    ;; I/O (format and write to stdout, retain nothing)
+    :println :pr :prn :print})
 
 (defn known-fn-arg-escapes?
   "Does a known function allow argument at arg-index to escape into its return value?"

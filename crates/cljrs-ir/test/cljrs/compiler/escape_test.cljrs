@@ -138,6 +138,28 @@
                    (ret 1))]
     (is (= :no-escape (get (analyze-states f) 0)))))
 
+(deftest test-type-predicates-are-non-escaping
+  ;; The pure type predicates return a bool and retain nothing.  Any
+  ;; alloc whose only use is being asked "what type are you?" must
+  ;; remain region-eligible.
+  (doseq [pred [:number? :string? :keyword? :symbol? :boolean? :int?
+                :nil? :seq? :vector? :map?]]
+    (let [f (ir-func [(alloc-vec 0 [])
+                      (call-known 1 pred [0])]
+                     (ret 1))]
+      (is (= :no-escape (get (analyze-states f) 0))
+          (str pred " should keep its argument :no-escape")))))
+
+(deftest test-print-family-is-non-escaping
+  ;; println/pr/prn/print all format their arguments and write to
+  ;; stdout, retaining nothing across the call.
+  (doseq [io-fn [:println :pr :prn :print]]
+    (let [f (ir-func [(alloc-vec 0 [])
+                      (call-known 1 io-fn [0])]
+                     (ret 1))]
+      (is (= :no-escape (get (analyze-states f) 0))
+          (str io-fn " should keep its argument :no-escape")))))
+
 (deftest test-mixed-escape-and-non-escape-uses-escapes
   ;; Same alloc used non-escapingly AND returned — the escaping use wins.
   (let [f (ir-func [(alloc-vec 0 [])
