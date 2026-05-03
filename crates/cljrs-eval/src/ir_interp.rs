@@ -415,6 +415,13 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
             "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
+    // JVM class names resolve to themselves as symbols, mirroring eval_symbol.
+    if cljrs_interp::eval::is_jvm_class_name(name) {
+        return Ok(Value::Symbol(GcPtr::new(cljrs_value::Symbol {
+            namespace: None,
+            name: Arc::from(name),
+        })));
+    }
     Err(EvalError::Runtime(format!(
         "IR interpreter: var not found {resolved_ns}/{name}"
     )))
