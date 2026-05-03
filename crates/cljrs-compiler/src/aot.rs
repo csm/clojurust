@@ -361,6 +361,46 @@ fn rewrite_calls_to_direct(
     rewrites
 }
 
+/// Tally region vs heap allocations across an IR function tree, so the
+/// AOT pipeline can report the impact of escape analysis at a glance.
+#[derive(Default)]
+struct AllocStats {
+    region: usize,
+    heap: usize,
+    closures: usize,
+    functions: usize,
+}
+
+fn count_alloc_stats(ir_func: &IrFunction) -> AllocStats {
+    use crate::ir::Inst;
+    let mut stats = AllocStats {
+        functions: 1,
+        ..Default::default()
+    };
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            match inst {
+                Inst::AllocVector(..)
+                | Inst::AllocMap(..)
+                | Inst::AllocSet(..)
+                | Inst::AllocList(..)
+                | Inst::AllocCons(..) => stats.heap += 1,
+                Inst::AllocClosure(..) => stats.closures += 1,
+                Inst::RegionAlloc(..) => stats.region += 1,
+                _ => {}
+            }
+        }
+    }
+    for sub in &ir_func.subfunctions {
+        let s = count_alloc_stats(sub);
+        stats.region += s.region;
+        stats.heap += s.heap;
+        stats.closures += s.closures;
+        stats.functions += s.functions;
+    }
+    stats
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Compile a `.cljrs` / `.cljc` source file to a standalone native binary.
@@ -475,6 +515,14 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
         "[aot] lowered to {} block(s), {} var(s)",
         ir_func.blocks.len(),
         ir_func.next_var
+    );
+
+    // Region allocation stats — show how many heap allocs the optimizer
+    // managed to lift onto the bump arena.
+    let stats = count_alloc_stats(&ir_func);
+    eprintln!(
+        "[aot] allocation stats: {} region-allocated, {} heap, {} closures (across {} functions)",
+        stats.region, stats.heap, stats.closures, stats.functions,
     );
 
     // ── 3b. Direct call optimization ────────────────────────────────────
