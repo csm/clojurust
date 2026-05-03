@@ -1150,7 +1150,14 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
         }
     }
 
-    cljrs_logging::feat_debug!("ir", "ir complete {:?} lowered:{} cached:{} failed:{}", f.name, lowered, cached, failed);
+    cljrs_logging::feat_debug!(
+        "ir",
+        "ir complete {:?} lowered:{} cached:{} failed:{}",
+        f.name,
+        lowered,
+        cached,
+        failed
+    );
 
     IR_LOWERING_ACTIVE.set(false);
 }

@@ -99,7 +99,13 @@ fn lower_arity_inner(
     use cljrs_gc::GcPtr;
     use cljrs_value::collections::vector::PersistentVector;
 
-    cljrs_logging::feat_debug!("lower", "lowering {:?}/{:?} optimize? {}", ns, name, optimize);
+    cljrs_logging::feat_debug!(
+        "lower",
+        "lowering {:?}/{:?} optimize? {}",
+        ns,
+        name,
+        optimize
+    );
 
     let globals = &env.globals;
 
