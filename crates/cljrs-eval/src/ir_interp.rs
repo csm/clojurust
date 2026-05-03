@@ -1079,14 +1079,20 @@ fn builtin_compare(known_fn: &KnownFn, args: &[Value]) -> EvalResult {
 /// Compiler loading is triggered separately (e.g., by the binary at startup).
 pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     use crate::apply::IR_LOWERING_ACTIVE;
+    let mut lowered = 0;
+    let mut cached = 0;
+    let mut failed = 0;
 
     // Skip if eager lowering is disabled.
     if !crate::apply::eager_lower_enabled() {
         return;
     }
 
+    cljrs_logging::feat_trace!("ir", "eager_lower_fn {:?}", f.name);
+
     // Don't lower macros (they operate on forms, not values).
     if f.is_macro {
+        cljrs_logging::feat_debug!("ir", "not lowering macro: {:?}", f.name);
         return;
     }
 
@@ -1096,11 +1102,13 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
         .compiler_ready
         .load(std::sync::atomic::Ordering::Acquire)
     {
+        cljrs_logging::feat_debug!("ir", "compiler not ready, not lowering");
         return;
     }
 
     // Don't nest lowering calls.
     if IR_LOWERING_ACTIVE.get() {
+        cljrs_logging::feat_trace!("ir", "lowering active, not continuing");
         return;
     }
 
@@ -1109,6 +1117,7 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     for arity in &f.arities {
         let arity_id = arity.ir_arity_id;
         if !crate::ir_cache::should_attempt(arity_id) {
+            cached += 1;
             continue;
         }
 
@@ -1121,13 +1130,17 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             env,
         ) {
             Ok(ir_func) => {
-                crate::ir_cache::store_cached(arity_id, std::sync::Arc::new(ir_func));
+                crate::ir_cache::store_cached(arity_id, Arc::new(ir_func));
+                lowered += 1;
             }
             Err(_) => {
                 crate::ir_cache::store_unsupported(arity_id);
+                failed += 1;
             }
         }
     }
+
+    cljrs_logging::feat_debug!("ir", "ir complete {:?} lowered:{} cached:{} failed:{}", f.name, lowered, cached, failed);
 
     IR_LOWERING_ACTIVE.set(false);
 }
