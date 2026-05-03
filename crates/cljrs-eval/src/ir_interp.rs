@@ -1131,6 +1131,17 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             continue;
         }
 
+        // Don't lower arities with destructured params or rest params.
+        // lower-fn-body only binds the gensym'd placeholder names from
+        // arity.params; the body uses the original symbolic names (a, b, k, v,
+        // ...) that bind_fn_params would normally introduce.  Those names are
+        // absent from the IR context and would be emitted as LoadGlobal
+        // instructions referencing non-existent vars.
+        if !arity.destructure_params.is_empty() || arity.destructure_rest.is_some() {
+            crate::ir_cache::store_unsupported(arity_id);
+            continue;
+        }
+
         match crate::lower::lower_and_optimize_arity(
             f.name.as_deref(),
             &arity.params,
