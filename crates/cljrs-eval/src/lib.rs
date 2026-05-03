@@ -70,6 +70,8 @@ pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
         "cljrs.compiler.ir",
         "cljrs.compiler.known",
         "cljrs.compiler.anf",
+        "cljrs.compiler.escape",
+        "cljrs.compiler.optimize",
     ] {
         let require_form = cljrs_reader::Form::new(
             cljrs_reader::form::FormKind::List(vec![
