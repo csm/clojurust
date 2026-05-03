@@ -34,4 +34,4 @@ jobs:
         run: cargo test --workspace
 
       - name: Clojure Tests
-        run: cargo run -p cljrs compile -o test-suite --test ./clojure-test-suite/test && CLJRS_GC_STATS=- ./test-suite
+        run: cargo run -p cljrs compile -o test-suite --test ./clojure-test-suite/test && CLJRS_EAGER_LOWER=1 CLJRS_GC_STATS=- ./test-suite
