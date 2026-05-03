@@ -1106,6 +1106,16 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
         return;
     }
 
+    // Don't lower closures that capture variables from an enclosing scope.
+    // lower-fn-body only knows about the explicit arity params; captured names
+    // are invisible to it, so any reference to a capture would be emitted as
+    // LoadGlobal(defining-ns, name) — which either resolves to the wrong var or
+    // fails at runtime with "var not found".  Top-level defns have no captures,
+    // so they are safe to lower.  Inner closures will fall back to tree-walking.
+    if !f.closed_over_names.is_empty() {
+        return;
+    }
+
     // Don't nest lowering calls.
     if IR_LOWERING_ACTIVE.get() {
         cljrs_logging::feat_trace!("ir", "lowering active, not continuing");
