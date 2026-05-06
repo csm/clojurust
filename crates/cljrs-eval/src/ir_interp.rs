@@ -28,14 +28,19 @@ use cljrs_env::error::{EvalError, EvalResult};
 // ── Register file ───────────────────────────────────────────────────────────
 
 /// Dense register file indexed by `VarId`.
+///
+/// Uses `Box<[Option<Value>]>` rather than `Vec` so the heap address of the
+/// slice data is stable after construction.  This lets us register the slice as
+/// a GC root via `root_option_values` without worrying about reallocation
+/// invalidating the stored raw pointer.
 struct Registers {
-    values: Vec<Option<Value>>,
+    values: Box<[Option<Value>]>,
 }
 
 impl Registers {
     fn new(capacity: u32) -> Self {
         Self {
-            values: vec![None; capacity as usize],
+            values: vec![None; capacity as usize].into_boxed_slice(),
         }
     }
 
@@ -46,11 +51,9 @@ impl Registers {
     }
 
     fn set(&mut self, id: VarId, val: Value) {
-        let idx = id.0 as usize;
-        if idx >= self.values.len() {
-            self.values.resize(idx + 1, None);
-        }
-        self.values[idx] = Some(val);
+        // Bounds check: VarIds are allocated sequentially up to ir_func.next_var,
+        // so any out-of-range access indicates malformed IR.
+        self.values[id.0 as usize] = Some(val);
     }
 
     fn get_cloned(&self, id: VarId) -> Value {
@@ -99,6 +102,10 @@ pub fn interpret_ir(
     cljrs_env::gc_roots::gc_safepoint(env);
 
     let mut regs = Registers::new(ir_func.next_var);
+    // Keep all values in the register file alive across GC safepoints.
+    // The Box<[Option<Value>]> slice address is stable; this guard pops the
+    // root entry when interpret_ir returns (or unwinds).
+    let _regs_root = cljrs_env::gc_roots::root_option_values(&regs.values);
     let mut region_stack: Vec<RegionEntry> = Vec::new();
 
     // Bind parameters to registers.
