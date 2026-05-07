@@ -193,7 +193,7 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
 }
 
 /// Recognise JVM-style class names used in Clojure for `instance?`, `catch`, etc.
-fn is_jvm_class_name(s: &str) -> bool {
+pub fn is_jvm_class_name(s: &str) -> bool {
     matches!(
         s,
         "clojure.lang.BigInt"

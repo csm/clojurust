@@ -7,8 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["prebuild-ir"]
-prebuild-ir = []
+default = []
+prebuild-ir = [
+    "dep:cljrs-ir-bd",
+    "dep:cljrs-eval-bd",
+    "dep:cljrs-interp-bd",
+    "dep:cljrs-value-bd",
+    "dep:cljrs-env-bd",
+    "dep:cljrs-reader-bd",
+    "dep:cljrs-types-bd",
+]
 no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-builtins/no-gc"]
 
 [dependencies]
@@ -24,10 +32,10 @@ tokio        = { workspace = true, features = ["rt", "sync", "rt-multi-thread"] 
 lazy_static = "1.5.0"
 
 [build-dependencies]
-cljrs-ir       = { workspace = true }
-cljrs-eval     = { workspace = true }
-cljrs-interp   = { workspace = true }
-cljrs-value    = { workspace = true }
-cljrs-env      = { workspace = true }
-cljrs-reader   = { workspace = true }
-cljrs-types    = { workspace = true }
+cljrs-ir-bd     = { path = "../cljrs-ir",     package = "cljrs-ir",     optional = true }
+cljrs-eval-bd   = { path = "../cljrs-eval",   package = "cljrs-eval",   optional = true }
+cljrs-interp-bd = { path = "../cljrs-interp", package = "cljrs-interp", optional = true }
+cljrs-value-bd  = { path = "../cljrs-value",  package = "cljrs-value",  optional = true }
+cljrs-env-bd    = { path = "../cljrs-env",    package = "cljrs-env",    optional = true }
+cljrs-reader-bd = { path = "../cljrs-reader", package = "cljrs-reader", optional = true }
+cljrs-types-bd  = { path = "../cljrs-types",  package = "cljrs-types",  optional = true }

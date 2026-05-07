@@ -10,6 +10,7 @@ repository.workspace = true
 no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-env/no-gc", "cljrs-builtins/no-gc", "cljrs-interp/no-gc"]
 
 [dependencies]
+cljrs-logging  = { workspace = true }
 cljrs-types    = { workspace = true }
 cljrs-ir       = { workspace = true }
 cljrs-gc       = { workspace = true }

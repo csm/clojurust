@@ -100,6 +100,40 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 #[cfg(feature = "prebuild-ir")]
 static PREBUILT_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_ir.bin"));
 
+/// Prebuilt IR bundle for the five cljrs.compiler.* namespaces.
+/// Loaded into the IR cache after ensure_compiler_loaded() populates the
+/// namespace vars so the compiler itself runs in IR mode on hot paths.
+#[cfg(feature = "prebuild-ir")]
+static PREBUILT_COMPILER_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compiler_ir.bin"));
+
+/// Load the prebuilt compiler IR bundle into the IR cache.
+///
+/// Called after `ensure_compiler_loaded` so that the compiler namespace vars
+/// (with their runtime `ir_arity_id`s) already exist in `globals`.
+/// `load_prebuilt_ir` matches bundle keys (`"ns/name:arity"`) to live arity
+/// objects and stores the pre-built IR in the cache, replacing tree-walking
+/// for the hot compiler code paths.
+#[cfg(feature = "prebuild-ir")]
+fn load_prebuilt_compiler_ir(globals: &Arc<GlobalEnv>) {
+    match cljrs_ir::deserialize_bundle(PREBUILT_COMPILER_IR) {
+        Ok(bundle) if !bundle.is_empty() => {
+            let n = cljrs_eval::load_prebuilt_ir(globals, &bundle);
+            cljrs_logging::feat_debug!(
+                "ir",
+                "loaded {n} prebuilt compiler IR arities from bundle ({} entries)",
+                bundle.len()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            cljrs_logging::feat_debug!("ir", "compiler IR bundle deserialize failed: {e}");
+        }
+    }
+}
+
+#[cfg(not(feature = "prebuild-ir"))]
+fn load_prebuilt_compiler_ir(_globals: &Arc<GlobalEnv>) {}
+
 /// Create a `GlobalEnv` with all built-ins and stdlib registered.
 ///
 /// Prefer this over `cljrs_eval::standard_env()` in the `cljrs` binary so that
@@ -127,12 +161,16 @@ pub fn standard_env() -> Arc<GlobalEnv> {
 
                 // Still load the compiler on a background thread so new user
                 // functions can be eagerly lowered at definition time.
+                // Once loaded, populate the IR cache with prebuilt compiler IR
+                // so the compiler itself runs in IR mode on hot paths.
                 let g = globals.clone();
                 let _ = std::thread::Builder::new()
                     .stack_size(16 * 1024 * 1024)
                     .spawn(move || {
                         let mut env = cljrs_eval::Env::new(g.clone(), "user");
-                        cljrs_eval::ensure_compiler_loaded(&g, &mut env);
+                        if cljrs_eval::ensure_compiler_loaded(&g, &mut env) {
+                            load_prebuilt_compiler_ir(&g);
+                        }
                     });
 
                 return globals;
@@ -153,7 +191,9 @@ pub fn standard_env() -> Arc<GlobalEnv> {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let mut env = cljrs_eval::Env::new(g.clone(), "user");
-                cljrs_eval::ensure_compiler_loaded(&g, &mut env);
+                if cljrs_eval::ensure_compiler_loaded(&g, &mut env) {
+                    load_prebuilt_compiler_ir(&g);
+                }
             })
             .and_then(|h| h.join().map_err(|_| std::io::Error::other("join failed")));
     }

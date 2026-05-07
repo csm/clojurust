@@ -25,6 +25,11 @@ thread_local! {
     /// Value on the stack).
     static VALUE_ROOTS: RefCell<Vec<(*const cljrs_value::Value, usize)>> =
         const { RefCell::new(Vec::new()) };
+    /// Shadow stack for `Option<Value>` slices (e.g., the IR interpreter's
+    /// register file).  Each entry is `(ptr, count)` pointing to a fixed-size
+    /// heap slice whose address will not change for the lifetime of the entry.
+    static OPTION_VALUE_ROOTS: RefCell<Vec<(*const Option<cljrs_value::Value>, usize)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// RAII guard that pops the Env pointer on drop.
@@ -83,6 +88,36 @@ pub fn root_values(vals: &[cljrs_value::Value]) -> ValueRootGuard {
     ValueRootGuard { pushed: true }
 }
 
+/// RAII guard that pops one entry from the option-value shadow stack on drop.
+pub struct OptionValueRootGuard {
+    pushed: bool,
+}
+
+impl Drop for OptionValueRootGuard {
+    fn drop(&mut self) {
+        if self.pushed {
+            OPTION_VALUE_ROOTS.with(|roots| {
+                roots.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Register a slice of `Option<Value>` as GC roots.
+///
+/// The caller **must** ensure the slice's heap address is stable for the
+/// lifetime of the returned guard — use `Box<[Option<Value>]>` rather than
+/// a `Vec` that could reallocate.
+pub fn root_option_values(vals: &[Option<cljrs_value::Value>]) -> OptionValueRootGuard {
+    if vals.is_empty() {
+        return OptionValueRootGuard { pushed: false };
+    }
+    OPTION_VALUE_ROOTS.with(|roots| {
+        roots.borrow_mut().push((vals.as_ptr(), vals.len()));
+    });
+    OptionValueRootGuard { pushed: true }
+}
+
 /// Interpreter-level GC safepoint.
 ///
 /// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection
@@ -128,6 +163,8 @@ pub fn gc_safepoint(env: &Env) {
         trace_thread_env_roots(visitor);
         // Trace values on the Rust call stack (shadow stack)
         trace_value_roots(visitor);
+        // Trace Option<Value> slices (e.g. IR interpreter register files)
+        trace_option_value_roots(visitor);
         // Trace dynamic variable bindings on this thread
         dynamics::trace_current(visitor);
         // Trace the global tap system (functions and queued values)
@@ -166,6 +203,24 @@ fn trace_value_roots(visitor: &mut cljrs_gc::MarkVisitor) {
             // on still-live stack frames.
             let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
             for val in slice {
+                val.trace(visitor);
+            }
+        }
+    });
+}
+
+/// Trace all Option<Value> slices registered in the thread-local shadow stack.
+///
+/// Used for the IR interpreter's register file (a `Box<[Option<Value>]>`).
+#[cfg(not(feature = "no-gc"))]
+fn trace_option_value_roots(visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    OPTION_VALUE_ROOTS.with(|roots| {
+        for &(ptr, count) in roots.borrow().iter() {
+            // SAFETY: the slice is a Box<[Option<Value>]> owned by an active
+            // stack frame; the address is stable for the guard's lifetime.
+            let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
+            for val in slice.iter().flatten() {
                 val.trace(visitor);
             }
         }

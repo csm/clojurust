@@ -1,14 +1,26 @@
-//! Build script: pre-lower clojure.core functions to IR and write the bundle
-//! to OUT_DIR so it can be embedded via `include_bytes!`.
+//! Build script: pre-lower clojure.core and the cljrs.compiler.* namespaces
+//! to IR and write the bundles to OUT_DIR so they can be embedded via
+//! `include_bytes!`.
 //!
 //! Only runs when the `prebuild-ir` feature is enabled.
+
+// The build-deps are optional (activated by the `prebuild-ir` feature) and
+// carry a `-bd` local alias to avoid collisions with the regular [dependencies]
+// table.  Extern-crate aliases restore the short names for all call sites below.
+#[cfg(feature = "prebuild-ir")]
+extern crate cljrs_eval_bd as cljrs_eval;
+#[cfg(feature = "prebuild-ir")]
+extern crate cljrs_interp_bd as cljrs_interp;
+#[cfg(feature = "prebuild-ir")]
+extern crate cljrs_ir_bd as cljrs_ir;
+#[cfg(feature = "prebuild-ir")]
+extern crate cljrs_value_bd as cljrs_value;
 
 #[cfg(feature = "prebuild-ir")]
 fn main() {
     use std::path::PathBuf;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let output = out_dir.join("core_ir.bin");
 
     // Re-run if bootstrap sources change.
     println!("cargo::rerun-if-changed=../cljrs-builtins/src/bootstrap.cljrs");
@@ -22,33 +34,35 @@ fn main() {
     let result = std::thread::Builder::new()
         .name("ir-prebuild".to_string())
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || prebuild_core(&output))
+        .spawn(move || prebuild_all(&out_dir))
         .expect("failed to spawn prebuild thread")
         .join()
         .expect("prebuild thread panicked");
 
     match result {
-        Ok(count) => {
-            eprintln!("cljrs-stdlib build.rs: pre-lowered {count} clojure.core arities to IR");
+        Ok((core_count, compiler_count)) => {
+            eprintln!(
+                "cljrs-stdlib build.rs: pre-lowered {core_count} clojure.core arities \
+                 and {compiler_count} compiler arities to IR"
+            );
         }
         Err(e) => {
             // Don't fail the build — just warn. The runtime will fall back to
             // eager lowering or tree-walking if no prebuilt IR is available.
             eprintln!("cljrs-stdlib build.rs: IR pre-lowering failed: {e}");
             eprintln!(
-                "cljrs-stdlib build.rs: writing empty bundle (runtime will use tree-walking)"
+                "cljrs-stdlib build.rs: writing empty bundles (runtime will use tree-walking)"
             );
-            let empty = cljrs_ir::IrBundle::new();
-            let bytes = cljrs_ir::serialize_bundle(&empty).unwrap();
-            std::fs::write(out_dir.join("core_ir.bin"), &bytes).unwrap();
+            let empty_bytes = cljrs_ir::serialize_bundle(&cljrs_ir::IrBundle::new()).unwrap();
+            let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+            std::fs::write(out_dir.join("core_ir.bin"), &empty_bytes).unwrap();
+            std::fs::write(out_dir.join("compiler_ir.bin"), &empty_bytes).unwrap();
         }
     }
 }
 
 #[cfg(feature = "prebuild-ir")]
-fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
-    use std::sync::Arc;
-
+fn prebuild_all(out_dir: &std::path::Path) -> Result<(usize, usize), String> {
     // Boot a minimal env with the tree-walking interpreter only (no IR dispatch).
     // We use cljrs_interp directly to avoid the IR hooks — we're *producing* the
     // IR, not consuming it.
@@ -59,47 +73,105 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
 
     let mut env = cljrs_eval::Env::new(globals.clone(), "user");
 
-    // Load the compiler namespaces (anf, ir, known).
+    // Load the compiler namespaces (ir, known, anf, escape, optimize).
     if !cljrs_eval::ensure_compiler_loaded(&globals, &mut env) {
         return Err("failed to load compiler namespaces".to_string());
     }
 
-    // Also load the optimize namespace (which transitively requires escape) so
-    // we can run escape analysis on the lowered IR — that's what inserts the
-    // RegionStart/RegionAlloc instructions consumed by the IR interpreter.
-    {
-        let span = cljrs_types::span::Span::new(Arc::new("<prebuild>".to_string()), 0, 0, 1, 1);
-        let require_form = cljrs_reader::Form::new(
-            cljrs_reader::form::FormKind::List(vec![
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Symbol("require".into()),
-                    span.clone(),
-                ),
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
-                        cljrs_reader::form::FormKind::Symbol("cljrs.compiler.optimize".into()),
-                        span.clone(),
-                    ))),
-                    span,
-                ),
-            ]),
-            cljrs_types::span::Span::new(Arc::new("<prebuild>".to_string()), 0, 0, 1, 1),
+    // ensure_compiler_loaded loads all 5 namespaces including optimize, so
+    // escape analysis is available for the optimize pass.
+
+    // ── clojure.core ──────────────────────────────────────────────────────────
+
+    let (core_count, core_fails, core_bundle) =
+        lower_ns_to_bundle("clojure.core", &globals, &mut env);
+
+    if core_fails > 0 {
+        eprintln!(
+            "cljrs-stdlib build.rs: {core_fails} clojure.core arities failed to lower+optimize"
         );
-        cljrs_eval::eval(&require_form, &mut env)
-            .map_err(|e| format!("failed to require cljrs.compiler.optimize: {e:?}"))?;
     }
 
-    // Walk clojure.core and lower every function arity.
+    // Diagnostic: count region instructions so changes to the optimize pass
+    // have a visible effect at build time.
+    let (region_insts, fns_with_regions) = count_region_insts(&core_bundle);
+    eprintln!(
+        "cljrs-stdlib build.rs: core bundle contains {region_insts} region instructions \
+         across {fns_with_regions} functions"
+    );
+
+    let core_bytes = cljrs_ir::serialize_bundle(&core_bundle)
+        .map_err(|e| format!("core bundle serialization failed: {e}"))?;
+    std::fs::write(out_dir.join("core_ir.bin"), &core_bytes)
+        .map_err(|e| format!("failed to write core_ir.bin: {e}"))?;
+
+    // ── cljrs.compiler.* ─────────────────────────────────────────────────────
+
+    const COMPILER_NS: &[&str] = &[
+        "cljrs.compiler.ir",
+        "cljrs.compiler.known",
+        "cljrs.compiler.anf",
+        "cljrs.compiler.escape",
+        "cljrs.compiler.optimize",
+    ];
+
+    let mut compiler_bundle = cljrs_ir::IrBundle::new();
+    let mut compiler_count = 0usize;
+    let mut compiler_fails = 0usize;
+
+    for ns_name in COMPILER_NS {
+        let (count, fails, bundle) = lower_ns_to_bundle(ns_name, &globals, &mut env);
+        compiler_count += count;
+        compiler_fails += fails;
+        for (key, ir_func) in bundle.functions {
+            compiler_bundle.insert(key, ir_func);
+        }
+    }
+
+    if compiler_fails > 0 {
+        eprintln!(
+            "cljrs-stdlib build.rs: {compiler_fails} compiler arities skipped \
+             (destructured params or unsupported forms)"
+        );
+    }
+
+    let (compiler_region_insts, compiler_fns_with_regions) = count_region_insts(&compiler_bundle);
+    eprintln!(
+        "cljrs-stdlib build.rs: compiler bundle contains {compiler_region_insts} region \
+         instructions across {compiler_fns_with_regions} functions"
+    );
+
+    let compiler_bytes = cljrs_ir::serialize_bundle(&compiler_bundle)
+        .map_err(|e| format!("compiler bundle serialization failed: {e}"))?;
+    std::fs::write(out_dir.join("compiler_ir.bin"), &compiler_bytes)
+        .map_err(|e| format!("failed to write compiler_ir.bin: {e}"))?;
+
+    Ok((core_count, compiler_count))
+}
+
+/// Lower all non-macro function arities in `ns_name` and return
+/// `(succeeded, failed, bundle)`.  Arities with destructured parameters are
+/// skipped; they would produce broken IR because `lower-fn-body` only knows
+/// the gensym placeholder names, not the binding names introduced by
+/// `bind_fn_params`.
+#[cfg(feature = "prebuild-ir")]
+fn lower_ns_to_bundle(
+    ns_name: &str,
+    globals: &std::sync::Arc<cljrs_eval::GlobalEnv>,
+    env: &mut cljrs_eval::Env,
+) -> (usize, usize, cljrs_ir::IrBundle) {
+    use std::sync::Arc;
+
     let mut bundle = cljrs_ir::IrBundle::new();
     let mut count = 0usize;
     let mut fail_count = 0usize;
-    let mut first_failure: Option<String> = None;
 
     let var_entries: Vec<(Arc<str>, cljrs_value::Value)> = {
         let ns_map = globals.namespaces.read().unwrap();
-        let ns = ns_map
-            .get("clojure.core")
-            .ok_or("clojure.core namespace not found")?;
+        let Some(ns) = ns_map.get(ns_name) else {
+            eprintln!("cljrs-stdlib build.rs: namespace {ns_name} not found, skipping");
+            return (0, 0, bundle);
+        };
         let interns = ns.get().interns.lock().unwrap();
         interns
             .iter()
@@ -119,12 +191,21 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
             continue;
         }
 
-        let ns_arc: Arc<str> = Arc::from("clojure.core");
+        let ns_arc: Arc<str> = Arc::from(ns_name);
         for arity in &f.arities {
+            // Skip arities with destructured params: lower-fn-body only binds
+            // the gensym placeholder names, so any reference to the original
+            // binding names in the body would become LoadGlobal, producing
+            // broken IR at runtime.
+            if !arity.destructure_params.is_empty() || arity.destructure_rest.is_some() {
+                fail_count += 1;
+                continue;
+            }
+
             let key = if arity.rest_param.is_some() {
-                format!("clojure.core/{var_name}:{}+", arity.params.len())
+                format!("{ns_name}/{var_name}:{}+", arity.params.len())
             } else {
-                format!("clojure.core/{var_name}:{}", arity.params.len())
+                format!("{ns_name}/{var_name}:{}", arity.params.len())
             };
 
             match cljrs_eval::lower::lower_and_optimize_arity(
@@ -133,36 +214,24 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
                 arity.rest_param.as_ref(),
                 &arity.body,
                 &ns_arc,
-                &mut env,
+                env,
             ) {
                 Ok(ir_func) => {
                     bundle.insert(key, ir_func);
                     count += 1;
                 }
-                Err(e) => {
+                Err(_) => {
                     fail_count += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some(format!("{key}: {e}"));
-                    }
                 }
             }
         }
     }
 
-    let bytes =
-        cljrs_ir::serialize_bundle(&bundle).map_err(|e| format!("serialization failed: {e}"))?;
-    std::fs::write(output, &bytes)
-        .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+    (count, fail_count, bundle)
+}
 
-    if fail_count > 0 {
-        eprintln!(
-            "cljrs-stdlib build.rs: {fail_count} arities failed to lower+optimize (first: {})",
-            first_failure.as_deref().unwrap_or("?"),
-        );
-    }
-
-    // Diagnostic: count region instructions in the bundle so changes to
-    // the optimize pass have a visible effect at build time.
+#[cfg(feature = "prebuild-ir")]
+fn count_region_insts(bundle: &cljrs_ir::IrBundle) -> (usize, usize) {
     let mut region_inst_count = 0usize;
     let mut fns_with_regions = 0usize;
     for ir_func in bundle.functions.values() {
@@ -184,15 +253,13 @@ fn prebuild_core(output: &std::path::Path) -> Result<usize, String> {
             fns_with_regions += 1;
         }
     }
-    eprintln!(
-        "cljrs-stdlib build.rs: bundle contains {region_inst_count} region instructions \
-         across {fns_with_regions} clojure.core functions",
-    );
-
-    Ok(count)
+    (region_inst_count, fns_with_regions)
 }
 
 #[cfg(not(feature = "prebuild-ir"))]
 fn main() {
-    // No-op when prebuild-ir feature is disabled.
+    // Tell Cargo not to re-run this script unless build.rs itself changes.
+    // Without this, Cargo re-runs any build script that emits no
+    // rerun-if-changed directives on every single build.
+    println!("cargo::rerun-if-changed=build.rs");
 }
