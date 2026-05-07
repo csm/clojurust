@@ -220,10 +220,8 @@ fn trace_option_value_roots(visitor: &mut cljrs_gc::MarkVisitor) {
             // SAFETY: the slice is a Box<[Option<Value>]> owned by an active
             // stack frame; the address is stable for the guard's lifetime.
             let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
-            for opt_val in slice {
-                if let Some(val) = opt_val {
-                    val.trace(visitor);
-                }
+            for val in slice.iter().flatten() {
+                val.trace(visitor);
             }
         }
     });

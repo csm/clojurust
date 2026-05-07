@@ -904,7 +904,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 
         // ── Dynamic binding / exception handling ────────────────────────
         KnownFn::SetBangVar => builtin_call_native("set!", &args),
-        KnownFn::WithBindings => return eval_ir_with_bindings(args, env),
+        KnownFn::WithBindings => eval_ir_with_bindings(args, env),
         KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
@@ -922,7 +922,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 /// so we assemble the frame here rather than delegating to eval_with_bindings_star.
 fn eval_ir_with_bindings(args: Vec<Value>, env: &mut Env) -> EvalResult {
     use std::collections::HashMap;
-    if args.len() < 1 {
+    if args.is_empty() {
         return Err(EvalError::Arity {
             name: "with-bindings".into(),
             expected: "1+".into(),
@@ -932,7 +932,7 @@ fn eval_ir_with_bindings(args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Last arg is the body thunk; preceding args are (Var, value) pairs.
     let body = args.last().unwrap().clone();
     let pairs = &args[..args.len() - 1];
-    if pairs.len() % 2 != 0 {
+    if !pairs.len().is_multiple_of(2) {
         return Err(EvalError::Runtime(
             "with-bindings: odd number of var/val pairs".into(),
         ));
