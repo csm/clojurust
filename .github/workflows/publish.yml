@@ -45,9 +45,12 @@ jobs:
           echo "Publishing version: $VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-          # Update workspace dependency versions so inter-crate deps use the new version
+          # Update workspace dependency versions so inter-crate deps use the new version.
+          # The /g flag and lack of ^ anchor are intentional: this must also rewrite
+          # inline version = "0.1.0" inside [build-dependencies] entries (e.g. cljrs-stdlib),
+          # not just the top-level [package] version line.
           for toml in crates/*/Cargo.toml; do
-            sed -i "s/^version.*=.*\"0\.1\.0\"/version = \"$VERSION\"/" "$toml"
+            sed -i "s/version = \"0\.1\.0\"/version = \"$VERSION\"/g" "$toml"
           done
 
           # Update workspace dependency table to use the new version
