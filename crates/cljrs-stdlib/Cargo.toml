@@ -32,10 +32,10 @@ tokio        = { workspace = true, features = ["rt", "sync", "rt-multi-thread"] 
 lazy_static = "1.5.0"
 
 [build-dependencies]
-cljrs-ir-bd     = { path = "../cljrs-ir",     package = "cljrs-ir",     optional = true }
-cljrs-eval-bd   = { path = "../cljrs-eval",   package = "cljrs-eval",   optional = true }
-cljrs-interp-bd = { path = "../cljrs-interp", package = "cljrs-interp", optional = true }
-cljrs-value-bd  = { path = "../cljrs-value",  package = "cljrs-value",  optional = true }
-cljrs-env-bd    = { path = "../cljrs-env",    package = "cljrs-env",    optional = true }
-cljrs-reader-bd = { path = "../cljrs-reader", package = "cljrs-reader", optional = true }
-cljrs-types-bd  = { path = "../cljrs-types",  package = "cljrs-types",  optional = true }
+cljrs-ir-bd     = { path = "../cljrs-ir",     package = "cljrs-ir",     version = "0.1.0", optional = true }
+cljrs-eval-bd   = { path = "../cljrs-eval",   package = "cljrs-eval",   version = "0.1.0", optional = true }
+cljrs-interp-bd = { path = "../cljrs-interp", package = "cljrs-interp", version = "0.1.0", optional = true }
+cljrs-value-bd  = { path = "../cljrs-value",  package = "cljrs-value",  version = "0.1.0", optional = true }
+cljrs-env-bd    = { path = "../cljrs-env",    package = "cljrs-env",    version = "0.1.0", optional = true }
+cljrs-reader-bd = { path = "../cljrs-reader", package = "cljrs-reader", version = "0.1.0", optional = true }
+cljrs-types-bd  = { path = "../cljrs-types",  package = "cljrs-types",  version = "0.1.0", optional = true }
