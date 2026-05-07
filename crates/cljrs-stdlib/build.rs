@@ -123,8 +123,7 @@ fn prebuild_all(out_dir: &std::path::Path) -> Result<(usize, usize), String> {
         );
     }
 
-    let (compiler_region_insts, compiler_fns_with_regions) =
-        count_region_insts(&compiler_bundle);
+    let (compiler_region_insts, compiler_fns_with_regions) = count_region_insts(&compiler_bundle);
     eprintln!(
         "cljrs-stdlib build.rs: compiler bundle contains {compiler_region_insts} region \
          instructions across {compiler_fns_with_regions} functions"

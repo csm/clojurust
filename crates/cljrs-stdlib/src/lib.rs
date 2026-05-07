@@ -104,8 +104,7 @@ static PREBUILT_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_ir.bi
 /// Loaded into the IR cache after ensure_compiler_loaded() populates the
 /// namespace vars so the compiler itself runs in IR mode on hot paths.
 #[cfg(feature = "prebuild-ir")]
-static PREBUILT_COMPILER_IR: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/compiler_ir.bin"));
+static PREBUILT_COMPILER_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compiler_ir.bin"));
 
 /// Load the prebuilt compiler IR bundle into the IR cache.
 ///
