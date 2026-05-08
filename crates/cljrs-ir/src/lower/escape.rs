@@ -65,13 +65,9 @@ pub(crate) fn known_fn_arg_escapes(func: &KnownFn, arg_index: usize) -> bool {
     use KnownFn::*;
     match func {
         // Non-escaping: predicates, arithmetic, I/O, lookups that return elements
-        Get | Nth | Count | Contains | First
-        | Add | Sub | Mul | Div | Rem
-        | Eq | Lt | Gt | Lte | Gte
-        | IsNil | IsSeq | IsVector | IsMap | Identical
-        | IsNumber | IsString | IsKeyword | IsSymbol | IsBool | IsInt
-        | Str | Deref | AtomDeref
-        | Println | Pr | Prn | Print => false,
+        Get | Nth | Count | Contains | First | Add | Sub | Mul | Div | Rem | Eq | Lt | Gt | Lte
+        | Gte | IsNil | IsSeq | IsVector | IsMap | Identical | IsNumber | IsString | IsKeyword
+        | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref | Println | Pr | Prn | Print => false,
 
         // These return a modified copy of arg 0 → arg 0 escapes; others don't
         Dissoc | Disj => arg_index == 0,
@@ -126,13 +122,29 @@ fn add_uses_for_inst(uses: &mut HashMap<VarId, Vec<UseInfo>>, inst: &Inst, block
     match inst {
         Inst::CallKnown(_, func, args) => {
             for (i, &arg) in args.iter().enumerate() {
-                add_use(uses, arg, block_id, UseKind::KnownCallArg { func: func.clone(), arg_index: i });
+                add_use(
+                    uses,
+                    arg,
+                    block_id,
+                    UseKind::KnownCallArg {
+                        func: func.clone(),
+                        arg_index: i,
+                    },
+                );
             }
         }
         Inst::Call(_, callee, args) => {
             add_use(uses, *callee, block_id, UseKind::CallCallee);
             for (i, &arg) in args.iter().enumerate() {
-                add_use(uses, arg, block_id, UseKind::UnknownCallArg { callee: *callee, arg_index: i });
+                add_use(
+                    uses,
+                    arg,
+                    block_id,
+                    UseKind::UnknownCallArg {
+                        callee: *callee,
+                        arg_index: i,
+                    },
+                );
             }
         }
         Inst::AllocClosure(_, _, captures) => {
@@ -140,9 +152,7 @@ fn add_uses_for_inst(uses: &mut HashMap<VarId, Vec<UseInfo>>, inst: &Inst, block
                 add_use(uses, cap, block_id, UseKind::ClosureCapture);
             }
         }
-        Inst::AllocVector(_, elems)
-        | Inst::AllocSet(_, elems)
-        | Inst::AllocList(_, elems) => {
+        Inst::AllocVector(_, elems) | Inst::AllocSet(_, elems) | Inst::AllocList(_, elems) => {
             for &elem in elems {
                 add_use(uses, elem, block_id, UseKind::StoredInHeap);
             }
@@ -270,11 +280,14 @@ pub(crate) fn build_defn_map(root: &IrFunction) -> HashMap<(Arc<str>, Arc<str>),
             let mut alloc_info: HashMap<VarId, ClosureInfo> = HashMap::new();
             for inst in &block.insts {
                 if let Inst::AllocClosure(dst, tmpl, _) = inst {
-                    alloc_info.insert(*dst, ClosureInfo {
-                        arity_fn_names: tmpl.arity_fn_names.clone(),
-                        param_counts: tmpl.param_counts.clone(),
-                        is_variadic: tmpl.is_variadic.clone(),
-                    });
+                    alloc_info.insert(
+                        *dst,
+                        ClosureInfo {
+                            arity_fn_names: tmpl.arity_fn_names.clone(),
+                            param_counts: tmpl.param_counts.clone(),
+                            is_variadic: tmpl.is_variadic.clone(),
+                        },
+                    );
                 }
             }
             // Match DefVar instructions against alloc_info
@@ -424,7 +437,11 @@ pub(crate) fn compute_fn_summary(ir_func: &IrFunction, ctx: &EscapeContext) -> V
         }
         if ctx.computing.borrow().contains(name) {
             // Cycle guard: conservative all-Escapes
-            return ir_func.params.iter().map(|_| EscapeState::Escapes).collect();
+            return ir_func
+                .params
+                .iter()
+                .map(|_| EscapeState::Escapes)
+                .collect();
         }
         ctx.computing.borrow_mut().insert(name.clone());
     }
@@ -432,7 +449,8 @@ pub(crate) fn compute_fn_summary(ir_func: &IrFunction, ctx: &EscapeContext) -> V
     let uses = build_use_chains(ir_func);
     let var_defs = build_var_defs(ir_func);
 
-    let summary: Vec<EscapeState> = ir_func.params
+    let summary: Vec<EscapeState> = ir_func
+        .params
         .iter()
         .map(|(_, pv)| {
             classify_escape_with_ctx(
@@ -516,7 +534,11 @@ pub(crate) fn classify_escape_with_ctx(
                     if let Some(target_fn) = resolved {
                         if let Some(ectx) = ctx {
                             let summary = compute_fn_summary(&target_fn, ectx);
-                            match summary.get(*arg_index).copied().unwrap_or(EscapeState::Escapes) {
+                            match summary
+                                .get(*arg_index)
+                                .copied()
+                                .unwrap_or(EscapeState::Escapes)
+                            {
                                 EscapeState::NoEscape => {} // stays no-escape
                                 EscapeState::Returns => {
                                     // The return value of the call may alias this alloc
@@ -611,5 +633,9 @@ pub(crate) fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> Anal
         })
         .collect();
 
-    AnalysisResult { states, uses, alloc_blocks }
+    AnalysisResult {
+        states,
+        uses,
+        alloc_blocks,
+    }
 }

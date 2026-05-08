@@ -10,5 +10,5 @@ pub mod escape;
 pub mod known;
 pub mod optimize;
 
-pub use anf::{lower_fn_body, LowerError};
+pub use anf::{LowerError, lower_fn_body};
 pub use optimize::optimize;

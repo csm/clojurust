@@ -6,17 +6,19 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::escape::{EscapeContext, EscapeState, analyze, make_context};
 use crate::{Block, BlockId, Inst, IrFunction, RegionAllocKind, Terminator, VarId};
-use super::escape::{
-    analyze, make_context, EscapeContext, EscapeState,
-};
 
 // ── CFG helpers ──────────────────────────────────────────────────────────────
 
 fn block_successors(block: &Block) -> Vec<BlockId> {
     match &block.terminator {
         Terminator::Jump(target) => vec![*target],
-        Terminator::Branch { then_block, else_block, .. } => {
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
             vec![*then_block, *else_block]
         }
         Terminator::RecurJump { target, .. } => vec![*target],
@@ -186,9 +188,9 @@ fn lca_of(dom_of: &HashMap<BlockId, HashSet<BlockId>>, a: BlockId, b: BlockId) -
         return None;
     }
     // Pick the deepest: the one dominated by all others (i.e. has the most dominators)
-    common.into_iter().max_by_key(|&d| {
-        dom_of.get(&d).map(|s| s.len()).unwrap_or(0)
-    })
+    common
+        .into_iter()
+        .max_by_key(|&d| dom_of.get(&d).map(|s| s.len()).unwrap_or(0))
 }
 
 fn lca_of_many(
@@ -272,7 +274,7 @@ fn collect_use_blocks(
     uses: &HashMap<VarId, Vec<super::escape::UseInfo>>,
     ir_func: &IrFunction,
 ) -> HashSet<BlockId> {
-    use super::escape::{known_fn_arg_escapes, UseKind};
+    use super::escape::{UseKind, known_fn_arg_escapes};
 
     let mut worklist: Vec<VarId> = vec![alloc_var];
     let mut visited: HashSet<VarId> = HashSet::new();
@@ -288,7 +290,8 @@ fn collect_use_blocks(
                 UseKind::KnownCallArg { func, arg_index } => {
                     if known_fn_arg_escapes(func, *arg_index) {
                         // Find the call result and propagate
-                        if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block) {
+                        if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block)
+                        {
                             for inst in &block.insts {
                                 if let Inst::CallKnown(dst, f, args) = inst {
                                     if f == func && args.contains(&current) {
@@ -333,9 +336,9 @@ fn alloc_to_region_kind(inst: &Inst) -> Option<RegionAllocKind> {
 
 fn alloc_operands(inst: &Inst) -> Vec<VarId> {
     match inst {
-        Inst::AllocVector(_, elems)
-        | Inst::AllocSet(_, elems)
-        | Inst::AllocList(_, elems) => elems.clone(),
+        Inst::AllocVector(_, elems) | Inst::AllocSet(_, elems) | Inst::AllocList(_, elems) => {
+            elems.clone()
+        }
         Inst::AllocMap(_, pairs) => pairs.iter().flat_map(|&(k, v)| [k, v]).collect(),
         Inst::AllocCons(_, head, tail) => vec![*head, *tail],
         _ => vec![],
@@ -366,7 +369,11 @@ fn emit_region_for_alloc(
     };
 
     // Alloc block must be dominated by start
-    if !doms.get(&alloc_block).map(|d| d.contains(&start)).unwrap_or(false) {
+    if !doms
+        .get(&alloc_block)
+        .map(|d| d.contains(&start))
+        .unwrap_or(false)
+    {
         return ir_func;
     }
 

@@ -7,11 +7,9 @@ use std::sync::Arc;
 
 use cljrs_reader::form::{Form, FormKind};
 
-use crate::{
-    BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, Terminator, VarId,
-};
+use crate::{BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, Terminator, VarId};
 
-use super::context::{fresh_global_name_id, LowerCtx};
+use super::context::{LowerCtx, fresh_global_name_id};
 use super::known::{resolve_known_fn, strip_ns_prefix};
 
 // ── Error type ───────────────────────────────────────────────────────────────
@@ -52,10 +50,7 @@ pub fn lower_fn_body(
     params: &[Arc<str>],
     body: &[Form],
 ) -> Result<IrFunction, LowerError> {
-    let mut ctx = LowerCtx::new(
-        name.map(Arc::from),
-        Arc::from(ns),
-    );
+    let mut ctx = LowerCtx::new(name.map(Arc::from), Arc::from(ns));
 
     // Bind each param to a fresh VarId.
     let mut bound_params: Vec<(Arc<str>, VarId)> = Vec::with_capacity(params.len());
@@ -122,9 +117,7 @@ fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
             let local_name = kw_local_name(s);
             Ok(ctx.emit_const(Const::Keyword(Arc::from(local_name))))
         }
-        FormKind::AutoKeyword(s) => {
-            Ok(ctx.emit_const(Const::Keyword(Arc::from(s.as_str()))))
-        }
+        FormKind::AutoKeyword(s) => Ok(ctx.emit_const(Const::Keyword(Arc::from(s.as_str())))),
         FormKind::Symbol(s) => lower_symbol(ctx, s),
         FormKind::Vector(elems) => {
             let vars: Result<Vec<VarId>, _> = elems.iter().map(|e| lower_form(ctx, e)).collect();
@@ -177,7 +170,10 @@ fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
                 ctx.emit(Inst::LoadVar(dst, var_ns, var_name));
                 Ok(dst)
             } else {
-                Err(LowerError::UnsupportedForm(format!("#' expects symbol, got {:?}", inner.kind)))
+                Err(LowerError::UnsupportedForm(format!(
+                    "#' expects symbol, got {:?}",
+                    inner.kind
+                )))
             }
         }
         FormKind::Meta(_, inner) => lower_form(ctx, inner),
@@ -218,7 +214,8 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
             2 => {
                 // (:key m default) — fall through to dynamic call
                 let callee = lower_form(ctx, head)?;
-                let arg_vars: Result<Vec<VarId>, _> = args.iter().map(|a| lower_form(ctx, a)).collect();
+                let arg_vars: Result<Vec<VarId>, _> =
+                    args.iter().map(|a| lower_form(ctx, a)).collect();
                 let arg_vars = arg_vars?;
                 let dst = ctx.fresh_var();
                 ctx.emit(Inst::Call(dst, callee, arg_vars));
@@ -236,35 +233,34 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
     };
 
     match sym.as_str() {
-        "if"    => lower_if(ctx, args),
-        "do"    => lower_body(ctx, args),
+        "if" => lower_if(ctx, args),
+        "do" => lower_body(ctx, args),
         "let" | "let*" => lower_let(ctx, args),
-        "loop"  | "loop*" => lower_loop(ctx, args),
+        "loop" | "loop*" => lower_loop(ctx, args),
         "recur" => lower_recur(ctx, args),
-        "def"   => lower_def(ctx, args),
-        "fn"    | "fn*" => lower_fn(ctx, args),
-        "defn"  => lower_defn(ctx, args),
+        "def" => lower_def(ctx, args),
+        "fn" | "fn*" => lower_fn(ctx, args),
+        "defn" => lower_defn(ctx, args),
         "quote" => {
             if args.len() != 1 {
-                return Err(LowerError::MalformedSpecialForm("quote expects 1 argument".into()));
+                return Err(LowerError::MalformedSpecialForm(
+                    "quote expects 1 argument".into(),
+                ));
             }
             lower_quote(ctx, &args[0])
         }
-        "throw"  => lower_throw(ctx, args),
-        "set!"   => lower_set_bang(ctx, args),
-        "and"    => lower_and(ctx, args),
-        "or"     => lower_or(ctx, args),
-        "try"    => lower_try(ctx, args),
+        "throw" => lower_throw(ctx, args),
+        "set!" => lower_set_bang(ctx, args),
+        "and" => lower_and(ctx, args),
+        "or" => lower_or(ctx, args),
+        "try" => lower_try(ctx, args),
         "binding" => lower_binding(ctx, args),
-        "letfn"  => lower_letfn(ctx, args),
+        "letfn" => lower_letfn(ctx, args),
         "with-out-str" => lower_with_out_str(ctx, args),
         // Module-level forms should never reach here.
-        "ns" | "require" | "in-ns" | "alias" | "load-file" => {
-            Err(LowerError::UnsupportedForm(format!(
-                "{} is a module-level form and cannot be compiled",
-                sym
-            )))
-        }
+        "ns" | "require" | "in-ns" | "alias" | "load-file" => Err(LowerError::UnsupportedForm(
+            format!("{} is a module-level form and cannot be compiled", sym),
+        )),
         // These should be expanded before lowering.
         "defmacro" | "defonce" => Err(LowerError::UnsupportedForm(format!(
             "{sym} should be expanded before ANF lowering"
@@ -279,7 +275,9 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
 
 fn lower_if(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() || args.len() > 3 {
-        return Err(LowerError::MalformedSpecialForm("if expects 1-3 arguments".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "if expects 1-3 arguments".into(),
+        ));
     }
     let test = lower_form(ctx, &args[0])?;
     let then_block = ctx.fresh_block();
@@ -321,7 +319,11 @@ fn lower_if(ctx: &mut LowerCtx, args: &[Form]) -> R {
 
 // ── Destructuring ─────────────────────────────────────────────────────────────
 
-fn lower_destructure_binding(ctx: &mut LowerCtx, pattern: &Form, val: VarId) -> Result<(), LowerError> {
+fn lower_destructure_binding(
+    ctx: &mut LowerCtx,
+    pattern: &Form,
+    val: VarId,
+) -> Result<(), LowerError> {
     match &pattern.kind {
         FormKind::Symbol(s) => {
             ctx.bind_local(Arc::from(s.as_str()), val);
@@ -553,10 +555,14 @@ fn lower_with_default(ctx: &mut LowerCtx, got: VarId, default_form: &Form) -> R 
 
 fn lower_let(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() {
-        return Err(LowerError::MalformedSpecialForm("let requires a binding vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "let requires a binding vector".into(),
+        ));
     }
     let FormKind::Vector(bindings) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("let bindings must be a vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "let bindings must be a vector".into(),
+        ));
     };
     if bindings.len() % 2 != 0 {
         return Err(LowerError::MalformedSpecialForm(
@@ -587,10 +593,14 @@ struct BindingInfo {
 
 fn lower_loop(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() {
-        return Err(LowerError::MalformedSpecialForm("loop requires a binding vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "loop requires a binding vector".into(),
+        ));
     }
     let FormKind::Vector(bindings) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("loop bindings must be a vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "loop bindings must be a vector".into(),
+        ));
     };
     if bindings.len() % 2 != 0 {
         return Err(LowerError::MalformedSpecialForm(
@@ -605,7 +615,11 @@ fn lower_loop(ctx: &mut LowerCtx, args: &[Form]) -> R {
         let pattern = bindings[i].clone();
         let init_val = lower_form(ctx, &bindings[i + 1])?;
         let gensym_name: Arc<str> = Arc::from(format!("__loop_{}", ctx.fresh_var().0).as_str());
-        binding_info.push(BindingInfo { pattern, gensym_name, init_val });
+        binding_info.push(BindingInfo {
+            pattern,
+            gensym_name,
+            init_val,
+        });
         i += 2;
     }
 
@@ -686,10 +700,14 @@ fn lower_recur(ctx: &mut LowerCtx, args: &[Form]) -> R {
 
 fn lower_def(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() {
-        return Err(LowerError::MalformedSpecialForm("def requires a name".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "def requires a name".into(),
+        ));
     }
     let FormKind::Symbol(name_sym) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("def name must be a symbol".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "def name must be a symbol".into(),
+        ));
     };
     let name_str: Arc<str> = Arc::from(name_sym.as_str());
     let ns = ctx.ns().clone();
@@ -709,16 +727,24 @@ fn lower_def(ctx: &mut LowerCtx, args: &[Form]) -> R {
 
 fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() {
-        return Err(LowerError::MalformedSpecialForm("defn requires a name".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "defn requires a name".into(),
+        ));
     }
     let FormKind::Symbol(name_sym) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("defn name must be a symbol".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "defn name must be a symbol".into(),
+        ));
     };
     let name_str = name_sym.clone();
 
     // Skip optional docstring.
     let rest_start = if args.len() > 2 {
-        if let FormKind::Str(_) = &args[1].kind { 2 } else { 1 }
+        if let FormKind::Str(_) = &args[1].kind {
+            2
+        } else {
+            1
+        }
     } else {
         1
     };
@@ -782,7 +808,12 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form]) -> R {
         if ctx.lookup_local(fname).is_none() {
             let nil_val = ctx.emit_const(Const::Nil);
             let def_dst = ctx.fresh_var();
-            ctx.emit(Inst::DefVar(def_dst, ns.clone(), Arc::from(fname.as_str()), nil_val));
+            ctx.emit(Inst::DefVar(
+                def_dst,
+                ns.clone(),
+                Arc::from(fname.as_str()),
+                nil_val,
+            ));
             ctx.push_scope();
             ctx.bind_local(Arc::from(fname.as_str()), def_dst);
             Some(def_dst)
@@ -923,12 +954,13 @@ fn lower_fn_arity(
         .iter()
         .map(|p| {
             if let FormKind::Symbol(s) = &p.kind {
-                ParamInfo { name: Arc::from(s.as_str()), pattern: None }
+                ParamInfo {
+                    name: Arc::from(s.as_str()),
+                    pattern: None,
+                }
             } else {
                 ParamInfo {
-                    name: Arc::from(
-                        format!("__destructure_{}", fresh_global_name_id()).as_str(),
-                    ),
+                    name: Arc::from(format!("__destructure_{}", fresh_global_name_id()).as_str()),
                     pattern: Some(p.clone()),
                 }
             }
@@ -937,12 +969,13 @@ fn lower_fn_arity(
 
     let rest_info: Option<ParamInfo> = rest_param.map(|p| {
         if let FormKind::Symbol(s) = &p.kind {
-            ParamInfo { name: Arc::from(s.as_str()), pattern: None }
+            ParamInfo {
+                name: Arc::from(s.as_str()),
+                pattern: None,
+            }
         } else {
             ParamInfo {
-                name: Arc::from(
-                    format!("__destructure_rest_{}", fresh_global_name_id()).as_str(),
-                ),
+                name: Arc::from(format!("__destructure_rest_{}", fresh_global_name_id()).as_str()),
                 pattern: Some(p.clone()),
             }
         }
@@ -1044,7 +1077,9 @@ fn lower_fn_arity(
 
 fn lower_throw(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.len() != 1 {
-        return Err(LowerError::MalformedSpecialForm("throw expects 1 argument".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "throw expects 1 argument".into(),
+        ));
     }
     let val = lower_form(ctx, &args[0])?;
     ctx.emit(Inst::Throw(val));
@@ -1088,12 +1123,16 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let ncaptures = capture_names.len();
 
     // Body closure.
-    let body_name: Arc<str> = Arc::from(
-        format!("__cljrs_try_body_{}", fresh_global_name_id()).as_str(),
-    );
+    let body_name: Arc<str> =
+        Arc::from(format!("__cljrs_try_body_{}", fresh_global_name_id()).as_str());
     let body_fn_ir = lower_fn_arity(
-        ctx, Some(body_name.clone()), ns.clone(),
-        &capture_names, &[], None, &body_forms,
+        ctx,
+        Some(body_name.clone()),
+        ns.clone(),
+        &capture_names,
+        &[],
+        None,
+        &body_forms,
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1121,17 +1160,25 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
             } else {
                 "e".to_string()
             };
-            let catch_body = if cp.len() > 3 { cp[3..].to_vec() } else { vec![] };
-            let catch_name: Arc<str> = Arc::from(
-                format!("__cljrs_try_catch_{}", fresh_global_name_id()).as_str(),
-            );
+            let catch_body = if cp.len() > 3 {
+                cp[3..].to_vec()
+            } else {
+                vec![]
+            };
+            let catch_name: Arc<str> =
+                Arc::from(format!("__cljrs_try_catch_{}", fresh_global_name_id()).as_str());
             let catch_params = vec![Form::new(
                 FormKind::Symbol(catch_sym),
                 cljrs_types::span::Span::new(Arc::new("<try>".to_string()), 0, 0, 1, 1),
             )];
             let catch_fn_ir = lower_fn_arity(
-                ctx, Some(catch_name.clone()), ns.clone(),
-                &capture_names, &catch_params, None, &catch_body,
+                ctx,
+                Some(catch_name.clone()),
+                ns.clone(),
+                &capture_names,
+                &catch_params,
+                None,
+                &catch_body,
             )?;
             ctx.add_subfunction(catch_fn_ir);
             let dst = ctx.fresh_var();
@@ -1158,12 +1205,16 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let finally_closure = if let Some(ff) = finally_form {
         if let FormKind::List(fp) = &ff.kind {
             let fin_body = fp[1..].to_vec();
-            let fin_name: Arc<str> = Arc::from(
-                format!("__cljrs_try_finally_{}", fresh_global_name_id()).as_str(),
-            );
+            let fin_name: Arc<str> =
+                Arc::from(format!("__cljrs_try_finally_{}", fresh_global_name_id()).as_str());
             let fin_fn_ir = lower_fn_arity(
-                ctx, Some(fin_name.clone()), ns.clone(),
-                &capture_names, &[], None, &fin_body,
+                ctx,
+                Some(fin_name.clone()),
+                ns.clone(),
+                &capture_names,
+                &[],
+                None,
+                &fin_body,
             )?;
             ctx.add_subfunction(fin_fn_ir);
             let dst = ctx.fresh_var();
@@ -1208,10 +1259,14 @@ fn is_catch_or_finally(form: &Form) -> bool {
 
 fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.is_empty() {
-        return Err(LowerError::MalformedSpecialForm("binding requires a binding vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "binding requires a binding vector".into(),
+        ));
     }
     let FormKind::Vector(bindings) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("binding bindings must be a vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "binding bindings must be a vector".into(),
+        ));
     };
     if bindings.len() % 2 != 0 {
         return Err(LowerError::MalformedSpecialForm(
@@ -1246,12 +1301,16 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
     let ncaptures = capture_names.len();
 
-    let body_name: Arc<str> = Arc::from(
-        format!("__cljrs_binding_body_{}", fresh_global_name_id()).as_str(),
-    );
+    let body_name: Arc<str> =
+        Arc::from(format!("__cljrs_binding_body_{}", fresh_global_name_id()).as_str());
     let body_fn_ir = lower_fn_arity(
-        ctx, Some(body_name.clone()), ns,
-        &capture_names, &[], None, &args[1..],
+        ctx,
+        Some(body_name.clone()),
+        ns,
+        &capture_names,
+        &[],
+        None,
+        &args[1..],
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1269,7 +1328,11 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
 
     flat_bindings.push(body_closure);
     let result = ctx.fresh_var();
-    ctx.emit(Inst::CallKnown(result, KnownFn::WithBindings, flat_bindings));
+    ctx.emit(Inst::CallKnown(
+        result,
+        KnownFn::WithBindings,
+        flat_bindings,
+    ));
     Ok(result)
 }
 
@@ -1277,10 +1340,14 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
 
 fn lower_letfn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.len() < 2 {
-        return Err(LowerError::MalformedSpecialForm("letfn requires bindings and body".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "letfn requires bindings and body".into(),
+        ));
     }
     let FormKind::Vector(bindings) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("letfn bindings must be a vector".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "letfn bindings must be a vector".into(),
+        ));
     };
 
     let ns = ctx.ns().clone();
@@ -1295,13 +1362,19 @@ fn lower_letfn(ctx: &mut LowerCtx, args: &[Form]) -> R {
         .iter()
         .map(|b| {
             let FormKind::List(parts) = &b.kind else {
-                return Err(LowerError::MalformedSpecialForm("letfn binding must be a list".into()));
+                return Err(LowerError::MalformedSpecialForm(
+                    "letfn binding must be a list".into(),
+                ));
             };
             let FormKind::Symbol(sym) = &parts[0].kind else {
-                return Err(LowerError::MalformedSpecialForm("letfn binding name must be a symbol".into()));
+                return Err(LowerError::MalformedSpecialForm(
+                    "letfn binding name must be a symbol".into(),
+                ));
             };
             if parts.len() < 2 {
-                return Err(LowerError::MalformedSpecialForm("letfn binding needs params".into()));
+                return Err(LowerError::MalformedSpecialForm(
+                    "letfn binding needs params".into(),
+                ));
             }
             Ok(LetfnBinding {
                 name: Arc::from(sym.as_str()),
@@ -1376,12 +1449,16 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
     let ncaptures = capture_names.len();
 
-    let body_name: Arc<str> = Arc::from(
-        format!("__cljrs_with_out_str_{}", fresh_global_name_id()).as_str(),
-    );
+    let body_name: Arc<str> =
+        Arc::from(format!("__cljrs_with_out_str_{}", fresh_global_name_id()).as_str());
     let body_fn_ir = lower_fn_arity(
-        ctx, Some(body_name.clone()), ns,
-        &capture_names, &[], None, body_forms,
+        ctx,
+        Some(body_name.clone()),
+        ns,
+        &capture_names,
+        &[],
+        None,
+        body_forms,
     )?;
     ctx.add_subfunction(body_fn_ir);
 
@@ -1399,7 +1476,11 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
     ));
 
     let result = ctx.fresh_var();
-    ctx.emit(Inst::CallKnown(result, KnownFn::WithOutStr, vec![body_closure]));
+    ctx.emit(Inst::CallKnown(
+        result,
+        KnownFn::WithOutStr,
+        vec![body_closure],
+    ));
     Ok(result)
 }
 
@@ -1407,10 +1488,14 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
 
 fn lower_set_bang(ctx: &mut LowerCtx, args: &[Form]) -> R {
     if args.len() != 2 {
-        return Err(LowerError::MalformedSpecialForm("set! expects 2 arguments".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "set! expects 2 arguments".into(),
+        ));
     }
     let FormKind::Symbol(sym_str) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm("set! target must be a symbol".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "set! target must be a symbol".into(),
+        ));
     };
     let (var_ns, var_name) = split_sym(sym_str, ctx.ns());
     let var_dst = ctx.fresh_var();
@@ -1620,8 +1705,7 @@ fn lower_known_call(ctx: &mut LowerCtx, known: KnownFn, name: &str, arg_forms: &
     }
 
     // Fixed-arity known call.
-    let arg_vars: Result<Vec<VarId>, _> =
-        arg_forms.iter().map(|a| lower_form(ctx, a)).collect();
+    let arg_vars: Result<Vec<VarId>, _> = arg_forms.iter().map(|a| lower_form(ctx, a)).collect();
     let arg_vars = arg_vars?;
 
     // Arity check for `pr` with 0 args.
@@ -1650,7 +1734,9 @@ fn lower_known_call(ctx: &mut LowerCtx, known: KnownFn, name: &str, arg_forms: &
 
 fn lower_apply_call(ctx: &mut LowerCtx, arg_forms: &[Form]) -> R {
     if arg_forms.len() < 2 {
-        return Err(LowerError::MalformedSpecialForm("apply requires at least 2 arguments".into()));
+        return Err(LowerError::MalformedSpecialForm(
+            "apply requires at least 2 arguments".into(),
+        ));
     }
     let arg_vars: Result<Vec<VarId>, _> = arg_forms.iter().map(|a| lower_form(ctx, a)).collect();
     let arg_vars = arg_vars?;
@@ -1696,7 +1782,10 @@ fn is_binary_foldable(kf: &KnownFn) -> bool {
 }
 
 fn is_comparison(kf: &KnownFn) -> bool {
-    matches!(kf, KnownFn::Eq | KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte)
+    matches!(
+        kf,
+        KnownFn::Eq | KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte
+    )
 }
 
 fn emit_binary_fold(ctx: &mut LowerCtx, kf: KnownFn, args: Vec<VarId>) -> R {
@@ -1800,53 +1889,80 @@ fn try_inline_expansion(
 ) -> Result<Option<VarId>, LowerError> {
     match strip_ns_prefix(callee_name) {
         "inc" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("inc needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("inc needs 1 arg"))?,
+            )?;
             let one = ctx.emit_const(Const::Long(1));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Add, vec![x, one]));
             Ok(Some(dst))
         }
         "dec" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("dec needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("dec needs 1 arg"))?,
+            )?;
             let one = ctx.emit_const(Const::Long(1));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Sub, vec![x, one]));
             Ok(Some(dst))
         }
         "not" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("not needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("not needs 1 arg"))?,
+            )?;
             Ok(Some(emit_not(ctx, x)))
         }
         "not=" => {
-            let a = lower_form(ctx, args.first().ok_or_else(|| malformed("not= needs 2 args"))?)?;
-            let b = lower_form(ctx, args.get(1).ok_or_else(|| malformed("not= needs 2 args"))?)?;
+            let a = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("not= needs 2 args"))?,
+            )?;
+            let b = lower_form(
+                ctx,
+                args.get(1).ok_or_else(|| malformed("not= needs 2 args"))?,
+            )?;
             let eq = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(eq, KnownFn::Eq, vec![a, b]));
             Ok(Some(emit_not(ctx, eq)))
         }
         "zero?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("zero? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("zero? needs 1 arg"))?,
+            )?;
             let zero = ctx.emit_const(Const::Long(0));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Eq, vec![x, zero]));
             Ok(Some(dst))
         }
         "pos?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("pos? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("pos? needs 1 arg"))?,
+            )?;
             let zero = ctx.emit_const(Const::Long(0));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Gt, vec![x, zero]));
             Ok(Some(dst))
         }
         "neg?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("neg? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("neg? needs 1 arg"))?,
+            )?;
             let zero = ctx.emit_const(Const::Long(0));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Lt, vec![x, zero]));
             Ok(Some(dst))
         }
         "even?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("even? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("even? needs 1 arg"))?,
+            )?;
             let two = ctx.emit_const(Const::Long(2));
             let rem = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(rem, KnownFn::Rem, vec![x, two]));
@@ -1856,7 +1972,10 @@ fn try_inline_expansion(
             Ok(Some(dst))
         }
         "odd?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("odd? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("odd? needs 1 arg"))?,
+            )?;
             let two = ctx.emit_const(Const::Long(2));
             let rem = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(rem, KnownFn::Rem, vec![x, two]));
@@ -1866,31 +1985,54 @@ fn try_inline_expansion(
             Ok(Some(emit_not(ctx, eq)))
         }
         "true?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("true? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("true? needs 1 arg"))?,
+            )?;
             let t = ctx.emit_const(Const::Bool(true));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Identical, vec![x, t]));
             Ok(Some(dst))
         }
         "false?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("false? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first()
+                    .ok_or_else(|| malformed("false? needs 1 arg"))?,
+            )?;
             let f = ctx.emit_const(Const::Bool(false));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Identical, vec![x, f]));
             Ok(Some(dst))
         }
         "max" => {
-            let a = lower_form(ctx, args.first().ok_or_else(|| malformed("max needs 2 args"))?)?;
-            let b = lower_form(ctx, args.get(1).ok_or_else(|| malformed("max needs 2 args"))?)?;
+            let a = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("max needs 2 args"))?,
+            )?;
+            let b = lower_form(
+                ctx,
+                args.get(1).ok_or_else(|| malformed("max needs 2 args"))?,
+            )?;
             Ok(Some(emit_max(ctx, a, b)))
         }
         "min" => {
-            let a = lower_form(ctx, args.first().ok_or_else(|| malformed("min needs 2 args"))?)?;
-            let b = lower_form(ctx, args.get(1).ok_or_else(|| malformed("min needs 2 args"))?)?;
+            let a = lower_form(
+                ctx,
+                args.first().ok_or_else(|| malformed("min needs 2 args"))?,
+            )?;
+            let b = lower_form(
+                ctx,
+                args.get(1).ok_or_else(|| malformed("min needs 2 args"))?,
+            )?;
             Ok(Some(emit_min(ctx, a, b)))
         }
         "empty?" => {
-            let x = lower_form(ctx, args.first().ok_or_else(|| malformed("empty? needs 1 arg"))?)?;
+            let x = lower_form(
+                ctx,
+                args.first()
+                    .ok_or_else(|| malformed("empty? needs 1 arg"))?,
+            )?;
             let seq_dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(seq_dst, KnownFn::Seq, vec![x]));
             let dst = ctx.fresh_var();
