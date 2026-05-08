@@ -187,10 +187,10 @@ impl LowerCtx {
         from_block: BlockId,
         var_id: VarId,
     ) {
-        if let Some(block) = self.finished_blocks.iter_mut().find(|b| b.id == header) {
-            if let Some(Inst::Phi(_, entries)) = block.phis.get_mut(phi_index) {
-                entries.push((from_block, var_id));
-            }
+        if let Some(block) = self.finished_blocks.iter_mut().find(|b| b.id == header)
+            && let Some(Inst::Phi(_, entries)) = block.phis.get_mut(phi_index)
+        {
+            entries.push((from_block, var_id));
         }
     }
 

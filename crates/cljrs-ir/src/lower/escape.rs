@@ -90,10 +90,10 @@ pub(crate) fn collect_allocs(ir_func: &IrFunction) -> HashMap<VarId, BlockId> {
         let block_id = block.id;
         let all_insts = block.phis.iter().chain(block.insts.iter());
         for inst in all_insts {
-            if is_alloc_inst(inst) {
-                if let Some(dst) = inst.dst() {
-                    result.insert(dst, block_id);
-                }
+            if is_alloc_inst(inst)
+                && let Some(dst) = inst.dst()
+            {
+                result.insert(dst, block_id);
             }
         }
     }
@@ -292,10 +292,10 @@ pub(crate) fn build_defn_map(root: &IrFunction) -> HashMap<(Arc<str>, Arc<str>),
             }
             // Match DefVar instructions against alloc_info
             for inst in &block.insts {
-                if let Inst::DefVar(_, ns, name, value) = inst {
-                    if let Some(info) = alloc_info.get(value) {
-                        result.insert((ns.clone(), name.clone()), info.clone());
-                    }
+                if let Inst::DefVar(_, ns, name, value) = inst
+                    && let Some(info) = alloc_info.get(value)
+                {
+                    result.insert((ns.clone(), name.clone()), info.clone());
                 }
             }
         }
@@ -370,10 +370,11 @@ fn find_call_result(
 ) -> Option<VarId> {
     let block = ir_func.blocks.iter().find(|b| b.id == block_id)?;
     for inst in &block.insts {
-        if let Inst::CallKnown(dst, func, args) = inst {
-            if func == known_fn && args.contains(&used_var) {
-                return Some(*dst);
-            }
+        if let Inst::CallKnown(dst, func, args) = inst
+            && func == known_fn
+            && args.contains(&used_var)
+        {
+            return Some(*dst);
         }
     }
     None
@@ -388,10 +389,11 @@ fn find_unknown_call_with_arg(
 ) -> Option<(VarId, usize)> {
     let block = ir_func.blocks.iter().find(|b| b.id == block_id)?;
     for inst in &block.insts {
-        if let Inst::Call(dst, callee, args) = inst {
-            if *callee == callee_var && args.contains(&arg_var) {
-                return Some((*dst, args.len()));
-            }
+        if let Inst::Call(dst, callee, args) = inst
+            && *callee == callee_var
+            && args.contains(&arg_var)
+        {
+            return Some((*dst, args.len()));
         }
     }
     None
@@ -584,10 +586,10 @@ pub(crate) fn classify_escape_with_ctx(
                     // Propagate through phi outputs
                     if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block) {
                         for phi in &block.phis {
-                            if let Inst::Phi(dst, entries) = phi {
-                                if entries.iter().any(|(_, v)| *v == current) {
-                                    worklist.push_back(*dst);
-                                }
+                            if let Inst::Phi(dst, entries) = phi
+                                && entries.iter().any(|(_, v)| *v == current)
+                            {
+                                worklist.push_back(*dst);
                             }
                         }
                     }

@@ -293,10 +293,11 @@ fn collect_use_blocks(
                         if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block)
                         {
                             for inst in &block.insts {
-                                if let Inst::CallKnown(dst, f, args) = inst {
-                                    if f == func && args.contains(&current) {
-                                        worklist.push(*dst);
-                                    }
+                                if let Inst::CallKnown(dst, f, args) = inst
+                                    && f == func
+                                    && args.contains(&current)
+                                {
+                                    worklist.push(*dst);
                                 }
                             }
                         }
@@ -305,10 +306,10 @@ fn collect_use_blocks(
                 UseKind::PhiInput => {
                     if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block) {
                         for phi in &block.phis {
-                            if let Inst::Phi(dst, entries) = phi {
-                                if entries.iter().any(|(_, v)| *v == current) {
-                                    worklist.push(*dst);
-                                }
+                            if let Inst::Phi(dst, entries) = phi
+                                && entries.iter().any(|(_, v)| *v == current)
+                            {
+                                worklist.push(*dst);
                             }
                         }
                     }
@@ -393,11 +394,11 @@ fn emit_region_for_alloc(
     for block in &mut ir_func.blocks {
         if block.id == alloc_block {
             for inst in &mut block.insts {
-                if inst.dst() == Some(alloc_var) {
-                    if let Some(kind) = alloc_to_region_kind(inst) {
-                        let operands = alloc_operands(inst);
-                        *inst = Inst::RegionAlloc(alloc_var, region_var, kind, operands);
-                    }
+                if inst.dst() == Some(alloc_var)
+                    && let Some(kind) = alloc_to_region_kind(inst)
+                {
+                    let operands = alloc_operands(inst);
+                    *inst = Inst::RegionAlloc(alloc_var, region_var, kind, operands);
                 }
             }
         }

@@ -362,13 +362,12 @@ fn lower_destructure_sequential(
                 lower_destructure_binding(ctx, &pattern[i], rest_var)?;
                 i += 1;
                 // Optional `:as alias` after rest
-                if i + 1 < n {
-                    if let FormKind::Keyword(k) = &pattern[i].kind {
-                        if k == "as" {
-                            lower_destructure_binding(ctx, &pattern[i + 1], val)?;
-                            // don't advance i — the outer loop will stop
-                        }
-                    }
+                if i + 1 < n
+                    && let FormKind::Keyword(k) = &pattern[i].kind
+                    && k == "as"
+                {
+                    lower_destructure_binding(ctx, &pattern[i + 1], val)?;
+                    // don't advance i — the outer loop will stop
                 }
             }
             FormKind::Keyword(k) if k == "as" => {
@@ -418,17 +417,16 @@ fn lower_destructure_associative(
     let mut defaults: Vec<(String, Form)> = Vec::new();
     let mut i = 0;
     while i + 1 < pairs.len() {
-        if let FormKind::Keyword(k) = &pairs[i].kind {
-            if k == "or" {
-                if let FormKind::Map(or_pairs) = &pairs[i + 1].kind {
-                    let mut j = 0;
-                    while j + 1 < or_pairs.len() {
-                        if let FormKind::Symbol(sym) = &or_pairs[j].kind {
-                            defaults.push((sym.clone(), or_pairs[j + 1].clone()));
-                        }
-                        j += 2;
-                    }
+        if let FormKind::Keyword(k) = &pairs[i].kind
+            && k == "or"
+            && let FormKind::Map(or_pairs) = &pairs[i + 1].kind
+        {
+            let mut j = 0;
+            while j + 1 < or_pairs.len() {
+                if let FormKind::Symbol(sym) = &or_pairs[j].kind {
+                    defaults.push((sym.clone(), or_pairs[j + 1].clone()));
                 }
+                j += 2;
             }
         }
         i += 2;
@@ -768,17 +766,17 @@ fn parse_params(params_vec: &[Form]) -> Result<(Vec<Form>, Option<Form>), LowerE
     let mut rest: Option<Form> = None;
     let mut i = 0;
     while i < params_vec.len() {
-        if let FormKind::Symbol(s) = &params_vec[i].kind {
-            if s == "&" {
-                i += 1;
-                if i >= params_vec.len() {
-                    return Err(LowerError::MalformedSpecialForm(
-                        "& must be followed by a parameter name".into(),
-                    ));
-                }
-                rest = Some(params_vec[i].clone());
-                break;
+        if let FormKind::Symbol(s) = &params_vec[i].kind
+            && s == "&"
+        {
+            i += 1;
+            if i >= params_vec.len() {
+                return Err(LowerError::MalformedSpecialForm(
+                    "& must be followed by a parameter name".into(),
+                ));
             }
+            rest = Some(params_vec[i].clone());
+            break;
         }
         fixed.push(params_vec[i].clone());
         i += 1;
@@ -1041,11 +1039,11 @@ fn lower_fn_arity(
             lower_destructure_binding(&mut sub, pat, gensym_var)?;
         }
     }
-    if let Some(ref ri) = rest_info {
-        if let Some(ref pat) = ri.pattern {
-            let gensym_var = sub.lookup_local(&ri.name).unwrap();
-            lower_destructure_binding(&mut sub, pat, gensym_var)?;
-        }
+    if let Some(ref ri) = rest_info
+        && let Some(ref pat) = ri.pattern
+    {
+        let gensym_var = sub.lookup_local(&ri.name).unwrap();
+        lower_destructure_binding(&mut sub, pat, gensym_var)?;
     }
 
     // Push loop header for recur.
@@ -1247,10 +1245,10 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
 }
 
 fn is_catch_or_finally(form: &Form) -> bool {
-    if let FormKind::List(p) = &form.kind {
-        if let Some(FormKind::Symbol(s)) = p.first().map(|f| &f.kind) {
-            return s == "catch" || s == "finally";
-        }
+    if let FormKind::List(p) = &form.kind
+        && let Some(FormKind::Symbol(s)) = p.first().map(|f| &f.kind)
+    {
+        return s == "catch" || s == "finally";
     }
     false
 }
@@ -1577,17 +1575,17 @@ fn lower_call(ctx: &mut LowerCtx, callee_form: &Form, arg_forms: &[Form]) -> R {
     };
 
     // Try inline expansions first.
-    if let Some(name) = sym_name {
-        if let Some(result) = try_inline_expansion(ctx, name, arg_forms)? {
-            return Ok(result);
-        }
+    if let Some(name) = sym_name
+        && let Some(result) = try_inline_expansion(ctx, name, arg_forms)?
+    {
+        return Ok(result);
     }
 
     // Known function?
-    if let Some(name) = sym_name {
-        if let Some(known) = resolve_known_fn(name) {
-            return lower_known_call(ctx, known, name, arg_forms);
-        }
+    if let Some(name) = sym_name
+        && let Some(known) = resolve_known_fn(name)
+    {
+        return lower_known_call(ctx, known, name, arg_forms);
     }
 
     // Generic dynamic call.
@@ -1717,14 +1715,14 @@ fn lower_known_call(ctx: &mut LowerCtx, known: KnownFn, name: &str, arg_forms: &
     }
 
     let expected = known_fn_arity(&known);
-    if let Some(exp) = expected {
-        if arg_vars.len() != exp {
-            // Arity mismatch — fall through to dynamic call.
-            let callee = lower_symbol(ctx, name)?;
-            let dst = ctx.fresh_var();
-            ctx.emit(Inst::Call(dst, callee, arg_vars));
-            return Ok(dst);
-        }
+    if let Some(exp) = expected
+        && arg_vars.len() != exp
+    {
+        // Arity mismatch — fall through to dynamic call.
+        let callee = lower_symbol(ctx, name)?;
+        let dst = ctx.fresh_var();
+        ctx.emit(Inst::Call(dst, callee, arg_vars));
+        return Ok(dst);
     }
 
     let dst = ctx.fresh_var();
@@ -1830,13 +1828,12 @@ fn emit_binary_fold(ctx: &mut LowerCtx, kf: KnownFn, args: Vec<VarId>) -> R {
             } else {
                 // Left-fold: (+ (+ a b) c)
                 let first = args[0];
-                let result = args[1..].iter().fold(Ok(first), |acc, &next| {
-                    let prev = acc?;
+
+                args[1..].iter().try_fold(first, |prev, &next| {
                     let dst = ctx.fresh_var();
                     ctx.emit(Inst::CallKnown(dst, kf.clone(), vec![prev, next]));
                     Ok(dst)
-                });
-                result
+                })
             }
         }
     }
