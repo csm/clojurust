@@ -55,8 +55,12 @@ jobs:
           echo ""
           echo "--- Sample crate Cargo.toml ---"
           cat crates/cljrs-types/Cargo.toml
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "chore: release $VERSION"
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release publish --execute --no-confirm --allow-dirty
+        run: cargo release publish --execute --no-confirm
