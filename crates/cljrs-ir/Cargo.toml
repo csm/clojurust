@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 cljrs-types  = { workspace = true }
-cljrs-reader = { path = "../cljrs-reader" }
+cljrs-reader = { workspace = true }
 serde        = { workspace = true, features = ["rc"] }
 postcard     = { workspace = true, features = ["alloc"] }
 

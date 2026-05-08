@@ -24,21 +24,21 @@ license = "EPL-1.0"
 repository = "https://github.com/csm/clojurust"
 
 [workspace.dependencies]
-cljrs-types    = { path = "crates/cljrs-types" }
-cljrs-gc       = { path = "crates/cljrs-gc" }
-cljrs-value    = { path = "crates/cljrs-value" }
-cljrs-reader   = { path = "crates/cljrs-reader" }
-cljrs-eval     = { path = "crates/cljrs-eval" }
-cljrs-stdlib   = { path = "crates/cljrs-stdlib" }
-cljrs-runtime  = { path = "crates/cljrs-runtime" }
-cljrs-ir       = { path = "crates/cljrs-ir" }
-cljrs-compiler = { path = "crates/cljrs-compiler" }
-cljrs-interop  = { path = "crates/cljrs-interop" }
-cljrs-logging  = { path = "crates/cljrs-logging" }
-cljrs-env      = { path = "crates/cljrs-env" }
-cljrs-builtins = { path = "crates/cljrs-builtins" }
-cljrs-interp   = { path = "crates/cljrs-interp" }
-cljrs-ir-prebuild = { path = "crates/cljrs-ir-prebuild" }
+cljrs-types    = { path = "crates/cljrs-types",    version = "0.1.0" }
+cljrs-gc       = { path = "crates/cljrs-gc",       version = "0.1.0" }
+cljrs-value    = { path = "crates/cljrs-value",    version = "0.1.0" }
+cljrs-reader   = { path = "crates/cljrs-reader",   version = "0.1.0" }
+cljrs-eval     = { path = "crates/cljrs-eval",     version = "0.1.0" }
+cljrs-stdlib   = { path = "crates/cljrs-stdlib",   version = "0.1.0" }
+cljrs-runtime  = { path = "crates/cljrs-runtime",  version = "0.1.0" }
+cljrs-ir       = { path = "crates/cljrs-ir",       version = "0.1.0" }
+cljrs-compiler = { path = "crates/cljrs-compiler", version = "0.1.0" }
+cljrs-interop  = { path = "crates/cljrs-interop",  version = "0.1.0" }
+cljrs-logging  = { path = "crates/cljrs-logging",  version = "0.1.0" }
+cljrs-env      = { path = "crates/cljrs-env",      version = "0.1.0" }
+cljrs-builtins = { path = "crates/cljrs-builtins", version = "0.1.0" }
+cljrs-interp   = { path = "crates/cljrs-interp",   version = "0.1.0" }
+cljrs-ir-prebuild = { path = "crates/cljrs-ir-prebuild", version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
