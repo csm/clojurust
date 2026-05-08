@@ -4,18 +4,6 @@
 //!
 //! Only runs when the `prebuild-ir` feature is enabled.
 
-// The build-deps are optional (activated by the `prebuild-ir` feature) and
-// carry a `-bd` local alias to avoid collisions with the regular [dependencies]
-// table.  Extern-crate aliases restore the short names for all call sites below.
-#[cfg(feature = "prebuild-ir")]
-extern crate cljrs_eval_bd as cljrs_eval;
-#[cfg(feature = "prebuild-ir")]
-extern crate cljrs_interp_bd as cljrs_interp;
-#[cfg(feature = "prebuild-ir")]
-extern crate cljrs_ir_bd as cljrs_ir;
-#[cfg(feature = "prebuild-ir")]
-extern crate cljrs_value_bd as cljrs_value;
-
 #[cfg(feature = "prebuild-ir")]
 fn main() {
     use std::path::PathBuf;
