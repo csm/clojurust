@@ -246,6 +246,7 @@ mod tests {
         (globals, env)
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(src: &str, env: &mut Env) -> EvalResult {
         let mut parser = Parser::new(src.to_string(), "<test>".to_string());
         let forms = parser.parse_all().expect("parse error");

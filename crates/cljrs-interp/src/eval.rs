@@ -1478,7 +1478,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_var_restore() {
-        let (globals, mut env) = make_env();
+        let (_globals, mut env) = make_env();
         eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
         eval_src("(binding [*x* 42] *x*)", &mut env).unwrap();
         // After binding block, value restored to root

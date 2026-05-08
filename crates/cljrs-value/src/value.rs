@@ -1306,6 +1306,7 @@ impl cljrs_gc::Trace for TypeInstance {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1314,7 @@ mod tests {
     fn kw(s: &str) -> Value {
         Value::keyword(Keyword::simple(s))
     }
+    #[allow(dead_code)]
     fn sym(s: &str) -> Value {
         Value::symbol(Symbol::simple(s))
     }
@@ -1422,6 +1424,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_pr_str_double() {
         assert_eq!(Value::Double(1.0).to_string(), "1.0");
         assert_eq!(Value::Double(3.14).to_string(), "3.14");

@@ -754,6 +754,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct Tracked {
         value: i32,
         dropped: Arc<Mutex<bool>>,
@@ -768,6 +769,7 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct Parent {
         child: GcPtr<Tracked>,
     }
