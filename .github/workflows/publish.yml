@@ -39,22 +39,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
+
       - name: Set crate versions
         run: |
           VERSION="${BASE_VERSION}.${{ github.run_number }}"
           echo "Publishing version: $VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
-          # Replace every version = "0.1.0" occurrence in one pass — covers
-          # [package] version, [workspace.dependencies] entries, and inline
-          # [dependencies] entries (e.g. build-deps in cljrs-stdlib) all at once.
-          # Including Cargo.toml here avoids the duplicate-key bug that appeared
-          # when a separate sed tried to prepend version = "=$VERSION" to workspace
-          # dep lines that already contained version = "0.1.0" at the end.
-          for toml in Cargo.toml crates/*/Cargo.toml; do
-            sed -i "s/version = \"0\.1\.0\"/version = \"$VERSION\"/g" "$toml"
-          done
-
+          cargo release version "$VERSION" --execute --no-confirm
           echo "--- Workspace Cargo.toml ---"
           cat Cargo.toml
           echo ""
@@ -64,52 +59,4 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          # Poll crates.io API until the given crate@version is indexed (max 5 min).
-          wait_for_crate() {
-            local crate="$1"
-            local version="$2"
-            local max_attempts=20
-            local sleep_sec=15
-            echo "Waiting for ${crate}@${version} to appear on crates.io..."
-            for i in $(seq 1 $max_attempts); do
-              http_status=$(curl -sf -o /dev/null -w "%{http_code}" \
-                -H "User-Agent: clojurust-publish-workflow" \
-                "https://crates.io/api/v1/crates/${crate}/${version}")
-              if [ "$http_status" = "200" ]; then
-                echo "${crate}@${version} is available."
-                return 0
-              fi
-              echo "Attempt ${i}/${max_attempts}: not yet available (HTTP ${http_status}), retrying in ${sleep_sec}s..."
-              sleep $sleep_sec
-            done
-            echo "ERROR: ${crate}@${version} did not appear on crates.io after $((max_attempts * sleep_sec))s"
-            return 1
-          }
-
-          # Publish order: leaves first, then dependents
-          CRATES=(
-            cljrs-logging
-            cljrs-types
-            cljrs-gc
-            cljrs-ir
-            cljrs-reader
-            cljrs-value
-            cljrs-env
-            cljrs-interop
-            cljrs-builtins
-            cljrs-interp
-            cljrs-eval
-            cljrs-ir-prebuild
-            cljrs-runtime
-            cljrs-stdlib
-            cljrs-compiler
-            cljrs
-          )
-
-          for crate in "${CRATES[@]}"; do
-            echo "::group::Publishing $crate"
-            cargo publish --allow-dirty -p "$crate"
-            echo "::endgroup::"
-            wait_for_crate "$crate" "$VERSION"
-          done
+        run: cargo release publish --execute --no-confirm
