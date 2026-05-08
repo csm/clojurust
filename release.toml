@@ -1,4 +1,3 @@
-[workspace]
 # Keep all workspace crate versions in lock-step when bumping.
 dependent-version = "upgrade"
 
