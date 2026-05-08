@@ -488,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_float() {
         assert_eq!(parse1("3.14").kind, FormKind::Float(3.14));
         assert_eq!(parse1("1e10").kind, FormKind::Float(1e10));

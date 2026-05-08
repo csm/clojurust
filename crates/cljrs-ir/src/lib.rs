@@ -11,6 +11,8 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod lower;
+
 use cljrs_types::error::CljxError::SerializationError;
 use cljrs_types::error::CljxResult;
 use cljrs_types::span::Span;

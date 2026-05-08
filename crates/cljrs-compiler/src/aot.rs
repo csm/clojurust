@@ -17,7 +17,6 @@ use cljrs_reader::Parser;
 
 use crate::codegen::Compiler;
 use crate::ir::IrFunction;
-use cljrs_eval::ir_convert;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -74,136 +73,33 @@ impl From<crate::codegen::CodegenError> for AotError {
 
 pub type AotResult<T> = Result<T, AotError>;
 
-// ── Clojure-based lowering ──────────────────────────────────────────────────
+// ── Rust-native lowering ────────────────────────────────────────────────────
 
-/// Lower forms via the Clojure compiler front-end.
+/// Lower forms directly via the native Rust compiler pipeline.
 ///
-/// 1. Ensures compiler namespaces are loaded
-/// 2. Converts Forms → Values via `form_to_value`
-/// 3. Calls `cljrs.compiler.anf/lower-fn-body` via `callback::invoke`
-/// 4. Converts returned Value → `IrFunction` via `ir_convert`
-pub fn lower_via_clojure(
+/// Replaces the old `lower_via_clojure` path: no interpreter round-trip,
+/// no `callback::invoke`, no `ir_convert`.
+pub fn lower_via_rust(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
     compilable_forms: &[cljrs_reader::Form],
-    env: &mut cljrs_eval::Env,
+    _env: &mut cljrs_eval::Env,
 ) -> AotResult<IrFunction> {
-    // Register compiler sources so require can find them.
-    crate::register_compiler_sources(&env.globals);
+    let ns_arc: Arc<str> = Arc::from(ns);
+    let ir = cljrs_ir::lower::lower_fn_body(name, &ns_arc, params, compilable_forms)
+        .map_err(|e| AotError::Eval(format!("lowering: {e:?}")))?;
+    let ir = cljrs_ir::lower::optimize(ir);
 
-    // Push eval context so callback::invoke can work.
-    cljrs_env::callback::push_eval_context(env);
-
-    // Set IR_LOWERING_ACTIVE to prevent eager lowering of closures
-    // created inside the Clojure compiler during this lowering call.
-    use cljrs_eval::apply::IR_LOWERING_ACTIVE;
-    let was_active = IR_LOWERING_ACTIVE.with(|c| c.get());
-    IR_LOWERING_ACTIVE.with(|c| c.set(true));
-
-    let result = lower_via_clojure_inner(name, ns, params, compilable_forms, env);
-
-    // Restore lowering flag and pop eval context.
-    IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
-    cljrs_env::callback::pop_eval_context();
-
-    result
-}
-
-fn lower_via_clojure_inner(
-    name: Option<&str>,
-    ns: &str,
-    params: &[Arc<str>],
-    compilable_forms: &[cljrs_reader::Form],
-    env: &mut cljrs_eval::Env,
-) -> AotResult<IrFunction> {
-    use cljrs_gc::GcPtr;
-    use cljrs_value::Value;
-    use cljrs_value::collections::vector::PersistentVector;
-
-    // Ensure the ANF and optimize namespaces are loaded.
-    let span = || cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1);
-    for ns_name in &["cljrs.compiler.anf", "cljrs.compiler.optimize"] {
-        let require_form = cljrs_reader::Form::new(
-            cljrs_reader::form::FormKind::List(vec![
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Symbol("require".into()),
-                    span(),
-                ),
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
-                        cljrs_reader::form::FormKind::Symbol((*ns_name).into()),
-                        span(),
-                    ))),
-                    span(),
-                ),
-            ]),
-            span(),
-        );
-        cljrs_eval::eval(&require_form, env).map_err(|e| AotError::Eval(format!("{e:?}")))?;
-    }
-
-    // Look up the lower-fn-body function.
-    let lower_fn = env
-        .globals
-        .lookup_var_in_ns("cljrs.compiler.anf", "lower-fn-body")
-        .ok_or_else(|| AotError::Eval("cljrs.compiler.anf/lower-fn-body not found".to_string()))?;
-    let lower_fn_val = lower_fn.get().deref().unwrap_or(Value::Nil);
-
-    // Build arguments:
-    // 1. fname (string or nil)
-    let fname_val = match name {
-        Some(n) => Value::string(n.to_string()),
-        None => Value::Nil,
-    };
-
-    // 2. ns (string)
-    let ns_val = Value::string(ns.to_string());
-
-    // 3. params (vector of strings)
-    let params_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        params.iter().map(|p| Value::string(p.to_string())),
-    )));
-
-    // 4. body-forms (vector of form values)
-    let body_forms_val = Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        compilable_forms
-            .iter()
-            .map(cljrs_builtins::form::form_to_value),
-    )));
-
-    // Call the Clojure lowering function.
-    let ir_data = cljrs_env::callback::invoke(
-        &lower_fn_val,
-        vec![fname_val, ns_val, params_val, body_forms_val],
-    )
-    .map_err(|e| AotError::Eval(format!("Clojure lowering failed: {e:?}")))?;
-
-    // Run the optimization pass (escape analysis → region allocation).
-    let optimize_fn = env
-        .globals
-        .lookup_var_in_ns("cljrs.compiler.optimize", "optimize")
-        .ok_or_else(|| AotError::Eval("cljrs.compiler.optimize/optimize not found".to_string()))?;
-    let optimize_fn_val = optimize_fn.get().deref().unwrap_or(Value::Nil);
-
-    let optimized = cljrs_env::callback::invoke(&optimize_fn_val, vec![ir_data])
-        .map_err(|e| AotError::Eval(format!("Optimization failed: {e:?}")))?;
-
-    // Convert the result Value → IrFunction.
-    let ir_func = ir_convert::value_to_ir_function(&optimized)
-        .map_err(|e| AotError::Eval(format!("IR conversion failed: {e}")))?;
-
-    // Under no-gc: run the blacklist analysis and reject programs that contain
-    // patterns the AOT code generator cannot safely compile.
     #[cfg(feature = "no-gc")]
     {
-        let violations = crate::escape::check(&ir_func);
+        let violations = crate::escape::check(&ir);
         if !violations.is_empty() {
             return Err(AotError::NoGcBlacklist(violations));
         }
     }
 
-    Ok(ir_func)
+    Ok(ir)
 }
 
 // ── Direct call optimization ────────────────────────────────────────────────
@@ -504,7 +400,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
 
     // Use the current namespace (may have been changed by ns form in preamble).
     let current_ns = env.current_ns.to_string();
-    let mut ir_func = lower_via_clojure(
+    let mut ir_func = lower_via_rust(
         Some("__cljrs_main"),
         &current_ns,
         &params,

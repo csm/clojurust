@@ -977,6 +977,7 @@ mod tests {
     // ── Floats ────────────────────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_floats() {
         assert_eq!(lex_one("3.14"), Token::Float(3.14));
         assert_eq!(lex_one("1e10"), Token::Float(1e10));
