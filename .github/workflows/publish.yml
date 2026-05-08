@@ -32,8 +32,12 @@ jobs:
     name: Publish to crates.io
     needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -58,7 +62,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -A
-          git commit -m "chore: release $VERSION"
+          git commit -m "chore: release $VERSION [skip ci]"
+          git push
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
 
       - name: Publish crates
         env:
