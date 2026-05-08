@@ -568,19 +568,21 @@ pub(crate) fn classify_escape_with_ctx(
                     }
                     let _ = arg_index; // suppress unused warning
                 }
-                UseKind::KnownCallArg { func, arg_index } => {
-                    if known_fn_arg_escapes(func, *arg_index) {
-                        // The call result may carry this alloc
-                        if let Some(call_result) =
-                            find_call_result(current, func, ir_func, use_info.block)
-                        {
-                            worklist.push_back(call_result);
-                        } else {
-                            result = EscapeState::Escapes;
-                            break 'outer;
-                        }
+                UseKind::KnownCallArg { func, arg_index }
+                    if known_fn_arg_escapes(func, *arg_index) =>
+                {
+                    // The call result may carry this alloc
+                    if let Some(call_result) =
+                        find_call_result(current, func, ir_func, use_info.block)
+                    {
+                        worklist.push_back(call_result);
+                    } else {
+                        result = EscapeState::Escapes;
+                        break 'outer;
                     }
-                    // else: doesn't escape through this call
+                }
+                UseKind::KnownCallArg { .. } => {
+                    // doesn't escape through this call
                 }
                 UseKind::PhiInput => {
                     // Propagate through phi outputs

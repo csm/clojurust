@@ -287,22 +287,22 @@ fn collect_use_blocks(
         for use_info in uses.get(&current).into_iter().flatten() {
             use_blocks.insert(use_info.block);
             match &use_info.kind {
-                UseKind::KnownCallArg { func, arg_index } => {
-                    if known_fn_arg_escapes(func, *arg_index) {
-                        // Find the call result and propagate
-                        if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block)
-                        {
-                            for inst in &block.insts {
-                                if let Inst::CallKnown(dst, f, args) = inst
-                                    && f == func
-                                    && args.contains(&current)
-                                {
-                                    worklist.push(*dst);
-                                }
+                UseKind::KnownCallArg { func, arg_index }
+                    if known_fn_arg_escapes(func, *arg_index) =>
+                {
+                    // Find the call result and propagate
+                    if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block) {
+                        for inst in &block.insts {
+                            if let Inst::CallKnown(dst, f, args) = inst
+                                && f == func
+                                && args.contains(&current)
+                            {
+                                worklist.push(*dst);
                             }
                         }
                     }
                 }
+                UseKind::KnownCallArg { .. } => {}
                 UseKind::PhiInput => {
                     if let Some(block) = ir_func.blocks.iter().find(|b| b.id == use_info.block) {
                         for phi in &block.phis {
