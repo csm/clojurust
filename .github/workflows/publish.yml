@@ -59,4 +59,4 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release publish --execute --no-confirm
+        run: cargo release publish --execute --no-confirm --allow-dirty
