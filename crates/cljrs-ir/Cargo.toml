@@ -7,14 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-cljrs-types = { workspace = true }
-serde = { workspace = true, features = ["rc"] }
-postcard = { workspace = true, features = ["alloc"] }
+cljrs-types  = { workspace = true }
+cljrs-reader = { path = "../cljrs-reader" }
+serde        = { workspace = true, features = ["rc"] }
+postcard     = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
-cljrs-eval     = { path = "../cljrs-eval" }
-cljrs-stdlib   = { path = "../cljrs-stdlib" }
-cljrs-reader   = { path = "../cljrs-reader" }
+cljrs-eval   = { path = "../cljrs-eval" }
+cljrs-stdlib = { path = "../cljrs-stdlib" }
 cljrs-value    = { path = "../cljrs-value" }
 cljrs-gc       = { path = "../cljrs-gc" }
 cljrs-env      = { path = "../cljrs-env" }

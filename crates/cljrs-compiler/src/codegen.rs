@@ -1621,7 +1621,7 @@ mod tests {
             .spawn(move || {
                 let globals = cljrs_stdlib::standard_env();
                 let mut env = cljrs_eval::Env::new(globals, "user");
-                crate::aot::lower_via_clojure(Some(&name), "user", &params, &body, &mut env)
+                crate::aot::lower_via_rust(Some(&name), "user", &params, &body, &mut env)
                     .unwrap()
             })
             .unwrap()
