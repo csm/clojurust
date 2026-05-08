@@ -15,9 +15,11 @@ use std::sync::Mutex;
 
 /// Serialize all AOT tests — each invokes `cargo build` in a harness project,
 /// and concurrent cargo processes fight over the crates.io index lock.
+#[allow(dead_code)]
 static AOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Compile a `.cljrs` source string to a binary, run it, and return stdout.
+#[allow(dead_code, clippy::result_large_err)]
 fn compile_and_run(name: &str, source: &str) -> String {
     let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -58,6 +60,7 @@ fn compile_and_run(name: &str, source: &str) -> String {
 }
 
 /// Assert that compiled output matches expected lines.
+#[allow(dead_code)]
 fn assert_output(name: &str, source: &str, expected: &str) {
     let actual = compile_and_run(name, source);
     assert_eq!(

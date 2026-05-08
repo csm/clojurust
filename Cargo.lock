@@ -332,6 +332,7 @@ dependencies = [
  "cljrs-gc",
  "cljrs-interp",
  "cljrs-ir",
+ "cljrs-logging",
  "cljrs-reader",
  "cljrs-stdlib",
  "cljrs-types",

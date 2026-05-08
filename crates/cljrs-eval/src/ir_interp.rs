@@ -28,14 +28,19 @@ use cljrs_env::error::{EvalError, EvalResult};
 // ── Register file ───────────────────────────────────────────────────────────
 
 /// Dense register file indexed by `VarId`.
+///
+/// Uses `Box<[Option<Value>]>` rather than `Vec` so the heap address of the
+/// slice data is stable after construction.  This lets us register the slice as
+/// a GC root via `root_option_values` without worrying about reallocation
+/// invalidating the stored raw pointer.
 struct Registers {
-    values: Vec<Option<Value>>,
+    values: Box<[Option<Value>]>,
 }
 
 impl Registers {
     fn new(capacity: u32) -> Self {
         Self {
-            values: vec![None; capacity as usize],
+            values: vec![None; capacity as usize].into_boxed_slice(),
         }
     }
 
@@ -46,11 +51,9 @@ impl Registers {
     }
 
     fn set(&mut self, id: VarId, val: Value) {
-        let idx = id.0 as usize;
-        if idx >= self.values.len() {
-            self.values.resize(idx + 1, None);
-        }
-        self.values[idx] = Some(val);
+        // Bounds check: VarIds are allocated sequentially up to ir_func.next_var,
+        // so any out-of-range access indicates malformed IR.
+        self.values[id.0 as usize] = Some(val);
     }
 
     fn get_cloned(&self, id: VarId) -> Value {
@@ -99,6 +102,10 @@ pub fn interpret_ir(
     cljrs_env::gc_roots::gc_safepoint(env);
 
     let mut regs = Registers::new(ir_func.next_var);
+    // Keep all values in the register file alive across GC safepoints.
+    // The Box<[Option<Value>]> slice address is stable; this guard pops the
+    // root entry when interpret_ir returns (or unwinds).
+    let _regs_root = cljrs_env::gc_roots::root_option_values(&regs.values);
     let mut region_stack: Vec<RegionEntry> = Vec::new();
 
     // Bind parameters to registers.
@@ -295,20 +302,17 @@ fn execute_inst(
         }
 
         Inst::Call(dst, callee, args) => {
-            // GC safepoint before call.
             cljrs_env::gc_roots::gc_safepoint(env);
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee_val, arg_vals, env)?;
+            let result = dispatch_or_sentinel(callee_val, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
         Inst::CallDirect(dst, name, args) => {
-            // Look up the function by name in globals and call it.
             cljrs_env::gc_roots::gc_safepoint(env);
-            let callee = load_global_value(globals, ns, name, ns)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            let result = apply_value(&callee, arg_vals, env)?;
+            let result = dispatch_sentinel_by_name(name, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
 
@@ -319,12 +323,15 @@ fn execute_inst(
         }
 
         Inst::DefVar(dst, def_ns, name, val_var) => {
+            // Always create a fresh, call-local Var (not registered in globals).
+            // The ANF compiler uses DefVar as a mutable cell for letfn / named-fn
+            // self-recursion; the cell is accessed only via the register returned
+            // here, never via LoadGlobal, so name collisions with real globals are
+            // harmless and we never need to touch the global namespace.
             let val = regs.get_cloned(*val_var);
-            globals.intern(def_ns, name.clone(), val.clone());
-            let var = globals
-                .lookup_var_in_ns(def_ns, name)
-                .expect("just interned");
-            regs.set(*dst, Value::Var(var));
+            let fresh = cljrs_value::Var::new(def_ns.clone(), name.clone());
+            fresh.bind(val);
+            regs.set(*dst, Value::Var(GcPtr::new(fresh)));
         }
 
         Inst::SetBang(var_id, val_id) => {
@@ -415,6 +422,13 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
             "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
+    // JVM class names resolve to themselves as symbols, mirroring eval_symbol.
+    if cljrs_interp::eval::is_jvm_class_name(name) {
+        return Ok(Value::Symbol(GcPtr::new(cljrs_value::Symbol {
+            namespace: None,
+            name: Arc::from(name),
+        })));
+    }
     Err(EvalError::Runtime(format!(
         "IR interpreter: var not found {resolved_ns}/{name}"
     )))
@@ -488,13 +502,37 @@ fn alloc_closure(
     let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
-    // Each arity maps to a subfunction in ir_func.subfunctions.
-    let subfuncs: Vec<Arc<IrFunction>> = ir_func
-        .subfunctions
-        .iter()
-        .map(clone_ir_function)
-        .map(Arc::new)
-        .collect();
+    // Each arity maps to a named subfunction in ir_func.subfunctions.
+    // We use arity_fn_names (when present) to match each arity slot to its
+    // correct subfunction by name, rather than relying on positional indexing.
+    // Positional indexing is wrong when the parent function has more
+    // subfunctions than arities (e.g. fnil has two inner lambdas but the
+    // returned closure is only the second one).
+    let subfuncs: Vec<Arc<IrFunction>> = if !template.arity_fn_names.is_empty() {
+        template
+            .arity_fn_names
+            .iter()
+            .map(|fn_name| {
+                let sf = ir_func
+                    .subfunctions
+                    .iter()
+                    .find(|sf| sf.name.as_deref() == Some(fn_name.as_ref()))
+                    .unwrap_or_else(|| {
+                        ir_func.subfunctions.first().unwrap_or_else(|| {
+                            panic!("IR closure: no subfunctions for '{fn_name}'")
+                        })
+                    });
+                Arc::new(clone_ir_function(sf))
+            })
+            .collect()
+    } else {
+        ir_func
+            .subfunctions
+            .iter()
+            .map(clone_ir_function)
+            .map(Arc::new)
+            .collect()
+    };
 
     let param_counts = template.param_counts.clone();
     let is_variadic = template.is_variadic.clone();
@@ -602,6 +640,79 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
     }
 }
 
+// ── Sentinel-aware call dispatch ────────────────────────────────────────────
+
+/// Dispatch a generic callee value, intercepting sentinel `NativeFunction`s.
+///
+/// Several clojure.core entries (volatile!, vswap!, make-delay, etc.) are
+/// sentinel stubs that unconditionally error when called normally — the real
+/// work happens in `eval_call`'s special-form dispatch, which the IR
+/// interpreter bypasses.  We intercept those by name here so that IR code
+/// calling them works correctly.
+fn dispatch_or_sentinel(
+    callee: Value,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    if let Value::NativeFunction(nf) = &callee
+        && is_sentinel(nf.get().name.as_ref())
+    {
+        return dispatch_sentinel_by_name(nf.get().name.as_ref(), args, globals, ns, env);
+    }
+    apply_value(&callee, args, env)
+}
+
+/// Dispatch a call to a sentinel operation by name, or fall through to a
+/// global lookup + `apply_value` for non-sentinel names.
+fn dispatch_sentinel_by_name(
+    name: &str,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult {
+    match name {
+        "volatile!" => cljrs_interp::apply::eval_volatile(args),
+        "reset!" => cljrs_interp::apply::eval_reset_bang(args, env),
+        "vreset!" => cljrs_interp::apply::eval_vreset_bang(args),
+        "vswap!" => cljrs_interp::apply::eval_vswap_bang(args, env),
+        "make-delay" => {
+            let f = args.into_iter().next().ok_or_else(|| EvalError::Arity {
+                name: "make-delay".into(),
+                expected: "1".into(),
+                got: 0,
+            })?;
+            cljrs_interp::apply::make_delay_from_fn(&f, globals.clone(), ns.clone())
+        }
+        "alter-var-root" => cljrs_interp::apply::eval_alter_var_root(args, env),
+        "vary-meta" => cljrs_interp::apply::eval_vary_meta(args, env),
+        "with-bindings*" => cljrs_interp::apply::eval_with_bindings_star(args, env),
+        "send" | "send-off" => cljrs_interp::apply::eval_send_to_agent(args, env),
+        _ => {
+            let callee = load_global_value(globals, ns, name, ns)?;
+            apply_value(&callee, args, env)
+        }
+    }
+}
+
+fn is_sentinel(name: &str) -> bool {
+    matches!(
+        name,
+        "volatile!"
+            | "reset!"
+            | "vreset!"
+            | "vswap!"
+            | "make-delay"
+            | "alter-var-root"
+            | "vary-meta"
+            | "with-bindings*"
+            | "send"
+            | "send-off"
+    )
+}
+
 // ── KnownFn dispatch ────────────────────────────────────────────────────────
 
 /// Dispatch a call to a known built-in function.
@@ -646,10 +757,7 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::IsKeyword => Ok(Value::Bool(matches!(args.first(), Some(Value::Keyword(_))))),
         KnownFn::IsSymbol => Ok(Value::Bool(matches!(args.first(), Some(Value::Symbol(_))))),
         KnownFn::IsBool => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
-        KnownFn::IsInt => Ok(Value::Bool(matches!(
-            args.first(),
-            Some(Value::Long(_) | Value::BigInt(_))
-        ))),
+        KnownFn::IsInt => Ok(Value::Bool(matches!(args.first(), Some(Value::Long(_))))),
 
         // ── String ──────────────────────────────────────────────────────
         KnownFn::Str => {
@@ -740,12 +848,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
                 Ok(Value::Nil)
             }
         }
-        KnownFn::AtomReset => builtin_call_native("reset!", &args),
-        KnownFn::AtomSwap => {
-            // swap! needs env for callback.
-            let callee = load_builtin(env, "swap!")?;
-            apply_value(&callee, args, env)
-        }
+        KnownFn::AtomReset => cljrs_interp::apply::eval_reset_bang(args, env),
+        KnownFn::AtomSwap => cljrs_interp::apply::eval_swap_bang(args, env),
 
         // ── I/O ─────────────────────────────────────────────────────────
         KnownFn::Println => builtin_call_native("println", &args),
@@ -800,7 +904,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 
         // ── Dynamic binding / exception handling ────────────────────────
         KnownFn::SetBangVar => builtin_call_native("set!", &args),
-        KnownFn::WithBindings | KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
+        KnownFn::WithBindings => eval_ir_with_bindings(args, env),
+        KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
@@ -809,6 +914,43 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 }
 
 // ── Helpers for KnownFn dispatch ────────────────────────────────────────────
+
+/// Handle `KnownFn::WithBindings` emitted by `lower-binding`.
+///
+/// The ANF lowerer emits flat args `[var0, val0, var1, val1, ..., body-fn]`.
+/// This is different from the `with-bindings*` public API which takes a map,
+/// so we assemble the frame here rather than delegating to eval_with_bindings_star.
+fn eval_ir_with_bindings(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    use std::collections::HashMap;
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "with-bindings".into(),
+            expected: "1+".into(),
+            got: 0,
+        });
+    }
+    // Last arg is the body thunk; preceding args are (Var, value) pairs.
+    let body = args.last().unwrap().clone();
+    let pairs = &args[..args.len() - 1];
+    if !pairs.len().is_multiple_of(2) {
+        return Err(EvalError::Runtime(
+            "with-bindings: odd number of var/val pairs".into(),
+        ));
+    }
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    for chunk in pairs.chunks(2) {
+        if let Value::Var(vp) = &chunk[0] {
+            frame.insert(cljrs_env::dynamics::var_key_of(vp), chunk[1].clone());
+        } else {
+            return Err(EvalError::Runtime(format!(
+                "with-bindings: binding key must be a Var, got {}",
+                chunk[0].type_name()
+            )));
+        }
+    }
+    let _guard = cljrs_env::dynamics::push_frame(frame);
+    cljrs_env::apply::apply_value(&body, vec![], env)
+}
 
 /// Call a native builtin by name from the global environment.
 fn builtin_call_native(name: &str, args: &[Value]) -> EvalResult {
@@ -988,14 +1130,20 @@ fn builtin_compare(known_fn: &KnownFn, args: &[Value]) -> EvalResult {
 /// Compiler loading is triggered separately (e.g., by the binary at startup).
 pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     use crate::apply::IR_LOWERING_ACTIVE;
+    let mut lowered = 0;
+    let mut cached = 0;
+    let mut failed = 0;
 
     // Skip if eager lowering is disabled.
     if !crate::apply::eager_lower_enabled() {
         return;
     }
 
+    cljrs_logging::feat_trace!("ir", "eager_lower_fn {:?}", f.name);
+
     // Don't lower macros (they operate on forms, not values).
     if f.is_macro {
+        cljrs_logging::feat_debug!("ir", "not lowering macro: {:?}", f.name);
         return;
     }
 
@@ -1005,11 +1153,23 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
         .compiler_ready
         .load(std::sync::atomic::Ordering::Acquire)
     {
+        cljrs_logging::feat_debug!("ir", "compiler not ready, not lowering");
+        return;
+    }
+
+    // Don't lower closures that capture variables from an enclosing scope.
+    // lower-fn-body only knows about the explicit arity params; captured names
+    // are invisible to it, so any reference to a capture would be emitted as
+    // LoadGlobal(defining-ns, name) — which either resolves to the wrong var or
+    // fails at runtime with "var not found".  Top-level defns have no captures,
+    // so they are safe to lower.  Inner closures will fall back to tree-walking.
+    if !f.closed_over_names.is_empty() {
         return;
     }
 
     // Don't nest lowering calls.
     if IR_LOWERING_ACTIVE.get() {
+        cljrs_logging::feat_trace!("ir", "lowering active, not continuing");
         return;
     }
 
@@ -1018,10 +1178,22 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     for arity in &f.arities {
         let arity_id = arity.ir_arity_id;
         if !crate::ir_cache::should_attempt(arity_id) {
+            cached += 1;
             continue;
         }
 
-        match crate::lower::lower_arity(
+        // Don't lower arities with destructured params or rest params.
+        // lower-fn-body only binds the gensym'd placeholder names from
+        // arity.params; the body uses the original symbolic names (a, b, k, v,
+        // ...) that bind_fn_params would normally introduce.  Those names are
+        // absent from the IR context and would be emitted as LoadGlobal
+        // instructions referencing non-existent vars.
+        if !arity.destructure_params.is_empty() || arity.destructure_rest.is_some() {
+            crate::ir_cache::store_unsupported(arity_id);
+            continue;
+        }
+
+        match crate::lower::lower_and_optimize_arity(
             f.name.as_deref(),
             &arity.params,
             arity.rest_param.as_ref(),
@@ -1030,13 +1202,24 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             env,
         ) {
             Ok(ir_func) => {
-                crate::ir_cache::store_cached(arity_id, std::sync::Arc::new(ir_func));
+                crate::ir_cache::store_cached(arity_id, Arc::new(ir_func));
+                lowered += 1;
             }
             Err(_) => {
                 crate::ir_cache::store_unsupported(arity_id);
+                failed += 1;
             }
         }
     }
+
+    cljrs_logging::feat_debug!(
+        "ir",
+        "ir complete {:?} lowered:{} cached:{} failed:{}",
+        f.name,
+        lowered,
+        cached,
+        failed
+    );
 
     IR_LOWERING_ACTIVE.set(false);
 }

@@ -1,0 +1,9 @@
+# Keep all workspace crate versions in lock-step when bumping.
+dependent-version = "upgrade"
+
+# Guard against `cargo release` (the composite command) being run directly,
+# either locally or in a future workflow step. The CI workflow intentionally
+# uses only the `version` and `publish` sub-commands, which never touch git
+# regardless of these settings.
+tag = false
+push = false

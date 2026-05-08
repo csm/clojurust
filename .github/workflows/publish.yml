@@ -32,64 +32,41 @@ jobs:
     name: Publish to crates.io
     needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
+
       - name: Set crate versions
         run: |
           VERSION="${BASE_VERSION}.${{ github.run_number }}"
           echo "Publishing version: $VERSION"
-
-          # Update workspace dependency versions so inter-crate deps use the new version
-          for toml in crates/*/Cargo.toml; do
-            sed -i "s/^version.*=.*\"0\.1\.0\"/version = \"$VERSION\"/" "$toml"
-          done
-
-          # Update workspace dependency table to use the new version
-          CRATES=(cljrs-logging cljrs-types cljrs-gc cljrs-ir cljrs-reader cljrs-value cljrs-env cljrs-interop cljrs-builtins cljrs-interp cljrs-eval cljrs-ir-prebuild cljrs-runtime cljrs-stdlib cljrs-compiler cljrs)
-          for crate in "${CRATES[@]}"; do
-            sed -i "s/^${crate} *= *{.*path/${crate} = { version = \"=$VERSION\", path/" Cargo.toml
-          done
-
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cargo release version "$VERSION" --execute --no-confirm
           echo "--- Workspace Cargo.toml ---"
           cat Cargo.toml
           echo ""
           echo "--- Sample crate Cargo.toml ---"
           cat crates/cljrs-types/Cargo.toml
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "chore: release $VERSION"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          # Publish order: leaves first, then dependents
-          # Sleep between publishes to let crates.io index catch up
-          CRATES=(
-            cljrs-logging
-            cljrs-types
-            cljrs-gc
-            cljrs-ir
-            cljrs-reader
-            cljrs-value
-            cljrs-env
-            cljrs-interop
-            cljrs-builtins
-            cljrs-interp
-            cljrs-eval
-            cljrs-ir-prebuild
-            cljrs-runtime
-            cljrs-stdlib
-            cljrs-compiler
-            cljrs
-          )
-
-          for crate in "${CRATES[@]}"; do
-            echo "::group::Publishing $crate"
-            cargo publish --allow-dirty -p "$crate"
-            echo "::endgroup::"
-            # Wait for crates.io index to update before publishing dependents
-            sleep 30
-          done
+        run: cargo release publish --execute --no-confirm

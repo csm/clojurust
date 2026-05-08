@@ -1,14 +1,22 @@
 [package]
-name        = "cljrs-stdlib"
-version     = "0.1.0"
-edition     = "2024"
+name = "cljrs-stdlib"
+version = "0.1.0"
+edition = "2024"
 description = "Built-in standard library namespaces for clojurust (clojure.string, clojure.set, clojure.test, …)"
 license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["prebuild-ir"]
-prebuild-ir = []
+default = []
+prebuild-ir = [
+    "dep:cljrs-ir",
+    "dep:cljrs-eval",
+    "dep:cljrs-interp",
+    "dep:cljrs-value",
+    "dep:cljrs-env",
+    "dep:cljrs-reader",
+    "dep:cljrs-types",
+]
 no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-builtins/no-gc"]
 
 [dependencies]
@@ -24,10 +32,10 @@ tokio        = { workspace = true, features = ["rt", "sync", "rt-multi-thread"] 
 lazy_static = "1.5.0"
 
 [build-dependencies]
-cljrs-ir       = { workspace = true }
-cljrs-eval     = { workspace = true }
-cljrs-interp   = { workspace = true }
-cljrs-value    = { workspace = true }
-cljrs-env      = { workspace = true }
-cljrs-reader   = { workspace = true }
-cljrs-types    = { workspace = true }
+cljrs-ir     = { path = "../cljrs-ir",     version = "0.1.0", optional = true }
+cljrs-eval   = { path = "../cljrs-eval",   version = "0.1.0", optional = true }
+cljrs-interp = { path = "../cljrs-interp", version = "0.1.0", optional = true }
+cljrs-value  = { path = "../cljrs-value",  version = "0.1.0", optional = true }
+cljrs-env    = { path = "../cljrs-env",    version = "0.1.0", optional = true }
+cljrs-reader = { path = "../cljrs-reader", version = "0.1.0", optional = true }
+cljrs-types  = { path = "../cljrs-types",  version = "0.1.0", optional = true }

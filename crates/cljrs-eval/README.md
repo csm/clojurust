@@ -94,6 +94,31 @@ pub mod lower {
 4. If not cached: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking)
 5. Eager lowering: `ir_interp::eager_lower_fn` is registered as the `on_fn_defined` hook;
    when `compiler_ready` is true, new `fn*` definitions are lowered immediately
+6. `eval_call` in `cljrs_interp` routes `Value::Fn` calls through `globals.call_cljrs_fn`
+   (the registered hook) rather than calling the tree-walker directly, so IR-cached
+   arities are used on direct call paths too
+
+## Special-form coverage in the IR interpreter
+
+Several `clojure.core` entries are sentinel stubs that error unconditionally
+when called through the normal function-call path — the real logic lives in
+`eval_call`'s special-form dispatch.  `ir_interp.rs` handles all of them
+without going through the stubs:
+
+| Operation | How handled in IR |
+|---|---|
+| `swap!` (`KnownFn::AtomSwap`) | `cljrs_interp::apply::eval_swap_bang` |
+| `with-bindings*` (`KnownFn::WithBindings`) | `cljrs_interp::apply::eval_with_bindings_star` |
+| `volatile!` | `dispatch_sentinel_by_name` → `eval_volatile` |
+| `vreset!` | `dispatch_sentinel_by_name` → `eval_vreset_bang` |
+| `vswap!` | `dispatch_sentinel_by_name` → `eval_vswap_bang` |
+| `make-delay` | `dispatch_sentinel_by_name` → `make_delay_from_fn` |
+| `alter-var-root` | `dispatch_sentinel_by_name` → `eval_alter_var_root` |
+| `vary-meta` | `dispatch_sentinel_by_name` → `eval_vary_meta` |
+| `send` / `send-off` | `dispatch_sentinel_by_name` → `eval_send_to_agent` |
+
+Both `Inst::Call` (where the callee register holds a sentinel `NativeFunction`)
+and `Inst::CallDirect` (where the callee is named directly) are intercepted.
 
 ---
 

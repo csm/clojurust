@@ -193,7 +193,7 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
 }
 
 /// Recognise JVM-style class names used in Clojure for `instance?`, `catch`, etc.
-fn is_jvm_class_name(s: &str) -> bool {
+pub fn is_jvm_class_name(s: &str) -> bool {
     matches!(
         s,
         "clojure.lang.BigInt"
@@ -1478,7 +1478,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_var_restore() {
-        let (globals, mut env) = make_env();
+        let (_globals, mut env) = make_env();
         eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
         eval_src("(binding [*x* 42] *x*)", &mut env).unwrap();
         // After binding block, value restored to root

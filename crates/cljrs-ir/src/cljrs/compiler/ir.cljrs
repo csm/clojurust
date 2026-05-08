@@ -252,11 +252,12 @@
                  blocks))))
 
 (defn get-all-locals
-  "Return all local bindings across all scopes (for closure capture)."
+  "Return all local bindings across all scopes (for closure capture).
+   Inner scopes shadow outer scopes — the innermost binding for each name wins."
   [ctx]
   (let [scopes (:locals @ctx)]
     (reduce (fn [acc scope]
-              (reduce (fn [a [k v]] (if (get a k) a (assoc a k v)))
+              (reduce (fn [a [k v]] (assoc a k v))
                       acc
                       scope))
             {}

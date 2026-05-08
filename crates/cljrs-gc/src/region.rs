@@ -461,7 +461,7 @@ mod tests {
         // Allocate many objects to exceed the default chunk size.
         let mut region = Region::with_capacity(128);
         for i in 0..100 {
-            let p = region.alloc(i as i64);
+            let p = region.alloc(i);
             assert_eq!(*p.get(), i);
         }
         assert_eq!(region.object_count(), 100);
