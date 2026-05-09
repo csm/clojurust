@@ -68,15 +68,16 @@ fn loop_local_empty_vec_is_no_escape_through_recur() {
 
 #[test]
 fn returned_vector_escapes() {
-    // The vec is the function's return value — must be classified as
-    // Escapes regardless of analyser improvements.
+    // The vec is the function's return value.  After stage 2 the analyser
+    // classifies it as `Returns` (not `Escapes`) — the caller decides whether
+    // it truly escapes.
     let ir = lower("[1 2 3]");
     let dst = first_alloc_vec(&ir).expect("alloc-vec");
     let ctx = make_analysis_context(&ir);
     let analysis = analyze(&ir, Some(&ctx));
     assert_eq!(
         analysis.states.get(&dst).copied(),
-        Some(EscapeState::Escapes),
+        Some(EscapeState::Returns),
     );
 }
 
