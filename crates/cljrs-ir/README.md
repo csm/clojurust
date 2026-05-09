@@ -141,9 +141,12 @@ pub fn inline(ir: IrFunction) -> IrFunction;
    small, non-capturing, non-variadic `defn` in the same compilation unit and
    splices the callee body into the caller.  Runs up to 8 rounds per function,
    bottom-up.  Threshold: ≤ 20 instructions across all callee blocks.
-2. **Escape analysis** (`lower::escape`) — classifies each allocation as
-   `NoEscape`, `ArgEscape`, `Returns`, or `Escapes`.  Inter-procedural via
-   `EscapeContext`.
+2. **Escape analysis** (`lower::escape`) — two-pass analysis.  Pass 1
+   classifies each allocation as `NoEscape`, `ArgEscape`, `Returns`, or
+   `Escapes` (inter-procedural via `EscapeContext`).  Pass 2 (stage-3
+   caller-context propagation) identifies callee allocations that are
+   transitively `NoEscape` at a specific call site and records them in
+   `AnalysisResult::cross_fn_no_escape`, keyed by callee arity-fn-name.
 3. **Region promotion** (`lower::optimize`) — rewrites `NoEscape` allocations
    to `RegionStart` / `RegionAlloc` / `RegionEnd` over the minimal CFG
    subgraph that covers the allocation and all its uses.
@@ -160,9 +163,12 @@ pub enum UseKind { Return, DefVar, SetBang, ClosureCapture, Throw,
                    StoredInHeap, Recur, KnownCallArg{..}, UnknownCallArg{..},
                    PhiInput, BranchCond, Deref, CallCallee }
 pub struct AnalysisResult {
-    pub states:       HashMap<VarId, EscapeState>,
-    pub uses:         HashMap<VarId, Vec<UseInfo>>,
-    pub alloc_blocks: HashMap<VarId, BlockId>,
+    pub states:            HashMap<VarId, EscapeState>,
+    // Stage-3: callee arity-fn-name → callee alloc VarIds that are
+    // transitively NoEscape because the call result is NoEscape here.
+    pub cross_fn_no_escape: HashMap<Arc<str>, HashSet<VarId>>,
+    pub uses:              HashMap<VarId, Vec<UseInfo>>,
+    pub alloc_blocks:      HashMap<VarId, BlockId>,
 }
 ```
 

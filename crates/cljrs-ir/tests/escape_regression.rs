@@ -12,7 +12,9 @@
 //! These tests use the public Rust ANF lowerer + analyzer, so they run
 //! quickly and don't depend on the embedded Clojure compiler.
 
-use cljrs_ir::lower::{EscapeState, analyze, lower_fn_body, make_analysis_context, optimize};
+use cljrs_ir::lower::{
+    EscapeContext, EscapeState, analyze, lower_fn_body, make_analysis_context, optimize,
+};
 use cljrs_ir::{Inst, IrFunction};
 use cljrs_reader::Parser;
 use std::sync::Arc;
@@ -174,6 +176,73 @@ fn non_escaping_inline_result_stays_no_escape() {
     assert!(
         region_alloc_count(&optimized) >= 1,
         "inlined triple alloc should be region-promoted; IR:\n{optimized}"
+    );
+}
+
+// ── Stage-3: caller-context propagation tests ────────────────────────────────
+
+/// Walk `ir` and every subfunction recursively; return true if any function's
+/// `analyze` result has a non-empty `cross_fn_no_escape` map.
+fn any_has_cross_fn_no_escape(ir: &cljrs_ir::IrFunction, ctx: &EscapeContext) -> bool {
+    if !analyze(ir, Some(ctx)).cross_fn_no_escape.is_empty() {
+        return true;
+    }
+    ir.subfunctions
+        .iter()
+        .any(|sub| any_has_cross_fn_no_escape(sub, ctx))
+}
+
+#[test]
+fn cross_fn_no_escape_populated_when_return_value_is_local() {
+    // The top-level expression calls make-pair and passes the result straight
+    // to `count` — only an inspection use, so call_dst is NoEscape.
+    // make-pair's AllocVector is classified Returns in isolation (stage 2).
+    // Stage-3 pass-2 should record it in cross_fn_no_escape.
+    //
+    // Note: we do NOT go through `optimize` here so the Call instruction is
+    // still present (inlining would replace it and pass-2 would see nothing).
+    let ir = lower(
+        "(do
+           (defn make-pair [a b] [a b])
+           (count (make-pair 1 2)))",
+    );
+    let ctx = make_analysis_context(&ir);
+    assert!(
+        any_has_cross_fn_no_escape(&ir, &ctx),
+        "make-pair's AllocVector should appear in cross_fn_no_escape; IR:\n{ir}"
+    );
+}
+
+#[test]
+fn cross_fn_no_escape_empty_when_return_value_escapes() {
+    // The top-level returns make-pair's result directly — call_dst is Returns,
+    // not NoEscape, so pass-2 should not record anything.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b] [a b])
+           (make-pair 1 2))",
+    );
+    let ctx = make_analysis_context(&ir);
+    assert!(
+        !any_has_cross_fn_no_escape(&ir, &ctx),
+        "when the call result itself escapes, cross_fn_no_escape must be empty; IR:\n{ir}"
+    );
+}
+
+#[test]
+fn cross_fn_no_escape_covers_all_returns_allocs() {
+    // make-triple returns a 3-element vector; use-triple passes it to count.
+    // All Returns-tagged allocs in make-triple should be captured.
+    let ir = lower(
+        "(do
+           (defn make-triple [a b c] [a b c])
+           (count (make-triple 1 2 3)))",
+    );
+    let ctx = make_analysis_context(&ir);
+    // Check that the analysis (across the tree) picks up make-triple's alloc.
+    assert!(
+        any_has_cross_fn_no_escape(&ir, &ctx),
+        "make-triple's AllocVector should appear in cross_fn_no_escape; IR:\n{ir}"
     );
 }
 

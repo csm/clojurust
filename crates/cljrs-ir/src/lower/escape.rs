@@ -655,14 +655,34 @@ pub(crate) fn classify_escape_with_ctx(
 /// the optimizer (and downstream tooling such as `cljrs-ir-viz`).
 pub struct AnalysisResult {
     pub states: HashMap<VarId, EscapeState>,
+    /// Callee arity-fn-name → set of alloc `VarId`s that are transitively
+    /// `NoEscape` from this caller because the call's return value is
+    /// `NoEscape` here.  Populated only when `ctx` is `Some`.
+    ///
+    /// Produced by the stage-3 caller-context propagation pass.  The VarIds
+    /// live in the *callee's* scope, not the caller's.  Stage 4 uses this
+    /// map to decide which callee variants to clone and region-parameterise.
+    pub cross_fn_no_escape: HashMap<Arc<str>, HashSet<VarId>>,
     pub uses: HashMap<VarId, Vec<UseInfo>>,
     pub alloc_blocks: HashMap<VarId, BlockId>,
 }
 
-/// Run escape analysis on `ir_func`.  When `ctx` is `Some`, inter-procedural
-/// closure-call resolution is enabled (build the context with
-/// [`crate::lower::make_analysis_context`]).
-pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisResult {
+// ── Pass-1: intra-procedural escape states ───────────────────────────────────
+
+type Pass1Result<'f> = (
+    HashMap<VarId, EscapeState>,
+    HashMap<VarId, Vec<UseInfo>>,
+    HashMap<VarId, BlockId>,
+    HashMap<VarId, &'f Inst>,
+);
+
+/// Compute per-alloc escape states for `ir_func` without cross-function
+/// propagation (pass 1 only).
+///
+/// Returns `(states, uses, alloc_blocks, var_defs)`.  `var_defs` borrows
+/// from `ir_func` and is returned so the caller can reuse it in pass 2
+/// without rebuilding.
+fn analyze_states<'f>(ir_func: &'f IrFunction, ctx: Option<&EscapeContext>) -> Pass1Result<'f> {
     let alloc_blocks = collect_allocs(ir_func);
     let uses = build_use_chains(ir_func);
     let var_defs = build_var_defs(ir_func);
@@ -682,12 +702,10 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
         })
         .collect();
 
-    AnalysisResult {
-        states,
-        uses,
-        alloc_blocks,
-    }
+    (states, uses, alloc_blocks, var_defs)
 }
+
+// ── Per-allocation return summary ─────────────────────────────────────────────
 
 /// Per-allocation return summary for a function.
 ///
@@ -695,10 +713,82 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
 /// Allocations whose only escape path is a `Return` terminator are classified
 /// as [`EscapeState::Returns`] rather than [`EscapeState::Escapes`], making
 /// it possible for callers to decide whether the value truly escapes.
-#[allow(dead_code)] // used by stage-3 caller-context propagation (not yet implemented)
+///
+/// Calls [`analyze_states`] (pass 1 only) to avoid infinite recursion when
+/// invoked from [`analyze`]'s pass-2 loop.
 pub(crate) fn compute_return_alloc_summary(
     ir_func: &IrFunction,
     ctx: &EscapeContext,
 ) -> HashMap<VarId, EscapeState> {
-    analyze(ir_func, Some(ctx)).states
+    analyze_states(ir_func, Some(ctx)).0
+}
+
+// ── Pass-2: caller-context propagation ───────────────────────────────────────
+
+/// Run escape analysis on `ir_func`.  When `ctx` is `Some`, inter-procedural
+/// closure-call resolution is enabled (build the context with
+/// [`crate::lower::make_analysis_context`]).
+///
+/// Two-pass algorithm:
+/// * **Pass 1** (`analyze_states`) — classify every allocation in the current
+///   function using the worklist-based `classify_escape_with_ctx`.
+/// * **Pass 2** — for every `Call(dst, callee, args)` where `dst` is
+///   `NoEscape` in this function, look up the callee's return-alloc summary
+///   (via `compute_return_alloc_summary`) and record any `Returns`-tagged
+///   allocations in `cross_fn_no_escape`.  This information is consumed by
+///   stage 4's region-parameter-passing transform.
+pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisResult {
+    let (states, uses, alloc_blocks, var_defs) = analyze_states(ir_func, ctx);
+
+    // Pass 2: caller-context propagation.
+    let mut cross_fn_no_escape: HashMap<Arc<str>, HashSet<VarId>> = HashMap::new();
+    if let Some(ectx) = ctx {
+        for block in &ir_func.blocks {
+            for inst in &block.insts {
+                let Inst::Call(dst, callee, args) = inst else {
+                    continue;
+                };
+                // `states` only contains allocation VarIds, not call-result
+                // VarIds, so classify the call result explicitly.  We reuse
+                // the `uses` chain built in pass 1.
+                let dst_state = classify_escape_with_ctx(
+                    *dst,
+                    &uses,
+                    ir_func,
+                    Some(ectx),
+                    Some(&var_defs),
+                    EscapeMode::Alloc,
+                );
+                if dst_state != EscapeState::NoEscape {
+                    continue;
+                }
+                let Some(callee_name) =
+                    resolve_call_target(*callee, args.len(), &var_defs, &ectx.defn_map)
+                else {
+                    continue;
+                };
+                let Some(callee_fn) = ectx.registry.get(&callee_name) else {
+                    continue;
+                };
+                let returns_allocs: HashSet<VarId> = compute_return_alloc_summary(callee_fn, ectx)
+                    .into_iter()
+                    .filter(|(_, s)| *s == EscapeState::Returns)
+                    .map(|(v, _)| v)
+                    .collect();
+                if !returns_allocs.is_empty() {
+                    cross_fn_no_escape
+                        .entry(callee_name)
+                        .or_default()
+                        .extend(returns_allocs);
+                }
+            }
+        }
+    }
+
+    AnalysisResult {
+        states,
+        cross_fn_no_escape,
+        uses,
+        alloc_blocks,
+    }
 }
