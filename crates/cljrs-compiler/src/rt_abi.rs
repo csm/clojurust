@@ -1923,6 +1923,53 @@ pub unsafe extern "C" fn rt_into3(
     call_global_fn("clojure.core", "into", vec![to, xform, from])
 }
 
+/// `(peek coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "peek", vec![coll])
+}
+
+/// `(pop coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "pop", vec![coll])
+}
+
+/// `(vec coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "vec", vec![coll])
+}
+
+/// `(mapcat f coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *const Value {
+    let f = unsafe { val_ref(f) }.clone();
+    let coll = unsafe { val_ref(coll) }.clone();
+    call_global_fn("clojure.core", "mapcat", vec![f, coll])
+}
+
+/// `(repeatedly n f)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
+    let n = unsafe { val_ref(n) }.clone();
+    let f = unsafe { val_ref(f) }.clone();
+    call_global_fn("clojure.core", "repeatedly", vec![n, f])
+}
+
 // ── set! ─────────────────────────────────────────────────────────────────────
 
 /// `(set! var val)` — set a dynamic var's thread-local or root binding.
@@ -2604,6 +2651,11 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_comp as *const () as usize);
     std::hint::black_box(rt_partial as *const () as usize);
     std::hint::black_box(rt_complement as *const () as usize);
+    std::hint::black_box(rt_peek as *const () as usize);
+    std::hint::black_box(rt_pop as *const () as usize);
+    std::hint::black_box(rt_vec as *const () as usize);
+    std::hint::black_box(rt_mapcat as *const () as usize);
+    std::hint::black_box(rt_repeatedly as *const () as usize);
 }
 
 #[cfg(test)]
