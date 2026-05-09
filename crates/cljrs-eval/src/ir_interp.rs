@@ -910,6 +910,19 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
         }
+        // Analysis-only KnownFns: variants the analyzer cares about but
+        // the interpreter has no specialised path for.  Fall back to a
+        // dynamic lookup of the builtin by name.
+        KnownFn::IsEmpty
+        | KnownFn::Peek
+        | KnownFn::Pop
+        | KnownFn::Vec
+        | KnownFn::Mapcat
+        | KnownFn::Repeatedly => {
+            let fn_name = known_fn_to_name(known_fn);
+            let callee = load_builtin(env, fn_name)?;
+            apply_value(&callee, args, env)
+        }
     }
 }
 
@@ -999,6 +1012,12 @@ fn known_fn_to_name(kf: &KnownFn) -> &'static str {
         KnownFn::WithOutStr => "with-out-str",
         KnownFn::TryCatchFinally => "try",
         KnownFn::SetBangVar => "set!",
+        KnownFn::IsEmpty => "empty?",
+        KnownFn::Peek => "peek",
+        KnownFn::Pop => "pop",
+        KnownFn::Vec => "vec",
+        KnownFn::Mapcat => "mapcat",
+        KnownFn::Repeatedly => "repeatedly",
         _ => "unknown",
     }
 }

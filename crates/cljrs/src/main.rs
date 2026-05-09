@@ -110,6 +110,25 @@ enum Commands {
         /// The expression to evaluate.
         expr: String,
     },
+    /// Render the optimized IR for a source file to a self-contained HTML
+    /// page (source ↔ IR with region color-coding and escape annotations).
+    ///
+    /// Useful for debugging the bump-allocation optimizer: any allocation
+    /// that didn't make it into a region is flagged with its escape
+    /// verdict and a representative blamed use.
+    IrViz {
+        /// Path to the source file.
+        file: PathBuf,
+        /// Output HTML path.  If omitted, writes to <file>.ir.html alongside the source.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
+        /// Suppress the `[aot] ...` progress output.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Run clojure.test tests for one or more namespaces.
     ///
     /// If no namespaces are given, discovers and runs all test namespaces
@@ -270,6 +289,12 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             }
             Ok(0)
         }
+        Commands::IrViz {
+            file,
+            out,
+            src_paths,
+            quiet,
+        } => run_ir_viz(file, out, src_paths, quiet),
         Commands::Test {
             namespaces,
             src_paths,
@@ -284,6 +309,41 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             gc_hard_limit_mb,
         ),
     }
+}
+
+/// Lower a source file through the AOT pipeline (up to region optimization)
+/// and write a self-contained HTML visualizer to disk.
+fn run_ir_viz(
+    file: PathBuf,
+    out: Option<PathBuf>,
+    src_paths: Vec<PathBuf>,
+    quiet: bool,
+) -> miette::Result<i32> {
+    let (source, ir) = cljrs_compiler::aot::lower_file_to_ir(&file, &src_paths, quiet)
+        .map_err(|e| miette::miette!("{e}"))?;
+    let title = format!("IR — {}", file.display());
+    let html = cljrs_ir_viz::render_html(
+        &ir,
+        Some(&source),
+        &cljrs_ir_viz::RenderOptions { title: Some(title) },
+    );
+    let out_path = out.unwrap_or_else(|| {
+        let mut p = file.clone();
+        let new_name = format!(
+            "{}.ir.html",
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("output")
+        );
+        p.set_file_name(new_name);
+        p
+    });
+    std::fs::write(&out_path, html)
+        .map_err(|e| miette::miette!("writing {}: {e}", out_path.display()))?;
+    if !quiet {
+        eprintln!("[ir-viz] wrote {}", out_path.display());
+    }
+    Ok(0)
 }
 
 /// Write a snapshot of `cljrs_gc::GC_STATS` to `target`.

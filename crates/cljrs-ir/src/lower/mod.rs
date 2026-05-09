@@ -11,4 +11,14 @@ pub mod known;
 pub mod optimize;
 
 pub use anf::{LowerError, lower_fn_body};
+pub use escape::{AnalysisResult, EscapeContext, EscapeState, UseInfo, UseKind, analyze};
 pub use optimize::optimize;
+
+/// Build an inter-procedural escape-analysis context for the entire IR tree
+/// rooted at `ir_func`.  Pass the result to [`analyze`] (as `Some(&ctx)`) to
+/// enable cross-function closure-call resolution.
+pub fn make_analysis_context(ir_func: &IrFunction) -> EscapeContext {
+    escape::make_context(ir_func)
+}
+
+use crate::IrFunction;

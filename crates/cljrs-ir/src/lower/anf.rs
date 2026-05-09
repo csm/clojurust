@@ -83,6 +83,7 @@ fn lower_body(ctx: &mut LowerCtx, forms: &[Form]) -> R {
 // ── Form dispatch ─────────────────────────────────────────────────────────────
 
 fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
+    ctx.maybe_emit_source_loc(&form.span);
     match &form.kind {
         FormKind::Nil => Ok(ctx.emit_const(Const::Nil)),
         FormKind::Bool(b) => Ok(ctx.emit_const(Const::Bool(*b))),

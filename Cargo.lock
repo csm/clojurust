@@ -257,6 +257,7 @@ dependencies = [
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-interop",
+ "cljrs-ir-viz",
  "cljrs-logging",
  "cljrs-reader",
  "cljrs-runtime",
@@ -400,6 +401,16 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+]
+
+[[package]]
+name = "cljrs-ir-viz"
+version = "0.1.0"
+dependencies = [
+ "cljrs-compiler",
+ "cljrs-ir",
+ "cljrs-reader",
+ "cljrs-types",
 ]
 
 [[package]]
