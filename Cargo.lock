@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "clap",
  "cljrs-compiler",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-builtins"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "bigdecimal",
  "cljrs-env",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-compiler"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-env"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-gc",
  "cljrs-logging",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-eval"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-gc"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "bigdecimal",
  "cljrs-logging",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interop"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-gc",
  "cljrs-types",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interp"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-env",
  "cljrs-eval",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir-prebuild"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "clap",
  "cljrs-env",
@@ -404,11 +404,11 @@ dependencies = [
 
 [[package]]
 name = "cljrs-logging"
-version = "0.1.0"
+version = "0.1.40"
 
 [[package]]
 name = "cljrs-reader"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-types",
  "miette",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-runtime"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-stdlib"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-types"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "miette",
  "serde",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-value"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "bigdecimal",
  "cljrs-gc",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "rust-interop-example"
-version = "0.1.0"
+version = "0.1.40"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
