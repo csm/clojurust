@@ -141,6 +141,12 @@ fn clone_inst(
             ops.iter().map(|&v| rv(var_map, v)).collect(),
         ),
         Inst::RegionEnd(region) => Inst::RegionEnd(rv(var_map, *region)),
+        Inst::RegionParam(dst) => Inst::RegionParam(rv(var_map, *dst)),
+        Inst::CallWithRegion(dst, name, args) => Inst::CallWithRegion(
+            rv(var_map, *dst),
+            name.clone(),
+            args.iter().map(|&v| rv(var_map, v)).collect(),
+        ),
     }
 }
 

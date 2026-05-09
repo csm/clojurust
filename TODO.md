@@ -189,8 +189,8 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] Known function argument escape tracking (`known_fn_arg_escapes`).
 - [x] Assoc/conj chain detection (`detect_collection_chains`).
 - [x] Inter-procedural escape analysis (`EscapeContext`, `compute_fn_summary`).
-- [ ] `Returns` state for allocations — see `crates/cljrs-ir/ESCAPE_OPT_PLAN.md` stage 2.
-- [ ] Caller-context propagation for returned allocations — see plan stage 3.
+- [x] `Returns` state for allocations — see `crates/cljrs-ir/ESCAPE_OPT_PLAN.md` stage 2.
+- [x] Caller-context propagation for returned allocations — see plan stage 3.
 
 ### Phase 8.1.3 — Function-local regions
 
@@ -214,7 +214,7 @@ Compiler work:
   - `RegionAlloc(VarId, VarId, RegionAllocKind, Vec<VarId>)` — allocate in region
 - [x] Replace non-escaping allocations with region allocations (`optimize.rs`).
 - [x] Inlining pass before escape analysis (`lower/inline.rs`) — enables cross-function region promotion.
-- [ ] Region parameter passing for non-inlineable callees — see `crates/cljrs-ir/ESCAPE_OPT_PLAN.md` stage 4.
+- [x] Region parameter passing for non-inlineable callees (`lower/regionalize.rs`) — see `crates/cljrs-ir/ESCAPE_OPT_PLAN.md` stage 4.
 - [ ] Fallback to GC heap for escaping objects — requires compiler codegen (Phase 10/11).
 
 ### Phase 8.1.4 — Persistent structure virtualization

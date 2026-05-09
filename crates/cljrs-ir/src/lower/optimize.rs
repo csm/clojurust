@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::escape::{EscapeContext, EscapeState, analyze, make_context};
 use super::inline::inline as inline_pass;
+use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Inst, IrFunction, RegionAllocKind, Terminator, VarId};
 
 // ── CFG helpers ──────────────────────────────────────────────────────────────
@@ -181,7 +182,11 @@ pub(crate) fn post_dominators(ir_func: &IrFunction) -> HashMap<BlockId, HashSet<
 /// Returns the deepest block that dominates both a and b (i.e. appears in
 /// both dom_of[a] and dom_of[b], and is dominated by all other common
 /// dominators).
-fn lca_of(dom_of: &HashMap<BlockId, HashSet<BlockId>>, a: BlockId, b: BlockId) -> Option<BlockId> {
+pub(crate) fn lca_of(
+    dom_of: &HashMap<BlockId, HashSet<BlockId>>,
+    a: BlockId,
+    b: BlockId,
+) -> Option<BlockId> {
     let da = dom_of.get(&a)?;
     let db = dom_of.get(&b)?;
     let common: HashSet<_> = da.intersection(db).copied().collect();
@@ -194,7 +199,7 @@ fn lca_of(dom_of: &HashMap<BlockId, HashSet<BlockId>>, a: BlockId, b: BlockId) -
         .max_by_key(|&d| dom_of.get(&d).map(|s| s.len()).unwrap_or(0))
 }
 
-fn lca_of_many(
+pub(crate) fn lca_of_many(
     dom_of: &HashMap<BlockId, HashSet<BlockId>>,
     blocks: impl IntoIterator<Item = BlockId>,
 ) -> Option<BlockId> {
@@ -207,7 +212,11 @@ fn lca_of_many(
 
 /// Return the set of block IDs reachable from `start` whose paths terminate at `end`.
 /// Stops expanding past `end`. Includes both `start` and `end`.
-fn blocks_on_path(ir_func: &IrFunction, start: BlockId, end: BlockId) -> HashSet<BlockId> {
+pub(crate) fn blocks_on_path(
+    ir_func: &IrFunction,
+    start: BlockId,
+    end: BlockId,
+) -> HashSet<BlockId> {
     let by_id = block_by_id_map(ir_func);
     let mut stack = vec![start];
     let mut seen: HashSet<BlockId> = HashSet::new();
@@ -228,7 +237,7 @@ fn blocks_on_path(ir_func: &IrFunction, start: BlockId, end: BlockId) -> HashSet
     seen
 }
 
-fn has_back_edge(
+pub(crate) fn has_back_edge(
     ir_func: &IrFunction,
     region_blocks: &HashSet<BlockId>,
     doms: &HashMap<BlockId, HashSet<BlockId>>,
@@ -249,7 +258,10 @@ fn has_back_edge(
     false
 }
 
-fn region_contains_throw(ir_func: &IrFunction, region_blocks: &HashSet<BlockId>) -> bool {
+pub(crate) fn region_contains_throw(
+    ir_func: &IrFunction,
+    region_blocks: &HashSet<BlockId>,
+) -> bool {
     let by_id = block_by_id_map(ir_func);
     for &b in region_blocks {
         if let Some(block) = by_id.get(&b) {
@@ -270,7 +282,7 @@ fn region_contains_throw(ir_func: &IrFunction, region_blocks: &HashSet<BlockId>)
 
 /// Walk the propagation chain and collect all blocks where `alloc_var` (or
 /// any value derived from it through phi/known-call forwarding) is used.
-fn collect_use_blocks(
+pub(crate) fn collect_use_blocks(
     alloc_var: VarId,
     uses: &HashMap<VarId, Vec<super::escape::UseInfo>>,
     ir_func: &IrFunction,
@@ -475,10 +487,22 @@ fn optimize_tree(ir_func: IrFunction, ctx: &EscapeContext) -> IrFunction {
 
 /// Run all optimization passes on an IR function tree.
 ///
-/// Order: inlining first (so escape analysis sees the expanded body),
-/// then region-allocation promotion.
+/// Order:
+///   1. Inlining — splice eligible callees into call sites so their
+///      allocations are visible as local to the caller.
+///   2. Local region promotion (`optimize_tree`) — turn `NoEscape`
+///      allocations into `RegionAlloc` scoped over the LCA dominator subgraph.
+///   3. Cross-function region promotion (`promote_cross_fn_allocs`) — for
+///      `Call` sites whose result is `NoEscape`, clone a region-parameterised
+///      variant of the callee that uses the caller's region.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
     let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
-    optimize_tree(ir_func, &ctx)
+    let ir_func = optimize_tree(ir_func, &ctx);
+
+    // Stage 4 needs a fresh analysis context because the local pass may have
+    // rewritten allocations (and added blocks), invalidating the cached
+    // per-function summaries the original `ctx` carries.
+    let ctx2 = make_context(&ir_func);
+    promote_cross_fn_allocs(ir_func, &ctx2)
 }

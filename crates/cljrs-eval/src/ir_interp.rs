@@ -383,6 +383,34 @@ fn execute_inst(
             // Pop and drop the region entry (Drop impl handles cleanup).
             region_stack.pop();
         }
+
+        Inst::RegionParam(dst) => {
+            // Marker bound at the entry of a region-parameterised callee
+            // variant.  The actual region is inherited via the thread-local
+            // region stack; the VarId is referenced as the (ignored) `region`
+            // operand of subsequent `RegionAlloc` instructions, so we just
+            // bind it to nil.
+            regs.set(*dst, Value::Nil);
+        }
+
+        Inst::CallWithRegion(dst, name, args) => {
+            cljrs_env::gc_roots::gc_safepoint(env);
+            let target = ir_func
+                .subfunctions
+                .iter()
+                .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
+                .ok_or_else(|| {
+                    EvalError::Runtime(format!(
+                        "IR interpreter: CallWithRegion target {name} not found in subfunctions"
+                    ))
+                })?;
+            let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            // The caller's RegionStart has already pushed a region onto the
+            // thread-local stack, so the callee's `RegionAlloc`s will pick it
+            // up via `try_alloc_in_region`.
+            let result = interpret_ir(target, arg_vals, globals, ns, env)?;
+            regs.set(*dst, result);
+        }
     }
 
     Ok(())

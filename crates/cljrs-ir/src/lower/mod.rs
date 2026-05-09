@@ -10,6 +10,7 @@ pub mod escape;
 pub mod inline;
 pub mod known;
 pub mod optimize;
+pub mod regionalize;
 
 pub use anf::{LowerError, lower_fn_body};
 pub use escape::{AnalysisResult, EscapeContext, EscapeState, UseInfo, UseKind, analyze};

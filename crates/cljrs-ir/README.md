@@ -27,6 +27,10 @@ src/
     inline.rs   — inlining pass: splices small callees into call sites
     known.rs    — symbol → KnownFn resolution
     optimize.rs — region-allocation promotion; dominator/post-dominator CFG analysis
+    regionalize.rs — stage-4 cross-function region promotion: clones callees
+                     whose `Returns` allocs are NoEscape at a call site, wraps
+                     the call site in RegionStart/RegionEnd, rewrites Call →
+                     CallWithRegion targeting the cloned variant by name
   cljrs/compiler/
     ir.cljrs       — IR data constructors + mutable builder context (atom-based)
     known.cljrs    — symbol-name → KnownFn keyword resolution
@@ -88,7 +92,8 @@ pub struct Block {
 `Const`, `LoadLocal`, `LoadGlobal`, `LoadVar`, `AllocVector`, `AllocMap`,
 `AllocSet`, `AllocList`, `AllocCons`, `AllocClosure`, `CallKnown`, `Call`,
 `CallDirect`, `Deref`, `DefVar`, `SetBang`, `Throw`, `Phi`, `Recur`,
-`SourceLoc`, `RegionStart`, `RegionAlloc`, `RegionEnd`
+`SourceLoc`, `RegionStart`, `RegionAlloc`, `RegionEnd`, `RegionParam`,
+`CallWithRegion`
 
 ### Terminators
 
@@ -150,6 +155,17 @@ pub fn inline(ir: IrFunction) -> IrFunction;
 3. **Region promotion** (`lower::optimize`) — rewrites `NoEscape` allocations
    to `RegionStart` / `RegionAlloc` / `RegionEnd` over the minimal CFG
    subgraph that covers the allocation and all its uses.
+4. **Cross-function region promotion** (`lower::regionalize`) — for `Call`
+   sites whose result is `NoEscape` and whose callee has `Returns`-tagged
+   allocations, clones a region-parameterised variant of the callee
+   (`<orig>__rgN`) where those allocations become `RegionAlloc` and the entry
+   block carries a `RegionParam` marker.  The call site is rewritten to
+   `CallWithRegion(dst, target_name, args)` and bracketed by
+   `RegionStart`/`RegionEnd` over the dom/postdom-LCA scope of `dst`'s uses.
+   At runtime the callee inherits the caller's region via the thread-local
+   region stack, so its `RegionAlloc` instructions bump-allocate into the
+   caller's region.  Variants are attached as subfunctions of the calling
+   function so both the IR interpreter and codegen can resolve them by name.
 
 ### Analysis (re-exported from `lower::`)
 

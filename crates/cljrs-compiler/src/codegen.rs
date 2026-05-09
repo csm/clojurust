@@ -691,6 +691,24 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let func_ref = self.import_func(self.rt.rt_region_end);
                 self.builder.ins().call(func_ref, &[handle]);
             }
+
+            Inst::RegionParam(dst) => {
+                // Marker bound at the entry of a region-parameterised callee
+                // variant.  The actual region is inherited via the
+                // thread-local region stack, so the operand is just nil.
+                let val = self.call_rt_0(self.rt.rt_const_nil)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, val);
+            }
+
+            Inst::CallWithRegion(dst, fn_name, args) => {
+                // Direct call to a region-parameterised variant.  The caller's
+                // surrounding `RegionStart`/`RegionEnd` keeps the region
+                // active on the thread-local stack across this call.
+                let val = self.emit_direct_call(fn_name, args)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, val);
+            }
         }
         Ok(())
     }
