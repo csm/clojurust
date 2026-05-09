@@ -714,9 +714,6 @@ cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
-
-[build-dependencies]
-cc = "1"
 "#,
         ws = workspace_root.display()
     );
