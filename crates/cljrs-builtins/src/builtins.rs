@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use crate::time::builtin_nanotime;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 thread_local! {
@@ -675,6 +676,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
             Arity::Variadic { min: 1 },
             builtin_exception_dot,
         ),
+
+        // time utils
+        ("nanotime", Arity::Fixed(0), builtin_nanotime),
     ];
 
     for (name, arity, func) in fns {
