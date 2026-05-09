@@ -101,6 +101,9 @@ pub enum KnownFn {
     Cons,
     Seq,
     LazySeq,
+    Peek,
+    Pop,
+    Vec,
 
     // Arithmetic (pure, no alloc for i64/f64)
     Add,
@@ -121,6 +124,7 @@ pub enum KnownFn {
     IsSeq,
     IsVector,
     IsMap,
+    IsEmpty,
 
     // String
     Str,
@@ -148,10 +152,12 @@ pub enum KnownFn {
     Filter,
     Mapv,
     Filterv,
+    Mapcat,
     Some,
     Every,
     Into,
     Into3,
+    Repeatedly,
 
     // More HOFs
     GroupBy,
@@ -704,6 +710,8 @@ impl KnownFn {
             | KnownFn::IsSeq
             | KnownFn::IsVector
             | KnownFn::IsMap
+            | KnownFn::IsEmpty
+            | KnownFn::Peek
             | KnownFn::Identical => Effect::Pure,
 
             // Allocating — return a new persistent collection
@@ -720,6 +728,8 @@ impl KnownFn {
             | KnownFn::Next
             | KnownFn::Seq
             | KnownFn::LazySeq
+            | KnownFn::Pop
+            | KnownFn::Vec
             | KnownFn::Str
             | KnownFn::Transient
             | KnownFn::PersistentBang => Effect::Alloc,
@@ -793,10 +803,12 @@ impl KnownFn {
             | KnownFn::Filter
             | KnownFn::Mapv
             | KnownFn::Filterv
+            | KnownFn::Mapcat
             | KnownFn::Some
             | KnownFn::Every
             | KnownFn::Into
-            | KnownFn::Into3 => Effect::UnknownCall,
+            | KnownFn::Into3
+            | KnownFn::Repeatedly => Effect::UnknownCall,
 
             // Try/catch calls unknown closures
             KnownFn::TryCatchFinally => Effect::UnknownCall,

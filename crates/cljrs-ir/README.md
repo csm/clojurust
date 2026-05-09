@@ -91,6 +91,24 @@ pub struct Block {
 160+ built-in function identifiers with effect classification (`Effect`):
 `Pure`, `Alloc`, `HeapRead`, `HeapWrite`, `IO`, `UnknownCall`.
 
+Some `KnownFn` variants exist purely for analysis precision — the
+codegen and IR interpreter dispatch them through the dynamic builtin
+lookup like a regular `Call`, but the analyzer can use them to tighten
+escape verdicts.  For example, `Empty?`, `Peek`, `Pop`, `Vec`,
+`Mapcat`, `Repeatedly` carry no specialised codegen path; they're
+recognised so that the escape analyzer can see through `(empty? coll)`
+or `(pop coll)` instead of treating them as opaque `UnknownCall`s.
+
+### Recur and escape analysis
+
+`UseKind::Recur` is *not* treated as an unconditional escape.  When the
+analyzer encounters a `Recur` use, it walks to the matching loop-header
+`Phi` (positionally aligned with the `RecurJump`'s args) and continues
+analysis from the phi's downstream uses.  This is sound because `recur`
+is structural control flow — values rebind at the loop header without
+leaving the function — and it's what allows a loop-local empty vector
+to reach `NoEscape` and get promoted to a region.
+
 ### Region allocation
 
 `RegionAllocKind`: `Vector`, `Map`, `Set`, `List`, `Cons`

@@ -66,12 +66,14 @@ pub(crate) fn known_fn_arg_escapes(func: &KnownFn, arg_index: usize) -> bool {
     match func {
         // Non-escaping: predicates, arithmetic, I/O, lookups that return elements
         Get | Nth | Count | Contains | First | Add | Sub | Mul | Div | Rem | Eq | Lt | Gt | Lte
-        | Gte | IsNil | IsSeq | IsVector | IsMap | Identical | IsNumber | IsString | IsKeyword
-        | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref | Println | Pr | Prn | Print => false,
+        | Gte | IsNil | IsSeq | IsVector | IsMap | IsEmpty | Peek | Identical | IsNumber
+        | IsString | IsKeyword | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref | Println
+        | Pr | Prn | Print => false,
 
         // These return a modified copy of arg 0 → arg 0 escapes; others don't
         Dissoc | Disj => arg_index == 0,
         Rest | Next | Seq => arg_index == 0,
+        Pop | Vec => arg_index == 0,
         Transient => arg_index == 0,
         AssocBang | ConjBang => arg_index == 0,
         PersistentBang => arg_index == 0,
@@ -380,6 +382,35 @@ fn find_call_result(
     None
 }
 
+/// Walk from a `Recur` use back to the loop-header phi(s) that the
+/// recur arg feeds.  Returns the destination `VarId` of each matching
+/// phi; an empty result means the source block's terminator wasn't a
+/// `RecurJump` (shouldn't normally happen, but we stay defensive).
+///
+/// Loop-header phis are emitted in binding order by `lower_loop`, and
+/// `lower_recur` stores recur args in the same order — so `args[i]`
+/// corresponds to `target_block.phis[i]`.
+fn recur_target_phis(ir_func: &IrFunction, var: VarId, source_block: BlockId) -> Vec<VarId> {
+    let Some(block) = ir_func.blocks.iter().find(|b| b.id == source_block) else {
+        return Vec::new();
+    };
+    let Terminator::RecurJump { target, args } = &block.terminator else {
+        return Vec::new();
+    };
+    let Some(target_block) = ir_func.blocks.iter().find(|b| b.id == *target) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, &arg) in args.iter().enumerate() {
+        if arg == var
+            && let Some(Inst::Phi(phi_dst, _)) = target_block.phis.get(i)
+        {
+            out.push(*phi_dst);
+        }
+    }
+    out
+}
+
 /// Find a Call instruction in `block_id` with the given callee and arg.
 fn find_unknown_call_with_arg(
     ir_func: &IrFunction,
@@ -516,10 +547,20 @@ pub(crate) fn classify_escape_with_ctx(
                 | UseKind::SetBang
                 | UseKind::ClosureCapture
                 | UseKind::Throw
-                | UseKind::StoredInHeap
-                | UseKind::Recur => {
+                | UseKind::StoredInHeap => {
                     result = EscapeState::Escapes;
                     break 'outer;
+                }
+                UseKind::Recur => {
+                    // `recur` is structural control flow — it rebinds the
+                    // value at the loop header's phi without leaving the
+                    // function.  Whether this allocation actually escapes
+                    // depends on the phi's downstream uses, so walk to the
+                    // matching phi(s) and let the worklist sort it out.
+                    // The visited set keeps cycles from blowing up.
+                    for phi_dst in recur_target_phis(ir_func, current, use_info.block) {
+                        worklist.push_back(phi_dst);
+                    }
                 }
                 UseKind::UnknownCallArg { callee, arg_index } => {
                     // Try inter-procedural lookup
