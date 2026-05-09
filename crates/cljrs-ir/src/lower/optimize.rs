@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::escape::{EscapeContext, EscapeState, analyze, make_context};
+use super::inline::inline as inline_pass;
 use crate::{Block, BlockId, Inst, IrFunction, RegionAllocKind, Terminator, VarId};
 
 // ── CFG helpers ──────────────────────────────────────────────────────────────
@@ -473,7 +474,11 @@ fn optimize_tree(ir_func: IrFunction, ctx: &EscapeContext) -> IrFunction {
 }
 
 /// Run all optimization passes on an IR function tree.
+///
+/// Order: inlining first (so escape analysis sees the expanded body),
+/// then region-allocation promotion.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
+    let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
     optimize_tree(ir_func, &ctx)
 }
