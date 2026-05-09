@@ -536,12 +536,7 @@ pub(crate) fn classify_escape_with_ctx(
         for use_info in use_list {
             match &use_info.kind {
                 UseKind::Return => {
-                    if mode == EscapeMode::Param {
-                        result = EscapeState::join(result, EscapeState::Returns);
-                    } else {
-                        result = EscapeState::Escapes;
-                        break 'outer;
-                    }
+                    result = EscapeState::join(result, EscapeState::Returns);
                 }
                 UseKind::DefVar
                 | UseKind::SetBang
@@ -692,4 +687,17 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
         uses,
         alloc_blocks,
     }
+}
+
+/// Per-allocation return summary for a function.
+///
+/// Returns `{alloc_var → EscapeState}` for every allocation in `ir_func`.
+/// Allocations whose only escape path is a `Return` terminator are classified
+/// as [`EscapeState::Returns`] rather than [`EscapeState::Escapes`], making
+/// it possible for callers to decide whether the value truly escapes.
+pub(crate) fn compute_return_alloc_summary(
+    ir_func: &IrFunction,
+    ctx: &EscapeContext,
+) -> HashMap<VarId, EscapeState> {
+    analyze(ir_func, Some(ctx)).states
 }
