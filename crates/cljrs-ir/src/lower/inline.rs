@@ -26,10 +26,7 @@ const MAX_ROUNDS: usize = 8;
 // ── Eligibility ──────────────────────────────────────────────────────────────
 
 fn instruction_count(ir: &IrFunction) -> usize {
-    ir.blocks
-        .iter()
-        .map(|b| b.insts.len() + b.phis.len())
-        .sum()
+    ir.blocks.iter().map(|b| b.insts.len() + b.phis.len()).sum()
 }
 
 fn has_load_local(ir: &IrFunction) -> bool {
@@ -75,22 +72,26 @@ fn clone_inst(
         Inst::LoadGlobal(dst, ns, name) => {
             Inst::LoadGlobal(rv(var_map, *dst), ns.clone(), name.clone())
         }
-        Inst::LoadVar(dst, ns, name) => {
-            Inst::LoadVar(rv(var_map, *dst), ns.clone(), name.clone())
-        }
-        Inst::AllocVector(dst, elems) => {
-            Inst::AllocVector(rv(var_map, *dst), elems.iter().map(|&v| rv(var_map, v)).collect())
-        }
+        Inst::LoadVar(dst, ns, name) => Inst::LoadVar(rv(var_map, *dst), ns.clone(), name.clone()),
+        Inst::AllocVector(dst, elems) => Inst::AllocVector(
+            rv(var_map, *dst),
+            elems.iter().map(|&v| rv(var_map, v)).collect(),
+        ),
         Inst::AllocMap(dst, pairs) => Inst::AllocMap(
             rv(var_map, *dst),
-            pairs.iter().map(|&(k, v)| (rv(var_map, k), rv(var_map, v))).collect(),
+            pairs
+                .iter()
+                .map(|&(k, v)| (rv(var_map, k), rv(var_map, v)))
+                .collect(),
         ),
-        Inst::AllocSet(dst, elems) => {
-            Inst::AllocSet(rv(var_map, *dst), elems.iter().map(|&v| rv(var_map, v)).collect())
-        }
-        Inst::AllocList(dst, elems) => {
-            Inst::AllocList(rv(var_map, *dst), elems.iter().map(|&v| rv(var_map, v)).collect())
-        }
+        Inst::AllocSet(dst, elems) => Inst::AllocSet(
+            rv(var_map, *dst),
+            elems.iter().map(|&v| rv(var_map, v)).collect(),
+        ),
+        Inst::AllocList(dst, elems) => Inst::AllocList(
+            rv(var_map, *dst),
+            elems.iter().map(|&v| rv(var_map, v)).collect(),
+        ),
         Inst::AllocCons(dst, h, t) => {
             Inst::AllocCons(rv(var_map, *dst), rv(var_map, *h), rv(var_map, *t))
         }
@@ -115,14 +116,20 @@ fn clone_inst(
             args.iter().map(|&v| rv(var_map, v)).collect(),
         ),
         Inst::Deref(dst, src) => Inst::Deref(rv(var_map, *dst), rv(var_map, *src)),
-        Inst::DefVar(dst, ns, name, val) => {
-            Inst::DefVar(rv(var_map, *dst), ns.clone(), name.clone(), rv(var_map, *val))
-        }
+        Inst::DefVar(dst, ns, name, val) => Inst::DefVar(
+            rv(var_map, *dst),
+            ns.clone(),
+            name.clone(),
+            rv(var_map, *val),
+        ),
         Inst::SetBang(var, val) => Inst::SetBang(rv(var_map, *var), rv(var_map, *val)),
         Inst::Throw(val) => Inst::Throw(rv(var_map, *val)),
         Inst::Phi(dst, entries) => Inst::Phi(
             rv(var_map, *dst),
-            entries.iter().map(|&(bid, v)| (rb(block_map, bid), rv(var_map, v))).collect(),
+            entries
+                .iter()
+                .map(|&(bid, v)| (rb(block_map, bid), rv(var_map, v)))
+                .collect(),
         ),
         Inst::Recur(args) => Inst::Recur(args.iter().map(|&v| rv(var_map, v)).collect()),
         Inst::SourceLoc(span) => Inst::SourceLoc(span.clone()),
@@ -147,7 +154,11 @@ fn clone_terminator(
         // The key transformation: Return → Jump to continuation.
         Terminator::Return(_) => Terminator::Jump(cont_block),
         Terminator::Jump(b) => Terminator::Jump(rb(block_map, *b)),
-        Terminator::Branch { cond, then_block, else_block } => Terminator::Branch {
+        Terminator::Branch {
+            cond,
+            then_block,
+            else_block,
+        } => Terminator::Branch {
             cond: rv(var_map, *cond),
             then_block: rb(block_map, *then_block),
             else_block: rb(block_map, *else_block),
@@ -342,16 +353,18 @@ fn inline_one_round(
         .flat_map(|b| b.phis.iter().chain(b.insts.iter()))
         .filter_map(|i| i.dst().map(|dst| (dst, i.clone())))
         .collect();
-    let var_defs: HashMap<VarId, &Inst> =
-        var_defs_owned.iter().map(|(k, v)| (*k, v)).collect();
+    let var_defs: HashMap<VarId, &Inst> = var_defs_owned.iter().map(|(k, v)| (*k, v)).collect();
 
     let mut changed = false;
     let mut block_idx = 0;
 
     while block_idx < func.blocks.len() {
         // Find the first eligible call in this block.
-        let found = func.blocks[block_idx].insts.iter().enumerate().find_map(
-            |(inst_idx, inst)| {
+        let found = func.blocks[block_idx]
+            .insts
+            .iter()
+            .enumerate()
+            .find_map(|(inst_idx, inst)| {
                 let Inst::Call(dst, callee_var, args) = inst else {
                     return None;
                 };
@@ -361,12 +374,19 @@ fn inline_one_round(
                     return None;
                 }
                 Some((inst_idx, fn_name, *callee_var, args.clone(), *dst))
-            },
-        );
+            });
 
         if let Some((inst_idx, fn_name, callee_self, args, call_dst)) = found {
             let callee = registry[&fn_name].clone();
-            func = do_inline(func, block_idx, inst_idx, &callee, callee_self, args, call_dst);
+            func = do_inline(
+                func,
+                block_idx,
+                inst_idx,
+                &callee,
+                callee_self,
+                args,
+                call_dst,
+            );
             changed = true;
             // block_idx now points to B_pre (ends in Jump) — advance past it.
         }

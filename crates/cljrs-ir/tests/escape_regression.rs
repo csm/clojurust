@@ -181,4 +181,3 @@ fn non_escaping_inline_result_stays_no_escape() {
 fn _arc_witness() -> Arc<str> {
     Arc::from("x")
 }
-
