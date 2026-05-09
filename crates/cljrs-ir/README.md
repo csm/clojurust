@@ -19,6 +19,14 @@ can depend on the same types without a circular dependency.
 src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
+  lower/
+    mod.rs      — re-exports: lower_fn_body, analyze, inline, optimize, EscapeContext …
+    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust)
+    context.rs  — LowerCtx builder state used by anf.rs
+    escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
+    inline.rs   — inlining pass: splices small callees into call sites
+    known.rs    — symbol → KnownFn resolution
+    optimize.rs — region-allocation promotion; dominator/post-dominator CFG analysis
   cljrs/compiler/
     ir.cljrs       — IR data constructors + mutable builder context (atom-based)
     known.cljrs    — symbol-name → KnownFn keyword resolution
@@ -116,6 +124,29 @@ to reach `NoEscape` and get promoted to a region.
 ### Closures
 
 `ClosureTemplate`: static description of an `fn*` form (arity info, capture names).
+
+### Optimization pipeline (re-exported from `lower::`)
+
+```rust
+/// Inline small, non-capturing callees into their call sites, then promote
+/// non-escaping allocations to region (bump) allocation.
+pub fn optimize(ir: IrFunction) -> IrFunction;
+
+/// Run only the inlining pass (before escape analysis).
+pub fn inline(ir: IrFunction) -> IrFunction;
+```
+
+**Pipeline order** inside `optimize`:
+1. **Inlining** (`lower::inline`) — resolves `Call` sites whose callee is a
+   small, non-capturing, non-variadic `defn` in the same compilation unit and
+   splices the callee body into the caller.  Runs up to 8 rounds per function,
+   bottom-up.  Threshold: ≤ 20 instructions across all callee blocks.
+2. **Escape analysis** (`lower::escape`) — classifies each allocation as
+   `NoEscape`, `ArgEscape`, `Returns`, or `Escapes`.  Inter-procedural via
+   `EscapeContext`.
+3. **Region promotion** (`lower::optimize`) — rewrites `NoEscape` allocations
+   to `RegionStart` / `RegionAlloc` / `RegionEnd` over the minimal CFG
+   subgraph that covers the allocation and all its uses.
 
 ### Analysis (re-exported from `lower::`)
 

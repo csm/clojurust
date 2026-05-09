@@ -7,11 +7,13 @@
 pub mod anf;
 pub mod context;
 pub mod escape;
+pub mod inline;
 pub mod known;
 pub mod optimize;
 
 pub use anf::{LowerError, lower_fn_body};
 pub use escape::{AnalysisResult, EscapeContext, EscapeState, UseInfo, UseKind, analyze};
+pub use inline::inline;
 pub use optimize::optimize;
 
 /// Build an inter-procedural escape-analysis context for the entire IR tree

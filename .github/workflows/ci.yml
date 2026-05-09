@@ -35,3 +35,8 @@ jobs:
 
       - name: Clojure Tests
         run: cargo run -p cljrs compile -o test-suite --test ./clojure-test-suite/test && CLJRS_GC_STATS=- ./test-suite
+
+      - name: Graph sample (region-alloc smoke test)
+        env:
+          CLJRS_GC_STATS: "-"
+        run: cargo run -p cljrs compile -o graph-sample samples/graph.cljrs && ./graph-sample

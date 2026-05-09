@@ -108,6 +108,74 @@ fn loop_local_alloc_gets_promoted_to_region() {
     );
 }
 
+// ── Inlining tests ───────────────────────────────────────────────────────────
+
+/// Count `Inst::Call` instructions (non-known dynamic calls) in the IR tree.
+fn dynamic_call_count(ir: &IrFunction) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if matches!(inst, cljrs_ir::Inst::Call(..)) {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += dynamic_call_count(sub);
+    }
+    n
+}
+
+#[test]
+fn inlined_callee_alloc_promoted_to_region() {
+    // make-pair returns [a b]; caller only calls count on the result.
+    // Without inlining: the AllocVector escapes via Return → GC.
+    // With inlining:    the AllocVector is local to caller → NoEscape → RegionAlloc.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b] [a b])
+           (defn count-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        region_alloc_count(&optimized) >= 1,
+        "inlined callee alloc should be region-promoted; IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn eligible_call_is_eliminated_after_inline() {
+    // After inlining make-pair into count-pair, the dynamic Call instruction
+    // should be gone from count-pair's body.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b] [a b])
+           (defn count-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+    assert_eq!(
+        dynamic_call_count(&optimized),
+        0,
+        "dynamic call to make-pair should be eliminated by inlining; IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn non_escaping_inline_result_stays_no_escape() {
+    // Nested: make-triple wraps make-pair; both should be inlined and
+    // the allocation promoted.
+    let ir = lower(
+        "(do
+           (defn make-triple [a b c] [a b c])
+           (defn sum-triple [x] (count (make-triple x x x))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        region_alloc_count(&optimized) >= 1,
+        "inlined triple alloc should be region-promoted; IR:\n{optimized}"
+    );
+}
+
 // Suppress an unused-import lint if Arc isn't picked up by every test.
 #[allow(dead_code)]
 fn _arc_witness() -> Arc<str> {
