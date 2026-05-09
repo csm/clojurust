@@ -695,6 +695,7 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
 /// Allocations whose only escape path is a `Return` terminator are classified
 /// as [`EscapeState::Returns`] rather than [`EscapeState::Escapes`], making
 /// it possible for callers to decide whether the value truly escapes.
+#[allow(dead_code)] // used by stage-3 caller-context propagation (not yet implemented)
 pub(crate) fn compute_return_alloc_summary(
     ir_func: &IrFunction,
     ctx: &EscapeContext,
