@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 no-gc = ["cljrs-gc/no-gc"]
+async = ["dep:tokio"]
 
 [dependencies]
 cljrs-types   = { workspace = true }
@@ -21,3 +22,5 @@ thiserror    = { workspace = true }
 rpds         = { workspace = true }
 uuid         = { workspace = true }
 regex        = { workspace = true }
+tokio        = { workspace = true, optional = true, features = ["sync", "rt", "time", "macros"] }
+

@@ -265,6 +265,7 @@ dependencies = [
  "cljrs-value",
  "miette",
  "rustyline",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -285,6 +286,7 @@ dependencies = [
  "rand",
  "regex",
  "rpds",
+ "tokio",
  "uuid",
 ]
 
@@ -371,6 +373,7 @@ dependencies = [
  "cljrs-types",
  "cljrs-value",
  "regex",
+ "tokio",
  "uuid",
 ]
 
@@ -437,6 +440,7 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+ "futures-util",
  "lazy_static",
  "tokio",
 ]
@@ -464,6 +468,7 @@ dependencies = [
  "regex",
  "rpds",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
@@ -718,6 +723,29 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "futures-core"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-task"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+
+[[package]]
+name = "futures-util"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "pin-project-lite",
+]
 
 [[package]]
 name = "getrandom"
@@ -1429,6 +1457,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "pin-project-lite",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

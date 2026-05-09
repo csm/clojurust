@@ -69,6 +69,14 @@ pub fn standard_env_with_paths(source_paths: Vec<PathBuf>) -> Arc<GlobalEnv>;
 `union`, `intersection`, `difference`, `subset?`, `superset?`,
 `select`, `map-invert`
 
+## Cargo features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `prebuild-ir` | off | Pre-lower `clojure.core` to IR at build time. |
+| `no-gc` | off | Disable GC across the dependency chain. |
+| `async` | off | Pull in `tokio` + `futures-util`; enables the core.async surface (`chan`, `put!`, `take!`, `go`, `alt`, `alts`, `timeout`) — currently a stub in `core_async.rs`, fleshed out in Phase E. |
+
 ## Dependency notes
 
 - `cljrs-stdlib` depends on `cljrs-eval` (for `GlobalEnv`, `standard_env_minimal`)

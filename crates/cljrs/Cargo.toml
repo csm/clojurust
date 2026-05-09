@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = []
 # Propagate no-gc to all direct dependencies; transitive deps pick it up through their own feature chains.
 no-gc = [
     "cljrs-gc/no-gc",
@@ -15,6 +16,11 @@ no-gc = [
     "cljrs-compiler/no-gc",
     "cljrs-runtime/no-gc",
     "cljrs-stdlib/no-gc",
+]
+async = [
+    "dep:tokio",
+    "cljrs-value/async",
+    "cljrs-stdlib/async",
 ]
 enable-rustyline = ["rustyline"]
 
@@ -38,3 +44,4 @@ miette        = { workspace = true }
 tracing-subscriber = "0.3.23"
 tracing = "0.1.44"
 rustyline = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "sync", "rt-multi-thread", "time", "macros"] }

@@ -76,6 +76,8 @@ pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
         Value::Promise(p) => p.is_static_alloc(),
         Value::Future(p) => p.is_static_alloc(),
         Value::Agent(p) => p.is_static_alloc(),
+        #[cfg(feature = "async")]
+        Value::Channel(p) => p.is_static_alloc(),
         Value::TypeInstance(p) => p.is_static_alloc(),
         Value::ObjectArray(p) => p.is_static_alloc(),
         Value::NativeObject(p) => p.is_static_alloc(),
@@ -860,7 +862,8 @@ impl cljrs_gc::Trace for CljxPromise {
 
 // ── CljxFuture ────────────────────────────────────────────────────────────────
 
-/// Thread-pool future state.
+/// Resolved state of a `CljxFuture`. `Running` means not yet resolved.
+#[derive(Clone)]
 pub enum FutureState {
     Running,
     Done(Value),
@@ -868,28 +871,224 @@ pub enum FutureState {
     Cancelled,
 }
 
-/// A future value computed asynchronously on another thread.
+/// A future value computed asynchronously.
+///
+/// The internal storage depends on the `async` feature:
+/// - off: a `Mutex<FutureState>` + `Condvar`, driven by an OS thread spawned
+///   in `future-call*`.
+/// - on:  a `tokio::sync::Mutex<FutureState>` + `tokio::sync::Notify`, driven
+///   either by an OS thread (existing `future` macro) or by a `spawn_local`
+///   task (Phase B `^:async` fns).
+///
+/// The public Rust API is identical in both cases: callers use
+/// `blocking_deref` / `blocking_deref_timeout` to wait synchronously,
+/// `complete` / `fail` / `cancel` to resolve, and `is_done` / `is_cancelled`
+/// to inspect.  The async-only `await_value` is added behind the feature.
 pub struct CljxFuture {
-    pub state: Mutex<FutureState>,
-    pub cond: Condvar,
+    inner: FutureInner,
+}
+
+#[cfg(not(feature = "async"))]
+struct FutureInner {
+    state: Mutex<FutureState>,
+    cond: Condvar,
+}
+
+#[cfg(feature = "async")]
+struct FutureInner {
+    state: tokio::sync::Mutex<FutureState>,
+    /// std Mutex shadow of the resolved state, so blocking callers do not need
+    /// a tokio runtime handle to read it.
+    sync_state: Mutex<FutureState>,
+    sync_cond: Condvar,
+    notify: tokio::sync::Notify,
 }
 
 impl CljxFuture {
     pub fn new() -> Self {
-        Self {
+        #[cfg(not(feature = "async"))]
+        let inner = FutureInner {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
-        }
+        };
+        #[cfg(feature = "async")]
+        let inner = FutureInner {
+            state: tokio::sync::Mutex::new(FutureState::Running),
+            sync_state: Mutex::new(FutureState::Running),
+            sync_cond: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+        };
+        Self { inner }
     }
 
     /// True if done, failed, or cancelled (not still running).
     pub fn is_done(&self) -> bool {
-        !matches!(&*self.state.lock().unwrap(), FutureState::Running)
+        !matches!(&*self.lock_sync(), FutureState::Running)
     }
 
     /// True if explicitly cancelled.
     pub fn is_cancelled(&self) -> bool {
-        matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+        matches!(&*self.lock_sync(), FutureState::Cancelled)
+    }
+
+    /// Snapshot the current resolved state, or `Running` if not yet resolved.
+    pub fn snapshot(&self) -> FutureState {
+        self.lock_sync().clone()
+    }
+
+    /// Block the calling OS thread until resolved, returning the resolved
+    /// state (`Done`, `Failed`, or `Cancelled`).
+    ///
+    /// Must NOT be called from inside the tokio LocalSet executor — it parks
+    /// the executor thread.  Callers in async contexts must use `await_value`
+    /// instead.
+    pub fn blocking_deref(&self) -> FutureState {
+        let mut guard = self.lock_sync();
+        loop {
+            match &*guard {
+                FutureState::Running => {
+                    #[cfg(not(feature = "async"))]
+                    {
+                        guard = self.inner.cond.wait(guard).unwrap();
+                    }
+                    #[cfg(feature = "async")]
+                    {
+                        guard = self.inner.sync_cond.wait(guard).unwrap();
+                    }
+                }
+                resolved => return resolved.clone(),
+            }
+        }
+    }
+
+    /// Block the calling OS thread until resolved or `timeout` elapses.
+    /// Returns `None` on timeout, otherwise the resolved state.
+    pub fn blocking_deref_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<FutureState> {
+        let guard = self.lock_sync();
+        if !matches!(&*guard, FutureState::Running) {
+            return Some(guard.clone());
+        }
+        #[cfg(not(feature = "async"))]
+        let (guard, _wait) = self.inner.cond.wait_timeout(guard, timeout).unwrap();
+        #[cfg(feature = "async")]
+        let (guard, _wait) = self.inner.sync_cond.wait_timeout(guard, timeout).unwrap();
+        match &*guard {
+            FutureState::Running => None,
+            resolved => Some(resolved.clone()),
+        }
+    }
+
+    /// Resolve the future with a value.  Returns `true` if the transition
+    /// from `Running` succeeded; `false` if it was already resolved.
+    pub fn complete(&self, value: Value) -> bool {
+        self.set_resolved(FutureState::Done(value))
+    }
+
+    /// Resolve the future with an error message.  Returns `true` if the
+    /// transition from `Running` succeeded.
+    pub fn fail(&self, err: String) -> bool {
+        self.set_resolved(FutureState::Failed(err))
+    }
+
+    /// Cancel the future.  Returns `true` if the transition from `Running`
+    /// succeeded; `false` if it was already resolved.
+    pub fn cancel(&self) -> bool {
+        self.set_resolved(FutureState::Cancelled)
+    }
+
+    /// Internal: lock the synchronous state mirror.
+    #[cfg(not(feature = "async"))]
+    fn lock_sync(&self) -> std::sync::MutexGuard<'_, FutureState> {
+        self.inner.state.lock().unwrap()
+    }
+
+    #[cfg(feature = "async")]
+    fn lock_sync(&self) -> std::sync::MutexGuard<'_, FutureState> {
+        self.inner.sync_state.lock().unwrap()
+    }
+
+    /// Internal: attempt to flip from `Running` to a resolved state.
+    fn set_resolved(&self, new_state: FutureState) -> bool {
+        let mut guard = self.lock_sync();
+        if !matches!(&*guard, FutureState::Running) {
+            return false;
+        }
+        *guard = new_state.clone();
+        #[cfg(not(feature = "async"))]
+        {
+            self.inner.cond.notify_all();
+        }
+        #[cfg(feature = "async")]
+        {
+            // Mirror into the tokio-side state for `await_value` callers.
+            // We block briefly on the tokio mutex; this is fine because
+            // resolution is rare and uncontended.
+            if let Ok(mut tokio_guard) = self.inner.state.try_lock() {
+                *tokio_guard = new_state;
+            } else {
+                // Fall back to a futures-blocking acquire via a fresh handle.
+                // Safe: only the worker holds the tokio mutex briefly during reads.
+                let inner_state = &self.inner.state;
+                let mut tokio_guard = futures_lite_block_on(inner_state.lock());
+                *tokio_guard = new_state;
+            }
+            self.inner.sync_cond.notify_all();
+            self.inner.notify.notify_waiters();
+        }
+        true
+    }
+}
+
+/// Async-only: yield until the future is resolved.
+///
+/// Safe to call from inside a `^:async` body running on the LocalSet
+/// executor.  Uses `tokio::sync::Notify` for the wake.
+#[cfg(feature = "async")]
+impl CljxFuture {
+    pub async fn await_value(&self) -> FutureState {
+        loop {
+            // Register interest BEFORE checking the state to avoid losing a
+            // wake that arrives between the check and the wait.
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            {
+                let guard = self.inner.state.lock().await;
+                if !matches!(&*guard, FutureState::Running) {
+                    return guard.clone();
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Tiny synchronous block-on used only for the rare resolution path when the
+/// tokio mutex is contended.  Polls the future on a parking_lot-style spin
+/// with a thread parker; bounded contention so this is acceptable.
+#[cfg(feature = "async")]
+fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
+
+    struct ThreadWaker(thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker: Waker = Arc::new(ThreadWaker(thread::current())).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => thread::park(),
+        }
     }
 }
 
@@ -907,11 +1106,9 @@ impl std::fmt::Debug for CljxFuture {
 
 impl cljrs_gc::Trace for CljxFuture {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        {
-            let state = self.state.lock().unwrap();
-            if let FutureState::Done(v) = &*state {
-                v.trace(visitor);
-            }
+        let state = self.lock_sync();
+        if let FutureState::Done(v) = &*state {
+            v.trace(visitor);
         }
     }
 }
@@ -976,6 +1173,71 @@ impl cljrs_gc::Trace for Agent {
                 key.trace(visitor);
                 f.trace(visitor);
             }
+        }
+    }
+}
+
+// ── CljxChannel (async only) ─────────────────────────────────────────────────
+
+#[cfg(feature = "async")]
+pub use channel::CljxChannel;
+
+#[cfg(feature = "async")]
+mod channel {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::Value;
+
+    /// A core.async-style channel over `Value`.
+    ///
+    /// Phase A introduces only the type; the put/take/close/select operations
+    /// are implemented in Phase E.  The channel uses a tokio `mpsc` under the
+    /// hood: many producers, one consumer at a time (the receiver is behind a
+    /// tokio `Mutex` so concurrent `take!` callers serialize cleanly).
+    pub struct CljxChannel {
+        pub sender: tokio::sync::mpsc::Sender<Value>,
+        pub receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Value>>,
+        /// `None` means rendezvous (Phase E will implement true unbuffered).
+        pub capacity: Option<usize>,
+        pub closed: AtomicBool,
+    }
+
+    impl CljxChannel {
+        /// Create a new channel.  `capacity = None` is treated as capacity 1
+        /// for now (true rendezvous lands in Phase E).
+        pub fn new(capacity: Option<usize>) -> Self {
+            let cap = capacity.unwrap_or(1).max(1);
+            let (sender, receiver) = tokio::sync::mpsc::channel(cap);
+            Self {
+                sender,
+                receiver: tokio::sync::Mutex::new(receiver),
+                capacity,
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        pub fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+
+        pub fn close(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+
+    impl std::fmt::Debug for CljxChannel {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Channel")
+        }
+    }
+
+    impl cljrs_gc::Trace for CljxChannel {
+        fn trace(&self, _visitor: &mut cljrs_gc::MarkVisitor) {
+            // Channel buffers contain Values, but enumerating them would
+            // require taking the mpsc receiver off the channel.  Phase G
+            // covers precise root tracking for in-flight channel values; for
+            // now, in-flight values are kept alive by the strong references
+            // held by their senders/receivers.
         }
     }
 }

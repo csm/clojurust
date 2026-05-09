@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 no-gc = ["cljrs-gc/no-gc", "cljrs-env/no-gc", "cljrs-value/no-gc", "cljrs-builtins/no-gc"]
+async = ["dep:tokio", "cljrs-value/async", "cljrs-builtins/async"]
 
 [dependencies]
 cljrs-env = { workspace = true }
@@ -18,3 +19,4 @@ cljrs-gc = { workspace = true }
 cljrs-reader = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, optional = true, features = ["sync", "rt", "time", "macros"] }

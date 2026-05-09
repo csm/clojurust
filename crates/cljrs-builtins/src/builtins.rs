@@ -351,7 +351,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         ("future-call*", Arity::Fixed(2), builtin_future_call_star),
         ("agent", Arity::Fixed(1), builtin_agent),
-        ("await", Arity::Variadic { min: 1 }, builtin_await),
+        ("await-agent", Arity::Variadic { min: 1 }, builtin_await_agent),
         ("agent-error", Arity::Fixed(1), builtin_agent_error),
         ("restart-agent", Arity::Fixed(2), builtin_restart_agent),
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
@@ -4903,40 +4903,24 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                     }
                 };
                 let timeout_val = args[2].clone();
-                let guard = f.get().state.lock().unwrap();
-                match &*guard {
-                    FutureState::Done(v) => Ok(v.clone()),
-                    FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
-                    FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
-                    FutureState::Running => {
-                        let (guard, _) = f
-                            .get()
-                            .cond
-                            .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                            .unwrap();
-                        match &*guard {
-                            FutureState::Done(v) => Ok(v.clone()),
-                            FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
-                            FutureState::Cancelled => {
-                                Err(ValueError::Other("future was cancelled".into()))
-                            }
-                            FutureState::Running => Ok(timeout_val),
-                        }
+                match f
+                    .get()
+                    .blocking_deref_timeout(std::time::Duration::from_millis(timeout_ms))
+                {
+                    Some(FutureState::Done(v)) => Ok(v),
+                    Some(FutureState::Failed(e)) => Err(ValueError::Other(e)),
+                    Some(FutureState::Cancelled) => {
+                        Err(ValueError::Other("future was cancelled".into()))
                     }
+                    Some(FutureState::Running) => Ok(timeout_val),
+                    None => Ok(timeout_val),
                 }
             } else {
-                let mut guard = f.get().state.lock().unwrap();
-                loop {
-                    match &*guard {
-                        FutureState::Done(v) => return Ok(v.clone()),
-                        FutureState::Failed(e) => return Err(ValueError::Other(e.clone())),
-                        FutureState::Cancelled => {
-                            return Err(ValueError::Other("future was cancelled".into()));
-                        }
-                        FutureState::Running => {
-                            guard = f.get().cond.wait(guard).unwrap();
-                        }
-                    }
+                match f.get().blocking_deref() {
+                    FutureState::Done(v) => Ok(v),
+                    FutureState::Failed(e) => Err(ValueError::Other(e)),
+                    FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
+                    FutureState::Running => unreachable!("blocking_deref never returns Running"),
                 }
             }
         }
@@ -6442,11 +6426,7 @@ fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Future(f) => {
-            let mut state = f.get().state.lock().unwrap();
-            if matches!(&*state, FutureState::Running) {
-                *state = FutureState::Cancelled;
-                f.get().cond.notify_all();
-            }
+            f.get().cancel();
             Ok(Value::Bool(true))
         }
         v => Err(ValueError::WrongType {
@@ -6492,20 +6472,12 @@ fn builtin_future_call_star(args: &[Value]) -> ValueResult<Value> {
         dynamics::install_frames(captured_bindings);
         match cljrs_env::callback::invoke(&func, args) {
             Ok(result) => {
-                let mut state = thunk_ptr.get().state.lock().unwrap();
-                if matches!(&*state, FutureState::Running) {
-                    *state = FutureState::Done(result);
-                }
+                thunk_ptr.get().complete(result);
             }
             Err(e) => {
-                let mut state = thunk_ptr.get().state.lock().unwrap();
-                if matches!(&*state, FutureState::Running) {
-                    *state = FutureState::Failed(format!("{}", e));
-                }
+                thunk_ptr.get().fail(format!("{}", e));
             }
         }
-
-        thunk_ptr.get().cond.notify_all();
     });
     Ok(Value::Future(future_ptr))
 }
@@ -6539,7 +6511,7 @@ fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
     })))
 }
 
-fn builtin_await(args: &[Value]) -> ValueResult<Value> {
+fn builtin_await_agent(args: &[Value]) -> ValueResult<Value> {
     for agent_val in args {
         match agent_val {
             Value::Agent(a) => {
@@ -6553,9 +6525,9 @@ fn builtin_await(args: &[Value]) -> ValueResult<Value> {
                     .lock()
                     .unwrap()
                     .send(AgentMsg::Update(sync_fn))
-                    .map_err(|_| ValueError::Other("await: agent is shut down".into()))?;
+                    .map_err(|_| ValueError::Other("await-agent: agent is shut down".into()))?;
                 rx.recv()
-                    .map_err(|_| ValueError::Other("await: agent thread died".into()))?;
+                    .map_err(|_| ValueError::Other("await-agent: agent thread died".into()))?;
             }
             v => {
                 return Err(ValueError::WrongType {

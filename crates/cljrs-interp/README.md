@@ -4,6 +4,13 @@ Self-contained tree-walking interpreter for Clojure.
 
 **Phase:** Core interpreter — implemented.  `no-gc` region/static-sink support (Phases 4–5), blacklist integration (Phase 6), and integration tests (Phase 8) of `docs/no-gc-plan.md` — implemented.
 
+## Cargo features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `no-gc` | off | Propagate `no-gc` across the dependency chain (regions, static arenas). |
+| `async` | off | Pull in `tokio`; reserve plumbing for the Phase B `^:async` dispatch and `await` special form (not yet wired up — Phase A only). |
+
 ---
 
 ## Purpose

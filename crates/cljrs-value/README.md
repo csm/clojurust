@@ -2,7 +2,14 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) — implemented.  Phase A async groundwork (CljxChannel, tokio-backed CljxFuture) is gated on the `async` feature.
+
+## Cargo features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `no-gc` | off | Bypass GC for `[no_std]`-style profiling builds. |
+| `async` | off | Pull in `tokio`; switch `CljxFuture` to a `Notify`-based backend; enable `Value::Channel` and `CljxChannel`. |
 
 ---
 
@@ -87,6 +94,8 @@ pub enum Value {
     Promise(GcPtr<CljxPromise>),
     Future(GcPtr<CljxFuture>),
     Agent(GcPtr<Agent>),
+    #[cfg(feature = "async")]
+    Channel(GcPtr<CljxChannel>),  // core.async-style channel (Phase A+)
 
     // Records / reify (Phase 6-ext)
     TypeInstance(GcPtr<TypeInstance>),
@@ -221,16 +230,32 @@ pub struct CljxPromise {
     pub cond: Condvar,
 }
 
-pub struct CljxFuture {
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(String) | Cancelled
-    pub cond: Condvar,
-}
+pub struct CljxFuture { /* opaque */ }
+// FutureState: Running | Done(Value) | Failed(String) | Cancelled
+//
+// API (identical with or without the `async` feature):
+//   blocking_deref()                -> FutureState     // parks current thread
+//   blocking_deref_timeout(Duration)-> Option<...>     // None on timeout
+//   complete(v) / fail(e) / cancel()-> bool            // resolution, idempotent
+//   is_done() / is_cancelled()      -> bool
+//
+// With `async`: also `async fn await_value() -> FutureState` (yields on the
+// LocalSet executor instead of parking the OS thread).
 
 pub struct Agent {
     pub state: Arc<Mutex<Value>>,
     pub error: Arc<Mutex<Option<String>>>,
     pub sender: Mutex<SyncSender<AgentMsg>>,
 }
+
+#[cfg(feature = "async")]
+pub struct CljxChannel {
+    pub sender: tokio::sync::mpsc::Sender<Value>,
+    pub receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Value>>,
+    pub capacity: Option<usize>,  // None = rendezvous (full impl in Phase E)
+    pub closed: AtomicBool,
+}
+// Phase A introduces only the type; put/take/close/select land in Phase E.
 pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
 ```
 

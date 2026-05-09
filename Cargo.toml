@@ -50,7 +50,8 @@ bigdecimal   = "0.4"
 rand         = "0.10.1"
 rpds         = "1"
 uuid         = "1.22.0"
-tokio        = "1.50.0"
+tokio        = { version = "1.50.0", default-features = false }
+futures-util = { version = "0.3", default-features = false }
 regex        = "1.12.3"
 serde        = "1.0.228"
 postcard     = "1.1.3"

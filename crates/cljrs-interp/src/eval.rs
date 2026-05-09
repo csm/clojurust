@@ -253,21 +253,12 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Reduced(inner) => Ok(*inner),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
-        Value::Future(f) => {
-            let mut guard = f.get().state.lock().unwrap();
-            loop {
-                match &*guard {
-                    FutureState::Done(v) => return Ok(v.clone()),
-                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Runtime("future was cancelled".into()));
-                    }
-                    FutureState::Running => {
-                        guard = f.get().cond.wait(guard).unwrap();
-                    }
-                }
-            }
-        }
+        Value::Future(f) => match f.get().blocking_deref() {
+            FutureState::Done(v) => Ok(v),
+            FutureState::Failed(e) => Err(EvalError::Runtime(e)),
+            FutureState::Cancelled => Err(EvalError::Runtime("future was cancelled".into())),
+            FutureState::Running => unreachable!("blocking_deref never returns Running"),
+        },
         other => Err(EvalError::Runtime(format!(
             "cannot deref {}",
             other.type_name()
@@ -1119,7 +1110,7 @@ mod tests {
             (let [a (agent 0)]
               (send a + 1)
               (send a + 2)
-              (await a)
+              (await-agent a)
               @a)
             "#,
         )
@@ -1133,7 +1124,7 @@ mod tests {
             r#"
             (let [a (agent 10)]
               (send a (fn [_] (throw (ex-info "boom" {}))))
-              (await a)
+              (await-agent a)
               (let [err (agent-error a)]
                 (restart-agent a 99)
                 [err @a]))

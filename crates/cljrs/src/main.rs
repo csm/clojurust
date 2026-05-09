@@ -182,7 +182,7 @@ fn main() -> miette::Result<()> {
     let builder = std::thread::Builder::new()
         .name("cljrs-main".into())
         .stack_size(stack_size);
-    let handle = builder.spawn(move || run(cli)).into_diagnostic()?;
+    let handle = builder.spawn(move || run_on_runtime(cli)).into_diagnostic()?;
     let result: miette::Result<i32> = handle.join().unwrap_or_else(|e| {
         eprintln!("cljrs: thread panicked: {e:?}");
         std::process::exit(1);
@@ -191,6 +191,30 @@ fn main() -> miette::Result<()> {
         Ok(0) => Ok(()),
         Ok(code) => std::process::exit(code),
         Err(e) => Err(e),
+    }
+}
+
+/// Wrap `run` in a tokio current-thread runtime + LocalSet when the `async`
+/// feature is enabled.  This makes `tokio::task::spawn_local` available to
+/// `^:async` function calls and channel ops without requiring user code to
+/// set up a runtime.  Without the feature, this is just `run(cli)`.
+fn run_on_runtime(cli: Cli) -> miette::Result<i32> {
+    #[cfg(feature = "async")]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .into_diagnostic()?;
+        let local = tokio::task::LocalSet::new();
+        // `run` is synchronous today; the LocalSet is wired up so that future
+        // phases (B+) can call `tokio::task::spawn_local` from within the
+        // interpreter.  `run_until` keeps polling spawned local tasks until
+        // the provided future completes.
+        local.block_on(&rt, async { run(cli) })
+    }
+    #[cfg(not(feature = "async"))]
+    {
+        run(cli)
     }
 }
 

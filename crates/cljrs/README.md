@@ -65,6 +65,16 @@ cljrs test --src-path test/ --gc-stats /tmp/test-gc.log
 
 ---
 
+## Cargo features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `no-gc` | off | Compile every crate with the GC turned off (profiling/static-only builds). |
+| `enable-rustyline` | off | Pull in `rustyline` for line editing in the REPL. |
+| `async` | off | Build the binary on top of a tokio current-thread runtime + LocalSet, enabling Phase A+ async primitives (`^:async` fns, `await`, `chan`, `go`, …).  When off, none of the async surface is available — the interpreter, AOT compiler, and standard concurrency primitives (`future`, `promise`, `agent`) work exactly as before. |
+
+Build with `cargo build -p cljrs --features async` to opt in.
+
 ## Dependencies
 
 | Crate | Role |
@@ -78,3 +88,4 @@ cljrs test --src-path test/ --gc-stats /tmp/test-gc.log
 | `cljrs-interop` (workspace) | Rust interop (future phases) |
 | `clap` (workspace) | CLI argument parsing |
 | `miette` (workspace) | Rich terminal error rendering |
+| `tokio` (workspace, optional) | `async` feature — current-thread runtime + LocalSet |

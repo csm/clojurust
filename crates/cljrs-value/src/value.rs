@@ -126,6 +126,11 @@ pub enum Value {
     Promise(GcPtr<CljxPromise>),
     Future(GcPtr<CljxFuture>),
     Agent(GcPtr<Agent>),
+    /// A core.async-style channel.  Only present when the `async` feature is
+    /// enabled — without it, the variant does not exist on `Value` so no code
+    /// has to handle it.
+    #[cfg(feature = "async")]
+    Channel(GcPtr<crate::types::CljxChannel>),
 
     // ── Records / reify instances ─────────────────────────────────────────────
     TypeInstance(GcPtr<TypeInstance>),
@@ -757,6 +762,8 @@ impl ClojureHash for Value {
             Value::Promise(p) => p.get() as *const _ as u32,
             Value::Future(fu) => fu.get() as *const _ as u32,
             Value::Agent(a) => a.get() as *const _ as u32,
+            #[cfg(feature = "async")]
+            Value::Channel(c) => c.get() as *const _ as u32,
             // Record hash: combine type tag hash with fields hash.
             Value::TypeInstance(ti) => {
                 let tag_hash = hash_string(&ti.get().type_tag);
@@ -1045,6 +1052,8 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         Value::Promise(_) => write!(f, "#<Promise>"),
         Value::Future(_) => write!(f, "#<Future>"),
         Value::Agent(_) => write!(f, "#<Agent>"),
+        #[cfg(feature = "async")]
+        Value::Channel(_) => write!(f, "#<Channel>"),
         Value::TypeInstance(ti) => {
             let ti = ti.get();
             write!(f, "#{}{{", ti.type_tag)?;
@@ -1153,6 +1162,8 @@ impl Value {
             Value::Promise(_) => "promise",
             Value::Future(_) => "future",
             Value::Agent(_) => "agent",
+            #[cfg(feature = "async")]
+            Value::Channel(_) => "channel",
             Value::TypeInstance(_) => "record",
             Value::NativeObject(_) => "native-object",
             Value::BooleanArray(_) => "boolean-array",
@@ -1258,6 +1269,8 @@ impl cljrs_gc::Trace for Value {
             Value::Promise(p) => visitor.visit(p),
             Value::Future(p) => visitor.visit(p),
             Value::Agent(p) => visitor.visit(p),
+            #[cfg(feature = "async")]
+            Value::Channel(p) => visitor.visit(p),
             Value::TypeInstance(p) => visitor.visit(p),
             Value::ObjectArray(p) => visitor.visit(p),
             Value::BooleanArray(_)
@@ -1691,6 +1704,8 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Promise(_) => 25,
         Value::Future(_) => 26,
         Value::Agent(_) => 27,
+        #[cfg(feature = "async")]
+        Value::Channel(_) => 46,
         Value::TypeInstance(_) => 28,
         Value::BooleanArray(_) => 29,
         Value::ByteArray(_) => 30,
