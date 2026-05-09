@@ -246,6 +246,113 @@ fn cross_fn_no_escape_covers_all_returns_allocs() {
     );
 }
 
+// ── Stage-4: cross-function region promotion tests ─────────────────────────
+
+/// Count `Inst::CallWithRegion` insts across the IR tree.
+fn call_with_region_count(ir: &IrFunction) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if matches!(inst, Inst::CallWithRegion(..)) {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += call_with_region_count(sub);
+    }
+    n
+}
+
+/// Count `Inst::RegionParam` insts across the IR tree.
+fn region_param_count(ir: &IrFunction) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if matches!(inst, Inst::RegionParam(_)) {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += region_param_count(sub);
+    }
+    n
+}
+
+#[test]
+fn stage4_promotes_non_inlineable_callee() {
+    // make-pair has a nested `fn` (a subfunction), making it ineligible for
+    // inlining.  Yet its `[a b]` allocation is `Returns` and the call site
+    // only feeds `count` — so the result is `NoEscape` in the caller.  Stage
+    // 4 should clone make-pair into a region-parameterised variant and
+    // rewrite the call to `CallWithRegion`.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        call_with_region_count(&optimized) >= 1,
+        "stage 4 should rewrite the call to CallWithRegion; IR:\n{optimized}"
+    );
+    assert!(
+        region_param_count(&optimized) >= 1,
+        "the cloned variant should carry a RegionParam marker; IR:\n{optimized}"
+    );
+    assert!(
+        region_alloc_count(&optimized) >= 1,
+        "the cloned variant's vector alloc should be region-promoted; IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn stage4_skipped_when_callee_result_escapes() {
+    // The caller returns make-pair's result directly — call_dst is `Returns`,
+    // not `NoEscape`.  Stage 4 must NOT rewrite the call site.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn pass-thru [x] (make-pair x x)))",
+    );
+    let optimized = optimize(ir);
+    assert_eq!(
+        call_with_region_count(&optimized),
+        0,
+        "no CallWithRegion should be emitted when the call result escapes; IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn stage4_inline_first_falls_back_to_promotion() {
+    // When the callee is small enough to inline, stage-1 inlining handles it
+    // and stage 4 has nothing to do.  This test verifies that the small
+    // `make-pair` (no subfunctions) still gets a region-promoted alloc but
+    // *via inlining*, not via cross-fn region passing.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b] [a b])
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+    // Inlining removes the dynamic call.  stage 4 isn't expected to fire
+    // because there's nothing left to clone.
+    assert_eq!(
+        dynamic_call_count(&optimized),
+        0,
+        "small callee should be inlined; IR:\n{optimized}"
+    );
+    assert!(
+        region_alloc_count(&optimized) >= 1,
+        "after inlining, the alloc should be region-promoted; IR:\n{optimized}"
+    );
+}
+
 // Suppress an unused-import lint if Arc isn't picked up by every test.
 #[allow(dead_code)]
 fn _arc_witness() -> Arc<str> {
