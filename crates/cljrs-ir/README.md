@@ -99,6 +99,35 @@ pub struct Block {
 
 `ClosureTemplate`: static description of an `fn*` form (arity info, capture names).
 
+### Analysis (re-exported from `lower::`)
+
+```rust
+pub fn analyze(ir: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisResult;
+pub fn make_analysis_context(ir: &IrFunction) -> EscapeContext;
+
+pub enum EscapeState { NoEscape, ArgEscape, Returns, Escapes }
+pub struct UseInfo { pub block: BlockId, pub kind: UseKind }
+pub enum UseKind { Return, DefVar, SetBang, ClosureCapture, Throw,
+                   StoredInHeap, Recur, KnownCallArg{..}, UnknownCallArg{..},
+                   PhiInput, BranchCond, Deref, CallCallee }
+pub struct AnalysisResult {
+    pub states:       HashMap<VarId, EscapeState>,
+    pub uses:         HashMap<VarId, Vec<UseInfo>>,
+    pub alloc_blocks: HashMap<VarId, BlockId>,
+}
+```
+
+These are the same types the optimizer uses internally; they are exposed
+publicly so downstream tooling (e.g. `cljrs-ir-viz`) can present
+escape-analysis results without re-implementing the use-chain walk.
+
+### Source mapping
+
+ANF lowering emits `Inst::SourceLoc(span)` markers at the head of each
+form's lowering, deduplicated per `(file, line)` within a basic block.
+`SourceLoc` has no `dst` and `Effect::Pure`, so it is invisible to the
+optimizer and codegen — it exists for downstream tooling only.
+
 ---
 
 ## Dependencies

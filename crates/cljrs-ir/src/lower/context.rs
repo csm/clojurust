@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use cljrs_types::span::Span;
+
 use crate::{Block, BlockId, Inst, IrFunction, Terminator, VarId};
 
 // ── Global name counter (shared across all lowering calls in the process) ────
@@ -47,6 +49,11 @@ pub struct LowerCtx {
 
     /// Collected subfunctions from nested `fn*` forms.
     pub(crate) subfunctions: Vec<IrFunction>,
+
+    /// (file, line) of the most recent `SourceLoc` marker emitted into
+    /// the current block.  Reset on `start_block`.  Used to dedupe
+    /// consecutive `SourceLoc` insts on the same line.
+    pub(crate) last_source_loc: Option<(Arc<String>, u32)>,
 }
 
 impl LowerCtx {
@@ -65,6 +72,7 @@ impl LowerCtx {
             // Block 0 is the entry block (already "started")
             next_block: 1,
             subfunctions: Vec::new(),
+            last_source_loc: None,
         }
     }
 
@@ -116,6 +124,20 @@ impl LowerCtx {
 
     pub fn start_block(&mut self, id: BlockId) {
         self.current_block_id = id.0;
+        self.last_source_loc = None;
+    }
+
+    /// Emit a `SourceLoc` marker for `span` if the current block has not
+    /// already emitted one with the same `(file, line)`.  Source markers
+    /// are pure no-op instructions (no `dst`, `Effect::Pure`) consumed by
+    /// debugging / visualization tooling — see `cljrs-ir-viz`.
+    pub fn maybe_emit_source_loc(&mut self, span: &Span) {
+        let key = (span.file.clone(), span.line);
+        if self.last_source_loc.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_source_loc = Some(key);
+        self.current_insts.push(Inst::SourceLoc(span.clone()));
     }
 
     pub fn current_block_id(&self) -> BlockId {

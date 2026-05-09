@@ -13,7 +13,7 @@ use crate::{BlockId, Inst, IrFunction, KnownFn, Terminator, VarId};
 
 /// Escape classification for an allocation or parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EscapeState {
+pub enum EscapeState {
     NoEscape,
     ArgEscape,
     Returns,
@@ -36,7 +36,7 @@ impl EscapeState {
 // ── Use-chain types ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(crate) enum UseKind {
+pub enum UseKind {
     Return,
     DefVar,
     SetBang,
@@ -53,7 +53,7 @@ pub(crate) enum UseKind {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UseInfo {
+pub struct UseInfo {
     pub block: BlockId,
     pub kind: UseKind,
 }
@@ -409,11 +409,14 @@ pub(crate) enum EscapeMode {
 
 // ── Inter-procedural context ─────────────────────────────────────────────────
 
-pub(crate) struct EscapeContext {
-    pub registry: HashMap<Arc<str>, IrFunction>,
-    pub defn_map: HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
-    pub cache: RefCell<HashMap<Arc<str>, Vec<EscapeState>>>,
-    pub computing: RefCell<HashSet<Arc<str>>>,
+/// Inter-procedural escape-analysis context.  Carries a registry of all
+/// functions in the IR tree (including subfunctions) so that calls to
+/// known closures can be resolved precisely.
+pub struct EscapeContext {
+    pub(crate) registry: HashMap<Arc<str>, IrFunction>,
+    pub(crate) defn_map: HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
+    pub(crate) cache: RefCell<HashMap<Arc<str>, Vec<EscapeState>>>,
+    pub(crate) computing: RefCell<HashSet<Arc<str>>>,
 }
 
 pub(crate) fn make_context(root: &IrFunction) -> EscapeContext {
@@ -611,13 +614,19 @@ pub(crate) fn classify_escape_with_ctx(
 
 // ── Public analysis result ───────────────────────────────────────────────────
 
-pub(crate) struct AnalysisResult {
+/// The output of [`analyze`].  Maps every allocation in the function to its
+/// escape state, and exposes the use-chain map and alloc→block map used by
+/// the optimizer (and downstream tooling such as `cljrs-ir-viz`).
+pub struct AnalysisResult {
     pub states: HashMap<VarId, EscapeState>,
     pub uses: HashMap<VarId, Vec<UseInfo>>,
     pub alloc_blocks: HashMap<VarId, BlockId>,
 }
 
-pub(crate) fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisResult {
+/// Run escape analysis on `ir_func`.  When `ctx` is `Some`, inter-procedural
+/// closure-call resolution is enabled (build the context with
+/// [`crate::lower::make_analysis_context`]).
+pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisResult {
     let alloc_blocks = collect_allocs(ir_func);
     let uses = build_use_chains(ir_func);
     let var_defs = build_var_defs(ir_func);

@@ -299,6 +299,86 @@ fn count_alloc_stats(ir_func: &IrFunction) -> AllocStats {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Run the AOT pipeline up to (and including) ANF lowering + region
+/// optimization, but stop before code generation.  Returns the source text
+/// and the optimized `IrFunction` so tools like `cljrs-ir-viz` can inspect
+/// exactly what the AOT compiler would lower.
+///
+/// The `silent` flag suppresses the usual `[aot] ...` progress output.
+pub fn lower_file_to_ir(
+    src_path: &Path,
+    src_dirs: &[PathBuf],
+    silent: bool,
+) -> AotResult<(String, IrFunction)> {
+    macro_rules! note {
+        ($($arg:tt)*) => { if !silent { eprintln!($($arg)*); } };
+    }
+
+    note!("[aot] reading {}", src_path.display());
+    let source = std::fs::read_to_string(src_path)?;
+    let filename = src_path.display().to_string();
+
+    let mut parser = Parser::new(source.clone(), filename);
+    let forms = parser.parse_all()?;
+    note!("[aot] parsed {} top-level form(s)", forms.len());
+
+    let globals = if src_dirs.is_empty() {
+        cljrs_stdlib::standard_env()
+    } else {
+        cljrs_stdlib::standard_env_with_paths(src_dirs.to_vec())
+    };
+    let mut env = cljrs_eval::Env::new(globals, "user");
+
+    let mut expanded = Vec::with_capacity(forms.len());
+    for form in &forms {
+        if needs_interpreter(form) {
+            match cljrs_eval::eval(form, &mut env) {
+                Ok(_) => {}
+                Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
+            }
+        }
+        match cljrs_interp::macros::macroexpand_all(form, &mut env) {
+            Ok(f) => expanded.push(f),
+            Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
+        }
+    }
+    note!("[aot] macro-expanded {} form(s)", expanded.len());
+
+    let mut compilable = Vec::new();
+    for (i, form) in expanded.iter().enumerate() {
+        if needs_interpreter(&forms[i]) || expanded_needs_interpreter(form) {
+            continue;
+        }
+        compilable.push(form.clone());
+    }
+
+    let params: Vec<Arc<str>> = vec![];
+    let compilable_forms = if compilable.is_empty() {
+        let nil_form = cljrs_reader::Form::new(
+            cljrs_reader::form::FormKind::Nil,
+            cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+        );
+        vec![nil_form]
+    } else {
+        compilable
+    };
+
+    let current_ns = env.current_ns.to_string();
+    let ir_func = lower_via_rust(
+        Some("__cljrs_main"),
+        &current_ns,
+        &params,
+        &compilable_forms,
+        &mut env,
+    )?;
+    note!(
+        "[aot] lowered to {} block(s), {} var(s)",
+        ir_func.blocks.len(),
+        ir_func.next_var
+    );
+    Ok((source, ir_func))
+}
+
 /// Compile a `.cljrs` / `.cljc` source file to a standalone native binary.
 ///
 /// `src_path` is the input source file.  `out_path` is the desired output

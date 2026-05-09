@@ -1,0 +1,14 @@
+[package]
+name = "cljrs-ir-viz"
+version = "0.1.0"
+edition = "2024"
+description = "HTML visualizer for clojurust IR — source ↔ IR mapping with region-allocation color-coding"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-ir    = { workspace = true }
+cljrs-types = { workspace = true }
+
+[dev-dependencies]
+cljrs-reader = { workspace = true }
