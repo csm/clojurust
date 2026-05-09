@@ -9,9 +9,9 @@ mod new;
 mod regex;
 pub mod special;
 mod taps;
+mod time;
 pub mod transients;
 pub mod util;
-mod time;
 
 pub use special::*;
 pub use util::*;
