@@ -12,3 +12,4 @@ cljrs-types = { workspace = true }
 
 [dev-dependencies]
 cljrs-reader = { workspace = true }
+cljrs-compiler = { workspace = true }

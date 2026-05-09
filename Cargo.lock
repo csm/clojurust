@@ -407,6 +407,7 @@ dependencies = [
 name = "cljrs-ir-viz"
 version = "0.1.0"
 dependencies = [
+ "cljrs-compiler",
  "cljrs-ir",
  "cljrs-reader",
  "cljrs-types",
