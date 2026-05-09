@@ -12,7 +12,9 @@
 //! These tests use the public Rust ANF lowerer + analyzer, so they run
 //! quickly and don't depend on the embedded Clojure compiler.
 
-use cljrs_ir::lower::{EscapeContext, EscapeState, analyze, lower_fn_body, make_analysis_context, optimize};
+use cljrs_ir::lower::{
+    EscapeContext, EscapeState, analyze, lower_fn_body, make_analysis_context, optimize,
+};
 use cljrs_ir::{Inst, IrFunction};
 use cljrs_reader::Parser;
 use std::sync::Arc;

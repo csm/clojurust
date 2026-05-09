@@ -770,12 +770,11 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
                 let Some(callee_fn) = ectx.registry.get(&callee_name) else {
                     continue;
                 };
-                let returns_allocs: HashSet<VarId> =
-                    compute_return_alloc_summary(callee_fn, ectx)
-                        .into_iter()
-                        .filter(|(_, s)| *s == EscapeState::Returns)
-                        .map(|(v, _)| v)
-                        .collect();
+                let returns_allocs: HashSet<VarId> = compute_return_alloc_summary(callee_fn, ectx)
+                    .into_iter()
+                    .filter(|(_, s)| *s == EscapeState::Returns)
+                    .map(|(v, _)| v)
+                    .collect();
                 if !returns_allocs.is_empty() {
                     cross_fn_no_escape
                         .entry(callee_name)
