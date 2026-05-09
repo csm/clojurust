@@ -40,53 +40,23 @@ self/closure param (`params[0]`), then the user params.  `do_inline` maps
 
 ---
 
-## Stage 2 — `Returns` state for allocations
+## Stage 2 — `Returns` state for allocations  ✅ DONE  (`lower/escape.rs`)
 
-**Goal.** Instead of immediately classifying a returning allocation as
-`Escapes`, classify it as `Returns` — the same state parameters already use.
-This lets the caller decide whether the allocation actually escapes.
+**What it does.**  `classify_escape_with_ctx` no longer short-circuits to
+`Escapes` when an allocation reaches a `Return` terminator.  Both
+`EscapeMode::Alloc` and `EscapeMode::Param` now join `EscapeState::Returns`,
+so the caller can decide whether the value truly escapes.
 
-**Exact change.**  `escape.rs:538–543`:
-```rust
-// CURRENT
-UseKind::Return => {
-    if mode == EscapeMode::Param {
-        result = EscapeState::join(result, EscapeState::Returns);
-    } else {
-        result = EscapeState::Escapes;   // ← change this
-        break 'outer;
-    }
-}
+`compute_return_alloc_summary(ir_func, ctx)` was added as a thin wrapper over
+`analyze()` that surfaces the `states` map with the finer-grained
+classification.  It is annotated `#[allow(dead_code)]` pending stage-3 usage.
 
-// AFTER
-UseKind::Return => {
-    result = EscapeState::join(result, EscapeState::Returns);
-    // same for both Alloc and Param modes
-}
-```
+The `returned_vector_escapes` regression test was updated to assert `Returns`
+(previously `Escapes`).
 
-**New function.** Add to `escape.rs`:
-```rust
-/// Per-allocation return summary for a function.
-/// Maps each allocation VarId to its EscapeState, using `Returns` for
-/// allocations whose only escape path is via Return.
-pub(crate) fn compute_return_alloc_summary(
-    ir_func: &IrFunction,
-    ctx: &EscapeContext,
-) -> HashMap<VarId, EscapeState> { ... }
-```
-
-This is a thin wrapper over `analyze()` that returns the `states` map
-(which will now contain `Returns` entries instead of `Escapes` for
-returning allocations).
-
-**Impact on existing tests.**  The existing test `returned_vector_escapes`
-(escape_regression.rs:70) currently asserts `Escapes`.  After this change it
-will assert `Returns` — update the assertion and the comment.
-
-**Impact on the optimizer.**  `optimize_regions` filters for `NoEscape` only
-(`optimize.rs:432–433`), so `Returns` allocations are still skipped — no
-region promotion yet.  That is correct: without stage 4 we can't promote them.
+**Impact on the optimizer.**  `optimize_regions` filters for `NoEscape` only,
+so `Returns` allocations are still skipped — no region promotion yet.  That is
+correct: without stage 4 we can't promote them.
 
 ---
 
