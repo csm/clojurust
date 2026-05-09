@@ -353,6 +353,93 @@ fn stage4_inline_first_falls_back_to_promotion() {
     );
 }
 
+/// Recursively collect every named function in the IR tree, including
+/// subfunctions of subfunctions.
+fn collect_all_fn_names(ir: &IrFunction, out: &mut Vec<Arc<str>>) {
+    if let Some(name) = &ir.name {
+        out.push(name.clone());
+    }
+    for sub in &ir.subfunctions {
+        collect_all_fn_names(sub, out);
+    }
+}
+
+#[test]
+fn stage4_does_not_produce_duplicate_subfunction_names() {
+    // Regression for the codegen DuplicateDefinition crash: when stage 4
+    // clones a callee with inner closures, those inner subfunctions must be
+    // renamed so they don't collide with the original's subfunctions.  Both
+    // sides of the IR tree end up registered under `user_funcs` — duplicate
+    // names crash the cranelift module.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+    let mut names: Vec<Arc<str>> = Vec::new();
+    collect_all_fn_names(&optimized, &mut names);
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        names.len(),
+        "every named function in the IR tree must be unique; got duplicates in {names:?}"
+    );
+}
+
+#[test]
+fn stage4_handles_callee_with_self_capture() {
+    // Top-level `defn` produces a closure with a self-ref capture, so
+    // `make-pair__arity2.params` has 3 entries (self, a, b) while the call
+    // site only supplies 2 arguments.  Stage 4 must prepend the call's
+    // `callee_var` so the rewritten `CallWithRegion` matches the callee's
+    // signature — otherwise codegen verifies fail with "mismatched argument
+    // count".
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+
+    // Find the rewritten CallWithRegion and verify its arg count matches the
+    // target subfunction's params count.
+    fn find_target_and_call<'a>(ir: &'a IrFunction) -> Option<(&'a Arc<str>, usize, usize)> {
+        for block in &ir.blocks {
+            for inst in &block.insts {
+                if let Inst::CallWithRegion(_, name, args) = inst {
+                    if let Some(target) = ir
+                        .subfunctions
+                        .iter()
+                        .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
+                    {
+                        return Some((name, args.len(), target.params.len()));
+                    }
+                }
+            }
+        }
+        for sub in &ir.subfunctions {
+            if let Some(r) = find_target_and_call(sub) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    let (name, arg_count, param_count) =
+        find_target_and_call(&optimized).expect("CallWithRegion in IR");
+    assert_eq!(
+        arg_count, param_count,
+        "CallWithRegion to {name} passes {arg_count} args but the target expects {param_count}",
+    );
+}
+
 // Suppress an unused-import lint if Arc isn't picked up by every test.
 #[allow(dead_code)]
 fn _arc_witness() -> Arc<str> {

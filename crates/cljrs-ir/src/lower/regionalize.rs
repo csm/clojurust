@@ -48,6 +48,11 @@ struct Candidate {
     /// VarIds (in the *callee's* scope) of the `Returns` allocs that should
     /// become `RegionAlloc` in the cloned variant.
     returns_allocs: HashSet<VarId>,
+    /// Number of leading capture parameters the callee expects (computed as
+    /// `callee.params.len() - args.len()`).  Always 0 or 1 for stage 4 —
+    /// candidates with multi-capture callees are rejected upstream because
+    /// we can't reconstruct the captures from a `Call` site.
+    capture_count: usize,
 }
 
 // ── Resolution helpers ──────────────────────────────────────────────────────
@@ -130,6 +135,57 @@ fn alloc_operands(inst: &Inst) -> Vec<VarId> {
     }
 }
 
+/// Recursively rename every named subfunction in `func` (and its nested
+/// subfunctions) by appending `suffix`, and rewrite all `AllocClosure`
+/// instructions whose `arity_fn_names` reference one of the renamed names.
+///
+/// Without this rename the cloned IR tree would contain duplicates of every
+/// inner closure's arity-fn, and codegen's `declare_subfunctions` would call
+/// `declare_function` twice with the same name → `Module(DuplicateDefinition)`.
+fn rename_inner_subfunctions(func: &mut IrFunction, suffix: &str) {
+    // Pass 1: collect old → new name mapping by walking every subfunction
+    // (including recursively nested ones).
+    let mut name_map: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    fn collect(f: &IrFunction, suffix: &str, map: &mut HashMap<Arc<str>, Arc<str>>) {
+        for sub in &f.subfunctions {
+            if let Some(name) = &sub.name {
+                let new_name: Arc<str> = Arc::from(format!("{name}{suffix}").as_str());
+                map.insert(name.clone(), new_name);
+            }
+            collect(sub, suffix, map);
+        }
+    }
+    collect(func, suffix, &mut name_map);
+    if name_map.is_empty() {
+        return;
+    }
+
+    // Pass 2: rewrite `arity_fn_names` references in every `AllocClosure`
+    // throughout the tree, and update each subfunction's own `name` field.
+    fn rewrite(f: &mut IrFunction, map: &HashMap<Arc<str>, Arc<str>>) {
+        for block in &mut f.blocks {
+            for inst in block.phis.iter_mut().chain(block.insts.iter_mut()) {
+                if let Inst::AllocClosure(_, tmpl, _) = inst {
+                    for n in &mut tmpl.arity_fn_names {
+                        if let Some(new_name) = map.get(n) {
+                            *n = new_name.clone();
+                        }
+                    }
+                }
+            }
+        }
+        for sub in &mut f.subfunctions {
+            if let Some(name) = &sub.name
+                && let Some(new_name) = map.get(name)
+            {
+                sub.name = Some(new_name.clone());
+            }
+            rewrite(sub, map);
+        }
+    }
+    rewrite(func, &name_map);
+}
+
 /// Clone `original` and rewrite each `Returns` alloc in `targets` as
 /// `RegionAlloc(dst, region_var, kind, ops)`, with a `RegionParam(region_var)`
 /// inserted at the entry block's prologue.
@@ -168,6 +224,12 @@ fn specialize(original: &IrFunction, targets: &HashSet<VarId>, suffix: &str) -> 
     } else {
         return None;
     }
+
+    // Inner closures cloned along with the body share names with the
+    // original's inner closures — declaring them twice would explode in
+    // codegen.  Give every inner subfunction (and matching `AllocClosure`
+    // references) a fresh suffixed name.
+    rename_inner_subfunctions(&mut clone, suffix);
 
     let new_name: Arc<str> = match &original.name {
         Some(n) => Arc::from(format!("{n}{suffix}").as_str()),
@@ -208,6 +270,7 @@ fn rewrite_call_with_region_scope(
     func: &mut IrFunction,
     dst: VarId,
     target_name: Arc<str>,
+    capture_count: usize,
 ) -> bool {
     let Some((block_idx, inst_idx)) = find_call_by_dst(func, dst) else {
         return false;
@@ -250,12 +313,24 @@ fn rewrite_call_with_region_scope(
     let region_var = VarId(func.next_var);
     func.next_var += 1;
 
-    // Replace `Call` with `CallWithRegion`.
-    let Inst::Call(call_dst, _callee, args) = func.blocks[block_idx].insts[inst_idx].clone() else {
+    // Replace `Call` with `CallWithRegion`.  If the callee expects a leading
+    // self/closure capture parameter (`capture_count == 1`) prepend the
+    // call's own `callee` VarId so the cloned variant receives the closure
+    // object as its first argument — matching the `do_inline` calling
+    // convention.
+    let Inst::Call(call_dst, callee, args) = func.blocks[block_idx].insts[inst_idx].clone() else {
         return false;
     };
     debug_assert_eq!(call_dst, dst);
-    func.blocks[block_idx].insts[inst_idx] = Inst::CallWithRegion(dst, target_name, args);
+    let full_args: Vec<VarId> = if capture_count == 1 {
+        let mut v = Vec::with_capacity(args.len() + 1);
+        v.push(callee);
+        v.extend(args);
+        v
+    } else {
+        args
+    };
+    func.blocks[block_idx].insts[inst_idx] = Inst::CallWithRegion(dst, target_name, full_args);
 
     // Insert RegionStart at the head of `start_block`.
     if let Some(b) = func.blocks.iter_mut().find(|b| b.id == start_block) {
@@ -317,6 +392,22 @@ fn collect_candidates_in(
             let Some(callee_fn) = ctx.registry.get(&callee_name) else {
                 continue;
             };
+            // The callee's `params` includes leading capture parameters
+            // (typically 0 or 1: the self-ref of a top-level `defn`).  For
+            // stage 4 we can only reconstruct the call's full argument list
+            // when there are 0 captures (pass through `args` 1-to-1) or
+            // exactly 1 capture (prepend the call site's `callee_var`, which
+            // *is* the closure object and serves as the self-ref).  Anything
+            // beyond a single self-cap requires knowing which closed-over
+            // values to pass — information not present at the call site.
+            let total_params = callee_fn.params.len();
+            if total_params < args.len() {
+                continue;
+            }
+            let capture_count = total_params - args.len();
+            if capture_count > 1 {
+                continue;
+            }
             let returns_allocs = returns_allocs_of(callee_fn, ctx);
             if returns_allocs.is_empty() {
                 continue;
@@ -339,6 +430,7 @@ fn collect_candidates_in(
                     dst: *dst,
                     callee_fn_name: callee_name,
                     returns_allocs,
+                    capture_count,
                 },
             });
         }
@@ -415,7 +507,12 @@ pub fn promote_cross_fn_allocs(mut root: IrFunction, ctx: &EscapeContext) -> IrF
         };
 
         let caller = fn_at_path_mut(&mut root, &path);
-        let _ok = rewrite_call_with_region_scope(caller, candidate.dst, target_name);
+        let _ok = rewrite_call_with_region_scope(
+            caller,
+            candidate.dst,
+            target_name,
+            candidate.capture_count,
+        );
         // If rewrite failed, the clone we installed is dead but harmless.
         // It will only be referenced from `CallWithRegion` instructions.
     }
