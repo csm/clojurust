@@ -1,0 +1,69 @@
+(ns graph)
+
+(defn random-graph
+  "Generate a graph with n nodes and ~edges-per-node outgoing edges each.
+   Returns a map: {node #{neighbors}}"
+  [n edges-per-node]
+  (into {}
+        (for [i (range n)]
+          [i (into #{}
+                   (repeatedly edges-per-node #(rand-int n)))])))
+
+(defn bfs
+  "Return set of reachable nodes from start."
+  [graph start]
+  (loop [queue (conj [] start)
+         visited #{}]
+    (if (empty? queue)
+      visited
+      (let [node (peek queue)
+            queue (pop queue)]
+        (if (visited node)
+          (recur queue visited)
+          (recur
+           (into queue (graph node))
+           (conj visited node)))))))
+
+(defn count-paths
+  "Count number of paths up to depth k starting from start.
+   This explodes combinatorially and allocates heavily."
+  [graph start k]
+  (loop [frontier [start]
+         depth 0
+         total 0]
+    (if (= depth k)
+      total
+      (let [next-frontier
+            (mapcat graph frontier)]
+        (recur
+         (vec next-frontier)
+         (inc depth)
+         (+ total (count next-frontier)))))))
+
+(defn workload
+  "Run multiple iterations to amplify allocation pressure."
+  [n edges-per-node depth iterations]
+  (let [graph (random-graph n edges-per-node)]
+    (loop [i 0
+           acc 0]
+      (if (= i iterations)
+        acc
+        (let [reachable (bfs graph (rand-int n))
+              paths (count-paths graph (rand-int n) depth)]
+          ;; force realization + prevent dead code elimination
+          (recur (inc i) (+ acc (count reachable) paths)))))))
+
+(defn -main [& args]
+  (let [n (int (or (first args) "1000"))
+        edges (int (or (second args) "5"))
+        depth (int (or (nth args 2 nil) "5"))
+        iters (int (or (nth args 3 nil) "50"))]
+    (println "Running workload...")
+    (let [start (nanotime)
+          result (workload n edges depth iters)
+          end (nanotime)]
+      (println "Result:" result)
+      (println "Time (ms):" (/ (- end start) 1e6)))))
+
+; cljrs doesn't recognize -main yet, just fire the main here
+(-main)
