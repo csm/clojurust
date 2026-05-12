@@ -306,8 +306,11 @@ fn rewrite_call_with_region_scope(
     // region path can be reached via a loop back edge through the end_block,
     // meaning the value lives across that back edge and the region would be
     // freed while the value is still reachable.
-    let region_with_uses: std::collections::HashSet<_> =
-        region_blocks.iter().chain(use_blocks.iter()).copied().collect();
+    let region_with_uses: std::collections::HashSet<_> = region_blocks
+        .iter()
+        .chain(use_blocks.iter())
+        .copied()
+        .collect();
     if has_back_edge(func, &region_with_uses, &doms) {
         return false;
     }
