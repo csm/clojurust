@@ -57,6 +57,40 @@ fn box_val(v: Value) -> *const Value {
     ptr.get() as *const Value
 }
 
+/// Like `box_val` but allocates in the active region when one is open.
+///
+/// Only call this for collection `Value` variants (Vector, Set, List, …).
+/// Scalar values (Long, Bool, …) must NOT use this — they can escape a region
+/// via `RecurJump` and would become dangling pointers after `RegionEnd`.
+///
+/// Safety: the returned pointer is valid until the active region is popped
+/// (i.e. until `rt_region_end`).  The IR analysis guarantees collection values
+/// are consumed before that point.
+#[inline]
+fn box_coll_val(v: Value) -> *const Value {
+    if cljrs_gc::region::region_is_active() {
+        let ptr: GcPtr<Value> = unsafe { cljrs_gc::region::try_alloc_in_region(v).unwrap() };
+        ptr.get() as *const Value
+    } else {
+        box_val(v)
+    }
+}
+
+/// Allocate an inner collection type (`PersistentVector`, `PersistentHashSet`,
+/// `PersistentList`, …) in the active region when one is open, falling back to
+/// the GC heap otherwise.
+///
+/// # Safety
+/// Same region-lifetime constraint as `box_coll_val`.
+#[inline]
+fn alloc_inner_coll<T: cljrs_gc::Trace + 'static>(val: T) -> GcPtr<T> {
+    if cljrs_gc::region::region_is_active() {
+        unsafe { cljrs_gc::region::try_alloc_in_region(val).unwrap() }
+    } else {
+        GcPtr::new(val)
+    }
+}
+
 // ── Safepoint ───────────────────────────────────────────────────────────────
 
 /// GC safepoint for AOT-compiled code.
@@ -367,12 +401,8 @@ pub unsafe extern "C" fn rt_region_alloc_vector(
         Vec::new()
     };
     let pv = PersistentVector::from_iter(items);
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(pv).unwrap() }
-    } else {
-        GcPtr::new(pv)
-    };
-    box_val(Value::Vector(ptr))
+    let ptr = alloc_inner_coll(pv);
+    box_coll_val(Value::Vector(ptr))
 }
 
 /// Allocate a map in the active region (falling back to GC heap).
@@ -422,7 +452,8 @@ pub unsafe extern "C" fn rt_region_alloc_set(
         Vec::new()
     };
     let set = PersistentHashSet::from_iter(items);
-    box_val(Value::Set(SetValue::Hash(GcPtr::new(set))))
+    let ptr = alloc_inner_coll(set);
+    box_coll_val(Value::Set(SetValue::Hash(ptr)))
 }
 
 /// Allocate a list in the active region (falling back to GC heap).
@@ -446,12 +477,8 @@ pub unsafe extern "C" fn rt_region_alloc_list(
         Vec::new()
     };
     let list = PersistentList::from_iter(items);
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(list).unwrap() }
-    } else {
-        GcPtr::new(list)
-    };
-    box_val(Value::List(ptr))
+    let ptr = alloc_inner_coll(list);
+    box_coll_val(Value::List(ptr))
 }
 
 /// Allocate a cons cell in the active region (falling back to GC heap).
@@ -467,12 +494,8 @@ pub unsafe extern "C" fn rt_region_alloc_cons(
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
     let cons = CljxCons { head: h, tail: t };
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(cons).unwrap() }
-    } else {
-        GcPtr::new(cons)
-    };
-    box_val(Value::Cons(ptr))
+    let ptr = alloc_inner_coll(cons);
+    box_coll_val(Value::Cons(ptr))
 }
 
 /// Unwind the region stack to the given depth on exception.
@@ -695,12 +718,20 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
     let coll = unsafe { val_ref(coll) };
     let val = unsafe { val_ref(val) }.clone();
     match coll {
-        Value::Vector(v) => box_val(Value::Vector(GcPtr::new(v.get().conj(val)))),
+        Value::Vector(v) => {
+            let new_pv = v.get().conj(val);
+            box_coll_val(Value::Vector(alloc_inner_coll(new_pv)))
+        }
         Value::List(l) => {
             let new_list = PersistentList::cons(val, Arc::new((*l.get()).clone()));
-            box_val(Value::List(GcPtr::new(new_list)))
+            box_coll_val(Value::List(alloc_inner_coll(new_list)))
+        }
+        Value::Set(SetValue::Hash(m)) => {
+            let new_phs = m.get().conj(val);
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(new_phs))))
         }
         Value::Set(s) => {
+            // Sorted sets: delegate to interpreter (rare path)
             let new_set = s.conj(val);
             box_val(Value::Set(new_set))
         }
@@ -1903,9 +1934,35 @@ pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *co
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const Value {
-    let to = unsafe { val_ref(to) }.clone();
-    let from = unsafe { val_ref(from) }.clone();
-    call_global_fn("clojure.core", "into", vec![to, from])
+    let to_ref = unsafe { val_ref(to) };
+    let from_ref = unsafe { val_ref(from) };
+    // Fast paths: Vector target — iterate source directly without the interpreter.
+    // This keeps all intermediate allocations in the active region when present.
+    if let Value::Vector(v) = to_ref {
+        let mut result = v.get().clone();
+        match from_ref {
+            Value::Set(s) => {
+                for elem in s.iter() {
+                    result = result.conj(elem.clone());
+                }
+            }
+            Value::Vector(v2) => {
+                for elem in v2.get().iter() {
+                    result = result.conj(elem.clone());
+                }
+            }
+            Value::Nil => {}
+            _ => {
+                let to_val = to_ref.clone();
+                let from_val = from_ref.clone();
+                return call_global_fn("clojure.core", "into", vec![to_val, from_val]);
+            }
+        }
+        return box_coll_val(Value::Vector(alloc_inner_coll(result)));
+    }
+    let to_val = to_ref.clone();
+    let from_val = from_ref.clone();
+    call_global_fn("clojure.core", "into", vec![to_val, from_val])
 }
 
 /// `(into to xform from)`.
@@ -1937,8 +1994,17 @@ pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) }.clone();
-    call_global_fn("clojure.core", "pop", vec![coll])
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        Value::Vector(v) => match v.get().pop() {
+            Some(new_pv) => box_coll_val(Value::Vector(alloc_inner_coll(new_pv))),
+            None => rt_const_nil(),
+        },
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "pop", vec![coll_val])
+        }
+    }
 }
 
 /// `(vec coll)`.
@@ -1946,8 +2012,15 @@ pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) }.clone();
-    call_global_fn("clojure.core", "vec", vec![coll])
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        // Already a vector: return the same pointer — no allocation needed.
+        Value::Vector(_) => coll,
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "vec", vec![coll_val])
+        }
+    }
 }
 
 /// `(mapcat f coll)`.
@@ -1955,9 +2028,35 @@ pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *const Value {
-    let f = unsafe { val_ref(f) }.clone();
-    let coll = unsafe { val_ref(coll) }.clone();
-    call_global_fn("clojure.core", "mapcat", vec![f, coll])
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+    // Fast path: f is a Map and coll is a Vector.
+    // Applies the map lookup to each element and concatenates the resulting
+    // collections into a new Vector — entirely in the active region if present.
+    if let (Value::Map(m), Value::Vector(v)) = (f_ref, coll_ref) {
+        let mut result = PersistentVector::empty();
+        for elem in v.get().iter() {
+            if let Some(neighbors) = m.get(elem) {
+                match &neighbors {
+                    Value::Set(s) => {
+                        for item in s.iter() {
+                            result = result.conj(item.clone());
+                        }
+                    }
+                    Value::Vector(nv) => {
+                        for item in nv.get().iter() {
+                            result = result.conj(item.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return box_coll_val(Value::Vector(alloc_inner_coll(result)));
+    }
+    let f_val = f_ref.clone();
+    let coll_val = coll_ref.clone();
+    call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val])
 }
 
 /// `(repeatedly n f)`.
