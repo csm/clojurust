@@ -302,7 +302,13 @@ fn rewrite_call_with_region_scope(
     }
 
     let region_blocks = blocks_on_path(func, start_block, end_block);
-    if has_back_edge(func, &region_blocks, &doms) {
+    // Include all use_blocks in the back-edge check: a use_block outside the
+    // region path can be reached via a loop back edge through the end_block,
+    // meaning the value lives across that back edge and the region would be
+    // freed while the value is still reachable.
+    let region_with_uses: std::collections::HashSet<_> =
+        region_blocks.iter().chain(use_blocks.iter()).copied().collect();
+    if has_back_edge(func, &region_with_uses, &doms) {
         return false;
     }
     if region_contains_throw(func, &region_blocks) {

@@ -393,7 +393,13 @@ fn emit_region_for_alloc(
 
     let region = blocks_on_path(&ir_func, start, end);
 
-    if has_back_edge(&ir_func, &region, doms) {
+    // Check for back edges in the region OR in any use_blocks that fall outside
+    // the region. A use_block outside the path (e.g., a loop body block reached
+    // via a back edge through the end_block) can create a cycle: the value lives
+    // across that back edge, so closing the region at end_block is unsafe.
+    let region_with_uses: HashSet<BlockId> =
+        region.iter().chain(relevant.iter()).copied().collect();
+    if has_back_edge(&ir_func, &region_with_uses, doms) {
         return ir_func;
     }
     if region_contains_throw(&ir_func, &region) {
