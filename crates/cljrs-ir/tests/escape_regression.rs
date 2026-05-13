@@ -100,13 +100,16 @@ fn empty_q_and_count_dont_escape_arg() {
 
 #[test]
 fn loop_local_alloc_gets_promoted_to_region() {
-    // End-to-end: optimizer should turn the loop-local empty vec into a
-    // RegionAlloc.
-    let ir = lower("(loop [queue [] n 5] (if (empty? queue) n (recur (pop queue) (- n 1))))");
+    // A vec allocated fresh inside the loop body (not a phi-flowing loop
+    // variable) should be region-promoted: it's consumed within the same block
+    // before the RecurJump back-edge fires, so the region is safe.
+    let ir = lower(
+        "(loop [i 5 acc 0] (if (= i 0) acc (let [tmp [i]] (recur (- i 1) (+ acc (count tmp))))))",
+    );
     let optimized = optimize(ir);
     assert!(
         region_alloc_count(&optimized) >= 1,
-        "optimizer should promote the loop-local empty vec; IR was:\n{}",
+        "optimizer should promote the body-local temp vec; IR was:\n{}",
         optimized
     );
 }

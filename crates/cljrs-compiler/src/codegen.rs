@@ -152,6 +152,12 @@ struct RuntimeFuncs {
     rt_str_n: FuncId,
     rt_println_n: FuncId,
     rt_with_out_str: FuncId,
+    rt_peek: FuncId,
+    rt_pop: FuncId,
+    rt_vec: FuncId,
+    rt_mapcat: FuncId,
+    rt_is_empty: FuncId,
+    rt_repeatedly: FuncId,
     // Region allocation
     rt_region_start: FuncId,
     rt_region_end: FuncId,
@@ -1196,6 +1202,12 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::Zipmap => self.rt.rt_zipmap,
             KnownFn::Complement => self.rt.rt_complement,
             KnownFn::WithOutStr => self.rt.rt_with_out_str,
+            KnownFn::Peek => self.rt.rt_peek,
+            KnownFn::Pop => self.rt.rt_pop,
+            KnownFn::Vec => self.rt.rt_vec,
+            KnownFn::Mapcat => self.rt.rt_mapcat,
+            KnownFn::IsEmpty => self.rt.rt_is_empty,
+            KnownFn::Repeatedly => self.rt.rt_repeatedly,
             _ => {
                 return self.emit_unknown_call_from_args(args);
             }
@@ -1578,6 +1590,12 @@ fn declare_runtime_funcs(
         rt_str_n: declare_rt(module, "rt_str_n", &[ptr, types::I64], ptr)?,
         rt_println_n: declare_rt(module, "rt_println_n", &[ptr, types::I64], ptr)?,
         rt_with_out_str: declare_rt(module, "rt_with_out_str", &[ptr], ptr)?,
+        rt_peek: declare_rt(module, "rt_peek", &[ptr], ptr)?,
+        rt_pop: declare_rt(module, "rt_pop", &[ptr], ptr)?,
+        rt_vec: declare_rt(module, "rt_vec", &[ptr], ptr)?,
+        rt_mapcat: declare_rt(module, "rt_mapcat", &[ptr, ptr], ptr)?,
+        rt_is_empty: declare_rt(module, "rt_is_empty", &[ptr], ptr)?,
+        rt_repeatedly: declare_rt(module, "rt_repeatedly", &[ptr, ptr], ptr)?,
         // Region allocation
         rt_region_start: declare_rt(module, "rt_region_start", &[], ptr)?,
         rt_region_end: declare_rt(module, "rt_region_end", &[ptr], ptr)?,

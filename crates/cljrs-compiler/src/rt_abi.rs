@@ -57,6 +57,40 @@ fn box_val(v: Value) -> *const Value {
     ptr.get() as *const Value
 }
 
+/// Like `box_val` but allocates in the active region when one is open.
+///
+/// Only call this for collection `Value` variants (Vector, Set, List, …).
+/// Scalar values (Long, Bool, …) must NOT use this — they can escape a region
+/// via `RecurJump` and would become dangling pointers after `RegionEnd`.
+///
+/// Safety: the returned pointer is valid until the active region is popped
+/// (i.e. until `rt_region_end`).  The IR analysis guarantees collection values
+/// are consumed before that point.
+#[inline]
+fn box_coll_val(v: Value) -> *const Value {
+    if cljrs_gc::region::region_is_active() {
+        let ptr: GcPtr<Value> = unsafe { cljrs_gc::region::try_alloc_in_region(v).unwrap() };
+        ptr.get() as *const Value
+    } else {
+        box_val(v)
+    }
+}
+
+/// Allocate an inner collection type (`PersistentVector`, `PersistentHashSet`,
+/// `PersistentList`, …) in the active region when one is open, falling back to
+/// the GC heap otherwise.
+///
+/// # Safety
+/// Same region-lifetime constraint as `box_coll_val`.
+#[inline]
+fn alloc_inner_coll<T: cljrs_gc::Trace + 'static>(val: T) -> GcPtr<T> {
+    if cljrs_gc::region::region_is_active() {
+        unsafe { cljrs_gc::region::try_alloc_in_region(val).unwrap() }
+    } else {
+        GcPtr::new(val)
+    }
+}
+
 // ── Safepoint ───────────────────────────────────────────────────────────────
 
 /// GC safepoint for AOT-compiled code.
@@ -367,12 +401,8 @@ pub unsafe extern "C" fn rt_region_alloc_vector(
         Vec::new()
     };
     let pv = PersistentVector::from_iter(items);
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(pv).unwrap() }
-    } else {
-        GcPtr::new(pv)
-    };
-    box_val(Value::Vector(ptr))
+    let ptr = alloc_inner_coll(pv);
+    box_coll_val(Value::Vector(ptr))
 }
 
 /// Allocate a map in the active region (falling back to GC heap).
@@ -422,7 +452,8 @@ pub unsafe extern "C" fn rt_region_alloc_set(
         Vec::new()
     };
     let set = PersistentHashSet::from_iter(items);
-    box_val(Value::Set(SetValue::Hash(GcPtr::new(set))))
+    let ptr = alloc_inner_coll(set);
+    box_coll_val(Value::Set(SetValue::Hash(ptr)))
 }
 
 /// Allocate a list in the active region (falling back to GC heap).
@@ -446,12 +477,8 @@ pub unsafe extern "C" fn rt_region_alloc_list(
         Vec::new()
     };
     let list = PersistentList::from_iter(items);
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(list).unwrap() }
-    } else {
-        GcPtr::new(list)
-    };
-    box_val(Value::List(ptr))
+    let ptr = alloc_inner_coll(list);
+    box_coll_val(Value::List(ptr))
 }
 
 /// Allocate a cons cell in the active region (falling back to GC heap).
@@ -467,12 +494,8 @@ pub unsafe extern "C" fn rt_region_alloc_cons(
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
     let cons = CljxCons { head: h, tail: t };
-    let ptr = if cljrs_gc::region::region_is_active() {
-        unsafe { cljrs_gc::region::try_alloc_in_region(cons).unwrap() }
-    } else {
-        GcPtr::new(cons)
-    };
-    box_val(Value::Cons(ptr))
+    let ptr = alloc_inner_coll(cons);
+    box_coll_val(Value::Cons(ptr))
 }
 
 /// Unwind the region stack to the given depth on exception.
@@ -612,6 +635,29 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
     box_val(Value::Long(n as i64))
 }
 
+/// `(empty? coll)` — returns Bool without converting to a seq.
+///
+/// The KnownFn::IsEmpty codegen dispatches here so that BFS loops do not
+/// pay the cost of `builtin_seq` (which copies the entire queue into a
+/// cons-list on the GC heap) just to check emptiness.
+///
+/// # Safety
+/// `coll` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) };
+    let empty = match coll {
+        Value::Vector(v) => v.get().is_empty(),
+        Value::Map(m) => m.count() == 0,
+        Value::Set(s) => s.is_empty(),
+        Value::List(l) => l.get().is_empty(),
+        Value::Nil => true,
+        Value::Cons(_) => false,
+        _ => false,
+    };
+    box_val(Value::Bool(empty))
+}
+
 /// `(first coll)`.
 ///
 /// # Safety
@@ -695,12 +741,20 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
     let coll = unsafe { val_ref(coll) };
     let val = unsafe { val_ref(val) }.clone();
     match coll {
-        Value::Vector(v) => box_val(Value::Vector(GcPtr::new(v.get().conj(val)))),
+        Value::Vector(v) => {
+            let new_pv = v.get().conj(val);
+            box_coll_val(Value::Vector(alloc_inner_coll(new_pv)))
+        }
         Value::List(l) => {
             let new_list = PersistentList::cons(val, Arc::new((*l.get()).clone()));
-            box_val(Value::List(GcPtr::new(new_list)))
+            box_coll_val(Value::List(alloc_inner_coll(new_list)))
+        }
+        Value::Set(SetValue::Hash(m)) => {
+            let new_phs = m.get().conj(val);
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(new_phs))))
         }
         Value::Set(s) => {
+            // Sorted sets: delegate to interpreter (rare path)
             let new_set = s.conj(val);
             box_val(Value::Set(new_set))
         }
@@ -1228,6 +1282,27 @@ pub unsafe extern "C" fn rt_call(
     let callee = unsafe { val_ref(callee) };
     let nargs = nargs as usize;
     let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs) };
+
+    // Fast paths for map/set callables — avoid interpreter + GC heap allocation.
+    match callee {
+        Value::Map(m) if nargs >= 1 => {
+            let key = unsafe { val_ref(arg_slice[0]) };
+            return match m.get(key) {
+                Some(val) => box_coll_val(val.clone()),
+                None => rt_const_nil(),
+            };
+        }
+        Value::Set(s) if nargs >= 1 => {
+            let key = unsafe { val_ref(arg_slice[0]) };
+            return if s.contains(key) {
+                arg_slice[0]
+            } else {
+                rt_const_nil()
+            };
+        }
+        _ => {}
+    }
+
     let arg_values: Vec<Value> = arg_slice
         .iter()
         .map(|p| unsafe { val_ref(*p) }.clone())
@@ -1474,29 +1549,31 @@ pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) };
-    match coll {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
         Value::Nil => rt_const_nil(),
         Value::List(l) => {
             if l.get().is_empty() {
                 rt_const_nil()
             } else {
-                box_val(coll.clone())
+                // Return same pointer — already a valid non-nil seq.
+                coll
             }
         }
         Value::Vector(v) => {
             if v.get().count() == 0 {
                 rt_const_nil()
             } else {
-                // Convert vector to list for seq iteration.
-                let items: Vec<Value> = v.get().iter().cloned().collect();
-                box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+                // Return same pointer — rt_first/rt_rest handle Value::Vector directly,
+                // so we avoid O(n) PersistentList allocation here.
+                coll
             }
         }
         Value::Map(m) => {
             if m.count() == 0 {
                 rt_const_nil()
             } else {
+                // rt_first/rt_rest don't handle Map, so we must materialise the entry list.
                 let mut pairs = Vec::new();
                 m.for_each(|k, v| {
                     pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter(
@@ -1510,6 +1587,7 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
             if s.count() == 0 {
                 rt_const_nil()
             } else {
+                // rt_first/rt_rest don't handle Set, so we must materialise.
                 let items: Vec<Value> = s.iter().cloned().collect();
                 box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
             }
@@ -1522,7 +1600,8 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
                 box_val(Value::List(GcPtr::new(PersistentList::from_iter(chars))))
             }
         }
-        Value::Cons(_) | Value::LazySeq(_) => box_val(coll.clone()),
+        // Already a seq — return same pointer.
+        Value::Cons(_) | Value::LazySeq(_) => coll,
         _ => rt_const_nil(),
     }
 }
@@ -1903,9 +1982,35 @@ pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *co
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const Value {
-    let to = unsafe { val_ref(to) }.clone();
-    let from = unsafe { val_ref(from) }.clone();
-    call_global_fn("clojure.core", "into", vec![to, from])
+    let to_ref = unsafe { val_ref(to) };
+    let from_ref = unsafe { val_ref(from) };
+    // Fast paths: Vector target — iterate source directly without the interpreter.
+    // This keeps all intermediate allocations in the active region when present.
+    if let Value::Vector(v) = to_ref {
+        let mut result = v.get().clone();
+        match from_ref {
+            Value::Set(s) => {
+                for elem in s.iter() {
+                    result = result.conj(elem.clone());
+                }
+            }
+            Value::Vector(v2) => {
+                for elem in v2.get().iter() {
+                    result = result.conj(elem.clone());
+                }
+            }
+            Value::Nil => {}
+            _ => {
+                let to_val = to_ref.clone();
+                let from_val = from_ref.clone();
+                return call_global_fn("clojure.core", "into", vec![to_val, from_val]);
+            }
+        }
+        return box_coll_val(Value::Vector(alloc_inner_coll(result)));
+    }
+    let to_val = to_ref.clone();
+    let from_val = from_ref.clone();
+    call_global_fn("clojure.core", "into", vec![to_val, from_val])
 }
 
 /// `(into to xform from)`.
@@ -1921,6 +2026,108 @@ pub unsafe extern "C" fn rt_into3(
     let xform = unsafe { val_ref(xform) }.clone();
     let from = unsafe { val_ref(from) }.clone();
     call_global_fn("clojure.core", "into", vec![to, xform, from])
+}
+
+/// `(peek coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        Value::Vector(v) => match v.get().peek() {
+            // Return an interior pointer into the rpds leaf node that holds
+            // the last element.  The leaf is Arc-managed by the
+            // PersistentVector; the Vector's GcBox (in the region or on the
+            // GC heap) keeps the Arc alive until after any use of this ptr.
+            Some(val) => val as *const Value,
+            None => rt_const_nil(),
+        },
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "peek", vec![coll_val])
+        }
+    }
+}
+
+/// `(pop coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        Value::Vector(v) => match v.get().pop() {
+            Some(new_pv) => box_coll_val(Value::Vector(alloc_inner_coll(new_pv))),
+            None => rt_const_nil(),
+        },
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "pop", vec![coll_val])
+        }
+    }
+}
+
+/// `(vec coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        // Already a vector: return the same pointer — no allocation needed.
+        Value::Vector(_) => coll,
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "vec", vec![coll_val])
+        }
+    }
+}
+
+/// `(mapcat f coll)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *const Value {
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+    // Fast path: f is a Map and coll is a Vector.
+    // Applies the map lookup to each element and concatenates the resulting
+    // collections into a new Vector — entirely in the active region if present.
+    if let (Value::Map(m), Value::Vector(v)) = (f_ref, coll_ref) {
+        let mut result = PersistentVector::empty();
+        for elem in v.get().iter() {
+            if let Some(neighbors) = m.get(elem) {
+                match &neighbors {
+                    Value::Set(s) => {
+                        for item in s.iter() {
+                            result = result.conj(item.clone());
+                        }
+                    }
+                    Value::Vector(nv) => {
+                        for item in nv.get().iter() {
+                            result = result.conj(item.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return box_coll_val(Value::Vector(alloc_inner_coll(result)));
+    }
+    let f_val = f_ref.clone();
+    let coll_val = coll_ref.clone();
+    call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val])
+}
+
+/// `(repeatedly n f)`.
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
+    let n = unsafe { val_ref(n) }.clone();
+    let f = unsafe { val_ref(f) }.clone();
+    call_global_fn("clojure.core", "repeatedly", vec![n, f])
 }
 
 // ── set! ─────────────────────────────────────────────────────────────────────
@@ -2604,6 +2811,11 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_comp as *const () as usize);
     std::hint::black_box(rt_partial as *const () as usize);
     std::hint::black_box(rt_complement as *const () as usize);
+    std::hint::black_box(rt_peek as *const () as usize);
+    std::hint::black_box(rt_pop as *const () as usize);
+    std::hint::black_box(rt_vec as *const () as usize);
+    std::hint::black_box(rt_mapcat as *const () as usize);
+    std::hint::black_box(rt_repeatedly as *const () as usize);
 }
 
 #[cfg(test)]
