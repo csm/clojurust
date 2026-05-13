@@ -140,7 +140,7 @@ fn box_or_intern_val(v: Value) -> *const Value {
 #[inline]
 fn intern_long(n: i64) -> *const Value {
     static CACHE: OnceLock<Vec<usize>> = OnceLock::new();
-    if n >= 0 && n < INTERN_LONG_MAX {
+    if (0..INTERN_LONG_MAX).contains(&n) {
         let cache = CACHE.get_or_init(|| {
             (0..INTERN_LONG_MAX)
                 .map(|i| box_val(Value::Long(i)) as usize)
@@ -1574,7 +1574,13 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
             None => intern_nil(),
         },
         Value::List(l) => box_or_intern_val(l.get().iter().nth(i).cloned().unwrap_or(Value::Nil)),
-        Value::Str(s) => box_or_intern_val(s.get().chars().nth(i).map(Value::Char).unwrap_or(Value::Nil)),
+        Value::Str(s) => box_or_intern_val(
+            s.get()
+                .chars()
+                .nth(i)
+                .map(Value::Char)
+                .unwrap_or(Value::Nil),
+        ),
         _ => intern_nil(),
     }
 }
