@@ -2,3 +2,7 @@
 .idea/
 .cljrs-aot-test-harness
 **/.DS_Store
+# AOT test/debug artifacts
+/1
+/stderr
+samples/*.ir.html
