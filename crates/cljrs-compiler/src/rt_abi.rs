@@ -635,6 +635,29 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
     box_val(Value::Long(n as i64))
 }
 
+/// `(empty? coll)` — returns Bool without converting to a seq.
+///
+/// The KnownFn::IsEmpty codegen dispatches here so that BFS loops do not
+/// pay the cost of `builtin_seq` (which copies the entire queue into a
+/// cons-list on the GC heap) just to check emptiness.
+///
+/// # Safety
+/// `coll` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
+    let coll = unsafe { val_ref(coll) };
+    let empty = match coll {
+        Value::Vector(v) => v.get().is_empty(),
+        Value::Map(m) => m.count() == 0,
+        Value::Set(s) => s.is_empty(),
+        Value::List(l) => l.get().is_empty(),
+        Value::Nil => true,
+        Value::Cons(_) => false,
+        _ => false,
+    };
+    box_val(Value::Bool(empty))
+}
+
 /// `(first coll)`.
 ///
 /// # Safety
@@ -1259,6 +1282,27 @@ pub unsafe extern "C" fn rt_call(
     let callee = unsafe { val_ref(callee) };
     let nargs = nargs as usize;
     let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs) };
+
+    // Fast paths for map/set callables — avoid interpreter + GC heap allocation.
+    match callee {
+        Value::Map(m) if nargs >= 1 => {
+            let key = unsafe { val_ref(arg_slice[0]) };
+            return match m.get(key) {
+                Some(val) => box_coll_val(val.clone()),
+                None => rt_const_nil(),
+            };
+        }
+        Value::Set(s) if nargs >= 1 => {
+            let key = unsafe { val_ref(arg_slice[0]) };
+            return if s.contains(key) {
+                arg_slice[0]
+            } else {
+                rt_const_nil()
+            };
+        }
+        _ => {}
+    }
+
     let arg_values: Vec<Value> = arg_slice
         .iter()
         .map(|p| unsafe { val_ref(*p) }.clone())
@@ -1505,29 +1549,31 @@ pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) };
-    match coll {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
         Value::Nil => rt_const_nil(),
         Value::List(l) => {
             if l.get().is_empty() {
                 rt_const_nil()
             } else {
-                box_val(coll.clone())
+                // Return same pointer — already a valid non-nil seq.
+                coll
             }
         }
         Value::Vector(v) => {
             if v.get().count() == 0 {
                 rt_const_nil()
             } else {
-                // Convert vector to list for seq iteration.
-                let items: Vec<Value> = v.get().iter().cloned().collect();
-                box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+                // Return same pointer — rt_first/rt_rest handle Value::Vector directly,
+                // so we avoid O(n) PersistentList allocation here.
+                coll
             }
         }
         Value::Map(m) => {
             if m.count() == 0 {
                 rt_const_nil()
             } else {
+                // rt_first/rt_rest don't handle Map, so we must materialise the entry list.
                 let mut pairs = Vec::new();
                 m.for_each(|k, v| {
                     pairs.push(Value::Vector(GcPtr::new(PersistentVector::from_iter(
@@ -1541,6 +1587,7 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
             if s.count() == 0 {
                 rt_const_nil()
             } else {
+                // rt_first/rt_rest don't handle Set, so we must materialise.
                 let items: Vec<Value> = s.iter().cloned().collect();
                 box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
             }
@@ -1553,7 +1600,8 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
                 box_val(Value::List(GcPtr::new(PersistentList::from_iter(chars))))
             }
         }
-        Value::Cons(_) | Value::LazySeq(_) => box_val(coll.clone()),
+        // Already a seq — return same pointer.
+        Value::Cons(_) | Value::LazySeq(_) => coll,
         _ => rt_const_nil(),
     }
 }
@@ -1985,8 +2033,21 @@ pub unsafe extern "C" fn rt_into3(
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) }.clone();
-    call_global_fn("clojure.core", "peek", vec![coll])
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
+        Value::Vector(v) => match v.get().peek() {
+            // Return an interior pointer into the rpds leaf node that holds
+            // the last element.  The leaf is Arc-managed by the
+            // PersistentVector; the Vector's GcBox (in the region or on the
+            // GC heap) keeps the Arc alive until after any use of this ptr.
+            Some(val) => val as *const Value,
+            None => rt_const_nil(),
+        },
+        _ => {
+            let coll_val = coll_ref.clone();
+            call_global_fn("clojure.core", "peek", vec![coll_val])
+        }
+    }
 }
 
 /// `(pop coll)`.

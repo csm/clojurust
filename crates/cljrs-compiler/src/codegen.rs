@@ -156,6 +156,7 @@ struct RuntimeFuncs {
     rt_pop: FuncId,
     rt_vec: FuncId,
     rt_mapcat: FuncId,
+    rt_is_empty: FuncId,
     rt_repeatedly: FuncId,
     // Region allocation
     rt_region_start: FuncId,
@@ -1205,6 +1206,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::Pop => self.rt.rt_pop,
             KnownFn::Vec => self.rt.rt_vec,
             KnownFn::Mapcat => self.rt.rt_mapcat,
+            KnownFn::IsEmpty => self.rt.rt_is_empty,
             KnownFn::Repeatedly => self.rt.rt_repeatedly,
             _ => {
                 return self.emit_unknown_call_from_args(args);
@@ -1592,6 +1594,7 @@ fn declare_runtime_funcs(
         rt_pop: declare_rt(module, "rt_pop", &[ptr], ptr)?,
         rt_vec: declare_rt(module, "rt_vec", &[ptr], ptr)?,
         rt_mapcat: declare_rt(module, "rt_mapcat", &[ptr, ptr], ptr)?,
+        rt_is_empty: declare_rt(module, "rt_is_empty", &[ptr], ptr)?,
         rt_repeatedly: declare_rt(module, "rt_repeatedly", &[ptr, ptr], ptr)?,
         // Region allocation
         rt_region_start: declare_rt(module, "rt_region_start", &[], ptr)?,
