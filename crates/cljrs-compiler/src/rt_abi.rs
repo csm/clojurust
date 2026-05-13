@@ -16,7 +16,7 @@ use cljrs_value::{
     CljxCons, PersistentHashSet, PersistentList, PersistentVector, Symbol, TypeInstance, Value,
 };
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +91,67 @@ fn alloc_inner_coll<T: cljrs_gc::Trace + 'static>(val: T) -> GcPtr<T> {
     }
 }
 
+// ── Scalar value interning ───────────────────────────────────────────────────
+//
+// nil, true, false, and integers in 0..INTERN_LONG_MAX are allocated once and
+// reused for the lifetime of the process, eliminating the dominant source of
+// GC heap allocation in tight loops.
+
+/// Cached nil pointer (allocated once, reused forever).
+#[inline]
+fn intern_nil() -> *const Value {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    *PTR.get_or_init(|| box_val(Value::Nil) as usize) as *const Value
+}
+
+/// Cached true/false pointers (allocated once each, reused forever).
+#[inline]
+fn intern_bool(b: bool) -> *const Value {
+    static TRUE_PTR: OnceLock<usize> = OnceLock::new();
+    static FALSE_PTR: OnceLock<usize> = OnceLock::new();
+    if b {
+        *TRUE_PTR.get_or_init(|| box_val(Value::Bool(true)) as usize) as *const Value
+    } else {
+        *FALSE_PTR.get_or_init(|| box_val(Value::Bool(false)) as usize) as *const Value
+    }
+}
+
+/// Upper bound (exclusive) of the interned long cache.  Covers loop counters,
+/// BFS queue sizes (up to n=1000), and small arithmetic results.
+const INTERN_LONG_MAX: i64 = 1024;
+
+/// Route a dynamically-typed `Value` through the intern cache when possible,
+/// falling back to `box_val` for all other types.
+///
+/// Use this anywhere a returned `Value` might be a Nil/Bool/Long — e.g., the
+/// result of `rt_call`, `call_global_fn`, interpreter callbacks, etc.
+#[inline]
+fn box_or_intern_val(v: Value) -> *const Value {
+    match &v {
+        Value::Nil => intern_nil(),
+        Value::Bool(b) => intern_bool(*b),
+        Value::Long(n) => intern_long(*n),
+        _ => box_val(v),
+    }
+}
+
+/// Return a stable pointer for longs in [0, INTERN_LONG_MAX); allocate on the
+/// GC heap for everything else.
+#[inline]
+fn intern_long(n: i64) -> *const Value {
+    static CACHE: OnceLock<Vec<usize>> = OnceLock::new();
+    if (0..INTERN_LONG_MAX).contains(&n) {
+        let cache = CACHE.get_or_init(|| {
+            (0..INTERN_LONG_MAX)
+                .map(|i| box_val(Value::Long(i)) as usize)
+                .collect()
+        });
+        cache[n as usize] as *const Value
+    } else {
+        box_val(Value::Long(n))
+    }
+}
+
 // ── Safepoint ───────────────────────────────────────────────────────────────
 
 /// GC safepoint for AOT-compiled code.
@@ -106,22 +167,22 @@ pub extern "C" fn rt_safepoint() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_const_nil() -> *const Value {
-    box_val(Value::Nil)
+    intern_nil()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_const_true() -> *const Value {
-    box_val(Value::Bool(true))
+    intern_bool(true)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_const_false() -> *const Value {
-    box_val(Value::Bool(false))
+    intern_bool(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_const_long(n: i64) -> *const Value {
-    box_val(Value::Long(n))
+    intern_long(n)
 }
 
 #[unsafe(no_mangle)]
@@ -194,7 +255,7 @@ pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => box_val(Value::Long(x.wrapping_add(*y))),
+        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_add(*y)),
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x + y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 + y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x + *y as f64)),
@@ -209,7 +270,7 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => box_val(Value::Long(x.wrapping_sub(*y))),
+        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_sub(*y)),
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x - y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 - y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x - *y as f64)),
@@ -224,7 +285,7 @@ pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => box_val(Value::Long(x.wrapping_mul(*y))),
+        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_mul(*y)),
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x * y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 * y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x * *y as f64)),
@@ -239,7 +300,7 @@ pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) if *y != 0 => box_val(Value::Long(x / y)),
+        (Value::Long(x), Value::Long(y)) if *y != 0 => intern_long(x / y),
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x / y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 / y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x / *y as f64)),
@@ -254,7 +315,7 @@ pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) if *y != 0 => box_val(Value::Long(x % y)),
+        (Value::Long(x), Value::Long(y)) if *y != 0 => intern_long(x % y),
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x % y)),
         _ => rt_const_nil(),
     }
@@ -268,7 +329,7 @@ pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Valu
 pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value {
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
-    box_val(Value::Bool(a == b))
+    intern_bool(a == b)
 }
 
 /// # Safety
@@ -284,7 +345,7 @@ pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value
         (Value::Double(x), Value::Long(y)) => *x < (*y as f64),
         _ => false,
     };
-    box_val(Value::Bool(result))
+    intern_bool(result)
 }
 
 /// # Safety
@@ -300,7 +361,7 @@ pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value
         (Value::Double(x), Value::Long(y)) => *x > (*y as f64),
         _ => false,
     };
-    box_val(Value::Bool(result))
+    intern_bool(result)
 }
 
 /// # Safety
@@ -316,7 +377,7 @@ pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Valu
         (Value::Double(x), Value::Long(y)) => *x <= (*y as f64),
         _ => false,
     };
-    box_val(Value::Bool(result))
+    intern_bool(result)
 }
 
 /// # Safety
@@ -332,7 +393,7 @@ pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Valu
         (Value::Double(x), Value::Long(y)) => *x >= (*y as f64),
         _ => false,
     };
-    box_val(Value::Bool(result))
+    intern_bool(result)
 }
 
 // ── Region allocation ───────────────────────────────────────────────────────
@@ -613,7 +674,7 @@ pub unsafe extern "C" fn rt_get(coll: *const Value, key: *const Value) -> *const
         }
         _ => None,
     };
-    box_val(result.unwrap_or(Value::Nil))
+    box_or_intern_val(result.unwrap_or(Value::Nil))
 }
 
 /// `(count coll)` — returns a Long.
@@ -632,7 +693,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::Nil => 0,
         _ => 0,
     };
-    box_val(Value::Long(n as i64))
+    intern_long(n as i64)
 }
 
 /// `(empty? coll)` — returns Bool without converting to a seq.
@@ -655,7 +716,7 @@ pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
         Value::Cons(_) => false,
         _ => false,
     };
-    box_val(Value::Bool(empty))
+    intern_bool(empty)
 }
 
 /// `(first coll)`.
@@ -665,14 +726,16 @@ pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) };
-    let result = match coll {
-        Value::List(l) => l.get().first().cloned().unwrap_or(Value::Nil),
-        Value::Vector(v) => v.get().nth(0).cloned().unwrap_or(Value::Nil),
-        Value::Cons(c) => c.get().head.clone(),
-        Value::Nil => Value::Nil,
-        _ => Value::Nil,
-    };
-    box_val(result)
+    match coll {
+        // Return interior pointer for Vector — no alloc needed.
+        Value::Vector(v) => match v.get().nth(0) {
+            Some(val) => val as *const Value,
+            None => intern_nil(),
+        },
+        Value::List(l) => box_or_intern_val(l.get().first().cloned().unwrap_or(Value::Nil)),
+        Value::Cons(c) => box_or_intern_val(c.get().head.clone()),
+        _ => intern_nil(),
+    }
 }
 
 /// `(rest coll)`.
@@ -1183,19 +1246,19 @@ pub unsafe extern "C" fn rt_load_global(
     if let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() {
         // Try the specified namespace first.
         if let Some(val) = globals.lookup_in_ns(ns, name) {
-            return box_val(val);
+            return box_or_intern_val(val);
         }
         // Try resolving ns as an alias in the current namespace.
         if let Some(resolved_ns) = globals.resolve_alias(&current_ns, ns)
             && let Some(val) = globals.lookup_in_ns(&resolved_ns, name)
         {
-            return box_val(val);
+            return box_or_intern_val(val);
         }
         // If ns is the current namespace, also check refers (e.g. clojure.core).
         if ns == current_ns.as_ref()
             && let Some(val) = globals.lookup_in_ns(&current_ns, name)
         {
-            return box_val(val);
+            return box_or_intern_val(val);
         }
     }
     rt_const_nil()
@@ -1309,9 +1372,8 @@ pub unsafe extern "C" fn rt_call(
         .collect();
 
     match cljrs_env::callback::invoke(callee, arg_values) {
-        Ok(result) => box_val(result),
+        Ok(result) => box_or_intern_val(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
-            // Store thrown exception in thread-local for rt_try to find.
             PENDING_EXCEPTION.with(|cell| {
                 *cell.borrow_mut() = Some(box_val(val));
             });
@@ -1329,7 +1391,7 @@ pub unsafe extern "C" fn rt_call(
 pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_interp::eval::deref_value(v) {
-        Ok(result) => box_val(result),
+        Ok(result) => box_or_intern_val(result),
         Err(_) => rt_const_nil(),
     }
 }
@@ -1364,7 +1426,7 @@ pub unsafe extern "C" fn rt_pr(v: *const Value) -> *const Value {
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_is_nil(v: *const Value) -> *const Value {
-    box_val(Value::Bool(matches!(unsafe { val_ref(v) }, Value::Nil)))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Nil))
 }
 
 /// # Safety
@@ -1372,27 +1434,24 @@ pub unsafe extern "C" fn rt_is_nil(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_is_seq(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(
+    intern_bool(matches!(
         v,
         Value::List(_) | Value::Cons(_) | Value::LazySeq(_)
-    )))
+    ))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_is_vector(v: *const Value) -> *const Value {
-    box_val(Value::Bool(matches!(
-        unsafe { val_ref(v) },
-        Value::Vector(_)
-    )))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Vector(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
-    box_val(Value::Bool(matches!(unsafe { val_ref(v) }, Value::Map(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Map(_)))
 }
 
 // ── Identity ────────────────────────────────────────────────────────────────
@@ -1403,7 +1462,7 @@ pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_identical(a: *const Value, b: *const Value) -> *const Value {
-    box_val(Value::Bool(std::ptr::eq(a, b)))
+    intern_bool(std::ptr::eq(a, b))
 }
 
 // ── Str ─────────────────────────────────────────────────────────────────────
@@ -1508,13 +1567,22 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
         Value::Long(n) => *n as usize,
         _ => return rt_const_nil(),
     };
-    let result = match coll {
-        Value::Vector(v) => v.get().nth(i).cloned(),
-        Value::List(l) => l.get().iter().nth(i).cloned(),
-        Value::Str(s) => s.get().chars().nth(i).map(Value::Char),
-        _ => None,
-    };
-    box_val(result.unwrap_or(Value::Nil))
+    match coll {
+        // Return interior pointer for Vector — no alloc.
+        Value::Vector(v) => match v.get().nth(i) {
+            Some(val) => val as *const Value,
+            None => intern_nil(),
+        },
+        Value::List(l) => box_or_intern_val(l.get().iter().nth(i).cloned().unwrap_or(Value::Nil)),
+        Value::Str(s) => box_or_intern_val(
+            s.get()
+                .chars()
+                .nth(i)
+                .map(Value::Char)
+                .unwrap_or(Value::Nil),
+        ),
+        _ => intern_nil(),
+    }
 }
 
 /// `(contains? coll key)`.
@@ -1538,7 +1606,7 @@ pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *
         }
         _ => false,
     };
-    box_val(Value::Bool(result))
+    intern_bool(result)
 }
 
 // ── Sequence operations (extended) ──────────────────────────────────────────
@@ -1876,7 +1944,7 @@ fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
         && let Some(val) = globals.lookup_in_ns(ns, name)
     {
         match cljrs_env::callback::invoke(&val, args) {
-            Ok(result) => box_val(result),
+            Ok(result) => box_or_intern_val(result),
             Err(cljrs_value::ValueError::Thrown(v)) => {
                 PENDING_EXCEPTION.with(|cell| {
                     *cell.borrow_mut() = Some(box_val(v));
@@ -2605,50 +2673,42 @@ pub unsafe extern "C" fn rt_assoc_in(
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(
-        val,
-        Value::Long(_) | Value::Double(_)
-    )))
+    intern_bool(matches!(val, Value::Long(_) | Value::Double(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_string(v: *const Value) -> *const Value {
-    let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Str(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Str(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_keyword(v: *const Value) -> *const Value {
-    let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Keyword(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Keyword(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_symbol(v: *const Value) -> *const Value {
-    let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Symbol(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Symbol(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_bool(v: *const Value) -> *const Value {
-    let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Bool(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Bool(_)))
 }
 
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
-    let val = unsafe { val_ref(v) };
-    box_val(Value::Bool(matches!(val, Value::Long(_))))
+    intern_bool(matches!(unsafe { val_ref(v) }, Value::Long(_)))
 }
 
 // ── Additional I/O ──────────────────────────────────────────────────────────
