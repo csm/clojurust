@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use super::escape::{EscapeContext, EscapeState, analyze, make_context};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
-use crate::{Block, BlockId, Inst, IrFunction, RegionAllocKind, Terminator, VarId};
+use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
 
 // ── CFG helpers ──────────────────────────────────────────────────────────────
 
@@ -491,6 +491,156 @@ fn optimize_tree(ir_func: IrFunction, ctx: &EscapeContext) -> IrFunction {
     optimized
 }
 
+// ── Function-scope region wrapping ──────────────────────────────────────────
+
+/// Returns true when `kfn` always produces a non-collection scalar value
+/// (Long, Bool, or Nil) that will never be allocated in the active region.
+fn is_scalar_knownfn(kfn: &KnownFn) -> bool {
+    matches!(
+        kfn,
+        KnownFn::Add
+            | KnownFn::Sub
+            | KnownFn::Mul
+            | KnownFn::Div
+            | KnownFn::Rem
+            | KnownFn::Eq
+            | KnownFn::Lt
+            | KnownFn::Gt
+            | KnownFn::Lte
+            | KnownFn::Gte
+            | KnownFn::Count
+            | KnownFn::IsNil
+            | KnownFn::IsSeq
+            | KnownFn::IsVector
+            | KnownFn::IsMap
+            | KnownFn::IsEmpty
+            | KnownFn::IsNumber
+            | KnownFn::IsString
+            | KnownFn::IsKeyword
+            | KnownFn::IsSymbol
+            | KnownFn::IsBool
+            | KnownFn::IsInt
+            | KnownFn::Contains
+            | KnownFn::Identical
+            | KnownFn::Println
+            | KnownFn::Pr
+            | KnownFn::Prn
+            | KnownFn::Print
+    )
+}
+
+/// Classify a single instruction's destination as provably scalar, given
+/// already-classified vars.  Returns `true` if the dst should be added to
+/// the scalar set.
+fn inst_is_provably_scalar(inst: &Inst, scalar: &HashSet<VarId>) -> bool {
+    match inst {
+        Inst::Const(_, c) => matches!(
+            c,
+            Const::Nil | Const::Bool(_) | Const::Long(_) | Const::Double(_)
+        ),
+        Inst::CallKnown(_, kfn, _) => is_scalar_knownfn(kfn),
+        Inst::Phi(_, arms) => !arms.is_empty() && arms.iter().all(|(_, v)| scalar.contains(v)),
+        _ => false,
+    }
+}
+
+fn inst_dst(inst: &Inst) -> Option<VarId> {
+    match inst {
+        Inst::Const(d, _)
+        | Inst::LoadLocal(d, _)
+        | Inst::LoadGlobal(d, _, _)
+        | Inst::LoadVar(d, _, _)
+        | Inst::AllocVector(d, _)
+        | Inst::AllocMap(d, _)
+        | Inst::AllocSet(d, _)
+        | Inst::AllocList(d, _)
+        | Inst::AllocCons(d, _, _)
+        | Inst::AllocClosure(d, _, _)
+        | Inst::CallKnown(d, _, _)
+        | Inst::Call(d, _, _)
+        | Inst::CallDirect(d, _, _)
+        | Inst::Deref(d, _)
+        | Inst::DefVar(d, _, _, _)
+        | Inst::SetBang(d, _)
+        | Inst::Throw(d)
+        | Inst::Phi(d, _)
+        | Inst::RegionStart(d)
+        | Inst::RegionAlloc(d, _, _, _)
+        | Inst::RegionParam(d)
+        | Inst::CallWithRegion(d, _, _) => Some(*d),
+        Inst::RegionEnd(_) | Inst::SourceLoc(_) | Inst::Recur(_) => None,
+    }
+}
+
+/// Returns true when all `Return` terminators in `ir_func` return provably
+/// scalar (non-collection) values, making a function-scoped region safe.
+fn is_scalar_returning(ir_func: &IrFunction) -> bool {
+    let mut scalar: HashSet<VarId> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &ir_func.blocks {
+            for inst in block.phis.iter().chain(block.insts.iter()) {
+                if let Some(dst) = inst_dst(inst)
+                    && !scalar.contains(&dst)
+                    && inst_is_provably_scalar(inst, &scalar)
+                {
+                    scalar.insert(dst);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    ir_func.blocks.iter().all(|block| match &block.terminator {
+        Terminator::Return(var) => scalar.contains(var),
+        _ => true,
+    })
+}
+
+/// Wrap the function body in a function-scoped region: insert `RegionStart`
+/// at entry and `RegionEnd` before every `Return` terminator.
+fn wrap_function_region(mut ir_func: IrFunction) -> IrFunction {
+    let region_var = VarId(ir_func.next_var);
+    ir_func.next_var += 1;
+
+    // Insert RegionStart as the first instruction of the entry block.
+    if !ir_func.blocks.is_empty() {
+        ir_func.blocks[0]
+            .insts
+            .insert(0, Inst::RegionStart(region_var));
+    }
+
+    // Before each Return terminator, emit RegionEnd into the block's insts.
+    for block in &mut ir_func.blocks {
+        if matches!(block.terminator, Terminator::Return(_)) {
+            block.insts.push(Inst::RegionEnd(region_var));
+        }
+    }
+
+    ir_func
+}
+
+/// Apply function-scope region wrapping to every function in the tree that is
+/// provably scalar-returning.  Subfunctions are processed first so the parent's
+/// analysis sees final instruction shapes.
+fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
+    let mut ir_func = ir_func;
+    let subfunctions = std::mem::take(&mut ir_func.subfunctions);
+    ir_func.subfunctions = subfunctions
+        .into_iter()
+        .map(wrap_scalar_returning)
+        .collect();
+
+    if is_scalar_returning(&ir_func) {
+        wrap_function_region(ir_func)
+    } else {
+        ir_func
+    }
+}
+
+// ── Top-level pass ───────────────────────────────────────────────────────────
+
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
@@ -501,6 +651,9 @@ fn optimize_tree(ir_func: IrFunction, ctx: &EscapeContext) -> IrFunction {
 ///   3. Cross-function region promotion (`promote_cross_fn_allocs`) — for
 ///      `Call` sites whose result is `NoEscape`, clone a region-parameterised
 ///      variant of the callee that uses the caller's region.
+///   4. Function-scope region wrapping (`wrap_scalar_returning`) — wrap the
+///      bodies of provably scalar-returning functions so their intermediate
+///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
     let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
@@ -510,5 +663,8 @@ pub fn optimize(ir_func: IrFunction) -> IrFunction {
     // rewritten allocations (and added blocks), invalidating the cached
     // per-function summaries the original `ctx` carries.
     let ctx2 = make_context(&ir_func);
-    promote_cross_fn_allocs(ir_func, &ctx2)
+    let ir_func = promote_cross_fn_allocs(ir_func, &ctx2);
+
+    // Stage 5: function-scope regions for scalar-returning functions.
+    wrap_scalar_returning(ir_func)
 }
