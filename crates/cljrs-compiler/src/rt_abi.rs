@@ -135,6 +135,23 @@ fn box_or_intern_val(v: Value) -> *const Value {
     }
 }
 
+/// Box a `Value` returned from `invoke` / `call_global_fn`.
+///
+/// Collections go through `box_coll_val` so they land in the active region
+/// when one is open; scalars go through `box_or_intern_val`.
+#[inline]
+fn box_invoke_result(v: Value) -> *const Value {
+    match &v {
+        Value::Nil => intern_nil(),
+        Value::Bool(b) => intern_bool(*b),
+        Value::Long(n) => intern_long(*n),
+        Value::Vector(_) | Value::Set(_) | Value::List(_) | Value::Map(_) | Value::Cons(_) => {
+            box_coll_val(v)
+        }
+        _ => box_val(v),
+    }
+}
+
 /// Return a stable pointer for longs in [0, INTERN_LONG_MAX); allocate on the
 /// GC heap for everything else.
 #[inline]
@@ -489,7 +506,7 @@ pub unsafe extern "C" fn rt_region_alloc_map(
     } else {
         Vec::new()
     };
-    box_val(Value::Map(MapValue::from_pairs(kv_pairs)))
+    box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
 /// Allocate a set in the active region (falling back to GC heap).
@@ -587,9 +604,8 @@ pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> 
         .iter()
         .map(|p| unsafe { val_ref(*p) }.clone())
         .collect();
-    box_val(Value::Vector(GcPtr::new(PersistentVector::from_iter(
-        items,
-    ))))
+    let pv = PersistentVector::from_iter(items);
+    box_coll_val(Value::Vector(alloc_inner_coll(pv)))
 }
 
 /// Allocate a map from `n` key-value pairs (2*n pointers: k0, v0, k1, v1, ...).
@@ -607,7 +623,7 @@ pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *co
             (k, v)
         })
         .collect();
-    box_val(Value::Map(MapValue::from_pairs(kv_pairs)))
+    box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
 /// Allocate a set from `n` element pointers.
@@ -623,7 +639,7 @@ pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *co
         .map(|p| unsafe { val_ref(*p) }.clone())
         .collect();
     let set = PersistentHashSet::from_iter(items);
-    box_val(Value::Set(SetValue::Hash(GcPtr::new(set))))
+    box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(set))))
 }
 
 /// Allocate a list from `n` element pointers.
@@ -638,7 +654,8 @@ pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *c
         .iter()
         .map(|p| unsafe { val_ref(*p) }.clone())
         .collect();
-    box_val(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+    let list = PersistentList::from_iter(items);
+    box_coll_val(Value::List(alloc_inner_coll(list)))
 }
 
 /// Allocate a cons cell.
@@ -649,7 +666,7 @@ pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *c
 pub unsafe extern "C" fn rt_alloc_cons(head: *const Value, tail: *const Value) -> *const Value {
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
-    box_val(Value::Cons(GcPtr::new(CljxCons { head: h, tail: t })))
+    box_coll_val(Value::Cons(alloc_inner_coll(CljxCons { head: h, tail: t })))
 }
 
 // ── Collection operations ───────────────────────────────────────────────────
@@ -745,24 +762,24 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) };
-    let result = match coll {
+    match coll {
         Value::List(l) => {
-            let rest = l.get().rest();
-            Value::List(GcPtr::new((*rest).clone()))
+            let rest = (*l.get().rest()).clone();
+            box_coll_val(Value::List(alloc_inner_coll(rest)))
         }
         Value::Vector(v) => {
             if v.get().count() <= 1 {
-                Value::List(GcPtr::new(PersistentList::empty()))
+                box_coll_val(Value::List(alloc_inner_coll(PersistentList::empty())))
             } else {
                 let items: Vec<Value> = v.get().iter().skip(1).cloned().collect();
-                Value::List(GcPtr::new(PersistentList::from_iter(items)))
+                box_coll_val(Value::List(alloc_inner_coll(PersistentList::from_iter(
+                    items,
+                ))))
             }
         }
-        Value::Cons(c) => c.get().tail.clone(),
-        Value::Nil => Value::List(GcPtr::new(PersistentList::empty())),
-        _ => Value::List(GcPtr::new(PersistentList::empty())),
-    };
-    box_val(result)
+        Value::Cons(c) => box_coll_val(c.get().tail.clone()),
+        _ => box_coll_val(Value::List(alloc_inner_coll(PersistentList::empty()))),
+    }
 }
 
 /// `(assoc m k v)`.
@@ -1372,7 +1389,7 @@ pub unsafe extern "C" fn rt_call(
         .collect();
 
     match cljrs_env::callback::invoke(callee, arg_values) {
-        Ok(result) => box_or_intern_val(result),
+        Ok(result) => box_invoke_result(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
             PENDING_EXCEPTION.with(|cell| {
                 *cell.borrow_mut() = Some(box_val(val));
@@ -1391,7 +1408,7 @@ pub unsafe extern "C" fn rt_call(
 pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_interp::eval::deref_value(v) {
-        Ok(result) => box_or_intern_val(result),
+        Ok(result) => box_invoke_result(result),
         Err(_) => rt_const_nil(),
     }
 }
@@ -1944,7 +1961,7 @@ fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
         && let Some(val) = globals.lookup_in_ns(ns, name)
     {
         match cljrs_env::callback::invoke(&val, args) {
-            Ok(result) => box_or_intern_val(result),
+            Ok(result) => box_invoke_result(result),
             Err(cljrs_value::ValueError::Thrown(v)) => {
                 PENDING_EXCEPTION.with(|cell| {
                     *cell.borrow_mut() = Some(box_val(v));
