@@ -135,6 +135,23 @@ fn box_or_intern_val(v: Value) -> *const Value {
     }
 }
 
+/// Box a `Value` returned from `invoke` / `call_global_fn`.
+///
+/// Collections go through `box_coll_val` so they land in the active region
+/// when one is open; scalars go through `box_or_intern_val`.
+#[inline]
+fn box_invoke_result(v: Value) -> *const Value {
+    match &v {
+        Value::Nil => intern_nil(),
+        Value::Bool(b) => intern_bool(*b),
+        Value::Long(n) => intern_long(*n),
+        Value::Vector(_) | Value::Set(_) | Value::List(_) | Value::Map(_) | Value::Cons(_) => {
+            box_coll_val(v)
+        }
+        _ => box_val(v),
+    }
+}
+
 /// Return a stable pointer for longs in [0, INTERN_LONG_MAX); allocate on the
 /// GC heap for everything else.
 #[inline]
@@ -1372,7 +1389,7 @@ pub unsafe extern "C" fn rt_call(
         .collect();
 
     match cljrs_env::callback::invoke(callee, arg_values) {
-        Ok(result) => box_or_intern_val(result),
+        Ok(result) => box_invoke_result(result),
         Err(cljrs_value::ValueError::Thrown(val)) => {
             PENDING_EXCEPTION.with(|cell| {
                 *cell.borrow_mut() = Some(box_val(val));
@@ -1391,7 +1408,7 @@ pub unsafe extern "C" fn rt_call(
 pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_interp::eval::deref_value(v) {
-        Ok(result) => box_or_intern_val(result),
+        Ok(result) => box_invoke_result(result),
         Err(_) => rt_const_nil(),
     }
 }
@@ -1944,7 +1961,7 @@ fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
         && let Some(val) = globals.lookup_in_ns(ns, name)
     {
         match cljrs_env::callback::invoke(&val, args) {
-            Ok(result) => box_or_intern_val(result),
+            Ok(result) => box_invoke_result(result),
             Err(cljrs_value::ValueError::Thrown(v)) => {
                 PENDING_EXCEPTION.with(|cell| {
                     *cell.borrow_mut() = Some(box_val(v));
