@@ -798,12 +798,12 @@ pub unsafe extern "C" fn rt_assoc(
     match m {
         Value::Map(map) => {
             let new_map = map.assoc(k, v);
-            box_val(Value::Map(new_map))
+            box_coll_val(Value::Map(new_map))
         }
         Value::TypeInstance(ti) => {
             let mut fields = ti.get().fields.clone();
             fields = fields.assoc(k, v);
-            box_val(Value::TypeInstance(GcPtr::new(TypeInstance {
+            box_coll_val(Value::TypeInstance(alloc_inner_coll(TypeInstance {
                 type_tag: ti.get().type_tag.clone(),
                 fields,
             })))
@@ -836,7 +836,7 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
         Value::Set(s) => {
             // Sorted sets: delegate to interpreter (rare path)
             let new_set = s.conj(val);
-            box_val(Value::Set(new_set))
+            box_coll_val(Value::Set(new_set))
         }
         _ => rt_const_nil(),
     }
@@ -1553,8 +1553,8 @@ pub unsafe extern "C" fn rt_dissoc(m: *const Value, k: *const Value) -> *const V
     let m = unsafe { val_ref(m) };
     let k = unsafe { val_ref(k) };
     match m {
-        Value::Map(map) => box_val(Value::Map(map.dissoc(k))),
-        _ => box_val(m.clone()),
+        Value::Map(map) => box_coll_val(Value::Map(map.dissoc(k))),
+        _ => box_coll_val(m.clone()),
     }
 }
 
@@ -1567,8 +1567,8 @@ pub unsafe extern "C" fn rt_disj(set: *const Value, val: *const Value) -> *const
     let set = unsafe { val_ref(set) };
     let val = unsafe { val_ref(val) };
     match set {
-        Value::Set(s) => box_val(Value::Set(s.disj(val))),
-        _ => box_val(set.clone()),
+        Value::Set(s) => box_coll_val(Value::Set(s.disj(val))),
+        _ => box_coll_val(set.clone()),
     }
 }
 
