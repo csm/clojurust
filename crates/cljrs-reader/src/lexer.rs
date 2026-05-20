@@ -536,7 +536,25 @@ impl Lexer {
         start_line: u32,
         start_col: u32,
     ) -> CljxResult<(Token, Span)> {
-        let name = self.read_symbol_chars();
+        let mut name = self.read_symbol_chars();
+
+        // Peek for a version suffix: `@<commit-hash>`.  We only consume the `@`
+        // when it is immediately followed by 7–40 hex characters so that a
+        // standalone `@expr` (deref reader macro) is never affected — deref
+        // always starts a *new* form where `@` is the first character, not a
+        // mid-symbol suffix.
+        if self.peek() == Some('@') {
+            let version_candidate = self.peek_version_hash();
+            if let Some(hash) = version_candidate {
+                self.advance(); // consume '@'
+                for _ in 0..hash.len() {
+                    self.advance();
+                }
+                name.push('@');
+                name.push_str(&hash);
+            }
+        }
+
         let tok = match name.as_str() {
             "nil" => Token::Nil,
             "true" => Token::Bool(true),
@@ -544,6 +562,31 @@ impl Lexer {
             _ => Token::Symbol(name),
         };
         Ok((tok, self.span_from(start_pos, start_line, start_col)))
+    }
+
+    /// Look ahead past the `@` that `peek()` just returned and collect
+    /// characters as long as they are ASCII hex digits, up to 40.  Returns
+    /// `Some(hash)` if the candidate is 7–40 hex chars followed by a
+    /// non-hex-digit (or EOF), `None` otherwise.  Does **not** advance the
+    /// cursor.
+    fn peek_version_hash(&self) -> Option<String> {
+        // Start one byte past the current `@`.
+        let at_byte = self.pos + 1; // '@' is single-byte ASCII
+        let rest = &self.source[at_byte..];
+        let hash: String = rest
+            .chars()
+            .take(40)
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if hash.len() >= 7 {
+            // Make sure the character after the hash is a delimiter (or EOF).
+            let after = rest[hash.len()..].chars().next();
+            let is_delimited = after.map_or(true, |c| !c.is_ascii_hexdigit());
+            if is_delimited {
+                return Some(hash);
+            }
+        }
+        None
     }
 
     // ── Number ────────────────────────────────────────────────────────────

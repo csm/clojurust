@@ -22,6 +22,8 @@ pub enum RequireRefer {
 #[derive(Debug, Clone)]
 pub struct RequireSpec {
     pub ns: Arc<str>,
+    /// Present when the namespace symbol carried a `@<hash>` version suffix.
+    pub version: Option<Arc<str>>,
     pub alias: Option<Arc<str>>,
     pub refer: RequireRefer,
 }
@@ -92,6 +94,12 @@ pub struct GlobalEnv {
     pub call_cljrs_fn: fn(&CljxFn, &[Value], &mut Env) -> EvalResult,
     /// Hook for customization when a new fn* is defined.
     on_fn_defined: Option<fn(&CljxFn, &mut Env)>,
+    /// Cache of values resolved at a specific commit.
+    /// Key format: `"<ns>/<name>@<commit>"` for individual vars,
+    /// or `"<ns>@<commit>"` for whole versioned namespaces.
+    pub version_cache: Mutex<HashMap<Arc<str>, Value>>,
+    /// Parsed `cljrs.edn` config, loaded once at startup.
+    pub deps_config: RwLock<Option<Arc<cljrs_deps::DepsConfig>>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -118,6 +126,8 @@ impl GlobalEnv {
             eval_fn,
             call_cljrs_fn,
             on_fn_defined,
+            version_cache: Mutex::new(HashMap::new()),
+            deps_config: RwLock::new(None),
         })
     }
 
@@ -324,6 +334,36 @@ impl GlobalEnv {
     pub fn set_on_fn_defined(&mut self, hook: fn(&CljxFn, &mut Env)) {
         self.on_fn_defined = Some(hook);
     }
+
+    /// Return `(source_file, git_repo_root)` for the named namespace, if
+    /// both have been populated by the loader.
+    pub fn get_ns_git_context(&self, ns_name: &str) -> Option<(Arc<str>, Arc<str>)> {
+        let map = self.namespaces.read().unwrap();
+        let ns = map.get(ns_name)?;
+        let ns_ref = ns.get();
+        let file = ns_ref.source_file.lock().unwrap().clone()?;
+        let repo = ns_ref.git_repo_root.lock().unwrap().clone()?;
+        Some((file, repo))
+    }
+
+    /// Store a resolved versioned value in the cache.
+    /// Key: `"<ns>/<name>@<commit>"`.
+    pub fn cache_versioned(&self, ns: &str, name: &str, commit: &str, val: Value) {
+        let key: Arc<str> = Arc::from(format!("{ns}/{name}@{commit}"));
+        self.version_cache.lock().unwrap().insert(key, val);
+    }
+
+    /// Retrieve a previously resolved versioned value, if cached.
+    pub fn get_cached_versioned(&self, ns: &str, name: &str, commit: &str) -> Option<Value> {
+        let key = format!("{ns}/{name}@{commit}");
+        self.version_cache.lock().unwrap().get(key.as_str()).cloned()
+    }
+
+    /// Mark namespace `name@commit` as loaded in the standard loaded set.
+    pub fn cache_versioned_ns(&self, ns: &str, commit: &str) {
+        let key: Arc<str> = Arc::from(format!("{ns}@{commit}"));
+        self.version_cache.lock().unwrap().insert(key, Value::Nil);
+    }
 }
 
 // ── Env ───────────────────────────────────────────────────────────────────────
@@ -333,6 +373,10 @@ pub struct Env {
     pub frames: Vec<Frame>,
     pub current_ns: Arc<str>,
     pub globals: Arc<GlobalEnv>,
+    /// When set, unversioned same-namespace symbol lookups implicitly resolve
+    /// at this commit hash instead of HEAD.  Set by the versioned resolver when
+    /// evaluating a function body fetched from git history.
+    pub versioned_eval_commit: Option<Arc<str>>,
 }
 
 impl Env {
@@ -341,6 +385,15 @@ impl Env {
             frames: Vec::new(),
             current_ns: Arc::from(ns),
             globals,
+            versioned_eval_commit: None,
+        }
+    }
+
+    /// Create an Env for evaluating source at a specific commit.
+    pub fn new_versioned(globals: Arc<GlobalEnv>, ns: &str, commit: &str) -> Self {
+        Self {
+            versioned_eval_commit: Some(Arc::from(commit)),
+            ..Self::new(globals, ns)
         }
     }
 
@@ -382,6 +435,18 @@ impl Env {
             }
         }
         self.globals.lookup_in_ns(&self.current_ns, name)
+    }
+
+    /// Look up `name` in local frames only — does **not** fall back to the
+    /// global namespace.  Used by the versioned resolver to check for local
+    /// bindings before applying commit inheritance.
+    pub fn lookup_local_frames(&self, name: &str) -> Option<Value> {
+        for frame in self.frames.iter().rev() {
+            if let Some(v) = frame.lookup(name) {
+                return Some(v.clone());
+            }
+        }
+        None
     }
 
     /// Look up the Var object for `name` in the current namespace.

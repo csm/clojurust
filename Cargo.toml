@@ -17,7 +17,9 @@ members = [
     "crates/cljrs-builtins",
     "crates/cljrs-interp",
     "crates/cljrs-ir-prebuild",
-    "crates/cljrs-ir-viz"]
+    "crates/cljrs-ir-viz",
+    "crates/cljrs-deps",
+    "crates/cljrs-vcs"]
 resolver = "2"
 
 [workspace.package]
@@ -41,6 +43,8 @@ cljrs-builtins = { path = "crates/cljrs-builtins", version = "0.1.0" }
 cljrs-interp   = { path = "crates/cljrs-interp",   version = "0.1.0" }
 cljrs-ir-prebuild = { path = "crates/cljrs-ir-prebuild", version = "0.1.0" }
 cljrs-ir-viz  = { path = "crates/cljrs-ir-viz",  version = "0.1.0" }
+cljrs-deps    = { path = "crates/cljrs-deps",    version = "0.1.0" }
+cljrs-vcs     = { path = "crates/cljrs-vcs",     version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"

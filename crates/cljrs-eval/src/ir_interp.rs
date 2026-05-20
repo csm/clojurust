@@ -426,10 +426,7 @@ fn const_to_value(c: &Const) -> Value {
         Const::Double(d) => Value::Double(*d),
         Const::Str(s) => Value::Str(GcPtr::new(s.to_string())),
         Const::Keyword(k) => Value::Keyword(GcPtr::new(cljrs_value::keyword::Keyword::parse(k))),
-        Const::Symbol(s) => Value::Symbol(GcPtr::new(cljrs_value::Symbol {
-            namespace: None,
-            name: s.clone(),
-        })),
+        Const::Symbol(s) => Value::symbol(cljrs_value::Symbol::simple(s.clone())),
         Const::Char(c) => Value::Char(*c),
     }
 }
@@ -452,10 +449,7 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
     }
     // JVM class names resolve to themselves as symbols, mirroring eval_symbol.
     if cljrs_interp::eval::is_jvm_class_name(name) {
-        return Ok(Value::Symbol(GcPtr::new(cljrs_value::Symbol {
-            namespace: None,
-            name: Arc::from(name),
-        })));
+        return Ok(Value::symbol(cljrs_value::Symbol::simple(name)));
     }
     Err(EvalError::Runtime(format!(
         "IR interpreter: var not found {resolved_ns}/{name}"

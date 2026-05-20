@@ -1609,10 +1609,7 @@ fn handle_ns_aliases(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     drop(map);
     let mut m = cljrs_value::MapValue::empty();
     for (alias, full_ns_name) in &aliases {
-        let sym = Value::Symbol(cljrs_gc::GcPtr::new(cljrs_value::Symbol {
-            namespace: None,
-            name: alias.clone(),
-        }));
+        let sym = Value::symbol(cljrs_value::Symbol::simple(alias.clone()));
         let nsmap = env.globals.namespaces.read().unwrap();
         if let Some(target_ns) = nsmap.get(full_ns_name.as_ref()) {
             m = m.assoc(sym, Value::Namespace(target_ns.clone()));

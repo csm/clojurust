@@ -6833,10 +6833,7 @@ fn builtin_namespace_q(args: &[Value]) -> ValueResult<Value> {
 fn builtin_ns_name(args: &[Value]) -> ValueResult<Value> {
     let ns = ns_from_arg(&args[0])?;
     let name = ns.get().name.clone();
-    Ok(Value::Symbol(cljrs_gc::GcPtr::new(Symbol {
-        namespace: None,
-        name,
-    })))
+    Ok(Value::symbol(Symbol::simple(name)))
 }
 
 /// `(ns-interns ns)` — map of unqualified Symbol → Var for all interned vars.
@@ -6845,10 +6842,7 @@ fn builtin_ns_interns(args: &[Value]) -> ValueResult<Value> {
     let interns = ns.get().interns.lock().unwrap();
     let mut m = MapValue::empty();
     for (name, var) in interns.iter() {
-        let sym = Value::Symbol(cljrs_gc::GcPtr::new(Symbol {
-            namespace: None,
-            name: name.clone(),
-        }));
+        let sym = Value::symbol(Symbol::simple(name.clone()));
         m = m.assoc(sym, Value::Var(var.clone()));
     }
     Ok(Value::Map(m))
@@ -6860,10 +6854,7 @@ fn builtin_ns_refers(args: &[Value]) -> ValueResult<Value> {
     let refers = ns.get().refers.lock().unwrap();
     let mut m = MapValue::empty();
     for (name, var) in refers.iter() {
-        let sym = Value::Symbol(cljrs_gc::GcPtr::new(Symbol {
-            namespace: None,
-            name: name.clone(),
-        }));
+        let sym = Value::symbol(Symbol::simple(name.clone()));
         m = m.assoc(sym, Value::Var(var.clone()));
     }
     Ok(Value::Map(m))
@@ -6878,10 +6869,7 @@ fn builtin_ns_map(args: &[Value]) -> ValueResult<Value> {
     {
         let refers = ns.get().refers.lock().unwrap();
         for (name, var) in refers.iter() {
-            let sym = Value::Symbol(cljrs_gc::GcPtr::new(Symbol {
-                namespace: None,
-                name: name.clone(),
-            }));
+            let sym = Value::symbol(Symbol::simple(name.clone()));
             m = m.assoc(sym, Value::Var(var.clone()));
         }
     }
@@ -6889,10 +6877,7 @@ fn builtin_ns_map(args: &[Value]) -> ValueResult<Value> {
     {
         let interns = ns.get().interns.lock().unwrap();
         for (name, var) in interns.iter() {
-            let sym = Value::Symbol(cljrs_gc::GcPtr::new(Symbol {
-                namespace: None,
-                name: name.clone(),
-            }));
+            let sym = Value::symbol(Symbol::simple(name.clone()));
             m = m.assoc(sym, Value::Var(var.clone()));
         }
     }

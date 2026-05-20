@@ -242,10 +242,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
 pub unsafe extern "C" fn rt_const_symbol(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
-    box_val(Value::Symbol(GcPtr::new(Symbol {
-        namespace: None,
-        name: Arc::from(name),
-    })))
+    box_val(Value::symbol(Symbol::simple(name)))
 }
 
 // ── Truthiness ──────────────────────────────────────────────────────────────
