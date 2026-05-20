@@ -935,21 +935,29 @@ fn eval_require(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Parse a `RequireSpec` from an already-evaluated `Value`.
 /// Accepts: `'some.ns`, `['some.ns :as alias]`, `['some.ns :refer [syms]]`,
-/// `['some.ns :refer :all]`.
+/// `['some.ns :refer :all]`, and versioned forms like `'some.ns@abc1234` or
+/// `['some.ns@abc1234 :as alias]`.
 fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
     match val {
-        Value::Symbol(s) => Ok(RequireSpec {
-            ns: s.get().name.clone(),
-            alias: None,
-            refer: RequireRefer::None,
-        }),
+        Value::Symbol(s) => {
+            let sym = s.get();
+            Ok(RequireSpec {
+                ns: sym.name.clone(),
+                version: sym.version.clone(),
+                alias: None,
+                refer: RequireRefer::None,
+            })
+        }
         Value::Vector(v) => {
             let items: Vec<Value> = v.get().iter().cloned().collect();
             if items.is_empty() {
                 return Err("require spec vector must not be empty".into());
             }
-            let ns = match &items[0] {
-                Value::Symbol(s) => s.get().name.clone(),
+            let (ns, version) = match &items[0] {
+                Value::Symbol(s) => {
+                    let sym = s.get();
+                    (sym.name.clone(), sym.version.clone())
+                }
                 other => {
                     return Err(format!(
                         "require spec: first element must be a symbol, got {}",
@@ -1005,7 +1013,12 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
                 }
                 i += 1;
             }
-            Ok(RequireSpec { ns, alias, refer })
+            Ok(RequireSpec {
+                ns,
+                version,
+                alias,
+                refer,
+            })
         }
         other => Err(format!(
             "require expects a symbol or vector, got {}",
@@ -1015,19 +1028,27 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
 }
 
 /// Parse a `RequireSpec` from a raw `Form` (unevaluated, used in `ns` macro).
+/// Also handles versioned namespace symbols such as `my.ns@abc1234`.
 fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
     match &form.kind {
-        FormKind::Symbol(s) => Ok(RequireSpec {
-            ns: Arc::from(s.as_str()),
-            alias: None,
-            refer: RequireRefer::None,
-        }),
+        FormKind::Symbol(s) => {
+            let sym = cljrs_value::Symbol::parse(s);
+            Ok(RequireSpec {
+                ns: sym.name.clone(),
+                version: sym.version.clone(),
+                alias: None,
+                refer: RequireRefer::None,
+            })
+        }
         FormKind::Vector(items) => {
             if items.is_empty() {
                 return Err("require spec vector must not be empty".into());
             }
-            let ns = match &items[0].kind {
-                FormKind::Symbol(s) => Arc::from(s.as_str()),
+            let (ns, version) = match &items[0].kind {
+                FormKind::Symbol(s) => {
+                    let sym = cljrs_value::Symbol::parse(s);
+                    (sym.name.clone(), sym.version.clone())
+                }
                 _ => return Err("require spec: first element must be a symbol".into()),
             };
             let mut alias = None;
@@ -1076,7 +1097,12 @@ fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
                 }
                 i += 1;
             }
-            Ok(RequireSpec { ns, alias, refer })
+            Ok(RequireSpec {
+                ns,
+                version,
+                alias,
+                refer,
+            })
         }
         _ => Err("require spec must be a symbol or vector".into()),
     }

@@ -16,5 +16,6 @@ cljrs-builtins = { workspace = true }
 cljrs-value = { workspace = true }
 cljrs-gc = { workspace = true }
 cljrs-reader = { workspace = true }
+cljrs-vcs = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

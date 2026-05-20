@@ -312,14 +312,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cljrs-deps"
+version = "0.1.0"
+dependencies = [
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-types",
+ "thiserror",
+]
+
+[[package]]
 name = "cljrs-env"
 version = "0.1.0"
 dependencies = [
+ "cljrs-deps",
  "cljrs-gc",
  "cljrs-logging",
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+ "cljrs-vcs",
  "log",
  "thiserror",
 ]
@@ -371,6 +383,7 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+ "cljrs-vcs",
  "regex",
  "uuid",
 ]
@@ -476,6 +489,13 @@ dependencies = [
  "rpds",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "cljrs-vcs"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

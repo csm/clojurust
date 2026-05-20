@@ -163,25 +163,49 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
 // ── Symbol resolution ─────────────────────────────────────────────────────────
 
 fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
-    // Local frames (including closed-over).
-    if let Some(v) = env.lookup(s) {
+    let sym = Symbol::parse(s);
+
+    // Explicit version suffix (`name@hash` or `ns/name@hash`): always a
+    // namespace-level lookup — no local-frame fallback.
+    if let Some(ref commit) = sym.version.clone() {
+        return crate::versioned::resolve_versioned_symbol(&sym, commit, env);
+    }
+
+    // Local frames (params, let-bindings, closed-over vars) take priority for
+    // unversioned symbols.
+    if let Some(v) = env.lookup_local_frames(s) {
         return Ok(v);
     }
 
-    // Namespace-qualified: `ns/name`
-    if s.contains('/') && !s.starts_with('/') {
-        let sym = Symbol::parse(s);
-        if let Some(ns_part) = &sym.namespace {
-            // Resolve alias first, fall back to literal namespace name.
-            let resolved: Arc<str> = env
-                .globals
-                .resolve_alias(&env.current_ns, ns_part)
-                .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
-            return env
-                .globals
-                .lookup_in_ns(&resolved, &sym.name)
-                .ok_or_else(|| EvalError::UnboundSymbol(s.to_string()));
+    // Inherited versioned context: if we are evaluating inside a versioned
+    // function body, unversioned same-namespace symbols resolve at the inherited
+    // commit rather than HEAD.
+    if let Some(commit) = env.versioned_eval_commit.clone() {
+        let is_same_ns =
+            sym.namespace.is_none() || sym.namespace.as_deref() == Some(env.current_ns.as_ref());
+        if is_same_ns {
+            return crate::versioned::resolve_versioned_symbol(&sym, &commit, env);
         }
+    }
+
+    // Fall through to normal global namespace lookup.
+    if let Some(v) = env.globals.lookup_in_ns(&env.current_ns, s) {
+        return Ok(v);
+    }
+
+    // Namespace-qualified external symbol: `ns/name`
+    if s.contains('/')
+        && !s.starts_with('/')
+        && let Some(ns_part) = &sym.namespace
+    {
+        let resolved: Arc<str> = env
+            .globals
+            .resolve_alias(&env.current_ns, ns_part)
+            .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
+        return env
+            .globals
+            .lookup_in_ns(&resolved, &sym.name)
+            .ok_or_else(|| EvalError::UnboundSymbol(s.to_string()));
     }
 
     // JVM class names resolve to themselves as symbols (for instance?, catch, etc.)
@@ -1444,10 +1468,7 @@ mod tests {
             panic!("expected map")
         };
         // The map should contain 'my-test-var
-        let sym = Value::Symbol(cljrs_gc::GcPtr::new(cljrs_value::Symbol {
-            namespace: None,
-            name: Arc::from("my-test-var"),
-        }));
+        let sym = Value::symbol(cljrs_value::Symbol::simple("my-test-var"));
         assert!(m.get(&sym).is_some());
     }
 

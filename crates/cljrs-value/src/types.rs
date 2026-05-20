@@ -387,6 +387,15 @@ pub struct Namespace {
     pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
     /// Namespace aliases: short-name → full namespace name.
     pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,
+    /// Absolute path of the source file this namespace was loaded from,
+    /// populated by the loader.  Used by the versioned resolver to locate the
+    /// file for `git show`.
+    pub source_file: Mutex<Option<Arc<str>>>,
+    /// Absolute path of the git repository root that contains `source_file`.
+    pub git_repo_root: Mutex<Option<Arc<str>>>,
+    /// `true` for namespaces loaded from a specific commit (`name@hash`).
+    /// Versioned namespaces are immutable: `intern()` will refuse new bindings.
+    pub is_versioned: bool,
 }
 
 impl Namespace {
@@ -396,7 +405,24 @@ impl Namespace {
             interns: Mutex::new(HashMap::new()),
             refers: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
+            source_file: Mutex::new(None),
+            git_repo_root: Mutex::new(None),
+            is_versioned: false,
         }
+    }
+
+    /// Create a versioned (immutable) namespace for `name@commit`.
+    pub fn new_versioned(name: impl Into<Arc<str>>) -> Self {
+        Self {
+            is_versioned: true,
+            ..Self::new(name)
+        }
+    }
+
+    /// Record the source file path and its git repo root (if in a repo).
+    pub fn set_source_location(&self, file: &str, repo_root: Option<&str>) {
+        *self.source_file.lock().unwrap() = Some(Arc::from(file));
+        *self.git_repo_root.lock().unwrap() = repo_root.map(Arc::from);
     }
 }
 
