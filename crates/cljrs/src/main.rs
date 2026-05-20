@@ -491,10 +491,7 @@ fn run_deps_fetch(name: Option<String>) -> miette::Result<i32> {
         match config.find_dep(n) {
             Some(dep) => vec![(n.as_str(), dep)],
             None => {
-                return Err(miette::miette!(
-                    "dependency {:?} not found in cljrs.edn",
-                    n
-                ));
+                return Err(miette::miette!("dependency {:?} not found in cljrs.edn", n));
             }
         }
     } else {
@@ -575,10 +572,7 @@ fn run_deps_status() -> miette::Result<i32> {
                 if root.exists() {
                     println!("{dep_name}: local dep at {} — ok", root.display());
                 } else {
-                    println!(
-                        "{dep_name}: local dep at {} — NOT FOUND",
-                        root.display()
-                    );
+                    println!("{dep_name}: local dep at {} — NOT FOUND", root.display());
                     all_ok = false;
                 }
             }
