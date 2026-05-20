@@ -42,9 +42,7 @@ impl Symbol {
     pub fn parse(s: &str) -> Self {
         // Split namespace qualifier on the first `/`.
         let (ns_part, name_part) = match s.find('/') {
-            Some(idx) if idx > 0 && idx < s.len() - 1 => {
-                (Some(&s[..idx]), &s[idx + 1..])
-            }
+            Some(idx) if idx > 0 && idx < s.len() - 1 => (Some(&s[..idx]), &s[idx + 1..]),
             _ => (None, s),
         };
 
@@ -72,9 +70,9 @@ impl Symbol {
     pub fn versioned_name(&self) -> String {
         match (&self.namespace, &self.version) {
             (Some(ns), Some(v)) => format!("{}/{}@{}", ns, self.name, v),
-            (Some(ns), None)    => format!("{}/{}", ns, self.name),
-            (None,     Some(v)) => format!("{}@{}", self.name, v),
-            (None,     None)    => self.name.to_string(),
+            (Some(ns), None) => format!("{}/{}", ns, self.name),
+            (None, Some(v)) => format!("{}@{}", self.name, v),
+            (None, None) => self.name.to_string(),
         }
     }
 }

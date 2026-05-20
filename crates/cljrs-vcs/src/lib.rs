@@ -80,7 +80,10 @@ pub fn get_file_at_commit(repo_root: &Path, rel_path: &str, commit: &str) -> Vcs
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("does not exist") || stderr.contains("exists on disk") {
-            Err(VcsError::PathNotFound(rel_path.to_string(), commit.to_string()))
+            Err(VcsError::PathNotFound(
+                rel_path.to_string(),
+                commit.to_string(),
+            ))
         } else {
             Err(VcsError::CommitNotFound(commit.to_string()))
         }
@@ -110,7 +113,13 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
     // Stable cache directory derived from the URL (replace non-alphanum with _).
     let slug: String = url
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let repo_dir = cache_root().join(&slug);
 
@@ -127,8 +136,7 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
             return Err(VcsError::Io(std::io::Error::other("git fetch failed")));
         }
     } else {
-        std::fs::create_dir_all(&repo_dir)
-            .map_err(VcsError::Io)?;
+        std::fs::create_dir_all(&repo_dir).map_err(VcsError::Io)?;
         let status = std::process::Command::new("git")
             .arg("clone")
             .arg("--bare")
@@ -163,9 +171,11 @@ mod tests {
     #[test]
     fn valid_hashes() {
         assert!(is_valid_commit_hash("abc1234"));
-        assert!(is_valid_commit_hash("abc1234ef5678901234567890123456789012345"));
-        assert!(!is_valid_commit_hash("abc123"));   // too short
-        assert!(!is_valid_commit_hash("xyz1234"));  // non-hex
+        assert!(is_valid_commit_hash(
+            "abc1234ef5678901234567890123456789012345"
+        ));
+        assert!(!is_valid_commit_hash("abc123")); // too short
+        assert!(!is_valid_commit_hash("xyz1234")); // non-hex
         assert!(!is_valid_commit_hash(""));
     }
 }

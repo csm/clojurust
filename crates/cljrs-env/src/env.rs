@@ -356,7 +356,11 @@ impl GlobalEnv {
     /// Retrieve a previously resolved versioned value, if cached.
     pub fn get_cached_versioned(&self, ns: &str, name: &str, commit: &str) -> Option<Value> {
         let key = format!("{ns}/{name}@{commit}");
-        self.version_cache.lock().unwrap().get(key.as_str()).cloned()
+        self.version_cache
+            .lock()
+            .unwrap()
+            .get(key.as_str())
+            .cloned()
     }
 
     /// Mark namespace `name@commit` as loaded in the standard loaded set.

@@ -1013,7 +1013,12 @@ fn parse_require_spec_val(val: Value) -> Result<RequireSpec, String> {
                 }
                 i += 1;
             }
-            Ok(RequireSpec { ns, version, alias, refer })
+            Ok(RequireSpec {
+                ns,
+                version,
+                alias,
+                refer,
+            })
         }
         other => Err(format!(
             "require expects a symbol or vector, got {}",
@@ -1092,7 +1097,12 @@ fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
                 }
                 i += 1;
             }
-            Ok(RequireSpec { ns, version, alias, refer })
+            Ok(RequireSpec {
+                ns,
+                version,
+                alias,
+                refer,
+            })
         }
         _ => Err("require spec must be a symbol or vector".into()),
     }

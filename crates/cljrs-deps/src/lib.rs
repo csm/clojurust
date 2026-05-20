@@ -49,7 +49,9 @@ pub struct GitDep {
 pub enum Dependency {
     Git(GitDep),
     /// A local directory on disk, resolved relative to the `cljrs.edn` file.
-    Local { root: PathBuf },
+    Local {
+        root: PathBuf,
+    },
 }
 
 /// A single alias entry from the `:aliases` map.
@@ -106,8 +108,7 @@ pub fn load_config(start: &Path) -> DepsResult<Option<DepsConfig>> {
         None => Ok(None),
         Some(path) => {
             let src = std::fs::read_to_string(&path)?;
-            let config = parse_config(&src, &path)
-                .map_err(DepsError::Parse)?;
+            let config = parse_config(&src, &path).map_err(DepsError::Parse)?;
             Ok(Some(config))
         }
     }

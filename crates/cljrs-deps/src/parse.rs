@@ -14,9 +14,7 @@ use crate::{Alias, Dependency, DepsConfig, GitDep};
 /// a `DepsConfig`.  `config_path` is used only for resolving `:local/root`
 /// paths relative to the config directory.
 pub fn parse_config(src: &str, config_path: &Path) -> Result<DepsConfig, String> {
-    let config_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut parser = Parser::new(src.to_owned(), config_path.display().to_string());
     let forms = parser.parse_all().map_err(|e| e.to_string())?;
@@ -76,10 +74,7 @@ fn extract_path_vec(form: &Form, ctx: &str, base: &Path) -> Result<Vec<PathBuf>,
 
 // ── :deps ─────────────────────────────────────────────────────────────────────
 
-fn extract_deps_map(
-    form: &Form,
-    config_dir: &Path,
-) -> Result<Vec<(Arc<str>, Dependency)>, String> {
+fn extract_deps_map(form: &Form, config_dir: &Path) -> Result<Vec<(Arc<str>, Dependency)>, String> {
     let pairs = require_map(form, ":deps")?;
     let mut out = Vec::new();
     let mut i = 0;
@@ -93,11 +88,7 @@ fn extract_deps_map(
     Ok(out)
 }
 
-fn extract_dependency(
-    form: &Form,
-    config_dir: &Path,
-    name: &str,
-) -> Result<Dependency, String> {
+fn extract_dependency(form: &Form, config_dir: &Path, name: &str) -> Result<Dependency, String> {
     let pairs = require_map(form, &format!("dep {name}"))?;
     let mut git_url: Option<Arc<str>> = None;
     let mut git_sha: Option<Arc<str>> = None;
@@ -132,10 +123,7 @@ fn extract_dependency(
 
 // ── :aliases ──────────────────────────────────────────────────────────────────
 
-fn extract_aliases_map(
-    form: &Form,
-    config_dir: &Path,
-) -> Result<Vec<(Arc<str>, Alias)>, String> {
+fn extract_aliases_map(form: &Form, config_dir: &Path) -> Result<Vec<(Arc<str>, Alias)>, String> {
     let pairs = require_map(form, ":aliases")?;
     let mut out = Vec::new();
     let mut i = 0;
@@ -157,8 +145,7 @@ fn extract_alias(form: &Form, config_dir: &Path, name: &str) -> Result<Alias, St
     while i + 1 < pairs.len() {
         match keyword_name(&pairs[i]) {
             Some("extra-paths") => {
-                alias.extra_paths =
-                    extract_path_vec(&pairs[i + 1], ":extra-paths", config_dir)?;
+                alias.extra_paths = extract_path_vec(&pairs[i + 1], ":extra-paths", config_dir)?;
             }
             Some("extra-deps") => {
                 alias.extra_deps = extract_deps_map(&pairs[i + 1], config_dir)?;

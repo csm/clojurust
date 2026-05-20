@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
-use cljrs_reader::form::FormKind;
 use cljrs_reader::Form;
-use cljrs_value::{Symbol, Value};
+use cljrs_reader::form::FormKind;
+use cljrs_value::Symbol;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 

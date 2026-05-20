@@ -111,8 +111,8 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
     // Record source location on the namespace for versioned resolution.
     // Only meaningful for real files (not builtins).
     if !file_path.starts_with("<builtin:") {
-        let repo_root = cljrs_vcs::find_repo_root(Path::new(&file_path))
-            .map(|p| p.display().to_string());
+        let repo_root =
+            cljrs_vcs::find_repo_root(Path::new(&file_path)).map(|p| p.display().to_string());
         let ns_ptr = globals.get_or_create_ns(ns_name);
         ns_ptr
             .get()
@@ -209,13 +209,10 @@ pub fn load_versioned_ns(
     {
         use cljrs_value::Namespace;
         let ns = cljrs_gc::GcPtr::new(Namespace::new_versioned(versioned_ns_name.as_ref()));
-        ns.get().set_source_location(
-            &file_path,
-            Some(&repo_root.display().to_string()),
-        );
+        ns.get()
+            .set_source_location(&file_path, Some(&repo_root.display().to_string()));
         let mut map = globals.namespaces.write().unwrap();
-        map.entry(versioned_ns_name.clone())
-            .or_insert(ns);
+        map.entry(versioned_ns_name.clone()).or_insert(ns);
     }
 
     // Pre-refer clojure.core.

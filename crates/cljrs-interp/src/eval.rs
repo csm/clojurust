@@ -181,8 +181,8 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
     // function body, unversioned same-namespace symbols resolve at the inherited
     // commit rather than HEAD.
     if let Some(commit) = env.versioned_eval_commit.clone() {
-        let is_same_ns = sym.namespace.is_none()
-            || sym.namespace.as_deref() == Some(env.current_ns.as_ref());
+        let is_same_ns =
+            sym.namespace.is_none() || sym.namespace.as_deref() == Some(env.current_ns.as_ref());
         if is_same_ns {
             return crate::versioned::resolve_versioned_symbol(&sym, &commit, env);
         }
@@ -194,17 +194,17 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
     }
 
     // Namespace-qualified external symbol: `ns/name`
-    if s.contains('/') && !s.starts_with('/') {
-        if let Some(ns_part) = &sym.namespace {
-            let resolved: Arc<str> = env
-                .globals
-                .resolve_alias(&env.current_ns, ns_part)
-                .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
-            return env
-                .globals
-                .lookup_in_ns(&resolved, &sym.name)
-                .ok_or_else(|| EvalError::UnboundSymbol(s.to_string()));
-        }
+    if s.contains('/') && !s.starts_with('/')
+        && let Some(ns_part) = &sym.namespace
+    {
+        let resolved: Arc<str> = env
+            .globals
+            .resolve_alias(&env.current_ns, ns_part)
+            .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
+        return env
+            .globals
+            .lookup_in_ns(&resolved, &sym.name)
+            .ok_or_else(|| EvalError::UnboundSymbol(s.to_string()));
     }
 
     // JVM class names resolve to themselves as symbols (for instance?, catch, etc.)

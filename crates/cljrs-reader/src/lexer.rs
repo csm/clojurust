@@ -581,7 +581,7 @@ impl Lexer {
         if hash.len() >= 7 {
             // Make sure the character after the hash is a delimiter (or EOF).
             let after = rest[hash.len()..].chars().next();
-            let is_delimited = after.map_or(true, |c| !c.is_ascii_hexdigit());
+            let is_delimited = after.is_none_or(|c| !c.is_ascii_hexdigit());
             if is_delimited {
                 return Some(hash);
             }

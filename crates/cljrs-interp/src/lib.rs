@@ -15,8 +15,8 @@ pub mod eval;
 pub mod macros;
 pub mod special;
 pub mod syntax_quote;
-mod virtualize;
 pub mod versioned;
+mod virtualize;
 
 /// Create a minimal `GlobalEnv` with `clojure.core` builtins and bootstrap
 /// HOFs, but without any stdlib namespaces pre-loaded.
