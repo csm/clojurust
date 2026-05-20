@@ -34,6 +34,12 @@ struct Cli {
     #[arg(long, global = true, help = "Enable trace logging (implies --debug)")]
     trace: bool,
 
+    /// Require valid GPG or SSH signatures on every versioned commit before
+    /// executing historical code.  Off by default.  Can also be enabled
+    /// per-project via `:verify-commit-signatures true` in `cljrs.edn`.
+    #[arg(long, global = true)]
+    verify_commit_signatures: bool,
+
     /// Feature-level logging flags: -X debug:gc,jit or -X trace:reader
     ///
     /// Format: <level>:<feature1>,<feature2>,...
@@ -241,12 +247,13 @@ fn run(cli: Cli) -> miette::Result<i32> {
     let _mutator = cljrs_gc::register_mutator();
 
     let gc_stats_target = cli.gc_stats.clone();
+    let verify_commit_signatures = cli.verify_commit_signatures;
     let supports_gc_stats = matches!(
         &cli.command,
         Commands::Run { .. } | Commands::Eval { .. } | Commands::Test { .. },
     );
 
-    let result = run_command(cli.command);
+    let result = run_command(cli.command, verify_commit_signatures);
 
     if supports_gc_stats
         && let Some(target) = gc_stats_target.as_deref()
@@ -258,7 +265,7 @@ fn run(cli: Cli) -> miette::Result<i32> {
     result
 }
 
-fn run_command(command: Commands) -> miette::Result<i32> {
+fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Result<i32> {
     match command {
         Commands::Run {
             file,
@@ -270,7 +277,7 @@ fn run_command(command: Commands) -> miette::Result<i32> {
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config);
+            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
             run_source(&src, &filename, globals)?;
             Ok(0)
         }
@@ -280,7 +287,7 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             gc_hard_limit_mb,
         } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config);
+            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
             run_repl(globals);
             Ok(0)
         }
@@ -306,7 +313,7 @@ fn run_command(command: Commands) -> miette::Result<i32> {
         }
         Commands::Eval { expr } => {
             let gc_config = Arc::new(GcConfig::new());
-            let globals = setup_globals(Vec::new(), gc_config);
+            let globals = setup_globals(Vec::new(), gc_config, verify_commit_signatures);
             let result = eval_source(&expr, "<eval>", globals)?;
             if result != Value::Nil {
                 println!("{}", result);
@@ -331,6 +338,7 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             verbose,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
+            verify_commit_signatures,
         ),
         Commands::Deps { command } => match command {
             DepsCommands::Fetch { name } => run_deps_fetch(name),
@@ -397,8 +405,17 @@ fn write_gc_stats(target: &str) -> std::io::Result<()> {
 /// flags take precedence).  The parsed `DepsConfig` is stored in
 /// `GlobalEnv.deps_config` so that versioned symbol resolution and the
 /// `deps fetch`/`deps status` commands share the same config object.
-fn setup_globals(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) -> Arc<GlobalEnv> {
+fn setup_globals(
+    src_paths: Vec<PathBuf>,
+    gc_config: Arc<GcConfig>,
+    verify_commit_signatures: bool,
+) -> Arc<GlobalEnv> {
     let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
+    if verify_commit_signatures {
+        globals
+            .verify_commit_signatures
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Ok(cwd) = std::env::current_dir() {
         apply_deps_config(&globals, &cwd);
     }
@@ -420,6 +437,11 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                         paths.push(p.clone());
                     }
                 }
+            }
+            if config.verify_commit_signatures {
+                globals
+                    .verify_commit_signatures
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             *globals.deps_config.write().unwrap() = Some(Arc::new(config));
         }
@@ -469,6 +491,9 @@ fn format_eval_error(e: EvalError) -> miette::Report {
         EvalError::Runtime(msg) => miette::miette!("{}", msg),
         EvalError::Read(e) => miette::Report::from(e),
         EvalError::Recur(_) => miette::miette!("recur outside of loop/fn"),
+        EvalError::CommitSignatureVerificationFailed { commit, reason } => {
+            miette::miette!("commit {commit:?} failed signature verification: {reason}")
+        }
     }
 }
 
@@ -601,9 +626,10 @@ fn run_tests_command(
     verbose: bool,
     gc_soft_limit_mb: Option<usize>,
     gc_hard_limit_mb: Option<usize>,
+    verify_commit_signatures: bool,
 ) -> miette::Result<i32> {
     let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-    let globals = setup_globals(src_paths, gc_config);
+    let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
 
     let namespaces = if namespaces.is_empty() {
         // Read the final source paths (which may include cljrs.edn :paths).

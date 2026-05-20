@@ -191,6 +191,9 @@ pub fn load_versioned_ns(
         ))
     })?;
 
+    // Verify commit signature before loading any historical code.
+    globals.check_commit_signature(&repo_root.to_string_lossy(), commit)?;
+
     // Compute the path relative to the repo root.
     let abs_file = std::path::Path::new(&file_path);
     let rel_file = abs_file.strip_prefix(&repo_root).map_err(|_| {

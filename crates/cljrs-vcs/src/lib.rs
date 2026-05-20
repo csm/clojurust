@@ -22,6 +22,8 @@ pub enum VcsError {
     Utf8,
     #[error("no git repository found at or above {0:?}")]
     NoRepo(PathBuf),
+    #[error("commit {commit:?} has no valid signature: {reason}")]
+    SignatureVerificationFailed { commit: String, reason: String },
 }
 
 pub type VcsResult<T> = Result<T, VcsError>;
@@ -180,6 +182,33 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
     }
 
     Ok(repo_dir)
+}
+
+/// Verify the GPG or SSH signature on `commit` inside `repo_root`.
+///
+/// Delegates entirely to `git verify-commit`; trust is determined by the
+/// caller's GPG keyring or `gpg.program` git config.  Returns `Ok(())` when
+/// the signature is present and valid, `Err(SignatureVerificationFailed)`
+/// otherwise (unsigned commit, expired key, key not in keyring, etc.).
+pub fn verify_commit_signature(repo_root: &Path, commit: &str) -> VcsResult<()> {
+    if !is_valid_commit_hash(commit) {
+        return Err(VcsError::InvalidCommit(commit.to_string()));
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("verify-commit")
+        .arg(commit)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(VcsError::SignatureVerificationFailed {
+            commit: commit.to_string(),
+            reason,
+        })
+    }
 }
 
 #[cfg(test)]

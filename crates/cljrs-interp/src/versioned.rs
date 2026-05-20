@@ -48,6 +48,9 @@ pub fn resolve_versioned_symbol(sym: &Symbol, commit: &str, env: &mut Env) -> Ev
     // loaded yet, try to load it so the context gets populated.
     let (source_file, repo_root) = git_context_for_ns(&ns_name, env)?;
 
+    // Verify commit signature before loading any historical code.
+    env.globals.check_commit_signature(&repo_root, commit)?;
+
     // Compute repo-relative path.
     let abs_file = Path::new(source_file.as_ref());
     let repo_path = Path::new(repo_root.as_ref());
