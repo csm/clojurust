@@ -254,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cljrs-compiler",
+ "cljrs-deps",
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-interop",
@@ -264,6 +265,7 @@ dependencies = [
  "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
+ "cljrs-vcs",
  "miette",
  "rustyline",
  "tracing",

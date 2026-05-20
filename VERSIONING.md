@@ -102,7 +102,7 @@ dependencies use their current values unless explicitly pinned.
 | 5 | `RequireSpec.version`, `GlobalEnv` version cache, `Env.versioned_eval_commit` | `cljrs-env` | ✅ Done |
 | 6 | `eval_symbol` versioned dispatch, `resolve_versioned_symbol`, `load_versioned_ns` | `cljrs-interp` | ✅ Done |
 | 7 | `parse_require_spec_*` version extraction | `cljrs-interp` special forms | ✅ Done |
-| 8 | CLI: startup config load, `deps fetch/status` | `cljrs` | 🔲 Todo |
+| 8 | CLI: startup config load, `deps fetch/status` | `cljrs` | ✅ Done |
 
 ---
 
