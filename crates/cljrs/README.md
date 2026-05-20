@@ -17,14 +17,16 @@ src/
 
 ## Subcommands
 
-| Subcommand | Purpose                                                                |
-|------------|------------------------------------------------------------------------|
-| `run`      | Interpret a `.cljrs` / `.cljc` source file                              |
-| `repl`     | Start an interactive REPL                                               |
-| `compile`  | AOT-compile a source file (or test directory) to a native binary        |
-| `eval`     | Evaluate a single Clojure expression and print the result               |
-| `ir-viz`   | Render the optimized IR + source as a self-contained HTML visualizer    |
-| `test`     | Run `clojure.test` namespaces (named on the CLI or auto-discovered)     |
+| Subcommand    | Purpose                                                                |
+|---------------|------------------------------------------------------------------------|
+| `run`         | Interpret a `.cljrs` / `.cljc` source file                             |
+| `repl`        | Start an interactive REPL                                              |
+| `compile`     | AOT-compile a source file (or test directory) to a native binary       |
+| `eval`        | Evaluate a single Clojure expression and print the result              |
+| `ir-viz`      | Render the optimized IR + source as a self-contained HTML visualizer   |
+| `test`        | Run `clojure.test` namespaces (named on the CLI or auto-discovered)    |
+| `deps fetch`  | Clone / update git dependencies declared in `cljrs.edn`                |
+| `deps status` | Show which dependencies are cached and which are missing               |
 
 ### Per-subcommand flags
 
@@ -47,6 +49,18 @@ src/
 - `-v, --verbose` — print each passing assertion (helps isolate hangs)
 
 `eval` takes a single positional expression string.
+
+`deps fetch` accepts an optional positional dependency name; without it all git
+deps are fetched.  `deps status` takes no arguments.
+
+### `cljrs.edn` auto-discovery
+
+When any command that runs code (`run`, `repl`, `eval`, `test`) starts, it
+walks up the directory tree from the current working directory looking for a
+`cljrs.edn` file.  If found, its `:paths` entries are appended to the source
+search path (after any `--src-path` CLI flags), and the parsed `DepsConfig` is
+stored in `GlobalEnv.deps_config` so that versioned symbol resolution can use
+it without a second parse.
 
 ### Global flags
 
@@ -92,6 +106,11 @@ cljrs test --src-path test/ --gc-stats /tmp/test-gc.log
 
 # Bigger stack + tracing for one feature
 cljrs --stack-size-mb 256 -X trace:gc run heavy.cljrs
+
+# Dependency management (reads cljrs.edn from the current directory tree)
+cljrs deps fetch               # clone/update all git deps
+cljrs deps fetch my.lib        # fetch one dep by name
+cljrs deps status              # show cached vs missing deps
 ```
 
 ---
@@ -132,6 +151,8 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 | `cljrs-ir-viz` (workspace)  | HTML IR visualizer used by `ir-viz`                                |
 | `cljrs-interop` (workspace) | Rust ↔ Clojure FFI                                                |
 | `cljrs-logging` (workspace) | `--debug` / `--trace` / `-X` flag handling                        |
+| `cljrs-deps` (workspace)    | `cljrs.edn` parser; `DepsConfig` / `Dependency` types             |
+| `cljrs-vcs` (workspace)     | Git subprocess helpers: `fetch_remote`, `cache_path_for_url`      |
 | `clap` (workspace)          | CLI argument parsing                                              |
 | `miette` (workspace)        | Rich terminal error rendering                                     |
 | `tracing` / `tracing-subscriber` | Structured logging output                                    |

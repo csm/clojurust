@@ -99,6 +99,24 @@ pub fn cache_root() -> PathBuf {
     home.join(".cljrs").join("cache").join("git")
 }
 
+/// Return the local cache path for a given remote URL, without fetching.
+///
+/// This mirrors the slug derivation inside [`fetch_remote`] so callers can
+/// check cache existence without triggering network access.
+pub fn cache_path_for_url(url: &str) -> PathBuf {
+    let slug: String = url
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cache_root().join(slug)
+}
+
 /// Clone or fetch a remote git repository into the local cache.
 ///
 /// `url`  — remote URL (https or ssh)

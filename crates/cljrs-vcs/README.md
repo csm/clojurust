@@ -8,9 +8,10 @@ hashes, and managing the local dependency cache at `~/.cljrs/cache/git/`.
 
 ## Status
 
-Phase 2 (implemented).  All git operations shell out to the `git` binary; no
-libgit2 dependency.  Remote fetching (`fetch_remote`) is wired up but the CLI
-command that calls it (`cljrs deps fetch`) is Phase 8 (todo).
+Phase 2 (implemented), extended in Phase 8.  All git operations shell out to
+the `git` binary; no libgit2 dependency.  `fetch_remote` is called by
+`cljrs deps fetch`; `cache_path_for_url` is used by `cljrs deps status` to
+check cache presence without network access.
 
 ## File layout
 
@@ -32,6 +33,10 @@ pub fn get_file_at_commit(repo_root: &Path, rel_path: &str, commit: &str) -> Vcs
 
 /// Path to the local git-dep cache: `~/.cljrs/cache/git/`.
 pub fn cache_root() -> PathBuf
+
+/// Local cache path for a given remote URL (same slug derivation as `fetch_remote`).
+/// Does not touch the network; use to check cache existence before fetching.
+pub fn cache_path_for_url(url: &str) -> PathBuf
 
 /// Clone or fetch `url`, ensuring `sha` is present locally.
 /// Returns the path to the bare repo in the cache.

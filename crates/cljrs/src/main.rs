@@ -6,7 +6,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
 
-use cljrs_eval::{Env, EvalError, eval};
+use cljrs_eval::{Env, EvalError, GlobalEnv, eval};
 use cljrs_gc::GcConfig;
 use cljrs_stdlib::{self as cljrs_stdlib};
 use cljrs_value::Value;
@@ -150,6 +150,28 @@ enum Commands {
         #[arg(long)]
         gc_hard_limit_mb: Option<usize>,
     },
+    /// Manage project dependencies declared in cljrs.edn.
+    ///
+    /// Git dependencies are cached in ~/.cljrs/cache/git/.
+    /// No network access occurs unless you run `cljrs deps fetch`.
+    Deps {
+        #[command(subcommand)]
+        command: DepsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepsCommands {
+    /// Clone or update git dependencies from cljrs.edn.
+    ///
+    /// Without a name, fetches every git dependency declared in the
+    /// nearest cljrs.edn.  With a name, fetches only that dependency.
+    Fetch {
+        /// Dependency name to fetch (fetches all if omitted).
+        name: Option<String>,
+    },
+    /// Show which dependencies are cached and which are missing.
+    Status,
 }
 
 /// Build GC config from CLI flags, or use defaults if not specified.
@@ -248,7 +270,8 @@ fn run_command(command: Commands) -> miette::Result<i32> {
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            run_source(&src, &filename, src_paths, gc_config)?;
+            let globals = setup_globals(src_paths, gc_config);
+            run_source(&src, &filename, globals)?;
             Ok(0)
         }
         Commands::Repl {
@@ -257,7 +280,8 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             gc_hard_limit_mb,
         } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            run_repl(src_paths, gc_config);
+            let globals = setup_globals(src_paths, gc_config);
+            run_repl(globals);
             Ok(0)
         }
         Commands::Compile {
@@ -281,9 +305,9 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             Ok(0)
         }
         Commands::Eval { expr } => {
-            // Eval uses default GC config
             let gc_config = Arc::new(GcConfig::new());
-            let result = eval_source(&expr, "<eval>", gc_config)?;
+            let globals = setup_globals(Vec::new(), gc_config);
+            let result = eval_source(&expr, "<eval>", globals)?;
             if result != Value::Nil {
                 println!("{}", result);
             }
@@ -308,6 +332,10 @@ fn run_command(command: Commands) -> miette::Result<i32> {
             gc_soft_limit_mb,
             gc_hard_limit_mb,
         ),
+        Commands::Deps { command } => match command {
+            DepsCommands::Fetch { name } => run_deps_fetch(name),
+            DepsCommands::Status => run_deps_status(),
+        },
     }
 }
 
@@ -360,23 +388,56 @@ fn write_gc_stats(target: &str) -> std::io::Result<()> {
     }
 }
 
+// ── Environment setup ─────────────────────────────────────────────────────────
+
+/// Create a fully initialised `GlobalEnv` with stdlib, user source paths, GC
+/// config, and any `cljrs.edn` found in the current working directory.
+///
+/// Paths declared in `:paths` of `cljrs.edn` are appended to `src_paths` (CLI
+/// flags take precedence).  The parsed `DepsConfig` is stored in
+/// `GlobalEnv.deps_config` so that versioned symbol resolution and the
+/// `deps fetch`/`deps status` commands share the same config object.
+fn setup_globals(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) -> Arc<GlobalEnv> {
+    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
+    if let Ok(cwd) = std::env::current_dir() {
+        apply_deps_config(&globals, &cwd);
+    }
+    globals
+}
+
+/// Load the nearest `cljrs.edn` and wire its data into `globals`.
+///
+/// Silently does nothing when no config file is found; prints a warning to
+/// stderr when the file exists but cannot be parsed.
+fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
+    match cljrs_deps::load_config(cwd) {
+        Ok(Some(config)) => {
+            // Append edn :paths to the source-path list (CLI paths come first).
+            {
+                let mut paths = globals.source_paths.write().unwrap();
+                for p in &config.paths {
+                    if !paths.contains(p) {
+                        paths.push(p.clone());
+                    }
+                }
+            }
+            *globals.deps_config.write().unwrap() = Some(Arc::new(config));
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("cljrs: warning: could not load cljrs.edn: {e}"),
+    }
+}
+
 // ── Source evaluation ─────────────────────────────────────────────────────────
 
 /// Evaluate all forms in `src`, printing nothing. Returns the last value.
-fn eval_source(src: &str, filename: &str, gc_config: Arc<GcConfig>) -> miette::Result<Value> {
-    let globals = cljrs_stdlib::standard_env_with_paths_and_config(Vec::new(), gc_config);
+fn eval_source(src: &str, filename: &str, globals: Arc<GlobalEnv>) -> miette::Result<Value> {
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)
 }
 
 /// Run a source file: evaluate all top-level forms, print nothing on success.
-fn run_source(
-    src: &str,
-    filename: &str,
-    src_paths: Vec<PathBuf>,
-    gc_config: Arc<GcConfig>,
-) -> miette::Result<()> {
-    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
+fn run_source(src: &str, filename: &str, globals: Arc<GlobalEnv>) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)?;
     Ok(())
@@ -411,6 +472,116 @@ fn format_eval_error(e: EvalError) -> miette::Report {
     }
 }
 
+// ── Deps subcommand ───────────────────────────────────────────────────────────
+
+/// Fetch one or all git dependencies declared in the nearest `cljrs.edn`.
+fn run_deps_fetch(name: Option<String>) -> miette::Result<i32> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let config = cljrs_deps::load_config(&cwd)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("no cljrs.edn found in or above the current directory"))?;
+
+    if config.deps.is_empty() {
+        println!("No dependencies declared in cljrs.edn.");
+        return Ok(0);
+    }
+
+    // Collect (dep_name, dependency) pairs to process.
+    let to_fetch: Vec<(&str, &cljrs_deps::Dependency)> = if let Some(ref n) = name {
+        match config.find_dep(n) {
+            Some(dep) => vec![(n.as_str(), dep)],
+            None => {
+                return Err(miette::miette!("dependency {:?} not found in cljrs.edn", n));
+            }
+        }
+    } else {
+        config.deps.iter().map(|(n, d)| (n.as_ref(), d)).collect()
+    };
+
+    let mut all_ok = true;
+    for (dep_name, dep) in to_fetch {
+        match dep {
+            cljrs_deps::Dependency::Git(git_dep) => {
+                eprintln!("fetching {dep_name} ({})...", git_dep.url);
+                match cljrs_vcs::fetch_remote(&git_dep.url, &git_dep.sha) {
+                    Ok(path) => eprintln!("  ok → {}", path.display()),
+                    Err(e) => {
+                        eprintln!("  error: {e}");
+                        all_ok = false;
+                    }
+                }
+            }
+            cljrs_deps::Dependency::Local { root } => {
+                if root.exists() {
+                    eprintln!("{dep_name}: local dep at {} — ok", root.display());
+                } else {
+                    eprintln!(
+                        "{dep_name}: local dep at {} — directory not found",
+                        root.display()
+                    );
+                    all_ok = false;
+                }
+            }
+        }
+    }
+
+    Ok(if all_ok { 0 } else { 1 })
+}
+
+/// Print the cache status of every dependency declared in the nearest `cljrs.edn`.
+fn run_deps_status() -> miette::Result<i32> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let config = cljrs_deps::load_config(&cwd)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("no cljrs.edn found in or above the current directory"))?;
+
+    if config.deps.is_empty() {
+        println!("No dependencies declared in cljrs.edn.");
+        return Ok(0);
+    }
+
+    let mut all_ok = true;
+    for (dep_name, dep) in &config.deps {
+        match dep {
+            cljrs_deps::Dependency::Git(git_dep) => {
+                let cache_path = cljrs_vcs::cache_path_for_url(&git_dep.url);
+                let sha_present = cache_path.exists()
+                    && std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&cache_path)
+                        .arg("cat-file")
+                        .arg("-e")
+                        .arg(git_dep.sha.as_ref())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                if sha_present {
+                    println!(
+                        "{dep_name}: cached (sha: {}, url: {})",
+                        git_dep.sha, git_dep.url
+                    );
+                } else {
+                    println!(
+                        "{dep_name}: NOT cached — run `cljrs deps fetch` (sha: {}, url: {})",
+                        git_dep.sha, git_dep.url
+                    );
+                    all_ok = false;
+                }
+            }
+            cljrs_deps::Dependency::Local { root } => {
+                if root.exists() {
+                    println!("{dep_name}: local dep at {} — ok", root.display());
+                } else {
+                    println!("{dep_name}: local dep at {} — NOT FOUND", root.display());
+                    all_ok = false;
+                }
+            }
+        }
+    }
+
+    Ok(if all_ok { 0 } else { 1 })
+}
+
 // ── Test runner ───────────────────────────────────────────────────────────────
 
 /// Result of running tests for a single namespace.
@@ -431,8 +602,13 @@ fn run_tests_command(
     gc_soft_limit_mb: Option<usize>,
     gc_hard_limit_mb: Option<usize>,
 ) -> miette::Result<i32> {
+    let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+    let globals = setup_globals(src_paths, gc_config);
+
     let namespaces = if namespaces.is_empty() {
-        let discovered = discover_namespaces(&src_paths);
+        // Read the final source paths (which may include cljrs.edn :paths).
+        let effective_paths = globals.source_paths.read().unwrap().clone();
+        let discovered = discover_namespaces(&effective_paths);
         if discovered.is_empty() {
             eprintln!("cljrs test: no test namespaces found in source paths");
             return Ok(2);
@@ -443,8 +619,6 @@ fn run_tests_command(
         namespaces
     };
 
-    let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
 
     // Ensure clojure.test is loaded.
@@ -643,14 +817,13 @@ fn file_to_namespace(root: &PathBuf, file: &Path) -> Option<String> {
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
 
-fn run_repl(src_paths: Vec<PathBuf>, gc_config: Arc<GcConfig>) {
+fn run_repl(globals: Arc<GlobalEnv>) {
     println!("clojurust REPL (type :quit to exit)");
     println!();
 
     #[cfg(feature = "enable-rustyline")]
     let mut rl = rustyline::DefaultEditor::new().unwrap();
 
-    let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
     let mut env = Env::new(globals, "user");
 
     let stdin = io::stdin();
