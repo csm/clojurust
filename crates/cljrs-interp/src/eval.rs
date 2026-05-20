@@ -194,7 +194,8 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
     }
 
     // Namespace-qualified external symbol: `ns/name`
-    if s.contains('/') && !s.starts_with('/')
+    if s.contains('/')
+        && !s.starts_with('/')
         && let Some(ns_part) = &sym.namespace
     {
         let resolved: Arc<str> = env
