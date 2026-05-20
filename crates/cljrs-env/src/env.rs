@@ -398,10 +398,7 @@ impl GlobalEnv {
         cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit).map_err(
             |e| match e {
                 cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
-                    crate::error::EvalError::CommitSignatureVerificationFailed {
-                        commit: c,
-                        reason,
-                    }
+                    crate::error::EvalError::CommitSignatureVerificationFailed { commit: c, reason }
                 }
                 other => crate::error::EvalError::Runtime(format!("{other}")),
             },

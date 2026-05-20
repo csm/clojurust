@@ -54,11 +54,7 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
             }
             Some("verify-commit-signatures") => match &val.kind {
                 FormKind::Bool(b) => config.verify_commit_signatures = *b,
-                _ => {
-                    return Err(
-                        ":verify-commit-signatures must be true or false".to_string()
-                    )
-                }
+                _ => return Err(":verify-commit-signatures must be true or false".to_string()),
             },
             _ => {} // ignore unknown keys
         }
