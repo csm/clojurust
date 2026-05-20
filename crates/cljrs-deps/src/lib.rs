@@ -70,6 +70,10 @@ pub struct DepsConfig {
     pub deps: Vec<(Arc<str>, Dependency)>,
     /// Named aliases (e.g. `:dev`, `:test`).
     pub aliases: Vec<(Arc<str>, Alias)>,
+    /// When true, every versioned-symbol or versioned-namespace resolution
+    /// must pass `git verify-commit` before historical code is executed.
+    /// Equivalent to the `--verify-commit-signatures` CLI flag.
+    pub verify_commit_signatures: bool,
 }
 
 impl DepsConfig {

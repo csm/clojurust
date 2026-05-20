@@ -32,6 +32,13 @@ pub enum EvalError {
     #[doc(hidden)]
     #[error("internal: recur outside loop or fn")]
     Recur(Vec<Value>),
+
+    #[error(
+        "commit {commit:?} failed signature verification — \
+         refusing to execute versioned symbol (enable GPG/SSH trust or disable \
+         :verify-commit-signatures): {reason}"
+    )]
+    CommitSignatureVerificationFailed { commit: String, reason: String },
 }
 
 pub type EvalResult<T = Value> = Result<T, EvalError>;

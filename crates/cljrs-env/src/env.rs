@@ -1,6 +1,7 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::error::EvalResult;
@@ -100,6 +101,14 @@ pub struct GlobalEnv {
     pub version_cache: Mutex<HashMap<Arc<str>, Value>>,
     /// Parsed `cljrs.edn` config, loaded once at startup.
     pub deps_config: RwLock<Option<Arc<cljrs_deps::DepsConfig>>>,
+    /// When true, every versioned-symbol or versioned-namespace resolution
+    /// must pass `git verify-commit` before the historical code is executed.
+    /// Off by default; enabled via `--verify-commit-signatures` CLI flag or
+    /// `:verify-commit-signatures true` in `cljrs.edn`.
+    pub verify_commit_signatures: AtomicBool,
+    /// Session-scoped cache of commits that have already passed signature
+    /// verification this run, keyed by `(repo_root, commit_hash)`.
+    pub sig_verify_cache: Mutex<HashSet<(Arc<str>, Arc<str>)>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -128,6 +137,8 @@ impl GlobalEnv {
             on_fn_defined,
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
+            verify_commit_signatures: AtomicBool::new(false),
+            sig_verify_cache: Mutex::new(HashSet::new()),
         })
     }
 
@@ -367,6 +378,36 @@ impl GlobalEnv {
     pub fn cache_versioned_ns(&self, ns: &str, commit: &str) {
         let key: Arc<str> = Arc::from(format!("{ns}@{commit}"));
         self.version_cache.lock().unwrap().insert(key, Value::Nil);
+    }
+
+    /// If `:verify-commit-signatures` is enabled, verify that `commit` inside
+    /// `repo_root` carries a valid GPG or SSH signature.
+    ///
+    /// Returns `Ok(())` immediately when the feature is off.  On the happy
+    /// path the result is cached per `(repo_root, commit)` so each commit is
+    /// only verified once per session.  On failure returns
+    /// `EvalError::CommitSignatureVerificationFailed`.
+    pub fn check_commit_signature(&self, repo_root: &str, commit: &str) -> EvalResult<()> {
+        if !self.verify_commit_signatures.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let key = (Arc::<str>::from(repo_root), Arc::<str>::from(commit));
+        if self.sig_verify_cache.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit).map_err(
+            |e| match e {
+                cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
+                    crate::error::EvalError::CommitSignatureVerificationFailed {
+                        commit: c,
+                        reason,
+                    }
+                }
+                other => crate::error::EvalError::Runtime(format!("{other}")),
+            },
+        )?;
+        self.sig_verify_cache.lock().unwrap().insert(key);
+        Ok(())
     }
 }
 

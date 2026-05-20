@@ -52,6 +52,14 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
             Some("aliases") => {
                 config.aliases = extract_aliases_map(val, config_dir)?;
             }
+            Some("verify-commit-signatures") => match &val.kind {
+                FormKind::Bool(b) => config.verify_commit_signatures = *b,
+                _ => {
+                    return Err(
+                        ":verify-commit-signatures must be true or false".to_string()
+                    )
+                }
+            },
             _ => {} // ignore unknown keys
         }
     }
