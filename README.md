@@ -1,6 +1,7 @@
 # clojurust
 
 [![crates.io](https://img.shields.io/crates/v/cljrs.svg)](https://crates.io/crates/cljrs)
+[![docs](https://img.shields.io/badge/docs-csm.github.io%2Fclojurust-blue)](https://csm.github.io/clojurust/)
 
 A Rust-hosted dialect of the Clojure programming language.
 
