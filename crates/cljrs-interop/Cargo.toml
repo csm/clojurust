@@ -10,4 +10,5 @@ repository.workspace = true
 cljrs-types = { workspace = true }
 cljrs-gc    = { workspace = true }
 cljrs-value = { workspace = true }
+cljrs-env   = { workspace = true }
 num-bigint  = { workspace = true }

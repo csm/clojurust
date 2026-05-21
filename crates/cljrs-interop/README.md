@@ -4,7 +4,7 @@ Rust ↔ Clojure interoperability layer. Exposes Rust functions to Clojure code,
 marshals values across the boundary, and wraps opaque Rust structs as
 GC-managed `NativeObject` values.
 
-**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging, registration helpers).
+**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging, registration helpers, Registry).
 
 ---
 
@@ -16,6 +16,7 @@ src/
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
   register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
+  registry.rs  — Registry struct and InitFn type alias for cljrs_init convention
 ```
 
 The `NativeObject` trait and `NativeObjectBox` wrapper live in `cljrs-value::native_object`
@@ -67,13 +68,60 @@ pub fn wrap_fn_variadic<R, E, F>(name: impl Into<Arc<str>>, min: usize, f: F) ->
 These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
 `Arc<dyn Fn(&[Value]) -> ValueResult<Value> + Send + Sync>`.
 
+### Registry and InitFn
+
+The entry point for mixed Rust/Clojure projects.  User crates implement a
+`cljrs_init` function and list it under `:rust :init` in `cljrs.edn`; the
+build toolchain calls it before loading any Clojure source.
+
+```rust
+/// Signature of the hook-registration function.
+pub type InitFn = fn(&mut Registry);
+
+pub struct Registry { /* wraps Arc<GlobalEnv> */ }
+
+impl Registry {
+    pub fn new(env: Arc<GlobalEnv>) -> Self;
+
+    /// Register f under "my.ns/my-fn" (panics if no '/' present).
+    pub fn define(&self, qualified: &str, f: NativeFn);
+
+    /// Register f into an explicit namespace under a plain name.
+    pub fn define_in(&self, ns: &str, name: &str, f: NativeFn);
+
+    /// Access the underlying GlobalEnv for advanced operations.
+    pub fn env(&self) -> &Arc<GlobalEnv>;
+}
+```
+
+**Usage pattern:**
+
+```rust
+// user's lib.rs
+use cljrs_interop::{Registry, wrap_fn1, wrap_fn2};
+
+pub fn cljrs_init(registry: &mut Registry) {
+    registry.define("my.project/greet",
+        wrap_fn1("greet", |name: String| Ok::<String, String>(format!("Hello, {name}!"))));
+    registry.define("my.project/add",
+        wrap_fn2("add", |a: i64, b: i64| Ok::<i64, String>(a + b)));
+}
+```
+
+```edn
+;; cljrs.edn
+{:paths ["src"]
+ :rust  {:crate "."
+         :init  "my_project::cljrs_init"}}
+```
+
 ---
 
 ## Remaining work (Phase 9)
 
-- `#[cljx::export]` proc-macro — syntactic sugar over manual registration
-- `cljx.rust` namespace with intrinsics
-- Dynamic linking — load `.so`/`.dylib` Rust extensions at runtime
+- `#[cljrs::export]` proc-macro — syntactic sugar over manual registration
+- `cljrs.rust` namespace with intrinsics
+- Dynamic linking — load `.so`/`.dylib` Rust extensions at runtime via `cljrs build-native`
 
 ---
 
@@ -84,4 +132,5 @@ These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
 | `cljrs-types` (workspace) | `CljxError`, `CljxResult` |
 | `cljrs-gc` (workspace) | `GcPtr`, `Trace`, `MarkVisitor` |
 | `cljrs-value` (workspace) | `Value`, `NativeFn`, `NativeObject`, `NativeObjectBox` |
+| `cljrs-env` (workspace) | `GlobalEnv` — used by `Registry` to intern native functions |
 | `num-bigint` (workspace) | `BigInt` marshalling |

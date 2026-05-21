@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use cljrs_reader::{Form, FormKind, Parser};
 
-use crate::{Alias, Dependency, DepsConfig, GitDep};
+use crate::{Alias, Dependency, DepsConfig, GitDep, RustConfig};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -56,6 +56,9 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
                 FormKind::Bool(b) => config.verify_commit_signatures = *b,
                 _ => return Err(":verify-commit-signatures must be true or false".to_string()),
             },
+            Some("rust") => {
+                config.rust = Some(extract_rust_config(val, config_dir)?);
+            }
             _ => {} // ignore unknown keys
         }
     }
@@ -161,6 +164,32 @@ fn extract_alias(form: &Form, config_dir: &Path, name: &str) -> Result<Alias, St
     Ok(alias)
 }
 
+// ── :rust ─────────────────────────────────────────────────────────────────────
+
+fn extract_rust_config(form: &Form, config_dir: &Path) -> Result<RustConfig, String> {
+    let pairs = require_map(form, ":rust")?;
+    let mut crate_dir: PathBuf = config_dir.to_path_buf();
+    let mut init_fn: Option<Arc<str>> = None;
+
+    let mut i = 0;
+    while i + 1 < pairs.len() {
+        match keyword_name(&pairs[i]) {
+            Some("crate") => {
+                let rel = require_str(&pairs[i + 1], ":rust :crate")?;
+                crate_dir = config_dir.join(rel);
+            }
+            Some("init") => {
+                let s = require_str(&pairs[i + 1], ":rust :init")?;
+                init_fn = Some(Arc::from(s));
+            }
+            _ => {}
+        }
+        i += 2;
+    }
+
+    Ok(RustConfig { crate_dir, init_fn })
+}
+
 // ── Form helpers ──────────────────────────────────────────────────────────────
 
 fn require_map<'a>(form: &'a Form, ctx: &str) -> Result<&'a Vec<Form>, String> {
@@ -198,5 +227,57 @@ fn sym_or_kw_name(form: &Form) -> Option<String> {
         FormKind::Symbol(s) => Some(s.clone()),
         FormKind::Keyword(k) => Some(k.clone()),
         _ => None,
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(src: &str) -> Result<DepsConfig, String> {
+        parse_config(src, Path::new("/proj/cljrs.edn"))
+    }
+
+    #[test]
+    fn rust_key_defaults() {
+        // :rust with only :crate; no :init
+        let cfg = parse(r#"{:rust {:crate "."}}"#).unwrap();
+        let rust = cfg.rust.unwrap();
+        assert_eq!(rust.crate_dir, Path::new("/proj"));
+        assert!(rust.init_fn.is_none());
+    }
+
+    #[test]
+    fn rust_key_with_init() {
+        let cfg = parse(r#"{:rust {:crate "." :init "my_crate::cljrs_init"}}"#).unwrap();
+        let rust = cfg.rust.unwrap();
+        assert_eq!(rust.init_fn.as_deref(), Some("my_crate::cljrs_init"));
+    }
+
+    #[test]
+    fn rust_key_subdirectory_crate() {
+        let cfg = parse(r#"{:rust {:crate "native"}}"#).unwrap();
+        let rust = cfg.rust.unwrap();
+        assert_eq!(rust.crate_dir, Path::new("/proj/native"));
+    }
+
+    #[test]
+    fn no_rust_key_is_none() {
+        let cfg = parse(r#"{:paths ["src"]}"#).unwrap();
+        assert!(cfg.rust.is_none());
+    }
+
+    #[test]
+    fn rust_alongside_other_keys() {
+        let cfg = parse(
+            r#"{:paths ["src"]
+                :rust  {:crate "." :init "lib::cljrs_init"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.paths.len(), 1);
+        assert!(cfg.rust.is_some());
     }
 }

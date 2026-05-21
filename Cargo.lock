@@ -369,6 +369,7 @@ dependencies = [
 name = "cljrs-interop"
 version = "0.1.0"
 dependencies = [
+ "cljrs-env",
  "cljrs-gc",
  "cljrs-types",
  "cljrs-value",
