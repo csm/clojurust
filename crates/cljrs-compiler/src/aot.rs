@@ -528,8 +528,13 @@ pub fn compile_file(
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
 
     // ── 5. Generate harness project & build ─────────────────────────────
-    let harness_dir =
-        build_harness(out_path, &obj_bytes, &interpreted_source, &bundled_sources, rust_config)?;
+    let harness_dir = build_harness(
+        out_path,
+        &obj_bytes,
+        &interpreted_source,
+        &bundled_sources,
+        rust_config,
+    )?;
     link_with_cargo(&harness_dir, out_path)?;
 
     eprintln!("[aot] wrote {}", out_path.display());
@@ -714,9 +719,7 @@ fn build_harness(
         ));
         if let Some(crate_name) = rc.crate_name() {
             let crate_dir = rc.crate_dir.display();
-            native_deps.push_str(&format!(
-                "{crate_name} = {{ path = \"{crate_dir}\" }}\n"
-            ));
+            native_deps.push_str(&format!("{crate_name} = {{ path = \"{crate_dir}\" }}\n"));
         }
     }
     let cargo_toml = format!(
