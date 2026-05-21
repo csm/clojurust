@@ -1,0 +1,10 @@
+[book]
+title = "clojurust"
+authors = []
+description = "Reference documentation for clojurust — a Rust-hosted dialect of the Clojure programming language"
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = ""
+no-section-label = false

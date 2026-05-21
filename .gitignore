@@ -6,3 +6,5 @@
 /1
 /stderr
 samples/*.ir.html
+# mdBook generated output
+docs/book/book/
