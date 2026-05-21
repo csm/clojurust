@@ -18,11 +18,12 @@ check cache presence without network access.
 | File | Description |
 |------|-------------|
 | `src/lib.rs` | All public functions and `VcsError` type |
+| `tests/versioning_harness.rs` | Integration test harness — two-repo fixture (library + app) covering all versioned-symbol resolution cases |
 
 ## Public API
 
 ```rust
-/// True if `s` is a valid abbreviated or full git commit hash (7–40 hex chars).
+/// True if `s` is 7–40 lowercase or uppercase hex characters.
 pub fn is_valid_commit_hash(s: &str) -> bool
 
 /// Walk up from `start` to find the git repo root (dir containing `.git`).
