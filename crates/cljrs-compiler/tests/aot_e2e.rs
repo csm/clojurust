@@ -37,7 +37,7 @@ fn compile_and_run(name: &str, source: &str) -> String {
         .spawn({
             let src = src_path.clone();
             let bin = bin_path.clone();
-            move || cljrs_compiler::aot::compile_file(&src, &bin, &[])
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[], None)
         })
         .unwrap()
         .join()
@@ -1038,7 +1038,7 @@ fn compile_and_run_multi(name: &str, main_source: &str, deps: &[(&str, &str)]) -
             let src = src_path.clone();
             let bin = bin_path.clone();
             let src_dir = src_dir.clone();
-            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir])
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir], None)
         })
         .unwrap()
         .join()

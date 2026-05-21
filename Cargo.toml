@@ -61,6 +61,7 @@ regex        = "1.12.3"
 serde        = "1.0.228"
 postcard     = "1.1.3"
 rustyline    = "18.0.0"
+libloading   = "0.8"
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"

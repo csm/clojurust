@@ -164,6 +164,22 @@ enum Commands {
         #[command(subcommand)]
         command: DepsCommands,
     },
+    /// Build the project's native Rust crate as a shared library.
+    ///
+    /// Reads the `:rust` key from `cljrs.edn`, runs `cargo build` in the
+    /// declared crate directory, and prints the path of the resulting
+    /// `.so` / `.dylib` / `.dll`.  The library is loaded automatically by
+    /// `cljrs run` and `cljrs repl` to register native functions before any
+    /// Clojure code is evaluated.
+    ///
+    /// The user crate must declare `crate-type = ["cdylib"]` (or
+    /// `["cdylib", "rlib"]`) and export a `#[no_mangle] pub extern "C" fn
+    /// cljrs_init(registry: *mut cljrs_interop::Registry)` entry point.
+    BuildNative {
+        /// Build in release mode instead of debug.
+        #[arg(long)]
+        release: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -301,13 +317,24 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
         } => {
             // GC config is for the compiled binary, not the compilation process
             let _gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+            // Load cljrs.edn :rust config so native init gets wired into the
+            // generated harness main.rs.
+            let rust_config = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| cljrs_deps::load_config(&cwd).ok().flatten())
+                .and_then(|c| c.rust);
             if test {
                 // For test mode, the file is a directory containing test files
                 cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             } else {
-                cljrs_compiler::aot::compile_file(&file, &out, &src_paths)
-                    .map_err(|e| miette::miette!("{e}"))?;
+                cljrs_compiler::aot::compile_file(
+                    &file,
+                    &out,
+                    &src_paths,
+                    rust_config.as_ref(),
+                )
+                .map_err(|e| miette::miette!("{e}"))?;
             }
             Ok(0)
         }
@@ -344,6 +371,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             DepsCommands::Fetch { name } => run_deps_fetch(name),
             DepsCommands::Status => run_deps_status(),
         },
+        Commands::BuildNative { release } => run_build_native(release),
     }
 }
 
@@ -443,6 +471,11 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                     .verify_commit_signatures
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            // Load the native shared library (if :rust is configured) so that
+            // native functions are registered before any Clojure code runs.
+            if let Some(rust_config) = &config.rust {
+                load_native_lib(rust_config, globals);
+            }
             *globals.deps_config.write().unwrap() = Some(Arc::new(config));
         }
         Ok(None) => {}
@@ -495,6 +528,128 @@ fn format_eval_error(e: EvalError) -> miette::Report {
             miette::miette!("commit {commit:?} failed signature verification: {reason}")
         }
     }
+}
+
+// ── Native library support ────────────────────────────────────────────────────
+
+/// Return the expected on-disk path for the shared library produced by
+/// `cargo build` inside `crate_dir`.
+fn native_lib_path(crate_dir: &Path, crate_name: &str, release: bool) -> PathBuf {
+    let profile = if release { "release" } else { "debug" };
+    let lib_file = if cfg!(target_os = "windows") {
+        format!("{crate_name}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{crate_name}.dylib")
+    } else {
+        format!("lib{crate_name}.so")
+    };
+    crate_dir.join("target").join(profile).join(lib_file)
+}
+
+/// Load the shared library declared by `rust_config` and call its `cljrs_init`
+/// entry point to register native functions into `globals`.
+///
+/// A missing library emits a warning and returns — callers of unregistered
+/// functions will get a runtime error rather than a startup crash, which is
+/// friendlier during development.
+fn load_native_lib(rust_config: &cljrs_deps::RustConfig, globals: &Arc<GlobalEnv>) {
+    let Some(init_fn) = rust_config.init_fn.as_deref() else {
+        return;
+    };
+    let Some(crate_name) = rust_config.crate_name() else {
+        return;
+    };
+    // Symbol name is the last segment of the Rust path, e.g. "cljrs_init".
+    let sym_name = init_fn.rsplit("::").next().unwrap_or(init_fn);
+
+    let lib_path = native_lib_path(&rust_config.crate_dir, crate_name, false);
+    if !lib_path.exists() {
+        eprintln!(
+            "cljrs: native library not found at {} — run `cljrs build-native` first",
+            lib_path.display()
+        );
+        return;
+    }
+
+    // SAFETY: we own the process and are responsible for ensuring the library
+    // stays loaded (via mem::forget below) for the entire lifetime of globals.
+    unsafe {
+        let lib = match libloading::Library::new(&lib_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("cljrs: could not load {}: {e}", lib_path.display());
+                return;
+            }
+        };
+
+        // The exported symbol has C linkage and takes a raw pointer so it is
+        // callable across the FFI boundary without ABI assumptions.
+        let sym_bytes: Vec<u8> = format!("{sym_name}\0").into_bytes();
+        let init: libloading::Symbol<unsafe extern "C" fn(*mut cljrs_interop::Registry)> =
+            match lib.get(&sym_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "cljrs: could not find symbol {sym_name} in {}: {e}",
+                        lib_path.display()
+                    );
+                    return;
+                }
+            };
+
+        let mut registry = cljrs_interop::Registry::new(globals.clone());
+        init(&mut registry as *mut _);
+
+        // Prevent the library from being unloaded — its code must remain
+        // reachable as long as any registered NativeFn closures exist.
+        std::mem::forget(lib);
+    }
+    eprintln!(
+        "[build-native] loaded {} ({})",
+        lib_path.display(),
+        sym_name
+    );
+}
+
+/// Build the native Rust crate declared in `cljrs.edn` as a shared library.
+fn run_build_native(release: bool) -> miette::Result<i32> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let config = cljrs_deps::load_config(&cwd)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("no cljrs.edn found in or above the current directory"))?;
+
+    let rust_config = config
+        .rust
+        .as_ref()
+        .ok_or_else(|| miette::miette!("no :rust key found in cljrs.edn"))?;
+
+    let crate_name = rust_config
+        .crate_name()
+        .ok_or_else(|| miette::miette!(":rust has no :init function; cannot derive crate name"))?;
+
+    eprintln!(
+        "[build-native] building {} in {}",
+        crate_name,
+        rust_config.crate_dir.display()
+    );
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build");
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.current_dir(&rust_config.crate_dir);
+
+    let status = cmd.status().into_diagnostic()?;
+    if !status.success() {
+        return Err(miette::miette!("cargo build failed"));
+    }
+
+    let lib_path = native_lib_path(&rust_config.crate_dir, crate_name, release);
+    eprintln!("[build-native] built {}", lib_path.display());
+    println!("{}", lib_path.display());
+
+    Ok(0)
 }
 
 // ── Deps subcommand ───────────────────────────────────────────────────────────

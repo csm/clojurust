@@ -383,8 +383,15 @@ pub fn lower_file_to_ir(
 ///
 /// `src_path` is the input source file.  `out_path` is the desired output
 /// binary.  `src_dirs` are additional directories for `require` resolution
-/// during macro expansion.
-pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()> {
+/// during macro expansion.  `rust_config`, when present, causes the generated
+/// harness to depend on the user's Rust crate and call its `cljrs_init` hook
+/// before loading any Clojure code.
+pub fn compile_file(
+    src_path: &Path,
+    out_path: &Path,
+    src_dirs: &[PathBuf],
+    rust_config: Option<&cljrs_deps::RustConfig>,
+) -> AotResult<()> {
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
     let filename = src_path.display().to_string();
@@ -521,7 +528,8 @@ pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> A
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
 
     // ── 5. Generate harness project & build ─────────────────────────────
-    let harness_dir = build_harness(out_path, &obj_bytes, &interpreted_source, &bundled_sources)?;
+    let harness_dir =
+        build_harness(out_path, &obj_bytes, &interpreted_source, &bundled_sources, rust_config)?;
     link_with_cargo(&harness_dir, out_path)?;
 
     eprintln!("[aot] wrote {}", out_path.display());
@@ -674,6 +682,7 @@ fn build_harness(
     obj_bytes: &[u8],
     interpreted_source: &str,
     bundled_sources: &[(Arc<str>, String)],
+    rust_config: Option<&cljrs_deps::RustConfig>,
 ) -> AotResult<PathBuf> {
     // Place the harness in a temp dir next to the output.
     let harness_dir = out_path
@@ -697,6 +706,19 @@ fn build_harness(
     // Write Cargo.toml.
     // The empty [workspace] table prevents Cargo from thinking this is
     // part of a parent workspace.
+    let ws = workspace_root.display();
+    let mut native_deps = String::new();
+    if let Some(rc) = rust_config {
+        native_deps.push_str(&format!(
+            "cljrs-interop  = {{ path = \"{ws}/crates/cljrs-interop\" }}\n"
+        ));
+        if let Some(crate_name) = rc.crate_name() {
+            let crate_dir = rc.crate_dir.display();
+            native_deps.push_str(&format!(
+                "{crate_name} = {{ path = \"{crate_dir}\" }}\n"
+            ));
+        }
+    }
     let cargo_toml = format!(
         r#"[package]
 name = "cljrs-aot-harness"
@@ -714,8 +736,7 @@ cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
-"#,
-        ws = workspace_root.display()
+{native_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -771,6 +792,19 @@ cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
         ""
     };
 
+    // Emit the native init call when :rust :init is configured.  The init
+    // function has the signature `fn cljrs_init(registry: &mut Registry)`
+    // and is called before the preamble so native functions are visible to
+    // macro-expanded code at startup.
+    let native_init_code = match rust_config.and_then(|rc| rc.init_fn.as_deref()) {
+        Some(init_fn) => format!(
+            "\n    // Register native Rust functions via the user crate's init hook.\n    \
+             let mut __registry = cljrs_interop::Registry::new(globals.clone());\n    \
+             {init_fn}(&mut __registry);\n"
+        ),
+        None => String::new(),
+    };
+
     let main_rs = format!(
         r#"//! Auto-generated AOT harness for clojurust.
 //!
@@ -794,7 +828,7 @@ fn main() {{
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
-{bundled}
+{bundled}{native_init}
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
@@ -811,7 +845,8 @@ fn main() {{
 }}
 "#,
         preamble = preamble_code,
-        bundled = bundled_registration
+        bundled = bundled_registration,
+        native_init = native_init_code,
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
 

@@ -63,6 +63,10 @@ pub struct Alias {
 
 /// Rust-crate configuration for mixed Rust/Clojure projects.
 ///
+/// The `:init` value is a Rust path like `"my_project::cljrs_init"`. The
+/// first `::` segment is the crate name used in `Cargo.toml` and when
+/// looking for the compiled shared library on disk.
+///
 /// Parsed from the `:rust` key in `cljrs.edn`:
 ///
 /// ```edn
@@ -80,6 +84,18 @@ pub struct RustConfig {
     /// Clojure source.  Omit if you rely solely on `#[cljrs::export]`
     /// inventory-based registration (future feature).
     pub init_fn: Option<Arc<str>>,
+}
+
+impl RustConfig {
+    /// Derive the Rust crate name from the init function path.
+    ///
+    /// `"my_project::cljrs_init"` → `Some("my_project")`.
+    /// Returns `None` when `init_fn` is absent.
+    pub fn crate_name(&self) -> Option<&str> {
+        self.init_fn
+            .as_deref()
+            .map(|s| s.split("::").next().unwrap_or(s))
+    }
 }
 
 /// The fully parsed contents of a `cljrs.edn` file.
