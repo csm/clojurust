@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cljrs_vcs::{
-    find_repo_root, get_file_at_commit, is_valid_commit_hash, verify_commit_signature, VcsError,
+    VcsError, find_repo_root, get_file_at_commit, is_valid_commit_hash, verify_commit_signature,
 };
 
 // ---------------------------------------------------------------------------
@@ -374,9 +374,15 @@ fn test_invalid_commit_hash_rejected() {
 fn test_commit_not_found() {
     let lib = setup_library();
     // A plausible-looking but nonexistent SHA.
-    let result =
-        get_file_at_commit(&lib.root, "src/mylib.cljc", "deadbeefdeadbeefdeadbeef0000000000000001");
-    assert!(result.is_err(), "nonexistent commit SHA should error; got Ok");
+    let result = get_file_at_commit(
+        &lib.root,
+        "src/mylib.cljc",
+        "deadbeefdeadbeefdeadbeef0000000000000001",
+    );
+    assert!(
+        result.is_err(),
+        "nonexistent commit SHA should error; got Ok"
+    );
     assert!(
         matches!(
             result,
@@ -406,10 +412,7 @@ fn test_signature_verification_negative() {
 
     let result = verify_commit_signature(&lib.root, &lib.commit_v2);
 
-    assert!(
-        result.is_err(),
-        "unsigned commit should fail verification"
-    );
+    assert!(result.is_err(), "unsigned commit should fail verification");
     match result {
         Err(VcsError::SignatureVerificationFailed { commit, .. }) => {
             assert_eq!(commit, lib.commit_v2);
@@ -458,7 +461,14 @@ fn test_signature_verification_positive() {
     let sign_out = Command::new("git")
         .arg("-C")
         .arg(&root)
-        .args(["-c", "commit.gpgsign=true", "commit", "-S", "-m", "signed commit"])
+        .args([
+            "-c",
+            "commit.gpgsign=true",
+            "commit",
+            "-S",
+            "-m",
+            "signed commit",
+        ])
         .env("GIT_AUTHOR_NAME", "Test Signer")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test Signer")
