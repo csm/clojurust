@@ -86,7 +86,11 @@ valid clojurust EDN:
          :extra-deps  {test-tools {:git/url "..."
                                    :git/sha "..."}}}}
 
- :verify-commit-signatures true}
+ :verify-commit-signatures true
+
+ ; Optional: embed a Rust crate for native interop
+ :rust {:crate "."
+        :init  "my_project::cljrs_init"}}
 ```
 
 ### Keys
@@ -97,6 +101,23 @@ valid clojurust EDN:
 | `:deps` | map | Map from dependency name (symbol) to dependency descriptor. |
 | `:aliases` | map | Named alias maps with `:extra-paths` and `:extra-deps`. |
 | `:verify-commit-signatures` | boolean | If `true`, require GPG/SSH signatures on all versioned commits. |
+| `:rust` | map | Embedded Rust crate for native interop. See [Rust Interop](../rust-interop/index.md). |
+
+#### `:rust` key
+
+```clojure
+:rust {:crate "."                       ; path to Cargo.toml directory
+       :init  "my_project::cljrs_init"} ; Rust path to the init function
+```
+
+| Sub-key | Description |
+|---|---|
+| `:crate` | Directory containing the user's `Cargo.toml`, relative to `cljrs.edn`. |
+| `:init` | Fully-qualified Rust path to the init function. The first `::` segment is treated as the crate name. |
+
+When `:rust` is present, `cljrs run` and `cljrs repl` automatically load the
+compiled shared library from `<crate>/target/debug/lib<name>.so` (or
+equivalent). Build it first with `cljrs build-native`.
 
 ### Dependency descriptors
 
