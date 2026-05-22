@@ -1,0 +1,17 @@
+;; cljrs.edn — project descriptor for the cljrs-blake3 interop crate.
+;;
+;; The `cljrs compile` toolchain reads this file to locate Clojure sources
+;; and to wire up the Rust initialisation hook before loading them.
+;;
+;; :paths      — directories containing Clojure source files (.cljrs / .cljc)
+;; :test-paths — directories containing clojure.test namespaces
+;; :rust       — Rust integration settings
+;;   :crate    — path to the Cargo crate root (relative to this file)
+;;   :init     — fully-qualified Rust symbol for the cljrs_init hook
+
+{:name       "cljrs-blake3"
+ :version    "0.1.0"
+ :paths      ["src"]
+ :test-paths ["test"]
+ :rust       {:crate "."
+              :init  "cljrs_blake3::cljrs_init"}}

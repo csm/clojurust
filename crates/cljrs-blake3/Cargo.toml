@@ -1,0 +1,21 @@
+[package]
+name = "cljrs-blake3"
+version = "0.1.0"
+edition = "2024"
+description = "BLAKE3 cryptographic hash functions exposed as Clojure native functions"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-interop = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-value   = { workspace = true }
+blake3        = "1"
+
+[dev-dependencies]
+cljrs-eval    = { workspace = true }
+cljrs-stdlib  = { workspace = true }
+cljrs-env     = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-interop = { workspace = true }
+cljrs-reader  = { workspace = true }
