@@ -27,5 +27,6 @@
 - [Overview](rust-interop/index.md)
 - [Project setup](rust-interop/project-setup.md)
 - [Registry API](rust-interop/registry.md)
+- [The `#[export]` macro](rust-interop/export-macro.md)
 - [Interpreter mode](rust-interop/interpreter.md)
 - [AOT mode](rust-interop/aot.md)

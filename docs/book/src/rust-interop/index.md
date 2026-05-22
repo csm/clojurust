@@ -27,6 +27,7 @@ names to Rust functions.
 |---|---|
 | [Project setup](project-setup.md) | `cljrs.edn` config, Cargo setup, crate layout |
 | [Registry API](registry.md) | `Registry`, `wrap_fn*`, type marshalling, `NativeObject` |
+| [The `#[export]` macro](export-macro.md) | Zero-boilerplate function registration |
 | [Interpreter mode](interpreter.md) | `cljrs build-native`, auto-loading, hot-reload workflow |
 | [AOT mode](aot.md) | How `cljrs compile` wires native init into the binary |
 

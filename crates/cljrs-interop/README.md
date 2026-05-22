@@ -4,7 +4,8 @@ Rust ↔ Clojure interoperability layer. Exposes Rust functions to Clojure code,
 marshals values across the boundary, and wraps opaque Rust structs as
 GC-managed `NativeObject` values.
 
-**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging, registration helpers, Registry).
+**Phase:** 9 — partially implemented (NativeObject, marshalling, error bridging,
+registration helpers, Registry, `#[export]` proc-macro).
 
 ---
 
@@ -14,6 +15,7 @@ GC-managed `NativeObject` values.
 src/
   lib.rs       — re-exports, crate entry point
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
+  exports.rs   — ExportEntry, inventory::collect!, register_exports
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
   register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
   registry.rs  — Registry struct and InitFn type alias for cljrs_init convention
@@ -21,6 +23,9 @@ src/
 
 The `NativeObject` trait and `NativeObjectBox` wrapper live in `cljrs-value::native_object`
 and are re-exported from this crate for convenience.
+
+The `#[export]` attribute macro is implemented in `cljrs-export-macro` and
+re-exported here for ergonomic use as `#[cljrs_interop::export(...)]`.
 
 ---
 
@@ -67,6 +72,37 @@ pub fn wrap_fn_variadic<R, E, F>(name: impl Into<Arc<str>>, min: usize, f: F) ->
 
 These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
 `Arc<dyn Fn(&[Value]) -> ValueResult<Value> + Send + Sync>`.
+
+### `#[export]` proc-macro and `register_exports`
+
+Annotate any free Rust function with `#[export(ns = "...")]` to register it
+automatically. Then call `register_exports` once inside `cljrs_init`:
+
+```rust
+use cljrs_interop::{export, register_exports, Registry};
+
+#[export(ns = "math")]
+pub fn add(a: i64, b: i64) -> Result<i64, String> { Ok(a + b) }
+
+#[export(ns = "math")]
+pub fn pi() -> f64 { std::f64::consts::PI }
+
+pub fn cljrs_init(registry: &mut Registry) {
+    register_exports(registry);
+}
+```
+
+Supported signatures and attribute options are documented in the
+`cljrs-export-macro` crate README.
+
+```rust
+pub struct ExportEntry {
+    pub qualified: &'static str,  // "ns/name"
+    pub make_fn:   fn() -> NativeFn,
+}
+
+pub fn register_exports(registry: &mut Registry);
+```
 
 ### Registry and InitFn
 
@@ -119,7 +155,6 @@ pub fn cljrs_init(registry: &mut Registry) {
 
 ## Remaining work (Phase 9)
 
-- `#[cljrs::export]` proc-macro — syntactic sugar over manual registration
 - `cljrs.rust` namespace with intrinsics
 - Dynamic linking — load `.so`/`.dylib` Rust extensions at runtime via `cljrs build-native`
 
@@ -133,4 +168,6 @@ pub fn cljrs_init(registry: &mut Registry) {
 | `cljrs-gc` (workspace) | `GcPtr`, `Trace`, `MarkVisitor` |
 | `cljrs-value` (workspace) | `Value`, `NativeFn`, `NativeObject`, `NativeObjectBox` |
 | `cljrs-env` (workspace) | `GlobalEnv` — used by `Registry` to intern native functions |
+| `cljrs-export-macro` (workspace) | `#[export]` proc-macro |
+| `inventory` (workspace) | Link-time collection of `ExportEntry` items |
 | `num-bigint` (workspace) | `BigInt` marshalling |
