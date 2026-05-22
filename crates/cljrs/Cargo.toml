@@ -40,4 +40,5 @@ clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"
 tracing = "0.1.44"
-rustyline = { workspace = true, optional = true }
+rustyline  = { workspace = true, optional = true }
+libloading = { workspace = true }

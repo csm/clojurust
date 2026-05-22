@@ -61,6 +61,43 @@ pub struct Alias {
     pub extra_deps: Vec<(Arc<str>, Dependency)>,
 }
 
+/// Rust-crate configuration for mixed Rust/Clojure projects.
+///
+/// The `:init` value is a Rust path like `"my_project::cljrs_init"`. The
+/// first `::` segment is the crate name used in `Cargo.toml` and when
+/// looking for the compiled shared library on disk.
+///
+/// Parsed from the `:rust` key in `cljrs.edn`:
+///
+/// ```edn
+/// :rust {:crate "."                        ; path to directory with Cargo.toml
+///        :init  "my_project::cljrs_init"}  ; optional hook-registration fn
+/// ```
+#[derive(Debug, Clone)]
+pub struct RustConfig {
+    /// Directory containing the user's `Cargo.toml`, resolved relative to the
+    /// `cljrs.edn` file.  Defaults to the `cljrs.edn` directory (`"."`).
+    pub crate_dir: PathBuf,
+    /// Fully-qualified Rust path to the init function, e.g.
+    /// `"my_project::cljrs_init"`.  When present, `cljrs compile` emits a
+    /// call to this function in the generated `main.rs` before loading any
+    /// Clojure source.  Omit if you rely solely on `#[cljrs::export]`
+    /// inventory-based registration (future feature).
+    pub init_fn: Option<Arc<str>>,
+}
+
+impl RustConfig {
+    /// Derive the Rust crate name from the init function path.
+    ///
+    /// `"my_project::cljrs_init"` → `Some("my_project")`.
+    /// Returns `None` when `init_fn` is absent.
+    pub fn crate_name(&self) -> Option<&str> {
+        self.init_fn
+            .as_deref()
+            .map(|s| s.split("::").next().unwrap_or(s))
+    }
+}
+
 /// The fully parsed contents of a `cljrs.edn` file.
 #[derive(Debug, Clone, Default)]
 pub struct DepsConfig {
@@ -74,6 +111,8 @@ pub struct DepsConfig {
     /// must pass `git verify-commit` before historical code is executed.
     /// Equivalent to the `--verify-commit-signatures` CLI flag.
     pub verify_commit_signatures: bool,
+    /// Optional Rust-crate configuration for mixed Rust/Clojure projects.
+    pub rust: Option<RustConfig>,
 }
 
 impl DepsConfig {

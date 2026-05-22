@@ -3,7 +3,7 @@
 The `cljrs` binary — command-line interface for running, compiling, and
 interactively exploring clojurust programs.
 
-**[Full documentation →](https://csm.github.io/clojurust/)**
+**[Full documentation →](https://docs.clj.rs)**
 
 ---
 

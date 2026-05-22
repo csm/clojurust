@@ -11,6 +11,7 @@
   - [compile](cli/compile.md)
   - [test](cli/test.md)
   - [deps](cli/deps.md)
+  - [build-native](cli/build-native.md)
   - [ir-viz](cli/ir-viz.md)
 
 # The Language
@@ -20,3 +21,11 @@
 - [Versioned symbols](language/versioned-symbols.md)
 - [Differences from Clojure](language/differences.md)
 - [New built-in functions](language/builtins.md)
+
+# Rust Interop
+
+- [Overview](rust-interop/index.md)
+- [Project setup](rust-interop/project-setup.md)
+- [Registry API](rust-interop/registry.md)
+- [Interpreter mode](rust-interop/interpreter.md)
+- [AOT mode](rust-interop/aot.md)

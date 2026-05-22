@@ -59,3 +59,9 @@ cljrs compile --test test/ --out run-tests && ./run-tests
 AOT compilation is based on Cranelift. Not all language features are yet
 supported in AOT mode; in particular, features that rely on dynamic dispatch
 or late binding may fall back to interpreted execution within the compiled binary.
+
+## Native Rust code
+
+If `cljrs.edn` contains a `:rust` key, `cljrs compile` links the declared Rust
+crate into the binary and calls its `cljrs_init` function before any Clojure
+code runs. See [AOT mode](../rust-interop/aot.md) for details.
