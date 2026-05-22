@@ -11,12 +11,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use cljrs_eval::{Env, eval};
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-use cljrs_interop::{
-    FromValue, IntoValue, NativeObject, Registry, gc_native_object, register_exports, wrap_fn1,
-    wrap_fn2, wrap_result,
-};
-// Bring the `export` attribute into scope.
 use cljrs_interop::export;
+use cljrs_interop::{
+    FromValue, IntoValue, NativeObject, Registry, gc_native_object, wrap_fn1, wrap_fn2, wrap_result,
+};
 use cljrs_stdlib::standard_env;
 use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 
@@ -162,8 +160,8 @@ fn str_join(args: &[Value]) -> Result<Value, String> {
 }
 
 fn register_auto_fns(env: &mut Env) {
-    let registry = &mut Registry::new(env.globals.clone());
-    register_exports(registry);
+    // Registry::new automatically registers all #[export]-annotated functions.
+    Registry::new(env.globals.clone());
     env.globals.mark_loaded("strutils");
 }
 

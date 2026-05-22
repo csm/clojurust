@@ -26,6 +26,8 @@ use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_value::{NativeFn, Value};
 
+use crate::exports::register_exports;
+
 // ── InitFn ────────────────────────────────────────────────────────────────────
 
 /// The expected signature of a Rust-side hook-registration function.
@@ -54,10 +56,13 @@ pub struct Registry {
 impl Registry {
     /// Create a `Registry` backed by `env`.
     ///
-    /// Called by the generated `main.rs`; user code receives `&mut Registry`
-    /// and never constructs one directly.
+    /// Automatically registers every `#[export]`-annotated function found in
+    /// the binary (via `inventory`).  Called by the generated `main.rs`; user
+    /// code receives `&mut Registry` and never constructs one directly.
     pub fn new(env: Arc<GlobalEnv>) -> Self {
-        Self { env }
+        let r = Self { env };
+        register_exports(&r);
+        r
     }
 
     /// Register `f` under the fully-qualified Clojure name `"my.ns/my-fn"`.

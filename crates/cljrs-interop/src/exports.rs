@@ -1,5 +1,5 @@
 //! Static export registry — collects every `#[export]`-annotated function and
-//! lets a `cljrs_init` implementation register them all in one call.
+//! registers them automatically when a [`Registry`] is created.
 
 use cljrs_value::NativeFn;
 
@@ -7,8 +7,10 @@ use crate::registry::Registry;
 
 /// A single entry produced by `#[export]`.
 ///
-/// The `inventory` crate collects all of these at link time; call
-/// [`register_exports`] to intern them into a [`Registry`].
+/// The `inventory` crate collects all of these at link time.  Every
+/// [`Registry`] calls [`register_exports`] in its constructor, so
+/// `#[export]`-annotated functions are available without any explicit
+/// registration call.
 pub struct ExportEntry {
     /// Fully-qualified Clojure name, e.g. `"math/add"`.
     pub qualified: &'static str,
@@ -18,17 +20,12 @@ pub struct ExportEntry {
 
 inventory::collect!(ExportEntry);
 
-/// Register every `#[export]`-annotated function into `registry`.
+/// Intern every `#[export]`-annotated function into `registry`.
 ///
-/// Call this inside your `cljrs_init` function to avoid listing each function
-/// individually:
-///
-/// ```rust,ignore
-/// pub fn cljrs_init(registry: &mut Registry) {
-///     cljrs_interop::register_exports(registry);
-/// }
-/// ```
-pub fn register_exports(registry: &mut Registry) {
+/// Called automatically by [`Registry::new`]; you only need this directly if
+/// you are constructing a `Registry` by other means or want to re-register
+/// into a second environment.
+pub fn register_exports(registry: &Registry) {
     for entry in inventory::iter::<ExportEntry> {
         registry.define(entry.qualified, (entry.make_fn)());
     }
