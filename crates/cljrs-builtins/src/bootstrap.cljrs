@@ -1053,4 +1053,4 @@
 (defn re-seq
   [re s]
   (let [matcher (re-matcher re s)]
-    ))
+    (take-while identity (repeatedly #(re-find matcher)))))
