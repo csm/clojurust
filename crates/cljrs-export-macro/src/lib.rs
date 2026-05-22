@@ -59,7 +59,11 @@ impl Parse for ExportArgs {
             }
         }
 
-        Ok(Self { ns, name, variadic_min })
+        Ok(Self {
+            ns,
+            name,
+            variadic_min,
+        })
     }
 }
 
@@ -162,13 +166,12 @@ fn export_impl(args: ExportArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             None => 0,
         };
         build_variadic(&qualified, fn_ident, &func.sig.output, min)?
+    } else if args.variadic_min.is_some() {
+        return Err(syn::Error::new_spanned(
+            fn_ident,
+            "`variadic_min` is only valid when the function takes `&[Value]`",
+        ));
     } else {
-        if args.variadic_min.is_some() {
-            return Err(syn::Error::new_spanned(
-                fn_ident,
-                "`variadic_min` is only valid when the function takes `&[Value]`",
-            ));
-        }
         build_fixed(&qualified, fn_ident, &params, &func.sig.output)?
     };
 
@@ -266,14 +269,12 @@ fn build_result_expr(call: TokenStream2, ret: &ReturnType) -> syn::Result<TokenS
 
 /// Returns true for `&[Value]` (a reference to a slice of `Value`).
 fn is_slice_of_value(ty: &Type) -> bool {
-    if let Type::Reference(tr) = ty {
-        if let Type::Slice(ts) = tr.elem.as_ref() {
-            if let Type::Path(tp) = ts.elem.as_ref() {
-                if let Some(seg) = tp.path.segments.last() {
-                    return seg.ident == "Value";
-                }
-            }
-        }
+    if let Type::Reference(tr) = ty
+        && let Type::Slice(ts) = tr.elem.as_ref()
+        && let Type::Path(tp) = ts.elem.as_ref()
+        && let Some(seg) = tp.path.segments.last()
+    {
+        return seg.ident == "Value";
     }
     false
 }
@@ -281,30 +282,25 @@ fn is_slice_of_value(ty: &Type) -> bool {
 /// Returns true if `ty` is a path whose last segment is `Result` with ≥ 2
 /// generic arguments (covers `Result<T, E>`, `std::result::Result<T, E>`, etc.).
 fn is_result_type(ty: &Type) -> bool {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            if seg.ident == "Result" {
-                if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                    return ab.args.len() >= 2;
-                }
-            }
-        }
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Result"
+        && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
+    {
+        return ab.args.len() >= 2;
     }
     false
 }
 
 /// Extract the `T` from `Result<T, E>`.
 fn result_ok_type(ty: &Type) -> Option<&Type> {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            if seg.ident == "Result" {
-                if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                    if let Some(syn::GenericArgument::Type(t)) = ab.args.first() {
-                        return Some(t);
-                    }
-                }
-            }
-        }
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Result"
+        && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(t)) = ab.args.first()
+    {
+        return Some(t);
     }
     None
 }
