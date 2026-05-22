@@ -1,0 +1,154 @@
+(ns cljrs.blake3-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [blake3 :as b]))
+
+;; ── Known test vectors ────────────────────────────────────────────────────────
+;;
+;; Official BLAKE3 test vector (input_len=0, from test_vectors.json in the
+;; BLAKE3 reference repository):
+;;   blake3("") = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+
+(def ^:private empty-hash
+  "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+
+(deftest test-known-vector-empty
+  (testing "BLAKE3 hash of empty string matches official test vector"
+    (is (= empty-hash (b/hash "")))))
+
+(deftest test-known-vector-empty-bytes
+  (testing "BLAKE3 hash of empty byte vector matches empty-string hash"
+    (is (= empty-hash (b/hash [])))))
+
+;; ── Output format ─────────────────────────────────────────────────────────────
+
+(deftest test-hash-output-length
+  (testing "hash returns 64 hex characters (32 bytes)"
+    (is (= 64 (count (b/hash ""))))
+    (is (= 64 (count (b/hash "hello"))))
+    (is (= 64 (count (b/hash "the quick brown fox"))))))
+
+(deftest test-hash-raw-output-shape
+  (testing "hash-raw returns a 32-element vector"
+    (let [raw (b/hash-raw "hello")]
+      (is (= 32 (count raw)))))
+  (testing "every byte is an integer in 0..255"
+    (let [raw (b/hash-raw "hello")]
+      (is (every? integer? raw))
+      (is (every? #(and (>= % 0) (<= % 255)) raw)))))
+
+;; ── String vs byte-vector input consistency ───────────────────────────────────
+
+(deftest test-string-equals-byte-vector-input
+  (testing "hashing a string and the equivalent UTF-8 byte vector yields the same digest"
+    ;; "abc" = bytes [97 98 99]
+    (is (= (b/hash "abc")
+           (b/hash [97 98 99])))
+    (is (= (b/hash-raw "abc")
+           (b/hash-raw [97 98 99])))))
+
+;; ── Determinism ───────────────────────────────────────────────────────────────
+
+(deftest test-hash-is-deterministic
+  (testing "identical inputs always produce the same hash"
+    (is (= (b/hash "hello") (b/hash "hello")))
+    (is (= (b/hash [1 2 3]) (b/hash [1 2 3])))))
+
+(deftest test-different-inputs-differ
+  (testing "distinct inputs produce distinct hashes"
+    (is (not= (b/hash "hello") (b/hash "world")))
+    (is (not= (b/hash "") (b/hash "a")))))
+
+;; ── Incremental hasher ────────────────────────────────────────────────────────
+
+(deftest test-incremental-matches-single-pass
+  (testing "chunked update matches a single-pass hash of the concatenation"
+    (let [h (b/hasher-new)]
+      (b/hasher-update! h "hel")
+      (b/hasher-update! h "lo")
+      (is (= (b/hash "hello")
+             (b/hasher-finalize h))))))
+
+(deftest test-incremental-byte-vector-input
+  (testing "hasher-update! accepts byte vectors"
+    (let [h (b/hasher-new)]
+      (b/hasher-update! h [104 101])   ; "he"
+      (b/hasher-update! h [108 108 111]) ; "llo"
+      (is (= (b/hash "hello")
+             (b/hasher-finalize h))))))
+
+(deftest test-hasher-finalize-is-nondestructive
+  (testing "finalize can be called multiple times and returns the same digest"
+    (let [h (b/hasher-new)]
+      (b/hasher-update! h "data")
+      (let [first-result  (b/hasher-finalize h)
+            second-result (b/hasher-finalize h)]
+        (is (= first-result second-result))))))
+
+(deftest test-hasher-update-returns-hasher
+  (testing "hasher-update! returns the hasher for chaining"
+    (let [h  (b/hasher-new)
+          h2 (b/hasher-update! h "hello")]
+      (is (identical? h h2)))))
+
+(deftest test-hasher-finalize-raw
+  (testing "hasher-finalize-raw returns 32 bytes"
+    (let [h (b/hasher-new)
+          _ (b/hasher-update! h "test")]
+      (is (= 32 (count (b/hasher-finalize-raw h))))))
+  (testing "hasher-finalize-raw matches hash-raw for the same data"
+    (let [h (b/hasher-new)
+          _ (b/hasher-update! h "test")]
+      (is (= (b/hash-raw "test")
+             (b/hasher-finalize-raw h))))))
+
+;; ── Keyed hash ────────────────────────────────────────────────────────────────
+
+(deftest test-keyed-hash-output-length
+  (testing "keyed-hash produces a 64-char hex string"
+    (let [key (vec (repeat 32 0))]
+      (is (= 64 (count (b/keyed-hash key "hello")))))))
+
+(deftest test-keyed-hash-differs-from-plain-hash
+  (testing "keyed-hash with a non-zero key differs from plain hash"
+    (let [key (vec (repeat 32 1))]
+      (is (not= (b/hash "hello")
+                (b/keyed-hash key "hello"))))))
+
+(deftest test-keyed-hash-key-must-be-32-bytes
+  (testing "keyed-hash throws when key is not 32 bytes"
+    (is (thrown? Exception (b/keyed-hash (vec (repeat 16 0)) "hello")))
+    (is (thrown? Exception (b/keyed-hash (vec (repeat 33 0)) "hello")))))
+
+(deftest test-keyed-hash-same-key-same-result
+  (testing "identical key + data always give the same keyed hash"
+    (let [key (vec (range 32))]
+      (is (= (b/keyed-hash key "hello")
+             (b/keyed-hash key "hello"))))))
+
+(deftest test-keyed-hash-different-keys-differ
+  (testing "different keys with the same data give different keyed hashes"
+    (let [key1 (vec (repeat 32 0))
+          key2 (vec (repeat 32 1))]
+      (is (not= (b/keyed-hash key1 "hello")
+                (b/keyed-hash key2 "hello"))))))
+
+;; ── Key derivation ────────────────────────────────────────────────────────────
+
+(deftest test-derive-key-output-length
+  (testing "derive-key produces a 64-char hex string"
+    (is (= 64 (count (b/derive-key "test context" "key material"))))))
+
+(deftest test-derive-key-context-separates
+  (testing "different contexts with same material yield different keys"
+    (is (not= (b/derive-key "context-a" "material")
+              (b/derive-key "context-b" "material")))))
+
+(deftest test-derive-key-material-separates
+  (testing "same context with different material yields different keys"
+    (is (not= (b/derive-key "context" "material-a")
+              (b/derive-key "context" "material-b")))))
+
+(deftest test-derive-key-differs-from-plain-hash
+  (testing "derive-key is domain-separated from a plain hash"
+    (is (not= (b/hash "key material")
+              (b/derive-key "test context" "key material")))))

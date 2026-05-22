@@ -20,7 +20,8 @@ members = [
     "crates/cljrs-ir-prebuild",
     "crates/cljrs-ir-viz",
     "crates/cljrs-deps",
-    "crates/cljrs-vcs"]
+    "crates/cljrs-vcs",
+    "crates/cljrs-blake3"]
 resolver = "2"
 
 [workspace.package]
