@@ -190,3 +190,9 @@ impl Trace for Cache {
 
 If your struct holds no `GcPtr` fields (only plain Rust data), a no-op `Trace`
 impl is sufficient.
+
+---
+
+For simpler cases that don't need closures or custom `NativeObject` wiring,
+the [`#[export]` macro](export-macro.md) provides a zero-boilerplate alternative
+to manual `define` calls.
