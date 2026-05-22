@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-eval"
-version = "0.1.0"
+version = "0.1.61"
 edition = "2024"
 description = "IR-accelerated evaluation for clojurust (tier-1 IR interpreter + lowering)"
 license.workspace = true
