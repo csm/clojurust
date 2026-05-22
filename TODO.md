@@ -355,7 +355,7 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 ## Phase 9 — Rust Interop
 
 - [x] Define calling conventions: how Clojure code invokes Rust functions
-- [ ] Macro or annotation to expose a Rust `fn` as a clojurust native function (e.g. `#[cljx::export]`)
+- [x] Macro or annotation to expose a Rust `fn` as a clojurust native function (`#[cljrs_interop::export]` in `cljrs-export-macro`)
 - [x] Type marshalling: Clojure `Value` ↔ Rust primitive / struct conversions (`FromValue`/`IntoValue` traits in `cljrs-interop`)
 - [x] Error/exception bridging: Rust `Result`/`panic` → Clojure exception (`wrap_result` in `cljrs-interop`)
 - [x] Access to Rust structs as opaque objects (`NativeObject` variant in `Value`)

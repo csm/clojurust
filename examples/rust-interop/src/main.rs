@@ -5,14 +5,18 @@
 //! - Wrapping it as a `Value::NativeObject` and registering native functions
 //! - Using protocol dispatch from Clojure to call methods on the Rust object
 //! - Type marshalling with `FromValue` / `IntoValue`
+//! - Automatic registration with `#[export]` and `register_exports`
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use cljrs_eval::{Env, eval};
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_interop::{
-    FromValue, IntoValue, NativeObject, gc_native_object, wrap_fn1, wrap_fn2, wrap_result,
+    FromValue, IntoValue, NativeObject, Registry, gc_native_object, register_exports, wrap_fn1,
+    wrap_fn2, wrap_result,
 };
+// Bring the `export` attribute into scope.
+use cljrs_interop::export;
 use cljrs_stdlib::standard_env;
 use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 
@@ -118,6 +122,51 @@ fn builtin_counter_name(args: &[Value]) -> ValueResult<Value> {
     wrap_result(Ok::<_, std::fmt::Error>(c.name.clone()))
 }
 
+// ── Step 3b: Auto-registered string utilities via #[export] ──────────────────
+//
+// Each function annotated with #[export] is picked up by `register_exports` at
+// runtime — no manual listing required.
+
+#[export(ns = "strutils")]
+fn str_length(s: String) -> i64 {
+    s.chars().count() as i64
+}
+
+#[export(ns = "strutils")]
+fn str_reverse(s: String) -> String {
+    s.chars().rev().collect()
+}
+
+#[export(ns = "strutils", name = "str-upper")]
+fn str_upper(s: String) -> String {
+    s.to_uppercase()
+}
+
+#[export(ns = "strutils")]
+fn str_repeat(s: String, n: i64) -> Result<String, String> {
+    if n < 0 {
+        Err(format!("repeat count must be non-negative, got {n}"))
+    } else {
+        Ok(s.repeat(n as usize))
+    }
+}
+
+#[export(ns = "strutils", variadic_min = 1)]
+fn str_join(args: &[Value]) -> Result<Value, String> {
+    let sep = String::from_value(&args[0]).map_err(|e| e.to_string())?;
+    let parts: Result<Vec<String>, _> = args[1..]
+        .iter()
+        .map(|v| String::from_value(v).map_err(|e| e.to_string()))
+        .collect();
+    Ok(Value::Str(cljrs_gc::GcPtr::new(parts?.join(&sep))))
+}
+
+fn register_auto_fns(env: &mut Env) {
+    let registry = &mut Registry::new(env.globals.clone());
+    register_exports(registry);
+    env.globals.mark_loaded("strutils");
+}
+
 // ── Step 4: Register everything and run Clojure code ─────────────────────────
 
 fn register_counter_fns(env: &mut Env) {
@@ -197,6 +246,9 @@ fn main() {
     // Register math functions using wrap_fn* helpers.
     register_math_fns(&mut env);
 
+    // Register string utilities using #[export] + register_exports.
+    register_auto_fns(&mut env);
+
     // Evaluate Clojure code that uses the Counter.
     let clojure_code = r#"
         ;; Require our native namespace
@@ -260,6 +312,24 @@ fn main() {
             (println "Caught error:" e)))
 
         (println "\nDone!")
+
+        ;; ── #[export] macro demo: auto-registered string utilities ──────────
+        (require '[strutils :as su])
+
+        (println "\n── #[export] macro ──")
+        (println "str-length:" (su/str-length "hello"))
+        (println "str-reverse:" (su/str-reverse "hello"))
+        (println "str-upper:" (su/str-upper "hello world"))
+        (println "str-repeat:" (su/str-repeat "ab" 3))
+        (println "str-join:" (su/str-join ", " "one" "two" "three"))
+
+        ;; Error from a #[export] function
+        (try
+          (su/str-repeat "x" -1)
+          (catch Exception e
+            (println "Caught error:" e)))
+
+        (println "\nAll done!")
     "#;
 
     let mut parser =
