@@ -15,6 +15,7 @@ pub mod eval;
 pub mod macros;
 pub mod special;
 pub mod syntax_quote;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod versioned;
 mod virtualize;
 

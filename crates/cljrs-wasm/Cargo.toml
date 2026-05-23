@@ -1,0 +1,30 @@
+[package]
+name = "cljrs-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WebAssembly browser REPL for clojurust"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cljrs-interp   = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-types    = { workspace = true }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+# Activate getrandom's JS/browser entropy source for rand on wasm32.
+# rand uses getrandom 0.4; declaring it here with wasm_js unifies the feature
+# across the whole dep graph when building this crate.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+# uuid 1.22 requires an explicit randomness feature on wasm32-unknown-unknown.
+# Adding the "js" feature here unifies it across the dep graph.
+uuid = { version = "1.22.0", features = ["v4", "js"] }

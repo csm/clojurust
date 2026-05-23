@@ -84,6 +84,7 @@
       line-height: 1.65;
       min-height: 100vh;
       -webkit-font-smoothing: antialiased;
+      padding-bottom: 60px;
     }
 
     /* ── Layout ─────────────────────────────────────────────── */
@@ -245,6 +246,126 @@
       outline: 2px solid var(--accent);
       outline-offset: 3px;
     }
+
+    /* ── REPL bar (fixed, bottom of viewport) ───────────────── */
+    #repl-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: var(--bg0-h);
+      border-top: 1px solid var(--rule);
+    }
+
+    #repl-bar-inner {
+      max-width: 740px;
+      margin: 0 auto;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 7px 1.5rem;
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+
+    @media (min-width: 900px) {
+      #repl-bar-inner { padding-left: 0; padding-right: 0; }
+    }
+
+    #repl-prompt {
+      color: var(--accent2);
+      padding-top: 3px;
+      flex-shrink: 0;
+      user-select: none;
+      opacity: 0.7;
+    }
+
+    #repl-input {
+      flex: 1;
+      min-height: 26px;
+      max-height: 200px;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.65;
+      resize: none;
+      padding: 1px 0;
+      caret-color: var(--accent);
+    }
+
+    #repl-input:disabled { opacity: 0.35; cursor: not-allowed; }
+    #repl-input::placeholder { color: var(--text-faint); }
+
+    #repl-status {
+      padding-top: 4px;
+      font-size: 0.72rem;
+      color: var(--text-faint);
+      flex-shrink: 0;
+      opacity: 0.55;
+      white-space: nowrap;
+      transition: color 0.2s, opacity 0.2s;
+    }
+
+    #repl-status.ready { color: var(--green-b); opacity: 1; }
+    #repl-status.err   { color: var(--red-b);   opacity: 1; }
+
+    #repl-eval {
+      flex-shrink: 0;
+      padding: 2px 10px;
+      background: var(--surface2);
+      color: var(--accent2);
+      border: 1px solid var(--bg2);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      line-height: 1.65;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+      white-space: nowrap;
+    }
+
+    #repl-eval:hover:not(:disabled) {
+      background: var(--bg2);
+      color: var(--text);
+    }
+
+    #repl-eval:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* ── REPL result entries ─────────────────────────────────── */
+    .repl-divider {
+      border: none;
+      border-top: 1px solid var(--rule);
+      margin: 2.5rem 0 1.5rem;
+      display: flex;
+      align-items: center;
+    }
+
+    .repl-divider::after {
+      content: '; REPL';
+      margin-left: 0.75rem;
+      font-size: 0.72rem;
+      color: var(--text-faint);
+      white-space: nowrap;
+    }
+
+    .repl-entry {
+      margin: 0.6rem 0;
+      padding-left: 1rem;
+      border-left: 2px solid var(--accent2);
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }
+
+    .repl-in { color: var(--accent2); white-space: pre-wrap; word-break: break-word; }
+    .repl-in::before { content: 'user=> '; opacity: 0.5; }
+
+    .repl-print { color: var(--text-dim);  white-space: pre-wrap; word-break: break-word; }
+    .repl-val   { color: var(--yellow-b);  white-space: pre-wrap; word-break: break-word; }
+    .repl-err   { color: var(--red-b);     white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
@@ -297,6 +418,185 @@
       <a href="https://github.com/csm/clojurust/blob/main/COPYING.md" target="_blank" rel="noopener">license</a>
     </footer>
 
+    <div id="repl-out"></div>
+
+  </div><!-- /.wrapper -->
+
+  <div id="repl-bar">
+    <div id="repl-bar-inner">
+      <span id="repl-prompt">user=>&nbsp;</span>
+      <textarea id="repl-input"
+        rows="1"
+        disabled
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Loading REPL…"
+        aria-label="Clojure REPL input"
+      ></textarea>
+      <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
+      <span id="repl-status">loading…</span>
+    </div>
   </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    var WASM_JS  = 'https://docs.clj.rs/wasm/cljrs_wasm.js';
+    var WASM_BIN = 'https://docs.clj.rs/wasm/cljrs_wasm_bg.wasm';
+
+    var repl = null;
+    var history = [];
+    var historyIdx = -1;
+    var liveDraft = '';
+    var dividerInserted = false;
+
+    var input  = document.getElementById('repl-input');
+    var status = document.getElementById('repl-status');
+    var btn    = document.getElementById('repl-eval');
+    var out    = document.getElementById('repl-out');
+
+    // ── Auto-resize textarea ──────────────────────────────────
+    function resize() {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+      var bar = document.getElementById('repl-bar');
+      if (bar) document.body.style.paddingBottom = (bar.offsetHeight + 4) + 'px';
+    }
+
+    // ── Cursor-position helpers ───────────────────────────────
+    function onFirstLine() {
+      return input.value.lastIndexOf('\n', input.selectionStart - 1) === -1;
+    }
+    function onLastLine() {
+      return input.value.indexOf('\n', input.selectionStart) === -1;
+    }
+
+    // ── Append a REPL entry ───────────────────────────────────
+    function appendEntry(code, printOut, result, isError) {
+      if (!dividerInserted) {
+        dividerInserted = true;
+        var hr = document.createElement('div');
+        hr.className = 'repl-divider';
+        out.appendChild(hr);
+      }
+
+      var entry = document.createElement('div');
+      entry.className = 'repl-entry';
+
+      var inDiv = document.createElement('div');
+      inDiv.className = 'repl-in';
+      inDiv.textContent = code;
+      entry.appendChild(inDiv);
+
+      if (printOut) {
+        var p = document.createElement('div');
+        p.className = 'repl-print';
+        p.textContent = printOut;
+        entry.appendChild(p);
+      }
+      if (result !== '') {
+        var r = document.createElement('div');
+        r.className = isError ? 'repl-err' : 'repl-val';
+        r.textContent = result;
+        entry.appendChild(r);
+      }
+
+      out.appendChild(entry);
+      entry.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+
+    // ── Evaluate current input ────────────────────────────────
+    function evalInput() {
+      var code = input.value;
+      if (!code.trim() || !repl) return;
+      if (history[history.length - 1] !== code) history.push(code);
+      historyIdx = -1;
+      liveDraft = '';
+      var res = repl.eval(code);
+      appendEntry(code, res.output, res.result, res.is_error);
+      input.value = '';
+      resize();
+    }
+
+    btn.addEventListener('click', evalInput);
+
+    // ── Keyboard handling ─────────────────────────────────────
+    input.addEventListener('input', resize);
+    input.addEventListener('keydown', function (e) {
+
+      // Tab → two-space indent
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        var s = input.selectionStart;
+        input.value = input.value.slice(0, s) + '  ' + input.value.slice(s);
+        input.selectionStart = input.selectionEnd = s + 2;
+        resize();
+        return;
+      }
+
+      // Shift+Enter → evaluate
+      if (e.key === 'Enter' && e.shiftKey) {
+        e.preventDefault();
+        evalInput();
+        return;
+      }
+
+      // ↑ — history back (only on first line)
+      if (e.key === 'ArrowUp' && onFirstLine()) {
+        if (!history.length) return;
+        e.preventDefault();
+        if (historyIdx === -1) { liveDraft = input.value; historyIdx = history.length - 1; }
+        else if (historyIdx > 0) { historyIdx--; }
+        input.value = history[historyIdx];
+        resize();
+        input.selectionStart = input.selectionEnd = input.value.length;
+        return;
+      }
+
+      // ↓ — history forward (only on last line)
+      if (e.key === 'ArrowDown' && onLastLine()) {
+        if (historyIdx === -1) return;
+        e.preventDefault();
+        if (historyIdx < history.length - 1) {
+          historyIdx++;
+          input.value = history[historyIdx];
+        } else {
+          historyIdx = -1;
+          input.value = liveDraft;
+        }
+        resize();
+        input.selectionStart = input.selectionEnd = input.value.length;
+        return;
+      }
+    });
+
+    // ── Lazy WASM load ────────────────────────────────────────
+    function loadWasm() {
+      import(WASM_JS).then(function (mod) {
+        return mod.default(WASM_BIN).then(function () { return mod; });
+      }).then(function (mod) {
+        repl = new mod.Repl();
+        input.disabled = false;
+        btn.disabled = false;
+        input.placeholder = '(+ 1 2)  —  eval button or Shift+Enter  ·  Tab to indent  ·  ↑↓ history';
+        status.textContent = '● ready';
+        status.className = 'ready';
+        input.focus();
+      }).catch(function (err) {
+        status.textContent = '✕ failed';
+        status.className = 'err';
+        status.title = String(err);
+        console.error('[cljrs-wasm]', err);
+      });
+    }
+
+    if (typeof requestIdleCallback !== 'undefined') {
+      requestIdleCallback(loadWasm, { timeout: 4000 });
+    } else {
+      setTimeout(loadWasm, 250);
+    }
+  }());
+  </script>
 </body>
 </html>

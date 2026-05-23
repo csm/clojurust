@@ -1,7 +1,9 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::error::EvalResult;
@@ -388,22 +390,29 @@ impl GlobalEnv {
     /// only verified once per session.  On failure returns
     /// `EvalError::CommitSignatureVerificationFailed`.
     pub fn check_commit_signature(&self, repo_root: &str, commit: &str) -> EvalResult<()> {
-        if !self.verify_commit_signatures.load(Ordering::Relaxed) {
-            return Ok(());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.verify_commit_signatures.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let key = (Arc::<str>::from(repo_root), Arc::<str>::from(commit));
+            if self.sig_verify_cache.lock().unwrap().contains(&key) {
+                return Ok(());
+            }
+            cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit).map_err(
+                |e| match e {
+                    cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
+                        crate::error::EvalError::CommitSignatureVerificationFailed {
+                            commit: c,
+                            reason,
+                        }
+                    }
+                    other => crate::error::EvalError::Runtime(format!("{other}")),
+                },
+            )?;
+            self.sig_verify_cache.lock().unwrap().insert(key);
         }
-        let key = (Arc::<str>::from(repo_root), Arc::<str>::from(commit));
-        if self.sig_verify_cache.lock().unwrap().contains(&key) {
-            return Ok(());
-        }
-        cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit).map_err(
-            |e| match e {
-                cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
-                    crate::error::EvalError::CommitSignatureVerificationFailed { commit: c, reason }
-                }
-                other => crate::error::EvalError::Runtime(format!("{other}")),
-            },
-        )?;
-        self.sig_verify_cache.lock().unwrap().insert(key);
+        let _ = (repo_root, commit);
         Ok(())
     }
 }

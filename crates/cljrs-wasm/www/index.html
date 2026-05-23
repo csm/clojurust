@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>clojurust REPL</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a1a;
+      color: #d4d4d4;
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 14px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #9cdcfe;
+      letter-spacing: 0.05em;
+    }
+
+    header .status {
+      font-size: 12px;
+      color: #6a9955;
+    }
+
+    header .status.loading { color: #dcdcaa; }
+    header .status.error   { color: #f44747; }
+
+    #output {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .entry { display: flex; flex-direction: column; gap: 2px; }
+
+    .entry .input-line {
+      color: #9cdcfe;
+    }
+
+    .entry .input-line::before {
+      content: 'user=> ';
+      color: #569cd6;
+      user-select: none;
+    }
+
+    .entry .print-output {
+      white-space: pre-wrap;
+      color: #d4d4d4;
+      padding-left: 2px;
+    }
+
+    .entry .result-value {
+      color: #b5cea8;
+      white-space: pre-wrap;
+    }
+
+    .entry .result-error {
+      color: #f44747;
+      white-space: pre-wrap;
+    }
+
+    .entry .result-nil { color: #808080; }
+
+    #input-row {
+      background: #252526;
+      border-top: 1px solid #3c3c3c;
+      padding: 8px 16px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    #prompt {
+      color: #569cd6;
+      padding-top: 6px;
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    #input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #9cdcfe;
+      font-family: inherit;
+      font-size: inherit;
+      resize: none;
+      min-height: 28px;
+      line-height: 1.6;
+      padding: 4px 0;
+      caret-color: #aeafad;
+    }
+
+    #input::placeholder { color: #555; }
+
+    #clear-btn {
+      background: none;
+      border: 1px solid #3c3c3c;
+      color: #808080;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      flex-shrink: 0;
+      margin-top: 4px;
+    }
+
+    #clear-btn:hover { border-color: #666; color: #aaa; }
+
+    .welcome { color: #6a9955; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>clojurust REPL</h1>
+  <span id="status" class="status loading">Loading…</span>
+</header>
+
+<div id="output">
+  <div class="welcome">; clojurust browser REPL — pure Clojure, tree-walking interpreter</div>
+  <div class="welcome">; Enter expressions and press Enter (Shift+Enter for newline)</div>
+  <div class="welcome">; Use ↑ / ↓ to navigate history</div>
+</div>
+
+<div id="input-row">
+  <span id="prompt">user=&gt;&nbsp;</span>
+  <textarea id="input" rows="1" placeholder="(+ 1 2)" autocomplete="off" spellcheck="false" disabled></textarea>
+  <button id="clear-btn" title="Clear output">Clear</button>
+</div>
+
+<script type="module">
+  // ---------------------------------------------------------------------------
+  // Load the wasm-bindgen generated module.
+  // Adjust the path if your build output lands elsewhere.
+  // ---------------------------------------------------------------------------
+  import init, { Repl } from './cljrs_wasm.js';
+
+  const statusEl = document.getElementById('status');
+  const outputEl = document.getElementById('output');
+  const inputEl  = document.getElementById('input');
+  const clearBtn = document.getElementById('clear-btn');
+
+  let repl = null;
+  let history = [];      // array of input strings
+  let historyIdx = -1;   // -1 = "live" (not browsing history)
+  let liveInput = '';    // saved current input while browsing
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  async function boot() {
+    try {
+      await init();
+      repl = new Repl();
+      statusEl.textContent = 'Ready';
+      statusEl.className = 'status';
+      inputEl.disabled = false;
+      inputEl.focus();
+    } catch (err) {
+      statusEl.textContent = 'Failed to load';
+      statusEl.className = 'status error';
+      appendEntry('', '', String(err), true);
+    }
+  }
+
+  // ── Output helpers ─────────────────────────────────────────────────────────
+  function appendEntry(inputText, printOutput, result, isError) {
+    const entry = document.createElement('div');
+    entry.className = 'entry';
+
+    if (inputText) {
+      const inp = document.createElement('div');
+      inp.className = 'input-line';
+      inp.textContent = inputText;
+      entry.appendChild(inp);
+    }
+
+    if (printOutput) {
+      const out = document.createElement('div');
+      out.className = 'print-output';
+      out.textContent = printOutput;
+      entry.appendChild(out);
+    }
+
+    if (result !== '') {
+      const res = document.createElement('div');
+      if (isError) {
+        res.className = 'result-error';
+      } else if (result === 'nil') {
+        res.className = 'result-nil';
+      } else {
+        res.className = 'result-value';
+      }
+      res.textContent = result;
+      entry.appendChild(res);
+    }
+
+    outputEl.appendChild(entry);
+    outputEl.scrollTop = outputEl.scrollHeight;
+  }
+
+  // ── Evaluation ─────────────────────────────────────────────────────────────
+  function evalInput(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    // Push to history (dedupe consecutive identical entries).
+    if (history[history.length - 1] !== trimmed) {
+      history.push(trimmed);
+    }
+    historyIdx = -1;
+    liveInput = '';
+
+    const out = repl.eval(trimmed);
+    appendEntry(trimmed, out.output, out.result, out.is_error);
+  }
+
+  // ── Auto-resize textarea ───────────────────────────────────────────────────
+  function resize() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = inputEl.scrollHeight + 'px';
+  }
+
+  // ── Bracket balance check (simple) ────────────────────────────────────────
+  // Returns true if parens/brackets/braces are balanced (ignoring strings).
+  function isBalanced(text) {
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (const ch of text) {
+      if (escape)         { escape = false; continue; }
+      if (ch === '\\')    { escape = true;  continue; }
+      if (ch === '"')     { inStr = !inStr;  continue; }
+      if (inStr)          continue;
+      if ('([{'.includes(ch)) depth++;
+      if (')]}'.includes(ch)) depth--;
+    }
+    return depth <= 0;
+  }
+
+  // ── Key handling ──────────────────────────────────────────────────────────
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const text = inputEl.value;
+      // Submit if balanced or empty (so the user can submit intentionally).
+      if (!text.trim() || isBalanced(text)) {
+        evalInput(text);
+        inputEl.value = '';
+        resize();
+      } else {
+        // Unbalanced — insert a newline so the user can keep typing.
+        const pos = inputEl.selectionStart;
+        inputEl.value = text.slice(0, pos) + '\n' + text.slice(pos);
+        inputEl.selectionStart = inputEl.selectionEnd = pos + 1;
+        resize();
+      }
+      return;
+    }
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (history.length === 0) return;
+      if (historyIdx === -1) {
+        liveInput = inputEl.value;
+        historyIdx = history.length - 1;
+      } else if (historyIdx > 0) {
+        historyIdx--;
+      }
+      inputEl.value = history[historyIdx];
+      resize();
+      // Move cursor to end.
+      inputEl.selectionStart = inputEl.selectionEnd = inputEl.value.length;
+      return;
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyIdx === -1) return;
+      if (historyIdx < history.length - 1) {
+        historyIdx++;
+        inputEl.value = history[historyIdx];
+      } else {
+        historyIdx = -1;
+        inputEl.value = liveInput;
+      }
+      resize();
+      inputEl.selectionStart = inputEl.selectionEnd = inputEl.value.length;
+      return;
+    }
+  });
+
+  inputEl.addEventListener('input', () => {
+    historyIdx = -1;
+    resize();
+  });
+
+  // ── Clear button ──────────────────────────────────────────────────────────
+  clearBtn.addEventListener('click', () => {
+    // Remove all children except the welcome messages (first 3).
+    while (outputEl.children.length > 3) {
+      outputEl.removeChild(outputEl.lastChild);
+    }
+    inputEl.focus();
+  });
+
+  boot();
+</script>
+</body>
+</html>

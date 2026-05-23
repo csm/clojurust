@@ -5,6 +5,16 @@ on:
     branches: [main]
     paths:
       - "docs/book/**"
+      - "crates/cljrs-wasm/**"
+      - "crates/cljrs-interp/**"
+      - "crates/cljrs-env/**"
+      - "crates/cljrs-builtins/**"
+      - "crates/cljrs-gc/**"
+      - "crates/cljrs-value/**"
+      - "crates/cljrs-reader/**"
+      - "crates/cljrs-types/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
 
 permissions:
@@ -20,7 +30,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build book
+    name: Build book + WASM REPL
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +45,26 @@ jobs:
 
       - name: Build book
         run: mdbook build docs/book
+
+      - name: Install Rust toolchain (wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM REPL
+        run: wasm-pack build crates/cljrs-wasm --target web --no-typescript --release
+
+      - name: Copy WASM files into book
+        run: |
+          mkdir -p docs/book/book/wasm
+          cp crates/cljrs-wasm/pkg/cljrs_wasm.js \
+             crates/cljrs-wasm/pkg/cljrs_wasm_bg.wasm \
+             docs/book/book/wasm/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
