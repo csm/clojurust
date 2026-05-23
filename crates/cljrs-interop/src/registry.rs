@@ -106,8 +106,7 @@ impl Registry {
             panic!("Registry::define_versioned: {qualified:?} has no '/' separator")
         });
         let val = Value::NativeFunction(GcPtr::new(f));
-        self.env
-            .register_native_versioned(ns, sym, commit, val);
+        self.env.register_native_versioned(ns, sym, commit, val);
     }
 
     /// Register `f` into an explicit namespace and name as the implementation
@@ -117,8 +116,7 @@ impl Registry {
     /// string formatting when the parts are already separate.
     pub fn define_in_versioned(&self, ns: &str, name: &str, commit: &str, f: NativeFn) {
         let val = Value::NativeFunction(GcPtr::new(f));
-        self.env
-            .register_native_versioned(ns, name, commit, val);
+        self.env.register_native_versioned(ns, name, commit, val);
     }
 
     /// Access the underlying `GlobalEnv` for operations beyond simple `define`

@@ -107,12 +107,7 @@ pub fn resolve_versioned_symbol(sym: &Symbol, commit: &str, env: &mut Env) -> Ev
 ///
 /// Returns the HEAD `NativeFunction` value (caching it under the requested
 /// commit so later lookups are fast), or a descriptive `EvalError` otherwise.
-fn native_head_fallback(
-    ns_name: &Arc<str>,
-    name: &str,
-    commit: &str,
-    env: &mut Env,
-) -> EvalResult {
+fn native_head_fallback(ns_name: &Arc<str>, name: &str, commit: &str, env: &mut Env) -> EvalResult {
     match env.globals.lookup_in_ns(ns_name, name) {
         Some(val) if matches!(val, Value::NativeFunction(_)) => {
             // The var is a native function with no historical source definition.
@@ -256,8 +251,8 @@ mod tests {
             name: Arc::from("my-fn"),
             version: Some(Arc::from(commit)),
         };
-        let result = super::resolve_versioned_symbol(&sym, commit, &mut env)
-            .expect("should resolve");
+        let result =
+            super::resolve_versioned_symbol(&sym, commit, &mut env).expect("should resolve");
 
         assert!(
             matches!(result, Value::NativeFunction(_)),
@@ -283,7 +278,10 @@ mod tests {
 
         // Confirm the result is now in version_cache.
         let cached = globals.get_cached_versioned("mylib", "cached-fn", commit);
-        assert!(cached.is_some(), "result should be in version_cache after first lookup");
+        assert!(
+            cached.is_some(),
+            "result should be in version_cache after first lookup"
+        );
     }
 
     // ── HEAD fallback ─────────────────────────────────────────────────────────
