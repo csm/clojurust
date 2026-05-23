@@ -37,6 +37,8 @@ src/
   macros.rs      — macro expansion helpers
   syntax_quote.rs — syntax-quote (backtick) expansion
   virtualize.rs  — let-chain virtualization: assoc/conj chains → transients
+  versioned.rs   — versioned symbol resolution: git-source fetch, native version
+                   registry lookup, HEAD fallback for stable native functions
 tests/
   no_gc_eval.rs  — (no-gc mode) integration tests: arithmetic, def/defn provenance,
                    function-call region stack, loop/recur accumulation,

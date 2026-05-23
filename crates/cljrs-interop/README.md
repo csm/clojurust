@@ -151,6 +151,26 @@ pub fn cljrs_init(registry: &mut Registry) {
          :init  "my_project::cljrs_init"}}
 ```
 
+### Versioned symbols and native functions
+
+Clojure code can pin a function to a specific git commit with the
+`name@<hash>` syntax.  For native (Rust-backed) functions, the
+implementation lives in the running binary — we can't fetch and execute a
+historical compiled version.  The current contract is: a versioned
+lookup of a native symbol resolves to the **HEAD** (current)
+implementation regardless of the requested commit.
+
+Resolution order for `my.ns/greet@abc1234`:
+
+1. **Version cache** — already resolved this session → return immediately.
+2. **Git source** — fetch `my/ns.cljrs` at `abc1234`, find `(defn greet …)`, evaluate in snapshot env.
+3. **HEAD fallback** — no Clojure source definition exists (or the namespace has no git context at all) but `greet` is currently a `NativeFunction` → return the HEAD value.
+4. **Error** — symbol not found.
+
+A future design may fetch Rust source at the commit, compile it, and
+`dlopen` the result to provide true per-commit native semantics; that
+codepath would replace the HEAD fallback.
+
 ---
 
 ## Remaining work (Phase 9)
