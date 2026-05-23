@@ -44,6 +44,12 @@ impl EvalResult {
     }
 }
 
+impl Default for Repl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl Repl {
     #[wasm_bindgen(constructor)]
@@ -65,7 +71,7 @@ impl Repl {
                     output: String::new(),
                     result: format!("Read error: {e}"),
                     is_error: true,
-                }
+                };
             }
         };
 
@@ -115,10 +121,10 @@ fn format_error(e: EvalError) -> String {
 }
 
 fn pr_str(globals: &Arc<GlobalEnv>, val: Value) -> String {
-    if let Some(Value::NativeFunction(f)) = globals.lookup_in_ns("clojure.core", "pr-str") {
-        if let Ok(Value::Str(s)) = (f.get().func)(&[val.clone()]) {
-            return s.get().clone();
-        }
+    if let Some(Value::NativeFunction(f)) = globals.lookup_in_ns("clojure.core", "pr-str")
+        && let Ok(Value::Str(s)) = (f.get().func)(std::slice::from_ref(&val))
+    {
+        return s.get().clone();
     }
     format!("{val:?}")
 }

@@ -1,9 +1,9 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::Ordering;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::error::EvalResult;
