@@ -8,3 +8,5 @@ src = "src"
 [output.html]
 git-repository-url = ""
 no-section-label = false
+additional-css = ["repl.css"]
+additional-js = ["repl.js"]

@@ -1,0 +1,137 @@
+/* ── Fixed REPL input bar ──────────────────────────────────────────────────── */
+
+#cljrs-repl-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 20px;
+  background: var(--bg, #1c1d1f);
+  border-top: 1px solid var(--table-border-color, #3a3a3a);
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.25);
+  font-family: 'Source Code Pro', 'Consolas', 'Cascadia Code', 'JetBrains Mono', monospace;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+#cljrs-repl-prompt {
+  color: var(--links, #4aabdb);
+  padding-top: 5px;
+  white-space: nowrap;
+  user-select: none;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+#cljrs-repl-input {
+  flex: 1;
+  min-height: 28px;
+  max-height: 200px;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg, #d4d4d4);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.6;
+  resize: none;
+  padding: 2px 0;
+  caret-color: currentColor;
+  overflow-y: auto;
+}
+
+#cljrs-repl-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+#cljrs-repl-input::placeholder {
+  color: var(--fg, #888);
+  opacity: 0.4;
+}
+
+#cljrs-repl-status {
+  flex-shrink: 0;
+  padding-top: 5px;
+  font-size: 11px;
+  line-height: 1.6;
+  opacity: 0.5;
+  transition: opacity 0.3s, color 0.3s;
+  white-space: nowrap;
+}
+
+#cljrs-repl-status.ready {
+  color: #4caf50;
+  opacity: 1;
+}
+
+#cljrs-repl-status.error {
+  color: #f44747;
+  opacity: 1;
+}
+
+/* ── REPL result entries appended to page content ─────────────────────────── */
+
+.cljrs-repl-divider {
+  margin: 32px 0 16px;
+  border: none;
+  border-top: 1px solid var(--table-border-color, #3a3a3a);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.cljrs-repl-divider::after {
+  content: '— REPL session —';
+  font-size: 11px;
+  color: var(--fg, #888);
+  opacity: 0.5;
+  white-space: nowrap;
+  font-family: 'Source Code Pro', 'Consolas', monospace;
+}
+
+.cljrs-repl-entry {
+  margin: 12px 0;
+  font-family: 'Source Code Pro', 'Consolas', 'Cascadia Code', 'JetBrains Mono', monospace;
+  font-size: 0.88em;
+  line-height: 1.55;
+  border-left: 3px solid var(--links, #4aabdb);
+  padding: 4px 0 4px 14px;
+  border-radius: 0 3px 3px 0;
+}
+
+.cljrs-repl-in {
+  color: var(--links, #4aabdb);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cljrs-repl-in::before {
+  content: 'user=> ';
+  opacity: 0.6;
+}
+
+.cljrs-repl-print {
+  color: var(--fg, #d4d4d4);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 1px;
+}
+
+.cljrs-repl-out {
+  color: #b5cea8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 1px;
+}
+
+.cljrs-repl-err {
+  color: #f44747;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 1px;
+}
