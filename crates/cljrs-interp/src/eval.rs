@@ -167,8 +167,15 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
 
     // Explicit version suffix (`name@hash` or `ns/name@hash`): always a
     // namespace-level lookup — no local-frame fallback.
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(ref commit) = sym.version.clone() {
         return crate::versioned::resolve_versioned_symbol(&sym, commit, env);
+    }
+    #[cfg(target_arch = "wasm32")]
+    if sym.version.is_some() {
+        return Err(cljrs_env::error::EvalError::Runtime(
+            "versioned symbols are not supported in WASM".to_string(),
+        ));
     }
 
     // Local frames (params, let-bindings, closed-over vars) take priority for
@@ -180,6 +187,7 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
     // Inherited versioned context: if we are evaluating inside a versioned
     // function body, unversioned same-namespace symbols resolve at the inherited
     // commit rather than HEAD.
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(commit) = env.versioned_eval_commit.clone() {
         let is_same_ns =
             sym.namespace.is_none() || sym.namespace.as_deref() == Some(env.current_ns.as_ref());

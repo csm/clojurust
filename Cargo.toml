@@ -21,7 +21,8 @@ members = [
     "crates/cljrs-ir-viz",
     "crates/cljrs-deps",
     "crates/cljrs-vcs",
-    "crates/cljrs-blake3"]
+    "crates/cljrs-blake3",
+    "crates/cljrs-wasm"]
 resolver = "2"
 
 [workspace.package]
