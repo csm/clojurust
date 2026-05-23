@@ -491,7 +491,12 @@ fn eval_source(src: &str, filename: &str, globals: Arc<GlobalEnv>) -> miette::Re
 }
 
 /// Run a source file: evaluate all top-level forms, then call `-main` if defined.
-fn run_source(src: &str, filename: &str, globals: Arc<GlobalEnv>, args: &[String]) -> miette::Result<()> {
+fn run_source(
+    src: &str,
+    filename: &str,
+    globals: Arc<GlobalEnv>,
+    args: &[String],
+) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)?;
     call_main_if_defined(&mut env, args)?;
@@ -502,8 +507,7 @@ fn run_source(src: &str, filename: &str, globals: Arc<GlobalEnv>, args: &[String
 /// individual string arguments. Silently skips if `-main` is not defined.
 fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
     // resolve returns nil for undefined symbols; swallow lookup errors defensively.
-    let resolved = eval_in(env, "(resolve '-main)", "<main-check>")
-        .unwrap_or(Value::Nil);
+    let resolved = eval_in(env, "(resolve '-main)", "<main-check>").unwrap_or(Value::Nil);
     if resolved == Value::Nil {
         return Ok(());
     }
