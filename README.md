@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/cljrs.svg)](https://crates.io/crates/cljrs)
 [![docs](https://img.shields.io/badge/docs-docs.clj.rs-blue)](https://docs.clj.rs)
-[![main](https://img.shields.io/badge/main-clj.rs-gray)](https://clj.rs)
+[![main](https://img.shields.io/badge/main-clj.rs-yellow)](https://clj.rs)
 
 A Rust-hosted dialect of the Clojure programming language.
 
