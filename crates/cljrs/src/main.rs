@@ -554,7 +554,13 @@ fn native_lib_path(crate_dir: &Path, crate_name: &str, release: bool) -> PathBuf
 /// is expected to fall back to `<crate_dir>/target`.
 fn cargo_target_dir(crate_dir: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps", "--offline"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
         .current_dir(crate_dir)
         .output()
         .ok()?;
