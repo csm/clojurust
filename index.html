@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>clj.rs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inconsolata:wght@200..900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Iosevka+Extended:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Gruvbox palette ────────────────────────────────────── */
+    :root {
+      color-scheme: light dark;
+
+      /* dark mode (default) */
+      --bg0-h:   #1d2021;
+      --bg0:     #282828;
+      --bg1:     #3c3836;
+      --bg2:     #504945;
+      --fg:      #ebdbb2;
+      --fg2:     #d5c4a1;
+      --fg3:     #bdae93;
+      --gray:    #928374;
+      --red:     #cc241d;
+      --red-b:   #fb4934;
+      --green:   #98971a;
+      --green-b: #b8bb26;
+      --yellow:  #d79921;
+      --yellow-b:#fabd2f;
+      --blue:    #458588;
+      --blue-b:  #83a598;
+      --purple:  #b16286;
+      --purple-b:#d3869b;
+      --aqua:    #689d6a;
+      --aqua-b:  #8ec07c;
+      --orange:  #d65d0e;
+      --orange-b:#fe8019;
+
+      --surface:   var(--bg0);
+      --surface1:  var(--bg1);
+      --surface2:  var(--bg2);
+      --text:      var(--fg);
+      --text-dim:  var(--fg3);
+      --text-faint:var(--gray);
+      --accent:    var(--yellow-b);
+      --accent2:   var(--aqua-b);
+      --accent3:   var(--orange-b);
+      --link:      var(--blue-b);
+      --link-hover:var(--aqua-b);
+      --rule:      var(--bg2);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --surface:   #f9f5d7;   /* gruvbox light bg0_h */
+        --surface1:  #f2e5bc;   /* bg0 */
+        --surface2:  #ebdbb2;   /* bg1 */
+        --text:      #3c3836;
+        --text-dim:  #504945;
+        --text-faint:#7c6f64;
+        --accent:    #b57614;   /* yellow dark */
+        --accent2:   #427b58;   /* aqua dark */
+        --accent3:   #af3a03;   /* orange dark */
+        --link:      #076678;   /* blue dark */
+        --link-hover:#427b58;
+        --rule:      #d5c4a1;
+      }
+    }
+
+    /* ── Reset & base ───────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      font-size: 16px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    body {
+      font-family: 'Inconsolata', 'Iosevka Extended', 'Fira Code', 'Source Code Pro',
+                   'JetBrains Mono', 'Cascadia Code', ui-monospace,
+                   'Menlo', 'Consolas', monospace;
+      line-height: 1.65;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────── */
+    .wrapper {
+      max-width: 740px;
+      margin: 0 auto;
+      padding: 3.5rem 1.5rem 5rem;
+    }
+
+    @media (min-width: 900px) {
+      .wrapper {
+        padding: 5rem 0 6rem;
+      }
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      margin-bottom: 3rem;
+      border-bottom: 1px solid var(--rule);
+      padding-bottom: 1.5rem;
+    }
+
+    .site-title {
+      font-size: clamp(1.8rem, 5vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--accent);
+      line-height: 1.1;
+    }
+
+    .site-title span { color: var(--text-dim); }
+
+    .tagline {
+      margin-top: 0.6rem;
+      font-size: 0.9rem;
+      color: var(--text-faint);
+    }
+
+    /* ── Sections ───────────────────────────────────────────── */
+    section {
+      margin-bottom: 2.8rem;
+    }
+
+    .section-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      margin-bottom: 0.75rem;
+    }
+
+    .section-label::before {
+      content: '## ';
+      color: var(--accent2);
+    }
+
+    p {
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      max-width: 62ch;
+    }
+
+    p + p { margin-top: 0.75rem; }
+
+    /* ── Code / inline ───────────────────────────────────────── */
+    code {
+      background: var(--surface2);
+      color: var(--accent3);
+      padding: 0.1em 0.35em;
+      border-radius: 2px;
+      font-size: 0.88em;
+    }
+
+    /* ── Link list ──────────────────────────────────────────── */
+    .link-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+    }
+
+    .link-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+    }
+
+    .link-list li::before {
+      content: '->';
+      color: var(--accent2);
+      flex-shrink: 0;
+      font-size: 0.85rem;
+    }
+
+    .link-list a {
+      color: var(--link);
+      text-decoration: none;
+      font-size: 0.92rem;
+      transition: color 0.12s;
+    }
+
+    .link-list a:hover,
+    .link-list a:focus-visible {
+      color: var(--link-hover);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .link-list .desc {
+      color: var(--text-faint);
+      font-size: 0.82rem;
+    }
+
+    .link-list .desc::before { content: ';; '; }
+
+    /* ── Inline badge ────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      padding: 0.1em 0.45em;
+      border-radius: 2px;
+      vertical-align: middle;
+      font-weight: 700;
+    }
+
+    .badge-alpha {
+      background: var(--surface2);
+      color: var(--orange-b, #fe8019);
+    }
+
+    /* ── Divider ─────────────────────────────────────────────── */
+    hr {
+      border: none;
+      border-top: 1px solid var(--rule);
+      margin: 2.5rem 0;
+    }
+
+    /* ── Footer ─────────────────────────────────────────────── */
+    footer {
+      margin-top: 4rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--rule);
+      font-size: 0.78rem;
+      color: var(--text-faint);
+    }
+
+    footer a {
+      color: var(--text-faint);
+      text-decoration: none;
+    }
+
+    footer a:hover { color: var(--link-hover); }
+
+    /* ── Focus outline ──────────────────────────────────────── */
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+
+    <header>
+      <div class="site-title">cljrs <span class="badge badge-alpha">alpha</span></div>
+      <div class="tagline">a Clojure dialect implemented in Rust</div>
+    </header>
+
+    <section>
+      <div class="section-label">about</div>
+      <p>
+        cljrs is an experimental Clojure dialect targeting the Rust ecosystem.
+        It aims to be a capable Lisp runtime with persistent data structures,
+        a hosted macro system, and native interop — compiled or interpreted,
+        suitable for use as an agentic coding runtime.
+      </p>
+      <p>
+        Available on <code>crates.io</code>. Early stage; expect rough edges.
+      </p>
+    </section>
+
+    <section>
+      <div class="section-label">get it</div>
+      <ul class="link-list">
+        <li>
+          <a href="https://crates.io/crates/cljrs" target="_blank" rel="noopener">crates.io/crates/cljrs</a>
+          <span class="desc">published crate</span>
+        </li>
+        <li>
+          <a href="https://github.com/csm/clojurust" target="_blank" rel="noopener">github.com/csm/clojurust</a>
+          <span class="desc">source repository</span>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <div class="section-label">docs &amp; resources</div>
+      <ul class="link-list">
+        <li>
+          <a href="https://docs.clj.rs" >docs.clj.rs</a>
+          <span class="desc">language reference</span>
+        </li>
+      </ul>
+    </section>
+
+    <footer>
+      <span>clj.rs &mdash; open source &mdash; </span>
+      <a href="https://github.com/csm/clojurust/blob/main/COPYING.md" target="_blank" rel="noopener">license</a>
+    </footer>
+
+  </div>
+</body>
+</html>
