@@ -6,6 +6,13 @@ description = "BLAKE3 cryptographic hash functions exposed as Clojure native fun
 license.workspace = true
 repository.workspace = true
 
+[lib]
+# `cdylib` produces the `.so`/`.dylib`/`.dll` loaded dynamically by
+# `cljrs run` / `cljrs repl` after `cljrs build-native`.
+# `rlib` keeps the crate usable as a normal Rust workspace member —
+# integration tests and AOT static linking both depend on it.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 cljrs-interop = { workspace = true }
 cljrs-gc      = { workspace = true }
