@@ -2,7 +2,7 @@
 //! namespace against the native `blake3` functions registered by this crate.
 //!
 //! The test:
-//! 1. Calls `cljrs_blake3::cljrs_init` to register the `blake3` namespace.
+//! 1. Calls `cljrs_blake3::register` to register the `blake3` namespace.
 //! 2. Loads the standard environment with the crate's `test/` directory on
 //!    the source path so `(require 'cljrs.blake3-test)` resolves.
 //! 3. Drives `clojure.test/run-tests` and fails if any assertion fails.
@@ -67,7 +67,7 @@ fn run_clojure_blake3_tests() {
 
     // Register blake3 native functions before any Clojure code is evaluated.
     let mut registry = Registry::new(globals.clone());
-    cljrs_blake3::cljrs_init(&mut registry);
+    cljrs_blake3::register(&mut registry);
 
     let mut env = Env::new(globals, "user");
 
