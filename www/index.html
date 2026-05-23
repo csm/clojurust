@@ -313,6 +313,28 @@
     #repl-status.ready { color: var(--green-b); opacity: 1; }
     #repl-status.err   { color: var(--red-b);   opacity: 1; }
 
+    #repl-eval {
+      flex-shrink: 0;
+      padding: 2px 10px;
+      background: var(--surface2);
+      color: var(--accent2);
+      border: 1px solid var(--bg2);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      line-height: 1.65;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+      white-space: nowrap;
+    }
+
+    #repl-eval:hover:not(:disabled) {
+      background: var(--bg2);
+      color: var(--text);
+    }
+
+    #repl-eval:disabled { opacity: 0.3; cursor: not-allowed; }
+
     /* ── REPL result entries ─────────────────────────────────── */
     .repl-divider {
       border: none;
@@ -411,6 +433,7 @@
         placeholder="Loading REPL…"
         aria-label="Clojure REPL input"
       ></textarea>
+      <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
       <span id="repl-status">loading…</span>
     </div>
   </div>
@@ -430,6 +453,7 @@
 
     var input  = document.getElementById('repl-input');
     var status = document.getElementById('repl-status');
+    var btn    = document.getElementById('repl-eval');
     var out    = document.getElementById('repl-out');
 
     // ── Auto-resize textarea ──────────────────────────────────
@@ -482,6 +506,21 @@
       entry.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }
 
+    // ── Evaluate current input ────────────────────────────────
+    function evalInput() {
+      var code = input.value;
+      if (!code.trim() || !repl) return;
+      if (history[history.length - 1] !== code) history.push(code);
+      historyIdx = -1;
+      liveDraft = '';
+      var res = repl.eval(code);
+      appendEntry(code, res.output, res.result, res.is_error);
+      input.value = '';
+      resize();
+    }
+
+    btn.addEventListener('click', evalInput);
+
     // ── Keyboard handling ─────────────────────────────────────
     input.addEventListener('input', resize);
     input.addEventListener('keydown', function (e) {
@@ -499,15 +538,7 @@
       // Shift+Enter → evaluate
       if (e.key === 'Enter' && e.shiftKey) {
         e.preventDefault();
-        var code = input.value;
-        if (!code.trim() || !repl) return;
-        if (history[history.length - 1] !== code) history.push(code);
-        historyIdx = -1;
-        liveDraft = '';
-        var res = repl.eval(code);
-        appendEntry(code, res.output, res.result, res.is_error);
-        input.value = '';
-        resize();
+        evalInput();
         return;
       }
 
@@ -547,7 +578,8 @@
       }).then(function (mod) {
         repl = new mod.Repl();
         input.disabled = false;
-        input.placeholder = '(+ 1 2)  —  Shift+Enter to eval  ·  Tab to indent  ·  ↑↓ history';
+        btn.disabled = false;
+        input.placeholder = '(+ 1 2)  —  eval button or Shift+Enter  ·  Tab to indent  ·  ↑↓ history';
         status.textContent = '● ready';
         status.className = 'ready';
         input.focus();
