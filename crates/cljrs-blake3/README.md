@@ -28,9 +28,14 @@ cljrs.edn                         — project descriptor (paths, Rust init hook)
 ### Rust
 
 ```rust
-/// Register all `blake3` Clojure functions. Call from an embedding `main.rs`
-/// or from another crate's `cljrs_init`.
-pub fn cljrs_init(registry: &mut cljrs_interop::Registry);
+/// Register all `blake3` Clojure functions. Call from an embedding `main.rs`,
+/// from an integration test, or from another crate's init hook.
+pub fn register(registry: &mut cljrs_interop::Registry);
+
+/// C-ABI entry point looked up by `cljrs build-native` / `cljrs run`. Calls
+/// `register` internally.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cljrs_init(registry: *mut cljrs_interop::Registry);
 ```
 
 ### Clojure namespace: `blake3`
@@ -88,14 +93,20 @@ Add to your `cljrs.edn`:
          :init  "cljrs_blake3::cljrs_init"}}
 ```
 
-Or call `cljrs_init` directly in your own `cljrs_init` function:
+Or call `register` directly from your own init hook:
 
 ```rust
 pub fn cljrs_init(registry: &mut Registry) {
-    cljrs_blake3::cljrs_init(registry);
+    cljrs_blake3::register(registry);
     // … your own registrations …
 }
 ```
+
+> **Note on `Cargo.toml`:** this crate declares
+> `[lib] crate-type = ["cdylib", "rlib"]` — `cdylib` produces the
+> `.so`/`.dylib`/`.dll` loaded by `cljrs build-native`, while `rlib` keeps
+> the crate usable as a normal workspace dependency (integration tests, AOT
+> static linking). When wiring up your own interop crate, mirror this setup.
 
 ---
 

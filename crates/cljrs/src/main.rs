@@ -529,6 +529,13 @@ fn format_eval_error(e: EvalError) -> miette::Report {
 
 /// Return the expected on-disk path for the shared library produced by
 /// `cargo build` inside `crate_dir`.
+///
+/// Respects cargo's workspace semantics: when `crate_dir` is a workspace
+/// member, cargo writes artifacts to `<workspace_root>/target/`, not
+/// `<crate_dir>/target/`. We ask cargo where its target directory is via
+/// `cargo metadata`. If that fails (no cargo on PATH, malformed manifest,
+/// etc.), we fall back to `<crate_dir>/target/` so the standalone-crate
+/// case still works.
 fn native_lib_path(crate_dir: &Path, crate_name: &str, release: bool) -> PathBuf {
     let profile = if release { "release" } else { "debug" };
     let lib_file = if cfg!(target_os = "windows") {
@@ -538,7 +545,76 @@ fn native_lib_path(crate_dir: &Path, crate_name: &str, release: bool) -> PathBuf
     } else {
         format!("lib{crate_name}.so")
     };
-    crate_dir.join("target").join(profile).join(lib_file)
+    let target_dir = cargo_target_dir(crate_dir).unwrap_or_else(|| crate_dir.join("target"));
+    target_dir.join(profile).join(lib_file)
+}
+
+/// Ask `cargo metadata` for the target directory that cargo will actually use
+/// when building inside `crate_dir`. Returns `None` on any failure; the caller
+/// is expected to fall back to `<crate_dir>/target`.
+fn cargo_target_dir(crate_dir: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .current_dir(crate_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    // Cargo's metadata JSON puts `target_directory` at the top level. We do
+    // a small targeted extract rather than pulling in a JSON dependency.
+    let key = r#""target_directory":""#;
+    let start = stdout.find(key)? + key.len();
+    let rest = &stdout[start..];
+    let mut end = None;
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'"' => {
+                end = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let raw = &rest[..end?];
+    Some(PathBuf::from(json_unescape(raw)))
+}
+
+/// Decode the small subset of JSON string escapes that can appear in a
+/// `target_directory` path emitted by `cargo metadata`.
+fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Load the shared library declared by `rust_config` and call its `cljrs_init`
