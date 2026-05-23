@@ -78,6 +78,9 @@ enum Commands {
         /// GC hard memory limit in MB (forces collection when exceeded).
         #[arg(long)]
         gc_hard_limit_mb: Option<usize>,
+        /// Arguments forwarded to -main (everything after `--`).
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
     /// Start an interactive REPL.
     Repl {
@@ -288,13 +291,14 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             src_paths,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
+            args,
         } => {
             let src = std::fs::read_to_string(&file)
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
             let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
-            run_source(&src, &filename, globals)?;
+            run_source(&src, &filename, globals, &args)?;
             Ok(0)
         }
         Commands::Repl {
@@ -486,11 +490,45 @@ fn eval_source(src: &str, filename: &str, globals: Arc<GlobalEnv>) -> miette::Re
     eval_in(&mut env, src, filename)
 }
 
-/// Run a source file: evaluate all top-level forms, print nothing on success.
-fn run_source(src: &str, filename: &str, globals: Arc<GlobalEnv>) -> miette::Result<()> {
+/// Run a source file: evaluate all top-level forms, then call `-main` if defined.
+fn run_source(src: &str, filename: &str, globals: Arc<GlobalEnv>, args: &[String]) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
     eval_in(&mut env, src, filename)?;
+    call_main_if_defined(&mut env, args)?;
     Ok(())
+}
+
+/// Call `-main` in the current namespace if it is defined, passing `args` as
+/// individual string arguments. Silently skips if `-main` is not defined.
+fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
+    // resolve returns nil for undefined symbols; swallow lookup errors defensively.
+    let resolved = eval_in(env, "(resolve '-main)", "<main-check>")
+        .unwrap_or(Value::Nil);
+    if resolved == Value::Nil {
+        return Ok(());
+    }
+    let escaped: Vec<String> = args.iter().map(|s| escape_clojure_string(s)).collect();
+    let call = format!("(-main {})", escaped.join(" "));
+    eval_in(env, &call, "<main>")?;
+    Ok(())
+}
+
+/// Produce a Clojure string literal (double-quoted, with escapes) for `s`.
+fn escape_clojure_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Evaluate `src` in an existing `Env`. Returns the last value.

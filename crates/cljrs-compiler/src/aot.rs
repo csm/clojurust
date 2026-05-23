@@ -778,6 +778,53 @@ cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
     }
 
     // Write main.rs — calls into the compiled __cljrs_main.
+
+    // Generated Rust block that calls -main after the compiled body runs.
+    // Uses resolve to check existence, then builds and evals the call expression.
+    let main_call_code = r#"
+    // Call -main if defined, forwarding command-line arguments (skip program name).
+    {
+        let __argv: Vec<String> = std::env::args().skip(1).collect();
+        let __check = cljrs_reader::Parser::new(
+            "(resolve '-main)".to_string(),
+            "<main-check>".to_string(),
+        )
+        .parse_all()
+        .ok()
+        .and_then(|fs| cljrs_eval::eval(&fs[0], &mut env).ok());
+        if let Some(r) = __check {
+            if r != cljrs_value::Value::Nil {
+                let escaped: Vec<String> = __argv
+                    .iter()
+                    .map(|a| {
+                        let mut s = String::with_capacity(a.len() + 2);
+                        s.push('"');
+                        for ch in a.chars() {
+                            match ch {
+                                '"' => s.push_str("\\\""),
+                                '\\' => s.push_str("\\\\"),
+                                '\n' => s.push_str("\\n"),
+                                '\r' => s.push_str("\\r"),
+                                '\t' => s.push_str("\\t"),
+                                c => s.push(c),
+                            }
+                        }
+                        s.push('"');
+                        s
+                    })
+                    .collect();
+                let call = format!("(-main {})", escaped.join(" "));
+                if let Ok(fs) = cljrs_reader::Parser::new(call, "<main>".to_string()).parse_all() {
+                    if let Err(e) = cljrs_eval::eval(&fs[0], &mut env) {
+                        eprintln!("cljrs: error in -main: {e:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+"#;
+
     let preamble_code = if has_preamble {
         r#"
     // Evaluate interpreted preamble (ns, require, defn, defmacro, etc.).
@@ -839,7 +886,7 @@ fn main() {{
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
-
+{main_call}
     // Pop the eval context.
     cljrs_env::callback::pop_eval_context();
 
@@ -850,6 +897,7 @@ fn main() {{
         preamble = preamble_code,
         bundled = bundled_registration,
         native_init = native_init_code,
+        main_call = main_call_code,
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
 
