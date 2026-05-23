@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-reader"
-version = "0.1.0"
+version = "0.1.69"
 edition = "2024"
 description = "Lexer and parser producing Form AST nodes for clojurust"
 license.workspace = true
