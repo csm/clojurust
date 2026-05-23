@@ -30,12 +30,32 @@ src/
 | `deps fetch`  | Clone / update git dependencies declared in `cljrs.edn`                |
 | `deps status` | Show which dependencies are cached and which are missing               |
 
+### -main entry point
+
+After all top-level forms in the source file are evaluated, `cljrs run` looks
+up `-main` in the current namespace.  If the var exists it is called with the
+arguments that follow `--` on the command line, each as an individual string:
+
+```bash
+cljrs run app.cljrs -- hello world   # calls (-main "hello" "world")
+cljrs run app.cljrs                  # calls (-main) if -main is defined
+```
+
+The same convention applies to AOT binaries produced by `cljrs compile`: the
+compiled binary calls `-main` after `__cljrs_main` finishes, passing all
+`argv` entries (skipping the program name) as individual string arguments.
+
+If `-main` is not defined the program exits normally without error.
+
 ### Per-subcommand flags
 
 `run`, `repl`, `compile`, `test` accept:
 - `--src-path <DIR>` — repeatable; directories searched by `require`
 - `--gc-soft-limit-mb <MB>` — soft GC threshold
 - `--gc-hard-limit-mb <MB>` — hard GC threshold
+
+`run` additionally accepts:
+- `[-- ARGS…]` — positional arguments forwarded verbatim to `-main`
 
 `compile` additionally accepts:
 - `-o, --out <PATH>` — output binary path (required)
@@ -82,6 +102,7 @@ These appear before the subcommand and apply to every command:
 # Interpret a file
 cljrs run hello.cljrs
 cljrs run main.cljrs --src-path src --src-path lib
+cljrs run app.cljrs -- arg1 arg2    # args forwarded to -main
 
 # REPL
 cljrs repl --src-path src
