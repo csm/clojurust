@@ -125,15 +125,6 @@ impl Registry {
     /// Register f into an explicit namespace under a plain name.
     pub fn define_in(&self, ns: &str, name: &str, f: NativeFn);
 
-    /// Register f as the implementation of "my.ns/my-fn" at a specific git commit.
-    /// Used when a native function's behaviour changes between commits and callers
-    /// may use versioned symbols (`my.ns/my-fn@<hash>`) to pin to a specific version.
-    /// Checked before git-source lookup and before the HEAD fallback.
-    pub fn define_versioned(&self, qualified: &str, commit: &str, f: NativeFn);
-
-    /// Like define_versioned but with ns and name already separated.
-    pub fn define_in_versioned(&self, ns: &str, name: &str, commit: &str, f: NativeFn);
-
     /// Access the underlying GlobalEnv for advanced operations.
     pub fn env(&self) -> &Arc<GlobalEnv>;
 }
@@ -162,28 +153,23 @@ pub fn cljrs_init(registry: &mut Registry) {
 
 ### Versioned symbols and native functions
 
-Clojure code can pin a native function to a specific git commit with the
-`name@<hash>` syntax.  Resolution order for `my.ns/greet@abc1234`:
+Clojure code can pin a function to a specific git commit with the
+`name@<hash>` syntax.  For native (Rust-backed) functions, the
+implementation lives in the running binary — we can't fetch and execute a
+historical compiled version.  The current contract is: a versioned
+lookup of a native symbol resolves to the **HEAD** (current)
+implementation regardless of the requested commit.
+
+Resolution order for `my.ns/greet@abc1234`:
 
 1. **Version cache** — already resolved this session → return immediately.
-2. **Explicit native registry** — `define_versioned` was called for this `(name, commit)` pair → return that binding.
-3. **Git source** — fetch `my/ns.cljrs` at `abc1234`, find `(defn greet …)`, evaluate in snapshot env.
-4. **HEAD fallback** — no Clojure source definition exists but `greet` is currently a `NativeFunction` → return the HEAD value.  Suitable for stable native functions whose behaviour doesn't change between commits.
-5. **Error** — symbol not found.
+2. **Git source** — fetch `my/ns.cljrs` at `abc1234`, find `(defn greet …)`, evaluate in snapshot env.
+3. **HEAD fallback** — no Clojure source definition exists (or the namespace has no git context at all) but `greet` is currently a `NativeFunction` → return the HEAD value.
+4. **Error** — symbol not found.
 
-Register an explicit versioned binding when the native implementation evolves
-and reproducibility across commits matters:
-
-```rust
-pub fn cljrs_init(registry: &mut Registry) {
-    registry.define("my.project/greet",
-        wrap_fn1("greet", |name: String| Ok::<String, String>(format!("Hello, {name}!"))));
-
-    // Pin the v1 behaviour at the commit where it was introduced.
-    registry.define_versioned("my.project/greet", "abc1234def56",
-        wrap_fn1("greet", |name: String| Ok::<String, String>(format!("hi {name}"))));
-}
-```
+A future design may fetch Rust source at the commit, compile it, and
+`dlopen` the result to provide true per-commit native semantics; that
+codepath would replace the HEAD fallback.
 
 ---
 

@@ -88,37 +88,6 @@ impl Registry {
             .intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(f)));
     }
 
-    /// Register `f` as the implementation of `"my.ns/my-fn"` at a specific git
-    /// commit hash.
-    ///
-    /// Use this when the Rust implementation of a function changes between
-    /// commits and callers may use versioned symbols (`my.ns/my-fn@<hash>`) to
-    /// pin to a particular behaviour.  Versioned symbol resolution checks this
-    /// registry before falling back to git source lookup or the HEAD value.
-    ///
-    /// `commit` must be the full or abbreviated commit hash (the same string
-    /// used in the `@<hash>` symbol suffix).
-    ///
-    /// Panics if `qualified` contains no `/`; use [`define_in_versioned`][Self::define_in_versioned]
-    /// when the parts are already separate.
-    pub fn define_versioned(&self, qualified: &str, commit: &str, f: NativeFn) {
-        let (ns, sym) = split_qualified(qualified).unwrap_or_else(|| {
-            panic!("Registry::define_versioned: {qualified:?} has no '/' separator")
-        });
-        let val = Value::NativeFunction(GcPtr::new(f));
-        self.env.register_native_versioned(ns, sym, commit, val);
-    }
-
-    /// Register `f` into an explicit namespace and name as the implementation
-    /// at a specific git commit hash.
-    ///
-    /// Equivalent to `define_versioned("ns/name", commit, f)` but avoids
-    /// string formatting when the parts are already separate.
-    pub fn define_in_versioned(&self, ns: &str, name: &str, commit: &str, f: NativeFn) {
-        let val = Value::NativeFunction(GcPtr::new(f));
-        self.env.register_native_versioned(ns, name, commit, val);
-    }
-
     /// Access the underlying `GlobalEnv` for operations beyond simple `define`
     /// (e.g. registering builtin namespace sources, setting aliases).
     pub fn env(&self) -> &Arc<GlobalEnv> {

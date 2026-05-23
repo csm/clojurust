@@ -4,6 +4,17 @@
 //! happening inside a versioned namespace body — this module fetches the
 //! historical source from git and evaluates the relevant definition in a
 //! snapshot environment.
+//!
+//! ## Native (Rust-backed) functions
+//!
+//! Native functions registered via `cljrs-interop::Registry` have no
+//! Clojure source to fetch, and the binary is a single unit at runtime —
+//! we can't "go back in time" to a previous compiled implementation.
+//! The current contract is: versioned lookups of a native symbol resolve
+//! to the HEAD (current) implementation regardless of the requested
+//! commit.  A future design may fetch Rust source at the commit, compile
+//! it, and `dlopen` the result; that path would slot in where
+//! `native_head_fallback` is invoked today.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,18 +50,9 @@ pub fn resolve_versioned_symbol(sym: &Symbol, commit: &str, env: &mut Env) -> Ev
 
     let name = sym.name.as_ref();
 
-    // Cache check — covers both Clojure-defined and native-versioned bindings.
+    // Cache check.
     if let Some(cached) = env.globals.get_cached_versioned(&ns_name, name, commit) {
         return Ok(cached);
-    }
-
-    // Explicit native version registry: populated by Registry::define_versioned.
-    // Checked before git-source lookup so that native-only namespaces (with no
-    // Clojure source file) can still resolve versioned symbols.
-    if let Some(native_val) = env.globals.get_native_versioned(&ns_name, name, commit) {
-        env.globals
-            .cache_versioned(&ns_name, name, commit, native_val.clone());
-        return Ok(native_val);
     }
 
     // Get git context for the owning namespace.  If the namespace hasn't been
@@ -101,18 +103,20 @@ pub fn resolve_versioned_symbol(sym: &Symbol, commit: &str, env: &mut Env) -> Ev
     Ok(val)
 }
 
-/// Fall back to the HEAD value for a native Rust function when no explicit
-/// versioned binding has been registered and no Clojure source definition
-/// exists for the symbol at the requested commit.
+/// Fall back to the HEAD value for a native Rust function when no Clojure
+/// source definition exists for the symbol at the requested commit.
+///
+/// Native functions live in the running binary; we can't fetch and execute a
+/// historical compiled implementation, so versioned lookups of a native
+/// symbol resolve to the current implementation.  A future design may
+/// fetch Rust source at `commit`, compile it, and `dlopen` the result —
+/// that codepath would replace this fallback.
 ///
 /// Returns the HEAD `NativeFunction` value (caching it under the requested
 /// commit so later lookups are fast), or a descriptive `EvalError` otherwise.
 fn native_head_fallback(ns_name: &Arc<str>, name: &str, commit: &str, env: &mut Env) -> EvalResult {
     match env.globals.lookup_in_ns(ns_name, name) {
         Some(val) if matches!(val, Value::NativeFunction(_)) => {
-            // The var is a native function with no historical source definition.
-            // Return the current (HEAD) implementation and cache it for this
-            // commit so repeated versioned lookups are O(1).
             env.globals
                 .cache_versioned(ns_name, name, commit, val.clone());
             Ok(val)
@@ -233,67 +237,17 @@ mod tests {
         }
     }
 
-    // ── Explicit versioned native registry ────────────────────────────────────
-
-    /// define_versioned + versioned symbol lookup returns the registered value.
-    #[test]
-    fn explicit_versioned_native_roundtrip() {
-        let (globals, mut env) = make_env("mylib");
-        let commit = fake_commit();
-
-        // Register an explicit versioned binding (simulates Registry::define_versioned).
-        let val = Value::NativeFunction(GcPtr::new(const_native(42)));
-        globals.register_native_versioned("mylib", "my-fn", commit, val);
-
-        // Resolve the versioned symbol.
-        let sym = cljrs_value::Symbol {
-            namespace: Some(Arc::from("mylib")),
-            name: Arc::from("my-fn"),
-            version: Some(Arc::from(commit)),
-        };
-        let result =
-            super::resolve_versioned_symbol(&sym, commit, &mut env).expect("should resolve");
-
-        assert!(
-            matches!(result, Value::NativeFunction(_)),
-            "expected NativeFunction, got {result:?}"
-        );
-    }
-
-    /// A second lookup hits the version_cache, not the native_version_registry again.
-    #[test]
-    fn explicit_versioned_native_is_cached() {
-        let (globals, mut env) = make_env("mylib");
-        let commit = fake_commit();
-
-        let val = Value::NativeFunction(GcPtr::new(const_native(7)));
-        globals.register_native_versioned("mylib", "cached-fn", commit, val);
-
-        let sym = cljrs_value::Symbol {
-            namespace: Some(Arc::from("mylib")),
-            name: Arc::from("cached-fn"),
-            version: Some(Arc::from(commit)),
-        };
-        super::resolve_versioned_symbol(&sym, commit, &mut env).unwrap();
-
-        // Confirm the result is now in version_cache.
-        let cached = globals.get_cached_versioned("mylib", "cached-fn", commit);
-        assert!(
-            cached.is_some(),
-            "result should be in version_cache after first lookup"
-        );
-    }
-
     // ── HEAD fallback ─────────────────────────────────────────────────────────
 
-    /// When no explicit versioned entry exists but the var is a NativeFunction at
-    /// HEAD, resolve_versioned_symbol returns the HEAD value rather than erroring.
+    /// When a versioned symbol is requested for a native function, the HEAD
+    /// implementation is returned (no Clojure source exists at the commit).
     #[test]
-    fn head_fallback_for_unregistered_commit() {
+    fn head_fallback_for_native_function() {
         let (globals, mut env) = make_env("mylib");
         let commit = "deadbeef01234";
 
-        // Register the function at HEAD (no versioned entry for this commit).
+        // Register the function at HEAD.  No Clojure source exists for mylib
+        // at any commit, so the git-context path will fail.
         let nf = const_native(99);
         globals.intern(
             "mylib",
@@ -306,16 +260,15 @@ mod tests {
             name: Arc::from("stable-fn"),
             version: Some(Arc::from(commit)),
         };
-        // This should succeed via HEAD fallback even though no Clojure source
-        // exists for mylib at this commit.
         let result = super::resolve_versioned_symbol(&sym, commit, &mut env)
             .expect("HEAD fallback should succeed");
 
         assert!(matches!(result, Value::NativeFunction(_)));
     }
 
-    /// When the symbol doesn't exist at all (neither versioned nor HEAD), we get
-    /// an UnboundSymbol error — not a confusing "Cannot find definition" message.
+    /// When the symbol doesn't exist anywhere, we get UnboundSymbol — not the
+    /// confusing "Cannot find definition" message that the bare git-source
+    /// path would produce.
     #[test]
     fn missing_symbol_gives_unbound_error() {
         let (_globals, mut env) = make_env("mylib");

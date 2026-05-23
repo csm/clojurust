@@ -99,12 +99,6 @@ pub struct GlobalEnv {
     /// Key format: `"<ns>/<name>@<commit>"` for individual vars,
     /// or `"<ns>@<commit>"` for whole versioned namespaces.
     pub version_cache: Mutex<HashMap<Arc<str>, Value>>,
-    /// Explicit versioned bindings for native Rust functions.
-    /// Key format: `"<ns>/<name>@<commit>"`.
-    /// Populated by `Registry::define_versioned`; consulted by versioned symbol
-    /// resolution before the git-source path so that native functions without a
-    /// Clojure source definition can still be pinned to a specific commit.
-    pub native_version_registry: Mutex<HashMap<Arc<str>, Value>>,
     /// Parsed `cljrs.edn` config, loaded once at startup.
     pub deps_config: RwLock<Option<Arc<cljrs_deps::DepsConfig>>>,
     /// When true, every versioned-symbol or versioned-namespace resolution
@@ -142,7 +136,6 @@ impl GlobalEnv {
             call_cljrs_fn,
             on_fn_defined,
             version_cache: Mutex::new(HashMap::new()),
-            native_version_registry: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
             sig_verify_cache: Mutex::new(HashSet::new()),
@@ -375,26 +368,6 @@ impl GlobalEnv {
     pub fn get_cached_versioned(&self, ns: &str, name: &str, commit: &str) -> Option<Value> {
         let key = format!("{ns}/{name}@{commit}");
         self.version_cache
-            .lock()
-            .unwrap()
-            .get(key.as_str())
-            .cloned()
-    }
-
-    /// Register an explicit versioned binding for a native Rust function.
-    /// Key: `"<ns>/<name>@<commit>"`.
-    pub fn register_native_versioned(&self, ns: &str, name: &str, commit: &str, val: Value) {
-        let key: Arc<str> = Arc::from(format!("{ns}/{name}@{commit}"));
-        self.native_version_registry
-            .lock()
-            .unwrap()
-            .insert(key, val);
-    }
-
-    /// Retrieve an explicitly registered versioned native binding.
-    pub fn get_native_versioned(&self, ns: &str, name: &str, commit: &str) -> Option<Value> {
-        let key = format!("{ns}/{name}@{commit}");
-        self.native_version_registry
             .lock()
             .unwrap()
             .get(key.as_str())
