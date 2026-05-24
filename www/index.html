@@ -552,6 +552,26 @@
       return code;
     }
 
+    // Is the caret position inside an (unterminated-so-far) string literal?
+    // Scans from the start, respecting escapes, char literals, and comments.
+    function inString(text, pos) {
+      var inStr = false, i = 0;
+      while (i < pos) {
+        var c = text[i];
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === '"')  { inStr = false; i++; continue; }
+          i++;
+        } else {
+          if (c === ';')  { while (i < pos && text[i] !== '\n') i++; continue; }
+          if (c === '"')  { inStr = true; i++; continue; }
+          if (c === '\\') { i += 2; continue; }
+          i++;
+        }
+      }
+      return inStr;
+    }
+
     // From a bracket at `idx`, find its partner's index, or -1 if none /
     // mismatched type. Scans only over code chars.
     function matchFrom(text, code, idx) {
@@ -720,9 +740,34 @@
         return;
       }
 
-      // Backspace over an empty pair "(|)" deletes both delimiters.
+      // Auto-pair string quotes. The same char opens and closes, so the
+      // rules differ from brackets: type over a closing quote, wrap a
+      // selection, insert a lone quote when escaping or already inside a
+      // string, otherwise insert an empty pair.
+      if (e.key === '"' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (s === t && v[s] === '"') {
+          input.selectionStart = input.selectionEnd = s + 1;
+        } else if (s !== t) {
+          input.value = v.slice(0, s) + '"' + v.slice(s, t) + '"' + v.slice(t);
+          input.selectionStart = s + 1;
+          input.selectionEnd = t + 1;
+        } else if (v[s - 1] === '\\' || inString(v, s)) {
+          input.value = v.slice(0, s) + '"' + v.slice(s);
+          input.selectionStart = input.selectionEnd = s + 1;
+        } else {
+          input.value = v.slice(0, s) + '""' + v.slice(s);
+          input.selectionStart = input.selectionEnd = s + 1;
+        }
+        resize();
+        renderHighlights();
+        return;
+      }
+
+      // Backspace over an empty pair "(|)" or ""|"" deletes both delimiters.
       if (e.key === 'Backspace' && s === t && s > 0 &&
-          OPEN[v[s - 1]] && OPEN[v[s - 1]] === v[s]) {
+          ((OPEN[v[s - 1]] && OPEN[v[s - 1]] === v[s]) ||
+           (v[s - 1] === '"' && v[s] === '"'))) {
         e.preventDefault();
         input.value = v.slice(0, s - 1) + v.slice(s + 1);
         input.selectionStart = input.selectionEnd = s - 1;
