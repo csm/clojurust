@@ -6,6 +6,9 @@ on:
     paths:
       - 'www/**'
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     name: Upload www via SFTP
