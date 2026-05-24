@@ -281,8 +281,50 @@
       opacity: 0.7;
     }
 
-    #repl-input {
+    #repl-input-wrap {
       flex: 1;
+      position: relative;
+      min-height: 26px;
+    }
+
+    /* Backdrop that mirrors the textarea's text so we can paint a
+       background behind matching brackets. The textarea sits on top with a
+       transparent background; this layer shows through behind it. All
+       text-layout properties here MUST match #repl-input exactly or the
+       marks will drift out of alignment. */
+    #repl-highlights {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      margin: 0;
+      padding: 1px 0;
+      border: none;
+      overflow: hidden;
+      pointer-events: none;
+      color: transparent;
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #repl-highlights mark {
+      background: var(--accent2);
+      color: transparent;
+      border-radius: 2px;
+      opacity: 0.4;
+    }
+
+    #repl-highlights mark.unmatched {
+      background: var(--red-b);
+      opacity: 0.5;
+    }
+
+    #repl-input {
+      position: relative;
+      z-index: 1;
+      width: 100%;
       min-height: 26px;
       max-height: 200px;
       background: transparent;
@@ -425,14 +467,17 @@
   <div id="repl-bar">
     <div id="repl-bar-inner">
       <span id="repl-prompt">user=>&nbsp;</span>
-      <textarea id="repl-input"
-        rows="1"
-        disabled
-        autocomplete="off"
-        spellcheck="false"
-        placeholder="Loading REPL…"
-        aria-label="Clojure REPL input"
-      ></textarea>
+      <div id="repl-input-wrap">
+        <div id="repl-highlights" aria-hidden="true"></div>
+        <textarea id="repl-input"
+          rows="1"
+          disabled
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Loading REPL…"
+          aria-label="Clojure REPL input"
+        ></textarea>
+      </div>
       <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
       <span id="repl-status">loading…</span>
     </div>
@@ -455,6 +500,7 @@
     var status = document.getElementById('repl-status');
     var btn    = document.getElementById('repl-eval');
     var out    = document.getElementById('repl-out');
+    var hl     = document.getElementById('repl-highlights');
 
     // ── Auto-resize textarea ──────────────────────────────────
     function resize() {
@@ -470,6 +516,107 @@
     }
     function onLastLine() {
       return input.value.indexOf('\n', input.selectionStart) === -1;
+    }
+
+    // ── Bracket pairing & match highlight ─────────────────────
+    var OPEN  = { '(': ')', '[': ']', '{': '}' };
+    var CLOSE = { ')': '(', ']': '[', '}': '{' };
+
+    function escHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Classify each char as "code" (1) or not (0). Brackets inside string
+    // literals, line comments, or char literals (\() must be ignored so a
+    // "(" in a string can't pair with a real paren.
+    function scanCode(text) {
+      var n = text.length, code = new Uint8Array(n), i = 0;
+      while (i < n) {
+        var c = text[i];
+        if (c === ';') {                       // line comment to EOL
+          while (i < n && text[i] !== '\n') { i++; }
+          continue;
+        }
+        if (c === '"') {                       // string literal
+          i++;
+          while (i < n) {
+            if (text[i] === '\\') { i += 2; continue; }
+            if (text[i] === '"')  { i++; break; }
+            i++;
+          }
+          continue;
+        }
+        if (c === '\\') { i += 2; continue; }  // char literal (\( \space …)
+        code[i] = 1; i++;
+      }
+      return code;
+    }
+
+    // From a bracket at `idx`, find its partner's index, or -1 if none /
+    // mismatched type. Scans only over code chars.
+    function matchFrom(text, code, idx) {
+      var c = text[idx], depth = 0, i;
+      if (OPEN[c]) {
+        for (i = idx; i < text.length; i++) {
+          if (!code[i]) continue;
+          var ch = text[i];
+          if (OPEN[ch]) depth++;
+          else if (CLOSE[ch]) { if (--depth === 0) return ch === OPEN[c] ? i : -1; }
+        }
+      } else if (CLOSE[c]) {
+        for (i = idx; i >= 0; i--) {
+          if (!code[i]) continue;
+          var ch2 = text[i];
+          if (CLOSE[ch2]) depth++;
+          else if (OPEN[ch2]) { if (--depth === 0) return ch2 === CLOSE[c] ? i : -1; }
+        }
+      }
+      return -1;
+    }
+
+    // Pick the bracket adjacent to the caret (preferring the one just to its
+    // left, i.e. the one you just typed) and resolve its match.
+    function bracketInfo() {
+      if (input.selectionStart !== input.selectionEnd) return null;
+      var text = input.value, pos = input.selectionStart;
+      var code = scanCode(text);
+      var cands = [pos - 1, pos], k;
+      for (k = 0; k < cands.length; k++) {
+        var idx = cands[k];
+        if (idx < 0 || idx >= text.length || !code[idx]) continue;
+        var c = text[idx];
+        if (OPEN[c] || CLOSE[c]) {
+          var m = matchFrom(text, code, idx);
+          return { a: idx, b: m, err: m === -1 };
+        }
+      }
+      return null;
+    }
+
+    function renderHighlights() {
+      if (!hl) return;
+      var text = input.value, info = bracketInfo();
+      if (!info) { hl.textContent = text; syncScroll(); return; }
+      var marks = [{ i: info.a, cls: info.err ? 'unmatched' : '' }];
+      if (info.b !== -1) marks.push({ i: info.b, cls: '' });
+      marks.sort(function (x, y) { return x.i - y.i; });
+      var html = '', last = 0, j;
+      for (j = 0; j < marks.length; j++) {
+        var mi = marks[j].i;
+        html += escHtml(text.slice(last, mi));
+        html += '<mark' + (marks[j].cls ? ' class="' + marks[j].cls + '"' : '') +
+                '>' + escHtml(text[mi]) + '</mark>';
+        last = mi + 1;
+      }
+      html += escHtml(text.slice(last));
+      hl.innerHTML = html;
+      syncScroll();
+    }
+
+    function syncScroll() {
+      if (!hl) return;
+      hl.scrollTop = input.scrollTop;
+      hl.scrollLeft = input.scrollLeft;
     }
 
     // ── Append a REPL entry ───────────────────────────────────
@@ -532,13 +679,57 @@
       appendEntry(code, res.output, res.result, res.is_error);
       input.value = '';
       resize();
+      renderHighlights();
     }
 
     btn.addEventListener('click', evalInput);
 
     // ── Keyboard handling ─────────────────────────────────────
-    input.addEventListener('input', resize);
+    input.addEventListener('input', function () { resize(); renderHighlights(); });
+    input.addEventListener('keyup', renderHighlights);
+    input.addEventListener('click', renderHighlights);
+    input.addEventListener('scroll', syncScroll);
     input.addEventListener('keydown', function (e) {
+
+      var s = input.selectionStart, t = input.selectionEnd, v = input.value;
+
+      // Auto-close: typing an opener inserts its matching closer and puts
+      // the caret between them; a selection gets wrapped instead.
+      if (OPEN[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        var open = e.key, close = OPEN[open], sel = v.slice(s, t);
+        input.value = v.slice(0, s) + open + sel + close + v.slice(t);
+        if (sel) {
+          input.selectionStart = s + 1;
+          input.selectionEnd = s + 1 + sel.length;
+        } else {
+          input.selectionStart = input.selectionEnd = s + 1;
+        }
+        resize();
+        renderHighlights();
+        return;
+      }
+
+      // Type-over: pressing a closer when it's already the next char just
+      // steps past it, so the auto-inserted closer isn't doubled.
+      if (CLOSE[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey &&
+          s === t && v[s] === e.key) {
+        e.preventDefault();
+        input.selectionStart = input.selectionEnd = s + 1;
+        renderHighlights();
+        return;
+      }
+
+      // Backspace over an empty pair "(|)" deletes both delimiters.
+      if (e.key === 'Backspace' && s === t && s > 0 &&
+          OPEN[v[s - 1]] && OPEN[v[s - 1]] === v[s]) {
+        e.preventDefault();
+        input.value = v.slice(0, s - 1) + v.slice(s + 1);
+        input.selectionStart = input.selectionEnd = s - 1;
+        resize();
+        renderHighlights();
+        return;
+      }
 
       // Tab → two-space indent
       if (e.key === 'Tab') {
