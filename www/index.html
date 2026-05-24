@@ -503,7 +503,22 @@
       }
 
       out.appendChild(entry);
-      entry.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      scrollToBottom();
+    }
+
+    // ── Scroll the page to the very bottom ────────────────────
+    // The page (not a container) scrolls, and #repl-bar is fixed over
+    // the bottom of the viewport. scrollIntoView would tuck the newest
+    // entry behind the bar, so scroll to the full document height — the
+    // body's bottom padding leaves room for the entry to clear the bar.
+    // rAF lets resize() finalize that padding before we read scrollHeight.
+    function scrollToBottom() {
+      requestAnimationFrame(function () {
+        window.scrollTo({
+          top: document.documentElement.scrollHeight,
+          behavior: 'smooth'
+        });
+      });
     }
 
     // ── Evaluate current input ────────────────────────────────
