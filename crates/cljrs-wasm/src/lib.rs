@@ -56,6 +56,7 @@ impl Repl {
     pub fn new() -> Repl {
         console_error_panic_hook::set_once();
         let globals = cljrs_interp::standard_env_minimal(None, None, None);
+        cljrs_stdlib::register(&globals);
         Repl { globals }
     }
 

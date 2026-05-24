@@ -574,6 +574,7 @@ dependencies = [
  "cljrs-gc",
  "cljrs-interp",
  "cljrs-reader",
+ "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
  "console_error_panic_hook",

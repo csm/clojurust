@@ -13,10 +13,14 @@
 use std::sync::Arc;
 
 use cljrs_eval::GlobalEnv;
+#[cfg(not(target_arch = "wasm32"))]
 use cljrs_gc::GcConfig;
 
 mod core_async;
+// io and edn use std::fs which is not available on wasm32-unknown-unknown
+#[cfg(not(target_arch = "wasm32"))]
 mod edn;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod io;
 mod set;
 mod string;
@@ -26,7 +30,9 @@ const CLOJURE_TEST_SRC: &str = include_str!("clojure/test.cljrs");
 const CLOJURE_STRING_SRC: &str = include_str!("clojure/string.cljrs");
 const CLOJURE_SET_SRC: &str = include_str!("clojure/set.cljrs");
 const CLOJURE_TEMPLATE_SRC: &str = include_str!("clojure/template.cljrs");
+#[cfg(not(target_arch = "wasm32"))]
 const CLOJURE_RUST_IO_SRC: &str = include_str!("clojure/rust/io.cljrs");
+#[cfg(not(target_arch = "wasm32"))]
 const CLOJURE_EDN_SRC: &str = include_str!("clojure/edn.cljrs");
 const CLOJURE_WALK_SRC: &str = include_str!("clojure/walk.cljrs");
 const CLOJURE_DATA_SRC: &str = include_str!("clojure/data.cljrs");
@@ -76,13 +82,15 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     // clojure.test ─ pure Clojure, no native helpers.
     globals.register_builtin_source("clojure.test", CLOJURE_TEST_SRC);
 
-    // clojure.rust.io ─ I/O resources.
-    io::register(globals, "clojure.rust.io");
-    globals.register_builtin_source("clojure.rust.io", CLOJURE_RUST_IO_SRC);
+    // clojure.rust.io and clojure.edn use std::fs, unavailable on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        io::register(globals, "clojure.rust.io");
+        globals.register_builtin_source("clojure.rust.io", CLOJURE_RUST_IO_SRC);
 
-    // clojure.edn ─ EDN reader.
-    edn::register(globals, "clojure.edn");
-    globals.register_builtin_source("clojure.edn", CLOJURE_EDN_SRC);
+        edn::register(globals, "clojure.edn");
+        globals.register_builtin_source("clojure.edn", CLOJURE_EDN_SRC);
+    }
 
     // clojure.walk ─ pure Clojure, no native helpers.
     globals.register_builtin_source("clojure.walk", CLOJURE_WALK_SRC);
@@ -139,6 +147,7 @@ fn load_prebuilt_compiler_ir(_globals: &Arc<GlobalEnv>) {}
 /// Prefer this over `cljrs_eval::standard_env()` in the `cljrs` binary so that
 /// stdlib namespaces are loaded lazily (only on first `require`) instead of
 /// eagerly at startup.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn standard_env() -> Arc<GlobalEnv> {
     let globals = cljrs_eval::standard_env_minimal();
     register(&globals);
@@ -202,6 +211,7 @@ pub fn standard_env() -> Arc<GlobalEnv> {
 }
 
 /// Like [`standard_env()`] but also sets user source paths for `require`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn standard_env_with_paths(source_paths: Vec<std::path::PathBuf>) -> Arc<GlobalEnv> {
     let globals = standard_env();
     globals.set_source_paths(source_paths);
@@ -209,6 +219,7 @@ pub fn standard_env_with_paths(source_paths: Vec<std::path::PathBuf>) -> Arc<Glo
 }
 
 /// Like [`standard_env_with_paths()`] but also sets GC configuration.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn standard_env_with_paths_and_config(
     source_paths: Vec<std::path::PathBuf>,
     gc_config: Arc<GcConfig>,
