@@ -370,7 +370,7 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
+    type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
 
     pub struct GcHeap {
         inner: Mutex<GcHeapInner>,
@@ -470,10 +470,8 @@ type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
             self.total_allocated_bytes
                 .fetch_add(obj_size, Ordering::Relaxed);
             crate::stats::GC_STATS.record_gc_alloc(obj_size);
-            let current_usage = self
-                .memory_in_use
-                .fetch_add(obj_size, Ordering::Relaxed)
-                + obj_size;
+            let current_usage =
+                self.memory_in_use.fetch_add(obj_size, Ordering::Relaxed) + obj_size;
 
             if let Some(config) = self.config.lock().unwrap().as_ref()
                 && config.soft_limit_exceeded(current_usage)
