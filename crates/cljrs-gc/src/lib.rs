@@ -137,6 +137,8 @@ mod gc_header {
     pub struct GcBoxHeader {
         #[cfg(debug_assertions)]
         pub(crate) magic: Cell<u64>,
+        /// Exact size of the GcBox<T> allocation in bytes.
+        pub(crate) size: usize,
         pub(crate) lives: Cell<u8>,
         pub(crate) next: Cell<*mut GcBoxHeader>,
         pub(crate) trace_fn: unsafe fn(*const GcBoxHeader, &mut MarkVisitor),
@@ -148,6 +150,7 @@ mod gc_header {
             Self {
                 #[cfg(debug_assertions)]
                 magic: Cell::new(GC_MAGIC_ALIVE),
+                size: std::mem::size_of::<GcBox<T>>(),
                 lives: Cell::new(GC_INITIAL_LIVES - 1),
                 next: Cell::new(std::ptr::null_mut()),
                 trace_fn: trace_gc_box::<T>,
@@ -367,8 +370,7 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-    const ESTIMATED_OBJECT_SIZE: usize = 256;
-    type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
+type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
 
     pub struct GcHeap {
         inner: Mutex<GcHeapInner>,
@@ -454,6 +456,7 @@ mod gc_full {
                 header: GcBoxHeader::new::<T>(),
                 value,
             });
+            let obj_size = gc_box.header.size; // exact GcBox<T> size set at construction
             let raw: *mut GcBox<T> = Box::into_raw(gc_box);
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -465,12 +468,12 @@ mod gc_full {
                 inner.total_allocated += 1;
             }
             self.total_allocated_bytes
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
-            crate::stats::GC_STATS.record_gc_alloc(ESTIMATED_OBJECT_SIZE);
+                .fetch_add(obj_size, Ordering::Relaxed);
+            crate::stats::GC_STATS.record_gc_alloc(obj_size);
             let current_usage = self
                 .memory_in_use
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
-                + ESTIMATED_OBJECT_SIZE;
+                .fetch_add(obj_size, Ordering::Relaxed)
+                + obj_size;
 
             if let Some(config) = self.config.lock().unwrap().as_ref()
                 && config.soft_limit_exceeded(current_usage)
@@ -515,18 +518,28 @@ mod gc_full {
             let mut inner = self.inner.lock().unwrap();
             let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
+            // Bytes of objects marked reachable this cycle (the true live set).
+            let mut marked_bytes: usize = 0;
+            // Bytes of objects with lives==0 that will be freed now.
+            let mut freed_bytes: usize = 0;
             let mut current = inner.head;
             while !current.is_null() {
                 let header = unsafe { &*current };
                 let next = header.next.get();
                 let lives = header.lives.get();
+                let obj_size = header.size;
                 if lives >= GC_INITIAL_LIVES {
+                    // Marked reachable this cycle — reset grace counter.
                     header.lives.set(GC_INITIAL_LIVES - 1);
+                    marked_bytes += obj_size;
                     live.push(current);
                 } else if lives > 0 {
+                    // In grace period (unreachable but not yet freed).
                     header.lives.set(lives - 1);
                     live.push(current);
                 } else {
+                    // Grace period exhausted — collect now.
+                    freed_bytes += obj_size;
                     dead.push(current);
                 }
                 current = next;
@@ -544,8 +557,13 @@ mod gc_full {
                 header.next.set(inner.head);
                 inner.head = ptr;
             }
-            let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
-            self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
+            // Reset memory_in_use to the marked (truly reachable) live set.
+            // Grace-period objects are not counted: they are unreachable from
+            // roots and should not contribute to GC pressure, even though they
+            // won't be freed until their lives counter reaches zero.  Without
+            // this reset, memory_in_use drifts upward across the 10-cycle grace
+            // period and triggers a GC storm of O(N) sweeps that free nothing.
+            self.memory_in_use.store(marked_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
             crate::stats::GC_STATS.record_gc_pause(
                 mark_elapsed + sweep_elapsed,
