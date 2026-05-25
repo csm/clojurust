@@ -126,7 +126,14 @@ mod gc_header {
     use crate::{MarkVisitor, Trace};
     use std::cell::Cell;
 
-    pub(crate) const GC_INITIAL_LIVES: u8 = 10;
+    // Objects start at lives = GC_INITIAL_LIVES - 1.  The mark phase sets
+    // lives = GC_INITIAL_LIVES for reachable objects; sweep frees objects
+    // whose lives reach 0.  A value of 2 gives exactly one cycle of grace:
+    // enough to cover the window between an alloc frame dropping and the
+    // next GC safepoint (where VALUE_ROOTS or a new alloc frame re-roots it).
+    // 10 was chosen conservatively but keeps 9× more garbage in RAM than
+    // necessary, worsening OOM pressure under test suites with many forms.
+    pub(crate) const GC_INITIAL_LIVES: u8 = 2;
 
     #[cfg(debug_assertions)]
     pub(crate) const GC_MAGIC_ALIVE: u64 = 0xCAFE_BABE_DEAD_BEEF;

@@ -220,6 +220,12 @@ programs and the AOT test harness call it once at exit.
   GC is suppressed until `memory_in_use` grows by another 10% (the `suppressed_threshold`).
   The old trigger — re-enabling on every alloc-frame drop — fired O(N-heap) sweeps on
   every eval-frame return, causing a GC storm with hundreds of useless traversals.
+- **Minimal grace period** (`GC_INITIAL_LIVES = 2`): objects start at `lives = 1`.
+  GC only fires at explicit `gc_safepoint()` calls, not at arbitrary Rust points.
+  The single cycle of grace covers the narrow window between an alloc frame
+  dropping and the next safepoint at which `VALUE_ROOTS` or the new alloc frame
+  re-roots the value.  The old value of 10 kept 9× more garbage in RAM than
+  necessary, worsening OOM pressure under long test suites.
 - **Cycle collection**: because `GcPtr::drop` is a no-op, reference cycles do
   not prevent collection — any object unreachable from roots is freed.
 
