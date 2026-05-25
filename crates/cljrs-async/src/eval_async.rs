@@ -12,15 +12,48 @@
 //! expanded here first via [`cljrs_interp::macros::macroexpand`] so their
 //! desugared `if`/`do`/`let` shapes are handled with proper yielding.
 
+use std::future::Future;
+
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_gc::GcPtr;
 use cljrs_interp::apply::{bind_fn_params, select_arity};
 use cljrs_interp::destructure::{bind_pattern, value_to_seq_vec};
 use cljrs_interp::eval::{eval, is_special_form};
 use cljrs_interp::macros::macroexpand;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{CljxFnArity, FutureState, Value};
+use cljrs_value::{CljxFnArity, CljxFuture, FutureState, Value};
+
+/// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
+/// task settles on completion. The single delivery point for every async
+/// primitive (`^:async` calls, `timeout`, `alts`).
+///
+/// Must be called from within a Tokio `LocalSet` context.
+pub(crate) fn spawn_future<F>(task: F) -> Value
+where
+    F: Future<Output = EvalResult> + 'static,
+{
+    let future = GcPtr::new(CljxFuture::new());
+    let task_future = future.clone();
+    tokio::task::spawn_local(async move {
+        let result = task.await;
+        settle_future(&task_future, result);
+    });
+    Value::Future(future)
+}
+
+/// Write a completed result into a future and wake blocking `deref` waiters.
+pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
+    let mut state = future.get().state.lock().unwrap();
+    *state = match result {
+        Ok(v) => FutureState::Done(v),
+        Err(EvalError::Runtime(msg)) => FutureState::Failed(msg),
+        Err(e) => FutureState::Failed(format!("{e}")),
+    };
+    drop(state);
+    future.get().cond.notify_all();
+}
 
 /// Run the body of an `^:async` function to completion, yielding at every
 /// `await`. Returns the value of the last body form.
@@ -117,7 +150,7 @@ async fn eval_await_async(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Cooperatively await a Clojure value. Futures and promises yield to the
 /// executor until resolved; any other value is returned as-is.
-async fn await_value(val: Value) -> EvalResult {
+pub(crate) async fn await_value(val: Value) -> EvalResult {
     match val {
         Value::Future(f) => loop {
             {

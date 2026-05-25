@@ -23,10 +23,12 @@ Done:
 - Phase C: `deref`/`@` of a future inside an `^:async` body is a runtime error that steers
   callers to `await` (enforced in `cljrs-builtins` and `cljrs-interp` via the
   `cljrs_env::callback::current_is_async` context flag).
+- Phase D: `timeout`, `alts`, and the `alt` macro, in a `clojure.core.async` namespace built
+  at `init` time. `timeout` and `alts` are native fns that return a `Value::Future`; `alt` is
+  a Clojure macro that `await`s `alts` and dispatches to the matching handler.
 
 Not yet implemented (later phases):
 
-- Phase D: `timeout`, `alts`, `alt`.
 - Phase E: `chan`, `put!`, `take!`, `close!`, `go`.
 
 ### `await` and the single-thread executor
@@ -42,10 +44,12 @@ blocking bridge is a later phase.
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl` |
-| `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` and delivers the result into a `CljxFuture` |
-| `src/eval_async.rs` | `eval_async` async tree-walker and `run_async_fn` driver for `^:async` bodies |
-| `tests/async_fn.rs` | Phase B integration tests for dispatch, `await`, `let`/`if`, and error propagation |
+| `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl` and builds the `clojure.core.async` namespace |
+| `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
+| `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
+| `src/builtins.rs` | native `timeout` and `alts` functions |
+| `src/core_async.cljrs` | Clojure source for the `clojure.core.async` namespace (the `alt` macro) |
+| `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt` |
 
 ## Public API
 

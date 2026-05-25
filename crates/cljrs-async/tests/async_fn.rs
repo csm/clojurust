@@ -39,12 +39,19 @@ fn eval_sync(src: &str, env: &mut Env) -> Value {
 }
 
 /// Run a `!Send` future to completion on a current-thread Tokio LocalSet.
+/// Timers are enabled so `timeout` works.
 fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("build runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, f)
+}
+
+/// Print a value the way Clojure would (for asserting on collection results).
+fn pr(v: &Value) -> String {
+    format!("{v}")
 }
 
 #[test]
@@ -204,4 +211,80 @@ fn deref_of_future_in_sync_context_still_works() {
         Value::Long(3)
     );
     assert_eq!(eval_sync("@(future (* 6 7))", &mut env), Value::Long(42));
+}
+
+// ── Phase D: timeout, alts, alt ────────────────────────────────────────────
+
+const REQUIRE_ASYNC: &str = "(require '[clojure.core.async :refer [timeout alts alt]])";
+
+#[test]
+fn timeout_resolves_to_nil() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_ASYNC, &mut env);
+        let r = eval_async(&parse_one("(await (timeout 5))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Nil);
+    });
+}
+
+#[test]
+fn alts_picks_first_ready_value_and_index() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_ASYNC, &mut env);
+        eval_sync("(defn ^:async producer [] 42)", &mut env);
+        // The immediate producer resolves before the 1s timeout: index 0.
+        let val = eval_async(
+            &parse_one("(first (await (alts [(producer) (timeout 1000)])))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(val, Value::Long(42));
+        let idx = eval_async(
+            &parse_one("(second (await (alts [(producer) (timeout 1000)])))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(idx, Value::Long(0));
+    });
+}
+
+#[test]
+fn alts_selects_timeout_when_it_wins() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_ASYNC, &mut env);
+        // Only a timeout in the set: it must win at index 0 with value nil.
+        let r = eval_async(&parse_one("(await (alts [(timeout 5)]))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(pr(&r), "[nil 0]");
+    });
+}
+
+#[test]
+fn alt_dispatches_to_matching_handler() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_ASYNC, &mut env);
+        eval_sync("(defn ^:async producer [] :got)", &mut env);
+        eval_sync(
+            "(defn ^:async runner []
+               (alt (producer)     (fn [v] [:value v])
+                    (timeout 1000)  (fn [_] [:timed-out])))",
+            &mut env,
+        );
+        let r = eval_async(&parse_one("(await (runner))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(pr(&r), "[:value :got]");
+    });
 }
