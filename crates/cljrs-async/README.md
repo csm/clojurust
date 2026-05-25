@@ -20,10 +20,12 @@ Done:
 - Phase A: `init()` registers the async runtime hook with the interpreter.
 - Phase B: `^:async` fn dispatch via the `AsyncRuntime` hook; `eval_async` tree-walker;
   cooperative `await` of futures/promises.
+- Phase C: `deref`/`@` of a future inside an `^:async` body is a runtime error that steers
+  callers to `await` (enforced in `cljrs-builtins` and `cljrs-interp` via the
+  `cljrs_env::callback::current_is_async` context flag).
 
 Not yet implemented (later phases):
 
-- Phase C: `deref` blocking enforcement in async context.
 - Phase D: `timeout`, `alts`, `alt`.
 - Phase E: `chan`, `put!`, `take!`, `close!`, `go`.
 

@@ -4899,6 +4899,13 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
             }
         }
         Value::Future(f) => {
+            // `deref` blocks the OS thread; inside an `^:async` function that
+            // would park the single LocalSet executor. Steer callers to `await`.
+            if cljrs_env::callback::current_is_async() {
+                return Err(ValueError::Other(
+                    "deref on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
+                ));
+            }
             if with_timeout {
                 let timeout_ms = match &args[1] {
                     Value::Long(n) => *n as u64,

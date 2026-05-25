@@ -164,3 +164,44 @@ fn defn_attr_map_marks_async() {
         assert!(matches!(v, Value::Future(_)), "expected Future, got {v:?}");
     });
 }
+
+// ── Phase C: deref enforcement in async context ────────────────────────────
+
+#[test]
+fn deref_of_future_in_async_fn_errors() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async producer [] 42)", &mut env);
+        eval_sync("(defn ^:async bad [] (deref (producer)))", &mut env);
+        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
+        let err = format!("{:?}", r.unwrap_err());
+        assert!(err.contains("await"), "error should steer to await: {err}");
+    });
+}
+
+#[test]
+fn at_deref_of_future_in_async_fn_errors() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async producer [] 42)", &mut env);
+        eval_sync("(defn ^:async bad [] @(producer))", &mut env);
+        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
+        let err = format!("{:?}", r.unwrap_err());
+        assert!(err.contains("await"), "error should steer to await: {err}");
+    });
+}
+
+#[test]
+fn deref_of_future_in_sync_context_still_works() {
+    // With the async runtime registered, a *sync* (non-^:async) deref of a
+    // thread-based future must still block-and-return, not error.
+    let globals = async_env();
+    let mut env = Env::new(globals, "user");
+    assert_eq!(
+        eval_sync("(deref (future (+ 1 2)))", &mut env),
+        Value::Long(3)
+    );
+    assert_eq!(eval_sync("@(future (* 6 7))", &mut env), Value::Long(42));
+}

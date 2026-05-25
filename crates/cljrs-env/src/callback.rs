@@ -17,6 +17,9 @@ use crate::env::{Env, GlobalEnv};
 struct EvalContext {
     globals: Arc<GlobalEnv>,
     current_ns: Arc<str>,
+    /// True when the active call originates from inside an `^:async` function
+    /// body. Lets blocking builtins (`deref`) reject use that should be `await`.
+    is_async: bool,
 }
 
 thread_local! {
@@ -29,8 +32,15 @@ pub fn push_eval_context(env: &Env) {
         stack.borrow_mut().push(EvalContext {
             globals: env.globals.clone(),
             current_ns: env.current_ns.clone(),
+            is_async: env.is_async,
         });
     });
+}
+
+/// True when the innermost active eval context is inside an `^:async` function
+/// body. Returns `false` when there is no active context.
+pub fn current_is_async() -> bool {
+    EVAL_CONTEXT.with(|stack| stack.borrow().last().is_some_and(|ec| ec.is_async))
 }
 
 /// Pop the eval context after a native function returns.
@@ -59,6 +69,9 @@ pub fn install_eval_context(globals: Arc<GlobalEnv>, ns: Arc<str>) {
         stack.borrow_mut().push(EvalContext {
             globals,
             current_ns: ns,
+            // Cross-thread installs (agent/future worker threads) run blocking,
+            // synchronous work — never an async-yielding context.
+            is_async: false,
         });
     });
 }
