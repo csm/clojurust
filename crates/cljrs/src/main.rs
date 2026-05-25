@@ -257,7 +257,7 @@ fn main() -> miette::Result<()> {
                     .build()
                     .expect("failed to build Tokio runtime");
                 let local = tokio::task::LocalSet::new();
-                return rt.block_on(local.run_until(async move { run(cli) }));
+                rt.block_on(local.run_until(async move { run(cli) }))
             }
             #[cfg(not(feature = "async"))]
             run(cli)
