@@ -549,18 +549,26 @@ fn merge_combines_two_channels() {
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
-        eval_sync("(def out (merge [(to-chan! [1 2]) (to-chan! [3 4])]))", &mut env);
-        // Drain all four values; order is unspecified so sort.
-        let r = eval_async(
-            &parse_one("(await (into [] out))"),
+        eval_sync(
+            "(def out (merge [(to-chan! [1 2]) (to-chan! [3 4])]))",
             &mut env,
-        )
-        .await
-        .unwrap();
+        );
+        // Drain all four values; order is unspecified so sort.
+        let r = eval_async(&parse_one("(await (into [] out))"), &mut env)
+            .await
+            .unwrap();
         let mut vals: Vec<i64> = match &r {
-            Value::Vector(v) => v.get().iter().filter_map(|x| {
-                if let Value::Long(n) = x { Some(*n) } else { None }
-            }).collect(),
+            Value::Vector(v) => v
+                .get()
+                .iter()
+                .filter_map(|x| {
+                    if let Value::Long(n) = x {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             _ => panic!("expected vector, got {r:?}"),
         };
         vals.sort();
