@@ -23,7 +23,7 @@ members = [
     "crates/cljrs-vcs",
     "crates/cljrs-blake3",
     "crates/cljrs-wasm",
-    "crates/cljrs-async"]
+    "crates/cljrs-async", "crates/cljrs-base64"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,6 @@
+{:name "cljrs-base64"
+ :version "0.1.0"
+ :paths ["src"]
+ :test-paths ["test"]
+ :rust {:crate "."
+        :init "cljrs_base64::cljrs_init"}}

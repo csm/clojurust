@@ -1,0 +1,10 @@
+(ns cljrs.base64-test
+  (:require [clojure.test :refer [deftest is testing]]
+            base64))
+
+(deftest test-encode
+  (testing "empty input"
+    (is (= "" (base64/encode ""))))
+
+  (testing "basic string input"
+    (is (= "aGVsbG8gd29ybGQ=" (base64/encode "hello world")))))
