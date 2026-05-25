@@ -47,6 +47,7 @@
       --accent:    var(--yellow-b);
       --accent2:   var(--aqua-b);
       --accent3:   var(--orange-b);
+      --accent4:   var(--red-b);
       --link:      var(--blue-b);
       --link-hover:var(--aqua-b);
       --rule:      var(--bg2);
@@ -63,6 +64,7 @@
         --accent:    #b57614;   /* yellow dark */
         --accent2:   #427b58;   /* aqua dark */
         --accent3:   #af3a03;   /* orange dark */
+        --accent4:   #cc0303;   /* red dark */
         --link:      #076678;   /* blue dark */
         --link-hover:#427b58;
         --rule:      #d5c4a1;
@@ -318,7 +320,7 @@
     }
 
     #repl-highlights mark.unmatched {
-      background: var(--red-b);
+      background: var(--accent4);
       opacity: 0.5;
     }
 
@@ -353,8 +355,8 @@
       transition: color 0.2s, opacity 0.2s;
     }
 
-    #repl-status.ready { color: var(--green-b); opacity: 1; }
-    #repl-status.err   { color: var(--red-b);   opacity: 1; }
+    #repl-status.ready { color: var(--accent2); opacity: 1; }
+    #repl-status.err   { color: var(--accent4);   opacity: 1; }
 
     #repl-eval {
       flex-shrink: 0;
@@ -388,7 +390,7 @@
     }
 
     .repl-divider::after {
-      content: '; REPL';
+      content: ';; REPL - compiled as WASM, runs in your browser';
       margin-left: 0.75rem;
       font-size: 0.72rem;
       color: var(--text-faint);
@@ -407,8 +409,8 @@
     .repl-in::before { content: 'user=> '; opacity: 0.5; }
 
     .repl-print { color: var(--text-dim);  white-space: pre-wrap; word-break: break-word; }
-    .repl-val   { color: var(--yellow-b);  white-space: pre-wrap; word-break: break-word; }
-    .repl-err   { color: var(--red-b);     white-space: pre-wrap; word-break: break-word; }
+    .repl-val   { color: var(--accent);  white-space: pre-wrap; word-break: break-word; }
+    .repl-err   { color: var(--accent4);     white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
