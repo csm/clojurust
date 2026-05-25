@@ -540,6 +540,11 @@ pub struct CljxFn {
     pub closed_over_vals: Vec<Value>,
     /// True if this function was defined with `defmacro`.
     pub is_macro: bool,
+    /// True if this function carries `^:async` metadata. When an async runtime
+    /// (`cljrs-async`) is registered, calling such a function spawns its body as
+    /// a task and returns a `Value::Future` immediately instead of running it
+    /// synchronously. Without a runtime it runs synchronously like any other fn.
+    pub is_async: bool,
     /// Namespace in which this function was defined (for macro hygiene).
     pub defining_ns: Arc<str>,
 }
@@ -559,6 +564,7 @@ impl CljxFn {
             closed_over_names,
             closed_over_vals,
             is_macro,
+            is_async: false,
             defining_ns,
         }
     }

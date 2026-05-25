@@ -70,8 +70,17 @@ so intermediate allocations are freed per iteration.
 
 ### `eval_defn(args, env) -> EvalResult`
 
-Evaluate a `defn` form.  Under `no-gc`, wraps fn creation in `StaticCtxGuard`
-so the `CljxFn` object lands in the `StaticArena`.
+Evaluate a `defn` form.  Accepts metadata on the name (`(defn ^:async f …)`) and
+an attr-map (`(defn f {:async true} …)`); `^:async` marks the resulting `CljxFn`
+as async.  Under `no-gc`, wraps fn creation in `StaticCtxGuard` so the `CljxFn`
+object lands in the `StaticArena`.
+
+### `meta_form_is_async(meta: &Form) -> bool`
+
+Returns true when a `^meta` form (or attr-map literal) requests `:async` — either
+the keyword shorthand `^:async` or an explicit `{:async true}` map.  `fn`/`defn`
+use it to set `CljxFn::is_async`, which `cljrs-env::apply::dispatch_if_async`
+checks at call time to route through the async runtime.
 
 ### Special handlers in `apply.rs`
 

@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+pub mod eval_async;
 mod runtime;
 use runtime::AsyncRuntimeImpl;
 
