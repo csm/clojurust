@@ -37,4 +37,5 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "load-file",
     "binding",
     "with-out-str",
+    "await",
 ];

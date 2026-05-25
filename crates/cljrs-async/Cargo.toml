@@ -1,0 +1,18 @@
+[package]
+name = "cljrs-async"
+version = "0.1.0"
+edition = "2024"
+description = "Async support for clojurust — clojure.core.async via Tokio"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-types    = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-interp   = { workspace = true }
+tokio          = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+futures-util   = { workspace = true }

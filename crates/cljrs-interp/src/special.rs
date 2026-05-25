@@ -14,8 +14,8 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
-    CljxFn, CljxFnArity, Keyword, MapValue, MultiFn, Protocol, ProtocolFn, ProtocolMethod,
-    TypeInstance, Value, ValueError,
+    CljxFn, CljxFnArity, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
+    ProtocolMethod, TypeInstance, Value, ValueError,
 };
 
 /// Dispatch to the right special-form handler.
@@ -54,6 +54,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "load-file" => eval_load_file(args, env),
         "binding" => eval_binding(args, env),
         "with-out-str" => eval_with_out_str(args, env),
+        "await" => eval_await(args, env),
         _ => unreachable!("unknown special form: {head}"),
     }
 }
@@ -1859,4 +1860,38 @@ fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
     // Propagate errors but still pop the capture buffer
     result?;
     Ok(Value::string(captured))
+}
+
+// ── await ─────────────────────────────────────────────────────────────────────
+
+/// Blocking deref in sync context; yielding deref in async context.
+///
+/// When `cljrs-async` is loaded, `eval_async` intercepts `await` forms before
+/// the sync evaluator reaches this handler, so this path is only taken in
+/// non-async (sync) code. It blocks the OS thread until the future/promise
+/// resolves — equivalent to `(deref val)`.
+fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Runtime("await requires one argument".into()));
+    }
+    let val = eval(&args[0], env)?;
+    match val {
+        Value::Future(f) => {
+            let mut guard = f.get().state.lock().unwrap();
+            loop {
+                match &*guard {
+                    FutureState::Done(v) => return Ok(v.clone()),
+                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                    FutureState::Cancelled => {
+                        return Err(EvalError::Runtime("future was cancelled".into()));
+                    }
+                    FutureState::Running => {
+                        guard = f.get().cond.wait(guard).unwrap();
+                    }
+                }
+            }
+        }
+        Value::Promise(p) => Ok(p.get().deref_blocking()),
+        other => Ok(other),
+    }
 }

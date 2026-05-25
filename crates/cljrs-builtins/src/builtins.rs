@@ -352,7 +352,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         ("future-call*", Arity::Fixed(2), builtin_future_call_star),
         ("agent", Arity::Fixed(1), builtin_agent),
-        ("await", Arity::Variadic { min: 1 }, builtin_await),
+        (
+            "await-agent",
+            Arity::Variadic { min: 1 },
+            builtin_await_agent,
+        ),
         ("agent-error", Arity::Fixed(1), builtin_agent_error),
         ("restart-agent", Arity::Fixed(2), builtin_restart_agent),
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
@@ -6542,7 +6546,7 @@ fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
     })))
 }
 
-fn builtin_await(args: &[Value]) -> ValueResult<Value> {
+fn builtin_await_agent(args: &[Value]) -> ValueResult<Value> {
     for agent_val in args {
         match agent_val {
             Value::Agent(a) => {
@@ -6556,9 +6560,9 @@ fn builtin_await(args: &[Value]) -> ValueResult<Value> {
                     .lock()
                     .unwrap()
                     .send(AgentMsg::Update(sync_fn))
-                    .map_err(|_| ValueError::Other("await: agent is shut down".into()))?;
+                    .map_err(|_| ValueError::Other("await-agent: agent is shut down".into()))?;
                 rx.recv()
-                    .map_err(|_| ValueError::Other("await: agent thread died".into()))?;
+                    .map_err(|_| ValueError::Other("await-agent: agent thread died".into()))?;
             }
             v => {
                 return Err(ValueError::WrongType {

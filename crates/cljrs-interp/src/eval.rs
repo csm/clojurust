@@ -1151,7 +1151,7 @@ mod tests {
             (let [a (agent 0)]
               (send a + 1)
               (send a + 2)
-              (await a)
+              (await-agent a)
               @a)
             "#,
         )
@@ -1165,7 +1165,7 @@ mod tests {
             r#"
             (let [a (agent 10)]
               (send a (fn [_] (throw (ex-info "boom" {}))))
-              (await a)
+              (await-agent a)
               (let [err (agent-error a)]
                 (restart-agent a 99)
                 [err @a]))
