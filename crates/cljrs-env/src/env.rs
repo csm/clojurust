@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
+use crate::async_hook::AsyncRuntime;
+
 use crate::error::EvalResult;
 use cljrs_gc::{GcConfig, GcPtr};
 use cljrs_logging::feat_trace;
@@ -97,6 +99,9 @@ pub struct GlobalEnv {
     pub call_cljrs_fn: fn(&CljxFn, &[Value], &mut Env) -> EvalResult,
     /// Hook for customization when a new fn* is defined.
     on_fn_defined: Option<fn(&CljxFn, &mut Env)>,
+    /// Optional async runtime registered by `cljrs-async`.
+    /// `None` when the library is not linked; `Some` after `cljrs_async::init`.
+    pub async_rt: RwLock<Option<Arc<dyn AsyncRuntime>>>,
     /// Cache of values resolved at a specific commit.
     /// Key format: `"<ns>/<name>@<commit>"` for individual vars,
     /// or `"<ns>@<commit>"` for whole versioned namespaces.
@@ -137,6 +142,7 @@ impl GlobalEnv {
             eval_fn,
             call_cljrs_fn,
             on_fn_defined,
+            async_rt: RwLock::new(None),
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
@@ -348,6 +354,20 @@ impl GlobalEnv {
         self.on_fn_defined = Some(hook);
     }
 
+    /// Install an async runtime. Called once by `cljrs_async::init`.
+    /// Subsequent calls are silently ignored (first writer wins).
+    pub fn set_async_runtime(&self, rt: Arc<dyn AsyncRuntime>) {
+        let mut guard = self.async_rt.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(rt);
+        }
+    }
+
+    /// Return the async runtime, if one has been registered.
+    pub fn async_runtime(&self) -> Option<Arc<dyn AsyncRuntime>> {
+        self.async_rt.read().unwrap().clone()
+    }
+
     /// Return `(source_file, git_repo_root)` for the named namespace, if
     /// both have been populated by the loader.
     pub fn get_ns_git_context(&self, ns_name: &str) -> Option<(Arc<str>, Arc<str>)> {
@@ -428,6 +448,10 @@ pub struct Env {
     /// at this commit hash instead of HEAD.  Set by the versioned resolver when
     /// evaluating a function body fetched from git history.
     pub versioned_eval_commit: Option<Arc<str>>,
+    /// True when evaluating the body of an `^:async` function.
+    /// Set by `cljrs-async`; allows the `await` special form to know whether
+    /// to yield (async context) or block the OS thread (sync context).
+    pub is_async: bool,
 }
 
 impl Env {
@@ -437,6 +461,7 @@ impl Env {
             current_ns: Arc::from(ns),
             globals,
             versioned_eval_commit: None,
+            is_async: false,
         }
     }
 
@@ -524,6 +549,7 @@ impl Env {
     pub fn child(&self) -> Self {
         let (names, vals) = self.all_local_bindings();
         let mut child = Self::new(self.globals.clone(), &self.current_ns);
+        child.is_async = self.is_async;
         if !names.is_empty() {
             child.push_frame();
             for (n, v) in names.into_iter().zip(vals) {
