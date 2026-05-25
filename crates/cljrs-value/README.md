@@ -157,8 +157,14 @@ pub struct CljxFn {
     pub closed_over_names: Vec<Arc<str>>,
     pub closed_over_vals: Vec<Value>,
     pub is_macro: bool,
+    pub is_async: bool, // ^:async — dispatched via the async runtime when one is registered
+    pub defining_ns: Arc<str>,
 }
 ```
+
+`is_async` is set by the interpreter when a `fn`/`defn` carries `^:async` (or an
+`{:async true}` attr-map). `CljxFn::new` defaults it to `false`; `cljrs-env`'s
+`dispatch_if_async` checks it at call time.
 
 ### `Namespace` (Phase 4)
 

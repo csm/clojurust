@@ -250,6 +250,11 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
     // Extract the function pointer before the call so the borrow checker sees
     // only one mutable borrow of `env` at the call site.
     if let Value::Fn(f) = &callee {
+        // `^:async` functions dispatch through the async runtime (when one is
+        // registered), spawning the body and returning a Future immediately.
+        if let Some(fut) = cljrs_env::apply::dispatch_if_async(&callee, &args, env) {
+            return Ok(fut);
+        }
         let _args_root = cljrs_env::gc_roots::root_values(&args);
         cljrs_env::gc_roots::gc_safepoint(env);
         let call_fn = env.globals.call_cljrs_fn;

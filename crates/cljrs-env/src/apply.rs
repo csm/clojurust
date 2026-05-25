@@ -55,6 +55,23 @@ pub fn type_tag_of(val: &Value) -> Arc<str> {
     }
 }
 
+/// If `callee` is an `^:async` Clojure function and an async runtime is
+/// registered, spawn its body as a task and return a `Value::Future`.
+///
+/// Returns `None` when there is no async runtime or the callee is not an async
+/// function, in which case the caller proceeds with the normal synchronous
+/// call path. This is the single dispatch point shared by `apply_value` here
+/// and `eval_call` in `cljrs-interp`.
+pub fn dispatch_if_async(callee: &Value, args: &[Value], env: &Env) -> Option<Value> {
+    let Value::Fn(f) = callee else { return None };
+    if !f.get().is_async {
+        return None;
+    }
+    let rt = env.globals.async_runtime()?;
+    let call_env = Env::new(env.globals.clone(), &env.current_ns);
+    Some(rt.spawn_async_call(callee.clone(), args.to_vec(), call_env))
+}
+
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Root the callee and args so they survive any GC triggered at the safepoint.
@@ -78,7 +95,12 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             crate::callback::pop_eval_context();
             result
         }
-        Value::Fn(f) => env.call_cljrs_fn(f.get(), &args),
+        Value::Fn(f) => {
+            if let Some(fut) = dispatch_if_async(callee, &args, env) {
+                return Ok(fut);
+            }
+            env.call_cljrs_fn(f.get(), &args)
+        }
         Value::BoundFn(bf) => {
             let bf_ref = bf.get();
             // Push captured bindings as a frame on top of the current stack.

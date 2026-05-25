@@ -4,6 +4,8 @@ use cljrs_env::async_hook::AsyncRuntime;
 use cljrs_env::env::Env;
 use cljrs_value::Value;
 
+use crate::eval_async::{run_async_fn, spawn_future};
+
 pub(crate) struct AsyncRuntimeImpl;
 
 impl AsyncRuntimeImpl {
@@ -13,8 +15,10 @@ impl AsyncRuntimeImpl {
 }
 
 impl AsyncRuntime for AsyncRuntimeImpl {
-    fn spawn_async_call(&self, _callee: Value, _args: Vec<Value>, _env: Env) -> Value {
-        // Phase B: spawn the ^:async fn body as a spawn_local task, return Value::Future.
-        todo!("cljrs-async: ^:async dispatch not yet implemented (Phase B)")
+    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value {
+        // `spawn_future` keeps the task on the current LocalSet thread, so the
+        // `!Send` Clojure values (env, args, GcPtrs) never cross threads, and
+        // delivers the body's result into the returned Future.
+        spawn_future(async move { run_async_fn(callee, args, &env).await })
     }
 }

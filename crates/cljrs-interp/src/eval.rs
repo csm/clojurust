@@ -96,6 +96,11 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         )),
         FormKind::Deref(inner) => {
             let v = eval(inner, env)?;
+            if env.is_async && matches!(v, Value::Future(_)) {
+                return Err(EvalError::Runtime(
+                    "deref (@) on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
+                ));
+            }
             deref_value(v)
         }
         FormKind::Var(inner) => {

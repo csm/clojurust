@@ -127,7 +127,43 @@ fn compile_meta_form(meta: &Form, env: &mut Env) -> EvalResult<Value> {
 
 // ── fn* ───────────────────────────────────────────────────────────────────────
 
+/// Does a `^meta` form (or metadata map literal) request `:async`?
+///
+/// Handles the keyword shorthand `^:async` (a bare `:async` keyword form) and
+/// an explicit map such as `^{:async true}` or a `defn` attr-map `{:async true}`.
+pub fn meta_form_is_async(meta: &Form) -> bool {
+    match &meta.kind {
+        FormKind::Keyword(k) => k == "async",
+        FormKind::Map(entries) => entries.chunks(2).any(|kv| {
+            matches!(&kv[0].kind, FormKind::Keyword(k) if k == "async")
+                && !matches!(
+                    kv.get(1).map(|f| &f.kind),
+                    None | Some(FormKind::Bool(false)) | Some(FormKind::Nil)
+                )
+        }),
+        _ => false,
+    }
+}
+
 fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
+    // Peel any leading `^meta` wrappers, e.g. `(fn ^:async [..] ..)` or
+    // `(fn ^:async name [..] ..)`, recording whether `:async` was requested.
+    let mut is_async = false;
+    let peeled: Vec<Form>;
+    let args: &[Form] = if matches!(args.first().map(|f| &f.kind), Some(FormKind::Meta(..))) {
+        let mut head = args[0].clone();
+        while let FormKind::Meta(meta, inner) = head.kind {
+            is_async |= meta_form_is_async(&meta);
+            head = *inner;
+        }
+        peeled = std::iter::once(head)
+            .chain(args[1..].iter().cloned())
+            .collect();
+        &peeled
+    } else {
+        args
+    };
+
     let mut idx = 0;
     let mut name: Option<Arc<str>> = None;
 
@@ -174,7 +210,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Capture closed-over locals.
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
 
-    let cljrs_fn = CljxFn::new(
+    let mut cljrs_fn = CljxFn::new(
         name.clone(),
         arities,
         closed_over_names,
@@ -182,6 +218,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
         false,
         Arc::clone(&env.current_ns),
     );
+    cljrs_fn.is_async = is_async;
 
     env.on_fn_defined(&cljrs_fn);
 
@@ -786,7 +823,15 @@ fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form]) {
 // ── defn ──────────────────────────────────────────────────────────────────────
 
 pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
-    let name = require_sym(args, 0, "defn")?;
+    // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
+    let (name, mut is_async) = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Symbol(s)) => (s.clone(), false),
+        Some(FormKind::Meta(meta, inner)) => match &inner.kind {
+            FormKind::Symbol(s) => (s.clone(), meta_form_is_async(meta)),
+            _ => return Err(EvalError::Runtime("defn name must be a symbol".into())),
+        },
+        _ => return Err(EvalError::Runtime("defn requires a symbol name".into())),
+    };
     // Skip optional docstring and/or metadata map after the name.
     // Valid orderings: (defn name body...), (defn name "doc" body...),
     // (defn name {:meta ...} body...), (defn name "doc" {:meta ...} body...).
@@ -795,6 +840,8 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
         rest_start += 1;
     }
     if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Map(_)) {
+        // An attr-map such as `{:async true}` can also request async dispatch.
+        is_async |= meta_form_is_async(&args[rest_start]);
         rest_start += 1;
     }
     // Build (fn* name ...)
@@ -807,10 +854,13 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
     // intern outlives all scratch regions.
     #[cfg(feature = "no-gc")]
     let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-    let fn_val = eval_fn(&fn_args, env)?;
+    let mut fn_val = eval_fn(&fn_args, env)?;
+    if is_async && let Value::Fn(ref mut f) = fn_val {
+        f.get_mut().is_async = true;
+    }
     let var = env
         .globals
-        .intern(&env.current_ns, Arc::from(name), fn_val.clone());
+        .intern(&env.current_ns, Arc::from(name.as_str()), fn_val.clone());
     Ok(Value::Var(var))
 }
 

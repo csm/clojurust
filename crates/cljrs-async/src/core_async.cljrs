@@ -1,0 +1,18 @@
+;; clojure.core.async — Clojure-level definitions.
+;;
+;; Native primitives (timeout, alts) are registered from Rust before this file
+;; is evaluated. This file adds the macros built on top of them.
+
+;; (alt future-expr handler-fn  future-expr handler-fn  ...)
+;;
+;; Evaluates every future expression, awaits whichever completes first via
+;; `alts`, and invokes the matching handler with the produced value. Must be
+;; used inside an ^:async function body (it awaits).
+(defmacro alt [& clauses]
+  (let [pairs    (partition 2 clauses)
+        futs     (vec (map first pairs))
+        handlers (vec (map second pairs))
+        r        (gensym "alt_r__")]
+    (list 'let (vector r (list 'await (list 'alts futs)))
+          (list (list 'nth handlers (list 'second r))
+                (list 'first r)))))
