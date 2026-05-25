@@ -1072,15 +1072,12 @@ fn run() {
     // Initialize the standard environment.
     let globals = cljrs_stdlib::standard_env();
 
-    // Use a tighter GC soft limit to prevent OOM when running many test namespaces.
-    // standard_env() registers GC roots; this overrides the default high thresholds
-    // (typically 3 GiB on a 16 GiB machine) with values suited to batch testing.
-    cljrs_gc::HEAP.set_config(std::sync::Arc::new(
-        cljrs_gc::GcConfig::with_limits(
-            64 * 1024 * 1024,   // 64 MiB soft limit
-            128 * 1024 * 1024,  // 128 MiB hard limit
-        )
-    ));
+    // Do NOT override the GC soft limit here.  The interleaved
+    // require → run-tests → remove-ns loop keeps live objects bounded
+    // (~300 MiB peak), well below the default 3 GiB threshold, so GC
+    // never fires during the test run.  Forcing a low threshold causes
+    // GC to race with unregistered agent/future worker threads, which
+    // can corrupt their in-flight GcPtr allocations and hang the suite.
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -1120,6 +1117,7 @@ fn run() {
 
     code.push_str(
         r#"    ] {
+        eprintln!("[cljrs-test] requiring {}", ns_str);
         // Load the namespace on demand.
         let _ = cljrs_eval::eval(
             &cljrs_reader::Parser::new(
@@ -1129,6 +1127,7 @@ fn run() {
             &mut env
         );
 
+        eprintln!("[cljrs-test] running {}", ns_str);
         // Run tests for this namespace.
         let run_result = cljrs_eval::eval(
             &cljrs_reader::Parser::new(
@@ -1137,6 +1136,7 @@ fn run() {
             ).parse_all().unwrap()[0],
             &mut env
         );
+        eprintln!("[cljrs-test] done {}", ns_str);
         if let Ok(Value::Map(m)) = run_result {
             let mut pass = 0i64;
             let mut fail = 0i64;
