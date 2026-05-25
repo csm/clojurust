@@ -152,6 +152,19 @@ pub fn standard_env() -> Arc<GlobalEnv> {
     let globals = cljrs_eval::standard_env_minimal();
     register(&globals);
 
+    // Configure GC with default limits and register namespace bindings as roots.
+    // Without this, the GC never fires (no config → no soft-limit check).
+    // standard_env_with_paths_and_config() overrides the config but reuses this tracer.
+    cljrs_gc::HEAP.set_config(std::sync::Arc::new(GcConfig::new()));
+    let roots_gc = globals.clone();
+    cljrs_gc::HEAP.register_root_tracer(move |visitor| {
+        use cljrs_gc::GcVisitor as _;
+        let namespaces = roots_gc.namespaces.read().unwrap();
+        for (_name, ns_ptr) in namespaces.iter() {
+            visitor.visit(ns_ptr);
+        }
+    });
+
     // Try loading prebuilt IR first (skips compiler loading entirely).
     #[cfg(feature = "prebuild-ir")]
     {
@@ -227,18 +240,9 @@ pub fn standard_env_with_paths_and_config(
     let globals = standard_env();
     globals.set_source_paths(source_paths);
     globals.set_gc_config(gc_config.clone());
-    // Configure the global GC heap with the same limits
+    // Override the default GC config set by standard_env() with the custom limits.
+    // The root tracer is already registered by standard_env().
     cljrs_gc::HEAP.set_config(gc_config);
-    // Register GlobalEnv namespaces as GC roots so automatic collection
-    // can trace all live values reachable from namespace bindings.
-    let roots_globals = globals.clone();
-    cljrs_gc::HEAP.register_root_tracer(move |visitor| {
-        use cljrs_gc::GcVisitor as _;
-        let namespaces = roots_globals.namespaces.read().unwrap();
-        for (_name, ns_ptr) in namespaces.iter() {
-            visitor.visit(ns_ptr);
-        }
-    });
     globals
 }
 

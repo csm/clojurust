@@ -868,7 +868,7 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 }}
 
-fn main() {{
+fn run() {{
     // Ensure all rt_* symbols are linked into the binary.
     cljrs_compiler::rt_abi::anchor_rt_symbols();
 
@@ -892,6 +892,19 @@ fn main() {{
 
     // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
     cljrs_gc::dump_stats_from_env();
+}}
+
+fn main() {{
+    // Run on a large-stack thread to avoid stack overflows in deeply recursive
+    // Clojure code (macros, lazy sequences, recursive interpreting).
+    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    let thread = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn main thread");
+    if let Err(e) = thread.join() {{
+        std::panic::resume_unwind(e);
+    }}
 }}
 "#,
         preamble = preamble_code,
@@ -1048,12 +1061,6 @@ fn file_to_namespace(root: &Path, file: &Path) -> Option<String> {
 fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str) -> String {
     let mut code = String::new();
 
-    // Generate the namespace strings array inline
-    let ns_strings: Vec<String> = namespaces
-        .iter()
-        .map(|s| format!("\"{}\".to_string()", s))
-        .collect();
-
     code.push_str(
         r#"//! Auto-generated AOT test harness for clojurust.
 //!
@@ -1061,9 +1068,19 @@ fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str)
 
 use cljrs_value::Value;
 
-fn main() {
+fn run() {
     // Initialize the standard environment.
     let globals = cljrs_stdlib::standard_env();
+
+    // Use a tighter GC soft limit to prevent OOM when running many test namespaces.
+    // standard_env() registers GC roots; this overrides the default high thresholds
+    // (typically 3 GiB on a 16 GiB machine) with values suited to batch testing.
+    cljrs_gc::HEAP.set_config(std::sync::Arc::new(
+        cljrs_gc::GcConfig::with_limits(
+            64 * 1024 * 1024,   // 64 MiB soft limit
+            128 * 1024 * 1024,  // 128 MiB hard limit
+        )
+    ));
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -1086,40 +1103,36 @@ fn main() {
         &mut env
     );
 
-    // Load all test namespaces
-    (|| {
-"#,
-    );
-
-    for ns in namespaces.iter() {
-        code.push_str(&format!(
-            "        let _ = cljrs_eval::eval(&cljrs_reader::Parser::new(\n            \"(require '{})\".to_string(),\n            \"<test-harness>\".to_string()\n        ).parse_all().unwrap()[0], &mut env);\n",
-            ns
-        ));
-    }
-
-    code.push_str(
-        r#"    })();
-
-    // Run tests for each namespace separately
+    // For each test namespace: require it, run its tests, then remove from
+    // globals so GC can reclaim its closures and embedded form trees.
     let mut total_pass = 0i64;
     let mut total_fail = 0i64;
     let mut total_error = 0i64;
     let mut total_test_count = 0i64;
 
-    for ns_str in vec![
+    for ns_str in [
 "#,
     );
 
-    for ns_str in ns_strings.iter() {
-        code.push_str(&format!("        {},\n", ns_str));
+    for ns in namespaces.iter() {
+        code.push_str(&format!("        \"{}\",\n", ns));
     }
 
-    code.push_str(r#"    ].iter() {
+    code.push_str(
+        r#"    ] {
+        // Load the namespace on demand.
+        let _ = cljrs_eval::eval(
+            &cljrs_reader::Parser::new(
+                format!("(require '{})", ns_str),
+                "<test-harness>".to_string()
+            ).parse_all().unwrap()[0],
+            &mut env
+        );
+
+        // Run tests for this namespace.
         let run_result = cljrs_eval::eval(
             &cljrs_reader::Parser::new(
-                format!("(clojure.test/run-tests '{})", ns_str)
-                    .to_string(),
+                format!("(clojure.test/run-tests '{})", ns_str),
                 "<run-tests>".to_string()
             ).parse_all().unwrap()[0],
             &mut env
@@ -1145,6 +1158,10 @@ fn main() {
             total_error += error;
             total_test_count += test_count;
         }
+
+        // Remove the namespace from globals so GC can reclaim its closures.
+        env.globals.namespaces.write().unwrap().remove(ns_str);
+        env.globals.loaded.lock().unwrap().remove(ns_str);
     }
 
     // Flush output before exiting
@@ -1163,7 +1180,21 @@ fn main() {
     if total_fail > 0 || total_error > 0 {
         std::process::exit(1);
     }
-}"#);
+}
+
+fn main() {
+    // Run on a large-stack thread to avoid stack overflows in deeply recursive
+    // Clojure code (macros, lazy sequences, recursive interpreting).
+    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    let thread = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn main thread");
+    if let Err(e) = thread.join() {
+        std::panic::resume_unwind(e);
+    }
+}"#,
+    );
 
     code
 }

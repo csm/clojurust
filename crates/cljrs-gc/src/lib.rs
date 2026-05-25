@@ -367,7 +367,7 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-    const ESTIMATED_OBJECT_SIZE: usize = 48;
+    const ESTIMATED_OBJECT_SIZE: usize = 256;
     type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
 
     pub struct GcHeap {
