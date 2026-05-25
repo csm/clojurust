@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-env"
-version = "0.1.0"
+version = "0.1.77"
 edition = "2024"
 description = "Namespace and environment management for clojurust"
 license.workspace = true
