@@ -1072,12 +1072,21 @@ fn run() {
     // Initialize the standard environment.
     let globals = cljrs_stdlib::standard_env();
 
-    // Do NOT override the GC soft limit here.  The interleaved
-    // require → run-tests → remove-ns loop keeps live objects bounded
-    // (~300 MiB peak), well below the default 3 GiB threshold, so GC
-    // never fires during the test run.  Forcing a low threshold causes
-    // GC to race with unregistered agent/future worker threads, which
-    // can corrupt their in-flight GcPtr allocations and hang the suite.
+    // Tight GC soft limit so the collector fires frequently during each
+    // namespace's test run, reclaiming transient values promptly.
+    // Previously removed (fa08a90) because agents were not awaited before GC
+    // fired, which caused use-after-free.  That race is fixed (f66db55):
+    // await-agent now joins all agents before run-tests returns.
+    cljrs_gc::HEAP.set_config(std::sync::Arc::new(
+        cljrs_gc::GcConfig::with_limits(
+            64 * 1024 * 1024,   // 64 MiB soft limit
+            128 * 1024 * 1024,  // 128 MiB hard limit
+        )
+    ));
+    // GcPtr::Drop is a no-op: removing a namespace from the map does NOT free
+    // its closures/form-trees without an explicit collection.  force_collect is
+    // called twice per namespace below (GC_INITIAL_LIVES=2 requires two cycles
+    // to move objects through the grace period and actually free them).
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -1159,9 +1168,15 @@ fn run() {
             total_test_count += test_count;
         }
 
-        // Remove the namespace from globals so GC can reclaim its closures.
+        // Remove the namespace from globals then force two GC cycles.
+        // Cycle 1: objects with lives>0 get decremented to grace period (lives=0).
+        // Cycle 2: objects in grace period get freed.
+        // Without explicit collection the heap grows to 15+ GB because
+        // GcPtr::Drop is a no-op and memory_in_use only tracks struct headers.
         env.globals.namespaces.write().unwrap().remove(ns_str);
         env.globals.loaded.lock().unwrap().remove(ns_str);
+        cljrs_env::gc_roots::force_collect(&env);
+        cljrs_env::gc_roots::force_collect(&env);
     }
 
     // Flush output before exiting
