@@ -288,3 +288,135 @@ fn alt_dispatches_to_matching_handler() {
         assert_eq!(pr(&r), "[:value :got]");
     });
 }
+
+// ── Phase E: channels (chan, take!, put!, close!, poll!, offer!, go) ─────────
+
+const REQUIRE_CHAN: &str =
+    "(require '[clojure.core.async :refer [chan take! put! close! poll! offer! go]])";
+
+#[test]
+fn buffered_chan_put_then_take() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_CHAN, &mut env);
+        eval_sync("(def ch (chan 4))", &mut env);
+        let put = eval_async(&parse_one("(await (put! ch 42))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(put, Value::Bool(true));
+        let got = eval_async(&parse_one("(await (take! ch))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(got, Value::Long(42));
+    });
+}
+
+#[test]
+fn take_on_closed_channel_yields_nil() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_CHAN, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        // A buffered value remains takeable after close, then nil.
+        eval_async(&parse_one("(await (put! ch :only))"), &mut env)
+            .await
+            .unwrap();
+        eval_sync("(close! ch)", &mut env);
+        let first = eval_async(&parse_one("(await (take! ch))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(pr(&first), ":only");
+        let second = eval_async(&parse_one("(await (take! ch))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(second, Value::Nil);
+    });
+}
+
+#[test]
+fn put_on_closed_channel_is_false() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_CHAN, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(close! ch)", &mut env);
+        let put = eval_async(&parse_one("(await (put! ch 1))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(put, Value::Bool(false));
+    });
+}
+
+#[test]
+fn poll_and_offer_are_nonblocking() {
+    let globals = async_env();
+    let mut env = Env::new(globals, "user");
+    eval_sync(REQUIRE_CHAN, &mut env);
+    eval_sync("(def ch (chan 1))", &mut env);
+    // Buffer has room: offer succeeds; then it is full.
+    assert_eq!(eval_sync("(offer! ch 1)", &mut env), Value::Bool(true));
+    assert_eq!(eval_sync("(offer! ch 2)", &mut env), Value::Bool(false));
+    // poll drains the one value, then returns nil on empty.
+    assert_eq!(eval_sync("(poll! ch)", &mut env), Value::Long(1));
+    assert_eq!(eval_sync("(poll! ch)", &mut env), Value::Nil);
+}
+
+#[test]
+fn go_block_passes_value_through_channels() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_CHAN, &mut env);
+        eval_sync("(def in (chan 1))", &mut env);
+        eval_sync("(def out (chan 1))", &mut env);
+        // A go block takes from `in`, doubles it, and puts it on `out`.
+        eval_sync(
+            "(go (let [v (await (take! in))] (await (put! out (* v 2)))))",
+            &mut env,
+        );
+        eval_async(&parse_one("(await (put! in 21))"), &mut env)
+            .await
+            .unwrap();
+        let r = eval_async(&parse_one("(await (take! out))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Long(42));
+    });
+}
+
+#[test]
+fn rendezvous_chan_hands_off_to_taker() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_CHAN, &mut env);
+        eval_sync("(def ch (chan))", &mut env); // unbuffered (rendezvous)
+        eval_sync("(def out (chan 1))", &mut env);
+        // A consumer go block relays the rendezvous value to `out`.
+        eval_sync("(go (await (put! out (await (take! ch)))))", &mut env);
+        // The put resolves true only once the consumer has taken the value.
+        let put = eval_async(&parse_one("(await (put! ch :hello))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(put, Value::Bool(true));
+        let r = eval_async(&parse_one("(await (take! out))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(pr(&r), ":hello");
+    });
+}
+
+#[test]
+fn chan_is_a_channel_native_object() {
+    let globals = async_env();
+    let mut env = Env::new(globals, "user");
+    eval_sync(REQUIRE_CHAN, &mut env);
+    let ch = eval_sync("(chan)", &mut env);
+    assert!(
+        matches!(ch, Value::NativeObject(ref o) if o.get().type_tag() == "Channel"),
+        "expected a Channel native object, got {ch:?}"
+    );
+}
