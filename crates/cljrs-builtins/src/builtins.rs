@@ -352,7 +352,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         ("future-call*", Arity::Fixed(2), builtin_future_call_star),
         ("agent", Arity::Fixed(1), builtin_agent),
-        ("await-agent", Arity::Variadic { min: 1 }, builtin_await_agent),
+        (
+            "await-agent",
+            Arity::Variadic { min: 1 },
+            builtin_await_agent,
+        ),
         ("agent-error", Arity::Fixed(1), builtin_agent_error),
         ("restart-agent", Arity::Fixed(2), builtin_restart_agent),
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),

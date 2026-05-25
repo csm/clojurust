@@ -248,19 +248,21 @@ fn main() -> miette::Result<()> {
     let builder = std::thread::Builder::new()
         .name("cljrs-main".into())
         .stack_size(stack_size);
-    let handle = builder.spawn(move || {
-        #[cfg(feature = "async")]
-        {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build Tokio runtime");
-            let local = tokio::task::LocalSet::new();
-            return rt.block_on(local.run_until(async move { run(cli) }));
-        }
-        #[cfg(not(feature = "async"))]
-        run(cli)
-    }).into_diagnostic()?;
+    let handle = builder
+        .spawn(move || {
+            #[cfg(feature = "async")]
+            {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build Tokio runtime");
+                let local = tokio::task::LocalSet::new();
+                return rt.block_on(local.run_until(async move { run(cli) }));
+            }
+            #[cfg(not(feature = "async"))]
+            run(cli)
+        })
+        .into_diagnostic()?;
     let result: miette::Result<i32> = handle.join().unwrap_or_else(|e| {
         eprintln!("cljrs: thread panicked: {e:?}");
         std::process::exit(1);
