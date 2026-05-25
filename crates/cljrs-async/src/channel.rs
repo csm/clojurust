@@ -84,11 +84,6 @@ impl CljChannel {
         self.state.lock().unwrap().capacity == 0
     }
 
-    /// True if the channel has been closed.
-    pub(crate) fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
-    }
-
     /// Mark the channel closed. Idempotent. Pending and future takes drain any
     /// buffered values and then observe `nil`.
     pub(crate) fn close(&self) {
@@ -198,6 +193,12 @@ impl CljMult {
         Self {
             taps: Mutex::new(Vec::new()),
         }
+    }
+}
+
+impl Default for CljMult {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

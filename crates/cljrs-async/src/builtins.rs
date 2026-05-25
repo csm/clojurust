@@ -21,7 +21,7 @@ use cljrs_value::{
     gc_native_object,
 };
 
-use crate::channel::{CHANNEL_TAG, MULT_TAG, CljChannel, CljMult, RvOffer, RvStatus};
+use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
 use crate::eval_async::{await_value, spawn_future};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
@@ -269,7 +269,9 @@ fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
         for r in results {
             values.push(r?);
         }
-        Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(values))))
+        Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            values,
+        ))))
     }))
 }
 
@@ -280,9 +282,9 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_env::callback::capture_eval_context()
         .ok_or_else(|| ValueError::Other("thread-call called outside an eval context".into()))?;
-    let rt = globals.async_runtime().ok_or_else(|| {
-        ValueError::Other("thread-call requires an async runtime".into())
-    })?;
+    let rt = globals
+        .async_runtime()
+        .ok_or_else(|| ValueError::Other("thread-call requires an async runtime".into()))?;
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);
@@ -290,9 +292,8 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     spawn_future(async move {
         let v = await_value(fut).await.unwrap_or(Value::Nil);
         loop {
-            match chan_ref(result_ch.get()).try_put_buffered(&v) {
-                Some(_) => break,
-                None => {}
+            if chan_ref(result_ch.get()).try_put_buffered(&v).is_some() {
+                break;
             }
             tokio::task::yield_now().await;
         }
@@ -442,9 +443,8 @@ fn builtin_mult(args: &[Value]) -> ValueResult<Value> {
                     }
                 } else {
                     loop {
-                        match chan_ref(tap_ch.get()).try_put_buffered(&v) {
-                            Some(_) => break,
-                            None => {}
+                        if chan_ref(tap_ch.get()).try_put_buffered(&v).is_some() {
+                            break;
                         }
                         tokio::task::yield_now().await;
                     }
