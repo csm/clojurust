@@ -10,10 +10,10 @@ executor. All Clojure values remain on a single thread, keeping GC pointers (`!S
 
 ## Status
 
-**Phase E (channels)** — CSP channels are implemented. `(chan)` returns a `CljChannel`
-wrapped as a `Value::NativeObject`; `take!`/`put!` return a `Value::Future` that parks
-(yields) until the operation completes, and `close!`/`poll!`/`offer!` act synchronously. The
-`go` macro spawns its body as an async task via the native `async-spawn`.
+**Phase F (higher-level async utilities)** — All core `clojure.core.async` primitives are
+implemented. `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, and
+`untap-all!` are native Rust builtins; `async-pmap`, `thread`, `merge`, `reduce`, and `into`
+are defined in `core_async.cljrs`. `await` works correctly inside `loop/recur` bodies.
 
 Done:
 
@@ -28,6 +28,12 @@ Done:
   a Clojure macro that `await`s `alts` and dispatches to the matching handler.
 - Phase E: `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, and the `go`
   macro. Channels are `CljChannel` `NativeObject`s (buffered or unbuffered/rendezvous).
+- Phase F: `join-all` awaits a seq of futures and returns a vector of results. `thread-call`
+  runs a thunk and delivers its result to a buffered channel. `onto-chan!` seeds a channel from
+  a collection and closes it; `to-chan!` does the same but returns the channel before seeding
+  finishes (background task). `mult` broadcasts a source channel to all registered tap channels
+  (`tap!`/`untap!`/`untap-all!`). Clojure-level: `async-pmap`, `thread` macro, `merge`,
+  `reduce`, `into`. `eval_loop_async` enables proper `await` yielding inside `loop/recur`.
 
 ### Channel model
 
@@ -56,8 +62,7 @@ inside an async context:
 
 Not yet implemented (later phases):
 
-- Phase F+: `take!!`/`put!!` (blocking sync ops), `async-pmap`, `join-all`, GC safepoints,
-  IR support, and the wider `clojure.core.async` surface (`thread`, `pipeline`, `mult`, …).
+- Phase G+: `take!!`/`put!!` (blocking sync ops), `pipeline`, GC safepoints, IR support.
 
 ### `await` and the single-thread executor
 
@@ -75,10 +80,10 @@ blocking bridge is a later phase.
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl` and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
-| `src/channel.rs` | `CljChannel` — a buffered/rendezvous CSP channel exposed as a `NativeObject` |
-| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn` |
-| `src/core_async.cljrs` | Clojure source for the `clojure.core.async` namespace (the `alt` and `go` macros) |
-| `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, and channels |
+| `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
+| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!` |
+| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into` |
+| `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, and Phase F utilities |
 
 ## Public API
 
@@ -105,6 +110,13 @@ pub mod channel {
     impl CljChannel {
         /// Create a channel. `capacity == 0` is an unbuffered rendezvous channel.
         pub fn new(capacity: usize) -> Self;
+    }
+
+    /// A broadcast multiplexer. `(mult src-ch)` creates one; values from `src-ch`
+    /// are forwarded to all registered tap channels via `tap!`/`untap!`/`untap-all!`.
+    pub struct CljMult { /* ... */ }
+    impl CljMult {
+        pub fn new() -> Self;
     }
 }
 ```

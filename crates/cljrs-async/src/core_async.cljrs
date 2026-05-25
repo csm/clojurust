@@ -1,8 +1,9 @@
 ;; clojure.core.async — Clojure-level definitions.
 ;;
 ;; Native primitives (timeout, alts, chan, take!, put!, close!, poll!, offer!,
-;; async-spawn) are registered from Rust before this file is evaluated. This
-;; file adds the macros built on top of them.
+;; async-spawn, join-all, thread-call, onto-chan!, to-chan!, mult, tap!,
+;; untap!, untap-all!) are registered from Rust before this file is evaluated.
+;; This file adds the macros and higher-level functions built on top of them.
 
 ;; (go body...)
 ;;
@@ -26,3 +27,60 @@
     (list 'let (vector r (list 'await (list 'alts futs)))
           (list (list 'nth handlers (list 'second r))
                 (list 'first r)))))
+
+;; ── Phase F: higher-level async utilities ─────────────────────────────────────
+
+;; (async-pmap f coll)
+;;
+;; Map an ^:async function `f` over `coll` concurrently, collecting all results
+;; into a vector. Each element is dispatched as an independent async task; all
+;; tasks run in parallel on the LocalSet. An error in any task propagates.
+(defn ^:async async-pmap [f coll]
+  (let [futs (map (fn [x] (async-spawn (fn ^:async [] (await (f x))))) coll)]
+    (await (join-all futs))))
+
+;; (thread body...)
+;;
+;; Run `body` as an async task, returning a channel that delivers the result.
+;; Analogous to clojure.core.async/thread but backed by the LocalSet executor.
+(defmacro thread [& body]
+  (list 'clojure.core.async/thread-call
+        (cons 'fn (cons [] body))))
+
+;; (merge chs)
+;;
+;; Merge multiple input channels into a single output channel. Each input
+;; channel is consumed by a go block that relays values to `out`. When all
+;; input channels close, `out` is automatically closed. Returns `out`.
+(defn merge [chs]
+  (let [n         (count chs)
+        out       (chan n)
+        remaining (atom n)]
+    (doseq [ch chs]
+      (go (loop []
+            (let [v (await (take! ch))]
+              (if (nil? v)
+                (when (= (swap! remaining dec) 0)
+                  (close! out))
+                (do (await (put! out v))
+                    (recur)))))))
+    out))
+
+;; (reduce f init ch)
+;;
+;; Fold all values from channel `ch` through `(f acc v)`, starting with `init`.
+;; Returns the final accumulator when `ch` closes. Must be called inside an
+;; ^:async context (it awaits each value).
+(defn ^:async reduce [f init ch]
+  (loop [acc init]
+    (let [v (await (take! ch))]
+      (if (nil? v)
+        acc
+        (recur (f acc v))))))
+
+;; (into coll ch)
+;;
+;; Drain channel `ch` into collection `coll` using `conj`, returning the grown
+;; collection. Must be called inside an ^:async context.
+(defn ^:async into [coll ch]
+  (await (reduce conj coll ch)))

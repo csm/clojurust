@@ -124,7 +124,10 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             "do" => return eval_body_async(&forms[1..], env).await,
             "if" => return eval_if_async(&forms[1..], env).await,
             "let*" | "let" => return eval_let_async(&forms[1..], env).await,
-            // Other special forms (loop/recur/try/binding/…) don't yield in
+            // loop/loop* needs an async handler so that `await` inside the body
+            // yields correctly instead of falling back to blocking deref.
+            "loop*" | "loop" => return eval_loop_async(&forms[1..], env).await,
+            // Other special forms (try/binding/…) don't yield in
             // Phase B: run them synchronously. A `recur` that targets the
             // enclosing async fn surfaces as `EvalError::Recur` and is caught
             // by `run_async_fn`.
@@ -237,6 +240,59 @@ async fn eval_let_async(args: &[Form], env: &mut Env) -> EvalResult {
     let result = eval_body_async(&args[1..], env).await;
     env.pop_frame();
     result
+}
+
+/// `(loop* [bindings] body…)` / `(loop [bindings] body…)` — an async-aware
+/// loop: binding inits are evaluated with [`eval_async`], the body runs with
+/// [`eval_body_async`], and `recur` restarts the iteration.
+async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let bindings = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Vector(v)) => v.clone(),
+        _ => return Err(EvalError::Runtime("loop requires a binding vector".into())),
+    };
+    if bindings.len() % 2 != 0 {
+        return Err(EvalError::Runtime(
+            "loop binding vector must have even length".into(),
+        ));
+    }
+
+    let patterns: Vec<Form> = bindings.iter().step_by(2).cloned().collect();
+    let init_forms: Vec<Form> = bindings.iter().skip(1).step_by(2).cloned().collect();
+
+    // Evaluate initial binding values.
+    let mut current_vals: Vec<Value> = Vec::with_capacity(patterns.len());
+    for form in &init_forms {
+        current_vals.push(Box::pin(eval_async(form, env)).await?);
+    }
+
+    let body = &args[1..];
+    loop {
+        env.push_frame();
+        for (pat, val) in patterns.iter().zip(current_vals.iter()) {
+            if let Err(e) = bind_pattern(pat, val.clone(), env) {
+                env.pop_frame();
+                return Err(e);
+            }
+        }
+
+        let result = eval_body_async(body, env).await;
+        env.pop_frame();
+
+        match result {
+            Ok(v) => return Ok(v),
+            Err(EvalError::Recur(new_vals)) => {
+                if new_vals.len() != patterns.len() {
+                    return Err(EvalError::Arity {
+                        name: "recur".into(),
+                        expected: patterns.len().to_string(),
+                        got: new_vals.len(),
+                    });
+                }
+                current_vals = new_vals;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// A function call whose arguments may contain `await`s. Arguments are
