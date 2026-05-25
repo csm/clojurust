@@ -488,10 +488,9 @@ mod gc_full {
                 && config.soft_limit_exceeded(current_usage)
             {
                 if self.gc_suppressed.load(Ordering::Relaxed) {
-                    // Exponential-backoff suppression: only re-enable GC once
-                    // memory has grown past the threshold set by the last
-                    // zero-yield collection.  Avoids the GC storm caused by
-                    // firing on every alloc-frame drop.
+                    // Suppression active: only re-enable GC once memory has
+                    // grown past the threshold set by the last zero-yield
+                    // collection (current_memory + soft_limit/10).
                     let threshold = self.suppressed_threshold.load(Ordering::Relaxed);
                     if current_usage > threshold {
                         self.gc_suppressed.store(false, Ordering::Relaxed);
@@ -589,14 +588,24 @@ mod gc_full {
                 sweep_elapsed
             );
             if freed_count == 0 {
-                // Zero-yield collection: suppress GC with exponential backoff.
-                // Require memory to grow another 10% before retrying.  The old
-                // alloc-root-shrinkage trigger fired on every eval-frame drop,
-                // causing hundreds of O(N) sweeps that freed nothing (GC storm).
-                let current = post_memory;
-                let headroom = (current / 10).max(1);
+                // Zero-yield collection: suppress GC until memory grows by a
+                // fixed headroom (10% of the soft limit, not 10% of current
+                // memory).  Using post_memory/10 as headroom compounded across
+                // consecutive zero-yield cycles (e.g. during deep recursion
+                // where all objects are live), causing the threshold to grow
+                // without bound and GC to never fire again after the
+                // computation finishes — leading to OOM on long test suites.
+                // A fixed headroom gives linear growth, which stays bounded.
+                let soft_limit = self
+                    .config
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.soft_limit())
+                    .unwrap_or(64 * 1024 * 1024);
+                let headroom = (soft_limit / 10).max(1);
                 self.suppressed_threshold
-                    .store(current + headroom, Ordering::Relaxed);
+                    .store(post_memory + headroom, Ordering::Relaxed);
                 self.gc_suppressed.store(true, Ordering::Relaxed);
             } else {
                 self.gc_suppressed.store(false, Ordering::Relaxed);

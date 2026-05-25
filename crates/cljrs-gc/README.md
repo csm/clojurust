@@ -216,10 +216,16 @@ programs and the AOT test harness call it once at exit.
 - **Precise per-object size**: `GcBoxHeader::size` stores `std::mem::size_of::<GcBox<T>>()`
   at allocation time. `memory_in_use` is incremented by the exact GcBox size (not a
   flat 256-byte estimate), and decremented by the exact freed-object sizes.
-- **Exponential-backoff GC suppression**: after a zero-yield collection (nothing freed),
-  GC is suppressed until `memory_in_use` grows by another 10% (the `suppressed_threshold`).
-  The old trigger — re-enabling on every alloc-frame drop — fired O(N-heap) sweeps on
-  every eval-frame return, causing a GC storm with hundreds of useless traversals.
+- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed),
+  GC is suppressed until `memory_in_use` grows by another `soft_limit/10` bytes
+  (a fixed additive headroom, not a percentage of current memory).  Using a
+  percentage of current memory as headroom would compound across consecutive
+  zero-yield cycles (e.g. during deep recursion where all objects are live),
+  causing the threshold to grow exponentially and GC to stop firing permanently
+  after the computation finishes — leading to OOM on long test suites.  A fixed
+  headroom gives linear growth, which stays bounded.  The old trigger —
+  re-enabling on every alloc-frame drop — fired O(N-heap) sweeps on every
+  eval-frame return, causing a GC storm with hundreds of useless traversals.
 - **Minimal grace period** (`GC_INITIAL_LIVES = 2`): objects start at `lives = 1`.
   GC only fires at explicit `gc_safepoint()` calls, not at arbitrary Rust points.
   The single cycle of grace covers the narrow window between an alloc frame
