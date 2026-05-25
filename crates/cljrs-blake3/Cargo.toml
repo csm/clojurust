@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-blake3"
-version = "0.1.0"
+version = "0.1.75"
 edition = "2024"
 description = "BLAKE3 cryptographic hash functions exposed as Clojure native functions"
 license.workspace = true
