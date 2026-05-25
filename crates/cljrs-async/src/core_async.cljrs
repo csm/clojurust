@@ -1,7 +1,17 @@
 ;; clojure.core.async — Clojure-level definitions.
 ;;
-;; Native primitives (timeout, alts) are registered from Rust before this file
-;; is evaluated. This file adds the macros built on top of them.
+;; Native primitives (timeout, alts, chan, take!, put!, close!, poll!, offer!,
+;; async-spawn) are registered from Rust before this file is evaluated. This
+;; file adds the macros built on top of them.
+
+;; (go body...)
+;;
+;; Spawn `body` as an asynchronous task on the LocalSet executor and return a
+;; Future that delivers the body's value. The body runs in an async context, so
+;; channel operations are used as `(await (take! ch))` / `(await (put! ch v))`.
+(defmacro go [& body]
+  (list 'clojure.core.async/async-spawn
+        (cons 'fn (cons [] body))))
 
 ;; (alt future-expr handler-fn  future-expr handler-fn  ...)
 ;;
