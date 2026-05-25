@@ -214,13 +214,12 @@ programs and the AOT test harness call it once at exit.
 - **Type erasure**: `trace_fn` / `drop_fn` in the header enable type-erased
   mark and sweep without a vtable pointer per allocation.
 - **Precise per-object size**: `GcBoxHeader::size` stores `std::mem::size_of::<GcBox<T>>()`
-  at allocation time. `memory_in_use` is incremented by the exact GcBox size, not
-  a fixed estimate, giving accurate GC pressure signals.
-- **Live-set memory reset**: after each collection, `memory_in_use` is reset to the
-  sum of sizes of objects that were marked reachable in that cycle. Objects in the
-  grace-period (unreachable but `lives > 0`) are excluded. Without this, grace-period
-  objects inflate `memory_in_use` across 10 cycles, causing a GC storm of O(N) sweeps
-  that free nothing — particularly harmful for long-running test suites.
+  at allocation time. `memory_in_use` is incremented by the exact GcBox size (not a
+  flat 256-byte estimate), and decremented by the exact freed-object sizes.
+- **Exponential-backoff GC suppression**: after a zero-yield collection (nothing freed),
+  GC is suppressed until `memory_in_use` grows by another 10% (the `suppressed_threshold`).
+  The old trigger — re-enabling on every alloc-frame drop — fired O(N-heap) sweeps on
+  every eval-frame return, causing a GC storm with hundreds of useless traversals.
 - **Cycle collection**: because `GcPtr::drop` is a no-op, reference cycles do
   not prevent collection — any object unreachable from roots is freed.
 

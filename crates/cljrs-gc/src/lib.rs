@@ -379,7 +379,11 @@ mod gc_full {
         total_allocated_bytes: AtomicUsize,
         root_tracers: Mutex<Vec<RootTracer>>,
         gc_suppressed: std::sync::atomic::AtomicBool,
-        last_alloc_root_len: AtomicUsize,
+        /// memory_in_use threshold above which GC is re-enabled after a
+        /// zero-yield collection.  Implements exponential backoff: after
+        /// collecting and freeing nothing, we require another 10% of heap
+        /// growth before retrying, preventing a GC storm of O(N) sweeps.
+        suppressed_threshold: AtomicUsize,
     }
 
     struct GcHeapInner {
@@ -419,7 +423,7 @@ mod gc_full {
                 total_allocated_bytes: AtomicUsize::new(0),
                 root_tracers: Mutex::new(Vec::new()),
                 gc_suppressed: std::sync::atomic::AtomicBool::new(false),
-                last_alloc_root_len: AtomicUsize::new(0),
+                suppressed_threshold: AtomicUsize::new(0),
             }
         }
 
@@ -477,9 +481,12 @@ mod gc_full {
                 && config.soft_limit_exceeded(current_usage)
             {
                 if self.gc_suppressed.load(Ordering::Relaxed) {
-                    let current_roots = ALLOC_ROOTS.with(|r| r.borrow().len());
-                    let last = self.last_alloc_root_len.load(Ordering::Relaxed);
-                    if current_roots < last {
+                    // Exponential-backoff suppression: only re-enable GC once
+                    // memory has grown past the threshold set by the last
+                    // zero-yield collection.  Avoids the GC storm caused by
+                    // firing on every alloc-frame drop.
+                    let threshold = self.suppressed_threshold.load(Ordering::Relaxed);
+                    if current_usage > threshold {
                         self.gc_suppressed.store(false, Ordering::Relaxed);
                         crate::cancellation::request_gc();
                     }
@@ -516,8 +523,6 @@ mod gc_full {
             let mut inner = self.inner.lock().unwrap();
             let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
-            // Bytes of objects marked reachable this cycle (the true live set).
-            let mut marked_bytes: usize = 0;
             // Bytes of objects with lives==0 that will be freed now.
             let mut freed_bytes: usize = 0;
             let mut current = inner.head;
@@ -529,7 +534,6 @@ mod gc_full {
                 if lives >= GC_INITIAL_LIVES {
                     // Marked reachable this cycle — reset grace counter.
                     header.lives.set(GC_INITIAL_LIVES - 1);
-                    marked_bytes += obj_size;
                     live.push(current);
                 } else if lives > 0 {
                     // In grace period (unreachable but not yet freed).
@@ -555,13 +559,11 @@ mod gc_full {
                 header.next.set(inner.head);
                 inner.head = ptr;
             }
-            // Reset memory_in_use to the marked (truly reachable) live set.
-            // Grace-period objects are not counted: they are unreachable from
-            // roots and should not contribute to GC pressure, even though they
-            // won't be freed until their lives counter reaches zero.  Without
-            // this reset, memory_in_use drifts upward across the 10-cycle grace
-            // period and triggers a GC storm of O(N) sweeps that free nothing.
-            self.memory_in_use.store(marked_bytes, Ordering::Relaxed);
+            // Decrement memory_in_use by the bytes actually freed.  All heap
+            // objects (live + grace-period) remain counted; only physically
+            // freed objects are subtracted.  This keeps memory pressure
+            // accurate so GC fires again when the heap genuinely grows.
+            self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
             crate::stats::GC_STATS.record_gc_pause(
                 mark_elapsed + sweep_elapsed,
@@ -580,8 +582,14 @@ mod gc_full {
                 sweep_elapsed
             );
             if freed_count == 0 {
-                let root_len = ALLOC_ROOTS.with(|r| r.borrow().len());
-                self.last_alloc_root_len.store(root_len, Ordering::Relaxed);
+                // Zero-yield collection: suppress GC with exponential backoff.
+                // Require memory to grow another 10% before retrying.  The old
+                // alloc-root-shrinkage trigger fired on every eval-frame drop,
+                // causing hundreds of O(N) sweeps that freed nothing (GC storm).
+                let current = post_memory;
+                let headroom = (current / 10).max(1);
+                self.suppressed_threshold
+                    .store(current + headroom, Ordering::Relaxed);
                 self.gc_suppressed.store(true, Ordering::Relaxed);
             } else {
                 self.gc_suppressed.store(false, Ordering::Relaxed);
