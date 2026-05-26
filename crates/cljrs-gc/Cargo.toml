@@ -16,4 +16,8 @@ bigdecimal   = { workspace = true }
 num-rational = { workspace = true }
 regex        = { workspace = true }
 cljrs-logging = { workspace = true }
+
+# Not available on wasm32-unknown-unknown (pulls in errno).  The wasm build
+# uses a fixed 64 MB heap limit instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 system-memory = "0.1.7"
