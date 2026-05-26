@@ -142,6 +142,35 @@ fn load_prebuilt_compiler_ir(globals: &Arc<GlobalEnv>) {
 #[cfg(not(feature = "prebuild-ir"))]
 fn load_prebuilt_compiler_ir(_globals: &Arc<GlobalEnv>) {}
 
+/// Create a `GlobalEnv` with all built-ins and stdlib registered, **without**
+/// the IR lowering hook or compiler loading.
+///
+/// Use this in the AOT test harness and any other execution context where
+/// IR generation is not needed.  It avoids populating the global `IR_CACHE`
+/// with entries for test-namespace functions (entries that would never be
+/// evicted and would accumulate to hundreds of MB over 233 namespaces).
+/// It also skips loading the cljrs.compiler.* namespaces, saving additional
+/// startup time and memory.
+///
+/// GC config and root tracer are still registered identically to `standard_env`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn standard_env_no_ir() -> Arc<GlobalEnv> {
+    let globals = cljrs_eval::standard_env_minimal_no_ir();
+    register(&globals);
+
+    cljrs_gc::HEAP.set_config(std::sync::Arc::new(GcConfig::new()));
+    let roots_gc = globals.clone();
+    cljrs_gc::HEAP.register_root_tracer(move |visitor| {
+        use cljrs_gc::GcVisitor as _;
+        let namespaces = roots_gc.namespaces.read().unwrap();
+        for (_name, ns_ptr) in namespaces.iter() {
+            visitor.visit(ns_ptr);
+        }
+    });
+
+    globals
+}
+
 /// Create a `GlobalEnv` with all built-ins and stdlib registered.
 ///
 /// Prefer this over `cljrs_eval::standard_env()` in the `cljrs` binary so that

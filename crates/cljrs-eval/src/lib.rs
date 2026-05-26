@@ -108,6 +108,13 @@ pub fn standard_env_minimal() -> Arc<GlobalEnv> {
     cljrs_interp::standard_env_minimal(Some(eval), Some(apply::call_cljrs_fn), Some(eager_lower_fn))
 }
 
+/// Like `standard_env_minimal` but without IR lowering.  Use this when IR
+/// generation is not needed (e.g. the AOT test harness) to avoid populating
+/// the IR cache with entries that will never be evicted.
+pub fn standard_env_minimal_no_ir() -> Arc<GlobalEnv> {
+    cljrs_interp::standard_env_minimal(Some(eval), Some(apply::call_cljrs_fn), None)
+}
+
 pub fn standard_env() -> Arc<GlobalEnv> {
     let globals = standard_env_minimal();
     register_compiler_sources(&globals);
