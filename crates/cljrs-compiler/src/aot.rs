@@ -1083,6 +1083,27 @@ fn run() {
     // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
     let globals = cljrs_stdlib::standard_env_no_ir();
 
+    // Override GC soft limit to a small value so the collector fires during
+    // test execution.  standard_env_no_ir() calls set_config_from_env() which
+    // defaults to system_memory/3 (often 5+ GB); at that level memory_in_use
+    // (which only tracks GcBox sizes) never reaches the threshold, GC never
+    // runs, and all temporary Values + freed namespace closures accumulate.
+    // 64 MB is enough to trigger multiple collections per namespace test while
+    // adding negligible overhead (<1%).  CLJRS_GC_SOFT_LIMIT_MB overrides the
+    // 64 MB default for debugging/profiling.
+    {
+        let soft_mb: usize = std::env::var("CLJRS_GC_SOFT_LIMIT_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        cljrs_gc::HEAP.set_config(std::sync::Arc::new(
+            cljrs_gc::GcConfig::with_limits(
+                soft_mb * 1024 * 1024,
+                soft_mb * 2 * 1024 * 1024,
+            ),
+        ));
+    }
+
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 "#,
@@ -1096,13 +1117,19 @@ fn run() {
     cljrs_env::callback::push_eval_context(&env);
 
     // Load clojure.test once; it stays loaded for the entire run.
-    let _ = cljrs_eval::eval(
-        &cljrs_reader::Parser::new(
-            "(require 'clojure.test)".to_string(),
-            "<test-harness>".to_string()
-        ).parse_all().unwrap()[0],
-        &mut env
-    );
+    // push_alloc_frame() scopes transient eval allocations: after the frame
+    // drops, those GcBoxes are removed from ALLOC_ROOTS.  The namespace objects
+    // themselves stay alive via globals.namespaces, so GC can still trace them.
+    {
+        let _frame = cljrs_gc::push_alloc_frame();
+        let _ = cljrs_eval::eval(
+            &cljrs_reader::Parser::new(
+                "(require 'clojure.test)".to_string(),
+                "<test-harness>".to_string()
+            ).parse_all().unwrap()[0],
+            &mut env
+        );
+    }
 
     // Load, test, and unload each test namespace one at a time.
     //
@@ -1127,23 +1154,35 @@ fn run() {
 
     code.push_str(
         r#"    ] {
-        // Load this test namespace.
-        let _ = cljrs_eval::eval(
-            &cljrs_reader::Parser::new(
-                format!("(require '{})", ns_str).to_string(),
-                "<test-harness>".to_string()
-            ).parse_all().unwrap()[0],
-            &mut env
-        );
+        // Load this test namespace.  push_alloc_frame() scopes all GcBox
+        // allocations made during require: when the frame drops, those entries
+        // are removed from ALLOC_ROOTS so GC treats them as non-roots.  The
+        // namespace vars/closures remain reachable via globals.namespaces and
+        // are kept alive by GC tracing through that reference; purely transient
+        // allocations from eval become eligible for collection immediately.
+        {
+            let _frame = cljrs_gc::push_alloc_frame();
+            let _ = cljrs_eval::eval(
+                &cljrs_reader::Parser::new(
+                    format!("(require '{})", ns_str).to_string(),
+                    "<test-harness>".to_string()
+                ).parse_all().unwrap()[0],
+                &mut env
+            );
+        }
 
-        // Run its tests.
-        let run_result = cljrs_eval::eval(
-            &cljrs_reader::Parser::new(
-                format!("(clojure.test/run-tests '{})", ns_str).to_string(),
-                "<run-tests>".to_string()
-            ).parse_all().unwrap()[0],
-            &mut env
-        );
+        // Run its tests.  Same alloc-frame scoping so transient test
+        // infrastructure objects are freed after each namespace.
+        let run_result = {
+            let _frame = cljrs_gc::push_alloc_frame();
+            cljrs_eval::eval(
+                &cljrs_reader::Parser::new(
+                    format!("(clojure.test/run-tests '{})", ns_str).to_string(),
+                    "<run-tests>".to_string()
+                ).parse_all().unwrap()[0],
+                &mut env
+            )
+        };
         if let Ok(Value::Map(m)) = run_result {
             let mut pass = 0i64;
             let mut fail = 0i64;
