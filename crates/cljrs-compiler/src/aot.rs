@@ -731,6 +731,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
+cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
 cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
@@ -869,6 +870,9 @@ unsafe extern "C" {{
 }}
 
 fn run() {{
+    // Parse environment -X flags.
+    cljrs_logging::set_feature_levels_from_env().unwrap();
+
     // Ensure all rt_* symbols are linked into the binary.
     cljrs_compiler::rt_abi::anchor_rt_symbols();
 
@@ -1069,6 +1073,9 @@ fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str)
 use cljrs_value::Value;
 
 fn run() {
+    // Set -X flags from environment.
+    cljrs_logging::set_feature_levels_from_env().unwrap();
+
     // Initialize the standard environment.
     let globals = cljrs_stdlib::standard_env();
 
@@ -1314,6 +1321,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
 cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
