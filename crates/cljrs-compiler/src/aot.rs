@@ -1076,8 +1076,12 @@ fn run() {
     // Set -X flags from environment.
     cljrs_logging::set_feature_levels_from_env().unwrap();
 
-    // Initialize the standard environment.
-    let globals = cljrs_stdlib::standard_env();
+    // Initialize the standard environment without IR lowering.
+    // The test harness interprets Clojure at runtime; there is no benefit to
+    // eagerly compiling test functions to IR, and doing so fills IR_CACHE with
+    // entries that are never evicted (non-GC memory, leaks across all 233 namespaces).
+    // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
+    let globals = cljrs_stdlib::standard_env_no_ir();
 
     // Tight GC soft limit so the collector fires frequently during each
     // namespace's test run, reclaiming transient values promptly.
