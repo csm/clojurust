@@ -20,11 +20,14 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use cljrs_gc::{MarkVisitor, Trace};
-use cljrs_value::{NativeObject, Value};
+use cljrs_gc::{GcPtr, MarkVisitor, Trace};
+use cljrs_value::{NativeObject, NativeObjectBox, Value};
 
 /// The native type tag reported by [`NativeObject::type_tag`] for channels.
 pub(crate) const CHANNEL_TAG: &str = "Channel";
+
+/// The native type tag for broadcast multiplexers.
+pub(crate) const MULT_TAG: &str = "Mult";
 
 /// Outcome of a non-blocking rendezvous offer (capacity-0 `put!`).
 pub(crate) enum RvOffer {
@@ -166,6 +169,51 @@ impl Trace for CljChannel {
 impl NativeObject for CljChannel {
     fn type_tag(&self) -> &str {
         CHANNEL_TAG
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ── Mult ─────────────────────────────────────────────────────────────────────
+
+/// A broadcast multiplexer. Reads values from a source channel and forwards
+/// each one to all registered tap channels. Created with `(mult source-ch)`;
+/// taps are added/removed via `tap!`/`untap!`.
+#[derive(Debug)]
+pub struct CljMult {
+    /// (tap_channel, close_on_done) pairs. `close_on_done` controls whether the
+    /// tap channel is closed when the source channel closes.
+    pub(crate) taps: Mutex<Vec<(GcPtr<NativeObjectBox>, bool)>>,
+}
+
+impl CljMult {
+    pub fn new() -> Self {
+        Self {
+            taps: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Default for CljMult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Trace for CljMult {
+    fn trace(&self, visitor: &mut MarkVisitor) {
+        use cljrs_gc::GcVisitor as _;
+        for (ch, _) in self.taps.lock().unwrap().iter() {
+            visitor.visit(ch);
+        }
+    }
+}
+
+impl NativeObject for CljMult {
+    fn type_tag(&self) -> &str {
+        MULT_TAG
     }
 
     fn as_any(&self) -> &dyn Any {

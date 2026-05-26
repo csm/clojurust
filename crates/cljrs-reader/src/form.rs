@@ -1,3 +1,5 @@
+use std::mem;
+
 use cljrs_types::span::Span;
 
 /// A parsed Clojure form with its source location.
@@ -13,6 +15,59 @@ pub struct Form {
 impl Form {
     pub fn new(kind: FormKind, span: Span) -> Self {
         Self { kind, span }
+    }
+
+    /// Total heap bytes owned by this form tree (excluding the `Form` itself).
+    pub fn heap_size(&self) -> usize {
+        mem::size_of::<FormKind>() + self.kind.heap_size()
+    }
+}
+
+impl FormKind {
+    /// Heap bytes owned by this node and all children.
+    pub fn heap_size(&self) -> usize {
+        match self {
+            // Inline scalars — no heap.
+            FormKind::Nil
+            | FormKind::Bool(_)
+            | FormKind::Int(_)
+            | FormKind::Float(_)
+            | FormKind::Char(_)
+            | FormKind::Symbolic(_) => 0,
+
+            // String payloads.
+            FormKind::BigInt(s)
+            | FormKind::BigDecimal(s)
+            | FormKind::Ratio(s)
+            | FormKind::Str(s)
+            | FormKind::Regex(s)
+            | FormKind::Symbol(s)
+            | FormKind::Keyword(s)
+            | FormKind::AutoKeyword(s) => s.capacity(),
+
+            // Vec<Form> — Vec overhead + recursive children.
+            FormKind::List(v)
+            | FormKind::Vector(v)
+            | FormKind::Map(v)
+            | FormKind::Set(v)
+            | FormKind::AnonFn(v) => vec_heap_size(v),
+
+            // Box<Form> — one Form on heap.
+            FormKind::Quote(f)
+            | FormKind::SyntaxQuote(f)
+            | FormKind::Unquote(f)
+            | FormKind::UnquoteSplice(f)
+            | FormKind::Deref(f)
+            | FormKind::Var(f) => mem::size_of::<Form>() + f.heap_size(),
+
+            // Two Box<Form>.
+            FormKind::Meta(a, b) => mem::size_of::<Form>() * 2 + a.heap_size() + b.heap_size(),
+
+            // String + Box<Form>.
+            FormKind::TaggedLiteral(s, f) => s.capacity() + mem::size_of::<Form>() + f.heap_size(),
+
+            FormKind::ReaderCond { clauses, .. } => vec_heap_size(clauses),
+        }
     }
 }
 
@@ -76,4 +131,8 @@ pub enum FormKind {
         splicing: bool,
         clauses: Vec<Form>,
     },
+}
+
+fn vec_heap_size(forms: &[Form]) -> usize {
+    mem::size_of_val(forms) + forms.iter().map(|f| f.heap_size()).sum::<usize>()
 }

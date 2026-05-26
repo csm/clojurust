@@ -118,6 +118,36 @@ pub fn root_option_values(vals: &[Option<cljrs_value::Value>]) -> OptionValueRoo
     OptionValueRootGuard { pushed: true }
 }
 
+/// Force an immediate GC collection, bypassing the memory-pressure threshold.
+///
+/// Unlike `gc_safepoint`, this always initiates collection regardless of
+/// `gc_requested()`. Use this after removing namespaces from globals to ensure
+/// their closures and form-trees are freed before the next namespace is loaded.
+///
+/// Under `no-gc` this is a no-op.
+#[cfg(feature = "no-gc")]
+pub fn force_collect(_env: &Env) {}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn force_collect(env: &Env) {
+    let Some(_stw_guard) = cljrs_gc::begin_stw() else {
+        // Another thread is already collecting — just wait for it.
+        cljrs_gc::safepoint();
+        return;
+    };
+
+    cljrs_gc::HEAP.collect(|visitor| {
+        cljrs_gc::HEAP.trace_registered_roots(visitor);
+        trace_env_roots(env, visitor);
+        trace_thread_env_roots(visitor);
+        trace_value_roots(visitor);
+        trace_option_value_roots(visitor);
+        dynamics::trace_current(visitor);
+        crate::taps::trace_roots(visitor);
+        cljrs_gc::trace_thread_alloc_roots(visitor);
+    });
+}
+
 /// Interpreter-level GC safepoint.
 ///
 /// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection

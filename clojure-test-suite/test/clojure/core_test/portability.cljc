@@ -25,5 +25,5 @@
       :cljs #(js/setTimeout identity %)
       :clj Thread/sleep
       :lpy time/sleep
-      :rust sleep)
+      :rust clojure.core/sleep)
    ms))

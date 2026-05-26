@@ -315,9 +315,12 @@ impl GlobalEnv {
         let mut dst_refers = dst.get().refers.lock().unwrap();
         for name in names {
             if let Some(var) = src_interns.get(name) {
-                dst_refers
-                    .entry(name.clone())
-                    .or_insert_with(|| var.clone());
+                // Use insert (not or_insert_with) so that an explicit
+                // `require :refer [name]` always overrides a previous refer
+                // (e.g. one inherited from clojure.core via refer-all).
+                // clojure.core.async's `into` intentionally shadows clojure.core/into;
+                // or_insert_with would silently drop the override.
+                dst_refers.insert(name.clone(), var.clone());
             }
         }
     }

@@ -120,6 +120,15 @@ pub struct Form {
 
 impl Form {
     pub fn new(kind: FormKind, span: Span) -> Self
+
+    /// Total heap bytes owned by this form tree, excluding the Form struct itself.
+    /// Used by GcSize implementations to accurately track memory pressure.
+    pub fn heap_size(&self) -> usize
+}
+
+impl FormKind {
+    /// Heap bytes owned by this node and its children (recursive).
+    pub fn heap_size(&self) -> usize
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -16,3 +16,4 @@ bigdecimal   = { workspace = true }
 num-rational = { workspace = true }
 regex        = { workspace = true }
 cljrs-logging = { workspace = true }
+system-memory = "0.1.7"

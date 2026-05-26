@@ -527,6 +527,23 @@ pub struct CljxFnArity {
     pub ir_arity_id: u64,
 }
 
+impl CljxFnArity {
+    /// Heap bytes owned by this arity, not counting the `CljxFnArity` struct itself.
+    pub fn heap_size(&self) -> usize {
+        // params Vec buffer (Arc<str> pointers; the str data is shared, skip it)
+        self.params.capacity() * mem::size_of::<Arc<str>>()
+        // body: the dominant consumer — Form AST trees stored inline
+        + self.body.capacity() * mem::size_of::<Form>()
+        + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
+        // destructure_params
+        + self.destructure_params.capacity() * mem::size_of::<(usize, Form)>()
+        + self.destructure_params.iter().map(|(_, f)| f.heap_size()).sum::<usize>()
+        // destructure_rest
+        + self.destructure_rest.as_ref()
+            .map_or(0, |f| mem::size_of::<Form>() + f.heap_size())
+    }
+}
+
 // ── CljxFn ────────────────────────────────────────────────────────────────────
 
 /// An interpreted Clojure closure with captured environment.
@@ -576,6 +593,16 @@ impl cljrs_gc::Trace for CljxFn {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Vec<CljxFnArity> buffer + each arity's inline-owned heap
+        self.arities.capacity() * mem::size_of::<CljxFnArity>()
+            + self
+                .arities
+                .iter()
+                .map(CljxFnArity::heap_size)
+                .sum::<usize>()
+    }
 }
 
 // ── BoundFn ──────────────────────────────────────────────────────────────────
@@ -598,6 +625,11 @@ impl cljrs_gc::Trace for BoundFn {
         for val in self.captured_bindings.values() {
             val.trace(visitor);
         }
+    }
+
+    fn gc_size_extra(&self) -> usize {
+        // HashMap<usize, Value>: hashbrown open-addressing, ~1 control byte + entry per slot.
+        self.captured_bindings.capacity() * (1 + mem::size_of::<usize>() + mem::size_of::<Value>())
     }
 }
 

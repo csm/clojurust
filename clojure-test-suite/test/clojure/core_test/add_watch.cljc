@@ -244,14 +244,14 @@
              ;; add a watch to the agent
              (is (= g (add-watch g :g tester1)))
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= [{:key :g :old 20 :new 21 :tester 1}]
                     @state))
 
              ;; add a second watch - new key
              (add-watch g :s tester2)
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= #{{:key :g :old 20 :new 21 :tester 1}
                       {:key :g :old 21 :new 22 :tester 1}
                       {:key :s :old 21 :new 22 :tester 2}}
@@ -260,7 +260,7 @@
              ;; replace the first watch by reusing the key
              (add-watch g :g tester2)
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= #{{:key :g :old 20 :new 21 :tester 1}
                       {:key :g :old 21 :new 22 :tester 1}
                       {:key :s :old 21 :new 22 :tester 2}
@@ -271,7 +271,7 @@
              ;; remove the first watch
              (is (= g (remove-watch g :g)))
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= #{{:key :g :old 20 :new 21 :tester 1}
                       {:key :g :old 21 :new 22 :tester 1}
                       {:key :s :old 21 :new 22 :tester 2}
@@ -283,7 +283,7 @@
              ;; remove the second watches - should be no updates
              (remove-watch g :s)
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= #{{:key :g :old 20 :new 21 :tester 1}
                       {:key :g :old 21 :new 22 :tester 1}
                       {:key :s :old 21 :new 22 :tester 2}
@@ -295,7 +295,7 @@
              ;; add the first again, and check if it still works
              (add-watch g :g tester1)
              (update!)
-             (await g)
+             (#?(:rust await-agent :default await) g)
              (is (= #{{:key :g :old 20 :new 21 :tester 1}
                       {:key :g :old 21 :new 22 :tester 1}
                       {:key :s :old 21 :new 22 :tester 2}

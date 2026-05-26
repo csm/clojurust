@@ -77,6 +77,9 @@ Implemented by [`MarkVisitor`].  Call `visitor.visit(ptr)` inside
 ```rust
 pub trait Trace: Send + Sync {
     fn trace(&self, visitor: &mut MarkVisitor);
+
+    // Default impl returns 0; override for types with significant inline-owned heap.
+    fn gc_size_extra(&self) -> usize { 0 }
 }
 ```
 
@@ -84,8 +87,14 @@ Implemented by every type stored behind a `GcPtr`.  Must call
 `visitor.visit(ptr)` for every `GcPtr` reachable from `self` (directly or
 through `Arc`/`Mutex`/etc.).
 
-Built-in leaf impls: `String`, `i64`, `f64`, `bool`,
-`num_bigint::BigInt`, `bigdecimal::BigDecimal`,
+`gc_size_extra` returns heap bytes owned by the value that are NOT counted by
+`size_of::<GcBox<T>>()` — Vec buffers, String capacity, Form AST trees stored
+inline.  The GC adds this to the tracked `memory_in_use` so collection fires at
+the right threshold.  Do NOT cross `GcPtr` boundaries — pointed-to boxes are
+counted separately when allocated.
+
+Built-in leaf impls: `String` (overrides `gc_size_extra` to return `capacity()`),
+`i64`, `f64`, `bool`, `num_bigint::BigInt`, `bigdecimal::BigDecimal`,
 `num_rational::Ratio<BigInt>`.
 
 ### `GcPtr<T: Trace + 'static>`
@@ -213,6 +222,28 @@ programs and the AOT test harness call it once at exit.
 - **Intrusive linked list**: all `GcBox`es are linked via `GcBoxHeader::next`.
 - **Type erasure**: `trace_fn` / `drop_fn` in the header enable type-erased
   mark and sweep without a vtable pointer per allocation.
+- **Accurate allocation accounting**: `GcBoxHeader::size` stores
+  `size_of::<GcBox<T>>() + value.gc_size_extra()` at allocation time.
+  `memory_in_use` is incremented by this total (not a flat estimate) and
+  decremented by the same value when the object is freed.  Types that own
+  significant out-of-line heap (Form AST trees in `CljxFn`, String capacity)
+  override `gc_size_extra` so the GC threshold fires before the process OOMs.
+- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed),
+  GC is suppressed until `memory_in_use` grows by another `soft_limit/10` bytes
+  (a fixed additive headroom, not a percentage of current memory).  Using a
+  percentage of current memory as headroom would compound across consecutive
+  zero-yield cycles (e.g. during deep recursion where all objects are live),
+  causing the threshold to grow exponentially and GC to stop firing permanently
+  after the computation finishes — leading to OOM on long test suites.  A fixed
+  headroom gives linear growth, which stays bounded.  The old trigger —
+  re-enabling on every alloc-frame drop — fired O(N-heap) sweeps on every
+  eval-frame return, causing a GC storm with hundreds of useless traversals.
+- **Minimal grace period** (`GC_INITIAL_LIVES = 2`): objects start at `lives = 1`.
+  GC only fires at explicit `gc_safepoint()` calls, not at arbitrary Rust points.
+  The single cycle of grace covers the narrow window between an alloc frame
+  dropping and the next safepoint at which `VALUE_ROOTS` or the new alloc frame
+  re-roots the value.  The old value of 10 kept 9× more garbage in RAM than
+  necessary, worsening OOM pressure under long test suites.
 - **Cycle collection**: because `GcPtr::drop` is a no-op, reference cycles do
   not prevent collection — any object unreachable from roots is freed.
 

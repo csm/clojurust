@@ -79,6 +79,12 @@ impl cljrs_gc::Trace for SortedMap {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Per entry: Arc<Node<K,V>> (16 overhead) + left/right ptrs (16) + color+pad (8).
+        let n = self.inner.size();
+        n * (40 + 2 * std::mem::size_of::<Value>())
+    }
 }
 
 #[cfg(test)]

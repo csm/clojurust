@@ -53,14 +53,32 @@ pub fn is_static_addr(addr: usize) -> bool {
 // ── Trace trait ───────────────────────────────────────────────────────────────
 
 /// Implemented by every type that can be stored behind a [`GcPtr`].
+///
+/// The `gc_size_extra` method accounts for heap bytes owned by the value that
+/// are NOT captured by `size_of::<GcBox<T>>()` (e.g. `Vec` buffers, `String`
+/// capacity, `Form` AST trees stored inline).  The default returns 0, which is
+/// correct for primitives and types with no out-of-line heap.
+///
+/// Rules for implementors of `gc_size_extra`:
+/// - Count only bytes THIS value owns and will free when dropped.
+/// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
+///   separately when it is allocated.
 pub trait Trace: Send + Sync {
     fn trace(&self, visitor: &mut MarkVisitor);
+
+    fn gc_size_extra(&self) -> usize {
+        0
+    }
 }
 
 // ── Leaf Trace impls ──────────────────────────────────────────────────────────
 
 impl Trace for String {
     fn trace(&self, _: &mut MarkVisitor) {}
+
+    fn gc_size_extra(&self) -> usize {
+        self.capacity()
+    }
 }
 impl Trace for i64 {
     fn trace(&self, _: &mut MarkVisitor) {}
@@ -83,30 +101,24 @@ impl Trace for num_rational::Ratio<num_bigint::BigInt> {
 impl Trace for regex::Regex {
     fn trace(&self, _: &mut MarkVisitor) {}
 }
-impl Trace for std::sync::Mutex<Vec<i32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
+macro_rules! impl_trace_prim_array {
+    ($t:ty) => {
+        impl Trace for std::sync::Mutex<Vec<$t>> {
+            fn trace(&self, _: &mut MarkVisitor) {}
+            fn gc_size_extra(&self) -> usize {
+                self.lock().unwrap().capacity() * std::mem::size_of::<$t>()
+            }
+        }
+    };
 }
-impl Trace for std::sync::Mutex<Vec<i64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i16>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i8>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<char>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<bool>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
+impl_trace_prim_array!(i32);
+impl_trace_prim_array!(i64);
+impl_trace_prim_array!(i16);
+impl_trace_prim_array!(i8);
+impl_trace_prim_array!(char);
+impl_trace_prim_array!(f64);
+impl_trace_prim_array!(f32);
+impl_trace_prim_array!(bool);
 
 // ── GcVisitor ─────────────────────────────────────────────────────────────────
 
@@ -126,7 +138,14 @@ mod gc_header {
     use crate::{MarkVisitor, Trace};
     use std::cell::Cell;
 
-    pub(crate) const GC_INITIAL_LIVES: u8 = 10;
+    // Objects start at lives = GC_INITIAL_LIVES - 1.  The mark phase sets
+    // lives = GC_INITIAL_LIVES for reachable objects; sweep frees objects
+    // whose lives reach 0.  A value of 2 gives exactly one cycle of grace:
+    // enough to cover the window between an alloc frame dropping and the
+    // next GC safepoint (where VALUE_ROOTS or a new alloc frame re-roots it).
+    // 10 was chosen conservatively but keeps 9× more garbage in RAM than
+    // necessary, worsening OOM pressure under test suites with many forms.
+    pub(crate) const GC_INITIAL_LIVES: u8 = 2;
 
     #[cfg(debug_assertions)]
     pub(crate) const GC_MAGIC_ALIVE: u64 = 0xCAFE_BABE_DEAD_BEEF;
@@ -137,6 +156,8 @@ mod gc_header {
     pub struct GcBoxHeader {
         #[cfg(debug_assertions)]
         pub(crate) magic: Cell<u64>,
+        /// Exact size of the GcBox<T> allocation in bytes.
+        pub(crate) size: usize,
         pub(crate) lives: Cell<u8>,
         pub(crate) next: Cell<*mut GcBoxHeader>,
         pub(crate) trace_fn: unsafe fn(*const GcBoxHeader, &mut MarkVisitor),
@@ -144,10 +165,11 @@ mod gc_header {
     }
 
     impl GcBoxHeader {
-        pub(crate) fn new<T: Trace + 'static>() -> Self {
+        pub(crate) fn new<T: Trace + 'static>(heap_extra: usize) -> Self {
             Self {
                 #[cfg(debug_assertions)]
                 magic: Cell::new(GC_MAGIC_ALIVE),
+                size: std::mem::size_of::<GcBox<T>>() + heap_extra,
                 lives: Cell::new(GC_INITIAL_LIVES - 1),
                 next: Cell::new(std::ptr::null_mut()),
                 trace_fn: trace_gc_box::<T>,
@@ -367,7 +389,6 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-    const ESTIMATED_OBJECT_SIZE: usize = 48;
     type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
 
     pub struct GcHeap {
@@ -377,7 +398,15 @@ mod gc_full {
         total_allocated_bytes: AtomicUsize,
         root_tracers: Mutex<Vec<RootTracer>>,
         gc_suppressed: std::sync::atomic::AtomicBool,
-        last_alloc_root_len: AtomicUsize,
+        /// memory_in_use threshold above which GC is re-enabled after a
+        /// zero-yield collection.  The headroom doubles on each consecutive
+        /// zero-yield cycle (exponential backoff, capped at soft_limit) so a
+        /// long computation where all objects are live doesn't spin in a
+        /// constant GC storm of O(N) sweeps.  Resets to the base headroom
+        /// (soft_limit / 10) once GC actually frees something.
+        suppressed_threshold: AtomicUsize,
+        /// Current headroom used for exponential backoff after zero-yield cycles.
+        zero_yield_headroom: AtomicUsize,
     }
 
     struct GcHeapInner {
@@ -417,12 +446,28 @@ mod gc_full {
                 total_allocated_bytes: AtomicUsize::new(0),
                 root_tracers: Mutex::new(Vec::new()),
                 gc_suppressed: std::sync::atomic::AtomicBool::new(false),
-                last_alloc_root_len: AtomicUsize::new(0),
+                suppressed_threshold: AtomicUsize::new(0),
+                zero_yield_headroom: AtomicUsize::new(0),
             }
         }
 
         pub fn set_config(&self, config: Arc<GcConfig>) {
             *self.config.lock().unwrap() = Some(config);
+        }
+
+        pub fn set_config_from_env(&self) {
+            let soft_limit_mb: usize = match std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => (system_memory::total() / 3) as usize,
+            };
+            let hard_limit_mb: usize = match std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => soft_limit_mb,
+            };
+            self.set_config(Arc::new(GcConfig::with_limits(
+                soft_limit_mb,
+                hard_limit_mb,
+            )));
         }
 
         pub fn register_root_tracer(
@@ -450,10 +495,12 @@ mod gc_full {
 
         pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
             crate::cancellation::safepoint();
+            let heap_extra = value.gc_size_extra();
             let gc_box = Box::new(GcBox {
-                header: GcBoxHeader::new::<T>(),
+                header: GcBoxHeader::new::<T>(heap_extra),
                 value,
             });
+            let obj_size = gc_box.header.size; // GcBox<T> size + gc_size_extra()
             let raw: *mut GcBox<T> = Box::into_raw(gc_box);
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -465,20 +512,20 @@ mod gc_full {
                 inner.total_allocated += 1;
             }
             self.total_allocated_bytes
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
-            crate::stats::GC_STATS.record_gc_alloc(ESTIMATED_OBJECT_SIZE);
-            let current_usage = self
-                .memory_in_use
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
-                + ESTIMATED_OBJECT_SIZE;
+                .fetch_add(obj_size, Ordering::Relaxed);
+            crate::stats::GC_STATS.record_gc_alloc(obj_size);
+            let current_usage =
+                self.memory_in_use.fetch_add(obj_size, Ordering::Relaxed) + obj_size;
 
             if let Some(config) = self.config.lock().unwrap().as_ref()
                 && config.soft_limit_exceeded(current_usage)
             {
                 if self.gc_suppressed.load(Ordering::Relaxed) {
-                    let current_roots = ALLOC_ROOTS.with(|r| r.borrow().len());
-                    let last = self.last_alloc_root_len.load(Ordering::Relaxed);
-                    if current_roots < last {
+                    // Suppression active: only re-enable GC once memory has
+                    // grown past the threshold set by the last zero-yield
+                    // collection (current_memory + soft_limit/10).
+                    let threshold = self.suppressed_threshold.load(Ordering::Relaxed);
+                    if current_usage > threshold {
                         self.gc_suppressed.store(false, Ordering::Relaxed);
                         crate::cancellation::request_gc();
                     }
@@ -515,18 +562,25 @@ mod gc_full {
             let mut inner = self.inner.lock().unwrap();
             let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
+            // Bytes of objects with lives==0 that will be freed now.
+            let mut freed_bytes: usize = 0;
             let mut current = inner.head;
             while !current.is_null() {
                 let header = unsafe { &*current };
                 let next = header.next.get();
                 let lives = header.lives.get();
+                let obj_size = header.size;
                 if lives >= GC_INITIAL_LIVES {
+                    // Marked reachable this cycle — reset grace counter.
                     header.lives.set(GC_INITIAL_LIVES - 1);
                     live.push(current);
                 } else if lives > 0 {
+                    // In grace period (unreachable but not yet freed).
                     header.lives.set(lives - 1);
                     live.push(current);
                 } else {
+                    // Grace period exhausted — collect now.
+                    freed_bytes += obj_size;
                     dead.push(current);
                 }
                 current = next;
@@ -544,7 +598,10 @@ mod gc_full {
                 header.next.set(inner.head);
                 inner.head = ptr;
             }
-            let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
+            // Decrement memory_in_use by the bytes actually freed.  All heap
+            // objects (live + grace-period) remain counted; only physically
+            // freed objects are subtracted.  This keeps memory pressure
+            // accurate so GC fires again when the heap genuinely grows.
             self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
             crate::stats::GC_STATS.record_gc_pause(
@@ -564,10 +621,38 @@ mod gc_full {
                 sweep_elapsed
             );
             if freed_count == 0 {
-                let root_len = ALLOC_ROOTS.with(|r| r.borrow().len());
-                self.last_alloc_root_len.store(root_len, Ordering::Relaxed);
+                // Zero-yield collection: exponential-backoff suppression.
+                // Each consecutive zero-yield cycle doubles the headroom before
+                // the next GC attempt (capped at soft_limit/4).  This prevents a
+                // GC storm during deep recursion where all objects are live —
+                // without backoff, GC fires every soft_limit/10 bytes, tracing
+                // the entire live set O(N) times to no benefit.
+                // The headroom resets to soft_limit/10 when GC frees something.
+                // Cap at soft_limit/4 (not soft_limit) so that GC still fires
+                // frequently enough to catch short-lived test allocations after
+                // a long namespace-loading phase of zero-yield cycles.
+                let soft_limit = self
+                    .config
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.soft_limit())
+                    .unwrap_or(64 * 1024 * 1024);
+                let base_headroom = (soft_limit / 10).max(1);
+                let max_headroom = (soft_limit / 4).max(base_headroom);
+                let prev_headroom = self.zero_yield_headroom.load(Ordering::Relaxed);
+                let headroom = if prev_headroom == 0 {
+                    base_headroom
+                } else {
+                    prev_headroom.saturating_mul(2).min(max_headroom)
+                };
+                self.zero_yield_headroom.store(headroom, Ordering::Relaxed);
+                self.suppressed_threshold
+                    .store(post_memory + headroom, Ordering::Relaxed);
                 self.gc_suppressed.store(true, Ordering::Relaxed);
             } else {
+                // GC freed something: reset exponential backoff.
+                self.zero_yield_headroom.store(0, Ordering::Relaxed);
                 self.gc_suppressed.store(false, Ordering::Relaxed);
             }
         }

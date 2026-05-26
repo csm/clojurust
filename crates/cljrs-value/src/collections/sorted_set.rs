@@ -75,6 +75,11 @@ impl cljrs_gc::Trace for SortedSet {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        let n = self.inner.size();
+        n * (40 + std::mem::size_of::<Value>())
+    }
 }
 
 #[cfg(test)]

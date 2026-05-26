@@ -1,6 +1,8 @@
 /target
 .idea/
 .cljrs-aot-test-harness
+/test-suite
+/graph-sample
 **/.DS_Store
 # AOT test/debug artifacts
 /1

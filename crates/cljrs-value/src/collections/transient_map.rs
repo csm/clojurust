@@ -103,6 +103,11 @@ impl cljrs_gc::Trace for TransientMap {
             }
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        let n = self.map.lock().unwrap().size();
+        n * (40 + 2 * std::mem::size_of::<crate::Value>())
+    }
 }
 
 impl Default for TransientMap {

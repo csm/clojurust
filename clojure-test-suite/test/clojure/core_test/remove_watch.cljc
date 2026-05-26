@@ -174,7 +174,7 @@
                watchable (agent 0)
                update! (fn []
                          (send watchable inc)
-                         (await watchable))]
+                         (#?(:rust await-agent :default await) watchable))]
            ;; Make sure messages is empty
            (is (empty? @messages))
 

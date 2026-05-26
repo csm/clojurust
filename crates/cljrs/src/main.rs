@@ -947,6 +947,16 @@ fn run_tests_command(
 
     for ns in &namespaces {
         let result = run_single_ns_tests(&mut env, ns);
+        // Remove the namespace after testing so its closures and form-trees can
+        // be reclaimed by GC.  Without this all 233 namespaces accumulate
+        // simultaneously and peak RSS can exceed 15 GB.
+        // Two force_collect calls are required: GC_INITIAL_LIVES=2 means an
+        // unreachable object survives one cycle in the grace period before being
+        // freed on the second cycle.
+        env.globals.namespaces.write().unwrap().remove(ns.as_str());
+        env.globals.loaded.lock().unwrap().remove(ns.as_str());
+        cljrs_eval::force_collect(&env);
+        cljrs_eval::force_collect(&env);
         results.push(result);
     }
 

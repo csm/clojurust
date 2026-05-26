@@ -731,6 +731,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
+cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
 cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
@@ -868,7 +869,10 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 }}
 
-fn main() {{
+fn run() {{
+    // Parse environment -X flags.
+    cljrs_logging::set_feature_levels_from_env().unwrap();
+
     // Ensure all rt_* symbols are linked into the binary.
     cljrs_compiler::rt_abi::anchor_rt_symbols();
 
@@ -892,6 +896,19 @@ fn main() {{
 
     // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
     cljrs_gc::dump_stats_from_env();
+}}
+
+fn main() {{
+    // Run on a large-stack thread to avoid stack overflows in deeply recursive
+    // Clojure code (macros, lazy sequences, recursive interpreting).
+    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    let thread = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn main thread");
+    if let Err(e) = thread.join() {{
+        std::panic::resume_unwind(e);
+    }}
 }}
 "#,
         preamble = preamble_code,
@@ -1048,12 +1065,6 @@ fn file_to_namespace(root: &Path, file: &Path) -> Option<String> {
 fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str) -> String {
     let mut code = String::new();
 
-    // Generate the namespace strings array inline
-    let ns_strings: Vec<String> = namespaces
-        .iter()
-        .map(|s| format!("\"{}\".to_string()", s))
-        .collect();
-
     code.push_str(
         r#"//! Auto-generated AOT test harness for clojurust.
 //!
@@ -1061,9 +1072,37 @@ fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str)
 
 use cljrs_value::Value;
 
-fn main() {
-    // Initialize the standard environment.
-    let globals = cljrs_stdlib::standard_env();
+fn run() {
+    // Set -X flags from environment.
+    cljrs_logging::set_feature_levels_from_env().unwrap();
+
+    // Initialize the standard environment without IR lowering.
+    // The test harness interprets Clojure at runtime; there is no benefit to
+    // eagerly compiling test functions to IR, and doing so fills IR_CACHE with
+    // entries that are never evicted (non-GC memory, leaks across all 233 namespaces).
+    // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
+    let globals = cljrs_stdlib::standard_env_no_ir();
+
+    // Override GC soft limit to a small value so the collector fires during
+    // test execution.  standard_env_no_ir() calls set_config_from_env() which
+    // defaults to system_memory/3 (often 5+ GB); at that level memory_in_use
+    // (which only tracks GcBox sizes) never reaches the threshold, GC never
+    // runs, and all temporary Values + freed namespace closures accumulate.
+    // 64 MB is enough to trigger multiple collections per namespace test while
+    // adding negligible overhead (<1%).  CLJRS_GC_SOFT_LIMIT_MB overrides the
+    // 64 MB default for debugging/profiling.
+    {
+        let soft_mb: usize = std::env::var("CLJRS_GC_SOFT_LIMIT_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        cljrs_gc::HEAP.set_config(std::sync::Arc::new(
+            cljrs_gc::GcConfig::with_limits(
+                soft_mb * 1024 * 1024,
+                soft_mb * 2 * 1024 * 1024,
+            ),
+        ));
+    }
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -1077,53 +1116,73 @@ fn main() {
     // Push an eval context so rt_call can dispatch through the interpreter.
     cljrs_env::callback::push_eval_context(&env);
 
-    // Load clojure.test if not already loaded
-    let _ = cljrs_eval::eval(
-        &cljrs_reader::Parser::new(
-            "(require 'clojure.test)".to_string(),
-            "<test-harness>".to_string()
-        ).parse_all().unwrap()[0],
-        &mut env
-    );
-
-    // Load all test namespaces
-    (|| {
-"#,
-    );
-
-    for ns in namespaces.iter() {
-        code.push_str(&format!(
-            "        let _ = cljrs_eval::eval(&cljrs_reader::Parser::new(\n            \"(require '{})\".to_string(),\n            \"<test-harness>\".to_string()\n        ).parse_all().unwrap()[0], &mut env);\n",
-            ns
-        ));
+    // Load clojure.test once; it stays loaded for the entire run.
+    // push_alloc_frame() scopes transient eval allocations: after the frame
+    // drops, those GcBoxes are removed from ALLOC_ROOTS.  The namespace objects
+    // themselves stay alive via globals.namespaces, so GC can still trace them.
+    {
+        let _frame = cljrs_gc::push_alloc_frame();
+        let _ = cljrs_eval::eval(
+            &cljrs_reader::Parser::new(
+                "(require 'clojure.test)".to_string(),
+                "<test-harness>".to_string()
+            ).parse_all().unwrap()[0],
+            &mut env
+        );
     }
 
-    code.push_str(
-        r#"    })();
-
-    // Run tests for each namespace separately
+    // Load, test, and unload each test namespace one at a time.
+    //
+    // Memory strategy: each test namespace and all its vars/closures are
+    // removed from GlobalEnv after its tests finish, then two explicit GC
+    // cycles free the now-unreachable objects.  Two cycles are required
+    // because GC_INITIAL_LIVES=2 gives objects one grace cycle before they
+    // are actually freed.  This keeps peak RSS proportional to one namespace
+    // at a time rather than all 233 simultaneously.
     let mut total_pass = 0i64;
     let mut total_fail = 0i64;
     let mut total_error = 0i64;
     let mut total_test_count = 0i64;
 
-    for ns_str in vec![
+    for ns_str in &[
 "#,
     );
 
-    for ns_str in ns_strings.iter() {
-        code.push_str(&format!("        {},\n", ns_str));
+    for ns in namespaces.iter() {
+        code.push_str(&format!("        \"{}\",\n", ns));
     }
 
-    code.push_str(r#"    ].iter() {
-        let run_result = cljrs_eval::eval(
-            &cljrs_reader::Parser::new(
-                format!("(clojure.test/run-tests '{})", ns_str)
-                    .to_string(),
-                "<run-tests>".to_string()
-            ).parse_all().unwrap()[0],
-            &mut env
-        );
+    code.push_str(
+        r#"    ] {
+        // Load this test namespace.  push_alloc_frame() scopes all GcBox
+        // allocations made during require: when the frame drops, those entries
+        // are removed from ALLOC_ROOTS so GC treats them as non-roots.  The
+        // namespace vars/closures remain reachable via globals.namespaces and
+        // are kept alive by GC tracing through that reference; purely transient
+        // allocations from eval become eligible for collection immediately.
+        {
+            let _frame = cljrs_gc::push_alloc_frame();
+            let _ = cljrs_eval::eval(
+                &cljrs_reader::Parser::new(
+                    format!("(require '{})", ns_str).to_string(),
+                    "<test-harness>".to_string()
+                ).parse_all().unwrap()[0],
+                &mut env
+            );
+        }
+
+        // Run its tests.  Same alloc-frame scoping so transient test
+        // infrastructure objects are freed after each namespace.
+        let run_result = {
+            let _frame = cljrs_gc::push_alloc_frame();
+            cljrs_eval::eval(
+                &cljrs_reader::Parser::new(
+                    format!("(clojure.test/run-tests '{})", ns_str).to_string(),
+                    "<run-tests>".to_string()
+                ).parse_all().unwrap()[0],
+                &mut env
+            )
+        };
         if let Ok(Value::Map(m)) = run_result {
             let mut pass = 0i64;
             let mut fail = 0i64;
@@ -1145,6 +1204,19 @@ fn main() {
             total_error += error;
             total_test_count += test_count;
         }
+
+        // Unload the test namespace so the GC can reclaim its vars,
+        // closures, and form trees.  GcPtr::Drop is a no-op, so we must
+        // remove the namespace from GlobalEnv before collecting.
+        // The pressure-based GC (triggered by gc_safepoint during the next
+        // namespace's test execution) will naturally collect the freed objects:
+        // they are no longer reachable from GlobalEnv::namespaces and will be
+        // swept in the next collection cycle.
+        {
+            let ns_key: std::sync::Arc<str> = std::sync::Arc::from(*ns_str);
+            env.globals.namespaces.write().unwrap().remove(&*ns_key);
+            env.globals.loaded.lock().unwrap().remove(&*ns_key);
+        }
     }
 
     // Flush output before exiting
@@ -1163,7 +1235,21 @@ fn main() {
     if total_fail > 0 || total_error > 0 {
         std::process::exit(1);
     }
-}"#);
+}
+
+fn main() {
+    // Run on a large-stack thread to avoid stack overflows in deeply recursive
+    // Clojure code (macros, lazy sequences, recursive interpreting).
+    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    let thread = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn main thread");
+    if let Err(e) = thread.join() {
+        std::panic::resume_unwind(e);
+    }
+}"#,
+    );
 
     code
 }
@@ -1268,6 +1354,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
 cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
 cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
 cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
