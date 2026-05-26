@@ -158,7 +158,7 @@ pub fn standard_env_no_ir() -> Arc<GlobalEnv> {
     let globals = cljrs_eval::standard_env_minimal_no_ir();
     register(&globals);
 
-    cljrs_gc::HEAP.set_config(std::sync::Arc::new(GcConfig::new()));
+    cljrs_gc::HEAP.set_config_from_env();
     let roots_gc = globals.clone();
     cljrs_gc::HEAP.register_root_tracer(move |visitor| {
         use cljrs_gc::GcVisitor as _;
@@ -184,7 +184,7 @@ pub fn standard_env() -> Arc<GlobalEnv> {
     // Configure GC with default limits and register namespace bindings as roots.
     // Without this, the GC never fires (no config → no soft-limit check).
     // standard_env_with_paths_and_config() overrides the config but reuses this tracer.
-    cljrs_gc::HEAP.set_config(std::sync::Arc::new(GcConfig::new()));
+    cljrs_gc::HEAP.set_config_from_env();
     let roots_gc = globals.clone();
     cljrs_gc::HEAP.register_root_tracer(move |visitor| {
         use cljrs_gc::GcVisitor as _;

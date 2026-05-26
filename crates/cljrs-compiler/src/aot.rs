@@ -1065,6 +1065,11 @@ fn file_to_namespace(root: &Path, file: &Path) -> Option<String> {
 fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str) -> String {
     let mut code = String::new();
 
+    let ns_strings: Vec<String> = namespaces
+        .iter()
+        .map(|s| format!("\"{}\".to_string()", s))
+        .collect();
+
     code.push_str(
         r#"//! Auto-generated AOT test harness for clojurust.
 //!
@@ -1113,43 +1118,44 @@ fn run() {
         &mut env
     );
 
-    // For each test namespace: require it, run its tests, then remove from
-    // globals so GC can reclaim its closures and embedded form trees.
+    // Load all test namespaces
+    (|| {
+"#,
+    );
+
+    for ns in namespaces.iter() {
+        code.push_str(&format!(
+            "        let _ = cljrs_eval::eval(&cljrs_reader::Parser::new(\n            \"(require '{})\".to_string(),\n            \"<test-harness>\".to_string()\n        ).parse_all().unwrap()[0], &mut env);\n",
+            ns
+        ));
+    }
+
+    code.push_str(
+        r#"    })();
+
+    // Run tests for each namespace separately
     let mut total_pass = 0i64;
     let mut total_fail = 0i64;
     let mut total_error = 0i64;
     let mut total_test_count = 0i64;
 
-    for ns_str in [
+    for ns_str in vec![
 "#,
     );
 
-    for ns in namespaces.iter() {
-        code.push_str(&format!("        \"{}\",\n", ns));
+    for ns_str in ns_strings.iter() {
+        code.push_str(&format!("        {},\n", ns_str));
     }
 
-    code.push_str(
-        r#"    ] {
-        eprintln!("[cljrs-test] requiring {}", ns_str);
-        // Load the namespace on demand.
-        let _ = cljrs_eval::eval(
-            &cljrs_reader::Parser::new(
-                format!("(require '{})", ns_str),
-                "<test-harness>".to_string()
-            ).parse_all().unwrap()[0],
-            &mut env
-        );
-
-        eprintln!("[cljrs-test] running {}", ns_str);
-        // Run tests for this namespace.
+    code.push_str(r#"    ].iter() {
         let run_result = cljrs_eval::eval(
             &cljrs_reader::Parser::new(
-                format!("(clojure.test/run-tests '{})", ns_str),
+                format!("(clojure.test/run-tests '{})", ns_str)
+                    .to_string(),
                 "<run-tests>".to_string()
             ).parse_all().unwrap()[0],
             &mut env
         );
-        eprintln!("[cljrs-test] done {}", ns_str);
         if let Ok(Value::Map(m)) = run_result {
             let mut pass = 0i64;
             let mut fail = 0i64;
@@ -1171,16 +1177,6 @@ fn run() {
             total_error += error;
             total_test_count += test_count;
         }
-
-        // Remove the namespace from globals then force two GC cycles.
-        // Cycle 1: objects with lives>0 get decremented to grace period (lives=0).
-        // Cycle 2: objects in grace period get freed.
-        // Without explicit collection the heap grows to 15+ GB because
-        // GcPtr::Drop is a no-op and memory_in_use only tracks struct headers.
-        env.globals.namespaces.write().unwrap().remove(ns_str);
-        env.globals.loaded.lock().unwrap().remove(ns_str);
-        cljrs_env::gc_roots::force_collect(&env);
-        cljrs_env::gc_roots::force_collect(&env);
     }
 
     // Flush output before exiting

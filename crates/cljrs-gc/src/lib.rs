@@ -443,6 +443,18 @@ mod gc_full {
             *self.config.lock().unwrap() = Some(config);
         }
 
+        pub fn set_config_from_env(&self) {
+            let soft_limit_mb: usize = match std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => (system_memory::total() / 3) as usize,
+            };
+            let hard_limit_mb: usize = match std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => soft_limit_mb,
+            };
+            self.set_config(Arc::new(GcConfig::with_limits(soft_limit_mb, hard_limit_mb)));
+        }
+
         pub fn register_root_tracer(
             &self,
             tracer: impl Fn(&mut MarkVisitor) + Send + Sync + 'static,

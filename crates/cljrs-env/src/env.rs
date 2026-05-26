@@ -318,7 +318,10 @@ impl GlobalEnv {
                 // Use insert (not or_insert_with) so that an explicit
                 // `require :refer [name]` always overrides a previous refer
                 // (e.g. one inherited from clojure.core via refer-all).
-                dst_refers.insert(name.clone(), var.clone());
+                //dst_refers.insert(name.clone(), var.clone());
+                dst_refers
+                    .entry(name.clone())
+                    .or_insert_with(|| var.clone());
             }
         }
     }
