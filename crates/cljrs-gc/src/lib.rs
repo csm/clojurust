@@ -623,11 +623,14 @@ mod gc_full {
             if freed_count == 0 {
                 // Zero-yield collection: exponential-backoff suppression.
                 // Each consecutive zero-yield cycle doubles the headroom before
-                // the next GC attempt (capped at soft_limit).  This prevents a
+                // the next GC attempt (capped at soft_limit/4).  This prevents a
                 // GC storm during deep recursion where all objects are live —
                 // without backoff, GC fires every soft_limit/10 bytes, tracing
                 // the entire live set O(N) times to no benefit.
                 // The headroom resets to soft_limit/10 when GC frees something.
+                // Cap at soft_limit/4 (not soft_limit) so that GC still fires
+                // frequently enough to catch short-lived test allocations after
+                // a long namespace-loading phase of zero-yield cycles.
                 let soft_limit = self
                     .config
                     .lock()
@@ -636,11 +639,12 @@ mod gc_full {
                     .map(|c| c.soft_limit())
                     .unwrap_or(64 * 1024 * 1024);
                 let base_headroom = (soft_limit / 10).max(1);
+                let max_headroom = (soft_limit / 4).max(base_headroom);
                 let prev_headroom = self.zero_yield_headroom.load(Ordering::Relaxed);
                 let headroom = if prev_headroom == 0 {
                     base_headroom
                 } else {
-                    prev_headroom.saturating_mul(2).min(soft_limit)
+                    prev_headroom.saturating_mul(2).min(max_headroom)
                 };
                 self.zero_yield_headroom.store(headroom, Ordering::Relaxed);
                 self.suppressed_threshold
