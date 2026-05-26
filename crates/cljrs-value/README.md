@@ -141,6 +141,28 @@ All collections implement `PartialEq`, `Debug`, `Clone`, and `cljrs_gc::Trace`.
 `PersistentList`, `PersistentVector`, and `PersistentHashSet` implement
 `std::iter::FromIterator<Value>`.
 
+All collection Trace impls also override `gc_size_extra` to report the heap
+bytes owned by each collection beyond the GcBox struct.  Approximations used:
+
+| Type | Formula |
+|------|---------|
+| `PersistentArrayMap` | `16 + capacity × size_of::<Value>()` |
+| `PersistentHashMap` | `n × (40 + 2×size_of::<Value>())` |
+| `PersistentHashSet` | `n × (40 + size_of::<Value>())` |
+| `PersistentVector` | `n × (24 + size_of::<Value>())` |
+| `SortedMap` | `n × (40 + 2×size_of::<Value>())` |
+| `TransientMap/Set` | same as HashMap/Set (locked at alloc) |
+| `TransientVector` | same as Vector (locked at alloc) |
+| `ObjectArray` | `capacity × size_of::<Value>()` |
+| Primitive arrays | `capacity × size_of::<T>()` |
+| `BoundFn` | `capacity × (1 + size_of::<usize>() + size_of::<Value>())` |
+| `ExceptionInfo` | `message.capacity()` |
+
+The 40-byte per-entry overhead for HAMT/RBTree is: 16 bytes `Arc` ref-counts +
+16 bytes `EntryWithHash`/left-right pointers + 8 bytes tree-node sharing.  The
+24-byte overhead for trie vector elements is: 16 bytes `Arc` overhead + 8 bytes
+thin pointer in the leaf-node Vec.
+
 ### `CljxFn` / `CljxFnArity` (Phase 4)
 
 ```rust
