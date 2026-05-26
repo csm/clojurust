@@ -387,10 +387,14 @@ mod gc_full {
         root_tracers: Mutex<Vec<RootTracer>>,
         gc_suppressed: std::sync::atomic::AtomicBool,
         /// memory_in_use threshold above which GC is re-enabled after a
-        /// zero-yield collection.  Implements exponential backoff: after
-        /// collecting and freeing nothing, we require another 10% of heap
-        /// growth before retrying, preventing a GC storm of O(N) sweeps.
+        /// zero-yield collection.  The headroom doubles on each consecutive
+        /// zero-yield cycle (exponential backoff, capped at soft_limit) so a
+        /// long computation where all objects are live doesn't spin in a
+        /// constant GC storm of O(N) sweeps.  Resets to the base headroom
+        /// (soft_limit / 10) once GC actually frees something.
         suppressed_threshold: AtomicUsize,
+        /// Current headroom used for exponential backoff after zero-yield cycles.
+        zero_yield_headroom: AtomicUsize,
     }
 
     struct GcHeapInner {
@@ -431,6 +435,7 @@ mod gc_full {
                 root_tracers: Mutex::new(Vec::new()),
                 gc_suppressed: std::sync::atomic::AtomicBool::new(false),
                 suppressed_threshold: AtomicUsize::new(0),
+                zero_yield_headroom: AtomicUsize::new(0),
             }
         }
 
@@ -588,14 +593,13 @@ mod gc_full {
                 sweep_elapsed
             );
             if freed_count == 0 {
-                // Zero-yield collection: suppress GC until memory grows by a
-                // fixed headroom (10% of the soft limit, not 10% of current
-                // memory).  Using post_memory/10 as headroom compounded across
-                // consecutive zero-yield cycles (e.g. during deep recursion
-                // where all objects are live), causing the threshold to grow
-                // without bound and GC to never fire again after the
-                // computation finishes — leading to OOM on long test suites.
-                // A fixed headroom gives linear growth, which stays bounded.
+                // Zero-yield collection: exponential-backoff suppression.
+                // Each consecutive zero-yield cycle doubles the headroom before
+                // the next GC attempt (capped at soft_limit).  This prevents a
+                // GC storm during deep recursion where all objects are live —
+                // without backoff, GC fires every soft_limit/10 bytes, tracing
+                // the entire live set O(N) times to no benefit.
+                // The headroom resets to soft_limit/10 when GC frees something.
                 let soft_limit = self
                     .config
                     .lock()
@@ -603,11 +607,20 @@ mod gc_full {
                     .as_ref()
                     .map(|c| c.soft_limit())
                     .unwrap_or(64 * 1024 * 1024);
-                let headroom = (soft_limit / 10).max(1);
+                let base_headroom = (soft_limit / 10).max(1);
+                let prev_headroom = self.zero_yield_headroom.load(Ordering::Relaxed);
+                let headroom = if prev_headroom == 0 {
+                    base_headroom
+                } else {
+                    prev_headroom.saturating_mul(2).min(soft_limit)
+                };
+                self.zero_yield_headroom.store(headroom, Ordering::Relaxed);
                 self.suppressed_threshold
                     .store(post_memory + headroom, Ordering::Relaxed);
                 self.gc_suppressed.store(true, Ordering::Relaxed);
             } else {
+                // GC freed something: reset exponential backoff.
+                self.zero_yield_headroom.store(0, Ordering::Relaxed);
                 self.gc_suppressed.store(false, Ordering::Relaxed);
             }
         }

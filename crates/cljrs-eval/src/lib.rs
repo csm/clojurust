@@ -26,6 +26,7 @@ pub mod lower;
 pub use cljrs_env::callback::invoke;
 pub use cljrs_env::env::{Env, GlobalEnv};
 pub use cljrs_env::error::{EvalError, EvalResult};
+pub use cljrs_env::gc_roots::force_collect;
 pub use cljrs_env::loader::load_ns;
 pub use cljrs_interp::eval::eval;
 
