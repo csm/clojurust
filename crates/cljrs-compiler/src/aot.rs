@@ -1065,11 +1065,6 @@ fn file_to_namespace(root: &Path, file: &Path) -> Option<String> {
 fn generate_test_harness_code(namespaces: &[String], bundled_registration: &str) -> String {
     let mut code = String::new();
 
-    let ns_strings: Vec<String> = namespaces
-        .iter()
-        .map(|s| format!("\"{}\".to_string()", s))
-        .collect();
-
     code.push_str(
         r#"//! Auto-generated AOT test harness for clojurust.
 //!
@@ -1088,15 +1083,6 @@ fn run() {
     // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
     let globals = cljrs_stdlib::standard_env_no_ir();
 
-    // GcPtr::Drop is a no-op: removing a namespace from the map does NOT free
-    // its closures/form-trees without an explicit collection.  force_collect is
-    // called twice per namespace below (GC_INITIAL_LIVES=2 requires two cycles
-    // to move objects through the grace period and actually free them).
-    // standard_env_no_ir() already sets GcConfig::new() (1/3 RAM default),
-    // which is intentionally permissive: pressure-triggered GC during active
-    // test execution would be zero-yield (all objects live) and causes
-    // thrashing.  force_collect between namespaces is sufficient.
-
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 "#,
@@ -1109,7 +1095,7 @@ fn run() {
     // Push an eval context so rt_call can dispatch through the interpreter.
     cljrs_env::callback::push_eval_context(&env);
 
-    // Load clojure.test if not already loaded
+    // Load clojure.test once; it stays loaded for the entire run.
     let _ = cljrs_eval::eval(
         &cljrs_reader::Parser::new(
             "(require 'clojure.test)".to_string(),
@@ -1118,40 +1104,42 @@ fn run() {
         &mut env
     );
 
-    // Load all test namespaces
-    (|| {
-"#,
-    );
-
-    for ns in namespaces.iter() {
-        code.push_str(&format!(
-            "        let _ = cljrs_eval::eval(&cljrs_reader::Parser::new(\n            \"(require '{})\".to_string(),\n            \"<test-harness>\".to_string()\n        ).parse_all().unwrap()[0], &mut env);\n",
-            ns
-        ));
-    }
-
-    code.push_str(
-        r#"    })();
-
-    // Run tests for each namespace separately
+    // Load, test, and unload each test namespace one at a time.
+    //
+    // Memory strategy: each test namespace and all its vars/closures are
+    // removed from GlobalEnv after its tests finish, then two explicit GC
+    // cycles free the now-unreachable objects.  Two cycles are required
+    // because GC_INITIAL_LIVES=2 gives objects one grace cycle before they
+    // are actually freed.  This keeps peak RSS proportional to one namespace
+    // at a time rather than all 233 simultaneously.
     let mut total_pass = 0i64;
     let mut total_fail = 0i64;
     let mut total_error = 0i64;
     let mut total_test_count = 0i64;
 
-    for ns_str in vec![
+    for ns_str in &[
 "#,
     );
 
-    for ns_str in ns_strings.iter() {
-        code.push_str(&format!("        {},\n", ns_str));
+    for ns in namespaces.iter() {
+        code.push_str(&format!("        \"{}\",\n", ns));
     }
 
-    code.push_str(r#"    ].iter() {
+    code.push_str(
+        r#"    ] {
+        // Load this test namespace.
+        let _ = cljrs_eval::eval(
+            &cljrs_reader::Parser::new(
+                format!("(require '{})", ns_str).to_string(),
+                "<test-harness>".to_string()
+            ).parse_all().unwrap()[0],
+            &mut env
+        );
+
+        // Run its tests.
         let run_result = cljrs_eval::eval(
             &cljrs_reader::Parser::new(
-                format!("(clojure.test/run-tests '{})", ns_str)
-                    .to_string(),
+                format!("(clojure.test/run-tests '{})", ns_str).to_string(),
                 "<run-tests>".to_string()
             ).parse_all().unwrap()[0],
             &mut env
@@ -1176,6 +1164,19 @@ fn run() {
             total_fail += fail;
             total_error += error;
             total_test_count += test_count;
+        }
+
+        // Unload the test namespace so the GC can reclaim its vars,
+        // closures, and form trees.  GcPtr::Drop is a no-op, so we must
+        // remove the namespace from GlobalEnv before collecting.
+        // The pressure-based GC (triggered by gc_safepoint during the next
+        // namespace's test execution) will naturally collect the freed objects:
+        // they are no longer reachable from GlobalEnv::namespaces and will be
+        // swept in the next collection cycle.
+        {
+            let ns_key: std::sync::Arc<str> = std::sync::Arc::from(*ns_str);
+            env.globals.namespaces.write().unwrap().remove(&*ns_key);
+            env.globals.loaded.lock().unwrap().remove(&*ns_key);
         }
     }
 
