@@ -203,6 +203,11 @@ impl cljrs_gc::Trace for PersistentArrayMap {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Arc<Vec<Value>>: 16 bytes for Arc ref-counts + Vec buffer.
+        16 + self.entries.capacity() * std::mem::size_of::<Value>()
+    }
 }
 
 #[cfg(test)]

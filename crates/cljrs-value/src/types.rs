@@ -626,6 +626,11 @@ impl cljrs_gc::Trace for BoundFn {
             val.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // HashMap<usize, Value>: hashbrown open-addressing, ~1 control byte + entry per slot.
+        self.captured_bindings.capacity() * (1 + mem::size_of::<usize>() + mem::size_of::<Value>())
+    }
 }
 
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────

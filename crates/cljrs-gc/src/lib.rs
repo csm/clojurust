@@ -101,30 +101,24 @@ impl Trace for num_rational::Ratio<num_bigint::BigInt> {
 impl Trace for regex::Regex {
     fn trace(&self, _: &mut MarkVisitor) {}
 }
-impl Trace for std::sync::Mutex<Vec<i32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
+macro_rules! impl_trace_prim_array {
+    ($t:ty) => {
+        impl Trace for std::sync::Mutex<Vec<$t>> {
+            fn trace(&self, _: &mut MarkVisitor) {}
+            fn gc_size_extra(&self) -> usize {
+                self.lock().unwrap().capacity() * std::mem::size_of::<$t>()
+            }
+        }
+    };
 }
-impl Trace for std::sync::Mutex<Vec<i64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i16>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i8>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<char>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<bool>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
+impl_trace_prim_array!(i32);
+impl_trace_prim_array!(i64);
+impl_trace_prim_array!(i16);
+impl_trace_prim_array!(i8);
+impl_trace_prim_array!(char);
+impl_trace_prim_array!(f64);
+impl_trace_prim_array!(f32);
+impl_trace_prim_array!(bool);
 
 // ── GcVisitor ─────────────────────────────────────────────────────────────────
 

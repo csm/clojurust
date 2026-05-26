@@ -42,6 +42,11 @@ impl Trace for ObjectArray {
             }
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        let guard = self.0.lock().unwrap();
+        guard.capacity() * std::mem::size_of::<Value>()
+    }
 }
 
 /// The central runtime type: every Clojure value is a `Value`.
