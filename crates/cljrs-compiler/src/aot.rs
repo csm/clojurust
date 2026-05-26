@@ -1083,21 +1083,14 @@ fn run() {
     // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
     let globals = cljrs_stdlib::standard_env_no_ir();
 
-    // Tight GC soft limit so the collector fires frequently during each
-    // namespace's test run, reclaiming transient values promptly.
-    // Previously removed (fa08a90) because agents were not awaited before GC
-    // fired, which caused use-after-free.  That race is fixed (f66db55):
-    // await-agent now joins all agents before run-tests returns.
-    cljrs_gc::HEAP.set_config(std::sync::Arc::new(
-        cljrs_gc::GcConfig::with_limits(
-            64 * 1024 * 1024,   // 64 MiB soft limit
-            128 * 1024 * 1024,  // 128 MiB hard limit
-        )
-    ));
     // GcPtr::Drop is a no-op: removing a namespace from the map does NOT free
     // its closures/form-trees without an explicit collection.  force_collect is
     // called twice per namespace below (GC_INITIAL_LIVES=2 requires two cycles
     // to move objects through the grace period and actually free them).
+    // standard_env_no_ir() already sets GcConfig::new() (1/3 RAM default),
+    // which is intentionally permissive: pressure-triggered GC during active
+    // test execution would be zero-yield (all objects live) and causes
+    // thrashing.  force_collect between namespaces is sufficient.
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
