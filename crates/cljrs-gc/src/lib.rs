@@ -452,7 +452,10 @@ mod gc_full {
                 Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
                 None => soft_limit_mb,
             };
-            self.set_config(Arc::new(GcConfig::with_limits(soft_limit_mb, hard_limit_mb)));
+            self.set_config(Arc::new(GcConfig::with_limits(
+                soft_limit_mb,
+                hard_limit_mb,
+            )));
         }
 
         pub fn register_root_tracer(
