@@ -119,7 +119,7 @@ impl Region {
             ptr::write(
                 gc_box,
                 GcBox {
-                    header: GcBoxHeader::new::<T>(),
+                    header: GcBoxHeader::new::<T>(0),
                     value,
                 },
             );

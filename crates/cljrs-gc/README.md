@@ -77,6 +77,9 @@ Implemented by [`MarkVisitor`].  Call `visitor.visit(ptr)` inside
 ```rust
 pub trait Trace: Send + Sync {
     fn trace(&self, visitor: &mut MarkVisitor);
+
+    // Default impl returns 0; override for types with significant inline-owned heap.
+    fn gc_size_extra(&self) -> usize { 0 }
 }
 ```
 
@@ -84,8 +87,14 @@ Implemented by every type stored behind a `GcPtr`.  Must call
 `visitor.visit(ptr)` for every `GcPtr` reachable from `self` (directly or
 through `Arc`/`Mutex`/etc.).
 
-Built-in leaf impls: `String`, `i64`, `f64`, `bool`,
-`num_bigint::BigInt`, `bigdecimal::BigDecimal`,
+`gc_size_extra` returns heap bytes owned by the value that are NOT counted by
+`size_of::<GcBox<T>>()` — Vec buffers, String capacity, Form AST trees stored
+inline.  The GC adds this to the tracked `memory_in_use` so collection fires at
+the right threshold.  Do NOT cross `GcPtr` boundaries — pointed-to boxes are
+counted separately when allocated.
+
+Built-in leaf impls: `String` (overrides `gc_size_extra` to return `capacity()`),
+`i64`, `f64`, `bool`, `num_bigint::BigInt`, `bigdecimal::BigDecimal`,
 `num_rational::Ratio<BigInt>`.
 
 ### `GcPtr<T: Trace + 'static>`
@@ -213,9 +222,12 @@ programs and the AOT test harness call it once at exit.
 - **Intrusive linked list**: all `GcBox`es are linked via `GcBoxHeader::next`.
 - **Type erasure**: `trace_fn` / `drop_fn` in the header enable type-erased
   mark and sweep without a vtable pointer per allocation.
-- **Precise per-object size**: `GcBoxHeader::size` stores `std::mem::size_of::<GcBox<T>>()`
-  at allocation time. `memory_in_use` is incremented by the exact GcBox size (not a
-  flat 256-byte estimate), and decremented by the exact freed-object sizes.
+- **Accurate allocation accounting**: `GcBoxHeader::size` stores
+  `size_of::<GcBox<T>>() + value.gc_size_extra()` at allocation time.
+  `memory_in_use` is incremented by this total (not a flat estimate) and
+  decremented by the same value when the object is freed.  Types that own
+  significant out-of-line heap (Form AST trees in `CljxFn`, String capacity)
+  override `gc_size_extra` so the GC threshold fires before the process OOMs.
 - **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed),
   GC is suppressed until `memory_in_use` grows by another `soft_limit/10` bytes
   (a fixed additive headroom, not a percentage of current memory).  Using a

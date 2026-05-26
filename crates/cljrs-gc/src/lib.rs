@@ -53,14 +53,32 @@ pub fn is_static_addr(addr: usize) -> bool {
 // ── Trace trait ───────────────────────────────────────────────────────────────
 
 /// Implemented by every type that can be stored behind a [`GcPtr`].
+///
+/// The `gc_size_extra` method accounts for heap bytes owned by the value that
+/// are NOT captured by `size_of::<GcBox<T>>()` (e.g. `Vec` buffers, `String`
+/// capacity, `Form` AST trees stored inline).  The default returns 0, which is
+/// correct for primitives and types with no out-of-line heap.
+///
+/// Rules for implementors of `gc_size_extra`:
+/// - Count only bytes THIS value owns and will free when dropped.
+/// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
+///   separately when it is allocated.
 pub trait Trace: Send + Sync {
     fn trace(&self, visitor: &mut MarkVisitor);
+
+    fn gc_size_extra(&self) -> usize {
+        0
+    }
 }
 
 // ── Leaf Trace impls ──────────────────────────────────────────────────────────
 
 impl Trace for String {
     fn trace(&self, _: &mut MarkVisitor) {}
+
+    fn gc_size_extra(&self) -> usize {
+        self.capacity()
+    }
 }
 impl Trace for i64 {
     fn trace(&self, _: &mut MarkVisitor) {}
@@ -153,11 +171,11 @@ mod gc_header {
     }
 
     impl GcBoxHeader {
-        pub(crate) fn new<T: Trace + 'static>() -> Self {
+        pub(crate) fn new<T: Trace + 'static>(heap_extra: usize) -> Self {
             Self {
                 #[cfg(debug_assertions)]
                 magic: Cell::new(GC_MAGIC_ALIVE),
-                size: std::mem::size_of::<GcBox<T>>(),
+                size: std::mem::size_of::<GcBox<T>>() + heap_extra,
                 lives: Cell::new(GC_INITIAL_LIVES - 1),
                 next: Cell::new(std::ptr::null_mut()),
                 trace_fn: trace_gc_box::<T>,
@@ -483,11 +501,12 @@ mod gc_full {
 
         pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
             crate::cancellation::safepoint();
+            let heap_extra = value.gc_size_extra();
             let gc_box = Box::new(GcBox {
-                header: GcBoxHeader::new::<T>(),
+                header: GcBoxHeader::new::<T>(heap_extra),
                 value,
             });
-            let obj_size = gc_box.header.size; // exact GcBox<T> size set at construction
+            let obj_size = gc_box.header.size; // GcBox<T> size + gc_size_extra()
             let raw: *mut GcBox<T> = Box::into_raw(gc_box);
             {
                 let mut inner = self.inner.lock().unwrap();
