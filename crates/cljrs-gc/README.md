@@ -3,6 +3,10 @@
 Non-moving, stop-the-world mark-and-sweep garbage collector for clojurust;
 or, with the `no-gc` Cargo feature, a region-based allocator with no GC pauses.
 
+On `wasm32` targets the `system-memory` crate is excluded (it brings in `errno`,
+which does not build for `wasm32-unknown-unknown`).  The GC heap defaults to a
+fixed **64 MB** soft limit instead of consulting total system RAM.
+
 **Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
 `docs/no-gc-plan.md`) — implemented.

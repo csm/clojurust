@@ -456,9 +456,14 @@ mod gc_full {
         }
 
         pub fn set_config_from_env(&self) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let default_soft_limit: usize = (system_memory::total() / 3) as usize;
+            #[cfg(target_arch = "wasm32")]
+            let default_soft_limit: usize = 64 * 1024 * 1024;
+
             let soft_limit_mb: usize = match std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok() {
                 Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
-                None => (system_memory::total() / 3) as usize,
+                None => default_soft_limit,
             };
             let hard_limit_mb: usize = match std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok() {
                 Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
