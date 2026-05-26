@@ -40,3 +40,22 @@ jobs:
         env:
           CLJRS_GC_STATS: "-"
         run: cargo run -p cljrs compile -o graph-sample samples/graph.cljrs && ./graph-sample
+
+  wasm:
+    name: WASM build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build cljrs-wasm
+        run: wasm-pack build crates/cljrs-wasm --target web --no-typescript --release
