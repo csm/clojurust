@@ -41,6 +41,11 @@ jobs:
           CLJRS_GC_STATS: "-"
         run: cargo run -p cljrs compile -o graph-sample samples/graph.cljrs && ./graph-sample
 
+      - name: Game of Life (bump-allocator showcase)
+        env:
+          CLJRS_GC_STATS: "-"
+        run: cargo run -p cljrs compile -o life-sample samples/life.cljrs && ./life-sample
+
   wasm:
     name: WASM build
     runs-on: ubuntu-latest
