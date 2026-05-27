@@ -284,3 +284,42 @@ fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
         visitor.visit(ns_ptr);
     }
 }
+
+/// Service a pending GC request from an async (LocalSet) context.
+///
+/// Safe to call from within a Tokio `LocalSet` task at any cooperative yield
+/// point: when this executes, no other tasks are polling, so thread-local root
+/// stacks (ENV_ROOTS, VALUE_ROOTS, ALLOC_ROOTS) fully describe all GcPtrs held
+/// by suspended tasks and can be scanned safely.
+///
+/// Under `no-gc` this is a no-op.
+#[cfg(feature = "no-gc")]
+pub fn async_gc_collect() {}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn async_gc_collect() {
+    if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        return;
+    }
+    if cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        cljrs_gc::safepoint();
+        return;
+    }
+    if !cljrs_gc::take_gc_request() {
+        cljrs_gc::safepoint();
+        return;
+    }
+    let Some(_stw_guard) = cljrs_gc::begin_stw() else {
+        cljrs_gc::safepoint();
+        return;
+    };
+    cljrs_gc::HEAP.collect(|visitor| {
+        cljrs_gc::HEAP.trace_registered_roots(visitor);
+        trace_thread_env_roots(visitor);
+        trace_value_roots(visitor);
+        trace_option_value_roots(visitor);
+        dynamics::trace_current(visitor);
+        crate::taps::trace_roots(visitor);
+        cljrs_gc::trace_thread_alloc_roots(visitor);
+    });
+}

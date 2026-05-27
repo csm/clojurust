@@ -37,6 +37,10 @@ where
     let future = GcPtr::new(CljxFuture::new());
     let task_future = future.clone();
     tokio::task::spawn_local(async move {
+        // Root the result future across GC cycles: the spawning scope's alloc
+        // frame may have dropped before the task gets to run.
+        let anchor = Value::Future(task_future.clone());
+        let _root = cljrs_env::gc_roots::root_value(&anchor);
         let result = task.await;
         settle_future(&task_future, result);
     });
@@ -74,6 +78,10 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
     let arity = select_arity(&f, args.len())?.clone();
     let mut env = Env::with_closure(base.globals.clone(), &f.defining_ns, &f);
     env.is_async = true;
+
+    // Keep callee and the local env alive across GC cycles at async yield points.
+    let _callee_root = cljrs_env::gc_roots::root_value(&callee);
+    let _env_root = cljrs_env::gc_roots::push_env_root(&env);
 
     let mut current_args = args;
     loop {
@@ -155,28 +163,40 @@ async fn eval_await_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// executor until resolved; any other value is returned as-is.
 pub(crate) async fn await_value(val: Value) -> EvalResult {
     match val {
-        Value::Future(f) => loop {
-            {
-                let guard = f.get().state.lock().unwrap();
-                match &*guard {
-                    FutureState::Done(v) => return Ok(v.clone()),
-                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Runtime("future was cancelled".into()));
+        Value::Future(f) => {
+            // Root the future across GC cycles: the alloc frame of the scope that
+            // produced it may have dropped before this task reached a yield point.
+            let anchor = Value::Future(f.clone());
+            let _root = cljrs_env::gc_roots::root_value(&anchor);
+            loop {
+                {
+                    let guard = f.get().state.lock().unwrap();
+                    match &*guard {
+                        FutureState::Done(v) => return Ok(v.clone()),
+                        FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                        FutureState::Cancelled => {
+                            return Err(EvalError::Runtime("future was cancelled".into()));
+                        }
+                        FutureState::Running => {}
                     }
-                    FutureState::Running => {}
                 }
+                cljrs_env::gc_roots::async_gc_collect();
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        },
-        Value::Promise(p) => loop {
-            {
-                if let Some(v) = p.get().value.lock().unwrap().as_ref() {
-                    return Ok(v.clone());
+        }
+        Value::Promise(p) => {
+            let anchor = Value::Promise(p.clone());
+            let _root = cljrs_env::gc_roots::root_value(&anchor);
+            loop {
+                {
+                    if let Some(v) = p.get().value.lock().unwrap().as_ref() {
+                        return Ok(v.clone());
+                    }
                 }
+                cljrs_env::gc_roots::async_gc_collect();
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        },
+        }
         other => Ok(other),
     }
 }

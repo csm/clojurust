@@ -33,6 +33,7 @@ const CORE_ASYNC_SOURCE: &str = include_str!("core_async.cljrs");
 /// run. Idempotent: the namespace is built only once.
 pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
     globals.set_async_runtime(Arc::new(AsyncRuntimeImpl::new()));
+    runtime::spawn_gc_service();
 
     let ns = "clojure.core.async";
     if globals.is_loaded(ns) {

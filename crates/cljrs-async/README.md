@@ -10,12 +10,13 @@ executor. All Clojure values remain on a single thread, keeping GC pointers (`!S
 
 ## Status
 
-**Phase F (higher-level async utilities)** — All core `clojure.core.async` primitives are
-implemented. `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, and
-`untap-all!` are native Rust builtins; `async-pmap`, `thread`, `merge`, `reduce`, and `into`
-are defined in `core_async.cljrs`. `await` works correctly inside `loop/recur` bodies.
+**Phase G (GC safety for the async runtime)** — complete. GC safepoints are integrated at
+cooperative yield points. `async_gc_collect()` is called before every `yield_now().await` in
+`await_value`, and a background GC-service task (spawned by `init`) services GC requests between
+poll cycles. Explicit GC root guards protect `task_future` in `spawn_future`, callee/env in
+`run_async_fn`, and awaited futures/promises in `await_value`.
 
-Done:
+Done (Phases A–G):
 
 - Phase A: `init()` registers the async runtime hook with the interpreter.
 - Phase B: `^:async` fn dispatch via the `AsyncRuntime` hook; `eval_async` tree-walker;
@@ -34,6 +35,10 @@ Done:
   finishes (background task). `mult` broadcasts a source channel to all registered tap channels
   (`tap!`/`untap!`/`untap-all!`). Clojure-level: `async-pmap`, `thread` macro, `merge`,
   `reduce`, `into`. `eval_loop_async` enables proper `await` yielding inside `loop/recur`.
+- Phase G: GC safepoints at async yield points via `cljrs_env::gc_roots::async_gc_collect()`,
+  called before each `yield_now().await` in `await_value`. Background GC-service task spawned
+  by `init()`. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
+  `run_async_fn`, and awaited futures/promises in `await_value`.
 
 ### Channel model
 
@@ -62,7 +67,7 @@ inside an async context:
 
 Not yet implemented (later phases):
 
-- Phase G+: `take!!`/`put!!` (blocking sync ops), `pipeline`, GC safepoints, IR support.
+- Phase G+: `take!!`/`put!!` (blocking sync ops), `pipeline`, IR support.
 
 ### `await` and the single-thread executor
 
