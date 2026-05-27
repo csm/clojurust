@@ -295,6 +295,7 @@ fn lower_function(
             &arity.body,
             &ns_arc,
             env,
+            f.is_async,
         ) {
             Ok(ir_func) => {
                 if verbose {

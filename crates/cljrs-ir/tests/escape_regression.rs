@@ -22,7 +22,7 @@ use std::sync::Arc;
 fn lower(source: &str) -> IrFunction {
     let mut parser = Parser::new(source.to_string(), "<test>".to_string());
     let forms = parser.parse_all().expect("parse");
-    lower_fn_body(Some("test"), "user", &[], &forms).expect("lower")
+    lower_fn_body(Some("test"), "user", &[], &forms, false).expect("lower")
 }
 
 /// Count `Inst::RegionAlloc` insts in `ir` plus all subfunctions.

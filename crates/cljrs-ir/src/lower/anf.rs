@@ -35,22 +35,51 @@ impl std::error::Error for LowerError {}
 
 type R = Result<VarId, LowerError>;
 
+// ── Async metadata helper ─────────────────────────────────────────────────────
+
+/// Return `true` if a metadata form contains `:async true`.
+///
+/// Handles both shorthand `^:async` (a keyword form) and full
+/// `^{:async true}` (a map form).
+fn is_meta_async(meta: &Form) -> bool {
+    match &meta.kind {
+        FormKind::Keyword(k) => k == "async",
+        FormKind::Map(pairs) => {
+            // Map is stored as flat [k v k v ...] in FormKind::Map
+            let mut i = 0;
+            while i + 1 < pairs.len() {
+                if let FormKind::Keyword(k) = &pairs[i].kind
+                    && k == "async"
+                {
+                    return !matches!(&pairs[i + 1].kind, FormKind::Bool(false) | FormKind::Nil);
+                }
+                i += 2;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Lower a function arity's body to an `IrFunction`.
 ///
-/// `name`   — function name (for diagnostics), or `None` for anonymous.
-/// `ns`     — current Clojure namespace name.
-/// `params` — flat parameter name list, including the rest param if variadic
-///            (the rest param is the last element).
-/// `body`   — sequence of already macro-expanded body forms (implicit `do`).
+/// `name`     — function name (for diagnostics), or `None` for anonymous.
+/// `ns`       — current Clojure namespace name.
+/// `params`   — flat parameter name list, including the rest param if variadic
+///              (the rest param is the last element).
+/// `body`     — sequence of already macro-expanded body forms (implicit `do`).
+/// `is_async` — whether the function was declared `^:async`.
 pub fn lower_fn_body(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
     body: &[Form],
+    is_async: bool,
 ) -> Result<IrFunction, LowerError> {
     let mut ctx = LowerCtx::new(name.map(Arc::from), Arc::from(ns));
+    ctx.is_async = is_async;
 
     // Bind each param to a fresh VarId.
     let mut bound_params: Vec<(Arc<str>, VarId)> = Vec::with_capacity(params.len());
@@ -177,7 +206,18 @@ fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
                 )))
             }
         }
-        FormKind::Meta(_, inner) => lower_form(ctx, inner),
+        FormKind::Meta(meta, inner) => {
+            // Detect `^:async (fn ...)` — propagate is_async to lower_fn.
+            if let FormKind::List(parts) = &inner.kind
+                && !parts.is_empty()
+                && matches!(&parts[0].kind, FormKind::Symbol(s) if s == "fn" || s == "fn*")
+                && is_meta_async(meta)
+            {
+                lower_fn(ctx, &parts[1..], true)
+            } else {
+                lower_form(ctx, inner)
+            }
+        }
         // These should have been expanded before reaching the lowering pass.
         FormKind::SyntaxQuote(_)
         | FormKind::Unquote(_)
@@ -240,7 +280,7 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
         "loop" | "loop*" => lower_loop(ctx, args),
         "recur" => lower_recur(ctx, args),
         "def" => lower_def(ctx, args),
-        "fn" | "fn*" => lower_fn(ctx, args),
+        "fn" | "fn*" => lower_fn(ctx, args, false),
         "defn" => lower_defn(ctx, args),
         "quote" => {
             if args.len() != 1 {
@@ -250,6 +290,7 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
             }
             lower_quote(ctx, &args[0])
         }
+        "await" => lower_await(ctx, args),
         "throw" => lower_throw(ctx, args),
         "set!" => lower_set_bang(ctx, args),
         "and" => lower_and(ctx, args),
@@ -730,12 +771,29 @@ fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
             "defn requires a name".into(),
         ));
     }
-    let FormKind::Symbol(name_sym) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm(
-            "defn name must be a symbol".into(),
-        ));
+    // Name may carry `^:async` metadata: `(defn ^:async foo [x] ...)`.
+    let (name_str, is_async) = match &args[0].kind {
+        FormKind::Symbol(s) => (s.clone(), false),
+        FormKind::Meta(meta, inner) => {
+            let FormKind::Symbol(s) = &inner.kind else {
+                return Err(LowerError::MalformedSpecialForm(
+                    "defn name must be a symbol".into(),
+                ));
+            };
+            (s.clone(), is_meta_async(meta))
+        }
+        _ => {
+            return Err(LowerError::MalformedSpecialForm(
+                "defn name must be a symbol".into(),
+            ));
+        }
     };
-    let name_str = name_sym.clone();
+
+    // Normalise args[0] to a plain symbol (strip metadata for fn name arg).
+    let plain_name_form = Form::new(
+        FormKind::Symbol(name_str.clone()),
+        args[0].span.clone(),
+    );
 
     // Skip optional docstring.
     let rest_start = if args.len() > 2 {
@@ -749,11 +807,11 @@ fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     };
 
     // Build (fn name params body...) args.
-    let fn_args: Vec<Form> = std::iter::once(args[0].clone())
+    let fn_args: Vec<Form> = std::iter::once(plain_name_form)
         .chain(args[rest_start..].iter().cloned())
         .collect();
 
-    let fn_val = lower_fn(ctx, &fn_args)?;
+    let fn_val = lower_fn(ctx, &fn_args, is_async)?;
     let ns = ctx.ns().clone();
     let dst = ctx.fresh_var();
     ctx.emit(Inst::DefVar(dst, ns, Arc::from(name_str.as_str()), fn_val));
@@ -791,7 +849,7 @@ struct AritySpec {
     body: Vec<Form>,
 }
 
-fn lower_fn(ctx: &mut LowerCtx, args: &[Form]) -> R {
+fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
     // Detect optional name.
     let (fn_name, body_start) = if let Some(FormKind::Symbol(s)) = args.first().map(|f| &f.kind) {
         (Some(s.clone()), 1)
@@ -909,6 +967,7 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form]) -> R {
             &arity.fixed,
             arity.rest.as_ref(),
             &arity.body,
+            is_async,
         )?;
         ctx.add_subfunction(subfn);
 
@@ -942,6 +1001,7 @@ fn lower_fn_arity(
     fixed_params: &[Form],
     rest_param: Option<&Form>,
     body_forms: &[Form],
+    is_async: bool,
 ) -> Result<IrFunction, LowerError> {
     // Compute raw parameter info (gensym for destructuring patterns).
     struct ParamInfo {
@@ -990,6 +1050,7 @@ fn lower_fn_arity(
     }
 
     let mut sub = LowerCtx::new(arity_name, ns);
+    sub.is_async = is_async;
 
     // Bind all params.
     let mut bound_params: Vec<(Arc<str>, VarId)> = Vec::with_capacity(all_param_names.len());
@@ -1072,6 +1133,25 @@ fn lower_fn_arity(
     Ok(ir)
 }
 
+// ── await ─────────────────────────────────────────────────────────────────────
+
+fn lower_await(ctx: &mut LowerCtx, args: &[Form]) -> R {
+    if args.len() != 1 {
+        return Err(LowerError::MalformedSpecialForm(
+            "await expects exactly 1 argument".into(),
+        ));
+    }
+    if !ctx.is_async {
+        return Err(LowerError::MalformedSpecialForm(
+            "await used outside an ^:async function — annotate the enclosing fn with ^:async".into(),
+        ));
+    }
+    let src = lower_form(ctx, &args[0])?;
+    let dst = ctx.fresh_var();
+    ctx.emit(Inst::Await { src, dst });
+    Ok(dst)
+}
+
 // ── throw ─────────────────────────────────────────────────────────────────────
 
 fn lower_throw(ctx: &mut LowerCtx, args: &[Form]) -> R {
@@ -1132,6 +1212,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
         &[],
         None,
         &body_forms,
+        false,
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1178,6 +1259,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 &catch_params,
                 None,
                 &catch_body,
+                false,
             )?;
             ctx.add_subfunction(catch_fn_ir);
             let dst = ctx.fresh_var();
@@ -1214,6 +1296,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 &[],
                 None,
                 &fin_body,
+                false,
             )?;
             ctx.add_subfunction(fin_fn_ir);
             let dst = ctx.fresh_var();
@@ -1310,6 +1393,7 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
         &[],
         None,
         &args[1..],
+        false,
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1414,7 +1498,7 @@ fn lower_letfn(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 v.extend(p.body.clone());
                 v
             };
-            lower_fn(ctx, &fn_args_forms)
+            lower_fn(ctx, &fn_args_forms, false)
         })
         .collect::<Result<_, _>>()?;
 
@@ -1458,6 +1542,7 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
         &[],
         None,
         body_forms,
+        false,
     )?;
     ctx.add_subfunction(body_fn_ir);
 

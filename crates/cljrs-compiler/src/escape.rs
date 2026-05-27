@@ -446,6 +446,7 @@ mod tests {
             next_block: 1,
             span: None,
             subfunctions: vec![],
+            is_async: false,
         }
     }
 

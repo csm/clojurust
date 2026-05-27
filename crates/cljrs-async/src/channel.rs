@@ -90,6 +90,11 @@ impl CljChannel {
         self.state.lock().unwrap().closed = true;
     }
 
+    /// Return the buffered capacity (0 = rendezvous/unbuffered).
+    pub(crate) fn capacity(&self) -> usize {
+        self.state.lock().unwrap().capacity
+    }
+
     /// Non-blocking take.
     ///
     /// - `Some(v)` — a buffered or rendezvous-offered value was removed.

@@ -10,7 +10,7 @@ use cljrs_reader::Parser;
 fn lower(source: &str) -> cljrs_ir::IrFunction {
     let mut parser = Parser::new(source.to_string(), "<test>".to_string());
     let forms = parser.parse_all().expect("parse");
-    let ir = lower_fn_body(Some("test"), "user", &[], &forms).expect("lower");
+    let ir = lower_fn_body(Some("test"), "user", &[], &forms, false).expect("lower");
     optimize(ir)
 }
 

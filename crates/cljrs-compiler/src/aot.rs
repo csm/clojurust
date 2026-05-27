@@ -87,7 +87,7 @@ pub fn lower_via_rust(
     _env: &mut cljrs_eval::Env,
 ) -> AotResult<IrFunction> {
     let ns_arc: Arc<str> = Arc::from(ns);
-    let ir = cljrs_ir::lower::lower_fn_body(name, &ns_arc, params, compilable_forms)
+    let ir = cljrs_ir::lower::lower_fn_body(name, &ns_arc, params, compilable_forms, false)
         .map_err(|e| AotError::Eval(format!("lowering: {e:?}")))?;
     let ir = cljrs_ir::lower::optimize(ir);
 

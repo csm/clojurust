@@ -8,6 +8,8 @@ use cljrs_value::Value;
 
 use crate::env::Env;
 
+use crate::error::EvalResult;
+
 /// Interface implemented by `cljrs-async` and registered with `GlobalEnv`.
 ///
 /// All methods are called from the LocalSet thread, so `Value` / `Env` need
@@ -20,4 +22,15 @@ pub trait AsyncRuntime: Send + Sync {
     /// evaluated arguments, `env` is the calling environment. Returns a
     /// `Value::Future` immediately; the body runs concurrently.
     fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value;
+
+    /// Block the current OS thread until a value can be taken from the channel.
+    ///
+    /// Used by the IR interpreter's sync-context fallback for `ChanTake`.
+    /// Returns `Value::Nil` on a closed channel.
+    fn chan_take_blocking(&self, chan: Value) -> EvalResult;
+
+    /// Block the current OS thread until the value is accepted by the channel.
+    ///
+    /// Used by the IR interpreter's sync-context fallback for `ChanPut`.
+    fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()>;
 }

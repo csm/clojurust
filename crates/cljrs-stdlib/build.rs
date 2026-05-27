@@ -203,6 +203,7 @@ fn lower_ns_to_bundle(
                 &arity.body,
                 &ns_arc,
                 env,
+                f.is_async,
             ) {
                 Ok(ir_func) => {
                     bundle.insert(key, ir_func);
