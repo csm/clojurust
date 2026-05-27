@@ -78,6 +78,7 @@ impl AsyncRuntime for AsyncRuntimeImpl {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
     match val {
         Value::NativeObject(ptr) => {
