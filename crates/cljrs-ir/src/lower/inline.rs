@@ -147,6 +147,23 @@ fn clone_inst(
             name.clone(),
             args.iter().map(|&v| rv(var_map, v)).collect(),
         ),
+        Inst::Await { src, dst } => Inst::Await {
+            src: rv(var_map, *src),
+            dst: rv(var_map, *dst),
+        },
+        Inst::Spawn { fn_reg, args, dst } => Inst::Spawn {
+            fn_reg: rv(var_map, *fn_reg),
+            args: args.iter().map(|&v| rv(var_map, v)).collect(),
+            dst: rv(var_map, *dst),
+        },
+        Inst::ChanTake { chan, dst } => Inst::ChanTake {
+            chan: rv(var_map, *chan),
+            dst: rv(var_map, *dst),
+        },
+        Inst::ChanPut { chan, val } => Inst::ChanPut {
+            chan: rv(var_map, *chan),
+            val: rv(var_map, *val),
+        },
     }
 }
 

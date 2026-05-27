@@ -44,8 +44,9 @@ pub fn lower_arity(
     body: &[Form],
     ns: &Arc<str>,
     env: &mut Env,
+    is_async: bool,
 ) -> Result<IrFunction, LowerError> {
-    lower_arity_inner(name, params, rest_param, body, ns, env, false)
+    lower_arity_inner(name, params, rest_param, body, ns, env, false, is_async)
 }
 
 /// Like [`lower_arity`], but also runs the region-optimization pass.
@@ -56,10 +57,12 @@ pub fn lower_and_optimize_arity(
     body: &[Form],
     ns: &Arc<str>,
     env: &mut Env,
+    is_async: bool,
 ) -> Result<IrFunction, LowerError> {
-    lower_arity_inner(name, params, rest_param, body, ns, env, true)
+    lower_arity_inner(name, params, rest_param, body, ns, env, true, is_async)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_arity_inner(
     name: Option<&str>,
     params: &[Arc<str>],
@@ -68,6 +71,7 @@ fn lower_arity_inner(
     ns: &Arc<str>,
     env: &mut Env,
     do_optimize: bool,
+    is_async: bool,
 ) -> Result<IrFunction, LowerError> {
     cljrs_logging::feat_debug!(
         "lower",
@@ -96,7 +100,7 @@ fn lower_arity_inner(
         all_params.push(rest.clone());
     }
 
-    let ir = cljrs_ir::lower::lower_fn_body(name, ns, &all_params, &expanded_body)
+    let ir = cljrs_ir::lower::lower_fn_body(name, ns, &all_params, &expanded_body, is_async)
         .map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
 
     Ok(if do_optimize {

@@ -23,6 +23,7 @@ use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Term
 pub enum CodegenError {
     Module(cranelift_module::ModuleError),
     Codegen(String),
+    UnsupportedInst(String),
 }
 
 impl From<cranelift_module::ModuleError> for CodegenError {
@@ -714,6 +715,19 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let val = self.emit_direct_call(fn_name, args)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
+            }
+
+            // Async instructions are not compiled to native code in Phase H.
+            // Async IrFunctions are excluded from AOT by the caller (any function
+            // with `is_async = true` should not reach the codegen pipeline yet).
+            Inst::Await { .. }
+            | Inst::Spawn { .. }
+            | Inst::ChanTake { .. }
+            | Inst::ChanPut { .. } => {
+                return Err(CodegenError::UnsupportedInst(
+                    "async instructions (Await/Spawn/ChanTake/ChanPut) require JIT compilation"
+                        .into(),
+                ));
             }
         }
         Ok(())

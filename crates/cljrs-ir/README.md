@@ -77,6 +77,10 @@ pub struct IrFunction {
     pub next_block: u32,
     pub span: Option<Span>,
     pub subfunctions: Vec<IrFunction>,
+    /// Whether this function was declared `^:async`.
+    /// Async IR functions fall back to tree-walking `eval_async`; Phase H JIT
+    /// will emit Cranelift state machines with explicit resume points.
+    pub is_async: bool,
 }
 
 pub struct Block {
@@ -94,6 +98,18 @@ pub struct Block {
 `CallDirect`, `Deref`, `DefVar`, `SetBang`, `Throw`, `Phi`, `Recur`,
 `SourceLoc`, `RegionStart`, `RegionAlloc`, `RegionEnd`, `RegionParam`,
 `CallWithRegion`
+
+**Async instructions** (Phase H):
+
+- `Await { src, dst }` — yield point inside `^:async` fn; `dst` receives the
+  resolved `Future`/`Promise` value.  IR interpreter uses blocking deref;
+  `eval_async` yields to the Tokio executor.
+- `Spawn { fn_reg, args, dst }` — spawn an `^:async` call as a LocalSet task;
+  `dst` receives a `Value::Future` immediately.
+- `ChanTake { chan, dst }` — async take from a channel; parks until a value is
+  available.
+- `ChanPut { chan, val }` — async put into a channel; parks if the buffer is
+  full (no result value).
 
 ### Terminators
 

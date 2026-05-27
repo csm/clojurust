@@ -71,16 +71,13 @@ pub fn load_prebuilt_ir(globals: &Arc<GlobalEnv>, bundle: &IrBundle) -> usize;
 
 /// IR lowering helpers (in module `lower`):
 ///
-/// `lower_arity` — runs only `cljrs.compiler.anf/lower-fn-body`.
-/// `lower_and_optimize_arity` — also runs `cljrs.compiler.optimize/optimize`,
-///     which inserts `RegionStart`/`RegionAlloc`/`RegionEnd` instructions for
-///     non-escaping allocations.  Caller must have required
-///     `cljrs.compiler.optimize` first.  Used by `cljrs-stdlib`'s prebuild
-///     (`prebuild-ir` feature) and by AOT compilation, so prebuilt/AOT code
-///     gets bump-allocated regions.
+/// `lower_arity(name, params, rest, body, ns, env, is_async)` — ANF lowering only.
+/// `lower_and_optimize_arity(name, params, rest, body, ns, env, is_async)` — also
+///     runs region-optimization.  Both accept `is_async: bool` from the `CljxFn`
+///     and propagate it to `IrFunction::is_async`.
 pub mod lower {
-    pub fn lower_arity(...) -> Result<IrFunction, LowerError>;
-    pub fn lower_and_optimize_arity(...) -> Result<IrFunction, LowerError>;
+    pub fn lower_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;
+    pub fn lower_and_optimize_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;
 }
 ```
 
@@ -90,10 +87,13 @@ pub mod lower {
 
 1. `apply::call_cljrs_fn` is registered as the `call_cljrs_fn` function pointer in `GlobalEnv`
 2. On each call, it checks `ir_cache::get_cached(arity_id)` for a pre-lowered IR function
-3. If cached: executes via `ir_interp::interpret_ir` (register-file interpreter)
-4. If not cached: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking)
+3. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
+4. If not cached **or async**: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking).
+   For `^:async` functions the tree-walking path dispatches to `eval_async` in `cljrs-async`,
+   which cooperatively yields to the Tokio `LocalSet` executor.
 5. Eager lowering: `ir_interp::eager_lower_fn` is registered as the `on_fn_defined` hook;
-   when `compiler_ready` is true, new `fn*` definitions are lowered immediately
+   when `compiler_ready` is true, new `fn*` definitions are lowered immediately.
+   The resulting `IrFunction::is_async` flag matches the `CljxFn::is_async` attribute.
 6. `eval_call` in `cljrs_interp` routes `Value::Fn` calls through `globals.call_cljrs_fn`
    (the registered hook) rather than calling the tree-walker directly, so IR-cached
    arities are used on direct call paths too
