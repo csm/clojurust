@@ -62,6 +62,7 @@ pub fn lower_and_optimize_arity(
     lower_arity_inner(name, params, rest_param, body, ns, env, true, is_async)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_arity_inner(
     name: Option<&str>,
     params: &[Arc<str>],

@@ -990,6 +990,7 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
     Ok(dst)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_fn_arity(
     _parent_ctx: &mut LowerCtx,
     arity_name: Option<Arc<str>>,
