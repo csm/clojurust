@@ -418,7 +418,6 @@ fn execute_inst(
         // `try_ir_path` bypass in apply.rs), so these arms are rarely reached
         // in practice.  They provide a graceful sync-context fallback for the
         // cases where they are reached (e.g. in tests or non-async callers).
-
         Inst::Await { src, dst } => {
             // Sync fallback: block the OS thread until the future/promise resolves.
             let val = regs.get_cloned(*src);

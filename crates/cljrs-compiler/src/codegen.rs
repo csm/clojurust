@@ -720,7 +720,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             // Async instructions are not compiled to native code in Phase H.
             // Async IrFunctions are excluded from AOT by the caller (any function
             // with `is_async = true` should not reach the codegen pipeline yet).
-            Inst::Await { .. } | Inst::Spawn { .. } | Inst::ChanTake { .. } | Inst::ChanPut { .. } => {
+            Inst::Await { .. }
+            | Inst::Spawn { .. }
+            | Inst::ChanTake { .. }
+            | Inst::ChanPut { .. } => {
                 return Err(CodegenError::UnsupportedInst(
                     "async instructions (Await/Spawn/ChanTake/ChanPut) require JIT compilation"
                         .into(),

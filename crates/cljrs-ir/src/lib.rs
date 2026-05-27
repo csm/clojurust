@@ -365,7 +365,6 @@ pub enum Inst {
     CallWithRegion(VarId, Arc<str>, Vec<VarId>),
 
     // ── Async instructions ───────────────────────────────────────────────
-
     /// Yield point: await a `Future`/`Promise` inside an `^:async` function.
     ///
     /// `(dst, src)` — `src` holds a `Value::Future`/`Value::Promise`; `dst`
@@ -377,7 +376,11 @@ pub enum Inst {
     ///
     /// `(dst, fn_reg, args)` — calls `AsyncRuntime::spawn_async`; `dst`
     /// receives a `Value::Future` immediately.
-    Spawn { fn_reg: VarId, args: Vec<VarId>, dst: VarId },
+    Spawn {
+        fn_reg: VarId,
+        args: Vec<VarId>,
+        dst: VarId,
+    },
 
     /// Take a value from a channel (async).
     ///

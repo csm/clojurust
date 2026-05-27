@@ -790,10 +790,7 @@ fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     };
 
     // Normalise args[0] to a plain symbol (strip metadata for fn name arg).
-    let plain_name_form = Form::new(
-        FormKind::Symbol(name_str.clone()),
-        args[0].span.clone(),
-    );
+    let plain_name_form = Form::new(FormKind::Symbol(name_str.clone()), args[0].span.clone());
 
     // Skip optional docstring.
     let rest_start = if args.len() > 2 {
@@ -1143,7 +1140,8 @@ fn lower_await(ctx: &mut LowerCtx, args: &[Form]) -> R {
     }
     if !ctx.is_async {
         return Err(LowerError::MalformedSpecialForm(
-            "await used outside an ^:async function — annotate the enclosing fn with ^:async".into(),
+            "await used outside an ^:async function — annotate the enclosing fn with ^:async"
+                .into(),
         ));
     }
     let src = lower_form(ctx, &args[0])?;

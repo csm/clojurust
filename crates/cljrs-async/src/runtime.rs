@@ -82,10 +82,9 @@ fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
     match val {
         Value::NativeObject(ptr) => {
             let obj: &NativeObjectBox = ptr.get();
-            obj.downcast_ref::<CljChannel>()
-                .ok_or_else(|| EvalError::Runtime(
-                    format!("expected Channel, got {}", obj.type_tag()),
-                ))
+            obj.downcast_ref::<CljChannel>().ok_or_else(|| {
+                EvalError::Runtime(format!("expected Channel, got {}", obj.type_tag()))
+            })
         }
         other => Err(EvalError::Runtime(format!(
             "expected Channel, got {}",
