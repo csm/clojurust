@@ -145,7 +145,8 @@ mod gc_header {
     // next GC safepoint (where VALUE_ROOTS or a new alloc frame re-roots it).
     // 10 was chosen conservatively but keeps 9× more garbage in RAM than
     // necessary, worsening OOM pressure under test suites with many forms.
-    pub(crate) const GC_INITIAL_LIVES: u8 = 2;
+    // bump back to 4, 2 may be too small
+    pub(crate) const GC_INITIAL_LIVES: u8 = 4;
 
     #[cfg(debug_assertions)]
     pub(crate) const GC_MAGIC_ALIVE: u64 = 0xCAFE_BABE_DEAD_BEEF;
