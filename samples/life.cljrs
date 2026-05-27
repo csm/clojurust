@@ -1,0 +1,74 @@
+;; Conway's Game of Life — bump-allocator showcase.
+;;
+;; Why this is an excellent bump-allocator candidate:
+;;
+;;   For every live cell we materialise 8 [row col] neighbour vectors,
+;;   count the live ones, and immediately discard the list.  None of
+;;   those vectors escape their call site, so the escape analyser can
+;;   region-allocate them.  With the default settings (~600 live cells,
+;;   150 generations) roughly 650 000 tiny coordinate vectors are
+;;   created; the bump allocator reclaims them in bulk at the end of
+;;   each step rather than freeing them one-by-one through the GC.
+
+(ns life)
+
+(defn neighbours
+  "Return the 8 neighbours of cell [r c] as a vector of coordinate pairs.
+   Each pair is a 2-element vector — prime bump-allocator material."
+  [cell]
+  (let [r  (first cell)
+        c  (second cell)
+        r- (dec r) r+ (inc r)
+        c- (dec c) c+ (inc c)]
+    [[r- c-] [r- c] [r- c+]
+     [r  c-]        [r  c+]
+     [r+ c-] [r+ c] [r+ c+]]))
+
+(defn live-neighbour-count
+  "Count live neighbours of cell in board.
+   The intermediate filtered sequence does not escape this call."
+  [board cell]
+  (count (filter board (neighbours cell))))
+
+(defn step
+  "Advance board one generation.
+   candidates covers every cell that could possibly change state."
+  [board]
+  (let [candidates (into #{} (mapcat neighbours board))]
+    (into #{}
+          (filter (fn [cell]
+                    (let [n (live-neighbour-count board cell)]
+                      (if (board cell)
+                        (or (= n 2) (= n 3))   ; survival
+                        (= n 3))))             ; birth
+                  candidates))))
+
+(defn random-board
+  "Random initial configuration: n live cells placed in a w x h grid."
+  [n w h]
+  (into #{} (repeatedly n #(vector (rand-int h) (rand-int w)))))
+
+(defn simulate
+  "Run board for gens generations; return final live-cell count."
+  [board gens]
+  (loop [b board
+         g 0]
+    (if (= g gens)
+      (count b)
+      (recur (step b) (inc g)))))
+
+(defn -main [& args]
+  (let [w    (int (or (first args)     "80"))
+        h    (int (or (second args)    "40"))
+        n    (int (or (nth args 2 nil) "600"))
+        gens (int (or (nth args 3 nil) "150"))]
+    (println "Game of Life:" w "x" h "grid," n "starting cells," gens "generations")
+    (let [board (random-board n w h)
+          start (nanotime)
+          pop   (simulate board gens)
+          end   (nanotime)]
+      (println "Final population:" pop)
+      (println "Time (ms):" (/ (- end start) 1e6)))))
+
+; cljrs doesn't recognise -main yet, fire it directly
+(-main)
