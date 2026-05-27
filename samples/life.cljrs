@@ -46,7 +46,7 @@
 (defn random-board
   "Random initial configuration: n live cells placed in a w x h grid."
   [n w h]
-  (into #{} (repeatedly n #(vector (rand-int h) (rand-int w)))))
+  (into #{} (repeatedly n (fn [] [(rand-int h) (rand-int w)]))))
 
 (defn simulate
   "Run board for gens generations; return final live-cell count."
@@ -62,12 +62,11 @@
         h    (int (or (second args)    "40"))
         n    (int (or (nth args 2 nil) "600"))
         gens (int (or (nth args 3 nil) "150"))]
-    (println "Game of Life:" w "x" h "grid," n "starting cells," gens "generations")
-    (let [board (random-board n w h)
-          start (nanotime)
-          pop   (simulate board gens)
-          end   (nanotime)]
-      (println "Final population:" pop)
+    (println "Game of Life" w "x" h "grid," n "cells," gens "generations")
+    (let [start  (nanotime)
+          result (simulate (random-board n w h) gens)
+          end    (nanotime)]
+      (println "Final population:" result)
       (println "Time (ms):" (/ (- end start) 1e6)))))
 
 ; cljrs doesn't recognise -main yet, fire it directly
