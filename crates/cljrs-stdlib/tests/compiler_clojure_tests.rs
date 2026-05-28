@@ -1,10 +1,15 @@
 //! Runs the Clojure-side `clojure.test` suites for the namespaces in
 //! `cljrs.compiler.*` against the embedded compiler sources.
 //!
-//! Each test file at `test/cljrs/compiler/<name>_test.cljrs` is required
+//! Each test file at `cljrs-ir/test/cljrs/compiler/<name>_test.cljrs` is required
 //! through the cljrs evaluator, then `(clojure.test/run-tests …)` is invoked
 //! and its `:fail` / `:error` counters are checked.  A non-zero count fails
 //! the Rust test.
+//!
+//! These tests live in `cljrs-stdlib` rather than `cljrs-ir` because they
+//! need the full eval stack (`cljrs-eval`, `cljrs-stdlib`), and putting them
+//! in `cljrs-ir` would create a dev-dependency cycle:
+//!   cljrs-ir --(dev)--> cljrs-eval --(dep)--> cljrs-ir
 
 use std::path::PathBuf;
 
@@ -49,7 +54,8 @@ fn extract_counter(map: &Value, key: &str) -> i64 {
 #[test]
 fn run_clojure_compiler_tests() {
     // Source path so `(require 'cljrs.compiler.ir-test)` finds the test files.
-    let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test");
+    // The Clojure test sources live in the cljrs-ir crate tree.
+    let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cljrs-ir/test");
     assert!(
         test_dir.is_dir(),
         "test dir not found: {}",
