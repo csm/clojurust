@@ -26,54 +26,15 @@ impl AsyncRuntime for AsyncRuntimeImpl {
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
-        // Spin-poll: yield the CPU between attempts.
-        loop {
-            if let Some(val) = ch.try_take() {
-                return Ok(val);
-            }
-            std::thread::yield_now();
-        }
+        Ok(ch.take_blocking())
     }
 
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()> {
         let ch = downcast_channel(&chan)?;
-        if ch.capacity() == 0 {
-            // Rendezvous: offer and spin until a taker picks it up.
-            use crate::channel::RvOffer;
-            loop {
-                match ch.rv_offer(&val) {
-                    RvOffer::Offered(token) => {
-                        // Wait until the token is consumed.
-                        loop {
-                            use crate::channel::RvStatus;
-                            match ch.rv_status(token) {
-                                RvStatus::Taken => return Ok(()),
-                                RvStatus::ClosedUntaken => {
-                                    return Err(EvalError::Runtime(
-                                        "chan-put: channel closed before value was taken".into(),
-                                    ));
-                                }
-                                RvStatus::Waiting => std::thread::yield_now(),
-                            }
-                        }
-                    }
-                    RvOffer::Full => std::thread::yield_now(),
-                    RvOffer::Closed => {
-                        return Err(EvalError::Runtime("chan-put: channel is closed".into()));
-                    }
-                }
-            }
+        if ch.put_blocking(val) {
+            Ok(())
         } else {
-            // Buffered: spin until there is room.
-            loop {
-                match ch.try_put_buffered(&val) {
-                    Some(true) => return Ok(()),
-                    Some(false) => {
-                        return Err(EvalError::Runtime("chan-put: channel is closed".into()));
-                    }
-                    None => std::thread::yield_now(),
-                }
-            }
+            Err(EvalError::Runtime("chan-put: channel is closed".into()))
         }
     }
 }

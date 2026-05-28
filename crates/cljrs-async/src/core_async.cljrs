@@ -2,8 +2,8 @@
 ;;
 ;; Native primitives (timeout, alts, chan, take!, put!, close!, poll!, offer!,
 ;; async-spawn, join-all, thread-call, onto-chan!, to-chan!, mult, tap!,
-;; untap!, untap-all!) are registered from Rust before this file is evaluated.
-;; This file adds the macros and higher-level functions built on top of them.
+;; untap!, untap-all!, <!!, >!!) are registered from Rust before this file is
+;; evaluated. This file adds the macros and higher-level functions built on top.
 
 ;; (go body...)
 ;;

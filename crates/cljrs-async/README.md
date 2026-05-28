@@ -39,6 +39,11 @@ Done (Phases A–G):
   called before each `yield_now().await` in `await_value`. Background GC-service task spawned
   by `init()`. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
   `run_async_fn`, and awaited futures/promises in `await_value`.
+- Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
+  contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
+  remain non-deadlocking when called from the LocalSet executor thread). Errors with a
+  clear message if called inside an `^:async` function body. `CljChannel` condvars also
+  replace the previous spin-poll in the IR interpreter's `ChanTake`/`ChanPut` opcodes.
 
 ### Channel model
 
@@ -62,12 +67,8 @@ inside an async context:
 ```
 
 `poll!` (non-blocking take → value or `nil`) and `offer!` (non-blocking buffered put →
-`true`/`false`) act synchronously and return immediately. Blocking sync-context variants
-(`take!!`/`put!!`) are deferred along with the top-level blocking bridge (see below).
-
-Not yet implemented (later phases):
-
-- Phase G+: `take!!`/`put!!` (blocking sync ops), `pipeline`, IR support.
+`true`/`false`) act synchronously and return immediately. `<!!` and `>!!` are the
+blocking sync-context equivalents, suitable for REPL use and tests (see Phase H above).
 
 ### `await` and the single-thread executor
 
@@ -86,9 +87,9 @@ blocking bridge is a later phase.
 | `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
-| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!` |
+| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into` |
-| `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, and Phase F utilities |
+| `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 
 ## Public API
 
@@ -115,6 +116,12 @@ pub mod channel {
     impl CljChannel {
         /// Create a channel. `capacity == 0` is an unbuffered rendezvous channel.
         pub fn new(capacity: usize) -> Self;
+        /// Block the calling OS thread until a value is available (or channel closes → nil).
+        /// Uses Condvar with a 1 ms timeout to avoid deadlock on the LocalSet thread.
+        pub fn take_blocking(&self) -> Value;
+        /// Block the calling OS thread until the value is accepted or the channel closes.
+        /// Returns `true` on success, `false` if the channel was closed.
+        pub fn put_blocking(&self, v: Value) -> bool;
     }
 
     /// A broadcast multiplexer. `(mult src-ch)` creates one; values from `src-ch`

@@ -702,3 +702,145 @@ fn loop_with_await_inside_async_fn() {
         assert_eq!(r, Value::Long(15));
     });
 }
+
+// ── Phase H: <!! / >!! — blocking sync-context channel ops ───────────────────
+
+const REQUIRE_BLOCKING: &str = "(require '[clojure.core.async :refer \
+    [chan put! close! offer! <!! >!!]])";
+
+#[test]
+fn blocking_take_from_pre_filled_buffered_channel() {
+    // Value already in buffer; <!! returns immediately without parking.
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(offer! ch 42)", &mut env);
+        let r = eval_sync("(<!! ch)", &mut env);
+        assert_eq!(r, Value::Long(42));
+    });
+}
+
+#[test]
+fn blocking_take_of_closed_empty_channel_returns_nil() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(close! ch)", &mut env);
+        let r = eval_sync("(<!! ch)", &mut env);
+        assert_eq!(r, Value::Nil);
+    });
+}
+
+#[test]
+fn blocking_take_drains_value_buffered_by_go() {
+    // go block puts a value; we yield once to let it run, then <!! finds the
+    // buffered value and returns without actually parking.
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(
+            "(require '[clojure.core.async :refer [chan put! <!! go]])",
+            &mut env,
+        );
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(go (await (put! ch 99)))", &mut env);
+        tokio::task::yield_now().await; // let the go block fill the buffer
+        let r = eval_sync("(<!! ch)", &mut env);
+        assert_eq!(r, Value::Long(99));
+    });
+}
+
+#[test]
+fn blocking_put_into_buffered_channel() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 2))", &mut env);
+        let put_r = eval_sync("(>!! ch :ping)", &mut env);
+        assert_eq!(put_r, Value::Bool(true));
+        let take_r = eval_sync("(<!! ch)", &mut env);
+        assert!(
+            matches!(take_r, Value::Keyword(_)),
+            "expected :ping keyword, got {take_r:?}"
+        );
+    });
+}
+
+#[test]
+fn blocking_put_on_closed_channel_returns_false() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(close! ch)", &mut env);
+        let r = eval_sync("(>!! ch 1)", &mut env);
+        assert_eq!(r, Value::Bool(false));
+    });
+}
+
+#[test]
+fn blocking_take_multiple_values_from_seeded_channel() {
+    // to-chan! seeds a buffered channel; <!! drains it synchronously.
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(
+            "(require '[clojure.core.async :refer [to-chan! <!!]])",
+            &mut env,
+        );
+        // to-chan! seeds in a background task; yield so the task runs first.
+        eval_sync("(def ch (to-chan! [10 20 30]))", &mut env);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let a = eval_sync("(<!! ch)", &mut env);
+        let b = eval_sync("(<!! ch)", &mut env);
+        let c = eval_sync("(<!! ch)", &mut env);
+        let d = eval_sync("(<!! ch)", &mut env); // closed + drained → nil
+        assert_eq!(a, Value::Long(10));
+        assert_eq!(b, Value::Long(20));
+        assert_eq!(c, Value::Long(30));
+        assert_eq!(d, Value::Nil);
+    });
+}
+
+#[test]
+fn take_blocking_errors_inside_async_fn() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(defn ^:async bad [] (<!! ch))", &mut env);
+        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
+        assert!(r.is_err());
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("async"),
+            "error should mention async context: {msg}"
+        );
+    });
+}
+
+#[test]
+fn put_blocking_errors_inside_async_fn() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_BLOCKING, &mut env);
+        eval_sync("(def ch (chan 1))", &mut env);
+        eval_sync("(defn ^:async bad [] (>!! ch 1))", &mut env);
+        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
+        assert!(r.is_err());
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("async"),
+            "error should mention async context: {msg}"
+        );
+    });
+}
