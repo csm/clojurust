@@ -63,17 +63,13 @@ fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
 /// executes, making it safe to scan thread-local root stacks for all suspended tasks.
 ///
 /// Must be called from within a Tokio `LocalSet` context (e.g., from `init`).
+/// On `wasm32` this is a no-op — see below.
 pub(crate) fn spawn_gc_service() {
-    // On native targets, `spawn_local` panics when called outside a `LocalSet`
-    // context (e.g., in unit tests that call `init()` before `block_on_local`).
-    // `catch_unwind` silences that panic so the rest of init() still runs; the
-    // GC service simply won't run, which is acceptable — safepoints inside
-    // `await_value` still fire whenever code runs inside a LocalSet.
-    //
-    // On wasm32 with wasm-bindgen, panics become JS exceptions that
-    // `catch_unwind` *cannot* catch.  The WASM REPL therefore must only call
-    // `spawn_gc_service` (transitively via `init`) from inside a LocalSet
-    // context — the `Repl` constructor does this via its persistent pump.
+    // On native, `spawn_local` panics when called outside a `LocalSet` context
+    // (e.g. in unit tests that call `init()` before `block_on_local`).
+    // `catch_unwind` silences that panic; the service simply won't run, which is
+    // fine — safepoints inside `await_value` still fire whenever code runs in a
+    // LocalSet.
     #[cfg(not(target_arch = "wasm32"))]
     let _ = std::panic::catch_unwind(|| {
         tokio::task::spawn_local(async {
@@ -83,11 +79,13 @@ pub(crate) fn spawn_gc_service() {
             }
         });
     });
+
+    // On wasm32, tokio's yield_now() only cooperates with the LocalSet scheduler
+    // — it does NOT yield back to the browser event loop.  A `loop { yield_now();
+    // gc(); }` task therefore generates an endless chain of microtasks that
+    // starves rendering and bogs down the browser.  Skip the service entirely;
+    // GC safepoints in `await_value` fire at every real async suspension point,
+    // which is sufficient for correctness.
     #[cfg(target_arch = "wasm32")]
-    tokio::task::spawn_local(async {
-        loop {
-            tokio::task::yield_now().await;
-            cljrs_env::gc_roots::async_gc_collect();
-        }
-    });
+    let _ = ();
 }
