@@ -23,7 +23,10 @@ use cljrs_interp::eval::{eval, is_special_form};
 use cljrs_interp::macros::macroexpand;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{CljxFnArity, CljxFuture, FutureState, Value};
+use cljrs_value::value::SetValue;
+use cljrs_value::{
+    CljxFnArity, CljxFuture, FutureState, MapValue, PersistentHashSet, PersistentVector, Value,
+};
 
 /// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
 /// task settles on completion. The single delivery point for every async
@@ -112,10 +115,48 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
 
 /// Asynchronously evaluate a single form.
 pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
-    // Only list forms can contain control flow or an `await`; everything else
-    // is a leaf the sync evaluator handles directly.
-    if !matches!(form.kind, FormKind::List(_)) {
-        return eval(form, env);
+    // Collection literals may contain `await` sub-expressions (e.g. the
+    // return value of a ^:async fn is `[(await x) (await y)]`). Evaluate
+    // each element with eval_async so awaits yield cooperatively instead of
+    // blocking the LocalSet thread via the sync condvar path.
+    match &form.kind {
+        FormKind::Vector(elems) => {
+            let elems = elems.clone();
+            let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
+            for f in &elems {
+                vals.push(Box::pin(eval_async(f, env)).await?);
+            }
+            return Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))));
+        }
+        FormKind::Map(elems) => {
+            if elems.len() % 2 != 0 {
+                return Err(EvalError::Runtime(
+                    "map literal must have an even number of forms".into(),
+                ));
+            }
+            let elems = elems.clone();
+            let mut pairs: Vec<Value> = Vec::with_capacity(elems.len());
+            for f in &elems {
+                pairs.push(Box::pin(eval_async(f, env)).await?);
+            }
+            let kv_pairs: Vec<(Value, Value)> = pairs
+                .chunks(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect();
+            return Ok(Value::Map(MapValue::from_pairs(kv_pairs)));
+        }
+        FormKind::Set(elems) => {
+            let elems = elems.clone();
+            let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
+            for f in &elems {
+                vals.push(Box::pin(eval_async(f, env)).await?);
+            }
+            return Ok(Value::Set(SetValue::Hash(GcPtr::new(
+                PersistentHashSet::from_iter(vals),
+            ))));
+        }
+        FormKind::List(_) => {} // fall through to list handling below
+        _ => return eval(form, env),
     }
 
     // Reduce control-flow macros (when, cond, ->, …) to their special-form core
