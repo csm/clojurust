@@ -46,6 +46,9 @@ jobs:
           CLJRS_GC_STATS: "-"
         run: cargo run -p cljrs compile -o life-sample samples/life.cljrs && ./life-sample
 
+      - name: core.async sample (CSP showcase)
+        run: cargo run -p cljrs compile -o async-sample samples/core_async.cljrs && ./async-sample
+
   wasm:
     name: WASM build
     runs-on: ubuntu-latest

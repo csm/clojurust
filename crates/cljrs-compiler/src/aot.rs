@@ -408,6 +408,10 @@ pub fn compile_file(
     } else {
         cljrs_stdlib::standard_env_with_paths(src_dirs.to_vec())
     };
+    // Register clojure.core.async so that (require '[clojure.core.async ...])
+    // and the `go`/`alt` macros resolve during macro-expansion. The GC
+    // service is silently skipped when there is no LocalSet context.
+    cljrs_async::init(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -585,17 +589,21 @@ fn is_interpreter_only_sym(s: &str) -> bool {
 }
 
 /// Check the macro-expanded form for constructs that the AOT compiler
-/// cannot handle (e.g. alter-meta!, vary-meta). This recurses
+/// cannot handle (e.g. alter-meta!, vary-meta, await). This recurses
 /// into the form tree so that e.g. `(do (def x ...) (alter-meta! ...))` is caught.
+/// `await` and `async-spawn` are async special forms only the interpreter understands;
+/// any top-level form whose expansion tree contains them must stay interpreted.
 fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
     use cljrs_reader::form::FormKind;
     match &form.kind {
         FormKind::List(parts) => {
             if let Some(head) = parts.first()
                 && let FormKind::Symbol(s) = &head.kind
-                && is_interpreter_only_sym(s)
             {
-                return true;
+                let base = s.rsplit('/').next().unwrap_or(s.as_str());
+                if is_interpreter_only_sym(s.as_str()) || base == "await" {
+                    return true;
+                }
             }
             parts.iter().any(expanded_needs_interpreter)
         }
@@ -740,6 +748,8 @@ cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
 cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
+cljrs-async    = {{ path = "{ws}/crates/cljrs-async" }}
+tokio          = {{ version = "1", features = ["rt", "time"] }}
 {native_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
@@ -816,9 +826,19 @@ cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
                     .collect();
                 let call = format!("(-main {})", escaped.join(" "));
                 if let Ok(fs) = cljrs_reader::Parser::new(call, "<main>".to_string()).parse_all() {
-                    if let Err(e) = cljrs_eval::eval(&fs[0], &mut env) {
-                        eprintln!("cljrs: error in -main: {e:?}");
-                        std::process::exit(1);
+                    match cljrs_eval::eval(&fs[0], &mut env) {
+                        Ok(main_result) => {
+                            // If -main is ^:async it returns a Future; await it on the
+                            // current LocalSet so all spawned go-blocks drain to completion.
+                            if let Err(e) = cljrs_async::eval_async::await_value(main_result).await {
+                                eprintln!("cljrs: error in -main: {e:?}");
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("cljrs: error in -main: {e:?}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -869,7 +889,7 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 }}
 
-fn run() {{
+async fn run() {{
     // Parse environment -X flags.
     cljrs_logging::set_feature_levels_from_env().unwrap();
 
@@ -879,6 +899,9 @@ fn run() {{
     // Initialize the standard environment so that rt_call and other
     // runtime bridge functions can look up builtins.
     let globals = cljrs_stdlib::standard_env();
+
+    // Register the async runtime (clojure.core.async, ^:async dispatch, await).
+    cljrs_async::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -904,7 +927,17 @@ fn main() {{
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
     let thread = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
-        .spawn(run)
+        .spawn(|| {{
+            // Drive all async tasks (go blocks, ^:async fns, channels) on a
+            // single-threaded Tokio LocalSet so GcPtr<!Send> values stay on
+            // one OS thread throughout execution.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("failed to build Tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, run());
+        }})
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {{
         std::panic::resume_unwind(e);

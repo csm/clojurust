@@ -24,7 +24,7 @@
         futs     (vec (map first pairs))
         handlers (vec (map second pairs))
         r        (gensym "alt_r__")]
-    (list 'let (vector r (list 'await (list 'alts futs)))
+    (list 'let (vector r (list 'await (list 'clojure.core.async/alts futs)))
           (list (list 'nth handlers (list 'second r))
                 (list 'first r)))))
 

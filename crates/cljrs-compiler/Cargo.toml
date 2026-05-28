@@ -11,6 +11,7 @@ aot_full_test = []
 no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-stdlib/no-gc"]
 
 [dependencies]
+cljrs-async    = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-types    = { workspace = true }

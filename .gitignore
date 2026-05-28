@@ -3,6 +3,7 @@
 .cljrs-aot-test-harness
 /test-suite
 /graph-sample
+/async-sample
 **/.DS_Store
 # AOT test/debug artifacts
 /1
