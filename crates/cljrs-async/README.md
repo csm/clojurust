@@ -107,6 +107,11 @@ pub mod eval_async {
     /// function-call arguments with yielding; delegates other forms to the
     /// synchronous evaluator.
     pub async fn eval_async(form: &Form, env: &mut Env) -> Result<Value, EvalError>;
+
+    /// Cooperatively await a Clojure value inside a LocalSet context.
+    /// Futures and promises yield until resolved; any other value is returned as-is.
+    /// Used by the WASM REPL for implicit top-level await.
+    pub async fn await_value(val: Value) -> Result<Value, EvalError>;
 }
 
 pub mod channel {
@@ -135,8 +140,8 @@ pub mod channel {
 
 ## Integration
 
-The `cljrs` CLI links this crate when built with the `async` feature (on by default).
-Rust embedders add `cljrs-async` to their `Cargo.toml` and call `init` manually:
+**Native (CLI):** The `cljrs` CLI links this crate when built with the `async` feature (on by default).
+Rust embedders call `init` from within a Tokio `LocalSet` context:
 
 ```rust
 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -147,3 +152,12 @@ rt.block_on(local.run_until(async {
     // ... eval code ...
 }));
 ```
+
+**WASM (browser REPL):** `init` may be called before a `LocalSet` context exists
+(e.g. in `Repl::new()`); `spawn_gc_service` silently no-ops via `catch_unwind` in that
+case. Re-call `init` from inside a `LocalSet::run_until` block to start the GC service.
+`timeout` uses `gloo_timers::future::sleep` on `wasm32` instead of `tokio::time::sleep`.
+
+**Timer portability:** On `wasm32` the `time` feature of tokio is present but
+`platform_sleep` (used internally by `timeout`) delegates to `gloo-timers` so that
+the browser's `setTimeout` is used instead of a non-functional OS-level clock.

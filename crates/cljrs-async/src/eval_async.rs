@@ -161,7 +161,7 @@ async fn eval_await_async(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Cooperatively await a Clojure value. Futures and promises yield to the
 /// executor until resolved; any other value is returned as-is.
-pub(crate) async fn await_value(val: Value) -> EvalResult {
+pub async fn await_value(val: Value) -> EvalResult {
     match val {
         Value::Future(f) => {
             // Root the future across GC cycles: the alloc frame of the scope that
