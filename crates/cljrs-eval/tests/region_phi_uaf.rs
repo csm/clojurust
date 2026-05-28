@@ -60,8 +60,8 @@
 use std::sync::Arc;
 
 use cljrs_eval::{Env, ir_interp::interpret_ir};
-use cljrs_ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
 use cljrs_interp::standard_env_minimal;
+use cljrs_ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
 use cljrs_value::Value;
 
 /// Build the IR sketched in the module docs.
