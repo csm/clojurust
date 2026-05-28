@@ -106,17 +106,16 @@ impl Repl {
 
         local
             .run_until(async move {
-                let forms =
-                    match Parser::new(input, "<repl>".to_string()).parse_all() {
-                        Ok(f) => f,
-                        Err(e) => {
-                            return EvalResult {
-                                output: String::new(),
-                                result: format!("Read error: {e}"),
-                                is_error: true,
-                            };
-                        }
-                    };
+                let forms = match Parser::new(input, "<repl>".to_string()).parse_all() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return EvalResult {
+                            output: String::new(),
+                            result: format!("Read error: {e}"),
+                            is_error: true,
+                        };
+                    }
+                };
 
                 if forms.is_empty() {
                     return EvalResult {
