@@ -72,9 +72,21 @@ fn builtin_timeout(args: &[Value]) -> ValueResult<Value> {
         }
     };
     Ok(spawn_future(async move {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        platform_sleep(ms).await;
         Ok(Value::Nil)
     }))
+}
+
+/// Sleep for `ms` milliseconds using the best available platform timer.
+#[cfg(not(target_arch = "wasm32"))]
+async fn platform_sleep(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// On WASM use the browser's timer instead of tokio's OS-level clock.
+#[cfg(target_arch = "wasm32")]
+async fn platform_sleep(ms: u64) {
+    gloo_timers::future::sleep(Duration::from_millis(ms)).await;
 }
 
 /// `(alts coll)` — a Future delivering `[value index]` for whichever future in
