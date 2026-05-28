@@ -18,7 +18,8 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_value::{NativeObject, NativeObjectBox, Value};
@@ -64,6 +65,13 @@ struct ChannelState {
 #[derive(Debug)]
 pub struct CljChannel {
     state: Mutex<ChannelState>,
+    /// Fires when a value is added to the queue or the channel closes.
+    /// Wakes blocking takers waiting for data.
+    not_empty: Condvar,
+    /// Fires when a value is removed from the queue or the channel closes.
+    /// Wakes blocking putters waiting for space, and rendezvous putters waiting
+    /// for their offered value to be consumed.
+    not_full: Condvar,
 }
 
 impl CljChannel {
@@ -76,6 +84,8 @@ impl CljChannel {
                 closed: false,
                 taken: 0,
             }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
         }
     }
 
@@ -88,11 +98,9 @@ impl CljChannel {
     /// buffered values and then observe `nil`.
     pub(crate) fn close(&self) {
         self.state.lock().unwrap().closed = true;
-    }
-
-    /// Return the buffered capacity (0 = rendezvous/unbuffered).
-    pub(crate) fn capacity(&self) -> usize {
-        self.state.lock().unwrap().capacity
+        // Wake any threads blocking in take_blocking / put_blocking.
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
     }
 
     /// Non-blocking take.
@@ -104,6 +112,8 @@ impl CljChannel {
         let mut st = self.state.lock().unwrap();
         if let Some(v) = st.queue.pop_front() {
             st.taken = st.taken.wrapping_add(1);
+            drop(st);
+            self.not_full.notify_all();
             return Some(v);
         }
         if st.closed {
@@ -124,6 +134,8 @@ impl CljChannel {
         }
         if st.queue.len() < st.capacity {
             st.queue.push_back(v.clone());
+            drop(st);
+            self.not_empty.notify_all();
             return Some(true);
         }
         None
@@ -138,9 +150,106 @@ impl CljChannel {
         if st.queue.is_empty() {
             let token = st.taken;
             st.queue.push_back(v.clone());
+            drop(st);
+            self.not_empty.notify_all();
             RvOffer::Offered(token)
         } else {
             RvOffer::Full
+        }
+    }
+
+    /// Blocking take for synchronous (non-async) callers.
+    ///
+    /// Parks the calling OS thread on a `Condvar` until a value is available,
+    /// the channel is closed, or the 1 ms poll interval elapses (so the caller
+    /// remains responsive even when invoked from the LocalSet executor thread).
+    /// Returns `Value::Nil` on a closed, drained channel.
+    pub fn take_blocking(&self) -> Value {
+        let mut guard = self.state.lock().unwrap();
+        loop {
+            if let Some(v) = guard.queue.pop_front() {
+                guard.taken = guard.taken.wrapping_add(1);
+                drop(guard);
+                self.not_full.notify_all();
+                return v;
+            }
+            if guard.closed {
+                return Value::Nil;
+            }
+            // 1 ms timeout keeps the loop responsive on the LocalSet thread where
+            // notify_all may never fire (async producers can't run while blocked).
+            let (g, _) = self
+                .not_empty
+                .wait_timeout(guard, Duration::from_millis(1))
+                .unwrap();
+            guard = g;
+        }
+    }
+
+    /// Blocking put for synchronous (non-async) callers.
+    ///
+    /// Parks the calling OS thread until the value is accepted (buffered or
+    /// handed off in a rendezvous) or the channel is closed.
+    /// Returns `true` on success, `false` if the channel was closed.
+    pub fn put_blocking(&self, v: Value) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let cap = guard.capacity;
+
+        if cap == 0 {
+            // Rendezvous: phase 1 — claim the single slot.
+            let token = loop {
+                if guard.closed {
+                    return false;
+                }
+                if guard.queue.is_empty() {
+                    let t = guard.taken;
+                    guard.queue.push_back(v.clone());
+                    drop(guard);
+                    self.not_empty.notify_all();
+                    break t;
+                }
+                let (g, _) = self
+                    .not_full
+                    .wait_timeout(guard, Duration::from_millis(1))
+                    .unwrap();
+                guard = g;
+            };
+            // Phase 2 — wait for a taker to consume our offered value.
+            guard = self.state.lock().unwrap();
+            loop {
+                if guard.taken != token {
+                    return true;
+                }
+                if guard.closed {
+                    guard.queue.pop_front(); // cancel pending offer
+                    drop(guard);
+                    self.not_full.notify_all();
+                    return false;
+                }
+                let (g, _) = self
+                    .not_full
+                    .wait_timeout(guard, Duration::from_millis(1))
+                    .unwrap();
+                guard = g;
+            }
+        } else {
+            // Buffered: wait for room.
+            loop {
+                if guard.closed {
+                    return false;
+                }
+                if guard.queue.len() < cap {
+                    guard.queue.push_back(v);
+                    drop(guard);
+                    self.not_empty.notify_all();
+                    return true;
+                }
+                let (g, _) = self
+                    .not_full
+                    .wait_timeout(guard, Duration::from_millis(1))
+                    .unwrap();
+                guard = g;
+            }
         }
     }
 

@@ -50,6 +50,9 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ("tap!", Arity::Variadic { min: 2 }, builtin_tap),
         ("untap!", Arity::Fixed(2), builtin_untap),
         ("untap-all!", Arity::Fixed(1), builtin_untap_all),
+        // Phase H: blocking sync-context ops
+        ("<!!",  Arity::Fixed(1), builtin_take_blocking),
+        (">!!",  Arity::Fixed(2), builtin_put_blocking),
     ];
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
@@ -231,6 +234,44 @@ fn builtin_offer(args: &[Value]) -> ValueResult<Value> {
         return Ok(Value::Bool(false));
     }
     Ok(Value::Bool(chan.try_put_buffered(&val).unwrap_or(false)))
+}
+
+// ── Phase H: blocking sync-context channel ops (<!! / >!!) ──────────────────
+
+/// `(<!! ch)` — blocking take from a synchronous (non-async) context.
+///
+/// Parks the calling OS thread until a value is available on `ch`, or returns
+/// `nil` if `ch` is closed and drained. Must **not** be called from inside an
+/// `^:async` function — use `(await (take! ch))` there instead.
+fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
+    if cljrs_env::callback::current_is_async() {
+        return Err(ValueError::Other(
+            "<!! (blocking take) must not be called inside an ^:async function; \
+             use (await (take! ch)) instead"
+                .into(),
+        ));
+    }
+    let ch = channel_arg(args)?;
+    Ok(chan_ref(ch.get()).take_blocking())
+}
+
+/// `(>!! ch val)` — blocking put from a synchronous (non-async) context.
+///
+/// Parks the calling OS thread until `val` is accepted by `ch` (buffered or
+/// handed off in a rendezvous). Returns `true` on success, `false` if `ch` is
+/// closed. Must **not** be called from inside an `^:async` function — use
+/// `(await (put! ch val))` there instead.
+fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
+    if cljrs_env::callback::current_is_async() {
+        return Err(ValueError::Other(
+            ">!! (blocking put) must not be called inside an ^:async function; \
+             use (await (put! ch val)) instead"
+                .into(),
+        ));
+    }
+    let ch = channel_arg(args)?;
+    let val = args.get(1).cloned().unwrap_or(Value::Nil);
+    Ok(Value::Bool(chan_ref(ch.get()).put_blocking(val)))
 }
 
 /// `(async-spawn thunk)` — run a zero-arg function as an async task on the
