@@ -51,8 +51,8 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ("untap!", Arity::Fixed(2), builtin_untap),
         ("untap-all!", Arity::Fixed(1), builtin_untap_all),
         // Phase H: blocking sync-context ops
-        ("<!!",  Arity::Fixed(1), builtin_take_blocking),
-        (">!!",  Arity::Fixed(2), builtin_put_blocking),
+        ("<!!", Arity::Fixed(1), builtin_take_blocking),
+        (">!!", Arity::Fixed(2), builtin_put_blocking),
     ];
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
