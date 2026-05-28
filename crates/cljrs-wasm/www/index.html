@@ -141,8 +141,9 @@
 </header>
 
 <div id="output">
-  <div class="welcome">; clojurust browser REPL — pure Clojure, tree-walking interpreter</div>
+  <div class="welcome">; clojurust browser REPL — Clojure + clojure.core.async</div>
   <div class="welcome">; Enter expressions and press Enter (Shift+Enter for newline)</div>
+  <div class="welcome">; Async ops work natively: (await (timeout 1000)), (go ...), (chan), etc.</div>
   <div class="welcome">; Use ↑ / ↓ to navigate history</div>
 </div>
 
@@ -222,7 +223,9 @@
   }
 
   // ── Evaluation ─────────────────────────────────────────────────────────────
-  function evalInput(text) {
+  // repl.eval() is async (returns a Promise); disable input while in-flight so
+  // concurrent submissions don't race on the shared LocalSet.
+  async function evalInput(text) {
     const trimmed = text.trim();
     if (!trimmed) return;
 
@@ -233,8 +236,21 @@
     historyIdx = -1;
     liveInput = '';
 
-    const out = repl.eval(trimmed);
-    appendEntry(trimmed, out.output, out.result, out.is_error);
+    inputEl.disabled = true;
+    statusEl.textContent = 'Evaluating…';
+    statusEl.className = 'status loading';
+
+    try {
+      const out = await repl.eval(trimmed);
+      appendEntry(trimmed, out.output, out.result, out.is_error);
+    } catch (err) {
+      appendEntry(trimmed, '', String(err), true);
+    } finally {
+      inputEl.disabled = false;
+      statusEl.textContent = 'Ready';
+      statusEl.className = 'status';
+      inputEl.focus();
+    }
   }
 
   // ── Auto-resize textarea ───────────────────────────────────────────────────
@@ -261,15 +277,17 @@
   }
 
   // ── Key handling ──────────────────────────────────────────────────────────
-  inputEl.addEventListener('keydown', (e) => {
+  inputEl.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       const text = inputEl.value;
       // Submit if balanced or empty (so the user can submit intentionally).
       if (!text.trim() || isBalanced(text)) {
-        evalInput(text);
+        // Clear immediately so the user sees the form was accepted; evalInput
+        // then disables the textarea for the duration of the async eval.
         inputEl.value = '';
         resize();
+        await evalInput(text);
       } else {
         // Unbalanced — insert a newline so the user can keep typing.
         const pos = inputEl.selectionStart;
