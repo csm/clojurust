@@ -66,25 +66,21 @@ impl Repl {
         let globals = cljrs_interp::standard_env_minimal(None, None, None);
         cljrs_stdlib::register(&globals);
 
-        // init outside a LocalSet context: namespace and runtime hook are
-        // registered; spawn_gc_service silently no-ops (catch_unwind inside).
-        // The GC service is instead spawned on the first eval via the LocalSet.
-        cljrs_async::init(&globals);
-
         let local = Rc::new(LocalSet::new());
 
-        // Pump the LocalSet indefinitely from the browser's microtask queue so
-        // that goroutines and channel tasks make progress even between evals.
-        // The init call inside also fires spawn_gc_service in the correct
-        // LocalSet context.
+        // Schedule a persistent LocalSet pump on the browser's microtask queue.
+        // All of cljrs_async::init() — including spawn_gc_service() which calls
+        // tokio::task::spawn_local — runs from *inside* the LocalSet context here.
+        // We must NOT call init() before this block: on WASM, panics are JS
+        // exceptions that std::panic::catch_unwind cannot catch, so calling
+        // spawn_local outside a LocalSet would propagate an exception to the JS
+        // caller and show "failed" in the UI.
         {
             let local2 = local.clone();
             let globals2 = globals.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 local2
                     .run_until(async move {
-                        // Re-run init from within the LocalSet so spawn_gc_service
-                        // actually succeeds (idempotent for namespace loading).
                         cljrs_async::init(&globals2);
                         std::future::pending::<()>().await
                     })

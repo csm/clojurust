@@ -64,11 +64,17 @@ fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
 ///
 /// Must be called from within a Tokio `LocalSet` context (e.g., from `init`).
 pub(crate) fn spawn_gc_service() {
-    // `spawn_local` panics when called outside a `LocalSet` context (e.g., in
-    // unit tests that call `init()` before entering `block_on_local`).  In that
-    // case the GC service simply won't run, which is fine: the service is a
-    // best-effort background collector; the safepoints inside `await_value`
-    // still fire whenever the code is actually running inside a LocalSet.
+    // On native targets, `spawn_local` panics when called outside a `LocalSet`
+    // context (e.g., in unit tests that call `init()` before `block_on_local`).
+    // `catch_unwind` silences that panic so the rest of init() still runs; the
+    // GC service simply won't run, which is acceptable — safepoints inside
+    // `await_value` still fire whenever code runs inside a LocalSet.
+    //
+    // On wasm32 with wasm-bindgen, panics become JS exceptions that
+    // `catch_unwind` *cannot* catch.  The WASM REPL therefore must only call
+    // `spawn_gc_service` (transitively via `init`) from inside a LocalSet
+    // context — the `Repl` constructor does this via its persistent pump.
+    #[cfg(not(target_arch = "wasm32"))]
     let _ = std::panic::catch_unwind(|| {
         tokio::task::spawn_local(async {
             loop {
@@ -76,5 +82,12 @@ pub(crate) fn spawn_gc_service() {
                 cljrs_env::gc_roots::async_gc_collect();
             }
         });
+    });
+    #[cfg(target_arch = "wasm32")]
+    tokio::task::spawn_local(async {
+        loop {
+            tokio::task::yield_now().await;
+            cljrs_env::gc_roots::async_gc_collect();
+        }
     });
 }
