@@ -18,7 +18,7 @@ no-gc = [
     "cljrs-stdlib/no-gc",
 ]
 enable-rustyline = ["rustyline"]
-async = ["dep:cljrs-async", "dep:tokio"]
+async = ["dep:cljrs-async", "dep:cljrs-io", "dep:tokio"]
 
 [[bin]]
 name = "cljrs"
@@ -45,4 +45,5 @@ tracing = "0.1.44"
 rustyline   = { workspace = true, optional = true }
 libloading  = { workspace = true }
 cljrs-async = { workspace = true, optional = true }
+cljrs-io    = { workspace = true, optional = true }
 tokio       = { workspace = true, optional = true }

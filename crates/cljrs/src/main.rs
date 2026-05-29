@@ -461,7 +461,10 @@ fn setup_globals(
         apply_deps_config(&globals, &cwd);
     }
     #[cfg(feature = "async")]
-    cljrs_async::init(&globals);
+    {
+        cljrs_async::init(&globals);
+        cljrs_io::init(&globals);
+    }
     globals
 }
 

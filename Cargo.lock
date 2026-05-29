@@ -301,6 +301,7 @@ dependencies = [
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-interop",
+ "cljrs-io",
  "cljrs-ir-viz",
  "cljrs-logging",
  "cljrs-reader",
