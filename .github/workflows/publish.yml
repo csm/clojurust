@@ -65,12 +65,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -A
-          # Skip commit+tag+push if the tag already exists on the remote,
-          # making this step idempotent so re-runs of the same workflow job succeed.
+          # Always commit the version bump so cargo publish sees a clean tree.
+          # On a fresh re-run the files are re-edited from 0.1.0, so there will
+          # always be staged changes to commit.
+          git diff --cached --quiet || git commit -m "chore: release $VERSION"
+          # Only create and push the tag if it doesn't already exist on the remote,
+          # making retries safe after a partial publish failure.
           if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "Tag v$VERSION already exists on remote — skipping release commit"
+            echo "Tag v$VERSION already exists on remote — skipping tag push"
           else
-            git commit -m "chore: release $VERSION"
             git tag "v$VERSION"
             git push origin "v$VERSION"
           fi
