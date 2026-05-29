@@ -48,6 +48,9 @@ jobs:
         with:
           tool: cargo-release
 
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
       - name: Set crate versions
         run: |
           VERSION="${BASE_VERSION}.${{ github.run_number }}"
@@ -69,4 +72,28 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release publish --execute --no-confirm
+        run: |
+          # Build --exclude list for packages already live at this version.
+          # Makes the step idempotent so a retry after a partial failure is safe.
+          EXCLUDE=()
+          while IFS= read -r pkg; do
+            name="${pkg%%@*}"
+            ver="${pkg##*@}"
+            if curl -sf "https://crates.io/api/v1/crates/${name}/${ver}" \
+                 -H "User-Agent: clojurust-publish/1.0" | grep -q '"num"'; then
+              echo "Already published: ${name}@${ver} — skipping"
+              EXCLUDE+=(--exclude "${name}")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 \
+                     | jq -r '.packages[] | "\(.name)@\(.version)"')
+
+          # Use nightly cargo for -Zpublish-timeout, which extends the
+          # per-crate registry confirmation wait to 600 s.  Without this,
+          # a slow crates.io response causes "no packages ready to publish
+          # … 1 awaiting confirmation" (rust-lang/cargo#17028).
+          # --no-verify is safe here because CI already ran checks above.
+          cargo +nightly publish --workspace \
+            -Zpublish-timeout \
+            --config 'publish.timeout=600' \
+            --no-verify \
+            "${EXCLUDE[@]}"
