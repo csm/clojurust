@@ -102,45 +102,6 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     globals.register_builtin_source("clojure.zip", COLJURE_ZIP_SRC);
 }
 
-/// Prebuilt IR bundle for clojure.core (generated at build time).
-/// When the `prebuild-ir` feature is enabled, this contains serialized IR
-/// for all lowerable functions; otherwise it's an empty slice.
-#[cfg(feature = "prebuild-ir")]
-static PREBUILT_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_ir.bin"));
-
-/// Prebuilt IR bundle for the five cljrs.compiler.* namespaces.
-/// Loaded into the IR cache after ensure_compiler_loaded() populates the
-/// namespace vars so the compiler itself runs in IR mode on hot paths.
-#[cfg(feature = "prebuild-ir")]
-static PREBUILT_COMPILER_IR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compiler_ir.bin"));
-
-/// Load the prebuilt compiler IR bundle into the IR cache.
-///
-/// Called after `ensure_compiler_loaded` so that the compiler namespace vars
-/// (with their runtime `ir_arity_id`s) already exist in `globals`.
-/// `load_prebuilt_ir` matches bundle keys (`"ns/name:arity"`) to live arity
-/// objects and stores the pre-built IR in the cache, replacing tree-walking
-/// for the hot compiler code paths.
-#[cfg(feature = "prebuild-ir")]
-fn load_prebuilt_compiler_ir(globals: &Arc<GlobalEnv>) {
-    match cljrs_ir::deserialize_bundle(PREBUILT_COMPILER_IR) {
-        Ok(bundle) if !bundle.is_empty() => {
-            let n = cljrs_eval::load_prebuilt_ir(globals, &bundle);
-            cljrs_logging::feat_debug!(
-                "ir",
-                "loaded {n} prebuilt compiler IR arities from bundle ({} entries)",
-                bundle.len()
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            cljrs_logging::feat_debug!("ir", "compiler IR bundle deserialize failed: {e}");
-        }
-    }
-}
-
-#[cfg(not(feature = "prebuild-ir"))]
-fn load_prebuilt_compiler_ir(_globals: &Arc<GlobalEnv>) {}
 
 /// Create a `GlobalEnv` with all built-ins and stdlib registered, **without**
 /// the IR lowering hook or compiler loading.
@@ -194,47 +155,9 @@ pub fn standard_env() -> Arc<GlobalEnv> {
         }
     });
 
-    // Try loading prebuilt IR first (skips compiler loading entirely).
-    #[cfg(feature = "prebuild-ir")]
-    {
-        match cljrs_ir::deserialize_bundle(PREBUILT_IR) {
-            Ok(bundle) if !bundle.is_empty() => {
-                // Register compiler sources (needed for any functions not in the
-                // prebuilt bundle, and for user code that triggers IR lowering).
-                cljrs_eval::register_compiler_sources(&globals);
-
-                let loaded = cljrs_eval::load_prebuilt_ir(&globals, &bundle);
-                cljrs_logging::feat_debug!(
-                    "ir",
-                    "loaded {loaded} prebuilt IR arities from bundle ({} entries)",
-                    bundle.len()
-                );
-
-                // Still load the compiler on a background thread so new user
-                // functions can be eagerly lowered at definition time.
-                // Once loaded, populate the IR cache with prebuilt compiler IR
-                // so the compiler itself runs in IR mode on hot paths.
-                let g = globals.clone();
-                let _ = std::thread::Builder::new()
-                    .stack_size(16 * 1024 * 1024)
-                    .spawn(move || {
-                        let mut env = cljrs_eval::Env::new(g.clone(), "user");
-                        if cljrs_eval::ensure_compiler_loaded(&g, &mut env) {
-                            load_prebuilt_compiler_ir(&g);
-                        }
-                    });
-
-                return globals;
-            }
-            _ => {
-                // Empty or corrupt bundle — fall through to runtime lowering.
-            }
-        }
-    }
-
-    // Fallback: register and load compiler namespaces so IR lowering is
-    // available at runtime. Loading runs on a thread with a large stack
-    // because the Clojure compiler sources are deeply recursive.
+    // Register and load compiler namespaces so IR lowering is available at
+    // runtime.  Loading runs on a thread with a large stack because the
+    // Clojure compiler sources are deeply recursive.
     cljrs_eval::register_compiler_sources(&globals);
     {
         let g = globals.clone();
@@ -242,9 +165,7 @@ pub fn standard_env() -> Arc<GlobalEnv> {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let mut env = cljrs_eval::Env::new(g.clone(), "user");
-                if cljrs_eval::ensure_compiler_loaded(&g, &mut env) {
-                    load_prebuilt_compiler_ir(&g);
-                }
+                cljrs_eval::ensure_compiler_loaded(&g, &mut env);
             })
             .and_then(|h| h.join().map_err(|_| std::io::Error::other("join failed")));
     }
