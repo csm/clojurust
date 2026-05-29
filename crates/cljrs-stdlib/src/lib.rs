@@ -102,7 +102,6 @@ pub fn register(globals: &Arc<GlobalEnv>) {
     globals.register_builtin_source("clojure.zip", COLJURE_ZIP_SRC);
 }
 
-
 /// Create a `GlobalEnv` with all built-ins and stdlib registered, **without**
 /// the IR lowering hook or compiler loading.
 ///
