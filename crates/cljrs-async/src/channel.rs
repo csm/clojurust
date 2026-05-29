@@ -96,7 +96,7 @@ impl CljChannel {
 
     /// Mark the channel closed. Idempotent. Pending and future takes drain any
     /// buffered values and then observe `nil`.
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         self.state.lock().unwrap().closed = true;
         // Wake any threads blocking in take_blocking / put_blocking.
         self.not_empty.notify_all();
@@ -249,6 +249,44 @@ impl CljChannel {
                     .wait_timeout(guard, Duration::from_millis(1))
                     .unwrap();
                 guard = g;
+            }
+        }
+    }
+
+    /// Asynchronously put `v` onto the channel, cooperatively yielding to the
+    /// `LocalSet` executor until the value is accepted — buffered (capacity >= 1)
+    /// or handed off to a taker (rendezvous). Resolves `true` on success, or
+    /// `false` if the channel is (or becomes) closed before the value lands.
+    ///
+    /// This is the async counterpart to [`Self::put_blocking`] and the building
+    /// block other native crates use to stream produced values onto a channel.
+    /// Must run within a Tokio `LocalSet` context.
+    pub async fn put(&self, v: Value) -> bool {
+        if self.is_rendezvous() {
+            // Phase 1: claim the channel's single slot.
+            let token = loop {
+                match self.rv_offer(&v) {
+                    RvOffer::Offered(t) => break t,
+                    RvOffer::Closed => return false,
+                    RvOffer::Full => {}
+                }
+                tokio::task::yield_now().await;
+            };
+            // Phase 2: wait for a taker to consume the offered value.
+            loop {
+                match self.rv_status(token) {
+                    RvStatus::Taken => return true,
+                    RvStatus::ClosedUntaken => return false,
+                    RvStatus::Waiting => {}
+                }
+                tokio::task::yield_now().await;
+            }
+        } else {
+            loop {
+                if let Some(accepted) = self.try_put_buffered(&v) {
+                    return accepted;
+                }
+                tokio::task::yield_now().await;
             }
         }
     }

@@ -22,6 +22,11 @@ pub mod eval_async;
 mod runtime;
 use runtime::AsyncRuntimeImpl;
 
+// Re-exported so sibling native crates (e.g. `cljrs-io`) can spawn work onto the
+// shared `LocalSet` executor and await Clojure futures/promises without reaching
+// into private modules.
+pub use eval_async::{await_value, spawn_future};
+
 /// Clojure-level `clojure.core.async` definitions (the `alt` macro), evaluated
 /// on top of the native primitives at `init` time.
 const CORE_ASYNC_SOURCE: &str = include_str!("core_async.cljrs");
