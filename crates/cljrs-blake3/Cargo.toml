@@ -23,6 +23,4 @@ blake3        = "1"
 cljrs-eval    = { workspace = true }
 cljrs-stdlib  = { workspace = true }
 cljrs-env     = { workspace = true }
-cljrs-gc      = { workspace = true }
-cljrs-interop = { workspace = true }
 cljrs-reader  = { workspace = true }
