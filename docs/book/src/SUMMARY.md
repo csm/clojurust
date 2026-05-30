@@ -22,6 +22,12 @@
 - [Differences from Clojure](language/differences.md)
 - [New built-in functions](language/builtins.md)
 
+# Async & I/O
+
+- [Overview](async-io/index.md)
+- [core.async](async-io/async.md)
+- [Asynchronous I/O](async-io/io.md)
+
 # Rust Interop
 
 - [Overview](rust-interop/index.md)
