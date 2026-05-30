@@ -985,15 +985,14 @@ impl Drop for CljxFuture {
         // the *same* sweep, so we must NOT dereference it here (no `{v}`). We
         // only inspect the state discriminant, which is inline in our own
         // (still-valid) allocation.
-        if !self.observed.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok(state) = self.state.lock() {
-                if matches!(&*state, FutureState::Failed(_)) {
-                    eprintln!(
-                        "[clojurust warning] a failed future was discarded without its error \
-                         being observed (no await/deref); the thrown exception was lost"
-                    );
-                }
-            }
+        if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(state) = self.state.lock()
+            && matches!(&*state, FutureState::Failed(_))
+        {
+            eprintln!(
+                "[clojurust warning] a failed future was discarded without its error \
+                 being observed (no await/deref); the thrown exception was lost"
+            );
         }
     }
 }
