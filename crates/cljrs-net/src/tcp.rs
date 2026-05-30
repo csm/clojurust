@@ -1,4 +1,4 @@
-//! TCP client support for `clojure.rust.net.tcp`.
+//! TCP client/server support for `clojure.rust.net.tcp`.
 //!
 //! Phase A delivers `connect` and `close`. A connection is a map:
 //!
@@ -11,13 +11,21 @@
 //! ```
 //!
 //! `connect` returns a capacity-1 promise channel that yields the connection
-//! map once the TCP handshake completes, or a `Value::Error` on failure. The
-//! model is identical to `cljrs-io`'s discrete-op shape.
+//! map once the TCP handshake completes, or a `Value::Error` on failure.
+//!
+//! Phase B adds `listen` and `listen-close`. A server map is:
+//!
+//! ```clojure
+//! {:conns      <chan>   ; yields a connection map for each accepted socket
+//!  :local-addr "ip:port"
+//!  :resource   <handle>} ; TcpListenerResource — deterministic listener close
+//! ```
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::AbortHandle;
 
@@ -39,6 +47,8 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, Builtin)> = vec![
         ("connect", Arity::Fixed(1), builtin_connect),
         ("close", Arity::Fixed(1), builtin_close),
+        ("listen", Arity::Fixed(1), builtin_listen),
+        ("listen-close", Arity::Fixed(1), builtin_listen_close),
     ];
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
@@ -100,6 +110,60 @@ impl Resource for TcpStreamResource {
 
     fn resource_type(&self) -> &'static str {
         "TcpStream"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ── TcpListenerResource ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct TcpListenerInner {
+    closed: bool,
+    accept_abort: Option<AbortHandle>,
+}
+
+/// `Resource` implementation for a TCP listener.
+///
+/// Holds the `AbortHandle` for the `accept_loop` task. `close()` aborts the
+/// task, which drops the `TcpListener` and closes the listener FD.
+#[derive(Debug)]
+pub struct TcpListenerResource {
+    inner: Arc<Mutex<TcpListenerInner>>,
+}
+
+impl TcpListenerResource {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TcpListenerInner {
+                closed: false,
+                accept_abort: None,
+            })),
+        }
+    }
+}
+
+impl Resource for TcpListenerResource {
+    fn close(&self) -> ValueResult<()> {
+        let mut g = self.inner.lock().unwrap();
+        if g.closed {
+            return Ok(());
+        }
+        g.closed = true;
+        if let Some(h) = g.accept_abort.take() {
+            h.abort();
+        }
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+
+    fn resource_type(&self) -> &'static str {
+        "TcpListener"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -208,6 +272,110 @@ async fn writer_loop(mut write_half: OwnedWriteHalf, out_chan: GcPtr<NativeObjec
     .await;
 }
 
+// ── Connection builder ────────────────────────────────────────────────────────
+
+fn make_connection(stream: TcpStream, in_buf: usize, out_buf: usize) -> Value {
+    let remote_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    let local_addr = stream
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    let (read_half, write_half) = stream.into_split();
+    let in_chan = make_chan(in_buf);
+    let out_chan = make_chan(out_buf);
+    let resource = TcpStreamResource::new();
+    let shared_inner = resource.inner.clone();
+    let resource_handle = ResourceHandle::new(resource);
+    let r_jh = tokio::task::spawn_local(reader_loop(read_half, in_chan.clone()));
+    shared_inner.lock().unwrap().reader_abort = Some(r_jh.abort_handle());
+    let w_jh = tokio::task::spawn_local(writer_loop(write_half, out_chan.clone()));
+    shared_inner.lock().unwrap().writer_abort = Some(w_jh.abort_handle());
+    Value::Map(MapValue::from_pairs(vec![
+        (kw("in"), Value::NativeObject(in_chan)),
+        (kw("out"), Value::NativeObject(out_chan)),
+        (kw("remote-addr"), Value::string(remote_addr)),
+        (kw("local-addr"), Value::string(local_addr)),
+        (kw("resource"), Value::Resource(resource_handle)),
+    ]))
+}
+
+// ── Accept loop ───────────────────────────────────────────────────────────────
+
+/// Accept connections from `listener` and put each connection map on `conns_chan`.
+///
+/// Exits when the listener returns an error (e.g. the FD is closed by aborting
+/// this task) or when the consumer closes `conns_chan`. After exiting, closes
+/// `conns_chan` so consumers see EOF.
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    conns_chan: GcPtr<NativeObjectBox>,
+    in_buf: usize,
+    out_buf: usize,
+) {
+    loop {
+        match listener.accept().await {
+            Err(e) => {
+                chan_put(&conns_chan, net_error(format!("accept error: {e}"))).await;
+                break;
+            }
+            Ok((stream, _)) => {
+                let conn = make_connection(stream, in_buf, out_buf);
+                if !chan_put(&conns_chan, conn).await {
+                    break; // consumer closed :conns
+                }
+            }
+        }
+    }
+    chan_ref(conns_chan.get()).close();
+}
+
+// ── Listen implementation ─────────────────────────────────────────────────────
+
+/// Bind a TCP listener on `host:port` and return a server map.
+///
+/// Convenience wrapper used by tests and the Clojure `listen` builtin alike.
+pub fn listen_on(
+    host: &str,
+    port: u16,
+    conns_buf: usize,
+    in_buf: usize,
+    out_buf: usize,
+) -> ValueResult<Value> {
+    let addr = format!("{host}:{port}");
+
+    // Bind synchronously (std), then convert to Tokio (requires runtime context).
+    let std_listener = std::net::TcpListener::bind(&addr)
+        .map_err(|e| ValueError::Other(format!("listen on {addr}: {e}")))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| ValueError::Other(format!("set_nonblocking: {e}")))?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| ValueError::Other(format!("from_std: {e}")))?;
+
+    let local_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    let conns_chan = make_chan(conns_buf);
+
+    let resource = TcpListenerResource::new();
+    let shared_inner = resource.inner.clone();
+    let resource_handle = ResourceHandle::new(resource);
+
+    let jh = tokio::task::spawn_local(accept_loop(listener, conns_chan.clone(), in_buf, out_buf));
+    shared_inner.lock().unwrap().accept_abort = Some(jh.abort_handle());
+
+    Ok(Value::Map(MapValue::from_pairs(vec![
+        (kw("conns"), Value::NativeObject(conns_chan)),
+        (kw("local-addr"), Value::string(local_addr)),
+        (kw("resource"), Value::Resource(resource_handle)),
+    ])))
+}
+
 // ── Connect implementation ────────────────────────────────────────────────────
 
 /// Initiate a TCP connection and return the promise channel as a `Value`.
@@ -236,42 +404,7 @@ async fn do_connect(
             return Ok(Value::Nil);
         }
     };
-
-    let remote_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let local_addr = stream
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
-    let (read_half, write_half) = stream.into_split();
-
-    let in_chan = make_chan(in_buf);
-    let out_chan = make_chan(out_buf);
-
-    // Build the resource before spawning; keep the inner Arc so we can set the
-    // abort handles after obtaining the JoinHandles from spawn_local.
-    let resource = TcpStreamResource::new();
-    let shared_inner = resource.inner.clone();
-    let resource_handle = ResourceHandle::new(resource);
-
-    let r_jh = tokio::task::spawn_local(reader_loop(read_half, in_chan.clone()));
-    shared_inner.lock().unwrap().reader_abort = Some(r_jh.abort_handle());
-
-    let w_jh = tokio::task::spawn_local(writer_loop(write_half, out_chan.clone()));
-    shared_inner.lock().unwrap().writer_abort = Some(w_jh.abort_handle());
-
-    let conn = Value::Map(MapValue::from_pairs(vec![
-        (kw("in"), Value::NativeObject(in_chan)),
-        (kw("out"), Value::NativeObject(out_chan)),
-        (kw("remote-addr"), Value::string(remote_addr)),
-        (kw("local-addr"), Value::string(local_addr)),
-        (kw("resource"), Value::Resource(resource_handle)),
-    ]));
-
-    chan_deliver(&promise, conn).await;
+    chan_deliver(&promise, make_connection(stream, in_buf, out_buf)).await;
     Ok(Value::Nil)
 }
 
@@ -326,6 +459,55 @@ fn builtin_close(args: &[Value]) -> ValueResult<Value> {
     // Abort tasks and release the FD deterministically.
     if let Some(Value::Resource(handle)) = conn.get(&kw("resource")) {
         let _ = handle.close();
+    }
+
+    Ok(Value::Nil)
+}
+
+/// `(listen {:port p})` — bind a TCP listener and return a server map.
+///
+/// The `:conns` channel yields a connection map for each accepted socket and
+/// is closed when the listener closes. Optional keys: `:host` (default
+/// `"0.0.0.0"`), `:conns-buf` (default 8), `:in-buf` (default 8), `:out-buf`
+/// (default 8).
+fn builtin_listen(args: &[Value]) -> ValueResult<Value> {
+    let opts = match args.first() {
+        Some(Value::Map(m)) => m.clone(),
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "map {:port long}",
+                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
+            });
+        }
+    };
+
+    let host = opts_str(&opts, "host").unwrap_or_else(|| "0.0.0.0".to_string());
+    let port =
+        opts_port(&opts).ok_or_else(|| ValueError::Other(":port required (1-65535)".into()))?;
+    let conns_buf = opts_usize(&opts, "conns-buf").unwrap_or(8);
+    let in_buf = opts_usize(&opts, "in-buf").unwrap_or(8);
+    let out_buf = opts_usize(&opts, "out-buf").unwrap_or(8);
+
+    listen_on(&host, port, conns_buf, in_buf, out_buf)
+}
+
+/// `(listen-close server)` — stop the accept loop and close the `:conns` channel.
+fn builtin_listen_close(args: &[Value]) -> ValueResult<Value> {
+    let server = match args.first() {
+        Some(Value::Map(m)) => m.clone(),
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "server map {:conns ch :resource handle}",
+                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
+            });
+        }
+    };
+
+    if let Some(Value::Resource(handle)) = server.get(&kw("resource")) {
+        let _ = handle.close();
+    }
+    if let Some(Value::NativeObject(obj)) = server.get(&kw("conns")) {
+        chan_ref(obj.get()).close();
     }
 
     Ok(Value::Nil)

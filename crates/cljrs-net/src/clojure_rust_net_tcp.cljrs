@@ -1,8 +1,34 @@
 ;; clojure.rust.net.tcp — TCP client/server.
 ;;
 ;; Phase A (client):
-;;   connect  — (connect {:host h :port p}) => promise-chan -> conn-map
-;;   close    — (close conn) => nil
+;;   connect      — (connect {:host h :port p}) => promise-chan -> conn-map
+;;   close        — (close conn) => nil
 ;;
-;; The native functions are registered by cljrs-net; this file may add
-;; Clojure-level helpers on top as later phases are implemented.
+;; Phase B (server):
+;;   listen       — (listen {:port p}) => {:conns ch :local-addr str :resource h}
+;;   listen-close — (listen-close server) => nil
+;;   start-server — (start-server handler opts) => server-map
+
+(defn start-server
+  "Start a TCP server with `handler` called for each accepted connection.
+  Returns the server map {:conns <chan> :local-addr str :resource handle}.
+
+  `handler` is called with a connection map for each accepted connection.
+  Use (go ...) inside the handler to avoid blocking new accepts.
+
+  Opts (same as listen):
+    :port       integer (required, 1-65535)
+    :host       string (default \"0.0.0.0\")
+    :conns-buf  buffer depth for :conns (default 8)
+    :in-buf     per-connection :in buffer (default 8)
+    :out-buf    per-connection :out buffer (default 8)"
+  [handler opts]
+  (let [server (clojure.rust.net.tcp/listen opts)
+        conns  (:conns server)]
+    (clojure.core.async/go
+      (loop []
+        (let [conn (await (clojure.core.async/take! conns))]
+          (when (some? conn)
+            (handler conn)
+            (recur)))))
+    server))
