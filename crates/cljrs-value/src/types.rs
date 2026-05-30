@@ -928,7 +928,10 @@ impl cljrs_gc::Trace for CljxPromise {
 pub enum FutureState {
     Running,
     Done(Value),
-    Failed(String),
+    /// The future's body threw. Holds the thrown Clojure value (a
+    /// `Value::Error`) so `await`/`deref` can re-throw it with its
+    /// `ex-data`/`ex-cause` intact, rather than a stringified message.
+    Failed(Value),
     Cancelled,
 }
 
@@ -973,7 +976,9 @@ impl cljrs_gc::Trace for CljxFuture {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let state = self.state.lock().unwrap();
-            if let FutureState::Done(v) = &*state {
+            // Both Done and Failed hold a Value (the result or the thrown
+            // error); trace either so the GC keeps it alive until observed.
+            if let FutureState::Done(v) | FutureState::Failed(v) = &*state {
                 v.trace(visitor);
             }
         }

@@ -93,12 +93,15 @@ thing `throw` raises and `try`/`catch` catches) is put on the channel instead of
 an in-band error value, so a pipeline of channels propagates errors automatically (each stage
 `<?`s its input and is wrapped in `go-try`).
 
-**Known limitation:** `eval_async` does not yet evaluate `try`/`catch` with yielding — it
+**Error-value fidelity:** a failed future stores the thrown Clojure value
+(`FutureState::Failed(Value)`), and `await`/`deref` re-raise it as `EvalError::Thrown`, so
+`ex-message`/`ex-data`/`ex-cause` survive across an `await` boundary (and through `<?`/`go-try`).
+
+**Known limitation:** `eval_async` does not yet evaluate `try`/`catch` with *yielding* — it
 delegates them to the synchronous evaluator — so an `await`/`<?` inside a `try` (and therefore
-inside a `go-try` body) takes the synchronous `await` path. That resolves an already-ready
-value but is fragile when the awaited value is not yet available, and an uncaught `throw` that
-crosses an `await` boundary is currently stringified by `settle_future` (losing `ex-data`/
-`ex-cause`). Faithful async `try`/`catch` + error-value preservation is the deferred follow-up.
+inside a `go-try` body) takes the synchronous `await` path. That resolves an already-ready value
+but is fragile when the awaited value is not yet available. Yielding `try`/`catch` in
+`eval_async` is the remaining follow-up.
 
 ### `await` and the single-thread executor
 

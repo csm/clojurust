@@ -59,8 +59,9 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     let mut state = future.get().state.lock().unwrap();
     *state = match result {
         Ok(v) => FutureState::Done(v),
-        Err(EvalError::Runtime(msg)) => FutureState::Failed(msg),
-        Err(e) => FutureState::Failed(format!("{e}")),
+        // Preserve the thrown value (and any non-Thrown error as a fresh
+        // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
+        Err(e) => FutureState::Failed(e.to_error_value()),
     };
     drop(state);
     future.get().cond.notify_all();
@@ -218,7 +219,7 @@ pub async fn await_value(val: Value) -> EvalResult {
                     let guard = f.get().state.lock().unwrap();
                     match &*guard {
                         FutureState::Done(v) => return Ok(v.clone()),
-                        FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                        FutureState::Failed(v) => return Err(EvalError::Thrown(v.clone())),
                         FutureState::Cancelled => {
                             return Err(EvalError::Runtime("future was cancelled".into()));
                         }

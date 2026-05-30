@@ -37,6 +37,10 @@ fn eval_sync(src: &str, env: &mut Env) -> Value {
     result
 }
 
+fn pr(v: &Value) -> String {
+    format!("{v}")
+}
+
 fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -154,6 +158,36 @@ fn go_try_catches_throw_and_propagates_as_error() {
         assert!(
             msg.contains("boom"),
             "error should carry the message: {msg}"
+        );
+    });
+}
+
+#[test]
+fn awaited_throw_preserves_ex_data() {
+    // Fidelity: a throw that crosses an `await` boundary must keep its ex-data
+    // and ex-message (previously the error was stringified into a bare message).
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQ, &mut env);
+        eval_sync(
+            "(defn ^:async boom [] (throw (ex-info \"nope\" {:code 42})))",
+            &mut env,
+        );
+        // Catch the awaited error and read ex-message + ex-data back out.
+        eval_sync(
+            "(defn ^:async caller []
+               (try (await (boom))
+                    (catch Exception e [(ex-message e) (:code (ex-data e))])))",
+            &mut env,
+        );
+        let r = eval_async(&parse_one("(await (caller))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(
+            pr(&r),
+            "[\"nope\" 42]",
+            "ex-message/ex-data must survive the await boundary"
         );
     });
 }

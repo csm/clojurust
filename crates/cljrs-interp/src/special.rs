@@ -1931,7 +1931,7 @@ fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
             loop {
                 match &*guard {
                     FutureState::Done(v) => return Ok(v.clone()),
-                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                    FutureState::Failed(v) => return Err(EvalError::Thrown(v.clone())),
                     FutureState::Cancelled => {
                         return Err(EvalError::Runtime("future was cancelled".into()));
                     }
