@@ -1,0 +1,29 @@
+;; clojure.rust.error — error-value helpers shared across the channel-based
+;; APIs (clojure.core.async, clojure.rust.io.async, clojure.rust.net).
+;;
+;; An error is an ordinary value: an exception (Value::Error), the same thing
+;; `throw` raises and `try`/`catch` catches. Channel-based APIs deliver failures
+;; *in band* — an error value is put on the channel instead of a result — so a
+;; consumer needs to tell results from failures. These helpers do that, and
+;; `throw-err` is the basis of the `<?` family in clojure.core.async: it turns an
+;; in-band error back into a short-circuiting throw, matching Rust's `?`.
+
+(defn error?
+  "True if x is an error value (an exception) — e.g. one delivered in band on a
+  result channel."
+  [x]
+  (instance? Exception x))
+
+(defn ok?
+  "True if x is a non-error, non-nil value."
+  [x]
+  (and (some? x) (not (error? x))))
+
+(defn throw-err
+  "Return x unchanged unless it is an error value, in which case throw it.
+
+  The `?` primitive: lifts an in-band error into a thrown exception so it
+  short-circuits to the nearest try/catch (or go-try), exactly like Rust's `?`
+  propagates an Err."
+  [x]
+  (if (error? x) (throw x) x))

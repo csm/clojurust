@@ -70,6 +70,36 @@ inside an async context:
 `true`/`false`) act synchronously and return immediately. `<!!` and `>!!` are the
 blocking sync-context equivalents, suitable for REPL use and tests (see Phase H above).
 
+### Error propagation: the `<?` family
+
+Channel APIs deliver failures **in band** — an error value (a `Value::Error`, the same
+thing `throw` raises and `try`/`catch` catches) is put on the channel instead of a result.
+`clojure.rust.error` holds the predicates and the propagation primitive:
+
+- `(error? x)` — true if `x` is an error value.
+- `(ok? x)` — true if `x` is non-nil and not an error.
+- `(throw-err x)` — return `x`, unless it is an error, in which case `throw` it. This is the
+  `?` primitive; the short-circuit is an exception that unwinds to the nearest `try`.
+
+`clojure.core.async` builds the take-and-propagate sugar on top, mirroring Rust's `?`:
+
+| Macro | Expansion | Use in |
+|---|---|---|
+| `(<? ch)` | `(throw-err (await (take! ch)))` | `go` / `^:async` body |
+| `(<?? ch)` | `(throw-err (<!! ch))` | sync / REPL / tests |
+| `(go-try body…)` | `(go (try body… (catch Exception e e)))` delivered on a 1-buffer result chan | wraps a body so a thrown error becomes an in-band error on the returned channel |
+
+`<?` is unwrap-or-short-circuit; `go-try` is the boundary that turns a thrown error back into
+an in-band error value, so a pipeline of channels propagates errors automatically (each stage
+`<?`s its input and is wrapped in `go-try`).
+
+**Known limitation:** `eval_async` does not yet evaluate `try`/`catch` with yielding — it
+delegates them to the synchronous evaluator — so an `await`/`<?` inside a `try` (and therefore
+inside a `go-try` body) takes the synchronous `await` path. That resolves an already-ready
+value but is fragile when the awaited value is not yet available, and an uncaught `throw` that
+crosses an `await` boundary is currently stringified by `settle_future` (losing `ex-data`/
+`ex-cause`). Faithful async `try`/`catch` + error-value preservation is the deferred follow-up.
+
 ### `await` and the single-thread executor
 
 `await` only yields when evaluated by `eval_async` (i.e. inside an `^:async` function body or
@@ -83,12 +113,14 @@ blocking bridge is a later phase.
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl` and builds the `clojure.core.async` namespace |
+| `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
 | `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
-| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into` |
+| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
+| `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
+| `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 
 ## Public API
