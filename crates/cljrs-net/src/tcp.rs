@@ -21,14 +21,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::AbortHandle;
 
-use cljrs_async::channel::CljChannel;
+use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, chan_take, make_chan};
 use cljrs_async::spawn_future;
 use cljrs_env::env::GlobalEnv;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_value::{
     Arity, ExceptionInfo, Keyword, MapValue, NativeFn, NativeObjectBox, Resource, ResourceHandle,
-    Value, ValueError, ValueResult, gc_native_object,
+    Value, ValueError, ValueResult,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -107,16 +107,7 @@ impl Resource for TcpStreamResource {
     }
 }
 
-// ── Channel / value helpers ───────────────────────────────────────────────────
-
-fn make_chan(capacity: usize) -> GcPtr<NativeObjectBox> {
-    gc_native_object(CljChannel::new(capacity))
-}
-
-fn chan_ref(obj: &NativeObjectBox) -> &CljChannel {
-    obj.downcast_ref::<CljChannel>()
-        .expect("net channel NativeObjectBox holds a CljChannel")
-}
+// ── Value helpers ─────────────────────────────────────────────────────────────
 
 fn bytes_value(bytes: &[u8]) -> Value {
     let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
@@ -131,22 +122,6 @@ fn net_error(msg: impl Into<String>) -> Value {
         None,
         None,
     )))
-}
-
-async fn chan_put(ch: &GcPtr<NativeObjectBox>, v: Value) -> bool {
-    chan_ref(ch.get()).put(v).await
-}
-
-/// Deliver exactly one value on a capacity-1 promise channel and close it.
-async fn chan_deliver(ch: &GcPtr<NativeObjectBox>, v: Value) {
-    let _ = chan_ref(ch.get()).put(v).await;
-    chan_ref(ch.get()).close();
-}
-
-/// Async take from a channel: yields until a value is available or the channel
-/// closes. Returns `Value::Nil` when the channel is closed and drained.
-async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
-    chan_ref(ch.get()).take().await
 }
 
 fn kw(name: &str) -> Value {

@@ -22,7 +22,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-use cljrs_value::{NativeObject, NativeObjectBox, Value};
+use cljrs_value::{NativeObject, NativeObjectBox, Value, gc_native_object};
 
 /// The native type tag reported by [`NativeObject::type_tag`] for channels.
 pub(crate) const CHANNEL_TAG: &str = "Channel";
@@ -387,4 +387,38 @@ impl NativeObject for CljMult {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+// ── GcPtr<NativeObjectBox> helpers for channel consumers ─────────────────────
+
+/// Create a fresh `CljChannel` wrapped as a `Value::NativeObject`-ready pointer.
+pub fn make_chan(capacity: usize) -> GcPtr<NativeObjectBox> {
+    gc_native_object(CljChannel::new(capacity))
+}
+
+/// Borrow the `CljChannel` out of a `NativeObjectBox`.
+///
+/// Panics if `obj` does not hold a `CljChannel`; that is always the case for
+/// objects created by [`make_chan`] or the `(chan)` builtin.
+pub fn chan_ref(obj: &NativeObjectBox) -> &CljChannel {
+    obj.downcast_ref::<CljChannel>()
+        .expect("NativeObjectBox holds a CljChannel")
+}
+
+/// Asynchronously put `v` onto `ch`, yielding until accepted.
+/// Returns `false` if the channel is closed before the value lands.
+pub async fn chan_put(ch: &GcPtr<NativeObjectBox>, v: Value) -> bool {
+    chan_ref(ch.get()).put(v).await
+}
+
+/// Deliver exactly one value on a promise (capacity-1) channel, then close it.
+pub async fn chan_deliver(ch: &GcPtr<NativeObjectBox>, v: Value) {
+    let _ = chan_ref(ch.get()).put(v).await;
+    chan_ref(ch.get()).close();
+}
+
+/// Asynchronously take a value from `ch`, yielding until one is available.
+/// Returns `Value::Nil` when the channel is closed and drained.
+pub async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
+    chan_ref(ch.get()).take().await
 }

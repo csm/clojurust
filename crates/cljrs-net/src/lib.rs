@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use cljrs_async::load_source;
+
 pub mod tcp;
 
 /// Clojure source for `clojure.rust.net.tcp`.
@@ -48,18 +50,3 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
     }
 }
 
-fn load_source(globals: &Arc<cljrs_env::env::GlobalEnv>, ns: &str, source: &str) {
-    let mut env = cljrs_env::env::Env::new(globals.clone(), ns);
-    let mut parser = cljrs_reader::Parser::new(source.to_string(), format!("<{ns}>"));
-    match parser.parse_all() {
-        Ok(forms) => {
-            for form in forms {
-                let _alloc_frame = cljrs_gc::push_alloc_frame();
-                if let Err(e) = cljrs_interp::eval::eval(&form, &mut env) {
-                    eprintln!("[{ns} warning] {e:?}");
-                }
-            }
-        }
-        Err(e) => eprintln!("[{ns} parse error] {e:?}"),
-    }
-}

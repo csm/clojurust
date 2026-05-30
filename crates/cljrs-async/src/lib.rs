@@ -69,7 +69,8 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
 
 /// Evaluate a Clojure source string form-by-form into an already-created
 /// namespace. Parse/eval failures are reported but do not abort `init`.
-fn load_source(globals: &Arc<cljrs_env::env::GlobalEnv>, ns: &str, source: &str) {
+/// Exported for use by crates that register their own namespaces.
+pub fn load_source(globals: &Arc<cljrs_env::env::GlobalEnv>, ns: &str, source: &str) {
     let mut env = cljrs_env::env::Env::new(globals.clone(), ns);
     let mut parser = cljrs_reader::Parser::new(source.to_string(), format!("<{ns}>"));
     match parser.parse_all() {

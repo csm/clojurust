@@ -32,6 +32,7 @@ use std::sync::Arc;
 pub mod charset;
 pub mod fs;
 
+use cljrs_async::load_source;
 use cljrs_env::env::GlobalEnv;
 
 /// Clojure-level helpers (`error?`, `ok?`) loaded on top of the native
@@ -55,22 +56,6 @@ pub fn init(globals: &Arc<GlobalEnv>) {
     globals.get_or_create_ns(NS);
     globals.refer_all(NS, "clojure.core");
     fs::register(globals, NS);
-
-    let mut env = cljrs_env::env::Env::new(globals.clone(), NS);
-    let mut parser = cljrs_reader::Parser::new(
-        IO_ASYNC_SOURCE.to_string(),
-        "<clojure.rust.io.async>".into(),
-    );
-    match parser.parse_all() {
-        Ok(forms) => {
-            for form in forms {
-                let _alloc_frame = cljrs_gc::push_alloc_frame();
-                if let Err(e) = cljrs_interp::eval::eval(&form, &mut env) {
-                    eprintln!("[clojure.rust.io.async warning] {e:?}");
-                }
-            }
-        }
-        Err(e) => eprintln!("[clojure.rust.io.async parse error] {e:?}"),
-    }
+    load_source(globals, NS, IO_ASYNC_SOURCE);
     globals.mark_loaded(NS);
 }
