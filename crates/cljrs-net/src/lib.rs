@@ -49,4 +49,3 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         globals.mark_loaded(NS);
     }
 }
-
