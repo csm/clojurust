@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-export-macro"
-version = "0.1.0"
+version = "0.1.100"
 edition = "2024"
 description = "Proc-macro: #[export] for automatic registration of Rust functions as Clojurust native functions"
 license.workspace = true
