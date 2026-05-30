@@ -84,3 +84,54 @@
 ;; collection. Must be called inside an ^:async context.
 (defn ^:async into [coll ch]
   (await (reduce conj coll ch)))
+
+;; ── Error propagation: the `<?` family ────────────────────────────────────────
+;;
+;; Channel APIs deliver failures in band (an error value on the channel). The
+;; `<?` family is the consumption-side sugar: take a value and, if it is an
+;; error, throw it — otherwise return it. This mirrors Rust's `?`: `<?` is
+;; unwrap-or-short-circuit (the short-circuit is a throw that unwinds to the
+;; nearest try / go-try), and `go-try` is the boundary that catches the throw
+;; and turns it back into an in-band error on its result channel, so a pipeline
+;; of channels propagates errors automatically.
+;;
+;; `throw-err`/`error?`/`ok?` live in clojure.rust.error.
+
+;; (<? ch)
+;;
+;; Async take: `(await (take! ch))`, then throw if the value is an error. Use
+;; inside a go / ^:async body.
+(defmacro <? [ch]
+  (list 'clojure.rust.error/throw-err
+        (list 'await (list 'clojure.core.async/take! ch))))
+
+;; (<?? ch)
+;;
+;; Blocking take: `(<!! ch)`, then throw if the value is an error. The
+;; synchronous / REPL / test counterpart of `<?`. Must not be called inside an
+;; ^:async body (it parks the OS thread, like <!!).
+(defmacro <?? [ch]
+  (list 'clojure.rust.error/throw-err
+        (list 'clojure.core.async/<!! ch)))
+
+;; (go-try body...)
+;;
+;; Like `go`, but returns a result channel: the body's value is delivered on it,
+;; and a thrown exception is caught and delivered as an in-band error value
+;; instead. The channel carries exactly one value (result or error), then
+;; closes. Consume with `<?` to re-throw the error at the boundary — the CSP
+;; equivalent of a function that returns a Result.
+(defmacro go-try [& body]
+  (let [c (gensym "go_try_c__")
+        r (gensym "go_try_r__")]
+    (list 'let (vector c (list 'clojure.core.async/chan 1))
+          (list 'clojure.core.async/go
+                (list 'let (vector r (concat (list 'try)
+                                             body
+                                             (list (list 'catch 'Exception 'e 'e))))
+                      ;; nil can't ride a channel; a nil result just closes c,
+                      ;; so a taker sees nil — matching core.async's go channel.
+                      (list 'when (list 'some? r)
+                            (list 'await (list 'clojure.core.async/put! c r)))
+                      (list 'clojure.core.async/close! c)))
+          c)))
