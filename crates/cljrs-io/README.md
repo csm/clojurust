@@ -62,6 +62,12 @@ helpers. Not yet covered (candidate follow-ups): a stateful `AsyncReader` handle
 with a cursor (`open` / `read-chunk!` / `seek`), append/options maps for `spit`,
 directory streaming, and transducer-equipped channels.
 
+The `cljrs` CLI wires this in automatically: with its default-on `async`
+feature it calls `cljrs_io::init` at startup and drives each top-level form on
+a shared `LocalSet`, so `clojure.rust.io.async` works from `cljrs repl`,
+`cljrs run`, and `cljrs eval`. Consume results with `(await (take! ...))` — the
+blocking `<!!`/`>!!` ops deadlock the single-threaded executor at the top level.
+
 ## File layout
 
 | File | Description |
