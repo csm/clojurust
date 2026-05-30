@@ -698,15 +698,21 @@ fn eval_throw(args: &[Form], env: &mut Env) -> EvalResult {
 
 // ── try ───────────────────────────────────────────────────────────────────────
 
-struct CatchClause<'a> {
-    type_sym: &'a str,
-    binding: &'a str,
-    body: &'a [Form],
+/// A catch clause: `(catch Type binding body...)`.
+///
+/// Public so the async evaluator (`cljrs-async`) can reuse `parse_try_args` to
+/// build a yielding `try`/`catch`.
+pub struct CatchClause<'a> {
+    pub type_sym: &'a str,
+    pub binding: &'a str,
+    pub body: &'a [Form],
 }
 
 /// Convert a non-Thrown EvalError into a `Value::Error` so it can be bound
 /// inside a catch clause and inspected with `ex-message` / `ex-data`.
-fn eval_error_to_value(err: &EvalError) -> Value {
+///
+/// Public so the async evaluator can convert errors the same way `try` does.
+pub fn eval_error_to_value(err: &EvalError) -> Value {
     let msg = err.to_string();
     Value::Error(GcPtr::new(ExceptionInfo::new(
         ValueError::Other(msg.clone()),
