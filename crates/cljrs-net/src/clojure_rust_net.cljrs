@@ -1,0 +1,32 @@
+;; clojure.rust.net — umbrella networking namespace.
+;;
+;; Delegates to the transport-specific namespaces. For Phase A only TCP is
+;; implemented; later phases add :unix and :tls transports behind the same
+;; connect/listen/close API.
+
+(require 'clojure.rust.net.tcp)
+
+(defn connect
+  "Connect to a remote host. Returns a promise channel that yields a connection
+  map {:in ch :out ch :remote-addr str :local-addr str :resource handle} once
+  the handshake completes, or a Value::Error on failure.
+
+  Opts:
+    :host          string (required)
+    :port          integer (required, 1-65535)
+    :transport     :tcp (default) — future: :unix, :tls
+    :in-buf        channel buffer depth for :in (default 8)
+    :out-buf       channel buffer depth for :out (default 8)"
+  [opts]
+  (let [transport (get opts :transport :tcp)]
+    (case transport
+      :tcp (clojure.rust.net.tcp/connect opts)
+      (throw (ex-info (str "unsupported transport: " transport) {:transport transport})))))
+
+(defn close
+  "Close a connection map, releasing its socket and channels.
+
+  Closes :out (signals the writer to drain and half-close the write side),
+  closes :in, and aborts the reader/writer tasks via the :resource handle."
+  [conn]
+  (clojure.rust.net.tcp/close conn))

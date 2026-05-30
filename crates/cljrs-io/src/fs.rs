@@ -25,14 +25,11 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncReadExt;
 
-use cljrs_async::channel::CljChannel;
+use cljrs_async::channel::{chan_deliver as deliver, chan_put as put, chan_ref, make_chan};
 use cljrs_async::spawn_future;
 use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
-use cljrs_value::{
-    Arity, ExceptionInfo, NativeFn, NativeObjectBox, Value, ValueError, ValueResult,
-    gc_native_object,
-};
+use cljrs_value::{Arity, ExceptionInfo, NativeFn, Value, ValueError, ValueResult};
 
 use crate::charset::{CharDecoder, resolve_charset};
 
@@ -65,18 +62,7 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
     }
 }
 
-// ── Value/channel helpers ─────────────────────────────────────────────────────
-
-/// Create a fresh `core.async` channel and return its `GcPtr` handle.
-fn make_chan(capacity: usize) -> GcPtr<NativeObjectBox> {
-    gc_native_object(CljChannel::new(capacity))
-}
-
-/// Borrow the `CljChannel` out of a channel native object.
-fn chan_ref(obj: &NativeObjectBox) -> &CljChannel {
-    obj.downcast_ref::<CljChannel>()
-        .expect("io channel native object holds a CljChannel")
-}
+// ── Value helpers ─────────────────────────────────────────────────────────────
 
 /// Wrap raw bytes as a Clojure `byte-array` (`Value::ByteArray`, signed `i8`s).
 fn bytes_value(bytes: &[u8]) -> Value {
@@ -93,17 +79,6 @@ fn io_error(msg: impl Into<String>) -> Value {
         None,
         None,
     )))
-}
-
-/// Put `v` onto `ch`, yielding until accepted (ignoring a closed consumer).
-async fn put(ch: &GcPtr<NativeObjectBox>, v: Value) -> bool {
-    chan_ref(ch.get()).put(v).await
-}
-
-/// Deliver a single result on a promise channel, then close it.
-async fn deliver(ch: &GcPtr<NativeObjectBox>, v: Value) {
-    let _ = chan_ref(ch.get()).put(v).await;
-    chan_ref(ch.get()).close();
 }
 
 // ── Argument parsing ──────────────────────────────────────────────────────────

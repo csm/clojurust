@@ -12,9 +12,9 @@
 //!   until a `take!` consumes its value, so producer and consumer hand off
 //!   directly. Only one value is in flight at a time.
 //!
-//! The async builtins drive these via short, lock-scoped "try" steps and yield
-//! the `LocalSet` executor between attempts, matching the cooperative polling
-//! model used by [`crate::eval_async::await_value`].
+//! The async `put` and `take` methods use `tokio::sync::Notify` for wakeups:
+//! a waiting task parks until a producer/consumer fires the relevant `Notify`,
+//! so no spinning or busy-polling occurs on the executor.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -22,7 +22,8 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-use cljrs_value::{NativeObject, NativeObjectBox, Value};
+use cljrs_value::{NativeObject, NativeObjectBox, Value, gc_native_object};
+use tokio::sync::Notify;
 
 /// The native type tag reported by [`NativeObject::type_tag`] for channels.
 pub(crate) const CHANNEL_TAG: &str = "Channel";
@@ -72,6 +73,10 @@ pub struct CljChannel {
     /// Wakes blocking putters waiting for space, and rendezvous putters waiting
     /// for their offered value to be consumed.
     not_full: Condvar,
+    /// Async wakeup for `take`: fired when an item is enqueued or the channel closes.
+    async_not_empty: Notify,
+    /// Async wakeup for `put`: fired when an item is dequeued or the channel closes.
+    async_not_full: Notify,
 }
 
 impl CljChannel {
@@ -86,6 +91,8 @@ impl CljChannel {
             }),
             not_empty: Condvar::new(),
             not_full: Condvar::new(),
+            async_not_empty: Notify::new(),
+            async_not_full: Notify::new(),
         }
     }
 
@@ -98,9 +105,12 @@ impl CljChannel {
     /// buffered values and then observe `nil`.
     pub fn close(&self) {
         self.state.lock().unwrap().closed = true;
-        // Wake any threads blocking in take_blocking / put_blocking.
+        // Wake blocking (sync) callers.
         self.not_empty.notify_all();
         self.not_full.notify_all();
+        // Wake one async taker/putter; they cascade the notification on exit.
+        self.async_not_empty.notify_one();
+        self.async_not_full.notify_one();
     }
 
     /// Non-blocking take.
@@ -114,6 +124,7 @@ impl CljChannel {
             st.taken = st.taken.wrapping_add(1);
             drop(st);
             self.not_full.notify_all();
+            self.async_not_full.notify_one();
             return Some(v);
         }
         if st.closed {
@@ -136,6 +147,7 @@ impl CljChannel {
             st.queue.push_back(v.clone());
             drop(st);
             self.not_empty.notify_all();
+            self.async_not_empty.notify_one();
             return Some(true);
         }
         None
@@ -152,6 +164,7 @@ impl CljChannel {
             st.queue.push_back(v.clone());
             drop(st);
             self.not_empty.notify_all();
+            self.async_not_empty.notify_one();
             RvOffer::Offered(token)
         } else {
             RvOffer::Full
@@ -253,6 +266,26 @@ impl CljChannel {
         }
     }
 
+    /// Asynchronously take a value from the channel, cooperatively yielding to
+    /// the `LocalSet` executor until a value is available or the channel closes.
+    /// Returns `Value::Nil` when the channel is closed and drained.
+    ///
+    /// This is the async counterpart to [`Self::take_blocking`] and the
+    /// building block other native crates use to consume channel values.
+    /// Must run within a Tokio `LocalSet` context.
+    pub async fn take(&self) -> Value {
+        loop {
+            if let Some(v) = self.try_take() {
+                if matches!(v, Value::Nil) {
+                    // Channel closed: cascade so other parked takers wake too.
+                    self.async_not_empty.notify_one();
+                }
+                return v;
+            }
+            self.async_not_empty.notified().await;
+        }
+    }
+
     /// Asynchronously put `v` onto the channel, cooperatively yielding to the
     /// `LocalSet` executor until the value is accepted — buffered (capacity >= 1)
     /// or handed off to a taker (rendezvous). Resolves `true` on success, or
@@ -270,7 +303,7 @@ impl CljChannel {
                     RvOffer::Closed => return false,
                     RvOffer::Full => {}
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             };
             // Phase 2: wait for a taker to consume the offered value.
             loop {
@@ -279,14 +312,14 @@ impl CljChannel {
                     RvStatus::ClosedUntaken => return false,
                     RvStatus::Waiting => {}
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             }
         } else {
             loop {
                 if let Some(accepted) = self.try_put_buffered(&v) {
                     return accepted;
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             }
         }
     }
@@ -371,4 +404,38 @@ impl NativeObject for CljMult {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+// ── GcPtr<NativeObjectBox> helpers for channel consumers ─────────────────────
+
+/// Create a fresh `CljChannel` wrapped as a `Value::NativeObject`-ready pointer.
+pub fn make_chan(capacity: usize) -> GcPtr<NativeObjectBox> {
+    gc_native_object(CljChannel::new(capacity))
+}
+
+/// Borrow the `CljChannel` out of a `NativeObjectBox`.
+///
+/// Panics if `obj` does not hold a `CljChannel`; that is always the case for
+/// objects created by [`make_chan`] or the `(chan)` builtin.
+pub fn chan_ref(obj: &NativeObjectBox) -> &CljChannel {
+    obj.downcast_ref::<CljChannel>()
+        .expect("NativeObjectBox holds a CljChannel")
+}
+
+/// Asynchronously put `v` onto `ch`, yielding until accepted.
+/// Returns `false` if the channel is closed before the value lands.
+pub async fn chan_put(ch: &GcPtr<NativeObjectBox>, v: Value) -> bool {
+    chan_ref(ch.get()).put(v).await
+}
+
+/// Deliver exactly one value on a promise (capacity-1) channel, then close it.
+pub async fn chan_deliver(ch: &GcPtr<NativeObjectBox>, v: Value) {
+    let _ = chan_ref(ch.get()).put(v).await;
+    chan_ref(ch.get()).close();
+}
+
+/// Asynchronously take a value from `ch`, yielding until one is available.
+/// Returns `Value::Nil` when the channel is closed and drained.
+pub async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
+    chan_ref(ch.get()).take().await
 }
