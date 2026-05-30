@@ -207,27 +207,30 @@ async fn reader_loop(mut read_half: OwnedReadHalf, in_chan: GcPtr<NativeObjectBo
 /// half when `:out` is closed (TCP half-close: FIN without RST). Aborted via
 /// `TcpStreamResource::close` if the user calls `(close conn)`.
 async fn writer_loop(mut write_half: OwnedWriteHalf, out_chan: GcPtr<NativeObjectBox>) {
-    loop {
-        match chan_take(&out_chan).await {
-            Value::Nil => {
-                // :out closed; gracefully half-close the write side.
-                let _ = write_half.shutdown().await;
-                break;
-            }
-            Value::ByteArray(arr) => {
-                let bytes: Vec<u8> = arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
-                if write_half.write_all(&bytes).await.is_err() {
+    // Nested async block so write errors propagate via `?` rather than
+    // `if err { break }`, keeping each match arm free of collapsible ifs.
+    let _: std::io::Result<()> = async {
+        loop {
+            match chan_take(&out_chan).await {
+                Value::Nil => {
+                    // :out closed; gracefully half-close the write side.
+                    let _ = write_half.shutdown().await;
                     break;
                 }
-            }
-            Value::Str(s) => {
-                if write_half.write_all(s.get().as_bytes()).await.is_err() {
-                    break;
+                Value::ByteArray(arr) => {
+                    let bytes: Vec<u8> =
+                        arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
+                    write_half.write_all(&bytes).await?;
                 }
+                Value::Str(s) => {
+                    write_half.write_all(s.get().as_bytes()).await?;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        Ok(())
     }
+    .await;
 }
 
 // ── Connect implementation ────────────────────────────────────────────────────
