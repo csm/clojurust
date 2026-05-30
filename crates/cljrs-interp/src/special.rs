@@ -719,7 +719,7 @@ fn eval_error_to_value(err: &EvalError) -> Value {
 /// Test whether the type symbol on a `(catch <Type> e ...)` clause matches a
 /// thrown value. Type names are matched by their last `.`-separated segment so
 /// fully-qualified names like `java.lang.Exception` work as well as bare ones.
-fn catch_type_matches(type_name: &str, val: &Value) -> bool {
+pub fn catch_type_matches(type_name: &str, val: &Value) -> bool {
     let short = type_name.rsplit('.').next().unwrap_or(type_name);
     match short {
         // Catch-all (matches any value, error or not — back-compat).
@@ -779,7 +779,9 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
 }
 
 /// Split try args into (body, catch clauses, finally body).
-fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form]) {
+///
+/// Public so the async evaluator can parse `try` forms identically.
+pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form]) {
     let mut body_end = args.len();
     let mut catches: Vec<CatchClause<'_>> = Vec::new();
     let mut fin_body: &[Form] = &[];

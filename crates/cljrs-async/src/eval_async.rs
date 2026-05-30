@@ -181,10 +181,13 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             // loop/loop* needs an async handler so that `await` inside the body
             // yields correctly instead of falling back to blocking deref.
             "loop*" | "loop" => return eval_loop_async(&forms[1..], env).await,
-            // Other special forms (try/binding/…) don't yield in
-            // Phase B: run them synchronously. A `recur` that targets the
-            // enclosing async fn surfaces as `EvalError::Recur` and is caught
-            // by `run_async_fn`.
+            // try/catch/finally must yield so `await`/`<?` inside the body (and
+            // inside catch bodies) cooperate with the executor instead of taking
+            // the blocking sync path.
+            "try" => return eval_try_async(&forms[1..], env).await,
+            // Other special forms (binding/…) don't yield yet: run them
+            // synchronously. A `recur` that targets the enclosing async fn
+            // surfaces as `EvalError::Recur` and is caught by `run_async_fn`.
             other if is_special_form(other) => return eval(&expanded, env),
             _ => {}
         }
@@ -260,6 +263,59 @@ async fn eval_body_async(forms: &[Form], env: &mut Env) -> EvalResult {
         result = Box::pin(eval_async(form, env)).await?;
     }
     Ok(result)
+}
+
+/// `(try body... (catch Type e handler...)... (finally cleanup...))` with
+/// yielding bodies. Mirrors the synchronous `eval_try` (`cljrs-interp`) exactly,
+/// but evaluates the body, catch handlers, and finally block with `eval_async`
+/// so an `await`/`<?` inside any of them cooperates with the executor instead of
+/// falling back to the blocking sync path.
+async fn eval_try_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let (body, catches, fin_body) = cljrs_interp::special::parse_try_args(args);
+
+    let mut result = eval_body_async(body, env).await;
+
+    // Handle catch: never intercept Recur (loop/fn trampoline signal).
+    let err_opt = match std::mem::replace(&mut result, Ok(Value::Nil)) {
+        Ok(v) => {
+            result = Ok(v);
+            None
+        }
+        Err(EvalError::Recur(recur_args)) => {
+            result = Err(EvalError::Recur(recur_args));
+            None
+        }
+        Err(other) => Some(other),
+    };
+
+    if let Some(err) = err_opt {
+        let thrown_val = match err {
+            EvalError::Thrown(v) => v,
+            ref other => cljrs_interp::special::eval_error_to_value(other),
+        };
+        let mut handled = false;
+        for c in &catches {
+            if cljrs_interp::special::catch_type_matches(c.type_sym, &thrown_val) {
+                env.push_frame();
+                env.bind(std::sync::Arc::from(c.binding), thrown_val.clone());
+                result = eval_body_async(c.body, env).await;
+                env.pop_frame();
+                handled = true;
+                break;
+            }
+        }
+        if !handled {
+            // No matching catch — re-throw.
+            result = Err(EvalError::Thrown(thrown_val));
+        }
+    }
+
+    // Always run finally (its value is discarded).
+    if !fin_body.is_empty() {
+        let _ = eval_body_async(fin_body, env).await;
+    }
+
+    result
 }
 
 /// `(if test then else?)` with a yielding test and selected branch.
