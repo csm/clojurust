@@ -4919,8 +4919,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                 let timeout_val = args[2].clone();
                 let guard = f.get().state.lock().unwrap();
                 match &*guard {
-                    FutureState::Done(v) => Ok(v.clone()),
-                    FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
+                    FutureState::Done(v) => {
+                        f.get().mark_observed();
+                        Ok(v.clone())
+                    }
+                    FutureState::Failed(v) => {
+                        f.get().mark_observed();
+                        Err(ValueError::Thrown(v.clone()))
+                    }
                     FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
                     FutureState::Running => {
                         let (guard, _) = f
@@ -4929,8 +4935,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
                             .unwrap();
                         match &*guard {
-                            FutureState::Done(v) => Ok(v.clone()),
-                            FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
+                            FutureState::Done(v) => {
+                                f.get().mark_observed();
+                                Ok(v.clone())
+                            }
+                            FutureState::Failed(v) => {
+                                f.get().mark_observed();
+                                Err(ValueError::Thrown(v.clone()))
+                            }
                             FutureState::Cancelled => {
                                 Err(ValueError::Other("future was cancelled".into()))
                             }
@@ -4942,8 +4954,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                 let mut guard = f.get().state.lock().unwrap();
                 loop {
                     match &*guard {
-                        FutureState::Done(v) => return Ok(v.clone()),
-                        FutureState::Failed(v) => return Err(ValueError::Thrown(v.clone())),
+                        FutureState::Done(v) => {
+                            f.get().mark_observed();
+                            return Ok(v.clone());
+                        }
+                        FutureState::Failed(v) => {
+                            f.get().mark_observed();
+                            return Err(ValueError::Thrown(v.clone()));
+                        }
                         FutureState::Cancelled => {
                             return Err(ValueError::Other("future was cancelled".into()));
                         }

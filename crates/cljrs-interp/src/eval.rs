@@ -294,8 +294,14 @@ pub fn deref_value(v: Value) -> EvalResult {
             let mut guard = f.get().state.lock().unwrap();
             loop {
                 match &*guard {
-                    FutureState::Done(v) => return Ok(v.clone()),
-                    FutureState::Failed(v) => return Err(EvalError::Thrown(v.clone())),
+                    FutureState::Done(v) => {
+                        f.get().mark_observed();
+                        return Ok(v.clone());
+                    }
+                    FutureState::Failed(v) => {
+                        f.get().mark_observed();
+                        return Err(EvalError::Thrown(v.clone()));
+                    }
                     FutureState::Cancelled => {
                         return Err(EvalError::Runtime("future was cancelled".into()));
                     }

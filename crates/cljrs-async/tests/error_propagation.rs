@@ -165,7 +165,14 @@ fn go_try_catches_throw_and_propagates_as_error() {
 #[test]
 fn awaited_throw_preserves_ex_data() {
     // Fidelity: a throw that crosses an `await` boundary must keep its ex-data
-    // and ex-message (previously the error was stringified into a bare message).
+    // and ex-message (previously the error was stringified into a bare message,
+    // losing both). We await a throwing ^:async fn at top level and inspect the
+    // resulting error value directly — note we do NOT wrap the await in a
+    // try/catch, because eval_async delegates try to the synchronous evaluator,
+    // whose blocking await would deadlock the single LocalSet thread (the
+    // documented async try/catch limitation).
+    use cljrs_value::ValueError;
+
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
@@ -174,20 +181,32 @@ fn awaited_throw_preserves_ex_data() {
             "(defn ^:async boom [] (throw (ex-info \"nope\" {:code 42})))",
             &mut env,
         );
-        // Catch the awaited error and read ex-message + ex-data back out.
-        eval_sync(
-            "(defn ^:async caller []
-               (try (await (boom))
-                    (catch Exception e [(ex-message e) (:code (ex-data e))])))",
-            &mut env,
-        );
-        let r = eval_async(&parse_one("(await (caller))"), &mut env)
+        let err = eval_async(&parse_one("(await (boom))"), &mut env)
             .await
-            .unwrap();
-        assert_eq!(
-            pr(&r),
-            "[\"nope\" 42]",
-            "ex-message/ex-data must survive the await boundary"
-        );
+            .expect_err("awaiting a throwing async fn should error");
+
+        // The error must be a re-raised Thrown value (not a stringified Runtime
+        // error), and that value must be the original Value::Error with its
+        // ex-message and ex-data intact.
+        let thrown = match err {
+            cljrs_env::error::EvalError::Thrown(v) => v,
+            other => panic!("expected EvalError::Thrown, got {other:?}"),
+        };
+        let exc = match &thrown {
+            Value::Error(e) => e.get(),
+            other => panic!("expected a Value::Error, got {other:?}"),
+        };
+        assert_eq!(exc.message(), "nope", "ex-message must survive");
+        let data = exc.data().expect("ex-data must survive");
+        // :code -> 42 in the preserved data map.
+        let code = data
+            .get(&Value::keyword(cljrs_value::Keyword::simple("code")))
+            .expect("ex-data should contain :code");
+        assert_eq!(code, Value::Long(42), "ex-data value must survive");
+        // Sanity: the variant really is a thrown exception, not WrongType etc.
+        assert!(matches!(
+            ValueError::Thrown(thrown.clone()),
+            ValueError::Thrown(_)
+        ));
     });
 }

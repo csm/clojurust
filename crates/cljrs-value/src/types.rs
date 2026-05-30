@@ -939,6 +939,10 @@ pub enum FutureState {
 pub struct CljxFuture {
     pub state: Mutex<FutureState>,
     pub cond: Condvar,
+    /// Set once a consumer has read the settled result (via `await`/`deref`).
+    /// Used to warn about a `Failed` future that is discarded without anyone
+    /// ever observing its error (the fire-and-forget footgun).
+    observed: std::sync::atomic::AtomicBool,
 }
 
 impl CljxFuture {
@@ -946,6 +950,7 @@ impl CljxFuture {
         Self {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
+            observed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -957,6 +962,39 @@ impl CljxFuture {
     /// True if explicitly cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+    }
+
+    /// Mark this future's result as observed. Call when a consumer reads the
+    /// settled value (`await`/`deref`), so a later drop doesn't warn about an
+    /// unobserved error.
+    pub fn mark_observed(&self) {
+        self.observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for CljxFuture {
+    fn drop(&mut self) {
+        // Warn if a future failed but nobody ever observed the error — the
+        // fire-and-forget case where a thrown error would otherwise vanish.
+        // Tied to GC sweep timing: only fires once the future is unreachable,
+        // so a not-yet-awaited (still reachable) failed future won't warn.
+        //
+        // SAFETY: this Drop can run during GC sweep. The thrown value held in
+        // `Failed(v)` is itself a GC value whose backing box may be freed in
+        // the *same* sweep, so we must NOT dereference it here (no `{v}`). We
+        // only inspect the state discriminant, which is inline in our own
+        // (still-valid) allocation.
+        if !self.observed.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(state) = self.state.lock() {
+                if matches!(&*state, FutureState::Failed(_)) {
+                    eprintln!(
+                        "[clojurust warning] a failed future was discarded without its error \
+                         being observed (no await/deref); the thrown exception was lost"
+                    );
+                }
+            }
+        }
     }
 }
 
