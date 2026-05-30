@@ -33,8 +33,10 @@ use cljrs_value::{
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+type Builtin = fn(&[Value]) -> ValueResult<Value>;
+
 pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
-    let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
+    let fns: Vec<(&str, Arity, Builtin)> = vec![
         ("connect", Arity::Fixed(1), builtin_connect),
         ("close", Arity::Fixed(1), builtin_close),
     ];

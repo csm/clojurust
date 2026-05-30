@@ -70,11 +70,10 @@ fn test_connect_send_recv_close() {
         // Spawn the echo server (uses only Tokio/std types — no LocalSet required).
         tokio::task::spawn_local(run_echo_server(listener));
 
-        let globals = setup_globals();
+        let _globals = setup_globals();
 
         // TCP connect — returns a promise channel.
-        let promise =
-            cljrs_net::tcp::connect_to("127.0.0.1", port, 8, 8);
+        let promise = cljrs_net::tcp::connect_to("127.0.0.1", port, 8, 8);
 
         // Await the promise channel (drive the LocalSet while waiting).
         let conn_val = chan_of(&promise).take().await;
@@ -119,7 +118,10 @@ fn test_connect_send_recv_close() {
             }
         }
 
-        assert_eq!(response, request, "echo server must echo back the same bytes");
+        assert_eq!(
+            response, request,
+            "echo server must echo back the same bytes"
+        );
     });
 }
 
@@ -142,7 +144,8 @@ fn test_connect_failure_delivers_error() {
         let result = chan_of(&promise).take().await;
         assert!(
             matches!(result, Value::Error(_)),
-            "expected Value::Error for refused connection, got {}", result.type_name()
+            "expected Value::Error for refused connection, got {}",
+            result.type_name()
         );
     });
 }
