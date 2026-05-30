@@ -98,7 +98,18 @@ blocking bridge is a later phase.
 /// Must be called inside a Tokio LocalSet context for spawned tasks to run.
 pub fn init(globals: &Arc<GlobalEnv>);
 
+/// Re-exports for sibling native crates (e.g. cljrs-io) that drive their own
+/// work onto the shared LocalSet executor.
+pub use eval_async::{await_value, spawn_future};
+
 pub mod eval_async {
+    /// Spawn `task` on the current LocalSet and return a `Value::Future` that
+    /// settles when it completes. The shared delivery point for async primitives;
+    /// public so other native crates can produce results through the same path.
+    pub fn spawn_future<F>(task: F) -> Value
+    where
+        F: Future<Output = Result<Value, EvalError>> + 'static;
+
     /// Drive an ^:async fn body to completion, yielding at every await.
     pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env)
         -> Result<Value, EvalError>;
@@ -121,6 +132,12 @@ pub mod channel {
     impl CljChannel {
         /// Create a channel. `capacity == 0` is an unbuffered rendezvous channel.
         pub fn new(capacity: usize) -> Self;
+        /// Async put: yield to the LocalSet until the value is accepted (buffered
+        /// or handed off). `true` on success, `false` if the channel is closed.
+        /// The building block other crates use to stream produced values.
+        pub async fn put(&self, v: Value) -> bool;
+        /// Close the channel (idempotent). Buffered values still drain to takers.
+        pub fn close(&self);
         /// Block the calling OS thread until a value is available (or channel closes → nil).
         /// Uses Condvar with a 1 ms timeout to avoid deadlock on the LocalSet thread.
         pub fn take_blocking(&self) -> Value;

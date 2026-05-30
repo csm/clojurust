@@ -188,35 +188,8 @@ fn builtin_take(args: &[Value]) -> ValueResult<Value> {
 fn builtin_put(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     let val = args.get(1).cloned().unwrap_or(Value::Nil);
-    let rendezvous = chan_ref(ch.get()).is_rendezvous();
     Ok(spawn_future(async move {
-        if rendezvous {
-            // Phase 1: place the value into the channel's single slot.
-            let token = loop {
-                match chan_ref(ch.get()).rv_offer(&val) {
-                    RvOffer::Offered(t) => break t,
-                    RvOffer::Closed => return Ok(Value::Bool(false)),
-                    RvOffer::Full => {}
-                }
-                tokio::task::yield_now().await;
-            };
-            // Phase 2: wait for a taker to consume it (the handoff).
-            loop {
-                match chan_ref(ch.get()).rv_status(token) {
-                    RvStatus::Taken => return Ok(Value::Bool(true)),
-                    RvStatus::ClosedUntaken => return Ok(Value::Bool(false)),
-                    RvStatus::Waiting => {}
-                }
-                tokio::task::yield_now().await;
-            }
-        } else {
-            loop {
-                if let Some(accepted) = chan_ref(ch.get()).try_put_buffered(&val) {
-                    return Ok(Value::Bool(accepted));
-                }
-                tokio::task::yield_now().await;
-            }
-        }
+        Ok(Value::Bool(chan_ref(ch.get()).put(val).await))
     }))
 }
 

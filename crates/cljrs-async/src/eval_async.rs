@@ -32,8 +32,12 @@ use cljrs_value::{
 /// task settles on completion. The single delivery point for every async
 /// primitive (`^:async` calls, `timeout`, `alts`).
 ///
+/// Public so other native crates (e.g. `cljrs-io`) can drive their own async
+/// work onto the shared executor and deliver results through the same `Future`
+/// machinery.
+///
 /// Must be called from within a Tokio `LocalSet` context.
-pub(crate) fn spawn_future<F>(task: F) -> Value
+pub fn spawn_future<F>(task: F) -> Value
 where
     F: Future<Output = EvalResult> + 'static,
 {

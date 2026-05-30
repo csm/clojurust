@@ -142,6 +142,7 @@ cljrs deps status              # show cached vs missing deps
 
 | Feature             | Effect                                                                        |
 |---------------------|-------------------------------------------------------------------------------|
+| `async` (default **on**) | Pulls in `cljrs-async` and `cljrs-io` and builds the Tokio runtime that drives top-level async evaluation (see implementation notes). Without it, `^:async`/`core.async`/`clojure.rust.io.async` are unavailable and evaluation is purely synchronous. |
 | `no-gc` (default off) | Propagated to `cljrs-gc`/`cljrs-value`/`cljrs-eval`/`cljrs-compiler`/`cljrs-runtime`/`cljrs-stdlib`.  Disables the tracing GC; only region-allocated and stack values are permitted.  Compiles fail (`AotError::NoGcBlacklist`) if the program contains allocations the optimizer can't lift onto regions. |
 | `enable-rustyline`  | Pulls in `rustyline` for a line-editing REPL.  Without it, `cljrs repl` falls back to a plain `BufRead` loop.                                                                                |
 
@@ -155,6 +156,7 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 - The miette error hook is installed at startup so `CljxError` propagated to `main` renders with terminal-linked source snippets.
 - A worker thread is spawned with the configured stack size to run the actual command; the main thread only handles signal/exit setup.
 - The REPL prints results, paginates errors via `miette`, and persists multi-line input across blank prompts.
+- **Top-level async (with the `async` feature).** `main` builds a single-threaded Tokio runtime + `LocalSet` and stashes it in a thread-local `AsyncDriver` rather than wrapping the whole session in one `block_on`. Each top-level form is then evaluated through `cljrs_async::eval_async` via `LocalSet::block_on` in `eval_form`, so spawned tasks (core.async producers, `^:async` calls, `clojure.rust.io.async` readers/writers) make progress and a top-level `await` resolves. Tasks that outlive a form — e.g. a channel `def`d at one REPL prompt and consumed at the next — stay queued on the shared `LocalSet` and continue on the next form's drive. Note: blocking ops (`<!!`/`>!!`) still park the single executor thread and so are not usable at the top level; use `(await (take! ch))` / `go` instead.
 - `ir-viz` runs the AOT pipeline through region optimization (via `cljrs_compiler::aot::lower_file_to_ir`) and hands the resulting `IrFunction` to `cljrs_ir_viz::render_html`.
 
 ---
@@ -173,6 +175,9 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 | `cljrs-compiler` (workspace)| AOT pipeline (`compile_file`, `compile_test_harness`, `lower_file_to_ir`) |
 | `cljrs-ir-viz` (workspace)  | HTML IR visualizer used by `ir-viz`                                |
 | `cljrs-interop` (workspace) | Rust ↔ Clojure FFI                                                |
+| `cljrs-async` (workspace, optional) | `clojure.core.async` runtime + `eval_async`; enabled by `async`  |
+| `cljrs-io` (workspace, optional) | `clojure.rust.io.async` async file I/O; enabled by `async`       |
+| `tokio` (workspace, optional) | Single-threaded runtime + `LocalSet` driving async; enabled by `async` |
 | `cljrs-logging` (workspace) | `--debug` / `--trace` / `-X` flag handling                        |
 | `cljrs-deps` (workspace)    | `cljrs.edn` parser; `DepsConfig` / `Dependency` types             |
 | `cljrs-vcs` (workspace)     | Git subprocess helpers: `fetch_remote`, `cache_path_for_url`      |
