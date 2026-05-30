@@ -101,21 +101,71 @@ inherits from choosing core.async over a Manifold-style stream.
 
 ---
 
-## Execution Model
+## Execution Model — a worker pool, not a single thread
 
-Identical to `cljrs-async`/`cljrs-io`: everything runs on the single-thread Tokio `current_thread`
-+ `LocalSet` executor. Per connection, `cljrs-net` spawns (via `spawn_future`) two tasks:
+A single `LocalSet` thread is a demo, not a server: one interpreter thread cannot use more than
+one core, so meaningful concurrent serving needs real worker threads. The good news is that the
+GC already supports this — see Phase H below. The networking layer is designed against a
+**worker pool** from the start.
 
-1. a **reader task** — `socket.read()` into a plain `Vec<u8>` (which is `Send`), convert to a
-   `byte-array` `Value` **on the executor thread**, `put!` to `:in`, repeat until EOF/error.
-2. a **writer task** — `<!` from `:out`, write the bytes to the socket, repeat until `:out`
-   closes, then shut down the write half.
+### What the GC already allows
 
-The `Vec<u8> → byte-array` conversion happens on the GC thread because byte-arrays are `!Send`
-GC values and cannot be constructed off-thread. Keeping socket I/O on the LocalSet is the
-simplest correct design and matches `cljrs-io`. The fallback if TLS crypto throughput on the
-interp thread ever bites (read on a worker pool, ship `Vec<u8>` across, build the byte-array on
-the GC thread) is recorded under "Future Work" — not built now.
+The single-thread `LocalSet` in today's `cljrs-async` is an *async-runtime* choice
+(`current_thread` + `LocalSet` lets eval futures hold `GcPtr`s across `await` without being
+`Send`), **not** a GC limitation. The collector is already a *shared-heap, multi-mutator,
+stop-the-world* design:
+
+- one global `Mutex`-guarded `GcHeap` static (`cljrs-gc/src/lib.rs`); allocation across threads is
+  already serialized and sound;
+- `cljrs_gc::register_mutator()` exists and is already called per thread
+  (`crates/cljrs/src/main.rs:291`, plus test harnesses that `thread::spawn`);
+- `begin_stw()` (`cljrs-env/src/gc_roots.rs`) parks **all** registered mutators at safepoints and
+  traces **each** thread's thread-local root stack;
+- `GlobalEnv` is `Arc`-shared with `RwLock`/`Mutex`-guarded namespace tables, so all threads see
+  the same defs.
+
+So multiple OS threads can each run an interpreter against the same heap today. `GcPtr`'s
+`unsafe impl Send + Sync` is sound **under one discipline**: every thread that holds `GcPtr`s is a
+registered mutator that reaches safepoints, and every live value stays reachable from some traced
+root. Cross-thread dereference races are prevented *by* STW — during mark/sweep every mutator is
+parked. The only real hazard is a thread holding `GcPtr`s that never registers / never safepoints.
+
+### The model: shared-heap, pinned-connection workers
+
+`cljrs-async` grows a **worker pool** (Phase H): `W` worker OS threads (default ≈ core count),
+each running its own `current_thread` runtime + `LocalSet`, each a registered mutator, all sharing
+the one heap and one `Arc<GlobalEnv>`. This is the nginx-workers / BEAM-schedulers shape, but with
+a shared heap.
+
+- **Connections are pinned to a worker.** A raw socket FD is an integer — it *is* `Send`. An
+  accept path (a dedicated accept task, or `SO_REUSEPORT` with one listener per worker) hands the
+  FD to a worker, which builds the `TcpStream` + `:in`/`:out` channels **in its own `LocalSet`**.
+  Thereafter that connection's bytes, framing, and handler all run on that worker — so in steady
+  state **no `GcPtr` crosses threads** and per-worker futures stay `!Send`/local.
+- **Per connection**, the owning worker spawns two tasks (via `spawn_future`):
+  1. a **reader task** — `socket.read()` into a plain `Vec<u8>` (`Send`), convert to a `byte-array`
+     `Value` **on that worker thread** (byte-arrays are `!Send` GC values, built on the heap by a
+     registered mutator), `put!` to `:in`, until EOF/error;
+  2. a **writer task** — `<!` from `:out`, write to the socket, until `:out` closes, then shut down
+     the write half.
+- **Cross-worker handoff** (when a value must move between workers) goes through a channel. A
+  `GcPtr` value put by worker A and taken by worker B is safe because collection is STW (both are
+  parked during mark/sweep) **provided `CljChannel`'s `Trace` walks its buffer** so buffered values
+  stay rooted — verify this as part of Phase H. Tokio wakers are `Send`, so waking a parked
+  take/put task on another worker's runtime works.
+
+### The two ceilings (named honestly)
+
+1. **Global STW.** Every worker must reach a safepoint before any collection runs. I/O `await`
+   points are safepoints, so I/O-bound serving is fine, but a long CPU-bound native/FFI call with
+   no safepoint polling stalls GC for *all* workers. Long native calls must poll safepoints.
+2. **The single global heap mutex is the allocation bottleneck.** Every `GcPtr::new` locks the one
+   heap; at high allocation rates across many cores this serializes. The first scaling lever is
+   **thread-local allocation buffers (TLABs)**: a per-worker bump region that hits the global lock
+   only to refill. The endgame for linear scaling is **share-nothing workers** (per-worker heap,
+   no shared alloc lock, no global STW, cross-worker messages copied) — a `cljrs-gc` refactor
+   deferred to Future Work. The pinned-connection + channel-handoff design here is already the
+   share-nothing message-passing shape, so it ports forward unchanged.
 
 ---
 
@@ -271,6 +321,36 @@ same channel-of-connections server as TCP — only the address is a filesystem p
 
 ---
 
+## Phase H — Worker pool (the part that makes it not a toy)
+
+This phase lives in **`cljrs-async`**, not `cljrs-net` — it is the executor change that lets every
+preceding phase use more than one core. It can land before or in parallel with A–G; A–G are written
+to a per-worker `LocalSet` so they don't change when the pool arrives.
+
+- **Pool runtime.** Replace the single `current_thread` + `LocalSet` driver with `W` worker OS
+  threads (default ≈ available parallelism, configurable), each its own `current_thread` runtime +
+  `LocalSet`. Each worker calls `cljrs_gc::register_mutator()` on startup and runs to shutdown.
+- **Work distribution for sockets.** Either a dedicated accept task that round-robins / least-loaded
+  hands accepted **FDs** (which are `Send`) to workers over an mpsc, or `SO_REUSEPORT` with one
+  listener bound per worker so the kernel load-balances. The accepting code builds the
+  `TcpStream`/channels *on the destination worker's* `LocalSet`.
+- **Pinning.** Each connection's reader/writer/handler tasks stay on the worker that owns it; the
+  `{:in :out}` channels and all its byte-arrays are allocated and consumed on that one thread.
+- **Cross-worker channels.** Sending a value between workers is allowed and STW-safe; the work item
+  is to **audit `CljChannel::Trace`** so a value sitting in a channel buffer is traced (kept alive)
+  regardless of which worker collects, and to confirm cross-runtime wakeups behave (they do —
+  wakers are `Send`).
+- **Safepoint coverage.** Ensure long native calls reachable from the network path poll safepoints
+  so one busy worker can't stall global STW (ties into the existing `cljrs-async` GC-service task).
+
+**Explicitly deferred (Future Work):** TLABs to relieve the global heap mutex, and share-nothing
+per-worker heaps for linear scaling. Both are `cljrs-gc` changes, not networking ones.
+
+**Done when:** an echo/line server saturates multiple cores under concurrent clients (load spread
+across workers), with GC STW pauses correctly parking and tracing every worker.
+
+---
+
 ## Phase G — Lifecycle, timeouts, ergonomics
 
 - **Deterministic teardown.** A `with-open`-style binding macro (or reuse an existing one) so a
@@ -289,9 +369,10 @@ same channel-of-connections server as TCP — only the address is a filesystem p
 
 ## Key Design Constraints
 
-- **All socket I/O on the single-thread `!Send` LocalSet.** Byte-arrays are `!Send` GC values;
-  they are constructed on the executor thread from `Send` `Vec<u8>` buffers. Inherited from
-  `cljrs-async`/`cljrs-io`.
+- **Socket I/O runs on a pool of per-worker `LocalSet`s, not one thread** (Phase H). Each
+  connection is pinned to a worker; byte-arrays (`!Send` GC values) are built on that worker from
+  `Send` `Vec<u8>` buffers. The single-thread executor is an async-runtime default, not a GC limit —
+  the GC is already a shared-heap, multi-mutator, STW collector (`register_mutator`/`begin_stw`).
 - **Sockets are `Resource` (Arc), never `GcPtr`.** Deterministic close; no FD leaks. The GC has no
   finalizers. `resource.rs` already anticipates this.
 - **Backpressure is channel-native.** Bounded `:in`/`:out`/`:conns` buffers translate directly to
@@ -320,14 +401,21 @@ same channel-of-connections server as TCP — only the address is a filesystem p
 | E | TLS client + server via `rustls`/`tokio-rustls` (same `{:in :out}` shape) | A, B |
 | F | Unix-domain stream sockets (`#[cfg(unix)]`) | A, B |
 | G | Lifecycle: `with-open`, timeouts, half-close, error/EOF split helper | A–F |
+| H | **Worker pool** in `cljrs-async`: `W` per-worker `LocalSet`s, FD handoff, pinned connections, `CljChannel::Trace` audit | `cljrs-gc` STW (exists); parallel with A–G |
+
+Phase H is the multicore enabler and the one cross-crate change (it lives in `cljrs-async`). A–G
+are written against a per-worker `LocalSet` so they are unaffected by when H lands.
 
 ---
 
 ## Future Work (not in scope now)
 
-- Off-thread socket I/O with a worker pool feeding `Vec<u8>` to the GC thread, if TLS crypto
-  throughput on the interp thread becomes a bottleneck.
+- **TLABs** (thread-local allocation buffers) to relieve the single global heap mutex once the
+  worker pool is allocation-bound; a `cljrs-gc` change.
+- **Share-nothing per-worker heaps** (the BEAM/Ractor endgame) for linear scaling — de-globalize
+  the `static HEAP`, drop the shared alloc lock and global STW, copy cross-worker messages. Larger
+  `cljrs-gc` refactor; the pinned-connection + channel-handoff design ports to it unchanged.
 - Higher-level protocol crates built on `cljrs-net`: HTTP/1.1, WebSocket, HTTP/2 (the aleph stack),
   each as a separate crate consuming the `{:in :out}` connection + framing layer.
 - Connection pooling and a client-side reconnect/backoff helper.
-- `SO_*` socket options (keepalive, nodelay, reuseaddr) on the `connect`/`listen` opts maps.
+- `SO_*` socket options (keepalive, nodelay, reuseaddr, reuseport) on the `connect`/`listen` opts.
