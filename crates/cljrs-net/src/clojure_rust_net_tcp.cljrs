@@ -1,0 +1,8 @@
+;; clojure.rust.net.tcp — TCP client/server.
+;;
+;; Phase A (client):
+;;   connect  — (connect {:host h :port p}) => promise-chan -> conn-map
+;;   close    — (close conn) => nil
+;;
+;; The native functions are registered by cljrs-net; this file may add
+;; Clojure-level helpers on top as later phases are implemented.

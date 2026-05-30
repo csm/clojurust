@@ -253,6 +253,22 @@ impl CljChannel {
         }
     }
 
+    /// Asynchronously take a value from the channel, cooperatively yielding to
+    /// the `LocalSet` executor until a value is available or the channel closes.
+    /// Returns `Value::Nil` when the channel is closed and drained.
+    ///
+    /// This is the async counterpart to [`Self::take_blocking`] and the
+    /// building block other native crates use to consume channel values.
+    /// Must run within a Tokio `LocalSet` context.
+    pub async fn take(&self) -> Value {
+        loop {
+            if let Some(v) = self.try_take() {
+                return v;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Asynchronously put `v` onto the channel, cooperatively yielding to the
     /// `LocalSet` executor until the value is accepted — buffered (capacity >= 1)
     /// or handed off to a taker (rendezvous). Resolves `true` on success, or

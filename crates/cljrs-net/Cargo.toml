@@ -1,0 +1,21 @@
+[package]
+name = "cljrs-net"
+version = "0.1.0"
+edition = "2024"
+description = "TCP/Unix/TLS networking for clojurust — channel-oriented sockets over core.async"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-types    = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-interp   = { workspace = true }
+cljrs-async    = { workspace = true }
+tokio          = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+cljrs-stdlib   = { workspace = true }
+tokio          = { workspace = true, features = ["net", "io-util", "sync"] }

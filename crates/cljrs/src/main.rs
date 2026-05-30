@@ -481,6 +481,8 @@ fn setup_globals(
         let init = |g: &Arc<GlobalEnv>| {
             cljrs_async::init(g);
             cljrs_io::init(g);
+            #[cfg(feature = "net")]
+            cljrs_net::init(g);
         };
         match guard.as_ref() {
             Some(drv) => drv.local.block_on(&drv.rt, async { init(&globals) }),
