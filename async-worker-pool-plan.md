@@ -69,28 +69,81 @@ instances and a shared immortal arena underneath.**
 
 ---
 
-## The hard part, stated honestly: shared vars/atoms vs share-nothing
+## Guiding principle: pure-Clojure compatibility is not a constraint
 
-Clojure's **vars and atoms are globally shared mutable references**; the isolate model is
-share-nothing. This is the central tension and it determines whether the result "feels like Clojure."
-Three options, to be decided before Model B is built:
+clojurust does **not** aim to reproduce JVM-Clojure's concurrency semantics bit-for-bit. Where an
+honest separation of concerns conflicts with Clojure compatibility, separation wins, and we add
+new primitives on top where they make sense. The two-tier atom below is the first concrete
+application of this: rather than force one `atom` to satisfy both fast local use *and* cross-isolate
+sharing, we keep `atom` local-and-fast and add `shared-atom` as an explicit, separate tool.
 
-1. **Arena-promote on publish.** Var root values and atom contents must be *shareable* — deeply
-   immutable with no isolate-local pointers — and are copied into the shared static arena on
-   `def`/`reset!`. Reads from any isolate are then safe. Cost: every published value is copied once
-   into the arena; non-shareable values (e.g. one holding a native resource) can't be published.
-2. **Confine + message-pass.** Atoms/refs are owned by an isolate; cross-isolate access goes through
-   messages (un-Clojure-like, but pure share-nothing — the BEAM/ETS model).
-3. **Hybrid (recommended starting point).** *Immortal* shared state — code (compiled fns,
-   namespaces), interned keywords/symbols, and large `byte-array` blobs — lives in the static arena
-   and is referenced everywhere with no copy. *User-level mutable* state (atoms) starts
-   **isolate-confined**, with an explicit `shared-atom` (arena-promoted, copy-on-publish) for the
-   cases that genuinely need cross-isolate sharing. Vars: root bindings are arena-promoted (option 1)
-   since `def` is comparatively rare and global by nature; dynamic `binding` is already thread-local
-   and maps cleanly to per-isolate.
+---
 
-This is the one place the model can go wrong in a way that's expensive to undo, so it gets resolved
-explicitly (an ADR) before Phase B2.
+## ADR: vars/atoms across isolates — two-tier, decided
+
+Clojure's vars and atoms are globally-shared mutable references; the isolate model is share-nothing.
+**Resolved (this is no longer open):** a **two-tier** design, with `Arc` providing the shared cell
+and a `Send + Sync` value representation providing the shared contents.
+
+### Tier 1 — `atom` (isolate-local, the fast common case)
+
+Unchanged from today: a GC-heap-backed `Mutex<Value>` confined to one isolate. Bump-allocated,
+no refcount churn, `!Send` like everything else in an isolate. This is what `(atom …)` returns.
+
+### Tier 2 — `shared-atom` (explicit, cross-isolate)
+
+A new primitive for genuinely shared mutable state:
+
+```
+SharedAtom  = Arc<ArcSwap<SharedValue>>          ; Send + Sync; lock-free cross-isolate CAS
+SharedValue = immediate                           ; long/double/bool/nil/char — no allocation
+            | Arc<…>                               ; refcounted, acyclic, immutable structure
+            | ResourceHandle | static-arena ref    ; existing Send+Sync escape hatches
+```
+
+- **Cell:** `Arc<ArcSwap<…>>` gives identity, lifetime, and **lock-free atomic `swap!`/`reset!`**
+  across isolates — exactly an atom's CAS-retry semantics, off the shelf.
+- **Contents:** must be `Send + Sync`. Immutable persistent collections are **acyclic DAGs**, so
+  plain `Arc` refcounting is sufficient and leak-free — no tracing GC needed for shared values. This
+  reuses the pattern already in the tree: `ResourceHandle` is `Arc<dyn Resource>` and `static_arena`
+  is program-lifetime `Send + Sync`; `SharedValue` is the third instance of "an Arc/arena thing
+  beside the GC, not inside it."
+- **`Value` gains a shared variant** that points at a `SharedValue` (the same way `Value::Resource`
+  wraps an `Arc`), so both isolates' interpreters read it directly — no copy on read; `deref` is an
+  atomic refcount bump.
+- **Promote-on-publish:** `swap!`/`reset!` deep-copy any isolate-local parts of the new value into
+  `SharedValue` form before the atomic store (zero-copy if already shared). Reads are cheap.
+
+### Constraints (all the same "plain data only" rule)
+
+1. **Transitive shareability.** Everything reachable from a `shared-atom` must be shareable:
+   immediates + Arc/arena data. Values holding a **closure that captured isolate-local state** or a
+   **native resource bound to one isolate** cannot be published — same rule as message-copying.
+2. **Cycles leak.** Pure `Arc` refcounting leaks cycles, and a `shared-atom` holding another mutable
+   ref could build one. **Start by restricting `shared-atom` to hold immutable acyclic data only**
+   (no embedded refs/closures); revisit with a small dedicated collector for the shared tier only if
+   ref-holding-ref is ever needed.
+3. **Promotion cost** is paid once on publish; reads are cheap. Local `atom` avoids all of it.
+
+### Vars
+
+A var's root binding is the same shape as a shared mutable cell, so it uses the **same mechanism**:
+`Arc<ArcSwap<SharedValue>>`, promote-on-`def`. `def` is comparatively rare and global by nature, so
+the promotion cost is acceptable. Dynamic `binding` is already thread-local and maps directly to
+per-isolate — no change.
+
+### Immortal shared state (orthogonal, also decided)
+
+Code (compiled fns, namespaces), interned keywords/symbols, and large `byte-array` blobs live in the
+shared **static arena** and are referenced from every isolate with **no copy** (see B3). This is
+separate from the atom tiers and not in tension with anything.
+
+### Rejected alternative
+
+**Uniform Arc-backed atoms** (one tier, all atoms cross-isolate-capable). Rejected: every atom would
+pay refcounting + promotion and lose GC bump-allocation speed, and the cyclic-leak problem would
+become universal rather than confined to an opt-in primitive. The two-tier split keeps the common
+case fast and makes sharing an explicit, honest choice.
 
 ---
 
@@ -164,8 +217,8 @@ receiver's heap, verified independently collectable on both sides.
   **namespaces/compiled fns** live there too — all isolates run the same code with zero copy.
 - Large **`byte-array` blobs** can be arena-allocated and refcounted (the BEAM off-heap-binary
   trick) so big payloads are shared, not copied, across the boundary.
-- Resolve vars/atoms per the "hard part" ADR (start: hybrid — immortal shared code/keywords,
-  isolate-confined atoms + explicit `shared-atom`).
+- Implement the two-tier atoms / `shared-atom` / var-root mechanism per the ADR above
+  (`Arc<ArcSwap<SharedValue>>`, promote-on-publish; local `atom` stays GC-backed).
 
 **Done when:** isolates share code and keyword identity through the arena and only per-request
 mutable state is copied at the boundary.
@@ -198,7 +251,7 @@ actionable.
 | B1 | Per-isolate heaps; independent parallel collection; arena pointers skipped via `is_static_addr` | `cljrs-gc`, `cljrs-async` |
 | B2 | Copy/structured-clone boundary; `Send`-token handoff for resources (the `cljrs-net` seam) | `cljrs-async`, `cljrs-value` |
 | B3 | Shared static arena for code, interned keywords/symbols, refcounted blobs | `cljrs-gc`, `cljrs-value`, `cljrs-env` |
-| — | **ADR (before B2):** vars/atoms reconciliation (hybrid: immortal-shared + isolate-confined + `shared-atom`) | design |
+| — | **ADR (decided):** two-tier atoms — local `atom` (GC-backed) + `shared-atom`/var-root (`Arc<ArcSwap<SharedValue>>`, promote-on-publish) | design |
 
 A1+A2 (Model A) ship a safe, faster, `unsafe`-free runtime on their own. B1–B3 (Model B) add
 parallel collection and multicore Clojure execution.
@@ -207,7 +260,9 @@ parallel collection and multicore Clojure execution.
 
 ## Risks & open questions
 
-- **Vars/atoms vs share-nothing** — the central one (above); resolved by ADR before B2.
+- **Vars/atoms vs share-nothing** — *decided* (two-tier ADR above). Residual risks are narrow:
+  cycle leaks in the shared tier (mitigated by restricting `shared-atom` to acyclic immutable data)
+  and promotion cost on publish (mitigated by the shared static arena + work pinning).
 - **`future`/`agent` behavior change** — parallel→loop-async in Model A; re-parallelized via isolates
   in Model B. Document clearly; it diverges from JVM Clojure's thread-per-future.
 - **De-globalizing `HEAP`** — touches every allocation site; the thread-local root stacks already
