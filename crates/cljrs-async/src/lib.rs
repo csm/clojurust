@@ -31,6 +31,11 @@ pub use eval_async::{await_value, spawn_future};
 /// on top of the native primitives at `init` time.
 const CORE_ASYNC_SOURCE: &str = include_str!("core_async.cljrs");
 
+/// Error-value helpers (`error?`, `ok?`, `throw-err`) shared by the
+/// channel-based APIs. Loaded as `clojure.rust.error` before `clojure.core.async`
+/// so the `<?` family can refer to `throw-err`.
+const ERROR_SOURCE: &str = include_str!("clojure_rust_error.cljrs");
+
 /// Register the async runtime with the interpreter and load the
 /// `clojure.core.async` namespace.
 ///
@@ -39,6 +44,14 @@ const CORE_ASYNC_SOURCE: &str = include_str!("core_async.cljrs");
 pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
     globals.set_async_runtime(Arc::new(AsyncRuntimeImpl::new()));
     runtime::spawn_gc_service();
+
+    // clojure.rust.error first — the <? family refers its `throw-err`.
+    if !globals.is_loaded("clojure.rust.error") {
+        globals.get_or_create_ns("clojure.rust.error");
+        globals.refer_all("clojure.rust.error", "clojure.core");
+        load_source(globals, "clojure.rust.error", ERROR_SOURCE);
+        globals.mark_loaded("clojure.rust.error");
+    }
 
     let ns = "clojure.core.async";
     if globals.is_loaded(ns) {
@@ -50,20 +63,24 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
     globals.get_or_create_ns(ns);
     globals.refer_all(ns, "clojure.core");
     builtins::register(globals, ns);
+    load_source(globals, ns, CORE_ASYNC_SOURCE);
+    globals.mark_loaded(ns);
+}
 
+/// Evaluate a Clojure source string form-by-form into an already-created
+/// namespace. Parse/eval failures are reported but do not abort `init`.
+fn load_source(globals: &Arc<cljrs_env::env::GlobalEnv>, ns: &str, source: &str) {
     let mut env = cljrs_env::env::Env::new(globals.clone(), ns);
-    let mut parser =
-        cljrs_reader::Parser::new(CORE_ASYNC_SOURCE.to_string(), "<clojure.core.async>".into());
+    let mut parser = cljrs_reader::Parser::new(source.to_string(), format!("<{ns}>"));
     match parser.parse_all() {
         Ok(forms) => {
             for form in forms {
                 let _alloc_frame = cljrs_gc::push_alloc_frame();
                 if let Err(e) = cljrs_interp::eval::eval(&form, &mut env) {
-                    eprintln!("[clojure.core.async warning] {e:?}");
+                    eprintln!("[{ns} warning] {e:?}");
                 }
             }
         }
-        Err(e) => eprintln!("[clojure.core.async parse error] {e:?}"),
+        Err(e) => eprintln!("[{ns} parse error] {e:?}"),
     }
-    globals.mark_loaded(ns);
 }
