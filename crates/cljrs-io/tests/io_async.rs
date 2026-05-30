@@ -101,15 +101,21 @@ fn char_chan_streams_then_closes() {
             &mut env,
         );
         for expected in ['a', 'b', 'c'] {
-            let c = eval_async(&parse_one("(await (clojure.core.async/take! ch))"), &mut env)
-                .await
-                .unwrap();
+            let c = eval_async(
+                &parse_one("(await (clojure.core.async/take! ch))"),
+                &mut env,
+            )
+            .await
+            .unwrap();
             assert_eq!(c, Value::Char(expected));
         }
         // Channel closes at EOF: the next take yields nil.
-        let end = eval_async(&parse_one("(await (clojure.core.async/take! ch))"), &mut env)
-            .await
-            .unwrap();
+        let end = eval_async(
+            &parse_one("(await (clojure.core.async/take! ch))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
         assert_eq!(end, Value::Nil);
     });
     let _ = std::fs::remove_file(&cleanup);
