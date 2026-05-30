@@ -12,9 +12,9 @@
 //!   until a `take!` consumes its value, so producer and consumer hand off
 //!   directly. Only one value is in flight at a time.
 //!
-//! The async builtins drive these via short, lock-scoped "try" steps and yield
-//! the `LocalSet` executor between attempts, matching the cooperative polling
-//! model used by [`crate::eval_async::await_value`].
+//! The async `put` and `take` methods use `tokio::sync::Notify` for wakeups:
+//! a waiting task parks until a producer/consumer fires the relevant `Notify`,
+//! so no spinning or busy-polling occurs on the executor.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_value::{NativeObject, NativeObjectBox, Value, gc_native_object};
+use tokio::sync::Notify;
 
 /// The native type tag reported by [`NativeObject::type_tag`] for channels.
 pub(crate) const CHANNEL_TAG: &str = "Channel";
@@ -72,6 +73,10 @@ pub struct CljChannel {
     /// Wakes blocking putters waiting for space, and rendezvous putters waiting
     /// for their offered value to be consumed.
     not_full: Condvar,
+    /// Async wakeup for `take`: fired when an item is enqueued or the channel closes.
+    async_not_empty: Notify,
+    /// Async wakeup for `put`: fired when an item is dequeued or the channel closes.
+    async_not_full: Notify,
 }
 
 impl CljChannel {
@@ -86,6 +91,8 @@ impl CljChannel {
             }),
             not_empty: Condvar::new(),
             not_full: Condvar::new(),
+            async_not_empty: Notify::new(),
+            async_not_full: Notify::new(),
         }
     }
 
@@ -98,9 +105,12 @@ impl CljChannel {
     /// buffered values and then observe `nil`.
     pub fn close(&self) {
         self.state.lock().unwrap().closed = true;
-        // Wake any threads blocking in take_blocking / put_blocking.
+        // Wake blocking (sync) callers.
         self.not_empty.notify_all();
         self.not_full.notify_all();
+        // Wake one async taker/putter; they cascade the notification on exit.
+        self.async_not_empty.notify_one();
+        self.async_not_full.notify_one();
     }
 
     /// Non-blocking take.
@@ -114,6 +124,7 @@ impl CljChannel {
             st.taken = st.taken.wrapping_add(1);
             drop(st);
             self.not_full.notify_all();
+            self.async_not_full.notify_one();
             return Some(v);
         }
         if st.closed {
@@ -136,6 +147,7 @@ impl CljChannel {
             st.queue.push_back(v.clone());
             drop(st);
             self.not_empty.notify_all();
+            self.async_not_empty.notify_one();
             return Some(true);
         }
         None
@@ -152,6 +164,7 @@ impl CljChannel {
             st.queue.push_back(v.clone());
             drop(st);
             self.not_empty.notify_all();
+            self.async_not_empty.notify_one();
             RvOffer::Offered(token)
         } else {
             RvOffer::Full
@@ -263,9 +276,13 @@ impl CljChannel {
     pub async fn take(&self) -> Value {
         loop {
             if let Some(v) = self.try_take() {
+                if matches!(v, Value::Nil) {
+                    // Channel closed: cascade so other parked takers wake too.
+                    self.async_not_empty.notify_one();
+                }
                 return v;
             }
-            tokio::task::yield_now().await;
+            self.async_not_empty.notified().await;
         }
     }
 
@@ -286,7 +303,7 @@ impl CljChannel {
                     RvOffer::Closed => return false,
                     RvOffer::Full => {}
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             };
             // Phase 2: wait for a taker to consume the offered value.
             loop {
@@ -295,14 +312,14 @@ impl CljChannel {
                     RvStatus::ClosedUntaken => return false,
                     RvStatus::Waiting => {}
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             }
         } else {
             loop {
                 if let Some(accepted) = self.try_put_buffered(&v) {
                     return accepted;
                 }
-                tokio::task::yield_now().await;
+                self.async_not_full.notified().await;
             }
         }
     }
