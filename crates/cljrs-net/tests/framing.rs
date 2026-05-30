@@ -7,7 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use cljrs_async::channel::{chan_put, chan_ref, chan_take};
+use cljrs_env::env::Env;
 use cljrs_gc::GcPtr;
+use cljrs_reader::Parser;
 use cljrs_value::{Keyword, Value};
 
 fn setup_globals() -> Arc<cljrs_env::env::GlobalEnv> {
@@ -405,5 +407,83 @@ fn test_lines_framer_no_trailing_newline() {
             }
         }
         assert_eq!(lines, vec!["first", "second"]);
+    });
+}
+
+// ── Clojure pipe-fn as framer ─────────────────────────────────────────────────
+
+/// `frame` accepts a Clojure `(fn [in-chan] -> out-chan)` as the second argument.
+/// The function is called with `in-chan` and its return value (the output channel)
+/// is returned by `frame`. This lets framers be written entirely in Clojure
+/// without any Rust involvement.
+#[test]
+fn test_clojure_pipe_fn_as_framer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async {
+        let globals = setup_globals();
+
+        // Env in the frame namespace so `frame`, `chan`, `go`, etc. resolve.
+        let mut env = Env::new(globals.clone(), "clojure.rust.net.frame");
+
+        // Build an input channel and bind it by name for the Clojure expression.
+        let in_chan = cljrs_async::channel::make_chan(8);
+        env.push_frame();
+        env.bind(
+            Arc::from("test-in"),
+            Value::NativeObject(in_chan.clone()),
+        );
+
+        // A Clojure identity pipe-fn: reads from ch, puts each value on out, closes at EOF.
+        // Written entirely in Clojure — no Rust framer involved.
+        let src = r#"
+            (let [pipe (fn [ch]
+                         (let [out (clojure.core.async/chan 8)]
+                           (clojure.core.async/go
+                             (loop []
+                               (let [v (await (clojure.core.async/take! ch))]
+                                 (if (nil? v)
+                                   (clojure.core.async/close! out)
+                                   (do
+                                     (await (clojure.core.async/put! out v))
+                                     (recur))))))
+                           out))]
+              (frame test-in pipe))
+        "#;
+
+        let mut parser = Parser::new(src.to_string(), "<test>".to_string());
+        let forms = parser.parse_all().expect("parse error");
+        let out_chan_val = cljrs_interp::eval::eval(forms.last().unwrap(), &mut env)
+            .expect("eval error: frame with Clojure pipe-fn failed");
+
+        let out_chan = as_chan(&out_chan_val);
+
+        // Feed two byte-arrays into the input channel.
+        let payload1 = bytes_value(b"hello");
+        let payload2 = bytes_value(b"world");
+        chan_put(&in_chan, payload1).await;
+        chan_put(&in_chan, payload2).await;
+        chan_ref(in_chan.get()).close();
+
+        // Drain the output channel and verify the same byte-arrays come out.
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        loop {
+            match chan_take(&out_chan).await {
+                Value::Nil => break,
+                v @ Value::ByteArray(_) => received.push(bytes_of(v)),
+                Value::Error(e) => panic!("pipe-fn error: {}", e.get().message()),
+                other => panic!("unexpected: {}", other.type_name()),
+            }
+        }
+
+        assert_eq!(
+            received,
+            vec![b"hello".to_vec(), b"world".to_vec()],
+            "Clojure pipe-fn must relay all values and close the output channel at EOF"
+        );
     });
 }

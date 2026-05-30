@@ -23,6 +23,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use cljrs_async::channel::{chan_put, chan_ref, make_chan};
+use cljrs_env::callback::invoke;
 use cljrs_env::env::GlobalEnv;
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_value::{
@@ -405,21 +406,30 @@ fn builtin_length_prefixed(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::NativeObject(gc_native_object(spec)))
 }
 
-/// `(frame in-chan framer-spec)` / `(frame in-chan framer-spec out-buf)` —
-/// pipe `in-chan` through the framer and return a new channel that emits
-/// complete application messages (strings or byte-arrays depending on the spec).
+/// `(frame in-chan framer)` — pipe `in-chan` through a framer and return a new
+/// channel of decoded messages.
 ///
-/// Spawns a background task on the `LocalSet` that reads byte-array chunks from
-/// `in-chan`, feeds them through the stateful framer, and puts complete frames
-/// on the output channel. The output channel closes when `in-chan` closes (EOF)
-/// or when an error is propagated.
+/// `framer` may be either:
 ///
-/// The optional `out-buf` argument controls the output channel's buffer depth
-/// (default 8).
+/// - A **native framer spec** created by `(lines)`, `(by-delimiter b)`, or
+///   `(length-prefixed opts)`. Spawns a `LocalSet` background task that feeds
+///   byte-array chunks through the stateful framer and puts complete frames on
+///   the output channel. The optional third argument `out-buf` controls the
+///   output channel buffer depth (default 8).
+///
+/// - A **Clojure pipe function** `(fn [in-chan] -> out-chan)`. `frame` calls
+///   `(f in-chan)` and returns the result. The function is responsible for
+///   spawning a `go`-loop that reads from `in-chan` and puts decoded values on
+///   the channel it returns. This lets framers be written entirely in Clojure.
+///   The `out-buf` argument is ignored for pipe functions.
+///
+/// Both forms compose: `frame` returns a channel, so framers can be stacked.
 fn builtin_frame(args: &[Value]) -> ValueResult<Value> {
-    let in_chan = match args.first() {
-        Some(Value::NativeObject(obj)) if obj.get().type_tag() == "Channel" => obj.clone(),
-        Some(Value::NativeObject(obj)) => {
+    // Validate the first argument: must be a channel.
+    let in_chan_val = args.first().cloned().unwrap_or(Value::Nil);
+    let in_chan = match &in_chan_val {
+        Value::NativeObject(obj) if obj.get().type_tag() == "Channel" => obj.clone(),
+        Value::NativeObject(obj) => {
             return Err(ValueError::Other(format!(
                 "frame: first argument must be a channel, got native object type '{}'",
                 obj.get().type_tag()
@@ -428,56 +438,74 @@ fn builtin_frame(args: &[Value]) -> ValueResult<Value> {
         other => {
             return Err(ValueError::WrongType {
                 expected: "channel",
-                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
-            });
-        }
-    };
-
-    let spec = match args.get(1) {
-        Some(Value::NativeObject(obj)) => match obj.get().downcast_ref::<FramerSpec>() {
-            Some(s) => s.clone(),
-            None => {
-                return Err(ValueError::Other(format!(
-                    "frame: second argument must be a framer spec (lines/by-delimiter/length-prefixed), \
-                     got native object type '{}'",
-                    obj.get().type_tag()
-                )));
-            }
-        },
-        other => {
-            return Err(ValueError::WrongType {
-                expected: "framer spec (lines, by-delimiter, or length-prefixed)",
-                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
-            });
-        }
-    };
-
-    let out_buf = match args.get(2) {
-        Some(Value::Long(n)) if *n > 0 => *n as usize,
-        None | Some(Value::Nil) => spec.out_buf,
-        Some(other) => {
-            return Err(ValueError::WrongType {
-                expected: "positive long (out-buf)",
                 got: other.type_name().to_string(),
             });
         }
     };
 
-    let out_chan = make_chan(out_buf);
-    let out_val = Value::NativeObject(out_chan.clone());
+    match args.get(1) {
+        // ── Clojure pipe-fn path ───────────────────────────────────────────────
+        // Any Clojure-callable is treated as a pipe-fn: (f in-chan) → out-chan.
+        // The function is responsible for spawning a go-loop and returning the
+        // output channel. The `out-buf` argument is unused on this path.
+        Some(
+            f @ (Value::Fn(_)
+            | Value::NativeFunction(_)
+            | Value::MultiFn(_)
+            | Value::ProtocolFn(_)
+            | Value::BoundFn(_)
+            | Value::Var(_)
+            | Value::WithMeta(_, _)),
+        ) => invoke(f, vec![in_chan_val]),
 
-    let framer: Box<dyn Framer> = match spec.kind {
-        FramerKind::Lines => Box::new(LinesFramer::new()),
-        FramerKind::Delimiter(d) => Box::new(DelimiterFramer::new(d)),
-        FramerKind::LengthPrefixed {
-            prefix_len,
-            big_endian,
-        } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian)),
-    };
+        // ── Native FramerSpec path (lines/by-delimiter/length-prefixed) ────────
+        Some(Value::NativeObject(obj)) => {
+            let spec = obj
+                .get()
+                .downcast_ref::<FramerSpec>()
+                .ok_or_else(|| {
+                    ValueError::Other(format!(
+                        "frame: second argument must be a framer spec or a pipe function, \
+                         got native object type '{}'",
+                        obj.get().type_tag()
+                    ))
+                })?
+                .clone();
 
-    tokio::task::spawn_local(framer_task(in_chan, out_chan, framer));
+            let out_buf = match args.get(2) {
+                Some(Value::Long(n)) if *n > 0 => *n as usize,
+                None | Some(Value::Nil) => spec.out_buf,
+                Some(other) => {
+                    return Err(ValueError::WrongType {
+                        expected: "positive long (out-buf)",
+                        got: other.type_name().to_string(),
+                    });
+                }
+            };
 
-    Ok(out_val)
+            let out_chan = make_chan(out_buf);
+            let out_val = Value::NativeObject(out_chan.clone());
+
+            let framer: Box<dyn Framer> = match spec.kind {
+                FramerKind::Lines => Box::new(LinesFramer::new()),
+                FramerKind::Delimiter(d) => Box::new(DelimiterFramer::new(d)),
+                FramerKind::LengthPrefixed {
+                    prefix_len,
+                    big_endian,
+                } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian)),
+            };
+
+            tokio::task::spawn_local(framer_task(in_chan, out_chan, framer));
+            Ok(out_val)
+        }
+
+        other => Err(ValueError::WrongType {
+            expected: "framer spec (lines, by-delimiter, length-prefixed) or pipe function",
+            got: other
+                .map(|v| v.type_name().to_string())
+                .unwrap_or_default(),
+        }),
+    }
 }
 
 /// `(lines-encode str)` — encode a string for a line protocol by appending `\n`.
