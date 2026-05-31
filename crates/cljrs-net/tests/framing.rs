@@ -433,10 +433,7 @@ fn test_clojure_pipe_fn_as_framer() {
         // Build an input channel and bind it by name for the Clojure expression.
         let in_chan = cljrs_async::channel::make_chan(8);
         env.push_frame();
-        env.bind(
-            Arc::from("test-in"),
-            Value::NativeObject(in_chan.clone()),
-        );
+        env.bind(Arc::from("test-in"), Value::NativeObject(in_chan.clone()));
 
         // A Clojure identity pipe-fn: reads from ch, puts each value on out, closes at EOF.
         // Written entirely in Clojure — no Rust framer involved.

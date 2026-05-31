@@ -501,9 +501,7 @@ fn builtin_frame(args: &[Value]) -> ValueResult<Value> {
 
         other => Err(ValueError::WrongType {
             expected: "framer spec (lines, by-delimiter, length-prefixed) or pipe function",
-            got: other
-                .map(|v| v.type_name().to_string())
-                .unwrap_or_default(),
+            got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
         }),
     }
 }
