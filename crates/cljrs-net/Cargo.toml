@@ -26,5 +26,5 @@ cljrs-stdlib   = { workspace = true }
 cljrs-interp   = { workspace = true }
 cljrs-reader   = { workspace = true }
 cljrs-env      = { workspace = true }
-tokio          = { workspace = true, features = ["net", "io-util", "sync", "rt-multi-thread", "macros"] }
+tokio          = { workspace = true, features = ["net", "io-util", "sync", "rt-multi-thread", "macros", "test-util"] }
 rcgen          = "0.13"

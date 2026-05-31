@@ -1,4 +1,10 @@
 ;; clojure.rust.net — umbrella networking namespace.
+;;
+;; Phase G — lifecycle, timeouts, ergonomics additions:
+;;   with-open   — deterministic teardown macro (calls close on each binding)
+;;   connect     — updated: :connect-timeout-ms races connect against a timeout
+;;   split-err   — split an in-band-error channel into {:out values :err promise}
+;;   drain-to    — async fn: drain a channel to {:values [...] :error err-or-nil}
 
 (require 'clojure.rust.net.tcp)
 (require 'clojure.rust.net.tls)
@@ -11,19 +17,39 @@
   the handshake completes, or a Value::Error on failure.
 
   Opts:
-    :host          string (required for :tcp/:tls)
-    :port          integer (required for :tcp/:tls, 1-65535)
-    :path          string (required for :unix)
-    :transport     :tcp (default), :tls, :unix
-    :in-buf        channel buffer depth for :in (default 8)
-    :out-buf       channel buffer depth for :out (default 8)"
+    :host               string (required for :tcp/:tls)
+    :port               integer (required for :tcp/:tls, 1-65535)
+    :path               string (required for :unix)
+    :transport          :tcp (default), :tls, :unix
+    :in-buf             channel buffer depth for :in (default 8)
+    :out-buf            channel buffer depth for :out (default 8)
+    :connect-timeout-ms milliseconds before a pending connect is abandoned;
+                        delivers a Value::Error on the returned channel when the
+                        timeout fires. Implemented as (alts [(take! promise)
+                        (timeout ms)]) — an option dropped here does NOT cancel
+                        the underlying OS-level connection attempt."
   [opts]
-  (let [transport (get opts :transport :tcp)]
-    (case transport
-      :tcp  (clojure.rust.net.tcp/connect opts)
-      :tls  (clojure.rust.net.tls/connect opts)
-      :unix (clojure.rust.net.unix/connect opts)
-      (throw (ex-info (str "unsupported transport: " transport) {:transport transport})))))
+  (let [transport  (get opts :transport :tcp)
+        timeout-ms (get opts :connect-timeout-ms)
+        promise    (case transport
+                     :tcp  (clojure.rust.net.tcp/connect opts)
+                     :tls  (clojure.rust.net.tls/connect opts)
+                     :unix (clojure.rust.net.unix/connect opts)
+                     (throw (ex-info (str "unsupported transport: " transport)
+                                     {:transport transport})))]
+    (if timeout-ms
+      (let [out-chan (clojure.core.async/chan 1)]
+        (clojure.core.async/go
+          (let [result (await (clojure.core.async/alts
+                                [(clojure.core.async/take! promise)
+                                 (clojure.core.async/timeout timeout-ms)]))]
+            (await (clojure.core.async/put! out-chan
+                     (if (= (nth result 1) 1)
+                       (ex-info (str "connect timeout after " timeout-ms "ms")
+                                {:timeout-ms timeout-ms})
+                       (nth result 0))))))
+        out-chan)
+      promise)))
 
 (defn listen
   "Listen for incoming connections. Returns a server map
@@ -80,14 +106,110 @@
 (defn close
   "Close a connection, server, or UDP socket map, releasing its socket and channels.
 
+  Half-close semantics: closing :out alone (write half-close) sends a TCP FIN
+  so the peer sees EOF on reads, while :in continues draining until the peer
+  closes its write side:
+    (clojure.core.async/close! (:out conn))   ; half-close write side only
+
+  Full close (this function) tears down both sides:
+    (clojure.rust.net/close conn)             ; closes :out, :in, aborts tasks
+
   For stream connections (:remote-addr present — TCP, Unix, TLS): closes :out
   (signals writer to drain and half-close), closes :in, and aborts reader/writer
   tasks via :resource.
   For servers (:conns present — TCP, Unix, TLS): stops the accept loop, closes
   the listener FD (Unix listeners also unlink the socket path), and closes :conns.
-  For UDP sockets: closes :in, :out, and aborts reader/writer tasks via :resource."
+  For UDP sockets: closes :in, :out, and aborts reader/writer tasks via :resource.
+
+  Connections must be closed explicitly — the GC will not release socket FDs."
   [x]
   (cond
     (contains? x :conns)       (clojure.rust.net.tcp/listen-close x)
     (contains? x :remote-addr) (clojure.rust.net.tcp/close x)
     :else                      (clojure.rust.net.udp/close x)))
+
+(defn split-err
+  "Split a net in-band-error channel into {:out values-chan :err err-promise}.
+
+  :out receives all non-error values from in-chan and closes when in-chan
+  closes or delivers a Value::Error (whichever comes first).
+  :err is a capacity-1 channel that delivers the terminal Value::Error on error,
+  or nil on a clean EOF (in-chan closed without an error value).
+
+  Starts a background go-loop immediately. Returns {:out :err} without blocking.
+  Use this so consumers of a byte-stream channel can process values without
+  error?-checking every take — the split separates the stream from the
+  single terminal condition.
+
+  out-buf (optional, default 8) controls the buffer depth of :out.
+
+  Example:
+    (let [{:keys [out err]} (split-err (:in conn))]
+      (go-loop []
+        (when-let [chunk (<! out)]
+          (process chunk)
+          (recur)))
+      (go (when-let [e (<! err)]
+            (log-error e))))"
+  ([in-chan] (split-err in-chan 8))
+  ([in-chan out-buf]
+   (let [out (clojure.core.async/chan out-buf)
+         err (clojure.core.async/chan 1)]
+     (clojure.core.async/go
+       (loop []
+         (let [v (await (clojure.core.async/take! in-chan))]
+           (cond
+             (nil? v)
+             (do (await (clojure.core.async/put! err nil))
+                 (clojure.core.async/close! out))
+
+             (clojure.rust.error/error? v)
+             (do (await (clojure.core.async/put! err v))
+                 (clojure.core.async/close! out))
+
+             :else
+             (do (await (clojure.core.async/put! out v))
+                 (recur))))))
+     {:out out :err err})))
+
+(defn ^:async drain-to
+  "Drain in-chan to completion inside an ^:async context.
+  Returns {:values [all-non-error-values] :error Value::Error-or-nil}.
+  Blocks (in the async sense) until in-chan closes or delivers a terminal error.
+  Does not close in-chan.
+
+  Example:
+    (go (let [{:keys [values error]} (await (drain-to (:in conn)))]
+          (when error (log-error error))
+          (process-all values)))"
+  [in-chan]
+  (loop [acc []]
+    (let [v (await (clojure.core.async/take! in-chan))]
+      (cond
+        (nil? v) {:values acc :error nil}
+        (clojure.rust.error/error? v) {:values acc :error v}
+        :else (recur (conj acc v))))))
+
+(defmacro with-open
+  "bindings => [name init ...]
+
+  Evaluates body in a try/finally block, calling clojure.rust.net/close on each
+  named binding in reverse order when the block exits — normally or via exception.
+  Suitable for connection maps, server maps, and UDP socket maps.
+
+  Connections must be closed explicitly: the GC will not release socket FDs.
+  Use with-open to guarantee deterministic teardown.
+
+  Example:
+    (with-open [conn (await (take! (net/connect {:host h :port p})))]
+      (>! (:out conn) msg-bytes))"
+  [bindings & body]
+  (if (= (count bindings) 0)
+    `(do ~@body)
+    (let [name (first bindings)
+          init (second bindings)
+          rest-bindings (vec (drop 2 bindings))]
+      `(let [~name ~init]
+         (try
+           (with-open ~rest-bindings ~@body)
+           (finally (close ~name)))))))

@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–F implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets).
+**Status**: Phases A–G implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -28,6 +28,7 @@
 | `tests/udp.rs` | Phase D integration tests (echo round-trip, multiple senders, close) |
 | `tests/tls.rs` | Phase E integration tests (TLS echo round-trip with rcgen self-signed cert, connect failure) |
 | `tests/unix.rs` | Phase F integration tests (Unix echo round-trip, listener unlinks path, stale socket removal) |
+| `tests/lifecycle.rs` | Phase G integration tests (split-err, drain-to, with-open, :connect-timeout-ms) |
 
 ## Public API
 
@@ -129,11 +130,27 @@ builds register stub functions that throw "not supported on this platform".
 ### `clojure.rust.net` (umbrella)
 
 ```clojure
-(connect opts)            ;; :transport key selects :tcp (default), :tls, or :unix
-(listen opts)             ;; :transport key selects :tcp (default), :tls, or :unix
-(start-server handler opts) ;; :transport key selects :tcp (default), :tls, or :unix
-(close x)                 ;; dispatches on map shape: :conns → server close, :remote-addr → conn close, else → udp close
+;; Phase A–F transport dispatch
+(connect opts)              ;; :transport selects :tcp (default), :tls, :unix
+                            ;; :connect-timeout-ms N — races connect against timeout(N)
+(listen opts)               ;; :transport selects :tcp (default), :tls, :unix
+(start-server handler opts) ;; :transport selects :tcp (default), :tls, :unix
+(close x)                   ;; dispatches on map shape: :conns → server, :remote-addr → conn, else → udp
+
+;; Phase G — lifecycle and ergonomics
+(with-open [c (await (take! (connect ...)))] body...)
+;; => try/finally that calls close on each binding; ensures FDs are released
+
+(split-err in-chan)         ;; => {:out values-chan :err err-promise}
+(split-err in-chan out-buf) ;; :out gets non-error values; :err gets error-or-nil at EOF
+
+(drain-to in-chan)          ;; ^:async — blocks until close/error
+                            ;; => {:values [...] :error err-or-nil}
 ```
+
+**Half-close semantics**: `(close! (:out conn))` sends FIN (write half-close) so the
+peer sees EOF on reads, while `:in` continues draining until the peer closes its write
+side. `(close conn)` tears down both halves.
 
 ### `clojure.rust.net.udp`
 
