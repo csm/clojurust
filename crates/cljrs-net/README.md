@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–D implemented (TCP client + server + framing + UDP datagrams). Phases E–F (TLS, Unix) are stubs.
+**Status**: Phases A–E implemented (TCP client + server + framing + UDP datagrams + TLS client/server). Phase F (Unix sockets) is a stub.
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -10,18 +10,21 @@
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, and `clojure.rust.net` |
+| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, and `clojure.rust.net` |
 | `src/tcp.rs` | `TcpStreamResource`, `TcpListenerResource`, connection builder, accept loop, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
 | `src/udp.rs` | `UdpSocketResource`, reader/writer tasks, `socket`/`close` builtins |
+| `src/tls.rs` | `TlsStreamResource`, `TlsListenerResource`, generic reader/writer loops, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
-| `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net` |
+| `src/clojure_rust_net_tls.cljrs` | Clojure source for `clojure.rust.net.tls`; `start-server` sugar |
+| `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
 | `tests/framing.rs` | Phase C integration tests (lines + length-prefixed end-to-end, framer unit tests) |
 | `tests/udp.rs` | Phase D integration tests (echo round-trip, multiple senders, close) |
+| `tests/tls.rs` | Phase E integration tests (TLS echo round-trip with rcgen self-signed cert, connect failure) |
 
 ## Public API
 
@@ -69,6 +72,32 @@
 
 `frame` spawns a `LocalSet` background task that reads byte-arrays from `in-chan`, feeds them through the stateful framer, and puts complete frames on the returned output channel. Errors from `in-chan` are forwarded in-band; the output channel closes at EOF or on error.
 
+### `clojure.rust.net.tls`
+
+```clojure
+;; Phase E — TLS client
+(connect {:host "example.com" :port 443})
+;; => promise-chan — yields {:in ch :out ch :remote-addr str :local-addr str :resource h}
+;;    or Value::Error on failure
+;; Optional keys: :roots (:webpki default, :system, or "path/to/ca.pem")
+;;                :insecure-skip-verify true (skip cert verification — for testing only)
+;;                :alpn ["h2" "http/1.1"]
+;;                :in-buf, :out-buf (default 8)
+
+(close conn)         ;; => nil — closes :in/:out and aborts reader/writer tasks
+
+;; Phase E — TLS server
+(listen {:port 8443 :cert "cert.pem" :key "key.pem"})
+;; => {:conns <chan> :local-addr "0.0.0.0:8443" :resource h}
+;;    :conns yields a connection map per accepted TLS socket; closed when listener closes
+;; Optional keys: :host (default "0.0.0.0"), :alpn [...], :conns-buf, :in-buf, :out-buf
+
+(listen-close server) ;; => nil — stops accept loop, closes :conns
+
+(start-server handler {:port 8443 :cert "cert.pem" :key "key.pem"})
+;; => server-map — spawns go-loop that calls (handler conn) for each accepted TLS conn
+```
+
 ### `clojure.rust.net` (umbrella)
 
 ```clojure
@@ -99,6 +128,10 @@ pub fn udp::socket_on(host: &str, port: u16, in_buf: usize, out_buf: usize) -> V
 pub fn frame::frame_channel(in_chan: GcPtr<NativeObjectBox>, spec: FramerSpec, out_buf: usize) -> GcPtr<NativeObjectBox>
 pub fn frame::encode_line(s: &str) -> Value
 pub fn frame::encode_length_prefixed(data: &[u8], prefix_len: usize, big_endian: bool) -> Value
+pub fn tls::tls_connect_to(host: &str, port: u16, config: Arc<rustls::ClientConfig>, in_buf: usize, out_buf: usize) -> Value
+pub fn tls::tls_listen_on(host: &str, port: u16, config: Arc<rustls::ServerConfig>, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
+pub fn tls::build_client_config(opts: &MapValue) -> ValueResult<Arc<rustls::ClientConfig>>
+pub fn tls::build_server_config(opts: &MapValue) -> ValueResult<Arc<rustls::ServerConfig>>
 ```
 
 `init` registers all three namespaces, calling `cljrs_async::init` internally. Idempotent.
@@ -114,6 +147,14 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the
 ### `UdpSocketResource`
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks. `close()` aborts both tasks; once they finish the `Arc<UdpSocket>` drops and the FD is released.
+
+### `TlsStreamResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks (generic over the TLS stream halves). `close()` aborts both tasks, dropping the TLS stream halves and releasing the FD.
+
+### `TlsListenerResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `tls_accept_loop` task. `close()` aborts the task, dropping the `TcpListener` and releasing the listener FD.
 
 ## Connection Model
 
