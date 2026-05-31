@@ -52,8 +52,8 @@ use cljrs_value::{
 };
 
 use crate::pool_io::{
-    net_error, pool_reader, pool_writer, read_bridge, write_bridge, PoolSetupResult,
-    PoolStreamSetup,
+    PoolSetupResult, PoolStreamSetup, net_error, pool_reader, pool_writer, read_bridge,
+    write_bridge,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -251,9 +251,7 @@ async fn pool_tls_accept_loop(
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(e) => {
-            let _ = conn_info_tx
-                .send(Err(format!("from_std: {e}")))
-                .await;
+            let _ = conn_info_tx.send(Err(format!("from_std: {e}"))).await;
             return;
         }
     };
@@ -266,9 +264,7 @@ async fn pool_tls_accept_loop(
     loop {
         match listener.accept().await {
             Err(e) => {
-                let _ = conn_info_tx
-                    .send(Err(format!("accept error: {e}")))
-                    .await;
+                let _ = conn_info_tx.send(Err(format!("accept error: {e}"))).await;
                 break;
             }
             Ok((tcp_stream, peer_addr)) => {
@@ -282,9 +278,7 @@ async fn pool_tls_accept_loop(
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = conn_info_tx
-                                .send(Err(format!("TLS handshake: {e}")))
-                                .await;
+                            let _ = conn_info_tx.send(Err(format!("TLS handshake: {e}"))).await;
                             return;
                         }
                     };
@@ -539,9 +533,7 @@ pub fn tls_connect_to(
     let host = host.to_string();
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move {
-        do_tls_connect(host, port, config, in_buf, out_buf, promise).await
-    });
+    spawn_future(async move { do_tls_connect(host, port, config, in_buf, out_buf, promise).await });
     promise_val
 }
 
@@ -666,15 +658,13 @@ pub fn tls_listen_on(
     let resource_handle = ResourceHandle::new(resource);
 
     // Spawn accept loop on pool (Send).
-    let pool_jh = WorkerPool::global()
-        .handle()
-        .spawn(pool_tls_accept_loop(
-            std_listener,
-            acceptor,
-            conn_info_tx,
-            in_buf,
-            out_buf,
-        ));
+    let pool_jh = WorkerPool::global().handle().spawn(pool_tls_accept_loop(
+        std_listener,
+        acceptor,
+        conn_info_tx,
+        in_buf,
+        out_buf,
+    ));
 
     // Spawn bridge on LocalSet (!Send, touches GcPtr).
     let bridge_jh = tokio::task::spawn_local(local_tls_accept_bridge(

@@ -23,11 +23,7 @@ fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
 /// A simple Send computation offloaded to the pool returns the correct result.
 #[test]
 fn offload_simple_send_computation() {
-    let result = block_on_local(async {
-        WorkerPool::global()
-            .offload(async { 6u64 * 7 })
-            .await
-    });
+    let result = block_on_local(async { WorkerPool::global().offload(async { 6u64 * 7 }).await });
     assert_eq!(result, 42u64);
 }
 
@@ -87,8 +83,12 @@ fn handle_spawn_sub_tasks() {
         // Use the handle to spawn two tasks and collect via oneshot channels.
         let (tx1, rx1) = tokio::sync::oneshot::channel::<u64>();
         let (tx2, rx2) = tokio::sync::oneshot::channel::<u64>();
-        pool.handle().spawn(async move { let _ = tx1.send(10); });
-        pool.handle().spawn(async move { let _ = tx2.send(32); });
+        pool.handle().spawn(async move {
+            let _ = tx1.send(10);
+        });
+        pool.handle().spawn(async move {
+            let _ = tx2.send(32);
+        });
         let a = rx1.await.unwrap();
         let b = rx2.await.unwrap();
         a + b
@@ -105,9 +105,7 @@ fn offload_from_spawn_local_context() {
     let result = block_on_local(async {
         let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
         tokio::task::spawn_local(async move {
-            let val = WorkerPool::global()
-                .offload(async { 21u64 * 2 })
-                .await;
+            let val = WorkerPool::global().offload(async { 21u64 * 2 }).await;
             let _ = tx.send(val);
         });
         rx.await.unwrap()

@@ -124,10 +124,7 @@ where
 ///
 /// Closes `in_chan` when the pool reader signals EOF or an error. On error, puts
 /// a `Value::Error` first so the consumer can observe it before the channel closes.
-pub(crate) async fn read_bridge(
-    mut rx: mpsc::Receiver<ReadMsg>,
-    in_chan: GcPtr<NativeObjectBox>,
-) {
+pub(crate) async fn read_bridge(mut rx: mpsc::Receiver<ReadMsg>, in_chan: GcPtr<NativeObjectBox>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             ReadMsg::Data(bytes) => {
@@ -150,16 +147,12 @@ pub(crate) async fn read_bridge(
 ///
 /// Exits when `out_chan` is closed (returns `Value::Nil`). Dropping `tx` signals
 /// the pool writer to shut down.
-pub(crate) async fn write_bridge(
-    out_chan: GcPtr<NativeObjectBox>,
-    tx: mpsc::Sender<Vec<u8>>,
-) {
+pub(crate) async fn write_bridge(out_chan: GcPtr<NativeObjectBox>, tx: mpsc::Sender<Vec<u8>>) {
     loop {
         match chan_take(&out_chan).await {
             Value::Nil => break, // :out channel closed
             Value::ByteArray(arr) => {
-                let bytes: Vec<u8> =
-                    arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
+                let bytes: Vec<u8> = arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
                 if tx.send(bytes).await.is_err() {
                     break; // pool writer dropped
                 }
