@@ -20,13 +20,14 @@ standard library on top of them.
 ```
 src/
   lib.rs                         — module declarations and re-exports
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   keyword.rs                     — Keyword { namespace, name }
   symbol.rs                      — Symbol { namespace, name }
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
-  value.rs                       — Value enum (incl. NativeObject variant), MapValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
+  value.rs                       — Value enum (incl. NativeObject variant), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
     array_map.rs                 — PersistentArrayMap (≤8 entries, linear scan)
@@ -294,6 +295,38 @@ pub struct MultiFn {
     pub default_dispatch: String,  // normally ":default"
 }
 ```
+
+### `clone` — isolate copy boundary (Phase B2)
+
+```rust
+/// A Send + Sync intermediate representation for cross-isolate transfer.
+/// All heap data is owned (no GcPtr); safe to move across thread boundaries.
+pub enum SerializedValue { Nil, Bool(bool), Long(i64), /* … */ }
+
+/// Reason a value cannot cross an isolate boundary.
+pub enum CloneError {
+    NotShareable { type_name: &'static str },
+    Disconnected,
+}
+
+/// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
+/// closures, native resources, and other non-shareable types.
+pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError>;
+
+/// Allocate a fresh Value in the *current* GC heap from a SerializedValue.
+/// Infallible — non-shareable types are rejected at serialize time.
+pub fn deserialize(sv: SerializedValue) -> Value;
+```
+
+Shareable types: all scalars, strings, BigInt/BigDecimal/Ratio, Symbol/Keyword,
+all persistent collections, TypeInstance records, Error chains, primitive and
+object arrays, lazy sequences (realized first), WithMeta/Reduced wrappers.
+
+Non-shareable (returns `CloneError`): Atom, Var, Volatile, Promise, Future,
+Agent (mutable state); Fn, BoundFn, NativeFn, Macro, ProtocolFn, MultiFn
+(closures with isolate-local captures); Namespace, Protocol (global singletons);
+Resource, NativeObject (isolate-bound handles); TransientMap/Set/Vector;
+unforced Delay; Matcher.
 
 ### Dependencies
 
