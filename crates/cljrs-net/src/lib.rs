@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use cljrs_async::load_source;
 
+pub mod frame;
 pub mod tcp;
 
 /// Clojure source for `clojure.rust.net.tcp`.
@@ -24,8 +25,12 @@ const NET_TCP_SOURCE: &str = include_str!("clojure_rust_net_tcp.cljrs");
 /// Clojure source for the umbrella `clojure.rust.net` namespace.
 const NET_SOURCE: &str = include_str!("clojure_rust_net.cljrs");
 
+/// Clojure source for `clojure.rust.net.frame`.
+const NET_FRAME_SOURCE: &str = include_str!("clojure_rust_net_frame.cljrs");
+
 pub const NS_TCP: &str = "clojure.rust.net.tcp";
 pub const NS: &str = "clojure.rust.net";
+pub const NS_FRAME: &str = "clojure.rust.net.frame";
 
 /// Register the networking namespaces.
 ///
@@ -40,6 +45,14 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         tcp::register(globals, NS_TCP);
         load_source(globals, NS_TCP, NET_TCP_SOURCE);
         globals.mark_loaded(NS_TCP);
+    }
+
+    if !globals.is_loaded(NS_FRAME) {
+        globals.get_or_create_ns(NS_FRAME);
+        globals.refer_all(NS_FRAME, "clojure.core");
+        frame::register(globals, NS_FRAME);
+        load_source(globals, NS_FRAME, NET_FRAME_SOURCE);
+        globals.mark_loaded(NS_FRAME);
     }
 
     if !globals.is_loaded(NS) {
