@@ -21,6 +21,11 @@
 //!  :local-addr "ip:port"
 //!  :resource   <handle>} ; TlsListenerResource — deterministic listener close
 //! ```
+//!
+//! Phase A2: TCP connect, TLS handshake, and I/O tasks all run on the
+//! `WorkerPool` multi-thread runtime.  `GcPtr`/`Value` construction happens in
+//! LocalSet bridge tasks only.  `TlsStream<TcpStream>: Send` because
+//! `ClientConnection`/`ServerConnection: Send`.
 
 use std::any::Any;
 use std::io::BufReader;
@@ -29,18 +34,26 @@ use std::sync::{Arc, Mutex};
 use rustls::ClientConfig;
 use rustls::ServerConfig;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, chan_take, make_chan};
+use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, make_chan};
 use cljrs_async::spawn_future;
+use cljrs_async::worker_pool::WorkerPool;
 use cljrs_env::env::GlobalEnv;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_value::{
-    Arity, ExceptionInfo, Keyword, MapValue, NativeFn, NativeObjectBox, Resource, ResourceHandle,
-    Value, ValueError, ValueResult,
+    Arity, Keyword, MapValue, NativeFn, NativeObjectBox, Resource, ResourceHandle, Value,
+    ValueError, ValueResult,
+};
+
+use crate::pool_io::{
+    net_error, pool_reader, pool_writer, read_bridge, write_bridge, PoolSetupResult,
+    PoolStreamSetup,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -65,14 +78,14 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
 #[derive(Debug)]
 struct TlsStreamInner {
     closed: bool,
-    reader_abort: Option<AbortHandle>,
-    writer_abort: Option<AbortHandle>,
+    abort_handles: Vec<AbortHandle>,
 }
 
 /// `Resource` implementation for a TLS stream.
 ///
-/// Holds `AbortHandle`s for the reader and writer tasks spawned in `connect`.
-/// `close()` aborts both tasks, which drops the socket halves and closes the FD.
+/// Holds `AbortHandle`s for the pool reader, pool writer, and LocalSet bridge
+/// tasks. `close()` aborts all handles, which drops the socket halves and
+/// closes the FD.
 #[derive(Debug)]
 pub struct TlsStreamResource {
     inner: Arc<Mutex<TlsStreamInner>>,
@@ -83,8 +96,7 @@ impl TlsStreamResource {
         Self {
             inner: Arc::new(Mutex::new(TlsStreamInner {
                 closed: false,
-                reader_abort: None,
-                writer_abort: None,
+                abort_handles: Vec::new(),
             })),
         }
     }
@@ -97,10 +109,7 @@ impl Resource for TlsStreamResource {
             return Ok(());
         }
         g.closed = true;
-        if let Some(h) = g.reader_abort.take() {
-            h.abort();
-        }
-        if let Some(h) = g.writer_abort.take() {
+        for h in g.abort_handles.drain(..) {
             h.abort();
         }
         Ok(())
@@ -124,13 +133,13 @@ impl Resource for TlsStreamResource {
 #[derive(Debug)]
 struct TlsListenerInner {
     closed: bool,
-    accept_abort: Option<AbortHandle>,
+    abort_handles: Vec<AbortHandle>,
 }
 
 /// `Resource` implementation for a TLS listener.
 ///
-/// Holds the `AbortHandle` for the `tls_accept_loop` task. `close()` aborts the
-/// task, which drops the `TcpListener` and closes the listener FD.
+/// Holds `AbortHandle`s for the pool accept loop and the LocalSet accept bridge.
+/// `close()` aborts all handles, which drops the listener and closes the FD.
 #[derive(Debug)]
 pub struct TlsListenerResource {
     inner: Arc<Mutex<TlsListenerInner>>,
@@ -141,7 +150,7 @@ impl TlsListenerResource {
         Self {
             inner: Arc::new(Mutex::new(TlsListenerInner {
                 closed: false,
-                accept_abort: None,
+                abort_handles: Vec::new(),
             })),
         }
     }
@@ -154,7 +163,7 @@ impl Resource for TlsListenerResource {
             return Ok(());
         }
         g.closed = true;
-        if let Some(h) = g.accept_abort.take() {
+        for h in g.abort_handles.drain(..) {
             h.abort();
         }
         Ok(())
@@ -174,21 +183,6 @@ impl Resource for TlsListenerResource {
 }
 
 // ── Value helpers ─────────────────────────────────────────────────────────────
-
-fn bytes_value(bytes: &[u8]) -> Value {
-    let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-    Value::ByteArray(GcPtr::new(Mutex::new(signed)))
-}
-
-fn net_error(msg: impl Into<String>) -> Value {
-    let msg = msg.into();
-    Value::Error(GcPtr::new(ExceptionInfo::new(
-        ValueError::Other(msg.clone()),
-        msg,
-        None,
-        None,
-    )))
-}
 
 fn kw(name: &str) -> Value {
     Value::keyword(Keyword::simple(name))
@@ -241,93 +235,136 @@ fn opts_string_vec(opts: &MapValue, key: &str) -> Option<Vec<String>> {
     }
 }
 
-// ── Async tasks (generic — used by both client and server connections) ─────────
+// ── Pool tasks (Send, no GcPtr) ───────────────────────────────────────────────
 
-/// Read chunks from the TLS stream and put them on `:in`.
-///
-/// Closes `:in` at EOF or on error. Aborted via `TlsStreamResource::close`.
-async fn tls_reader_loop<R>(mut reader: R, in_chan: GcPtr<NativeObjectBox>)
-where
-    R: tokio::io::AsyncRead + Unpin + 'static,
-{
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if !chan_put(&in_chan, bytes_value(&buf[..n])).await {
-                    break; // consumer closed :in
-                }
-            }
-            Err(e) => {
-                chan_put(&in_chan, net_error(format!("read error: {e}"))).await;
-                break;
-            }
-        }
-    }
-    chan_ref(in_chan.get()).close();
-}
-
-/// Drain `:out` and write each value to the TLS stream.
-///
-/// Accepts `byte-array` and `string` values. Shuts down write side when `:out`
-/// is closed. Aborted via `TlsStreamResource::close`.
-async fn tls_writer_loop<W>(mut writer: W, out_chan: GcPtr<NativeObjectBox>)
-where
-    W: tokio::io::AsyncWrite + Unpin + 'static,
-{
-    let _: std::io::Result<()> = async {
-        loop {
-            match chan_take(&out_chan).await {
-                Value::Nil => {
-                    // :out closed; gracefully half-close the write side.
-                    let _ = writer.shutdown().await;
-                    break;
-                }
-                Value::ByteArray(arr) => {
-                    let bytes: Vec<u8> =
-                        arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
-                    writer.write_all(&bytes).await?;
-                }
-                Value::Str(s) => {
-                    writer.write_all(s.get().as_bytes()).await?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-    .await;
-}
-
-// ── Connection builder (generic) ──────────────────────────────────────────────
-
-fn make_tls_connection<R, W>(
-    reader: R,
-    writer: W,
-    remote_addr: String,
-    local_addr: String,
+/// Runs on the pool: accepts TCP connections, performs TLS handshake on the
+/// pool, splits the TLS stream, spawns pool_reader + pool_writer, and sends
+/// the `PoolStreamSetup` via `conn_info_tx`.
+async fn pool_tls_accept_loop(
+    std_listener: std::net::TcpListener,
+    acceptor: TlsAcceptor,
+    conn_info_tx: mpsc::Sender<PoolSetupResult>,
     in_buf: usize,
     out_buf: usize,
-) -> Value
-where
-    R: tokio::io::AsyncRead + Unpin + 'static,
-    W: tokio::io::AsyncWrite + Unpin + 'static,
-{
+) {
+    // Convert std listener inside pool runtime context.
+    let listener = match TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = conn_info_tx
+                .send(Err(format!("from_std: {e}")))
+                .await;
+            return;
+        }
+    };
+
+    let local_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    loop {
+        match listener.accept().await {
+            Err(e) => {
+                let _ = conn_info_tx
+                    .send(Err(format!("accept error: {e}")))
+                    .await;
+                break;
+            }
+            Ok((tcp_stream, peer_addr)) => {
+                let remote_addr = peer_addr.to_string();
+                let local_addr_conn = local_addr.clone();
+                let acceptor = acceptor.clone();
+                let conn_info_tx = conn_info_tx.clone();
+
+                // Spawn per-connection TLS handshake as a separate pool task.
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = conn_info_tx
+                                .send(Err(format!("TLS handshake: {e}")))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let (read_half, write_half) = tokio::io::split(tls_stream);
+                    let (read_tx, read_rx) =
+                        mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+                    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
+
+                    let reader_jh = tokio::spawn(pool_reader(read_half, read_tx));
+                    let writer_jh = tokio::spawn(pool_writer(write_half, write_rx));
+
+                    let setup = PoolStreamSetup {
+                        remote_addr,
+                        local_addr: local_addr_conn,
+                        read_rx,
+                        write_tx,
+                        reader_abort: reader_jh.abort_handle(),
+                        writer_abort: writer_jh.abort_handle(),
+                    };
+                    let _ = conn_info_tx.send(Ok(setup)).await;
+                });
+            }
+        }
+    }
+}
+
+// ── LocalSet bridge (touches GcPtr / Value) ───────────────────────────────────
+
+/// Runs on the LocalSet: receives `PoolSetupResult` from the pool accept loop,
+/// creates Clojure channels + bridges for each new connection, and puts the
+/// connection map on `conns_chan`.
+async fn local_tls_accept_bridge(
+    mut conn_info_rx: mpsc::Receiver<PoolSetupResult>,
+    conns_chan: GcPtr<NativeObjectBox>,
+    in_buf: usize,
+    out_buf: usize,
+) {
+    while let Some(result) = conn_info_rx.recv().await {
+        match result {
+            Err(e) => {
+                chan_put(&conns_chan, net_error(e)).await;
+                break;
+            }
+            Ok(setup) => {
+                let conn = make_tls_connection_from_setup(setup, in_buf, out_buf);
+                if !chan_put(&conns_chan, conn).await {
+                    break; // consumer closed :conns
+                }
+            }
+        }
+    }
+    chan_ref(conns_chan.get()).close();
+}
+
+/// Build a TLS connection map + resource from a `PoolStreamSetup`, spawning
+/// LocalSet bridge tasks. Called on the LocalSet thread.
+fn make_tls_connection_from_setup(setup: PoolStreamSetup, in_buf: usize, out_buf: usize) -> Value {
     let in_chan = make_chan(in_buf);
     let out_chan = make_chan(out_buf);
     let resource = TlsStreamResource::new();
     let shared_inner = resource.inner.clone();
     let resource_handle = ResourceHandle::new(resource);
-    let r_jh = tokio::task::spawn_local(tls_reader_loop(reader, in_chan.clone()));
-    shared_inner.lock().unwrap().reader_abort = Some(r_jh.abort_handle());
-    let w_jh = tokio::task::spawn_local(tls_writer_loop(writer, out_chan.clone()));
-    shared_inner.lock().unwrap().writer_abort = Some(w_jh.abort_handle());
+
+    let rb_jh = tokio::task::spawn_local(read_bridge(setup.read_rx, in_chan.clone()));
+    let wb_jh = tokio::task::spawn_local(write_bridge(out_chan.clone(), setup.write_tx));
+
+    {
+        let mut g = shared_inner.lock().unwrap();
+        g.abort_handles.push(setup.reader_abort);
+        g.abort_handles.push(setup.writer_abort);
+        g.abort_handles.push(rb_jh.abort_handle());
+        g.abort_handles.push(wb_jh.abort_handle());
+    }
+
     Value::Map(MapValue::from_pairs(vec![
         (kw("in"), Value::NativeObject(in_chan)),
         (kw("out"), Value::NativeObject(out_chan)),
-        (kw("remote-addr"), Value::string(remote_addr)),
-        (kw("local-addr"), Value::string(local_addr)),
+        (kw("remote-addr"), Value::string(setup.remote_addr)),
+        (kw("local-addr"), Value::string(setup.local_addr)),
         (kw("resource"), Value::Resource(resource_handle)),
     ]))
 }
@@ -489,6 +526,9 @@ fn load_private_key(path: &str) -> ValueResult<rustls::pki_types::PrivateKeyDer<
 // ── Connect implementation ────────────────────────────────────────────────────
 
 /// Initiate a TLS connection and return the promise channel as a `Value`.
+///
+/// TCP connect + TLS handshake + I/O tasks run on the `WorkerPool`; bridge
+/// tasks run on the LocalSet.
 pub fn tls_connect_to(
     host: &str,
     port: u16,
@@ -499,7 +539,9 @@ pub fn tls_connect_to(
     let host = host.to_string();
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move { do_tls_connect(host, port, config, in_buf, out_buf, promise).await });
+    spawn_future(async move {
+        do_tls_connect(host, port, config, in_buf, out_buf, promise).await
+    });
     promise_val
 }
 
@@ -513,105 +555,86 @@ async fn do_tls_connect(
 ) -> EvalResult {
     let addr = format!("{host}:{port}");
 
-    // TCP connect
-    let tcp_stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            chan_deliver(&promise, net_error(format!("connect to {addr}: {e}"))).await;
-            return Ok(Value::Nil);
-        }
-    };
+    // Channel for pool → LocalSet handshake.
+    let (setup_tx, setup_rx) = oneshot::channel::<PoolSetupResult>();
 
-    let remote_addr = tcp_stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let local_addr = tcp_stream
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
-    // TLS handshake
-    let server_name = match ServerName::try_from(host.as_str()) {
-        Ok(n) => n.to_owned(),
-        Err(e) => {
-            chan_deliver(
-                &promise,
-                net_error(format!("invalid SNI hostname {host}: {e}")),
-            )
-            .await;
-            return Ok(Value::Nil);
-        }
-    };
-
-    let connector = TlsConnector::from(config);
-    let tls_stream = match connector.connect(server_name, tcp_stream).await {
-        Ok(s) => s,
-        Err(e) => {
-            chan_deliver(&promise, net_error(format!("TLS handshake: {e}"))).await;
-            return Ok(Value::Nil);
-        }
-    };
-
-    let (reader, writer) = tokio::io::split(tls_stream);
-    let conn = make_tls_connection(reader, writer, remote_addr, local_addr, in_buf, out_buf);
-    chan_deliver(&promise, conn).await;
-    Ok(Value::Nil)
-}
-
-// ── Accept loop ───────────────────────────────────────────────────────────────
-
-/// Accept TLS connections and put each connection map on `conns_chan`.
-async fn tls_accept_loop(
-    listener: tokio::net::TcpListener,
-    acceptor: TlsAcceptor,
-    conns_chan: GcPtr<NativeObjectBox>,
-    in_buf: usize,
-    out_buf: usize,
-) {
-    loop {
-        match listener.accept().await {
+    // Spawn entire TLS connect + I/O pump on pool (Send).
+    WorkerPool::global().handle().spawn(async move {
+        // TCP connect
+        let tcp_stream = match TcpStream::connect(&addr).await {
+            Ok(s) => s,
             Err(e) => {
-                chan_put(&conns_chan, net_error(format!("accept error: {e}"))).await;
-                break;
+                let _ = setup_tx.send(Err(format!("connect to {addr}: {e}")));
+                return;
             }
-            Ok((tcp_stream, peer_addr)) => {
-                let remote_addr = peer_addr.to_string();
-                let local_addr = listener
-                    .local_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
-                let acceptor = acceptor.clone();
-                let conns_chan_clone = conns_chan.clone();
-                tokio::task::spawn_local(async move {
-                    let tls_stream = match acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            chan_put(&conns_chan_clone, net_error(format!("TLS handshake: {e}")))
-                                .await;
-                            return;
-                        }
-                    };
-                    let (reader, writer) = tokio::io::split(tls_stream);
-                    let conn = make_tls_connection(
-                        reader,
-                        writer,
-                        remote_addr,
-                        local_addr,
-                        in_buf,
-                        out_buf,
-                    );
-                    chan_put(&conns_chan_clone, conn).await;
-                });
+        };
+
+        let remote_addr = tcp_stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let local_addr = tcp_stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        // TLS handshake
+        let server_name = match ServerName::try_from(host.as_str()) {
+            Ok(n) => n.to_owned(),
+            Err(e) => {
+                let _ = setup_tx.send(Err(format!("invalid SNI hostname {host}: {e}")));
+                return;
             }
+        };
+
+        let connector = TlsConnector::from(config);
+        let tls_stream = match connector.connect(server_name, tcp_stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = setup_tx.send(Err(format!("TLS handshake: {e}")));
+                return;
+            }
+        };
+
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        let (read_tx, read_rx) = mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
+
+        let reader_jh = tokio::spawn(pool_reader(read_half, read_tx));
+        let writer_jh = tokio::spawn(pool_writer(write_half, write_rx));
+
+        let _ = setup_tx.send(Ok(PoolStreamSetup {
+            remote_addr,
+            local_addr,
+            read_rx,
+            write_tx,
+            reader_abort: reader_jh.abort_handle(),
+            writer_abort: writer_jh.abort_handle(),
+        }));
+    });
+
+    // Await the setup result back on the LocalSet.
+    match setup_rx.await {
+        Err(_) => {
+            chan_deliver(&promise, net_error("pool task dropped")).await;
+        }
+        Ok(Err(e)) => {
+            chan_deliver(&promise, net_error(e)).await;
+        }
+        Ok(Ok(setup)) => {
+            let conn = make_tls_connection_from_setup(setup, in_buf, out_buf);
+            chan_deliver(&promise, conn).await;
         }
     }
-    chan_ref(conns_chan.get()).close();
+    Ok(Value::Nil)
 }
 
 // ── Listen implementation ─────────────────────────────────────────────────────
 
 /// Bind a TLS listener on `host:port` and return a server map.
+///
+/// The accept loop and TLS handshakes run on the `WorkerPool`; a LocalSet bridge
+/// delivers connection maps onto `conns_chan`.
 pub fn tls_listen_on(
     host: &str,
     port: u16,
@@ -622,20 +645,19 @@ pub fn tls_listen_on(
 ) -> ValueResult<Value> {
     let addr = format!("{host}:{port}");
 
-    // Bind synchronously (std), then convert to Tokio.
+    // Bind synchronously (std) so we get the local_addr immediately.
     let std_listener = std::net::TcpListener::bind(&addr)
         .map_err(|e| ValueError::Other(format!("listen on {addr}: {e}")))?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| ValueError::Other(format!("set_nonblocking: {e}")))?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .map_err(|e| ValueError::Other(format!("from_std: {e}")))?;
 
-    let local_addr = listener
+    let local_addr = std_listener
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
 
+    let (conn_info_tx, conn_info_rx) = mpsc::channel::<PoolSetupResult>(conns_buf.max(1));
     let conns_chan = make_chan(conns_buf);
     let acceptor = TlsAcceptor::from(config);
 
@@ -643,14 +665,30 @@ pub fn tls_listen_on(
     let shared_inner = resource.inner.clone();
     let resource_handle = ResourceHandle::new(resource);
 
-    let jh = tokio::task::spawn_local(tls_accept_loop(
-        listener,
-        acceptor,
+    // Spawn accept loop on pool (Send).
+    let pool_jh = WorkerPool::global()
+        .handle()
+        .spawn(pool_tls_accept_loop(
+            std_listener,
+            acceptor,
+            conn_info_tx,
+            in_buf,
+            out_buf,
+        ));
+
+    // Spawn bridge on LocalSet (!Send, touches GcPtr).
+    let bridge_jh = tokio::task::spawn_local(local_tls_accept_bridge(
+        conn_info_rx,
         conns_chan.clone(),
         in_buf,
         out_buf,
     ));
-    shared_inner.lock().unwrap().accept_abort = Some(jh.abort_handle());
+
+    {
+        let mut g = shared_inner.lock().unwrap();
+        g.abort_handles.push(pool_jh.abort_handle());
+        g.abort_handles.push(bridge_jh.abort_handle());
+    }
 
     Ok(Value::Map(MapValue::from_pairs(vec![
         (kw("conns"), Value::NativeObject(conns_chan)),
