@@ -1,0 +1,45 @@
+;; clojure.rust.net.unix — Unix-domain stream sockets.
+;;
+;; Only available on Unix targets. On non-Unix targets all functions throw
+;; a "not supported on this platform" error.
+;;
+;; Native builtins (registered from Rust, #[cfg(unix)]):
+;;   connect      — (connect {:path "/tmp/app.sock"}) => promise-chan -> conn-map
+;;   close        — (close conn) => nil
+;;   listen       — (listen {:path "/tmp/app.sock"}) => {:conns ch :local-addr str :resource h}
+;;   listen-close — (listen-close server) => nil
+;;
+;; Connection map (same shape as TCP):
+;;   {:in          <chan>   ; byte-array chunks; closed at EOF
+;;    :out         <chan>   ; put byte-array/string values here
+;;    :remote-addr "..."   ; peer path, or empty for unnamed peers
+;;    :local-addr  "..."   ; local path, or empty for unnamed sockets
+;;    :resource    <handle>}
+;;
+;; Server map (same shape as TCP):
+;;   {:conns      <chan>   ; yields connection maps; closed when listener closes
+;;    :local-addr "..."   ; socket file path
+;;    :resource   <handle>}  ; close() unlinks the socket path
+
+(defn start-server
+  "Start a Unix-socket server with `handler` called for each accepted connection.
+  Returns the server map {:conns <chan> :local-addr str :resource handle}.
+
+  `handler` is called with a connection map for each accepted connection.
+  Use (go ...) inside the handler to avoid blocking new accepts.
+
+  Opts:
+    :path       string (required) — filesystem path for the socket file
+    :conns-buf  buffer depth for :conns (default 8)
+    :in-buf     per-connection :in buffer (default 8)
+    :out-buf    per-connection :out buffer (default 8)"
+  [handler opts]
+  (let [server (clojure.rust.net.unix/listen opts)
+        conns  (:conns server)]
+    (clojure.core.async/go
+      (loop []
+        (let [conn (await (clojure.core.async/take! conns))]
+          (when (some? conn)
+            (handler conn)
+            (recur)))))
+    server))

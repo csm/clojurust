@@ -1,4 +1,4 @@
-//! Networking for clojurust — TCP, UDP over core.async channels.
+//! Networking for clojurust — TCP, Unix, UDP, TLS over core.async channels.
 //!
 //! # Usage
 //!
@@ -20,6 +20,7 @@ pub mod frame;
 pub mod tcp;
 pub mod tls;
 pub mod udp;
+pub mod unix;
 
 /// Clojure source for `clojure.rust.net.tcp`.
 const NET_TCP_SOURCE: &str = include_str!("clojure_rust_net_tcp.cljrs");
@@ -36,11 +37,15 @@ const NET_UDP_SOURCE: &str = include_str!("clojure_rust_net_udp.cljrs");
 /// Clojure source for `clojure.rust.net.tls`.
 const NET_TLS_SOURCE: &str = include_str!("clojure_rust_net_tls.cljrs");
 
+/// Clojure source for `clojure.rust.net.unix`.
+const NET_UNIX_SOURCE: &str = include_str!("clojure_rust_net_unix.cljrs");
+
 pub const NS_TCP: &str = "clojure.rust.net.tcp";
 pub const NS: &str = "clojure.rust.net";
 pub const NS_FRAME: &str = "clojure.rust.net.frame";
 pub const NS_UDP: &str = "clojure.rust.net.udp";
 pub const NS_TLS: &str = "clojure.rust.net.tls";
+pub const NS_UNIX: &str = "clojure.rust.net.unix";
 
 /// Register the networking namespaces.
 ///
@@ -79,6 +84,14 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         tls::register(globals, NS_TLS);
         load_source(globals, NS_TLS, NET_TLS_SOURCE);
         globals.mark_loaded(NS_TLS);
+    }
+
+    if !globals.is_loaded(NS_UNIX) {
+        globals.get_or_create_ns(NS_UNIX);
+        globals.refer_all(NS_UNIX, "clojure.core");
+        unix::register(globals, NS_UNIX);
+        load_source(globals, NS_UNIX, NET_UNIX_SOURCE);
+        globals.mark_loaded(NS_UNIX);
     }
 
     if !globals.is_loaded(NS) {

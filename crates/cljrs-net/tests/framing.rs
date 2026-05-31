@@ -68,7 +68,7 @@ async fn setup_connection() -> (cljrs_value::MapValue, cljrs_value::MapValue) {
         Value::Str(s) => s.get().clone(),
         other => panic!("expected str :local-addr, got {}", other.type_name()),
     };
-    let port: u16 = local_addr.split(':').last().unwrap().parse().unwrap();
+    let port: u16 = local_addr.split(':').next_back().unwrap().parse().unwrap();
 
     // Start connecting — the promise resolves once the server accepts.
     let promise = cljrs_net::tcp::connect_to("127.0.0.1", port, 8, 8);
