@@ -4,7 +4,7 @@ use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
-    Agent, AgentFn, AgentMsg, Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
+    Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
     Symbol, Thunk, Value, Volatile,
 };
 use std::collections::HashMap;
@@ -869,103 +869,15 @@ fn handle_vreset(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 // ── agent ────────────────────────────────────────────────────────────────────
 
 /// Handle `(agent init-val & opts)`.
-fn handle_agent_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
-    if arg_forms.is_empty() {
-        return Err(EvalError::Arity {
-            name: "agent".into(),
-            expected: "1+".into(),
-            got: 0,
-        });
-    }
-    // Under no-gc: agent initial value must live in the StaticArena since the
-    // Agent container outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-    let init = eval(&arg_forms[0], env)?;
-
-    let (tx, rx) = std::sync::mpsc::sync_channel::<AgentMsg>(1024);
-    let state_arc = std::sync::Arc::new(std::sync::Mutex::new(init));
-    let error_arc: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let worker_state = state_arc.clone();
-    let worker_error = error_arc.clone();
-    std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            match msg {
-                AgentMsg::Update(f) => {
-                    let cur = worker_state.lock().unwrap().clone();
-                    match f(cur) {
-                        Ok(next) => *worker_state.lock().unwrap() = next,
-                        Err(e) => *worker_error.lock().unwrap() = Some(e),
-                    }
-                }
-                AgentMsg::Shutdown => break,
-            }
-        }
-    });
-    Ok(Value::Agent(GcPtr::new(Agent {
-        state: state_arc,
-        error: error_arc,
-        sender: std::sync::Mutex::new(tx),
-        watches: std::sync::Mutex::new(Vec::new()),
-    })))
+fn handle_agent_call(_arg_forms: &[Form], _env: &mut Env) -> EvalResult {
+    Err(EvalError::Runtime("agent is not yet implemented".into()))
 }
 
 /// Handle `(send agent f & extra)` / `(send-off agent f & extra)`.
-fn handle_send(arg_forms: &[Form], env: &mut Env) -> EvalResult {
-    if arg_forms.len() < 2 {
-        return Err(EvalError::Arity {
-            name: "send".into(),
-            expected: "2+".into(),
-            got: arg_forms.len(),
-        });
-    }
-    let agent_val = eval(&arg_forms[0], env)?;
-    let f = eval(&arg_forms[1], env)?;
-    let extra: Vec<Value> = arg_forms[2..]
-        .iter()
-        .map(|a| eval(a, env))
-        .collect::<EvalResult<_>>()?;
-    let globals = env.globals.clone();
-    let ns = env.current_ns.clone();
-
-    match &agent_val {
-        Value::Agent(a) => {
-            let agent_clone = a.clone();
-            let agent_val_clone = agent_val.clone();
-            let agent_fn: AgentFn = Box::new(move |state| {
-                let mut call_args = vec![state.clone()];
-                call_args.extend(extra);
-                let mut call_env = Env::new(globals, &ns);
-                let new_val = cljrs_env::apply::apply_value(&f, call_args, &mut call_env)
-                    .map_err(eval_error_to_value)?;
-                // Fire watches (agent watches fire on the agent thread)
-                fire_watches(
-                    &agent_clone.get().watches,
-                    &agent_val_clone,
-                    &state,
-                    &new_val,
-                    &mut call_env,
-                );
-                // Watch errors become agent errors
-                if let Err(e) = check_watch_error() {
-                    return Err(eval_error_to_value(e));
-                }
-                Ok(new_val)
-            });
-            a.get()
-                .sender
-                .lock()
-                .unwrap()
-                .send(AgentMsg::Update(agent_fn))
-                .map_err(|_| EvalError::Runtime("send: agent is shut down".into()))?;
-            Ok(agent_val.clone())
-        }
-        other => Err(EvalError::Runtime(format!(
-            "send: expected agent, got {}",
-            other.type_name()
-        ))),
-    }
+fn handle_send(_arg_forms: &[Form], _env: &mut Env) -> EvalResult {
+    Err(EvalError::Runtime(
+        "send/send-off: agents are not yet implemented".into(),
+    ))
 }
 
 // ── atom ──────────────────────────────────────────────────────────────────────
@@ -1480,54 +1392,10 @@ pub fn eval_with_bindings_star(args: Vec<Value>, env: &mut Env) -> EvalResult {
 }
 
 /// Execute `send` / `send-off` with already-evaluated args: `[agent, f, extra...]`.
-pub fn eval_send_to_agent(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
-    if args.len() < 2 {
-        return Err(EvalError::Arity {
-            name: "send".into(),
-            expected: "2+".into(),
-            got: args.len(),
-        });
-    }
-    let agent_val = args.remove(0);
-    let f = args.remove(0);
-    let extra = args;
-    let globals = env.globals.clone();
-    let ns = env.current_ns.clone();
-    match &agent_val {
-        Value::Agent(a) => {
-            let agent_clone = a.clone();
-            let agent_val_clone = agent_val.clone();
-            let agent_fn: AgentFn = Box::new(move |state| {
-                let mut call_args = vec![state.clone()];
-                call_args.extend(extra);
-                let mut call_env = Env::new(globals, &ns);
-                let new_val = cljrs_env::apply::apply_value(&f, call_args, &mut call_env)
-                    .map_err(eval_error_to_value)?;
-                fire_watches(
-                    &agent_clone.get().watches,
-                    &agent_val_clone,
-                    &state,
-                    &new_val,
-                    &mut call_env,
-                );
-                if let Err(e) = check_watch_error() {
-                    return Err(eval_error_to_value(e));
-                }
-                Ok(new_val)
-            });
-            a.get()
-                .sender
-                .lock()
-                .unwrap()
-                .send(AgentMsg::Update(agent_fn))
-                .map_err(|_| EvalError::Runtime("send: agent is shut down".into()))?;
-            Ok(agent_val.clone())
-        }
-        other => Err(EvalError::Runtime(format!(
-            "send: expected agent, got {}",
-            other.type_name()
-        ))),
-    }
+pub fn eval_send_to_agent(_args: Vec<Value>, _env: &mut Env) -> EvalResult {
+    Err(EvalError::Runtime(
+        "send/send-off: agents are not yet implemented".into(),
+    ))
 }
 
 // ── Namespace reflection (env-needing) ────────────────────────────────────────

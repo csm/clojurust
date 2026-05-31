@@ -159,54 +159,55 @@
        nil
 
        :default
-       (testing "remove watch agents"
-         (let [messages (volatile! #{})
-               watcher1 (fn [key ref old new]
-                          ;; `await` does a `send` on the agent, so
-                          ;; only add message if old and new differ
-                          (when (not= old new)
-                            (vswap! messages conj {:key key :ref ref :old old :new new :watcher :watcher1})))
-               watcher2 (fn [key ref old new]
-                          ;; `await` does a `send` on the agent, so
-                          ;; only add message if old and new differ
-                          (when (not= old new)
-                            (vswap! messages conj {:key key :ref ref :old old :new new :watcher :watcher2})))
-               watchable (agent 0)
-               update! (fn []
-                         (send watchable inc)
-                         (#?(:rust await-agent :default await) watchable))]
-           ;; Make sure messages is empty
-           (is (empty? @messages))
+       (when-var-exists agent
+         (testing "remove watch agents"
+           (let [messages (volatile! #{})
+                 watcher1 (fn [key ref old new]
+                            ;; `await` does a `send` on the agent, so
+                            ;; only add message if old and new differ
+                            (when (not= old new)
+                              (vswap! messages conj {:key key :ref ref :old old :new new :watcher :watcher1})))
+                 watcher2 (fn [key ref old new]
+                            ;; `await` does a `send` on the agent, so
+                            ;; only add message if old and new differ
+                            (when (not= old new)
+                              (vswap! messages conj {:key key :ref ref :old old :new new :watcher :watcher2})))
+                 watchable (agent 0)
+                 update! (fn []
+                           (send watchable inc)
+                           (#?(:rust await-agent :default await) watchable))]
+             ;; Make sure messages is empty
+             (is (empty? @messages))
 
-           ;; Add watches
-           (add-watch watchable :key1 watcher1)
-           (add-watch watchable :key2 watcher2)
+             ;; Add watches
+             (add-watch watchable :key1 watcher1)
+             (add-watch watchable :key2 watcher2)
 
-           ;; Update the atom
-           (update!)
+             ;; Update the atom
+             (update!)
 
-           ;; Check if all the watchers fired and added messages correctly
-           (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
-                              {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}}))
+             ;; Check if all the watchers fired and added messages correctly
+             (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
+                                {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}}))
 
-           ;; Remove a watch
-           (remove-watch watchable :key1)
+             ;; Remove a watch
+             (remove-watch watchable :key1)
 
-           ;; Update again
-           (update!)
+             ;; Update again
+             (update!)
 
-           ;; Check if the right watchers disappeared
-           (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
-                              {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}
-                              {:key :key2 :ref watchable :old 1 :new 2 :watcher :watcher2}}))
+             ;; Check if the right watchers disappeared
+             (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
+                                {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}
+                                {:key :key2 :ref watchable :old 1 :new 2 :watcher :watcher2}}))
 
-           ;; Remove the last watch
-           (remove-watch watchable :key2)
+             ;; Remove the last watch
+             (remove-watch watchable :key2)
 
-           ;; Update again
-           (update!)
+             ;; Update again
+             (update!)
 
-           ;; Check to make sure nothing was added
-           (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
-                              {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}
-                              {:key :key2 :ref watchable :old 1 :new 2 :watcher :watcher2}})))))))
+             ;; Check to make sure nothing was added
+             (is (= @messages #{{:key :key1 :ref watchable :old 0 :new 1 :watcher :watcher1}
+                                {:key :key2 :ref watchable :old 0 :new 1 :watcher :watcher2}
+                                {:key :key2 :ref watchable :old 1 :new 2 :watcher :watcher2}}))))))))

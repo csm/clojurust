@@ -155,18 +155,12 @@ pub fn standard_env() -> Arc<GlobalEnv> {
     });
 
     // Register and load compiler namespaces so IR lowering is available at
-    // runtime.  Loading runs on a thread with a large stack because the
-    // Clojure compiler sources are deeply recursive.
+    // runtime.  The main thread already has a large stack (set in main.rs),
+    // so we run this synchronously rather than on a background thread.
     cljrs_eval::register_compiler_sources(&globals);
     {
-        let g = globals.clone();
-        let _ = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                let mut env = cljrs_eval::Env::new(g.clone(), "user");
-                cljrs_eval::ensure_compiler_loaded(&g, &mut env);
-            })
-            .and_then(|h| h.join().map_err(|_| std::io::Error::other("join failed")));
+        let mut env = cljrs_eval::Env::new(globals.clone(), "user");
+        cljrs_eval::ensure_compiler_loaded(&globals, &mut env);
     }
 
     globals

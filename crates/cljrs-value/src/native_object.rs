@@ -30,7 +30,7 @@ use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 ///     fn trace(&self, _: &mut MarkVisitor) {}
 /// }
 /// ```
-pub trait NativeObject: Send + Sync + fmt::Debug + Trace + 'static {
+pub trait NativeObject: fmt::Debug + Trace + 'static {
     /// Short type name used for `type_tag_of` and protocol dispatch.
     ///
     /// Convention: use the Rust struct name (e.g. `"TcpStream"`, `"Counter"`).

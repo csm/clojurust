@@ -453,7 +453,7 @@ pub type NativeFnPtr = fn(&[Value]) -> crate::error::ValueResult<Value>;
 
 /// The callable stored inside a `NativeFn`. Supports both bare function
 /// pointers and closures that capture state.
-pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync>;
+pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value>>;
 
 #[derive(Clone, Debug)]
 pub enum Arity {
@@ -481,7 +481,7 @@ impl NativeFn {
     pub fn with_closure(
         name: impl Into<Arc<str>>,
         arity: Arity,
-        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync + 'static,
+        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -636,7 +636,7 @@ impl cljrs_gc::Trace for BoundFn {
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────
 
 /// A deferred computation that produces a `Value` when forced.
-pub trait Thunk: Send + Sync + std::fmt::Debug + cljrs_gc::Trace {
+pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
     fn force(&self) -> Result<Value, String>;
 }
 
