@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 pub mod apply;
 pub mod async_hook;

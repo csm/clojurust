@@ -22,10 +22,10 @@ use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo,
-    FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap,
-    PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk,
-    TypeInstance, Value, ValueError, ValueResult, Volatile,
+    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError,
+    ValueResult, Volatile,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -6505,6 +6505,7 @@ fn builtin_agent_error(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+#[allow(dead_code)]
 fn builtin_restart_agent(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Agent(a) => {

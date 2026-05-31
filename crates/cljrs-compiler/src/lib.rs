@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 //! Program analysis and optimization for clojurust.
 //!

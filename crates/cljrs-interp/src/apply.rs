@@ -4,8 +4,8 @@ use cljrs_builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::{Form, FormKind};
 use cljrs_value::{
-    Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList,
-    Symbol, Thunk, Value, Volatile,
+    Atom, CljxFn, CljxFnArity, Delay, LazySeq, MapValue, PersistentList, Symbol, Thunk, Value,
+    Volatile,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use cljrs_env::error::{EvalError, EvalResult};
 
 /// Convert an EvalError to a Value for storage (e.g. agent errors).
 /// Preserves Thrown values (ex-info); other errors become strings.
+#[allow(dead_code)]
 fn eval_error_to_value(e: EvalError) -> Value {
     match e {
         EvalError::Thrown(v) => v,

@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)]
 //! IR-accelerated evaluation for clojurust.
 //!
 //! Wraps the tree-walking interpreter (`cljrs-interp`) with IR lowering and

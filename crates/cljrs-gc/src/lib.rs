@@ -299,7 +299,6 @@ impl GcVisitor for MarkVisitor {
 
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
-
 impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(not(feature = "no-gc"))]
     pub fn new(value: T) -> Self {
@@ -473,10 +472,7 @@ mod gc_full {
             )));
         }
 
-        pub fn register_root_tracer(
-            &self,
-            tracer: impl Fn(&mut MarkVisitor) + 'static,
-        ) {
+        pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static) {
             self.root_tracers.lock().unwrap().push(Box::new(tracer));
         }
 
