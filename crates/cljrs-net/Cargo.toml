@@ -14,7 +14,7 @@ cljrs-env      = { workspace = true }
 cljrs-reader   = { workspace = true }
 cljrs-interp   = { workspace = true }
 cljrs-async    = { workspace = true }
-tokio          = { workspace = true, features = ["net", "io-util"] }
+tokio          = { workspace = true, features = ["net", "io-util", "sync"] }
 tokio-rustls   = { version = "0.26", default-features = false, features = ["ring"] }
 rustls         = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"

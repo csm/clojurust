@@ -20,6 +20,7 @@ mod builtins;
 pub mod channel;
 pub mod eval_async;
 mod runtime;
+pub mod worker_pool;
 use runtime::AsyncRuntimeImpl;
 
 // Re-exported so sibling native crates (e.g. `cljrs-io`) can spawn work onto the
