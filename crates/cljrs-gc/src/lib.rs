@@ -63,7 +63,7 @@ pub fn is_static_addr(addr: usize) -> bool {
 /// - Count only bytes THIS value owns and will free when dropped.
 /// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
 ///   separately when it is allocated.
-pub trait Trace: Send + Sync {
+pub trait Trace {
     fn trace(&self, visitor: &mut MarkVisitor);
 
     fn gc_size_extra(&self) -> usize {
@@ -299,9 +299,6 @@ impl GcVisitor for MarkVisitor {
 
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
-unsafe impl<T: Trace + 'static> Send for GcPtr<T> {}
-unsafe impl<T: Trace + 'static> Sync for GcPtr<T> {}
-
 impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(not(feature = "no-gc"))]
     pub fn new(value: T) -> Self {
@@ -389,7 +386,7 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-    type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
+    type RootTracer = Box<dyn Fn(&mut MarkVisitor)>;
 
     pub struct GcHeap {
         inner: Mutex<GcHeapInner>,
@@ -475,10 +472,7 @@ mod gc_full {
             )));
         }
 
-        pub fn register_root_tracer(
-            &self,
-            tracer: impl Fn(&mut MarkVisitor) + Send + Sync + 'static,
-        ) {
+        pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static) {
             self.root_tracers.lock().unwrap().push(Box::new(tracer));
         }
 
@@ -757,7 +751,7 @@ mod nogc_stubs {
             Self
         }
         pub fn set_config(&self, _: Arc<GcConfig>) {}
-        pub fn register_root_tracer(&self, _: impl Fn(&mut MarkVisitor) + Send + Sync + 'static) {}
+        pub fn register_root_tracer(&self, _: impl Fn(&mut MarkVisitor) + 'static) {}
         pub fn trace_registered_roots(&self, _: &mut MarkVisitor) {}
         pub fn memory_in_use(&self) -> usize {
             0

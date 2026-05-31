@@ -40,14 +40,15 @@
          (is (= ((f)) :inside-f) "bound-fn as result preserves initial bindings"))))
 
    (testing "Threaded/future cases"
-     (let [f (bound-fn* test-fn)
-           fut (future (f))]
-       (binding [*x* :here]
-         (is (= @fut :unset) "bound-fn stays bound even in other thread"))))
-     (binding [*x* :caller]
-       (let [f (future
-                 (binding [*x* :callee]
-                   (future (bound-fn* test-fn))))]
-         (binding [*x* :derefer]
-           (let [derefed-f @f]
-             (is (= :callee (@derefed-f)) "Binding in futures preserved.")))))))
+     (when-var-exists future
+       (let [f (bound-fn* test-fn)
+             fut (future (f))]
+         (binding [*x* :here]
+           (is (= @fut :unset) "bound-fn stays bound even in other thread")))
+       (binding [*x* :caller]
+         (let [f (future
+                   (binding [*x* :callee]
+                     (future (bound-fn* test-fn))))]
+           (binding [*x* :derefer]
+             (let [derefed-f @f]
+               (is (= :callee (@derefed-f)) "Binding in futures preserved."))))))))

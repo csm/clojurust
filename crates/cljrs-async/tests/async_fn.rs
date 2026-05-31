@@ -201,6 +201,7 @@ fn at_deref_of_future_in_async_fn_errors() {
 }
 
 #[test]
+#[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
 fn deref_of_future_in_sync_context_still_works() {
     // With the async runtime registered, a *sync* (non-^:async) deref of a
     // thread-based future must still block-and-return, not error.

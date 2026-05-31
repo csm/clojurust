@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)]
 pub mod collections;
 pub mod error;
 pub mod hash;
@@ -20,8 +21,8 @@ pub use native_object::{NativeObject, NativeObjectBox, gc_native_object};
 pub use resource::{Resource, ResourceHandle};
 pub use symbol::Symbol;
 pub use types::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture,
-    CljxPromise, Delay, DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn,
-    NativeFnFunc, NativeFnPtr, Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
+    Agent, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture, CljxPromise, Delay,
+    DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnFunc, NativeFnPtr,
+    Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
 };
 pub use value::{MapValue, ObjectArray, TypeInstance, Value};

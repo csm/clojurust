@@ -453,7 +453,7 @@ pub type NativeFnPtr = fn(&[Value]) -> crate::error::ValueResult<Value>;
 
 /// The callable stored inside a `NativeFn`. Supports both bare function
 /// pointers and closures that capture state.
-pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync>;
+pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value>>;
 
 #[derive(Clone, Debug)]
 pub enum Arity {
@@ -481,7 +481,7 @@ impl NativeFn {
     pub fn with_closure(
         name: impl Into<Arc<str>>,
         arity: Arity,
-        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync + 'static,
+        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -636,7 +636,7 @@ impl cljrs_gc::Trace for BoundFn {
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────
 
 /// A deferred computation that produces a `Value` when forced.
-pub trait Thunk: Send + Sync + std::fmt::Debug + cljrs_gc::Trace {
+pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
     fn force(&self) -> Result<Value, String>;
 }
 
@@ -1024,23 +1024,12 @@ impl cljrs_gc::Trace for CljxFuture {
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
-/// A Clojure agent action: takes the current state, returns the new state.
-pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, Value> + Send>;
-
-/// Messages sent to an agent's worker thread.
-pub enum AgentMsg {
-    Update(AgentFn),
-    Shutdown,
-}
-
-/// A Clojure agent — asynchronous state update queue.
+/// A Clojure agent — asynchronous state update queue (stub: not yet implemented).
 pub struct Agent {
-    /// Current state, shared between the Value::Agent handle and the worker thread.
+    /// Current state.
     pub state: Arc<Mutex<Value>>,
-    /// Last error, shared similarly.
+    /// Last error.
     pub error: Arc<Mutex<Option<Value>>>,
-    /// Channel to send actions to the worker thread.
-    pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
 }
 

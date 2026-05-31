@@ -50,20 +50,21 @@
         (t/is (= @f :here) "Delayed functions inherit there bindings when forced"))
       (t/is (= @f :here) "And value persists outside binding expression"))
 
-    ;; CLJS doesn't have futures
+    ;; CLJS doesn't have futures; on :rust future is not yet implemented
     #?@(:cljs []
         :default
-        [(let [f (future (test-fn))]
-           (binding [*x* :now-here]
-             (t/is (= @f :unset) "Thread context is separate from joining thread")))
-         (binding [*x* :outer]
+        [(when-var-exists future
            (let [f (future (test-fn))]
-             (binding [*x* :inner]
-               (t/is (= @f :outer) "Thread context preserves binding context."))))
-         (binding [*x* :caller]
-           (let [f (future
-                     (binding [*x* :callee]
-                       (future (test-fn))))]
-             (binding [*x* :derefer]
-               (let [derefed-f @f]
-                 (t/is (= :callee @derefed-f) "Binding in futures preserved.")))))])))
+             (binding [*x* :now-here]
+               (t/is (= @f :unset) "Thread context is separate from joining thread")))
+           (binding [*x* :outer]
+             (let [f (future (test-fn))]
+               (binding [*x* :inner]
+                 (t/is (= @f :outer) "Thread context preserves binding context."))))
+           (binding [*x* :caller]
+             (let [f (future
+                       (binding [*x* :callee]
+                         (future (test-fn))))]
+               (binding [*x* :derefer]
+                 (let [derefed-f @f]
+                   (t/is (= :callee @derefed-f) "Binding in futures preserved."))))))])))
