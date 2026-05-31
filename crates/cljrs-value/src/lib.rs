@@ -1,4 +1,5 @@
 #![allow(clippy::arc_with_non_send_sync)]
+pub mod clone;
 pub mod collections;
 pub mod error;
 pub mod hash;
@@ -25,4 +26,4 @@ pub use types::{
     DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnFunc, NativeFnPtr,
     Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
 };
-pub use value::{MapValue, ObjectArray, TypeInstance, Value};
+pub use value::{MapValue, ObjectArray, SetValue, TypeInstance, Value};
