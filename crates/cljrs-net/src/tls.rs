@@ -468,9 +468,7 @@ pub fn build_server_config(opts: &MapValue) -> ValueResult<Arc<ServerConfig>> {
 
 // ── Cert/key loaders ──────────────────────────────────────────────────────────
 
-fn load_certs(
-    path: &str,
-) -> ValueResult<Vec<rustls::pki_types::CertificateDer<'static>>> {
+fn load_certs(path: &str) -> ValueResult<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let file =
         std::fs::File::open(path).map_err(|e| ValueError::Other(format!("open {path}: {e}")))?;
     let mut reader = BufReader::new(file);
@@ -501,9 +499,7 @@ pub fn tls_connect_to(
     let host = host.to_string();
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move {
-        do_tls_connect(host, port, config, in_buf, out_buf, promise).await
-    });
+    spawn_future(async move { do_tls_connect(host, port, config, in_buf, out_buf, promise).await });
     promise_val
 }
 
@@ -591,11 +587,8 @@ async fn tls_accept_loop(
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            chan_put(
-                                &conns_chan_clone,
-                                net_error(format!("TLS handshake: {e}")),
-                            )
-                            .await;
+                            chan_put(&conns_chan_clone, net_error(format!("TLS handshake: {e}")))
+                                .await;
                             return;
                         }
                     };

@@ -77,8 +77,8 @@ fn test_tls_echo_round_trip() {
             (kw("cert"), Value::string(cert_path.clone())),
             (kw("key"), Value::string(key_path.clone())),
         ]);
-        let server_config = cljrs_net::tls::build_server_config(&server_opts)
-            .expect("build_server_config failed");
+        let server_config =
+            cljrs_net::tls::build_server_config(&server_opts).expect("build_server_config failed");
 
         // Start the TLS listener (port 0 = OS-assigned).
         let server_val = cljrs_net::tls::tls_listen_on("127.0.0.1", 0, server_config, 8, 8, 8)
@@ -126,8 +126,8 @@ fn test_tls_echo_round_trip() {
             kw("insecure-skip-verify"),
             Value::Bool(true),
         )]);
-        let client_config = cljrs_net::tls::build_client_config(&client_opts)
-            .expect("build_client_config failed");
+        let client_config =
+            cljrs_net::tls::build_client_config(&client_opts).expect("build_client_config failed");
 
         // Connect the TLS client.
         let promise = cljrs_net::tls::tls_connect_to("localhost", port, client_config, 8, 8);
@@ -166,7 +166,10 @@ fn test_tls_echo_round_trip() {
             }
         }
 
-        assert_eq!(response, request, "TLS echo server must return the same bytes");
+        assert_eq!(
+            response, request,
+            "TLS echo server must return the same bytes"
+        );
 
         // Cleanup temp files.
         let _ = std::fs::remove_file(&cert_path);
@@ -200,8 +203,8 @@ fn test_tls_connect_failure() {
             kw("insecure-skip-verify"),
             Value::Bool(true),
         )]);
-        let client_config = cljrs_net::tls::build_client_config(&client_opts)
-            .expect("build_client_config failed");
+        let client_config =
+            cljrs_net::tls::build_client_config(&client_opts).expect("build_client_config failed");
 
         // Port 1 is privileged and almost certainly not listening.
         let promise = cljrs_net::tls::tls_connect_to("127.0.0.1", 1, client_config, 8, 8);
