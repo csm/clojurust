@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod builtins;
 pub mod channel;
 pub mod eval_async;
+pub mod isolate;
 mod runtime;
 pub mod worker_pool;
 use runtime::AsyncRuntimeImpl;
