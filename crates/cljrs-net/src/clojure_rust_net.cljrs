@@ -1,6 +1,7 @@
 ;; clojure.rust.net — umbrella networking namespace.
 
 (require 'clojure.rust.net.tcp)
+(require 'clojure.rust.net.tls)
 (require 'clojure.rust.net.udp)
 
 (defn connect
@@ -11,13 +12,14 @@
   Opts:
     :host          string (required)
     :port          integer (required, 1-65535)
-    :transport     :tcp (default) — future: :unix, :tls
+    :transport     :tcp (default), :tls
     :in-buf        channel buffer depth for :in (default 8)
     :out-buf       channel buffer depth for :out (default 8)"
   [opts]
   (let [transport (get opts :transport :tcp)]
     (case transport
       :tcp (clojure.rust.net.tcp/connect opts)
+      :tls (clojure.rust.net.tls/connect opts)
       (throw (ex-info (str "unsupported transport: " transport) {:transport transport})))))
 
 (defn listen
@@ -28,7 +30,7 @@
   Opts:
     :port       integer (required, 1-65535)
     :host       string (default \"0.0.0.0\")
-    :transport  :tcp (default) — future: :unix, :tls
+    :transport  :tcp (default), :tls
     :conns-buf  buffer depth for :conns (default 8)
     :in-buf     per-connection :in buffer (default 8)
     :out-buf    per-connection :out buffer (default 8)"
@@ -36,6 +38,7 @@
   (let [transport (get opts :transport :tcp)]
     (case transport
       :tcp (clojure.rust.net.tcp/listen opts)
+      :tls (clojure.rust.net.tls/listen opts)
       (throw (ex-info (str "unsupported transport: " transport) {:transport transport})))))
 
 (defn start-server
