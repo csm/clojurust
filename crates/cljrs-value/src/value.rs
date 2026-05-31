@@ -13,6 +13,7 @@ use crate::hash::{
 use crate::keyword::Keyword;
 use crate::regex::Matcher;
 use crate::resource::ResourceHandle;
+use crate::shared::SharedAtom;
 use crate::symbol::Symbol;
 use crate::types::{
     Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
@@ -107,6 +108,14 @@ pub enum Value {
     // ── Mutable state ─────────────────────────────────────────────────────────
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
+    /// Cross-isolate mutable reference backed by `Arc<ArcSwap<SharedValue>>`.
+    /// Unlike `Atom`, a `SharedAtom` can cross the isolate boundary (the `Arc`
+    /// is cloned, not deep-copied) and its contents are lock-free CAS-swapped.
+    SharedAtom(std::sync::Arc<SharedAtom>),
+    /// Immutable refcounted byte buffer (the BEAM off-heap-binary trick).
+    /// Shared without copy across the isolate boundary; refcount drops to zero
+    /// only when every isolate releases its reference.
+    ByteBlob(std::sync::Arc<[u8]>),
 
     // ── Reduced (early termination sentinel for reduce/transduce) ───────────
     Reduced(Box<Value>),
@@ -484,6 +493,10 @@ impl PartialEq for Value {
             (Value::Error(a), Value::Error(b)) => {
                 std::ptr::eq(a.get() as *const _, b.get() as *const _)
             }
+            // SharedAtom: pointer identity (same Arc → same atom).
+            (Value::SharedAtom(a), Value::SharedAtom(b)) => Arc::ptr_eq(a, b),
+            // ByteBlob: pointer identity (same Arc → same underlying buffer).
+            (Value::ByteBlob(a), Value::ByteBlob(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -723,6 +736,15 @@ impl ClojureHash for Value {
                 let mut h: u32 = 0;
                 for item in a.get().0.lock().unwrap().iter() {
                     h = hash_combine_ordered(h, item.clojure_hash())
+                }
+                h
+            }
+
+            Value::SharedAtom(a) => Arc::as_ptr(a) as u32,
+            Value::ByteBlob(b) => {
+                let mut h: u32 = 0;
+                for byte in b.iter() {
+                    h = hash_combine_ordered(h, hash_i64(*byte as i64));
                 }
                 h
             }
@@ -1034,6 +1056,10 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
         },
         Value::Var(v) => write!(f, "#'{}/{}", v.get().namespace, v.get().name),
         Value::Atom(a) => write!(f, "#<Atom {}>", a.get().deref()),
+        Value::SharedAtom(a) => {
+            write!(f, "#<SharedAtom {}>", a.deref_val().type_name())
+        }
+        Value::ByteBlob(b) => write!(f, "#<ByteBlob {} bytes>", b.len()),
         Value::Namespace(n) => write!(f, "#<Namespace {}>", n.get().name),
         Value::Protocol(p) => write!(f, "#<Protocol {}>", p.get().name),
         Value::ProtocolFn(pf) => {
@@ -1149,6 +1175,8 @@ impl Value {
             | Value::MultiFn(_) => "fn",
             Value::Var(_) => "var",
             Value::Atom(_) => "atom",
+            Value::SharedAtom(_) => "shared-atom",
+            Value::ByteBlob(_) => "byte-blob",
             Value::Namespace(_) => "namespace",
             Value::LazySeq(_) => "lazyseq",
             Value::Cons(_) => "cons",
@@ -1274,8 +1302,9 @@ impl cljrs_gc::Trace for Value {
             | Value::DoubleArray(_)
             | Value::CharArray(_) => {}
             Value::NativeObject(p) => visitor.visit(p),
-            // Resource is Arc-ref-counted, not GcPtr — nothing to trace.
-            Value::Resource(_) => {}
+            // Resource, SharedAtom, and ByteBlob are Arc-ref-counted outside the
+            // GC heap — nothing to trace through the GC visitor.
+            Value::Resource(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => {}
             Value::TransientMap(m) => visitor.visit(m),
             Value::TransientVector(p) => visitor.visit(p),
             Value::TransientSet(m) => visitor.visit(m),
@@ -1687,6 +1716,8 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Macro(_) => 16,
         Value::Var(_) => 17,
         Value::Atom(_) => 18,
+        Value::SharedAtom(_) => 46,
+        Value::ByteBlob(_) => 47,
         Value::Namespace(_) => 19,
         Value::Protocol(_) => 20,
         Value::ProtocolFn(_) => 21,

@@ -41,6 +41,7 @@ use num_bigint::BigInt;
 
 use crate::collections::{PersistentHashSet, PersistentVector, SortedMap, SortedSet};
 use crate::error::ValueError;
+use crate::shared::SharedAtom;
 use crate::types::DelayState;
 use crate::{Keyword, MapValue, PersistentList, PersistentQueue, SetValue, Symbol, Value};
 use cljrs_gc::GcPtr;
@@ -151,6 +152,13 @@ pub enum SerializedValue {
         meta: Box<SerializedValue>,
     },
     Reduced(Box<SerializedValue>),
+
+    // Phase B3: cross-isolate shared references (Arc cloned, not deep-copied).
+    /// `SharedAtom` is inherently cross-isolate; the `Arc` is simply cloned so
+    /// both isolates share the same underlying `ArcSwap` cell.
+    SharedAtom(Arc<SharedAtom>),
+    /// `ByteBlob` is an immutable refcounted buffer; clone the `Arc`.
+    ByteBlob(Arc<[u8]>),
 }
 
 // Compile-time Send + Sync assertions.
@@ -334,6 +342,10 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         Value::TransientMap(_) => Err(not_shareable("transient-map")),
         Value::TransientSet(_) => Err(not_shareable("transient-set")),
         Value::TransientVector(_) => Err(not_shareable("transient-vector")),
+
+        // ── Phase B3: cross-isolate shared references (pass Arc through) ──
+        Value::SharedAtom(a) => Ok(SerializedValue::SharedAtom(a.clone())),
+        Value::ByteBlob(b) => Ok(SerializedValue::ByteBlob(b.clone())),
     }
 }
 
@@ -544,6 +556,10 @@ pub fn deserialize(sv: SerializedValue) -> Value {
                 items.into_iter().map(deserialize).collect(),
             )))
         }
+
+        // Phase B3: cross-isolate shared references — clone the Arc.
+        SerializedValue::SharedAtom(a) => Value::SharedAtom(a),
+        SerializedValue::ByteBlob(b) => Value::ByteBlob(b),
     }
 }
 

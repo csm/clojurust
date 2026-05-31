@@ -374,6 +374,69 @@ impl<T: Trace + 'static> Drop for GcPtr<T> {
 }
 
 // =============================================================================
+// StaticGcPtr — Send+Sync pointer to program-lifetime data
+// =============================================================================
+
+/// A raw pointer to a value that lives for the entire program lifetime.
+///
+/// Backed by the global `StaticArena` (in `no-gc` builds) or by `Box::leak`
+/// (in GC builds).  Either way the pointee is never freed and never moved, so
+/// it is safe to share across isolate threads.
+///
+/// `StaticGcPtr<T>` wraps `*const T` — it does **not** involve a `GcBox`
+/// header — so it is independent of the GC build mode and carries no GC
+/// overhead.
+pub struct StaticGcPtr<T: 'static>(NonNull<T>);
+
+// SAFETY: program-lifetime allocations are never moved, freed, or mutated
+// after the initial write.  The stored types (Keyword, Symbol, …) are
+// themselves `Sync` (no unsynchronised interior mutability).
+unsafe impl<T: 'static> Send for StaticGcPtr<T> {}
+unsafe impl<T: 'static> Sync for StaticGcPtr<T> {}
+
+impl<T: 'static> StaticGcPtr<T> {
+    /// Borrow the contained value.
+    pub fn get(&self) -> &T {
+        // SAFETY: pointer is program-lifetime, always valid.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Pointer equality: `true` iff both `StaticGcPtr`s point to the exact
+    /// same allocation (i.e. the same interned entry).
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.0 == b.0
+    }
+}
+
+impl<T: 'static> Clone for StaticGcPtr<T> {
+    fn clone(&self) -> Self {
+        StaticGcPtr(self.0)
+    }
+}
+
+impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { self.0.as_ref().fmt(f) }
+    }
+}
+
+/// Allocate `value` as program-lifetime memory and return a [`StaticGcPtr`].
+///
+/// In `no-gc` builds the allocation comes from the global bump-allocated
+/// `StaticArena` (never freed, no GC header overhead).  In GC builds
+/// `Box::leak` is used instead — the memory lives until the process exits.
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        static_arena::static_alloc_val(value)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))
+    }
+}
+
+// =============================================================================
 // Full GC implementation (default build)
 // =============================================================================
 
