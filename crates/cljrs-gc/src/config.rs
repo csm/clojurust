@@ -237,7 +237,7 @@ impl IsolateCancellation {
 }
 
 thread_local! {
-    static ISOLATE_CANCELLATION: IsolateCancellation = IsolateCancellation::new();
+    static ISOLATE_CANCELLATION: IsolateCancellation = const { IsolateCancellation::new() };
 }
 
 /// Invoke `f` with a reference to this thread's `IsolateCancellation`.

@@ -680,7 +680,7 @@ mod gc_full {
     }
 
     thread_local! {
-        static ISOLATE_HEAP: GcHeap = GcHeap::new();
+        static ISOLATE_HEAP: GcHeap = const { GcHeap::new() };
     }
 
     /// Zero-sized proxy that dispatches all heap operations to the calling
