@@ -44,7 +44,8 @@ src/
   lib.rs          — GcVisitor, Trace, GcBox<T>, GcPtr<T>, MarkVisitor, HEAP,
                     leaf Trace impls; conditional GC vs no-gc implementations
   gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
-  gc_full         — (GC mode only) GcHeap, ALLOC_ROOTS, AllocRootGuard
+  gc_full         — (GC mode only) GcHeap, HeapProxy, HEAP (per-isolate proxy),
+                    ALLOC_ROOTS, AllocRootGuard
   nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
   static_arena.rs — (no-gc mode) global program-lifetime bump allocator;
                     in debug builds, tracks chunk ranges for is_static_addr()
@@ -52,7 +53,8 @@ src/
                     ScratchGuard, StaticCtxGuard
   region.rs       — Region bump allocator, RegionGuard, thread-local region stack
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
-  config.rs       — (GC mode) GcConfig, GcCancellation, GcParked
+  config.rs       — (GC mode) GcConfig, GcCancellation (zero-sized proxy),
+                    IsolateCancellation thread-local (per-isolate STW state), GcParked
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects
 tests/
@@ -153,13 +155,33 @@ impl GcVisitor for MarkVisitor { … }
 Uses a grey stack (avoids recursion stack overflow) and handles cycles via
 already-marked check.
 
-### `HEAP`
+### `HeapProxy` and `HEAP`
 
 ```rust
-pub static HEAP: GcHeap;
+pub struct HeapProxy;   // zero-sized; all state in ISOLATE_HEAP thread-local
+
+impl HeapProxy {
+    pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T>
+    pub fn set_config(&self, config: Arc<GcConfig>)
+    pub fn set_config_from_env(&self)
+    pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static)
+    pub fn trace_registered_roots(&self, visitor: &mut MarkVisitor)
+    pub fn memory_in_use(&self) -> usize
+    pub fn count(&self) -> usize
+    pub fn total_allocated(&self) -> usize
+    pub fn total_freed(&self) -> usize
+    pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F)
+    pub fn collect_auto(&self) -> bool
+}
+
+pub static HEAP: HeapProxy;
 ```
 
-Global singleton; all `GcPtr::new` calls allocate here.
+`HEAP` is a zero-sized proxy that dispatches every operation to the calling
+thread's `ISOLATE_HEAP` thread-local `GcHeap`. Each OS thread (isolate) owns
+an independent heap; GC runs fully in parallel across threads with no
+cross-isolate stop-the-world coordination. All `GcPtr::new` calls allocate
+into the current thread's heap via this proxy.
 
 ### `region::Region`
 

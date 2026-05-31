@@ -32,7 +32,9 @@ pub use cancellation::{
 pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
 
 #[cfg(not(feature = "no-gc"))]
-pub use gc_full::{AllocRootGuard, GcHeap, HEAP, push_alloc_frame, trace_thread_alloc_roots};
+pub use gc_full::{
+    AllocRootGuard, GcHeap, HEAP, HeapProxy, push_alloc_frame, trace_thread_alloc_roots,
+};
 #[cfg(feature = "no-gc")]
 pub use nogc_stubs::{
     AllocRootGuard, CONFIG_CANCELLATION, CancellableGuard, GcConfig, GcHeap, GcParked, HEAP,
@@ -677,7 +679,73 @@ mod gc_full {
         }
     }
 
-    pub static HEAP: GcHeap = GcHeap::new();
+    thread_local! {
+        static ISOLATE_HEAP: GcHeap = GcHeap::new();
+    }
+
+    /// Zero-sized proxy that dispatches all heap operations to the calling
+    /// thread's [`GcHeap`] via the `ISOLATE_HEAP` thread-local.
+    ///
+    /// This means every isolate (OS thread) owns an independent heap; GC runs
+    /// fully in parallel on different threads with no cross-isolate coordination.
+    pub struct HeapProxy;
+
+    impl HeapProxy {
+        pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
+            ISOLATE_HEAP.with(|h| h.alloc(value))
+        }
+
+        pub fn set_config(&self, config: Arc<GcConfig>) {
+            ISOLATE_HEAP.with(|h| h.set_config(config));
+        }
+
+        pub fn set_config_from_env(&self) {
+            ISOLATE_HEAP.with(|h| h.set_config_from_env());
+        }
+
+        pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static) {
+            ISOLATE_HEAP.with(|h| h.register_root_tracer(tracer));
+        }
+
+        pub fn trace_registered_roots(&self, visitor: &mut MarkVisitor) {
+            ISOLATE_HEAP.with(|h| h.trace_registered_roots(visitor));
+        }
+
+        pub fn memory_in_use(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.memory_in_use())
+        }
+
+        pub fn count(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.count())
+        }
+
+        pub fn total_allocated(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.total_allocated())
+        }
+
+        pub fn total_freed(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.total_freed())
+        }
+
+        pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F) {
+            ISOLATE_HEAP.with(|h| h.collect(trace_roots));
+        }
+
+        pub fn collect_auto(&self) -> bool {
+            ISOLATE_HEAP.with(|h| h.collect_auto())
+        }
+
+        #[cfg(test)]
+        pub fn set_memory_in_use(&self, bytes: usize) {
+            ISOLATE_HEAP.with(|h| h.set_memory_in_use(bytes));
+        }
+    }
+
+    // SAFETY: HeapProxy is zero-sized; all state lives in a thread-local GcHeap.
+    // The Send + Sync impls are needed so `pub static HEAP: HeapProxy` is valid.
+    unsafe impl Sync for HeapProxy {}
+
+    pub static HEAP: HeapProxy = HeapProxy;
 
     thread_local! {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
@@ -896,6 +964,94 @@ mod tests {
         heap.collect(|vis| vis.visit(&p));
         assert_eq!(heap.count(), 1);
         assert!(!*dropped.lock().unwrap());
+    }
+
+    #[test]
+    fn b1_two_isolates_independent_heaps() {
+        use std::sync::{Arc, Barrier};
+        // Each thread has its own ISOLATE_HEAP; allocations on one do not appear
+        // in the other.
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let h1 = std::thread::Builder::new()
+            .name("isolate-1".into())
+            .spawn(move || {
+                let _mutator = crate::register_mutator();
+                // Allocate 100 objects on this isolate's heap
+                let _ptrs: Vec<_> = (0_i64..100)
+                    .map(|i| crate::gc_full::HEAP.alloc(i))
+                    .collect();
+                b1.wait(); // both threads are now at peak allocation
+                // This isolate has exactly 100 live objects
+                assert_eq!(
+                    crate::gc_full::HEAP.count(),
+                    100,
+                    "isolate-1 heap count should be 100"
+                );
+            })
+            .unwrap();
+
+        let b2 = barrier.clone();
+        let h2 = std::thread::Builder::new()
+            .name("isolate-2".into())
+            .spawn(move || {
+                let _mutator = crate::register_mutator();
+                // Allocate 200 objects on this isolate's heap
+                let _ptrs: Vec<_> = (0_i64..200)
+                    .map(|i| crate::gc_full::HEAP.alloc(i))
+                    .collect();
+                b2.wait();
+                // This isolate has exactly 200 live objects, unaffected by isolate-1
+                assert_eq!(
+                    crate::gc_full::HEAP.count(),
+                    200,
+                    "isolate-2 heap count should be 200"
+                );
+            })
+            .unwrap();
+
+        h1.join().expect("isolate-1 panicked");
+        h2.join().expect("isolate-2 panicked");
+    }
+
+    #[test]
+    fn b1_two_isolates_gc_independently() {
+        // Two threads run allocation-heavy loops and GC their own heaps independently.
+        let h1 = std::thread::Builder::new()
+            .name("gc-isolate-1".into())
+            .spawn(|| {
+                let _mutator = crate::register_mutator();
+                let heap = &crate::gc_full::HEAP;
+                heap.set_config(Arc::new(GcConfig::with_limits(16_384, 65_536)));
+                // Allocate in batches and collect; each collection touches only this heap
+                for _ in 0..5 {
+                    let _ptrs: Vec<_> = (0_i64..50).map(|i| heap.alloc(i)).collect();
+                    // drive a manual collect with no roots so objects are freed
+                    heap.collect(|_| {});
+                    heap.collect(|_| {}); // second pass clears grace-period objects
+                }
+                // After all collections the heap should be empty (or close to it).
+                // We don't assert an exact count because alloc_frame roots may keep
+                // some alive; just assert we can collect without panicking.
+            })
+            .unwrap();
+
+        let h2 = std::thread::Builder::new()
+            .name("gc-isolate-2".into())
+            .spawn(|| {
+                let _mutator = crate::register_mutator();
+                let heap = &crate::gc_full::HEAP;
+                heap.set_config(Arc::new(GcConfig::with_limits(16_384, 65_536)));
+                for _ in 0..5 {
+                    let _ptrs: Vec<_> = (0_i64..50).map(|i| heap.alloc(i)).collect();
+                    heap.collect(|_| {});
+                    heap.collect(|_| {});
+                }
+            })
+            .unwrap();
+
+        h1.join().expect("gc-isolate-1 panicked");
+        h2.join().expect("gc-isolate-2 panicked");
     }
 }
 

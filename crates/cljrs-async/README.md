@@ -10,12 +10,11 @@ executor. All Clojure values remain on a single thread, keeping GC pointers (`!S
 
 ## Status
 
-**Phase A2 (Send worker pool)** — complete. `WorkerPool` is a singleton multi-thread Tokio runtime
-for `Send`-only byte-level work (TCP/TLS I/O, hashing, compression) that must not block the heap
-thread. Results cross back to the `LocalSet` thread as `Vec<u8>`, `String`, or primitive types over
-oneshot/mpsc channels. On `wasm32`, a stub pool runs futures locally.
+**Phase B1 (per-isolate heaps)** — complete. `Isolate` gives each OS thread its own GC heap,
+`current_thread` Tokio runtime, and `LocalSet`. Collections are fully independent with no
+cross-isolate coordination. `GcPtr`'s `!Send` bound makes sharing across isolates a compile error.
 
-Done (Phases A–H, A2):
+Done (Phases A–H, A2, B1):
 
 - Phase A: `init()` registers the async runtime hook with the interpreter.
 - Phase B: `^:async` fn dispatch via the `AsyncRuntime` hook; `eval_async` tree-walker;
@@ -42,6 +41,9 @@ Done (Phases A–H, A2):
   (`WorkerPool::global()`, `offload`, `handle`). Pool tasks carry only `Vec<u8>`, `String`, and
   `Send` channel types; `GcPtr`/`Value` construction is confined to LocalSet bridge tasks.
   wasm32 stub runs futures locally.
+- Phase B1: `Isolate` type — per-isolate OS thread with independent GC heap (`ISOLATE_HEAP`
+  thread-local), `current_thread` Tokio runtime, and `LocalSet`. GC collections are fully
+  parallel and independent; no cross-isolate STW coordination.
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
   contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
   remain non-deadlocking when called from the LocalSet executor thread). Errors with a
@@ -126,6 +128,7 @@ blocking bridge is a later phase.
 | `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
+| `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
 | `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
@@ -137,6 +140,30 @@ blocking bridge is a later phase.
 /// Register the async runtime and load clojure.core.async.
 /// Must be called inside a Tokio LocalSet context for spawned tasks to run.
 pub fn init(globals: &Arc<GlobalEnv>);
+
+pub mod isolate {
+    /// An independent execution context with its own Tokio `current_thread`
+    /// runtime, `LocalSet`, and per-isolate GC heap (thread-local).
+    ///
+    /// Isolates share no heap pointers; the `!Send` bound on `GcPtr` enforces
+    /// this at compile time. Values cross isolate boundaries via copy or
+    /// structured-clone (Phase B2).
+    pub struct Isolate;
+    impl Isolate {
+        /// Create a new isolate with the given debug name.
+        pub fn new(name: impl Into<String>) -> Self;
+
+        /// Spawn on a dedicated OS thread; `f()` is the entry-point future.
+        /// The thread registers with the GC, configures per-isolate limits, and
+        /// runs a `current_thread` + `LocalSet` executor until `f()` completes.
+        /// Not available on wasm32.
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn spawn<F, Fut>(self, f: F) -> std::thread::JoinHandle<()>
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + 'static;
+    }
+}
 
 /// Re-exports for sibling native crates (e.g. cljrs-io) that drive their own
 /// work onto the shared LocalSet executor.
