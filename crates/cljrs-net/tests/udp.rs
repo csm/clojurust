@@ -55,7 +55,12 @@ fn test_udp_echo_round_trip() {
             Value::Str(s) => s.get().clone(),
             other => panic!("expected str :local-addr, got {}", other.type_name()),
         };
-        let server_port: u16 = server_local_addr.split(':').last().unwrap().parse().unwrap();
+        let server_port: u16 = server_local_addr
+            .split(':')
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let server_in = as_chan(&map_get(&server_map, "in"));
         let server_out = as_chan(&map_get(&server_map, "out"));
@@ -83,10 +88,7 @@ fn test_udp_echo_round_trip() {
         let payload = b"phase D udp echo test";
         let signed: Vec<i8> = payload.iter().map(|&b| b as i8).collect();
         let send_dgram = Value::Map(MapValue::from_pairs(vec![
-            (
-                kw("data"),
-                Value::ByteArray(GcPtr::new(Mutex::new(signed))),
-            ),
+            (kw("data"), Value::ByteArray(GcPtr::new(Mutex::new(signed)))),
             (
                 kw("addr"),
                 Value::string(format!("127.0.0.1:{server_port}")),
@@ -100,13 +102,8 @@ fn test_udp_echo_round_trip() {
                 // Verify echoed payload matches.
                 match dgram.get(&kw("data")) {
                     Some(Value::ByteArray(arr)) => {
-                        let received: Vec<u8> = arr
-                            .get()
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .map(|&b| b as u8)
-                            .collect();
+                        let received: Vec<u8> =
+                            arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
                         assert_eq!(received, payload, "echoed payload must match");
                     }
                     other => panic!(
@@ -162,8 +159,7 @@ fn test_close_socket_closes_in() {
     local.block_on(&rt, async {
         let _globals = setup_globals();
 
-        let sock_val =
-            cljrs_net::udp::socket_on("127.0.0.1", 0, 8, 8).expect("socket failed");
+        let sock_val = cljrs_net::udp::socket_on("127.0.0.1", 0, 8, 8).expect("socket failed");
         let sock_map = match sock_val {
             Value::Map(m) => m,
             other => panic!("expected socket map, got {}", other.type_name()),

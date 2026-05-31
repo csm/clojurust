@@ -190,16 +190,13 @@ async fn writer_loop(socket: Arc<UdpSocket>, out_chan: GcPtr<NativeObjectBox>) {
             Value::Map(m) => {
                 let data = m.get(&kw("data"));
                 let addr = m.get(&kw("addr"));
-                match (data, addr) {
-                    (Some(Value::ByteArray(arr)), Some(Value::Str(addr_str))) => {
-                        let bytes: Vec<u8> =
-                            arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
-                        let addr_str = addr_str.get().clone();
-                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                            let _ = socket.send_to(&bytes, addr).await;
-                        }
+                if let (Some(Value::ByteArray(arr)), Some(Value::Str(addr_str))) = (data, addr) {
+                    let bytes: Vec<u8> =
+                        arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
+                    let addr_str = addr_str.get().clone();
+                    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                        let _ = socket.send_to(&bytes, addr).await;
                     }
-                    _ => {}
                 }
             }
             _ => {}
