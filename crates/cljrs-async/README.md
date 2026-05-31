@@ -10,13 +10,12 @@ executor. All Clojure values remain on a single thread, keeping GC pointers (`!S
 
 ## Status
 
-**Phase G (GC safety for the async runtime)** — complete. GC safepoints are integrated at
-cooperative yield points. `async_gc_collect()` is called before every `yield_now().await` in
-`await_value`, and a background GC-service task (spawned by `init`) services GC requests between
-poll cycles. Explicit GC root guards protect `task_future` in `spawn_future`, callee/env in
-`run_async_fn`, and awaited futures/promises in `await_value`.
+**Phase A2 (Send worker pool)** — complete. `WorkerPool` is a singleton multi-thread Tokio runtime
+for `Send`-only byte-level work (TCP/TLS I/O, hashing, compression) that must not block the heap
+thread. Results cross back to the `LocalSet` thread as `Vec<u8>`, `String`, or primitive types over
+oneshot/mpsc channels. On `wasm32`, a stub pool runs futures locally.
 
-Done (Phases A–G):
+Done (Phases A–H, A2):
 
 - Phase A: `init()` registers the async runtime hook with the interpreter.
 - Phase B: `^:async` fn dispatch via the `AsyncRuntime` hook; `eval_async` tree-walker;
@@ -39,6 +38,10 @@ Done (Phases A–G):
   called before each `yield_now().await` in `await_value`. Background GC-service task spawned
   by `init()`. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
   `run_async_fn`, and awaited futures/promises in `await_value`.
+- Phase A2: `WorkerPool` singleton — multi-thread Tokio runtime for `Send` byte-level tasks
+  (`WorkerPool::global()`, `offload`, `handle`). Pool tasks carry only `Vec<u8>`, `String`, and
+  `Send` channel types; `GcPtr`/`Value` construction is confined to LocalSet bridge tasks.
+  wasm32 stub runs futures locally.
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
   contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
   remain non-deadlocking when called from the LocalSet executor thread). Errors with a
@@ -123,8 +126,10 @@ blocking bridge is a later phase.
 | `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
+| `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
+| `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
 
 ## Public API
 
@@ -136,6 +141,25 @@ pub fn init(globals: &Arc<GlobalEnv>);
 /// Re-exports for sibling native crates (e.g. cljrs-io) that drive their own
 /// work onto the shared LocalSet executor.
 pub use eval_async::{await_value, spawn_future};
+
+pub mod worker_pool {
+    /// Global Send-only worker pool backed by a Tokio multi-thread runtime.
+    /// On wasm32 this is a stub that runs futures locally.
+    pub struct WorkerPool { /* singleton */ }
+    impl WorkerPool {
+        /// Get (or initialize) the global singleton.
+        pub fn global() -> &'static Self;
+
+        /// Offload a Send future to the pool; the returned future can be awaited
+        /// on the LocalSet thread without blocking.
+        pub fn offload<F, T>(&self, f: F) -> impl Future<Output = T> + 'static
+        where F: Future<Output = T> + Send + 'static, T: Send + 'static;
+
+        /// Direct handle to the pool runtime for multi-task spawning (non-wasm only).
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn handle(&self) -> &tokio::runtime::Handle;
+    }
+}
 
 pub mod eval_async {
     /// Spawn `task` on the current LocalSet and return a `Value::Future` that

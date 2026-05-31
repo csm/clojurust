@@ -17,6 +17,7 @@ use std::sync::Arc;
 use cljrs_async::load_source;
 
 pub mod frame;
+mod pool_io;
 pub mod tcp;
 pub mod tls;
 pub mod udp;

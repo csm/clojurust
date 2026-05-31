@@ -2,19 +2,22 @@
 
 **Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–G implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics).
+**Status**: Phases A–G + A2 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
+
+**Phase A2 — pool-based I/O**: TCP and TLS byte-level I/O (connect, accept loop, TLS handshake, reader, writer) now runs on the `WorkerPool` multi-thread runtime instead of on the `LocalSet` executor thread. The LocalSet bridge tasks (`read_bridge`, `write_bridge`, `local_accept_bridge`) run on the LocalSet and are the only code that touches `GcPtr`/`Value`. This separation ensures the heap thread remains responsive under sustained byte-level traffic. `pool_io.rs` contains the shared pool tasks and bridge helpers. UDP and Unix sockets are not pool-based yet (their I/O is lower-volume).
 
 ## File Layout
 
 | File | Description |
 |---|---|
 | `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, and `clojure.rust.net` |
-| `src/tcp.rs` | `TcpStreamResource`, `TcpListenerResource`, connection builder, accept loop, `connect`/`listen`/`close` builtins |
+| `src/pool_io.rs` | Shared pool tasks and bridge helpers: `ReadMsg`, `PoolStreamSetup`, `pool_reader`, `pool_writer`, `read_bridge`, `write_bridge`, `bytes_value`, `net_error` |
+| `src/tcp.rs` | `TcpStreamResource` (Vec<AbortHandle>), `TcpListenerResource` (Vec<AbortHandle>), pool-based connect/accept, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
 | `src/udp.rs` | `UdpSocketResource`, reader/writer tasks, `socket`/`close` builtins |
-| `src/tls.rs` | `TlsStreamResource`, `TlsListenerResource`, generic reader/writer loops, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
+| `src/tls.rs` | `TlsStreamResource` (Vec<AbortHandle>), `TlsListenerResource` (Vec<AbortHandle>), pool-based TLS connect/accept, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
 | `src/unix.rs` | `UnixStreamResource`, `UnixListenerResource` (`close` unlinks path), reader/writer loops, accept loop, `connect`/`listen`/`close` builtins; `#[cfg(unix)]` with non-Unix stubs |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
@@ -185,11 +188,11 @@ pub fn tls::build_server_config(opts: &MapValue) -> ValueResult<Arc<rustls::Serv
 
 ### `TcpStreamResource`
 
-Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks. `close()` aborts both tasks, dropping the socket halves and releasing the FD.
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool reader, pool writer, and LocalSet bridge tasks (4 total). `close()` aborts all handles, dropping the pool socket halves and releasing the FD.
 
 ### `TcpListenerResource`
 
-Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `accept_loop` task. `close()` aborts the task, dropping the `TcpListener` and releasing the listener FD.
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool accept loop and the LocalSet accept bridge (2 total). `close()` aborts all handles, dropping the `TcpListener` and releasing the listener FD.
 
 ### `UdpSocketResource`
 
@@ -197,11 +200,11 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the re
 
 ### `TlsStreamResource`
 
-Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks (generic over the TLS stream halves). `close()` aborts both tasks, dropping the TLS stream halves and releasing the FD.
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool reader, pool writer, and LocalSet bridge tasks (4 total). `close()` aborts all handles, dropping the TLS stream halves and releasing the FD.
 
 ### `TlsListenerResource`
 
-Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `tls_accept_loop` task. `close()` aborts the task, dropping the `TcpListener` and releasing the listener FD.
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool TLS accept loop and the LocalSet accept bridge (2 total). `close()` aborts all handles, dropping the `TcpListener` and releasing the listener FD.
 
 ### `UnixStreamResource` (`#[cfg(unix)]`)
 
@@ -223,9 +226,11 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the
  :resource    <TcpStream>}   ; Arc<TcpStreamResource> — call (close conn) to release
 ```
 
-Two tasks are spawned per connection on the `LocalSet`:
-- **reader task** — reads the socket into `byte-array` chunks and puts them on `:in`
-- **writer task** — takes from `:out` and writes to the socket; shuts down the write half when `:out` closes
+Four tasks are spawned per connection (A2 pool model):
+- **pool reader** (pool thread) — reads the socket into `Vec<u8>` chunks and sends `ReadMsg` to the LocalSet bridge
+- **pool writer** (pool thread) — receives `Vec<u8>` from the LocalSet bridge and writes to the socket; shuts down gracefully when the sender is dropped
+- **read bridge** (LocalSet) — converts `ReadMsg` → `Value::ByteArray` and puts on `:in`
+- **write bridge** (LocalSet) — takes from `:out`, converts to `Vec<u8>`, sends to the pool writer
 
 ## Server Model
 
@@ -237,7 +242,7 @@ Two tasks are spawned per connection on the `LocalSet`:
  :resource   <TcpListener>} ; Arc<TcpListenerResource> — call (close server) to stop accepting
 ```
 
-The accept loop runs as a `spawn_local` task. When `:conns` is full, `chan_put` parks the accept loop, applying backpressure all the way to the TCP accept window.
+The accept loop runs on the `WorkerPool` (`pool_accept_loop`). A LocalSet bridge (`local_accept_bridge`) receives the `PoolStreamSetup` for each accepted connection and spawns the read/write bridges. When `:conns` is full, `chan_put` parks the bridge, applying backpressure all the way to the pool accept loop.
 
 ## Usage Example
 

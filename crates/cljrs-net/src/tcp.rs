@@ -20,23 +20,33 @@
 //!  :local-addr "ip:port"
 //!  :resource   <handle>} ; TcpListenerResource — deterministic listener close
 //! ```
+//!
+//! Phase A2: TCP connect and accept now run on the `WorkerPool` multi-thread
+//! runtime, so byte-level I/O never blocks the heap (`LocalSet`) thread.
+//! `GcPtr`/`Value` construction happens in LocalSet bridge tasks only.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, chan_take, make_chan};
+use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, make_chan};
 use cljrs_async::spawn_future;
+use cljrs_async::worker_pool::WorkerPool;
 use cljrs_env::env::GlobalEnv;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_value::{
-    Arity, ExceptionInfo, Keyword, MapValue, NativeFn, NativeObjectBox, Resource, ResourceHandle,
-    Value, ValueError, ValueResult,
+    Arity, Keyword, MapValue, NativeFn, NativeObjectBox, Resource, ResourceHandle, Value,
+    ValueError, ValueResult,
+};
+
+use crate::pool_io::{
+    PoolSetupResult, PoolStreamSetup, net_error, pool_reader, pool_writer, read_bridge,
+    write_bridge,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -61,16 +71,15 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
 #[derive(Debug)]
 struct TcpStreamInner {
     closed: bool,
-    reader_abort: Option<AbortHandle>,
-    writer_abort: Option<AbortHandle>,
+    abort_handles: Vec<AbortHandle>,
 }
 
 /// `Resource` implementation for a TCP stream.
 ///
-/// Holds `AbortHandle`s for the reader and writer tasks spawned in `connect`.
-/// `close()` aborts both tasks, which drops the socket halves and closes the FD.
-/// GC never finalises the socket — this `Arc`-backed resource is the sole
-/// cleanup path, matching the design note in `resource.rs`.
+/// Holds `AbortHandle`s for the pool reader, pool writer, and LocalSet bridge
+/// tasks. `close()` aborts all handles, which drops the pool socket halves and
+/// closes the FD. GC never finalises the socket — this `Arc`-backed resource is
+/// the sole cleanup path.
 #[derive(Debug)]
 pub struct TcpStreamResource {
     inner: Arc<Mutex<TcpStreamInner>>,
@@ -81,8 +90,7 @@ impl TcpStreamResource {
         Self {
             inner: Arc::new(Mutex::new(TcpStreamInner {
                 closed: false,
-                reader_abort: None,
-                writer_abort: None,
+                abort_handles: Vec::new(),
             })),
         }
     }
@@ -95,10 +103,7 @@ impl Resource for TcpStreamResource {
             return Ok(());
         }
         g.closed = true;
-        if let Some(h) = g.reader_abort.take() {
-            h.abort();
-        }
-        if let Some(h) = g.writer_abort.take() {
+        for h in g.abort_handles.drain(..) {
             h.abort();
         }
         Ok(())
@@ -122,13 +127,13 @@ impl Resource for TcpStreamResource {
 #[derive(Debug)]
 struct TcpListenerInner {
     closed: bool,
-    accept_abort: Option<AbortHandle>,
+    abort_handles: Vec<AbortHandle>,
 }
 
 /// `Resource` implementation for a TCP listener.
 ///
-/// Holds the `AbortHandle` for the `accept_loop` task. `close()` aborts the
-/// task, which drops the `TcpListener` and closes the listener FD.
+/// Holds `AbortHandle`s for the pool accept loop and the LocalSet accept bridge.
+/// `close()` aborts all handles, which drops the listener and closes the FD.
 #[derive(Debug)]
 pub struct TcpListenerResource {
     inner: Arc<Mutex<TcpListenerInner>>,
@@ -139,7 +144,7 @@ impl TcpListenerResource {
         Self {
             inner: Arc::new(Mutex::new(TcpListenerInner {
                 closed: false,
-                accept_abort: None,
+                abort_handles: Vec::new(),
             })),
         }
     }
@@ -152,7 +157,7 @@ impl Resource for TcpListenerResource {
             return Ok(());
         }
         g.closed = true;
-        if let Some(h) = g.accept_abort.take() {
+        for h in g.abort_handles.drain(..) {
             h.abort();
         }
         Ok(())
@@ -172,21 +177,6 @@ impl Resource for TcpListenerResource {
 }
 
 // ── Value helpers ─────────────────────────────────────────────────────────────
-
-fn bytes_value(bytes: &[u8]) -> Value {
-    let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-    Value::ByteArray(GcPtr::new(Mutex::new(signed)))
-}
-
-fn net_error(msg: impl Into<String>) -> Value {
-    let msg = msg.into();
-    Value::Error(GcPtr::new(ExceptionInfo::new(
-        ValueError::Other(msg.clone()),
-        msg,
-        None,
-        None,
-    )))
-}
 
 fn kw(name: &str) -> Value {
     Value::keyword(Keyword::simple(name))
@@ -215,114 +205,89 @@ fn opts_port(opts: &MapValue) -> Option<u16> {
     }
 }
 
-// ── Async tasks ───────────────────────────────────────────────────────────────
+// ── Pool tasks (Send, no GcPtr) ───────────────────────────────────────────────
 
-/// Read chunks from the socket and put them on `:in`.
-///
-/// Closes `:in` at EOF or on error (after putting the error value). Aborted
-/// via `TcpStreamResource::close` if the user calls `(close conn)`.
-async fn reader_loop(mut read_half: OwnedReadHalf, in_chan: GcPtr<NativeObjectBox>) {
-    let mut buf = vec![0u8; 8192];
+/// Runs on the pool: accepts connections from `listener`, spawns pool_reader +
+/// pool_writer for each, and sends the `PoolStreamSetup` via `conn_info_tx`.
+/// Exits when the listener FD is closed or an accept error occurs.
+async fn pool_accept_loop(
+    std_listener: std::net::TcpListener,
+    conn_info_tx: mpsc::Sender<PoolSetupResult>,
+    in_buf: usize,
+    out_buf: usize,
+) {
+    // Convert the std listener inside the pool runtime context.
+    let listener = match TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = conn_info_tx.send(Err(format!("from_std: {e}"))).await;
+            return;
+        }
+    };
+
     loop {
-        match read_half.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if !chan_put(&in_chan, bytes_value(&buf[..n])).await {
-                    break; // consumer closed :in
-                }
-            }
+        match listener.accept().await {
             Err(e) => {
-                chan_put(&in_chan, net_error(format!("read error: {e}"))).await;
+                let _ = conn_info_tx.send(Err(format!("accept error: {e}"))).await;
                 break;
             }
-        }
-    }
-    chan_ref(in_chan.get()).close();
-}
+            Ok((stream, _peer)) => {
+                let remote_addr = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let local_addr = stream
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
 
-/// Drain `:out` and write each value to the socket.
-///
-/// Accepts `byte-array` and `string` values. Calls `shutdown` on the write
-/// half when `:out` is closed (TCP half-close: FIN without RST). Aborted via
-/// `TcpStreamResource::close` if the user calls `(close conn)`.
-async fn writer_loop(mut write_half: OwnedWriteHalf, out_chan: GcPtr<NativeObjectBox>) {
-    // Nested async block so write errors propagate via `?` rather than
-    // `if err { break }`, keeping each match arm free of collapsible ifs.
-    let _: std::io::Result<()> = async {
-        loop {
-            match chan_take(&out_chan).await {
-                Value::Nil => {
-                    // :out closed; gracefully half-close the write side.
-                    let _ = write_half.shutdown().await;
+                let (read_half, write_half) = stream.into_split();
+
+                let (read_tx, read_rx) = mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+                let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
+
+                let reader_jh = tokio::spawn(pool_reader(read_half, read_tx));
+                let writer_jh = tokio::spawn(pool_writer(write_half, write_rx));
+
+                let setup = PoolStreamSetup {
+                    remote_addr,
+                    local_addr,
+                    read_rx,
+                    write_tx,
+                    reader_abort: reader_jh.abort_handle(),
+                    writer_abort: writer_jh.abort_handle(),
+                };
+
+                if conn_info_tx.send(Ok(setup)).await.is_err() {
+                    // LocalSet bridge dropped; abort the just-spawned tasks.
+                    reader_jh.abort();
+                    writer_jh.abort();
                     break;
                 }
-                Value::ByteArray(arr) => {
-                    let bytes: Vec<u8> =
-                        arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
-                    write_half.write_all(&bytes).await?;
-                }
-                Value::Str(s) => {
-                    write_half.write_all(s.get().as_bytes()).await?;
-                }
-                _ => {}
             }
         }
-        Ok(())
     }
-    .await;
 }
 
-// ── Connection builder ────────────────────────────────────────────────────────
+// ── LocalSet bridge (touches GcPtr / Value) ───────────────────────────────────
 
-fn make_connection(stream: TcpStream, in_buf: usize, out_buf: usize) -> Value {
-    let remote_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let local_addr = stream
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let (read_half, write_half) = stream.into_split();
-    let in_chan = make_chan(in_buf);
-    let out_chan = make_chan(out_buf);
-    let resource = TcpStreamResource::new();
-    let shared_inner = resource.inner.clone();
-    let resource_handle = ResourceHandle::new(resource);
-    let r_jh = tokio::task::spawn_local(reader_loop(read_half, in_chan.clone()));
-    shared_inner.lock().unwrap().reader_abort = Some(r_jh.abort_handle());
-    let w_jh = tokio::task::spawn_local(writer_loop(write_half, out_chan.clone()));
-    shared_inner.lock().unwrap().writer_abort = Some(w_jh.abort_handle());
-    Value::Map(MapValue::from_pairs(vec![
-        (kw("in"), Value::NativeObject(in_chan)),
-        (kw("out"), Value::NativeObject(out_chan)),
-        (kw("remote-addr"), Value::string(remote_addr)),
-        (kw("local-addr"), Value::string(local_addr)),
-        (kw("resource"), Value::Resource(resource_handle)),
-    ]))
-}
-
-// ── Accept loop ───────────────────────────────────────────────────────────────
-
-/// Accept connections from `listener` and put each connection map on `conns_chan`.
-///
-/// Exits when the listener returns an error (e.g. the FD is closed by aborting
-/// this task) or when the consumer closes `conns_chan`. After exiting, closes
-/// `conns_chan` so consumers see EOF.
-async fn accept_loop(
-    listener: tokio::net::TcpListener,
+/// Runs on the LocalSet: receives `PoolSetupResult` from the pool accept loop,
+/// creates Clojure channels + bridges for each new connection, and puts the
+/// connection map on `conns_chan`.
+async fn local_accept_bridge(
+    mut conn_info_rx: mpsc::Receiver<PoolSetupResult>,
     conns_chan: GcPtr<NativeObjectBox>,
     in_buf: usize,
     out_buf: usize,
 ) {
-    loop {
-        match listener.accept().await {
+    while let Some(result) = conn_info_rx.recv().await {
+        match result {
             Err(e) => {
-                chan_put(&conns_chan, net_error(format!("accept error: {e}"))).await;
+                chan_put(&conns_chan, net_error(e)).await;
                 break;
             }
-            Ok((stream, _)) => {
-                let conn = make_connection(stream, in_buf, out_buf);
+            Ok(setup) => {
+                let conn = make_tcp_connection_from_setup(setup, in_buf, out_buf);
                 if !chan_put(&conns_chan, conn).await {
                     break; // consumer closed :conns
                 }
@@ -332,11 +297,43 @@ async fn accept_loop(
     chan_ref(conns_chan.get()).close();
 }
 
+/// Build a connection map + resource from a `PoolStreamSetup`, spawning LocalSet
+/// bridge tasks. Called on the LocalSet thread.
+fn make_tcp_connection_from_setup(setup: PoolStreamSetup, in_buf: usize, out_buf: usize) -> Value {
+    let in_chan = make_chan(in_buf);
+    let out_chan = make_chan(out_buf);
+    let resource = TcpStreamResource::new();
+    let shared_inner = resource.inner.clone();
+    let resource_handle = ResourceHandle::new(resource);
+
+    // Bridge tasks: run on LocalSet, touch GcPtr.
+    let rb_jh = tokio::task::spawn_local(read_bridge(setup.read_rx, in_chan.clone()));
+    let wb_jh = tokio::task::spawn_local(write_bridge(out_chan.clone(), setup.write_tx));
+
+    {
+        let mut g = shared_inner.lock().unwrap();
+        g.abort_handles.push(setup.reader_abort);
+        g.abort_handles.push(setup.writer_abort);
+        g.abort_handles.push(rb_jh.abort_handle());
+        g.abort_handles.push(wb_jh.abort_handle());
+    }
+
+    Value::Map(MapValue::from_pairs(vec![
+        (kw("in"), Value::NativeObject(in_chan)),
+        (kw("out"), Value::NativeObject(out_chan)),
+        (kw("remote-addr"), Value::string(setup.remote_addr)),
+        (kw("local-addr"), Value::string(setup.local_addr)),
+        (kw("resource"), Value::Resource(resource_handle)),
+    ]))
+}
+
 // ── Listen implementation ─────────────────────────────────────────────────────
 
 /// Bind a TCP listener on `host:port` and return a server map.
 ///
-/// Convenience wrapper used by tests and the Clojure `listen` builtin alike.
+/// The accept loop runs on the `WorkerPool`; a LocalSet bridge delivers
+/// connection maps onto `conns_chan`. Convenience wrapper used by tests and the
+/// Clojure `listen` builtin alike.
 pub fn listen_on(
     host: &str,
     port: u16,
@@ -346,28 +343,46 @@ pub fn listen_on(
 ) -> ValueResult<Value> {
     let addr = format!("{host}:{port}");
 
-    // Bind synchronously (std), then convert to Tokio (requires runtime context).
+    // Bind synchronously (std) so we get the local_addr immediately.
     let std_listener = std::net::TcpListener::bind(&addr)
         .map_err(|e| ValueError::Other(format!("listen on {addr}: {e}")))?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| ValueError::Other(format!("set_nonblocking: {e}")))?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .map_err(|e| ValueError::Other(format!("from_std: {e}")))?;
 
-    let local_addr = listener
+    let local_addr = std_listener
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
 
+    let (conn_info_tx, conn_info_rx) = mpsc::channel::<PoolSetupResult>(conns_buf.max(1));
     let conns_chan = make_chan(conns_buf);
 
     let resource = TcpListenerResource::new();
     let shared_inner = resource.inner.clone();
     let resource_handle = ResourceHandle::new(resource);
 
-    let jh = tokio::task::spawn_local(accept_loop(listener, conns_chan.clone(), in_buf, out_buf));
-    shared_inner.lock().unwrap().accept_abort = Some(jh.abort_handle());
+    // Spawn accept loop on pool (Send).
+    let pool_jh = WorkerPool::global().handle().spawn(pool_accept_loop(
+        std_listener,
+        conn_info_tx,
+        in_buf,
+        out_buf,
+    ));
+
+    // Spawn bridge on LocalSet (!Send, touches GcPtr).
+    let bridge_jh = tokio::task::spawn_local(local_accept_bridge(
+        conn_info_rx,
+        conns_chan.clone(),
+        in_buf,
+        out_buf,
+    ));
+
+    {
+        let mut g = shared_inner.lock().unwrap();
+        g.abort_handles.push(pool_jh.abort_handle());
+        g.abort_handles.push(bridge_jh.abort_handle());
+    }
 
     Ok(Value::Map(MapValue::from_pairs(vec![
         (kw("conns"), Value::NativeObject(conns_chan)),
@@ -380,7 +395,9 @@ pub fn listen_on(
 
 /// Initiate a TCP connection and return the promise channel as a `Value`.
 ///
-/// Convenience wrapper used by tests and the Clojure `connect` builtin alike.
+/// The TCP connect and I/O tasks run on the `WorkerPool`; bridge tasks run on
+/// the LocalSet. Convenience wrapper used by tests and the Clojure `connect`
+/// builtin alike.
 pub fn connect_to(host: &str, port: u16, in_buf: usize, out_buf: usize) -> Value {
     let host = host.to_string();
     let promise = make_chan(1);
@@ -397,14 +414,58 @@ async fn do_connect(
     promise: GcPtr<NativeObjectBox>,
 ) -> EvalResult {
     let addr = format!("{host}:{port}");
-    let stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            chan_deliver(&promise, net_error(format!("connect to {addr}: {e}"))).await;
-            return Ok(Value::Nil);
+
+    // Channel for the pool → LocalSet handshake.
+    let (setup_tx, setup_rx) = oneshot::channel::<PoolSetupResult>();
+
+    // Spawn the entire TCP connect + I/O pump on the pool (Send).
+    WorkerPool::global().handle().spawn(async move {
+        match TcpStream::connect(&addr).await {
+            Err(e) => {
+                let _ = setup_tx.send(Err(format!("connect to {addr}: {e}")));
+            }
+            Ok(stream) => {
+                let remote_addr = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let local_addr = stream
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+
+                let (read_half, write_half) = stream.into_split();
+                let (read_tx, read_rx) = mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+                let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
+
+                let reader_jh = tokio::spawn(pool_reader(read_half, read_tx));
+                let writer_jh = tokio::spawn(pool_writer(write_half, write_rx));
+
+                let _ = setup_tx.send(Ok(PoolStreamSetup {
+                    remote_addr,
+                    local_addr,
+                    read_rx,
+                    write_tx,
+                    reader_abort: reader_jh.abort_handle(),
+                    writer_abort: writer_jh.abort_handle(),
+                }));
+            }
         }
-    };
-    chan_deliver(&promise, make_connection(stream, in_buf, out_buf)).await;
+    });
+
+    // Await the setup result back on the LocalSet (not blocking the thread).
+    match setup_rx.await {
+        Err(_) => {
+            chan_deliver(&promise, net_error("pool task dropped")).await;
+        }
+        Ok(Err(e)) => {
+            chan_deliver(&promise, net_error(e)).await;
+        }
+        Ok(Ok(setup)) => {
+            let conn = make_tcp_connection_from_setup(setup, in_buf, out_buf);
+            chan_deliver(&promise, conn).await;
+        }
+    }
     Ok(Value::Nil)
 }
 
@@ -435,8 +496,8 @@ fn builtin_connect(args: &[Value]) -> ValueResult<Value> {
 
 /// `(close conn)` — close a connection map.
 ///
-/// Closes both `:in` and `:out` channels and aborts the reader/writer tasks
-/// via the connection's `:resource` handle, releasing the socket FD.
+/// Closes both `:in` and `:out` channels and aborts all I/O tasks via the
+/// connection's `:resource` handle, releasing the socket FD.
 fn builtin_close(args: &[Value]) -> ValueResult<Value> {
     let conn = match args.first() {
         Some(Value::Map(m)) => m.clone(),
@@ -448,7 +509,7 @@ fn builtin_close(args: &[Value]) -> ValueResult<Value> {
         }
     };
 
-    // Signal the writer task; it will drain and shutdown the write half.
+    // Signal the writer task; it will drain and shutdown the write side.
     if let Some(Value::NativeObject(obj)) = conn.get(&kw("out")) {
         chan_ref(obj.get()).close();
     }
