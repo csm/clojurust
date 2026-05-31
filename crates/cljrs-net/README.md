@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–E implemented (TCP client + server + framing + UDP datagrams + TLS client/server). Phase F (Unix sockets) is a stub.
+**Status**: Phases A–F implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -10,21 +10,24 @@
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, and `clojure.rust.net` |
+| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, and `clojure.rust.net` |
 | `src/tcp.rs` | `TcpStreamResource`, `TcpListenerResource`, connection builder, accept loop, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
 | `src/udp.rs` | `UdpSocketResource`, reader/writer tasks, `socket`/`close` builtins |
 | `src/tls.rs` | `TlsStreamResource`, `TlsListenerResource`, generic reader/writer loops, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
+| `src/unix.rs` | `UnixStreamResource`, `UnixListenerResource` (`close` unlinks path), reader/writer loops, accept loop, `connect`/`listen`/`close` builtins; `#[cfg(unix)]` with non-Unix stubs |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
 | `src/clojure_rust_net_tls.cljrs` | Clojure source for `clojure.rust.net.tls`; `start-server` sugar |
-| `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` |
+| `src/clojure_rust_net_unix.cljrs` | Clojure source for `clojure.rust.net.unix`; `start-server` sugar |
+| `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` (`:tcp`, `:tls`, `:unix`) |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
 | `tests/framing.rs` | Phase C integration tests (lines + length-prefixed end-to-end, framer unit tests) |
 | `tests/udp.rs` | Phase D integration tests (echo round-trip, multiple senders, close) |
 | `tests/tls.rs` | Phase E integration tests (TLS echo round-trip with rcgen self-signed cert, connect failure) |
+| `tests/unix.rs` | Phase F integration tests (Unix echo round-trip, listener unlinks path, stale socket removal) |
 
 ## Public API
 
@@ -98,13 +101,38 @@
 ;; => server-map — spawns go-loop that calls (handler conn) for each accepted TLS conn
 ```
 
+### `clojure.rust.net.unix`
+
+Unix-domain stream sockets. `#[cfg(unix)]` — only on Unix targets; non-Unix
+builds register stub functions that throw "not supported on this platform".
+
+```clojure
+;; Phase F — Unix client
+(connect {:path "/tmp/app.sock"})
+;; => promise-chan — yields {:in ch :out ch :remote-addr str :local-addr str :resource h}
+;;    :remote-addr / :local-addr are filesystem paths (empty for unnamed sockets)
+;; Optional keys: :in-buf, :out-buf (default 8)
+
+(close conn)         ;; => nil — closes :in/:out and aborts reader/writer tasks
+
+;; Phase F — Unix server
+(listen {:path "/tmp/app.sock"})
+;; => {:conns <chan> :local-addr "/tmp/app.sock" :resource h}
+;;    (close server) also unlinks the socket file
+
+(listen-close server) ;; => nil — stops accept loop, unlinks socket path, closes :conns
+
+(start-server handler {:path "/tmp/app.sock"})
+;; => server-map — spawns go-loop that calls (handler conn) for each accepted conn
+```
+
 ### `clojure.rust.net` (umbrella)
 
 ```clojure
-(connect opts)            ;; delegates to tcp/connect; :transport key (default :tcp)
-(listen opts)             ;; delegates to tcp/listen; :transport key (default :tcp)
-(start-server handler opts) ;; delegates to tcp/start-server
-(close x)                 ;; dispatches on :conns key: server → listen-close, else → close
+(connect opts)            ;; :transport key selects :tcp (default), :tls, or :unix
+(listen opts)             ;; :transport key selects :tcp (default), :tls, or :unix
+(start-server handler opts) ;; :transport key selects :tcp (default), :tls, or :unix
+(close x)                 ;; dispatches on map shape: :conns → server close, :remote-addr → conn close, else → udp close
 ```
 
 ### `clojure.rust.net.udp`
@@ -132,6 +160,8 @@ pub fn tls::tls_connect_to(host: &str, port: u16, config: Arc<rustls::ClientConf
 pub fn tls::tls_listen_on(host: &str, port: u16, config: Arc<rustls::ServerConfig>, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 pub fn tls::build_client_config(opts: &MapValue) -> ValueResult<Arc<rustls::ClientConfig>>
 pub fn tls::build_server_config(opts: &MapValue) -> ValueResult<Arc<rustls::ServerConfig>>
+#[cfg(unix)] pub fn unix::connect_to(path: &str, in_buf: usize, out_buf: usize) -> Value
+#[cfg(unix)] pub fn unix::listen_on(path: &str, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 ```
 
 `init` registers all three namespaces, calling `cljrs_async::init` internally. Idempotent.
@@ -155,6 +185,14 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the re
 ### `TlsListenerResource`
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `tls_accept_loop` task. `close()` aborts the task, dropping the `TcpListener` and releasing the listener FD.
+
+### `UnixStreamResource` (`#[cfg(unix)]`)
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks. `close()` aborts both tasks, dropping the Unix stream halves and releasing the FD.
+
+### `UnixListenerResource` (`#[cfg(unix)]`)
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `accept_loop` task and the socket's filesystem `path`. `close()` aborts the task and **unlinks the socket path** via `std::fs::remove_file`, so the next `listen_on` on the same path does not get EADDRINUSE. `listen_on` also pre-unlinks any stale socket file before binding.
 
 ## Connection Model
 
