@@ -1024,23 +1024,12 @@ impl cljrs_gc::Trace for CljxFuture {
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
-/// A Clojure agent action: takes the current state, returns the new state.
-pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, Value> + Send>;
-
-/// Messages sent to an agent's worker thread.
-pub enum AgentMsg {
-    Update(AgentFn),
-    Shutdown,
-}
-
-/// A Clojure agent — asynchronous state update queue.
+/// A Clojure agent — asynchronous state update queue (stub: not yet implemented).
 pub struct Agent {
-    /// Current state, shared between the Value::Agent handle and the worker thread.
+    /// Current state.
     pub state: Arc<Mutex<Value>>,
-    /// Last error, shared similarly.
+    /// Last error.
     pub error: Arc<Mutex<Option<Value>>>,
-    /// Channel to send actions to the worker thread.
-    pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
 }
 
