@@ -93,7 +93,7 @@ fn test_tls_echo_round_trip() {
             Value::Str(s) => s.get().clone(),
             other => panic!("expected str :local-addr, got {}", other.type_name()),
         };
-        let port: u16 = local_addr.split(':').last().unwrap().parse().unwrap();
+        let port: u16 = local_addr.split(':').next_back().unwrap().parse().unwrap();
 
         let conns_ch = as_chan(&map_get(&server_map, "conns"));
 

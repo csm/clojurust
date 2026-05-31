@@ -57,7 +57,7 @@ fn test_udp_echo_round_trip() {
         };
         let server_port: u16 = server_local_addr
             .split(':')
-            .last()
+            .next_back()
             .unwrap()
             .parse()
             .unwrap();
@@ -115,7 +115,7 @@ fn test_udp_echo_round_trip() {
                 match dgram.get(&kw("addr")) {
                     Some(Value::Str(s)) => {
                         let addr = s.get();
-                        let echo_port: u16 = addr.split(':').last().unwrap().parse().unwrap();
+                        let echo_port: u16 = addr.split(':').next_back().unwrap().parse().unwrap();
                         assert_eq!(
                             echo_port, server_port,
                             ":addr port must be server's port; got {addr}"
@@ -206,7 +206,7 @@ fn test_udp_multiple_senders() {
             other => panic!("expected socket map, got {}", other.type_name()),
         };
         let server_port: u16 = match map_get(&server_map, "local-addr") {
-            Value::Str(s) => s.get().split(':').last().unwrap().parse().unwrap(),
+            Value::Str(s) => s.get().split(':').next_back().unwrap().parse().unwrap(),
             _ => panic!("expected str :local-addr"),
         };
         let server_in = as_chan(&map_get(&server_map, "in"));
@@ -218,7 +218,7 @@ fn test_udp_multiple_senders() {
             _ => panic!("expected socket map"),
         };
         let client_a_port: u16 = match map_get(&client_a_map, "local-addr") {
-            Value::Str(s) => s.get().split(':').last().unwrap().parse().unwrap(),
+            Value::Str(s) => s.get().split(':').next_back().unwrap().parse().unwrap(),
             _ => panic!("expected str"),
         };
         let client_a_out = as_chan(&map_get(&client_a_map, "out"));
@@ -230,7 +230,7 @@ fn test_udp_multiple_senders() {
             _ => panic!("expected socket map"),
         };
         let client_b_port: u16 = match map_get(&client_b_map, "local-addr") {
-            Value::Str(s) => s.get().split(':').last().unwrap().parse().unwrap(),
+            Value::Str(s) => s.get().split(':').next_back().unwrap().parse().unwrap(),
             _ => panic!("expected str"),
         };
         let client_b_out = as_chan(&map_get(&client_b_map, "out"));
@@ -275,7 +275,7 @@ fn test_udp_multiple_senders() {
             match chan_take(&server_in).await {
                 Value::Map(dgram) => match dgram.get(&kw("addr")) {
                     Some(Value::Str(s)) => {
-                        let p: u16 = s.get().split(':').last().unwrap().parse().unwrap();
+                        let p: u16 = s.get().split(':').next_back().unwrap().parse().unwrap();
                         received_ports.push(p);
                     }
                     _ => panic!("expected :addr string"),

@@ -445,8 +445,7 @@ fn builtin_connect(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let path =
-        opts_str(&opts, "path").ok_or_else(|| ValueError::Other(":path required".into()))?;
+    let path = opts_str(&opts, "path").ok_or_else(|| ValueError::Other(":path required".into()))?;
     let in_buf = opts_usize(&opts, "in-buf").unwrap_or(8);
     let out_buf = opts_usize(&opts, "out-buf").unwrap_or(8);
     Ok(connect_to(&path, in_buf, out_buf))
@@ -492,8 +491,7 @@ fn builtin_listen(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let path =
-        opts_str(&opts, "path").ok_or_else(|| ValueError::Other(":path required".into()))?;
+    let path = opts_str(&opts, "path").ok_or_else(|| ValueError::Other(":path required".into()))?;
     let conns_buf = opts_usize(&opts, "conns-buf").unwrap_or(8);
     let in_buf = opts_usize(&opts, "in-buf").unwrap_or(8);
     let out_buf = opts_usize(&opts, "out-buf").unwrap_or(8);

@@ -57,8 +57,7 @@ mod unix_tests {
 
             let path = sock("echo");
 
-            let server_val =
-                cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
+            let server_val = cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
             let server_map = match server_val {
                 Value::Map(m) => m,
                 other => panic!("expected server map, got {}", other.type_name()),
@@ -152,8 +151,7 @@ mod unix_tests {
 
             let path = sock("close_conns");
 
-            let server_val =
-                cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
+            let server_val = cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
             let server_map = match server_val {
                 Value::Map(m) => m,
                 other => panic!("expected server map, got {}", other.type_name()),
@@ -192,8 +190,7 @@ mod unix_tests {
 
             let path = sock("unlink");
 
-            let server_val =
-                cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
+            let server_val = cljrs_net::unix::listen_on(&path, 8, 8, 8).expect("listen_on failed");
             let server_map = match server_val {
                 Value::Map(m) => m,
                 _ => panic!("expected server map"),
