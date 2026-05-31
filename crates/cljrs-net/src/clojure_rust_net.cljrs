@@ -1,6 +1,7 @@
 ;; clojure.rust.net — umbrella networking namespace.
 
 (require 'clojure.rust.net.tcp)
+(require 'clojure.rust.net.udp)
 
 (defn connect
   "Connect to a remote host. Returns a promise channel that yields a connection
@@ -45,13 +46,31 @@
   [handler opts]
   (clojure.rust.net.tcp/start-server handler opts))
 
-(defn close
-  "Close a connection or server map, releasing its socket and channels.
+(defn socket
+  "Create a UDP datagram socket. Returns a socket map:
+  {:in <chan> :out <chan> :local-addr str :resource handle}
 
-  For connections: closes :out (signals writer to drain and half-close the write
-  side), closes :in, and aborts reader/writer tasks via the :resource handle.
-  For servers: stops the accept loop, closes the listener FD, and closes :conns."
+  :in yields {:data <byte-array> :addr \"ip:port\"} for each received datagram.
+  Put {:data <byte-array> :addr \"ip:port\"} maps on :out to send datagrams.
+
+  Opts:
+    :port    integer (required, 1-65535)
+    :host    string (default \"0.0.0.0\")
+    :in-buf  channel buffer depth for :in (default 8)
+    :out-buf channel buffer depth for :out (default 8)"
+  [opts]
+  (clojure.rust.net.udp/socket opts))
+
+(defn close
+  "Close a connection, server, or UDP socket map, releasing its socket and channels.
+
+  For TCP connections (:remote-addr present): closes :out (signals writer to drain
+  and half-close), closes :in, and aborts reader/writer tasks via :resource.
+  For TCP servers (:conns present): stops the accept loop, closes the listener FD,
+  and closes :conns.
+  For UDP sockets: closes :in, :out, and aborts reader/writer tasks via :resource."
   [x]
   (cond
-    (contains? x :conns) (clojure.rust.net.tcp/listen-close x)
-    :else                (clojure.rust.net.tcp/close x)))
+    (contains? x :conns)       (clojure.rust.net.tcp/listen-close x)
+    (contains? x :remote-addr) (clojure.rust.net.tcp/close x)
+    :else                      (clojure.rust.net.udp/close x)))

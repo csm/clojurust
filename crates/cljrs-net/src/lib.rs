@@ -1,4 +1,4 @@
-//! Networking for clojurust — TCP over core.async channels.
+//! Networking for clojurust — TCP, UDP over core.async channels.
 //!
 //! # Usage
 //!
@@ -18,6 +18,7 @@ use cljrs_async::load_source;
 
 pub mod frame;
 pub mod tcp;
+pub mod udp;
 
 /// Clojure source for `clojure.rust.net.tcp`.
 const NET_TCP_SOURCE: &str = include_str!("clojure_rust_net_tcp.cljrs");
@@ -28,9 +29,13 @@ const NET_SOURCE: &str = include_str!("clojure_rust_net.cljrs");
 /// Clojure source for `clojure.rust.net.frame`.
 const NET_FRAME_SOURCE: &str = include_str!("clojure_rust_net_frame.cljrs");
 
+/// Clojure source for `clojure.rust.net.udp`.
+const NET_UDP_SOURCE: &str = include_str!("clojure_rust_net_udp.cljrs");
+
 pub const NS_TCP: &str = "clojure.rust.net.tcp";
 pub const NS: &str = "clojure.rust.net";
 pub const NS_FRAME: &str = "clojure.rust.net.frame";
+pub const NS_UDP: &str = "clojure.rust.net.udp";
 
 /// Register the networking namespaces.
 ///
@@ -53,6 +58,14 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         frame::register(globals, NS_FRAME);
         load_source(globals, NS_FRAME, NET_FRAME_SOURCE);
         globals.mark_loaded(NS_FRAME);
+    }
+
+    if !globals.is_loaded(NS_UDP) {
+        globals.get_or_create_ns(NS_UDP);
+        globals.refer_all(NS_UDP, "clojure.core");
+        udp::register(globals, NS_UDP);
+        load_source(globals, NS_UDP, NET_UDP_SOURCE);
+        globals.mark_loaded(NS_UDP);
     }
 
     if !globals.is_loaded(NS) {

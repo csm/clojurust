@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–C implemented (TCP client + server + framing). Phases D–F (UDP, TLS, Unix) are stubs.
+**Status**: Phases A–D implemented (TCP client + server + framing + UDP datagrams). Phases E–F (TLS, Unix) are stubs.
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -10,15 +10,18 @@
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, and `clojure.rust.net` |
+| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, and `clojure.rust.net` |
 | `src/tcp.rs` | `TcpStreamResource`, `TcpListenerResource`, connection builder, accept loop, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
+| `src/udp.rs` | `UdpSocketResource`, reader/writer tasks, `socket`/`close` builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
+| `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
 | `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net` |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
 | `tests/framing.rs` | Phase C integration tests (lines + length-prefixed end-to-end, framer unit tests) |
+| `tests/udp.rs` | Phase D integration tests (echo round-trip, multiple senders, close) |
 
 ## Public API
 
@@ -75,12 +78,24 @@
 (close x)                 ;; dispatches on :conns key: server → listen-close, else → close
 ```
 
+### `clojure.rust.net.udp`
+
+```clojure
+(socket {:port 9000})
+;; => {:in <chan> :out <chan> :local-addr "0.0.0.0:9000" :resource h}
+;;    :in yields {:data <byte-array> :addr "ip:port"} per received datagram
+;;    put {:data <byte-array> :addr "ip:port"} on :out to send
+
+(close sock)  ;; => nil — closes :in/:out and aborts reader/writer tasks
+```
+
 ### Rust
 
 ```rust
 pub fn init(globals: &Arc<GlobalEnv>)
 pub fn tcp::connect_to(host: &str, port: u16, in_buf: usize, out_buf: usize) -> Value
 pub fn tcp::listen_on(host: &str, port: u16, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
+pub fn udp::socket_on(host: &str, port: u16, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 pub fn frame::frame_channel(in_chan: GcPtr<NativeObjectBox>, spec: FramerSpec, out_buf: usize) -> GcPtr<NativeObjectBox>
 pub fn frame::encode_line(s: &str) -> Value
 pub fn frame::encode_length_prefixed(data: &[u8], prefix_len: usize, big_endian: bool) -> Value
@@ -95,6 +110,10 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the re
 ### `TcpListenerResource`
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `accept_loop` task. `close()` aborts the task, dropping the `TcpListener` and releasing the listener FD.
+
+### `UdpSocketResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks. `close()` aborts both tasks; once they finish the `Arc<UdpSocket>` drops and the FD is released.
 
 ## Connection Model
 
