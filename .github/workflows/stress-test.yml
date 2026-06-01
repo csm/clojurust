@@ -1,0 +1,160 @@
+name: Stress Test
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CLJRS_GC_STATS: "-"
+
+jobs:
+  stress-test:
+    name: Full stress test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        id: build
+        continue-on-error: true
+        run: cargo build --release
+
+      # ── Rust tests ────────────────────────────────────────────────────────────
+
+      - name: Rust tests — debug
+        id: rust-debug
+        continue-on-error: true
+        run: cargo test --workspace
+
+      - name: Rust tests — release (full e2e compiler)
+        id: rust-release
+        continue-on-error: true
+        run: cargo test --workspace --release
+
+      # ── Clojure test suite ────────────────────────────────────────────────────
+
+      - name: Clojure test suite — interpreter
+        id: clojure-interp
+        continue-on-error: true
+        run: ./target/release/cljrs test --src-path ./clojure-test-suite/test
+
+      - name: Clojure test suite — AOT compile and run
+        id: clojure-aot
+        continue-on-error: true
+        run: |
+          ./target/release/cljrs compile -o clojure-test-suite-bin --test ./clojure-test-suite/test
+          ./clojure-test-suite-bin
+
+      # ── Samples — interpreted ─────────────────────────────────────────────────
+
+      - name: graph sample — interpreted
+        id: graph-interp
+        continue-on-error: true
+        run: ./target/release/cljrs run samples/graph.cljrs
+
+      - name: life sample — interpreted
+        id: life-interp
+        continue-on-error: true
+        run: ./target/release/cljrs run samples/life.cljrs
+
+      - name: core.async sample — interpreted
+        id: async-interp
+        continue-on-error: true
+        run: ./target/release/cljrs run samples/core_async.cljrs
+
+      - name: http-get sample — interpreted
+        id: http-get-interp
+        continue-on-error: true
+        run: ./target/release/cljrs run samples/http_get.cljrs
+
+      # ── Samples — AOT compiled ────────────────────────────────────────────────
+
+      - name: graph sample — AOT compile and run
+        id: graph-aot
+        continue-on-error: true
+        run: |
+          ./target/release/cljrs compile -o graph-bin samples/graph.cljrs
+          ./graph-bin
+
+      - name: life sample — AOT compile and run
+        id: life-aot
+        continue-on-error: true
+        run: |
+          ./target/release/cljrs compile -o life-bin samples/life.cljrs
+          ./life-bin
+
+      - name: core.async sample — AOT compile and run
+        id: async-aot
+        continue-on-error: true
+        run: |
+          ./target/release/cljrs compile -o async-bin samples/core_async.cljrs
+          ./async-bin
+
+      - name: http-get sample — AOT compile and run
+        id: http-get-aot
+        continue-on-error: true
+        run: |
+          ./target/release/cljrs compile -o http-get-bin samples/http_get.cljrs
+          ./http-get-bin
+
+      # ── Summary ───────────────────────────────────────────────────────────────
+
+      - name: Summarize results
+        if: always()
+        run: |
+          declare -A outcomes=(
+            [build]="${{ steps.build.outcome }}"
+            [rust-debug]="${{ steps.rust-debug.outcome }}"
+            [rust-release]="${{ steps.rust-release.outcome }}"
+            [clojure-interp]="${{ steps.clojure-interp.outcome }}"
+            [clojure-aot]="${{ steps.clojure-aot.outcome }}"
+            [graph-interp]="${{ steps.graph-interp.outcome }}"
+            [life-interp]="${{ steps.life-interp.outcome }}"
+            [async-interp]="${{ steps.async-interp.outcome }}"
+            [http-get-interp]="${{ steps.http-get-interp.outcome }}"
+            [graph-aot]="${{ steps.graph-aot.outcome }}"
+            [life-aot]="${{ steps.life-aot.outcome }}"
+            [async-aot]="${{ steps.async-aot.outcome }}"
+            [http-get-aot]="${{ steps.http-get-aot.outcome }}"
+          )
+
+          order=(
+            build
+            rust-debug rust-release
+            clojure-interp clojure-aot
+            graph-interp life-interp async-interp http-get-interp
+            graph-aot life-aot async-aot http-get-aot
+          )
+
+          {
+            echo "## Stress Test Results"
+            echo ""
+            echo "| Step | Result |"
+            echo "|------|--------|"
+            for step in "${order[@]}"; do
+              outcome="${outcomes[$step]}"
+              if [[ "$outcome" == "success" ]]; then
+                echo "| \`$step\` | ✅ passed |"
+              else
+                echo "| \`$step\` | ❌ $outcome |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=()
+          for step in "${order[@]}"; do
+            [[ "${outcomes[$step]}" != "success" ]] && failed+=("$step")
+          done
+
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            echo "Failed steps: ${failed[*]}"
+            exit 1
+          else
+            echo "All stress-test steps passed."
+          fi
