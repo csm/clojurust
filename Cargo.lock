@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "clap",
  "cljrs-async",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-async"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-blake3"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "blake3",
  "cljrs-env",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-builtins"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "bigdecimal",
  "cljrs-env",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-compiler"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-async",
  "cljrs-builtins",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-deps"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-env"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-deps",
  "cljrs-gc",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-eval"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-export-macro"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-gc"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "bigdecimal",
  "cljrs-logging",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interop"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-env",
  "cljrs-export-macro",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interp"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-io"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-async",
  "cljrs-env",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-reader",
  "cljrs-types",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir-prebuild"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "clap",
  "cljrs-env",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir-viz"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-compiler",
  "cljrs-ir",
@@ -546,11 +546,11 @@ dependencies = [
 
 [[package]]
 name = "cljrs-logging"
-version = "0.1.0"
+version = "0.1.112"
 
 [[package]]
 name = "cljrs-net"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-async",
  "cljrs-env",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-reader"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-types",
  "miette",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-runtime"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-stdlib"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-types"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "miette",
  "serde",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-value"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "arc-swap",
  "bigdecimal",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-vcs"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-wasm"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-async",
  "cljrs-builtins",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "rust-interop-example"
-version = "0.1.0"
+version = "0.1.112"
 dependencies = [
  "cljrs-eval",
  "cljrs-gc",
