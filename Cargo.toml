@@ -25,7 +25,8 @@ members = [
     "crates/cljrs-wasm",
     "crates/cljrs-async",
     "crates/cljrs-io",
-    "crates/cljrs-net"]
+    "crates/cljrs-net",
+    "crates/cljrs-charset"]
 resolver = "2"
 
 [workspace.package]
@@ -55,6 +56,7 @@ cljrs-vcs          = { path = "crates/cljrs-vcs",          version = "0.1.0" }
 cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0" }
 cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0" }
 cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
+cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
