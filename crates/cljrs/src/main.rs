@@ -483,6 +483,8 @@ fn setup_globals(
             cljrs_io::init(g);
             #[cfg(feature = "net")]
             cljrs_net::init(g);
+            #[cfg(feature = "charset")]
+            cljrs_charset::init(g);
         };
         match guard.as_ref() {
             Some(drv) => drv.local.block_on(&drv.rt, async { init(&globals) }),

@@ -311,6 +311,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cljrs-async",
+ "cljrs-charset",
  "cljrs-compiler",
  "cljrs-deps",
  "cljrs-eval",
