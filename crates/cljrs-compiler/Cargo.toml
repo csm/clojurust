@@ -12,6 +12,9 @@ no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-inter
 
 [dependencies]
 cljrs-async    = { workspace = true }
+cljrs-io       = { workspace = true }
+cljrs-net      = { workspace = true }
+cljrs-charset  = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-types    = { workspace = true }

@@ -412,6 +412,11 @@ pub fn compile_file(
     // and the `go`/`alt` macros resolve during macro-expansion. The GC
     // service is silently skipped when there is no LocalSet context.
     cljrs_async::init(&globals);
+    // Register I/O, networking, and charset namespaces so that require forms
+    // in source files resolve correctly during macro expansion.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -749,6 +754,9 @@ cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
 cljrs-async    = {{ path = "{ws}/crates/cljrs-async" }}
+cljrs-io       = {{ path = "{ws}/crates/cljrs-io" }}
+cljrs-net      = {{ path = "{ws}/crates/cljrs-net" }}
+cljrs-charset  = {{ path = "{ws}/crates/cljrs-charset" }}
 tokio          = {{ version = "1", features = ["rt", "time"] }}
 {native_deps}"#,
     );
@@ -902,6 +910,11 @@ async fn run() {{
 
     // Register the async runtime (clojure.core.async, ^:async dispatch, await).
     cljrs_async::init(&globals);
+
+    // Register I/O, networking, and charset namespaces.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
