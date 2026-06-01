@@ -1,0 +1,43 @@
+;; http-get.cljrs — basic HTTP GET using cljrs-net and cljrs-charset.
+;;
+;; Opens a plain TCP connection to clj.rs:80, encodes an HTTP/1.0 request
+;; as UTF-8 bytes with cljrs-charset, sends it, drains all response byte
+;; chunks, decodes each chunk back to a string, and prints the first line.
+;;
+;; The request encoding and response decoding are done explicitly through
+;; cljrs-charset to show the encode/decode cycle; cljrs-net's :out channel
+;; would also accept a raw string, but charset makes the byte conversion visible.
+
+(ns http-get-sample)
+
+(require '[clojure.rust.net     :as net])
+(require '[clojure.rust.charset :as charset])
+(require '[clojure.core.async   :refer [take! put! close!]])
+(require '[clojure.string       :as str])
+
+(def ^:private host "clj.rs")
+(def ^:private port 80)
+
+(defn ^:async -main [& _args]
+  (let [conn (await (take! (net/connect {:host host :port port})))]
+
+    ;; Build the HTTP request, encode it to UTF-8 bytes, and send it.
+    ;; Do not close :out — let the server close the connection after responding
+    ;; (Connection: close in the request header instructs it to do so).
+    ;; Closing :out prematurely causes pool_writer to send TCP FIN before the
+    ;; server has a chance to respond, which often triggers an RST instead of
+    ;; the expected HTTP response.
+    (await (put! (:out conn)
+                 (charset/encode (str "GET / HTTP/1.0\r\n"
+                                      "Host: " host "\r\n"
+                                      "Connection: close\r\n"
+                                      "\r\n"))))
+
+    ;; Drain all response byte chunks from :in, decode each one to a string,
+    ;; concatenate, and print only the first line.
+    (let [{:keys [values]} (await (net/drain-to (:in conn)))
+          response         (reduce str "" (map charset/decode values))
+          first-line       (first (str/split-lines response))]
+      (println first-line))
+
+    (net/close conn)))

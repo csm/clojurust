@@ -412,6 +412,11 @@ pub fn compile_file(
     // and the `go`/`alt` macros resolve during macro-expansion. The GC
     // service is silently skipped when there is no LocalSet context.
     cljrs_async::init(&globals);
+    // Register I/O, networking, and charset namespaces so that require forms
+    // in source files resolve correctly during macro expansion.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -749,7 +754,10 @@ cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
 cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
 cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
 cljrs-async    = {{ path = "{ws}/crates/cljrs-async" }}
-tokio          = {{ version = "1", features = ["rt", "time"] }}
+cljrs-io       = {{ path = "{ws}/crates/cljrs-io" }}
+cljrs-net      = {{ path = "{ws}/crates/cljrs-net" }}
+cljrs-charset  = {{ path = "{ws}/crates/cljrs-charset" }}
+tokio          = {{ version = "1", features = ["rt", "time", "net", "io-util"] }}
 {native_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
@@ -903,6 +911,11 @@ async fn run() {{
     // Register the async runtime (clojure.core.async, ^:async dispatch, await).
     cljrs_async::init(&globals);
 
+    // Register I/O, networking, and charset namespaces.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
+
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 {bundled}{native_init}
@@ -932,7 +945,7 @@ fn main() {{
             // single-threaded Tokio LocalSet so GcPtr<!Send> values stay on
             // one OS thread throughout execution.
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();

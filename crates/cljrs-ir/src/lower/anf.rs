@@ -744,12 +744,23 @@ fn lower_def(ctx: &mut LowerCtx, args: &[Form]) -> R {
             "def requires a name".into(),
         ));
     }
-    let FormKind::Symbol(name_sym) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm(
-            "def name must be a symbol".into(),
-        ));
+    // Name may carry metadata: `(def ^:private x 1)`.
+    let name_str: Arc<str> = match &args[0].kind {
+        FormKind::Symbol(s) => Arc::from(s.as_str()),
+        FormKind::Meta(_, inner) => {
+            let FormKind::Symbol(s) = &inner.kind else {
+                return Err(LowerError::MalformedSpecialForm(
+                    "def name must be a symbol".into(),
+                ));
+            };
+            Arc::from(s.as_str())
+        }
+        _ => {
+            return Err(LowerError::MalformedSpecialForm(
+                "def name must be a symbol".into(),
+            ));
+        }
     };
-    let name_str: Arc<str> = Arc::from(name_sym.as_str());
     let ns = ctx.ns().clone();
 
     let val = if args.len() >= 2 {
