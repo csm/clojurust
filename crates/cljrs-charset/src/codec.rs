@@ -66,7 +66,7 @@ impl CljDecoder {
 ///
 /// `max_utf8_buffer_length` pre-sizes the buffer so that `decode_to_string`
 /// completes in a single call without reallocation.
-fn decode_bytes(dec: &mut encoding_rs::Decoder, src: &[u8], last: bool) -> String {
+pub(crate) fn decode_bytes(dec: &mut encoding_rs::Decoder, src: &[u8], last: bool) -> String {
     let cap = dec
         .max_utf8_buffer_length(src.len())
         .unwrap_or_else(|| src.len().saturating_mul(4).max(4));
@@ -147,7 +147,7 @@ impl CljEncoder {
 /// Unmappable characters are substituted with HTML numeric character
 /// references (e.g. `&#12354;` for あ when encoding as Latin-1).  The loop
 /// handles `OutputFull` by extending the output buffer.
-fn encode_str(enc: &mut encoding_rs::Encoder, src: &str, last: bool) -> Vec<u8> {
+pub(crate) fn encode_str(enc: &mut encoding_rs::Encoder, src: &str, last: bool) -> Vec<u8> {
     use encoding_rs::EncoderResult;
 
     let mut out = Vec::new();

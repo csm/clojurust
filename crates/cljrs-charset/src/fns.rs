@@ -32,7 +32,7 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
 ///
 /// Accepts a keyword (`:utf-8`) or string (`"utf-8"`); `None`/`nil` defaults
 /// to UTF-8.  Unrecognised labels return an error.
-fn resolve_encoding(arg: Option<&Value>) -> ValueResult<&'static Encoding> {
+pub(crate) fn resolve_encoding(arg: Option<&Value>) -> ValueResult<&'static Encoding> {
     let label: String = match arg {
         None | Some(Value::Nil) => return Ok(encoding_rs::UTF_8),
         Some(Value::Keyword(k)) => k.get().name.as_ref().to_string(),

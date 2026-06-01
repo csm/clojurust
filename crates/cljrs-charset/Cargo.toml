@@ -10,4 +10,5 @@ repository.workspace = true
 cljrs-gc    = { workspace = true }
 cljrs-value = { workspace = true }
 cljrs-env   = { workspace = true }
+cljrs-async = { workspace = true }
 encoding_rs = { workspace = true }

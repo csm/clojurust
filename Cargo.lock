@@ -387,6 +387,7 @@ dependencies = [
 name = "cljrs-charset"
 version = "0.1.0"
 dependencies = [
+ "cljrs-async",
  "cljrs-env",
  "cljrs-gc",
  "cljrs-value",

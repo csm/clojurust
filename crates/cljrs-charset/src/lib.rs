@@ -1,44 +1,53 @@
 //! Charset encoding and decoding with stream support — `clojure.rust.charset`.
 //!
-//! Provides the `clojure.rust.charset` namespace backed by [`encoding_rs`],
-//! which supports the WHATWG encoding standard (UTF-8, UTF-16, Shift-JIS,
-//! windows-1252, ISO-8859-*, and many more).
+//! Provides two namespaces:
 //!
-//! # Clojure API
+//! - **`clojure.rust.charset`** — synchronous streaming codecs
+//!   ([`decoder`]/[`encoder`] + [`update!`]/[`finish!`]) and one-shot helpers
+//!   ([`decode`]/[`encode`]).
+//! - **`clojure.rust.charset.async`** — async channel-to-channel transformers:
+//!   [`decode-chan`] reads `ByteBlob` values from a `core.async` channel and
+//!   delivers decoded strings onto a new channel; [`encode-chan`] does the
+//!   reverse.
 //!
-//! ```clojure
-//! ;; Streaming decode
-//! (let [dec (charset/decoder :shift-jis)]
-//!   (charset/update! dec some-bytes)   ;; => "partial string"
-//!   (charset/finish! dec))             ;; => "tail string"
-//!
-//! ;; Streaming encode
-//! (let [enc (charset/encoder :windows-1252)]
-//!   (charset/update! enc "Hello")      ;; => #bytes[...]
-//!   (charset/finish! enc))             ;; => #bytes[]
-//!
-//! ;; One-shot helpers
-//! (charset/decode blob)                ;; UTF-8 decode
-//! (charset/decode blob :iso-8859-1)   ;; with explicit charset
-//! (charset/encode "こんにちは" :shift-jis)
-//! ```
+//! Both namespaces are backed by [`encoding_rs`], which implements the WHATWG
+//! encoding standard (UTF-8, UTF-16, Shift-JIS, windows-1252, ISO-8859-*, …).
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! let globals = cljrs_stdlib::standard_env();
+//!
+//! // Synchronous codecs
 //! cljrs_charset::init(&globals);
+//!
+//! // Async channel transforms (also requires cljrs_async::init)
+//! cljrs_async::init(&globals);
+//! cljrs_charset::init_async(&globals);
 //! ```
+//!
+//! [`decoder`]: crate::NS
+//! [`encoder`]: crate::NS
+//! [`update!`]: crate::NS
+//! [`finish!`]: crate::NS
+//! [`decode`]: crate::NS
+//! [`encode`]: crate::NS
+//! [`decode-chan`]: crate::NS_ASYNC
+//! [`encode-chan`]: crate::NS_ASYNC
 
 use std::sync::Arc;
 
 use cljrs_env::env::GlobalEnv;
 
 mod codec;
+mod codec_chan;
 mod fns;
 
-/// The Clojure namespace populated by this crate.
+/// The synchronous codec namespace.
 pub const NS: &str = "clojure.rust.charset";
+
+/// The async channel-transform namespace.
+pub const NS_ASYNC: &str = "clojure.rust.charset.async";
 
 /// Register the `clojure.rust.charset` namespace into `globals`.
 ///
@@ -51,6 +60,21 @@ pub fn init(globals: &Arc<GlobalEnv>) {
     globals.refer_all(NS, "clojure.core");
     fns::register(globals, NS);
     globals.mark_loaded(NS);
+}
+
+/// Register the `clojure.rust.charset.async` namespace into `globals`.
+///
+/// Idempotent.  Requires the `cljrs-async` runtime ([`cljrs_async::init`])
+/// and a running Tokio `LocalSet` — call both before spawning tasks that use
+/// the namespace.
+pub fn init_async(globals: &Arc<GlobalEnv>) {
+    if globals.is_loaded(NS_ASYNC) {
+        return;
+    }
+    globals.get_or_create_ns(NS_ASYNC);
+    globals.refer_all(NS_ASYNC, "clojure.core");
+    codec_chan::register(globals, NS_ASYNC);
+    globals.mark_loaded(NS_ASYNC);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
