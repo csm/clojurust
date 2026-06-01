@@ -85,6 +85,47 @@ mod tests {
     }
 
     #[test]
+    fn utf8_multibyte_split_across_chunks() {
+        // 'あ' = U+3042 encodes as 3 bytes: E3 81 82.
+        // Split every possible way across two update! calls and verify the
+        // decoder buffers the incomplete sequence internally and completes it
+        // on the next call — the defining behaviour of a streaming decoder.
+        let input = "あいう"; // 9 bytes total: [E3 81 82] [E3 81 84] [E3 81 86]
+        let bytes = input.as_bytes();
+        assert_eq!(bytes.len(), 9);
+
+        for split in 1..bytes.len() {
+            let dec = CljDecoder::new(encoding_rs::UTF_8);
+            // First chunk may end mid-character; decoder must buffer the partial bytes.
+            let part1 = dec.update(&bytes[..split]).unwrap();
+            // Second chunk supplies the remaining bytes; decoder completes the char.
+            let part2 = dec.update(&bytes[split..]).unwrap();
+            let tail = dec.finish().unwrap();
+            let decoded = part1 + &part2 + &tail;
+            assert_eq!(
+                decoded, input,
+                "split at byte {split} produced wrong output"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_split_finish_replaces_incomplete_sequence() {
+        // If the stream ends with an incomplete multi-byte sequence, finish!
+        // should replace the dangling bytes with U+FFFD (replacement character).
+        let dec = CljDecoder::new(encoding_rs::UTF_8);
+        // First two bytes of 'あ' (E3 81), no third byte — stream ends here.
+        let partial = dec.update(&[0xE3, 0x81]).unwrap();
+        assert_eq!(partial, ""); // nothing output yet; bytes are buffered
+        let tail = dec.finish().unwrap();
+        assert_eq!(
+            partial + &tail,
+            "\u{FFFD}",
+            "incomplete trailing sequence must produce U+FFFD"
+        );
+    }
+
+    #[test]
     fn finish_after_finish_returns_error() {
         let dec = CljDecoder::new(encoding_rs::UTF_8);
         dec.finish().unwrap();
