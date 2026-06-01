@@ -37,8 +37,8 @@ pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
         | Value::Double(_)
         | Value::Char(_)
         | Value::Uuid(_) => true,
-        // Arc-managed — not GcPtr.
-        Value::Resource(_) => true,
+        // Arc-managed — not GcPtr; always considered static.
+        Value::Resource(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
         // GcPtr variants.
         Value::BigInt(p) => p.is_static_alloc(),
         Value::BigDecimal(p) => p.is_static_alloc(),

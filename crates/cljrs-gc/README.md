@@ -9,7 +9,8 @@ fixed **64 MB** soft limit instead of consulting total system RAM.
 
 **Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
-`docs/no-gc-plan.md`) — implemented.
+`docs/no-gc-plan.md`) — implemented.  B3 (`StaticGcPtr`, `static_alloc`) —
+implemented.
 
 ---
 
@@ -120,10 +121,37 @@ impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
 ```
 
-### Free functions (no-gc only)
+### `StaticGcPtr<T: 'static>` (always available — Phase B3)
+
+Program-lifetime pointer safe to share across isolate threads.  Backed by the
+global `StaticArena` (in `no-gc` builds) or `Box::leak` (in GC builds).
+Unlike `GcPtr`, it wraps `*const T` directly (no `GcBox` header) and is
+`Send + Sync`.
 
 ```rust
-// debug_assertions only:
+pub struct StaticGcPtr<T: 'static>(NonNull<T>);
+
+impl<T: 'static> StaticGcPtr<T> {
+    pub fn get(&self) -> &T
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool
+}
+impl<T: 'static> Clone for StaticGcPtr<T> { /* O(1) NonNull copy */ }
+
+/// Allocate `value` as program-lifetime memory.
+/// no-gc: StaticArena bump-alloc; GC: Box::leak.
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+```
+
+### Free functions
+
+```rust
+// always:
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+
+// no-gc only:
+pub fn static_arena() -> &'static StaticArena;
+
+// no-gc + debug_assertions only:
 pub fn is_static_addr(addr: usize) -> bool;  // checks the StaticArena chunk registry
 ```
 

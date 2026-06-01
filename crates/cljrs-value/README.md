@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) + B2 (structured-clone boundary) + B3 (shared static arena: intern tables, SharedValue, SharedAtom, ByteBlob) — implemented.
 
 ---
 
@@ -20,14 +20,16 @@ standard library on top of them.
 ```
 src/
   lib.rs                         — module declarations and re-exports
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2)
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); handles SharedAtom/ByteBlob pass-through (B3)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
+  intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   keyword.rs                     — Keyword { namespace, name }
+  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
   symbol.rs                      — Symbol { namespace, name }
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
-  value.rs                       — Value enum (incl. NativeObject variant), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
+  value.rs                       — Value enum (incl. SharedAtom, ByteBlob variants), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
     array_map.rs                 — PersistentArrayMap (≤8 entries, linear scan)
@@ -75,6 +77,8 @@ pub enum Value {
     // Runtime objects
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
+    SharedAtom(Arc<SharedAtom>),       // cross-isolate mutable ref (Phase B3)
+    ByteBlob(Arc<[u8]>),               // refcounted immutable byte buffer (Phase B3)
     Namespace(GcPtr<Namespace>),
     NativeFn(GcPtr<NativeFn>),
     CljxFn(GcPtr<CljxFn>),
@@ -113,6 +117,53 @@ pub struct Keyword  { namespace: Option<Arc<str>>, name: Arc<str> }
 
 Both support `simple(name)`, `qualified(ns, name)`, `parse(str)`, and
 `full_name() -> String`.
+
+### Phase B3 — Shared static arena
+
+#### Intern tables (`intern` module)
+
+```rust
+pub fn intern_keyword(namespace: Option<&str>, name: &str)
+    -> StaticGcPtr<Keyword>;
+pub fn intern_symbol(namespace: Option<&str>, name: &str, version: Option<&str>)
+    -> StaticGcPtr<Symbol>;
+```
+
+Global `OnceLock<Mutex<HashMap<…>>>` tables.  First call allocates the
+`Keyword`/`Symbol` into program-lifetime memory via `static_alloc`; subsequent
+calls return a clone of the same `StaticGcPtr` (pointer-stable identity across
+all isolates).
+
+#### `SharedValue` and `SharedAtom` (`shared` module)
+
+```rust
+pub enum SharedValue {
+    Nil, Bool(bool), Long(i64), Double(f64), Char(char), Uuid(u128),
+    Str(Arc<str>),
+    Keyword(StaticGcPtr<Keyword>),
+    Symbol(StaticGcPtr<Symbol>),
+    ByteBlob(Arc<[u8]>),              // BEAM off-heap-binary trick
+}
+
+pub struct SharedAtom {
+    pub cell: Arc<ArcSwap<SharedValue>>,
+    pub meta: Mutex<Option<SharedValue>>,
+}
+
+impl SharedAtom {
+    pub fn new(val: SharedValue) -> Self
+    pub fn deref_val(&self) -> Arc<SharedValue>     // atomic load
+    pub fn reset(&self, val: SharedValue) -> Arc<SharedValue>
+    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry
+}
+
+pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
+pub fn demote (sv:    &SharedValue) -> Value;
+```
+
+`promote` converts an isolate-local `Value` to `SharedValue` (fails for
+closures, resources, atoms, …).  `demote` converts back into a fresh
+isolate-local `Value`.
 
 ### `ClojureHash`
 
