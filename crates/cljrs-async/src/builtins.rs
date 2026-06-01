@@ -173,7 +173,9 @@ fn builtin_chan(args: &[Value]) -> ValueResult<Value> {
 /// event-driven notification rather than busy-polling.
 fn builtin_take(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(spawn_future(async move { Ok(chan_ref(ch.get()).take().await) }))
+    Ok(spawn_future(
+        async move { Ok(chan_ref(ch.get()).take().await) },
+    ))
 }
 
 /// `(put! ch val)` — a Future that resolves `true` once `val` is delivered (for
