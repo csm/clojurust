@@ -32,10 +32,15 @@ jobs:
         continue-on-error: true
         run: cargo test --workspace
 
-      - name: Rust tests — release (full e2e compiler)
+      - name: Rust tests — release
         id: rust-release
         continue-on-error: true
         run: cargo test --workspace --release
+
+      - name: Compiler e2e tests — full suite (aot_full_test)
+        id: compiler-e2e
+        continue-on-error: true
+        run: cargo test -p cljrs-compiler --features aot_full_test --release
 
       # ── Clojure test suite ────────────────────────────────────────────────────
 
@@ -112,6 +117,7 @@ jobs:
             [build]="${{ steps.build.outcome }}"
             [rust-debug]="${{ steps.rust-debug.outcome }}"
             [rust-release]="${{ steps.rust-release.outcome }}"
+            [compiler-e2e]="${{ steps.compiler-e2e.outcome }}"
             [clojure-interp]="${{ steps.clojure-interp.outcome }}"
             [clojure-aot]="${{ steps.clojure-aot.outcome }}"
             [graph-interp]="${{ steps.graph-interp.outcome }}"
@@ -126,7 +132,7 @@ jobs:
 
           order=(
             build
-            rust-debug rust-release
+            rust-debug rust-release compiler-e2e
             clojure-interp clojure-aot
             graph-interp life-interp async-interp http-get-interp
             graph-aot life-aot async-aot http-get-aot
