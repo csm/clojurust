@@ -169,17 +169,11 @@ fn builtin_chan(args: &[Value]) -> ValueResult<Value> {
 }
 
 /// `(take! ch)` — a Future that resolves to the next value on `ch`, or `nil`
-/// once `ch` is closed and drained. Parks (yields) until a value is available.
+/// once `ch` is closed and drained. Parks until a value is available using
+/// event-driven notification rather than busy-polling.
 fn builtin_take(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(spawn_future(async move {
-        loop {
-            if let Some(v) = chan_ref(ch.get()).try_take() {
-                return Ok(v);
-            }
-            tokio::task::yield_now().await;
-        }
-    }))
+    Ok(spawn_future(async move { Ok(chan_ref(ch.get()).take().await) }))
 }
 
 /// `(put! ch val)` — a Future that resolves `true` once `val` is delivered (for

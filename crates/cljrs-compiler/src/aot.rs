@@ -757,7 +757,7 @@ cljrs-async    = {{ path = "{ws}/crates/cljrs-async" }}
 cljrs-io       = {{ path = "{ws}/crates/cljrs-io" }}
 cljrs-net      = {{ path = "{ws}/crates/cljrs-net" }}
 cljrs-charset  = {{ path = "{ws}/crates/cljrs-charset" }}
-tokio          = {{ version = "1", features = ["rt", "time"] }}
+tokio          = {{ version = "1", features = ["rt", "time", "net", "io-util"] }}
 {native_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
@@ -945,7 +945,7 @@ fn main() {{
             // single-threaded Tokio LocalSet so GcPtr<!Send> values stay on
             // one OS thread throughout execution.
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();
