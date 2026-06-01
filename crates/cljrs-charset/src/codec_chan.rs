@@ -38,8 +38,16 @@ const DEFAULT_CAP: usize = 8;
 
 pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
     let entries: &[(&str, Arity, NativeFnPtr)] = &[
-        ("decode-chan", Arity::Variadic { min: 1 }, builtin_decode_chan),
-        ("encode-chan", Arity::Variadic { min: 1 }, builtin_encode_chan),
+        (
+            "decode-chan",
+            Arity::Variadic { min: 1 },
+            builtin_decode_chan,
+        ),
+        (
+            "encode-chan",
+            Arity::Variadic { min: 1 },
+            builtin_encode_chan,
+        ),
     ];
     for (name, arity, func) in entries {
         let nf = NativeFn::new(*name, arity.clone(), *func);
