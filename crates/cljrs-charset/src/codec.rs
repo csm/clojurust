@@ -87,7 +87,7 @@ impl Trace for CljDecoder {
 
 impl NativeObject for CljDecoder {
     fn type_tag(&self) -> &str {
-        "Decoder"
+        "cljrs-charset/Decoder"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -200,7 +200,7 @@ impl Trace for CljEncoder {
 
 impl NativeObject for CljEncoder {
     fn type_tag(&self) -> &str {
-        "Encoder"
+        "cljrs-charset/Encoder"
     }
     fn as_any(&self) -> &dyn Any {
         self

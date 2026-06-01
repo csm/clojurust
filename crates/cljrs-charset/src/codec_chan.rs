@@ -15,7 +15,7 @@
 //! - Non-ByteBlob / non-Str values (including `Value::Error`) are forwarded
 //!   to the output channel unchanged.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cljrs_async::{
     channel::{chan_put as put, chan_ref, chan_take, make_chan},
@@ -116,6 +116,13 @@ fn builtin_decode_chan(args: &[Value]) -> ValueResult<Value> {
                     }
                     break;
                 }
+                Value::ByteArray(a) => {
+                    let raw: Vec<u8> = a.get().lock().unwrap().iter().map(|&b| b as u8).collect();
+                    let s = decode_bytes(&mut dec, &raw, false);
+                    if !s.is_empty() && !put(&out_ch, str_val(s)).await {
+                        break 'pump;
+                    }
+                }
                 Value::ByteBlob(blob) => {
                     let s = decode_bytes(&mut dec, blob.as_ref(), false);
                     // Skip empty strings: they happen when the decoder is
@@ -202,5 +209,6 @@ fn str_val(s: String) -> Value {
 }
 
 fn blob_val(bytes: Vec<u8>) -> Value {
-    Value::ByteBlob(Arc::from(bytes.as_slice()))
+    let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
+    Value::ByteArray(GcPtr::new(Mutex::new(signed)))
 }

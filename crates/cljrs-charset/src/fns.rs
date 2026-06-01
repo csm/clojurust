@@ -1,6 +1,7 @@
 //! Native function implementations for `clojure.rust.charset`.
 
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
@@ -48,11 +49,15 @@ pub(crate) fn resolve_encoding(arg: Option<&Value>) -> ValueResult<&'static Enco
         .ok_or_else(|| ValueError::Other(format!("unknown charset: {label}")))
 }
 
-fn bytes_from_value(v: &Value) -> ValueResult<&[u8]> {
+fn bytes_from_value(v: &Value) -> ValueResult<Cow<'_, [u8]>> {
     match v {
-        Value::ByteBlob(b) => Ok(b.as_ref()),
+        Value::ByteBlob(b) => Ok(Cow::Borrowed(b.as_ref())),
+        Value::ByteArray(a) => {
+            let bytes: Vec<u8> = a.get().lock().unwrap().iter().map(|&b| b as u8).collect();
+            Ok(Cow::Owned(bytes))
+        }
         other => Err(ValueError::WrongType {
-            expected: "byte-blob",
+            expected: "byte-array or byte-blob",
             got: other.type_name().to_string(),
         }),
     }
@@ -79,7 +84,8 @@ fn as_native<'a>(v: &'a Value, expected: &'static str) -> ValueResult<&'a Native
 }
 
 fn bytes_to_value(bytes: Vec<u8>) -> Value {
-    Value::ByteBlob(Arc::from(bytes.as_slice()))
+    let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
+    Value::ByteArray(GcPtr::new(Mutex::new(signed)))
 }
 
 // ── Streaming constructors ────────────────────────────────────────────────────
@@ -103,7 +109,7 @@ fn builtin_encoder(args: &[Value]) -> ValueResult<Value> {
 // ── Streaming operations ──────────────────────────────────────────────────────
 
 /// `(update! decoder bytes)` → string
-/// `(update! encoder string)` → byte-blob
+/// `(update! encoder string)` → byte-array
 ///
 /// Feed an incremental chunk to a codec.  The codec remains open for further
 /// calls; use `finish!` to flush trailing state.
@@ -111,7 +117,7 @@ fn builtin_update(args: &[Value]) -> ValueResult<Value> {
     let obj = as_native(&args[0], "Decoder or Encoder")?;
     if let Some(dec) = obj.downcast_ref::<CljDecoder>() {
         let bytes = bytes_from_value(&args[1])?;
-        let s = dec.update(bytes)?;
+        let s = dec.update(&bytes)?;
         Ok(Value::Str(GcPtr::new(s)))
     } else if let Some(enc) = obj.downcast_ref::<CljEncoder>() {
         let s = str_from_value(&args[1])?;
@@ -126,7 +132,7 @@ fn builtin_update(args: &[Value]) -> ValueResult<Value> {
 }
 
 /// `(finish! decoder)` → string
-/// `(finish! encoder)` → byte-blob
+/// `(finish! encoder)` → byte-array
 ///
 /// Flush any buffered state and close the codec.  Further calls to `update!`
 /// or `finish!` on the same object will return an error.
@@ -155,7 +161,7 @@ fn builtin_finish(args: &[Value]) -> ValueResult<Value> {
 fn builtin_decode(args: &[Value]) -> ValueResult<Value> {
     let bytes = bytes_from_value(&args[0])?;
     let enc = resolve_encoding(args.get(1))?;
-    let (cow, _, _) = enc.decode(bytes);
+    let (cow, _, _) = enc.decode(&bytes);
     Ok(Value::Str(GcPtr::new(cow.into_owned())))
 }
 
@@ -167,5 +173,6 @@ fn builtin_encode(args: &[Value]) -> ValueResult<Value> {
     let s = str_from_value(&args[0])?;
     let enc = resolve_encoding(args.get(1))?;
     let (cow, _, _) = enc.encode(s);
-    Ok(Value::ByteBlob(Arc::from(cow.as_ref())))
+    let signed: Vec<i8> = cow.iter().map(|&b| b as i8).collect();
+    Ok(Value::ByteArray(GcPtr::new(Mutex::new(signed))))
 }
