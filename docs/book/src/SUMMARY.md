@@ -27,6 +27,8 @@
 - [Overview](async-io/index.md)
 - [core.async](async-io/async.md)
 - [Asynchronous I/O](async-io/io.md)
+- [Charset encoding](async-io/charset.md)
+- [Networking](async-io/net.md)
 
 # Rust Interop
 
