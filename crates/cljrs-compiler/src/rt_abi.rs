@@ -740,6 +740,72 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
     intern_long(n as i64)
 }
 
+/// `(count (filter pred coll))` fused — count matching elements without
+/// materializing the intermediate sequence.
+///
+/// `Set`/`Map` predicates are tested directly; other predicates are `invoke`d
+/// per element.  Iterates concrete collections in compiled Rust; falls back to
+/// the interpreted lazy `filter` + `count` for inputs `eager_seq_elems` can't
+/// walk directly.  Allocates nothing in the common path — the key win over the
+/// lazy path, whose per-element cons cells dominate `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        // Fall back to the interpreter for lazy/cons inputs, then count.
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        return unsafe { rt_count(seq) };
+    };
+    let mut n: usize = 0;
+    for elem in elems {
+        let keep = match pred_ref {
+            Value::Set(s) => s.contains(&elem),
+            Value::Map(m) => m
+                .get(&elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+            _ => match cljrs_env::callback::invoke(pred_ref, vec![elem]) {
+                Ok(r) => !matches!(r, Value::Nil | Value::Bool(false)),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            },
+        };
+        if keep {
+            n += 1;
+        }
+    }
+    intern_long(n as i64)
+}
+
+/// Eagerly collect the elements of a directly-iterable collection, or `None`
+/// for inputs that need the interpreter's full `seq` machinery.
+fn eager_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Store a thrown value in the pending-exception slot (mirrors `rt_call`).
+#[inline]
+fn stash_pending_exception(val: Value) {
+    PENDING_EXCEPTION.with(|cell| {
+        *cell.borrow_mut() = Some(box_val(val));
+    });
+}
+
 /// `(empty? coll)` — returns Bool without converting to a seq.
 ///
 /// The KnownFn::IsEmpty codegen dispatches here so that BFS loops do not

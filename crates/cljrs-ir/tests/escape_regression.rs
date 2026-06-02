@@ -493,6 +493,57 @@ fn stage4_deep_promotion_skipped_when_result_is_extracted() {
     );
 }
 
+// ── Eager HOF fusion tests ───────────────────────────────────────────────────
+
+/// Count `CallKnown` insts whose known fn debug-prints as `name`, across tree.
+fn known_call_count(ir: &IrFunction, name: &str) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(_, kfn, _) = inst
+                && format!("{kfn:?}") == name
+            {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += known_call_count(sub, name);
+    }
+    n
+}
+
+#[test]
+fn count_filter_is_fused_to_count_filter() {
+    // `count` is the sole consumer of `filter`, so the pair fuses into the
+    // allocation-free `CountFilter` and the dead `filter` is removed.
+    let ir = lower("(count (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "Filter"),
+        0,
+        "the fused filter should be removed; IR:\n{optimized}"
+    );
+    assert_eq!(
+        known_call_count(&optimized, "Count"),
+        0,
+        "the count should become CountFilter; IR:\n{optimized}"
+    );
+    assert_eq!(known_call_count(&optimized, "CountFilter"), 1);
+}
+
+#[test]
+fn count_filter_not_fused_when_filter_escapes() {
+    // The filter result is used twice (count + returned), so it must not fuse.
+    let ir = lower("(let [s (filter (fn [x] x) [1 2 3])] [(count s) s])");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "CountFilter"),
+        0,
+        "filter with a non-count use must not fuse; IR:\n{optimized}"
+    );
+}
+
 // Suppress an unused-import lint if Arc isn't picked up by every test.
 #[allow(dead_code)]
 fn _arc_witness() -> Arc<str> {

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::escape::{EscapeContext, EscapeState, analyze, make_context};
+use super::escape::{EscapeContext, EscapeState, UseKind, analyze, build_use_chains, make_context};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
@@ -509,6 +509,7 @@ fn is_scalar_knownfn(kfn: &KnownFn) -> bool {
             | KnownFn::Lte
             | KnownFn::Gte
             | KnownFn::Count
+            | KnownFn::CountFilter
             | KnownFn::IsNil
             | KnownFn::IsSeq
             | KnownFn::IsVector
@@ -642,11 +643,90 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
     }
 }
 
+// ── Eager HOF fusion ─────────────────────────────────────────────────────────
+
+/// Fuse `(count (filter pred coll))` into a single `CountFilter(pred, coll)`
+/// when the `filter` result is consumed *only* by that `count`.
+///
+/// `count` fully realizes a finite seq and returns a scalar, so this is
+/// observationally identical — but the fused op iterates `coll` and counts
+/// matching elements **without materializing** the intermediate sequence.
+/// That removes the dominant cost of the lazy path: the interpreted
+/// `clojure.core/filter` fallback (which re-walks Form ASTs and re-parses
+/// symbols per element) and the lazy cons-cell heap allocations.  This is the
+/// hot path in `samples/life.cljrs` — `live-neighbour-count` is exactly
+/// `(count (filter board (neighbours cell)))`.
+///
+/// The dead `filter` instruction is removed once its sole consumer is rewritten.
+fn fuse_eager_count_consumers(mut ir_func: IrFunction) -> IrFunction {
+    ir_func.subfunctions = ir_func
+        .subfunctions
+        .into_iter()
+        .map(fuse_eager_count_consumers)
+        .collect();
+
+    let uses = build_use_chains(&ir_func);
+
+    // seq_var → (pred, coll) for every `filter` whose result is used exactly
+    // once, as the argument to a `count`.
+    let mut filter_defs: HashMap<VarId, (VarId, VarId)> = HashMap::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(dst, KnownFn::Filter, args) = inst
+                && args.len() == 2
+            {
+                let sole_count_use = uses
+                    .get(dst)
+                    .map(|u| {
+                        u.len() == 1
+                            && matches!(
+                                &u[0].kind,
+                                UseKind::KnownCallArg {
+                                    func: KnownFn::Count,
+                                    ..
+                                }
+                            )
+                    })
+                    .unwrap_or(false);
+                if sole_count_use {
+                    filter_defs.insert(*dst, (args[0], args[1]));
+                }
+            }
+        }
+    }
+
+    if filter_defs.is_empty() {
+        return ir_func;
+    }
+
+    // Rewrite each `count(seq)` into `CountFilter(pred, coll)` and drop the
+    // now-dead `filter` instruction defining `seq`.
+    for block in &mut ir_func.blocks {
+        block.insts.retain(|inst| match inst {
+            Inst::CallKnown(dst, KnownFn::Filter, _) => !filter_defs.contains_key(dst),
+            _ => true,
+        });
+        for inst in &mut block.insts {
+            if let Inst::CallKnown(_, kfn @ KnownFn::Count, args) = inst
+                && args.len() == 1
+                && let Some(&(pred, coll)) = filter_defs.get(&args[0])
+            {
+                *kfn = KnownFn::CountFilter;
+                *args = vec![pred, coll];
+            }
+        }
+    }
+
+    ir_func
+}
+
 // ── Top-level pass ───────────────────────────────────────────────────────────
 
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
+///   0. Eager HOF fusion (`fuse_eager_count_consumers`) — fuse
+///      `count(filter …)` into the allocation-free `CountFilter`.
 ///   1. Inlining — splice eligible callees into call sites so their
 ///      allocations are visible as local to the caller.
 ///   2. Local region promotion (`optimize_tree`) — turn `NoEscape`
@@ -658,6 +738,7 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
 ///      bodies of provably scalar-returning functions so their intermediate
 ///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
+    let ir_func = fuse_eager_count_consumers(ir_func);
     let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
     let ir_func = optimize_tree(ir_func, &ctx);

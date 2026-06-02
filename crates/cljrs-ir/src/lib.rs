@@ -217,6 +217,13 @@ pub enum KnownFn {
 
     // Output capture
     WithOutStr,
+
+    // Fused eager consumers (synthesized by the optimizer, never parsed from
+    // source).  `CountFilter(pred, coll)` == `(count (filter pred coll))` but
+    // iterates and counts without materializing the intermediate lazy seq,
+    // avoiding both the interpreted lazy-seq fallback and its per-element heap
+    // allocations.
+    CountFilter,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -880,6 +887,7 @@ impl KnownFn {
             | KnownFn::Mapv
             | KnownFn::Filterv
             | KnownFn::Mapcat
+            | KnownFn::CountFilter
             | KnownFn::Some
             | KnownFn::Every
             | KnownFn::Into
