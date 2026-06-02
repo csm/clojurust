@@ -136,8 +136,34 @@ impl Region {
         self.object_count += 1;
         crate::stats::GC_STATS.record_region_alloc(layout.size());
 
-        // SAFETY: `gc_box` is non-null (from bump_alloc).
-        GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
+        // SAFETY: `gc_box` is non-null (from bump_alloc) and ≥16-aligned.
+        // In GC builds the pointer is tagged region-local so the collector
+        // never dereferences it after this region is reset; in no-gc builds
+        // there is no collector and the pointer is untagged.
+        #[cfg(not(feature = "no-gc"))]
+        {
+            unsafe { GcPtr::from_region_raw(gc_box) }
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
+        }
+    }
+
+    /// Trace every live object in this region, marking any GC-heap objects
+    /// they reference so the collector keeps those alive.
+    ///
+    /// Called by [`trace_active_regions`] during GC root scanning.  Each
+    /// drop-entry pointer is a live `GcBox` whose header `trace_fn` walks the
+    /// value's `GcPtr` children; the region is on the active stack, so its
+    /// headers are valid.
+    #[cfg(not(feature = "no-gc"))]
+    pub(crate) fn trace_live(&self, visitor: &mut crate::MarkVisitor) {
+        for entry in &self.drops {
+            let header = entry.ptr as *const GcBoxHeader;
+            // SAFETY: `entry.ptr` is a live GcBox in this (active) region.
+            unsafe { ((*header).trace_fn)(header, visitor) };
+        }
     }
 
     /// Drop all objects and reclaim memory, keeping the first chunk for reuse.
@@ -268,6 +294,33 @@ impl Drop for RegionGuard {
             stack.borrow_mut().pop();
         });
     }
+}
+
+/// Trace every object in every region on this thread's active region stack,
+/// marking the GC-heap objects they reference.
+///
+/// Invoked by `GcHeap::collect` during root scanning so that region→heap
+/// references are honoured even though the mark phase treats region objects
+/// themselves as opaque (see `MarkVisitor::visit`).
+///
+/// Scanning only the *current* thread's regions is complete by design: each
+/// `GcHeap` lives on a single OS thread, regions are thread-local, and region
+/// objects are only ever bump-allocated into the region at the top of *this*
+/// thread's stack (`try_alloc_in_region`).  A region is freed when it leaves
+/// the stack, so every live region able to hold a pointer into this thread's
+/// heap is exactly one of the regions iterated here.  (clojurust uses parallel
+/// per-thread heaps with independent collections rather than a cross-thread
+/// stop-the-world GC, so there is no other thread's heap to consider.)
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn trace_active_regions(visitor: &mut crate::MarkVisitor) {
+    REGION_STACK.with(|stack| {
+        for &region_ptr in stack.borrow().iter() {
+            // SAFETY: `RegionGuard`/`push_region_raw` guarantee every pointer
+            // on the stack refers to a live `Region`.
+            let region = unsafe { &*region_ptr };
+            region.trace_live(visitor);
+        }
+    });
 }
 
 /// Allocate in the currently active thread-local region, if one exists.
@@ -482,15 +535,18 @@ mod tests {
     }
 
     #[test]
-    fn gc_can_trace_through_region_objects() {
-        // A GC-heap parent holds a GcPtr to a region-allocated child.
-        // The GC marker should be able to trace through the region object.
+    fn gc_skips_region_objects_from_heap_parent() {
+        // A GC-heap parent holds a GcPtr to a region-allocated child.  The
+        // marker must treat the region child as opaque (skip it), not trace
+        // into it — region objects are not heap-managed.  Marking must
+        // succeed and the parent must survive.
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let mut region = Region::new();
         let child = region.alloc(Tracked {
             id: 1,
             dropped: dropped.clone(),
         });
+        assert!(child.is_region_alloc(), "region alloc must be tagged");
 
         // The parent is on the GC heap, pointing to a region-allocated child.
         let heap = crate::GcHeap::new();
@@ -498,7 +554,6 @@ mod tests {
             child: child.clone(),
         });
 
-        // Marking should succeed without crashing.
         heap.collect(|vis| {
             use crate::GcVisitor as _;
             vis.visit(&parent);
@@ -508,6 +563,66 @@ mod tests {
         assert_eq!(heap.count(), 1);
         // Child is region-managed, not in heap — still alive.
         assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_does_not_follow_reset_region_pointer() {
+        // The exact crash this fix targets: a GC-heap object references a
+        // region object, the region is reset (its memory freed/reused), and a
+        // later GC marks the heap object.  The dangling region pointer must be
+        // skipped (via its provenance tag), not dereferenced.
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let heap = crate::GcHeap::new();
+
+        let mut region = Region::new();
+        let region_child = region.alloc(Tracked {
+            id: 1,
+            dropped: dropped.clone(),
+        });
+        let parent = heap.alloc(Parent {
+            child: region_child,
+        });
+
+        // Reset the region: `region_child`'s backing storage is now dead.
+        region.reset();
+
+        // Marking the parent must not touch the dangling region pointer.
+        heap.collect(|vis| {
+            use crate::GcVisitor as _;
+            vis.visit(&parent);
+        });
+        assert_eq!(
+            heap.count(),
+            1,
+            "parent survives; no crash on dangling region ptr"
+        );
+    }
+
+    #[test]
+    fn active_region_keeps_heap_child_alive() {
+        // A region object holds a GcPtr to a heap object that is otherwise
+        // unreachable.  While the region is active it is traced as a GC root,
+        // so the heap child must survive collection.
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let heap = crate::GcHeap::new();
+        let heap_child = heap.alloc(Tracked {
+            id: 9,
+            dropped: dropped.clone(),
+        });
+
+        let mut region = Region::new();
+        let _parent = region.alloc(Parent { child: heap_child });
+        let _guard = unsafe { RegionGuard::new(&mut region) };
+
+        // Two collections (one to exhaust the grace period) with no explicit
+        // roots: the heap child survives only because the active region is a
+        // root.
+        heap.collect(|_vis| {});
+        heap.collect(|_vis| {});
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "heap object reachable only through an active region must survive GC"
+        );
     }
 
     #[test]

@@ -21,6 +21,17 @@ the GC heap or a bump-allocated region; `clone` is O(1); `drop` is a no-op.
 
 **Default build (GC mode):** memory is freed only during `GcHeap::collect`.
 
+**Region provenance tagging (GC mode):** region-allocated `GcPtr`s carry a
+low-bit tag (`REGION_PTR_TAG`; `GcBox<T>` is ≥8-aligned so bit 0 is free).
+`MarkVisitor::visit` checks the tag *without dereferencing* and **skips**
+region objects — a region whose scope has ended leaves dangling pointers whose
+headers are freed/reused memory, so tracing them would follow a garbage
+`trace_fn`.  Because the mark phase no longer traces *into* region objects,
+`GcHeap::collect` instead treats every live region on the thread's region
+stack as a root (`region::trace_active_regions`), so heap objects reachable
+only through a live region are still kept alive.  `GcPtr::raw()` masks the tag
+on every dereference; `GcPtr::is_region_alloc()` exposes it.
+
 **`no-gc` build:** every function call and every `loop` iteration pushes a
 scratch `Region`; intermediates are freed when the scope exits.  Return values
 and `recur` arguments are evaluated in the caller's context (the
@@ -52,7 +63,8 @@ src/
                     in debug builds, tracks chunk ranges for is_static_addr()
   alloc_ctx.rs    — (no-gc mode) thread-local allocation context stack;
                     ScratchGuard, StaticCtxGuard
-  region.rs       — Region bump allocator, RegionGuard, thread-local region stack
+  region.rs       — Region bump allocator, RegionGuard, thread-local region
+                    stack; trace_active_regions() (GC-root scan of live regions)
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
   config.rs       — (GC mode) GcConfig, GcCancellation (zero-sized proxy),
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
@@ -113,6 +125,9 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc)
     pub fn get(&self) -> &T             // borrow; invalid after collect frees it
     pub fn ptr_eq(a: &Self, b: &Self) -> bool
+
+    // GC mode only:
+    pub fn is_region_alloc(&self) -> bool  // true if bump-allocated in a Region
 
     // no-gc + debug_assertions only:
     pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena

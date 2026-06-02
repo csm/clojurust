@@ -65,10 +65,10 @@ pub(crate) fn known_fn_arg_escapes(func: &KnownFn, arg_index: usize) -> bool {
     use KnownFn::*;
     match func {
         // Non-escaping: predicates, arithmetic, I/O, lookups that return elements
-        Get | Nth | Count | Contains | First | Add | Sub | Mul | Div | Rem | Eq | Lt | Gt | Lte
-        | Gte | IsNil | IsSeq | IsVector | IsMap | IsEmpty | Peek | Identical | IsNumber
-        | IsString | IsKeyword | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref | Println
-        | Pr | Prn | Print => false,
+        Get | Nth | Count | CountFilter | Contains | First | Add | Sub | Mul | Div | Rem | Eq
+        | Lt | Gt | Lte | Gte | IsNil | IsSeq | IsVector | IsMap | IsEmpty | Peek | Identical
+        | IsNumber | IsString | IsKeyword | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref
+        | Println | Pr | Prn | Print => false,
 
         // These return a modified copy of arg 0 → arg 0 escapes; others don't
         Dissoc | Disj => arg_index == 0,
