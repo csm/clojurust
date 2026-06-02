@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-types"
-version = "0.1.0"
+version = "0.1.120"
 edition = "2024"
 description = "Core types, source spans, and diagnostics for clojurust"
 license.workspace = true
