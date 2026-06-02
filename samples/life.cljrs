@@ -68,6 +68,3 @@
           end    (nanotime)]
       (println "Final population:" result)
       (println "Time (ms):" (/ (- end start) 1e6)))))
-
-; cljrs doesn't recognise -main yet, fire it directly
-(-main)
