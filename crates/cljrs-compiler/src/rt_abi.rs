@@ -705,9 +705,268 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::List(l) => l.get().count(),
         Value::Str(s) => s.get().len(),
         Value::Nil => 0,
+        // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
+        // be walked and realized to be counted.  Without this arm `count`
+        // returns 0 for every lazy seq, silently corrupting any
+        // `(count (filter …))` computation.
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut count = 0usize;
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        count += 1;
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        count += l.get().count();
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        count += v.get().count();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            count
+        }
         _ => 0,
     };
     intern_long(n as i64)
+}
+
+/// `(count (filter pred coll))` fused — count matching elements without
+/// materializing the intermediate sequence.
+///
+/// `Set`/`Map` predicates are tested directly; other predicates are `invoke`d
+/// per element.  Iterates concrete collections in compiled Rust; falls back to
+/// the interpreted lazy `filter` + `count` for inputs `eager_seq_elems` can't
+/// walk directly.  Allocates nothing in the common path — the key win over the
+/// lazy path, whose per-element cons cells dominate `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        // Fall back to the interpreter for lazy/cons inputs, then count.
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        return unsafe { rt_count(seq) };
+    };
+    let mut n: usize = 0;
+    for elem in elems {
+        let keep = match pred_ref {
+            Value::Set(s) => s.contains(&elem),
+            Value::Map(m) => m
+                .get(&elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+            _ => match cljrs_env::callback::invoke(pred_ref, vec![elem]) {
+                Ok(r) => !matches!(r, Value::Nil | Value::Bool(false)),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            },
+        };
+        if keep {
+            n += 1;
+        }
+    }
+    intern_long(n as i64)
+}
+
+/// Eagerly collect the elements of a directly-iterable collection, or `None`
+/// for inputs that need the interpreter's full `seq` machinery.
+fn eager_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Store a thrown value in the pending-exception slot (mirrors `rt_call`).
+#[inline]
+fn stash_pending_exception(val: Value) {
+    PENDING_EXCEPTION.with(|cell| {
+        *cell.borrow_mut() = Some(box_val(val));
+    });
+}
+
+/// Apply a filter predicate to `elem`.  Returns `Some(keep)`, or `None` if the
+/// predicate threw (exception already stashed).  `Set`/`Map` predicates are
+/// tested directly; others are `invoke`d.
+#[inline]
+fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
+    match pred {
+        Value::Set(s) => Some(s.contains(elem)),
+        Value::Map(m) => Some(
+            m.get(elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+        ),
+        _ => match cljrs_env::callback::invoke(pred, vec![elem.clone()]) {
+            Ok(r) => Some(!matches!(r, Value::Nil | Value::Bool(false))),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                None
+            }
+            Err(_) => None,
+        },
+    }
+}
+
+/// `(into to (filter pred coll))` fused — eager, no intermediate lazy seq.
+///
+/// Iterates `coll`, conj-ing matching elements straight into `to`.  Set and
+/// Vector targets are built natively; other targets fall back to interpreted
+/// `into` over an eagerly-filtered vector.  Avoids the interpreted lazy
+/// `filter` + `into` realization that dominates `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_filter(
+    to: *const Value,
+    pred: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => {
+                        s.conj_mut(elem);
+                    }
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => r = r.conj(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let mut kept = Vec::new();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => kept.push(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(kept)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// `(into to (mapcat f coll))` fused — eager, no intermediate lazy seq.
+///
+/// For each element of `coll`, calls `f` (which must return a collection) and
+/// conj-es its elements into `to`.  Set and Vector targets are built natively.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_mapcat(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    // Fall back to interpreted `mapcat` + `into` if any input isn't directly
+    // iterable.
+    let fallback = || {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+    };
+
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        return fallback();
+    };
+    let mut elements: Vec<Value> = Vec::new();
+    for elem in elems {
+        let r = match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => v,
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        };
+        match eager_seq_elems(&r) {
+            Some(inner) => elements.extend(inner),
+            // `f` returned a non-directly-iterable collection: bail out.  (`f`
+            // is pure in the fused patterns we target, so re-running it in the
+            // fallback is safe.)
+            None => return fallback(),
+        }
+    }
+
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for x in elements {
+                s.conj_mut(x);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for x in elements {
+                r = r.conj(x);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(elements)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
 }
 
 /// `(empty? coll)` — returns Bool without converting to a seq.
@@ -2955,5 +3214,21 @@ mod tests {
         let v = unsafe { rt_alloc_vector(elems.as_ptr(), 2) };
         let n = unsafe { rt_count(v) };
         assert!(matches!(unsafe { &*n }, Value::Long(2)));
+    }
+
+    #[test]
+    fn test_count_cons_chain() {
+        // Regression: `count` over a cons/seq chain (e.g. the result of
+        // `filter`/`map`) must walk the chain, not return 0.
+        let nil = rt_const_nil();
+        let c1 = unsafe { rt_alloc_cons(rt_const_long(3), nil) };
+        let c2 = unsafe { rt_alloc_cons(rt_const_long(2), c1) };
+        let c3 = unsafe { rt_alloc_cons(rt_const_long(1), c2) };
+        let n = unsafe { rt_count(c3) };
+        assert!(
+            matches!(unsafe { &*n }, Value::Long(3)),
+            "count of a 3-element cons chain must be 3, got {:?}",
+            unsafe { &*n }
+        );
     }
 }

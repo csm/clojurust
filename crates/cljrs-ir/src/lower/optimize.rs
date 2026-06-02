@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::escape::{EscapeContext, EscapeState, analyze, make_context};
+use super::escape::{EscapeContext, EscapeState, analyze, build_use_chains, make_context};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
@@ -509,6 +509,7 @@ fn is_scalar_knownfn(kfn: &KnownFn) -> bool {
             | KnownFn::Lte
             | KnownFn::Gte
             | KnownFn::Count
+            | KnownFn::CountFilter
             | KnownFn::IsNil
             | KnownFn::IsSeq
             | KnownFn::IsVector
@@ -642,11 +643,115 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
     }
 }
 
+// ── Eager HOF fusion ─────────────────────────────────────────────────────────
+
+/// Fuse lazy HOFs into their eager, compiled consumers:
+///
+/// * `(count  (filter pred coll))` → `CountFilter(pred, coll)`
+/// * `(into to (filter pred coll))` → `IntoFilter(to, pred, coll)`
+/// * `(into to (mapcat f  coll))`   → `IntoMapcat(to, f, coll)`
+///
+/// fired only when the lazy producer's result is consumed *exactly once*, by
+/// the consumer it fuses with — so no laziness or seq identity is relied upon.
+/// The consumers (`count`/`into`) fully realize their source, so the eager
+/// fusion is observationally identical while skipping the interpreted lazy-seq
+/// realization (Form re-walking, symbol re-parsing) and the per-element cons
+/// allocations that dominate `samples/life.cljrs`'s `step`.
+///
+/// The dead producer instruction is removed once its consumer is rewritten.
+fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
+    ir_func.subfunctions = ir_func
+        .subfunctions
+        .into_iter()
+        .map(fuse_eager_hofs)
+        .collect();
+
+    let uses = build_use_chains(&ir_func);
+
+    // seq_var → (producer_fn, arg0, arg1) for every `filter`/`mapcat` whose
+    // result is used exactly once.
+    let mut producers: HashMap<VarId, (KnownFn, VarId, VarId)> = HashMap::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(dst, kfn @ (KnownFn::Filter | KnownFn::Mapcat), args) = inst
+                && args.len() == 2
+                && uses.get(dst).map(|u| u.len() == 1).unwrap_or(false)
+            {
+                producers.insert(*dst, (kfn.clone(), args[0], args[1]));
+            }
+        }
+    }
+    if producers.is_empty() {
+        return ir_func;
+    }
+
+    // Decide fusions by inspecting consumers.  consumer_dst → (fused_fn, args);
+    // remove_seqs → producer instructions made dead.
+    let mut rewrites: HashMap<VarId, (KnownFn, Vec<VarId>)> = HashMap::new();
+    let mut remove_seqs: HashSet<VarId> = HashSet::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            let Inst::CallKnown(cdst, cfn, cargs) = inst else {
+                continue;
+            };
+            match cfn {
+                // (count seq) where seq = (filter pred coll)
+                KnownFn::Count if cargs.len() == 1 => {
+                    if let Some((KnownFn::Filter, pred, coll)) = producers.get(&cargs[0]) {
+                        rewrites.insert(*cdst, (KnownFn::CountFilter, vec![*pred, *coll]));
+                        remove_seqs.insert(cargs[0]);
+                    }
+                }
+                // (into to seq) where seq = (filter pred coll) | (mapcat f coll)
+                KnownFn::Into if cargs.len() == 2 => {
+                    let to = cargs[0];
+                    if let Some((prod, a0, a1)) = producers.get(&cargs[1]) {
+                        let fused = match prod {
+                            KnownFn::Filter => KnownFn::IntoFilter,
+                            KnownFn::Mapcat => KnownFn::IntoMapcat,
+                            _ => continue,
+                        };
+                        rewrites.insert(*cdst, (fused, vec![to, *a0, *a1]));
+                        remove_seqs.insert(cargs[1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return ir_func;
+    }
+
+    for block in &mut ir_func.blocks {
+        // Drop the now-dead producer instructions.
+        block.insts.retain(|inst| match inst {
+            Inst::CallKnown(dst, KnownFn::Filter | KnownFn::Mapcat, _) => {
+                !remove_seqs.contains(dst)
+            }
+            _ => true,
+        });
+        // Rewrite each fused consumer in place.
+        for inst in &mut block.insts {
+            if let Inst::CallKnown(dst, cfn, cargs) = inst
+                && let Some((fused_fn, fused_args)) = rewrites.get(dst)
+            {
+                *cfn = fused_fn.clone();
+                *cargs = fused_args.clone();
+            }
+        }
+    }
+
+    ir_func
+}
+
 // ── Top-level pass ───────────────────────────────────────────────────────────
 
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
+///   0. Eager HOF fusion (`fuse_eager_hofs`) — fuse count(filter),
+///      `count(filter …)` into the allocation-free `CountFilter`.
 ///   1. Inlining — splice eligible callees into call sites so their
 ///      allocations are visible as local to the caller.
 ///   2. Local region promotion (`optimize_tree`) — turn `NoEscape`
@@ -658,6 +763,7 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
 ///      bodies of provably scalar-returning functions so their intermediate
 ///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
+    let ir_func = fuse_eager_hofs(ir_func);
     let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
     let ir_func = optimize_tree(ir_func, &ctx);

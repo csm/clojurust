@@ -866,6 +866,26 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
         KnownFn::Count => builtin_call_native("count", &args),
+        KnownFn::CountFilter => {
+            // Synthesized fused op == (count (filter pred coll)).
+            let filter_fn = load_builtin(env, "filter")?;
+            let seq = apply_value(&filter_fn, args, env)?;
+            builtin_call_native("count", &[seq])
+        }
+        KnownFn::IntoFilter | KnownFn::IntoMapcat => {
+            // Synthesized fused ops == (into to (filter|mapcat f coll)).
+            let hof = if matches!(known_fn, KnownFn::IntoFilter) {
+                "filter"
+            } else {
+                "mapcat"
+            };
+            let mut args = args;
+            let to = args.remove(0);
+            let hof_fn = load_builtin(env, hof)?;
+            let seq = apply_value(&hof_fn, args, env)?;
+            let into_fn = load_builtin(env, "into")?;
+            apply_value(&into_fn, vec![to, seq], env)
+        }
         KnownFn::Contains => builtin_call_native("contains?", &args),
         KnownFn::Assoc => builtin_call_native("assoc", &args),
         KnownFn::Dissoc => builtin_call_native("dissoc", &args),
