@@ -30,7 +30,12 @@ src/
     regionalize.rs — stage-4 cross-function region promotion: clones callees
                      whose `Returns` allocs are NoEscape at a call site, wraps
                      the call site in RegionStart/RegionEnd, rewrites Call →
-                     CallWithRegion targeting the cloned variant by name
+                     CallWithRegion targeting the cloned variant by name.
+                     Also co-promotes allocations reachable only through the
+                     returned container (e.g. the inner coordinate vectors of
+                     `neighbours`), guarded by a caller-side check that the
+                     result is never element-extracted (first/nth/get/peek) or
+                     passed to an opaque call
   cljrs/compiler/
     ir.cljrs       — IR data constructors + mutable builder context (atom-based)
     known.cljrs    — symbol-name → KnownFn keyword resolution
@@ -182,6 +187,17 @@ pub fn inline(ir: IrFunction) -> IrFunction;
    region stack, so its `RegionAlloc` instructions bump-allocate into the
    caller's region.  Variants are attached as subfunctions of the calling
    function so both the IR interpreter and codegen can resolve them by name.
+   The clone also co-promotes allocations reachable *only* through the
+   returned container (e.g. the eight inner `[r c]` vectors stored inside
+   `neighbours`' result vector): their lifetime is bounded by the returned
+   value, so they live in the same region.  This is gated by a caller-side
+   check that the call result is never element-extracted (`first`/`nth`/
+   `get`/`peek`) or passed to an opaque call, either of which could keep an
+   inner pointer alive past `RegionEnd`.  Note: this sharpens the IR (and
+   benefits the tree-walking interpreter, where `AllocVector` is not
+   region-aware); the AOT backend already bump-allocates any collection
+   built while a region scope is active, so the win there comes from region
+   *scope* coverage rather than the per-allocation kind.
 
 ### Analysis (re-exported from `lower::`)
 

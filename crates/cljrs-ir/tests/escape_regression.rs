@@ -443,6 +443,56 @@ fn stage4_handles_callee_with_self_capture() {
     );
 }
 
+#[test]
+fn stage4_co_promotes_container_contained_allocs() {
+    // `make-grid` returns a vector of three inner coordinate vectors.  The
+    // inner vectors are stored only into the returned outer vector, so they
+    // are reachable solely through it.  When the call result feeds `count`
+    // (a structural, non-extracting consumer) stage 4 should co-promote the
+    // whole nest: the outer vector AND all three inner vectors.  This is the
+    // `neighbours` showcase pattern in miniature.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn use-grid [a] (count (make-grid a))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        call_with_region_count(&optimized) >= 1,
+        "stage 4 should rewrite the call to CallWithRegion; IR:\n{optimized}"
+    );
+    assert!(
+        region_alloc_count(&optimized) >= 4,
+        "outer vector + three inner vectors should all be region-promoted \
+         (expected >= 4 RegionAllocs); IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn stage4_deep_promotion_skipped_when_result_is_extracted() {
+    // Same nest, but the call result is element-*extracted* via `first` before
+    // being consumed.  The extracted inner vector could outlive the caller's
+    // region, so deep co-promotion must be skipped: only the outer container
+    // (the shallow `Returns` alloc) is region-promoted, leaving exactly one
+    // RegionAlloc.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn pick [a] (count (first (make-grid a)))))",
+    );
+    let optimized = optimize(ir);
+    assert_eq!(
+        region_alloc_count(&optimized),
+        1,
+        "only the outer container should be promoted when the result is \
+         element-extracted; IR:\n{optimized}"
+    );
+}
+
 // Suppress an unused-import lint if Arc isn't picked up by every test.
 #[allow(dead_code)]
 fn _arc_witness() -> Arc<str> {
