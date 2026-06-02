@@ -705,6 +705,36 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::List(l) => l.get().count(),
         Value::Str(s) => s.get().len(),
         Value::Nil => 0,
+        // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
+        // be walked and realized to be counted.  Without this arm `count`
+        // returns 0 for every lazy seq, silently corrupting any
+        // `(count (filter …))` computation.
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut count = 0usize;
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        count += 1;
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        count += l.get().count();
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        count += v.get().count();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            count
+        }
         _ => 0,
     };
     intern_long(n as i64)
@@ -2955,5 +2985,21 @@ mod tests {
         let v = unsafe { rt_alloc_vector(elems.as_ptr(), 2) };
         let n = unsafe { rt_count(v) };
         assert!(matches!(unsafe { &*n }, Value::Long(2)));
+    }
+
+    #[test]
+    fn test_count_cons_chain() {
+        // Regression: `count` over a cons/seq chain (e.g. the result of
+        // `filter`/`map`) must walk the chain, not return 0.
+        let nil = rt_const_nil();
+        let c1 = unsafe { rt_alloc_cons(rt_const_long(3), nil) };
+        let c2 = unsafe { rt_alloc_cons(rt_const_long(2), c1) };
+        let c3 = unsafe { rt_alloc_cons(rt_const_long(1), c2) };
+        let n = unsafe { rt_count(c3) };
+        assert!(
+            matches!(unsafe { &*n }, Value::Long(3)),
+            "count of a 3-element cons chain must be 3, got {:?}",
+            unsafe { &*n }
+        );
     }
 }
