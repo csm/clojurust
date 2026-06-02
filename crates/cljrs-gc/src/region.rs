@@ -303,10 +303,14 @@ impl Drop for RegionGuard {
 /// references are honoured even though the mark phase treats region objects
 /// themselves as opaque (see `MarkVisitor::visit`).
 ///
-/// Note: this scans only the *current* thread's regions.  Under a
-/// stop-the-world collection that pauses other mutator threads, their region
-/// stacks are not visited here — a known limitation to revisit if regions are
-/// used across threads concurrently with GC.
+/// Scanning only the *current* thread's regions is complete by design: each
+/// `GcHeap` lives on a single OS thread, regions are thread-local, and region
+/// objects are only ever bump-allocated into the region at the top of *this*
+/// thread's stack (`try_alloc_in_region`).  A region is freed when it leaves
+/// the stack, so every live region able to hold a pointer into this thread's
+/// heap is exactly one of the regions iterated here.  (clojurust uses parallel
+/// per-thread heaps with independent collections rather than a cross-thread
+/// stop-the-world GC, so there is no other thread's heap to consider.)
 #[cfg(not(feature = "no-gc"))]
 pub(crate) fn trace_active_regions(visitor: &mut crate::MarkVisitor) {
     REGION_STACK.with(|stack| {
