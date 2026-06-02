@@ -224,6 +224,11 @@ pub enum KnownFn {
     // avoiding both the interpreted lazy-seq fallback and its per-element heap
     // allocations.
     CountFilter,
+    /// `IntoFilter(to, pred, coll)` == `(into to (filter pred coll))` and
+    /// `IntoMapcat(to, f, coll)` == `(into to (mapcat f coll))`, built eagerly
+    /// in compiled Rust — no intermediate lazy seq, no interpreted realization.
+    IntoFilter,
+    IntoMapcat,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -888,6 +893,8 @@ impl KnownFn {
             | KnownFn::Filterv
             | KnownFn::Mapcat
             | KnownFn::CountFilter
+            | KnownFn::IntoFilter
+            | KnownFn::IntoMapcat
             | KnownFn::Some
             | KnownFn::Every
             | KnownFn::Into

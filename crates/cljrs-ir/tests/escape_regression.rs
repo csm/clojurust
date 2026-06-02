@@ -533,6 +533,24 @@ fn count_filter_is_fused_to_count_filter() {
 }
 
 #[test]
+fn into_filter_is_fused() {
+    let ir = lower("(into [] (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Filter"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoFilter"), 1);
+}
+
+#[test]
+fn into_mapcat_is_fused() {
+    let ir = lower("(into #{} (mapcat (fn [x] [x x]) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Mapcat"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoMapcat"), 1);
+}
+
+#[test]
 fn count_filter_not_fused_when_filter_escapes() {
     // The filter result is used twice (count + returned), so it must not fuse.
     let ir = lower("(let [s (filter (fn [x] x) [1 2 3])] [(count s) s])");

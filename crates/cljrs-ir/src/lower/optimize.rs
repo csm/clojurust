@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::escape::{EscapeContext, EscapeState, UseKind, analyze, build_use_chains, make_context};
+use super::escape::{EscapeContext, EscapeState, analyze, build_use_chains, make_context};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
@@ -645,74 +645,99 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
 
 // ── Eager HOF fusion ─────────────────────────────────────────────────────────
 
-/// Fuse `(count (filter pred coll))` into a single `CountFilter(pred, coll)`
-/// when the `filter` result is consumed *only* by that `count`.
+/// Fuse lazy HOFs into their eager, compiled consumers:
 ///
-/// `count` fully realizes a finite seq and returns a scalar, so this is
-/// observationally identical — but the fused op iterates `coll` and counts
-/// matching elements **without materializing** the intermediate sequence.
-/// That removes the dominant cost of the lazy path: the interpreted
-/// `clojure.core/filter` fallback (which re-walks Form ASTs and re-parses
-/// symbols per element) and the lazy cons-cell heap allocations.  This is the
-/// hot path in `samples/life.cljrs` — `live-neighbour-count` is exactly
-/// `(count (filter board (neighbours cell)))`.
+/// * `(count  (filter pred coll))` → `CountFilter(pred, coll)`
+/// * `(into to (filter pred coll))` → `IntoFilter(to, pred, coll)`
+/// * `(into to (mapcat f  coll))`   → `IntoMapcat(to, f, coll)`
 ///
-/// The dead `filter` instruction is removed once its sole consumer is rewritten.
-fn fuse_eager_count_consumers(mut ir_func: IrFunction) -> IrFunction {
+/// fired only when the lazy producer's result is consumed *exactly once*, by
+/// the consumer it fuses with — so no laziness or seq identity is relied upon.
+/// The consumers (`count`/`into`) fully realize their source, so the eager
+/// fusion is observationally identical while skipping the interpreted lazy-seq
+/// realization (Form re-walking, symbol re-parsing) and the per-element cons
+/// allocations that dominate `samples/life.cljrs`'s `step`.
+///
+/// The dead producer instruction is removed once its consumer is rewritten.
+fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
     ir_func.subfunctions = ir_func
         .subfunctions
         .into_iter()
-        .map(fuse_eager_count_consumers)
+        .map(fuse_eager_hofs)
         .collect();
 
     let uses = build_use_chains(&ir_func);
 
-    // seq_var → (pred, coll) for every `filter` whose result is used exactly
-    // once, as the argument to a `count`.
-    let mut filter_defs: HashMap<VarId, (VarId, VarId)> = HashMap::new();
+    // seq_var → (producer_fn, arg0, arg1) for every `filter`/`mapcat` whose
+    // result is used exactly once.
+    let mut producers: HashMap<VarId, (KnownFn, VarId, VarId)> = HashMap::new();
     for block in &ir_func.blocks {
         for inst in &block.insts {
-            if let Inst::CallKnown(dst, KnownFn::Filter, args) = inst
+            if let Inst::CallKnown(dst, kfn @ (KnownFn::Filter | KnownFn::Mapcat), args) = inst
                 && args.len() == 2
+                && uses.get(dst).map(|u| u.len() == 1).unwrap_or(false)
             {
-                let sole_count_use = uses
-                    .get(dst)
-                    .map(|u| {
-                        u.len() == 1
-                            && matches!(
-                                &u[0].kind,
-                                UseKind::KnownCallArg {
-                                    func: KnownFn::Count,
-                                    ..
-                                }
-                            )
-                    })
-                    .unwrap_or(false);
-                if sole_count_use {
-                    filter_defs.insert(*dst, (args[0], args[1]));
-                }
+                producers.insert(*dst, (kfn.clone(), args[0], args[1]));
             }
         }
     }
-
-    if filter_defs.is_empty() {
+    if producers.is_empty() {
         return ir_func;
     }
 
-    // Rewrite each `count(seq)` into `CountFilter(pred, coll)` and drop the
-    // now-dead `filter` instruction defining `seq`.
+    // Decide fusions by inspecting consumers.  consumer_dst → (fused_fn, args);
+    // remove_seqs → producer instructions made dead.
+    let mut rewrites: HashMap<VarId, (KnownFn, Vec<VarId>)> = HashMap::new();
+    let mut remove_seqs: HashSet<VarId> = HashSet::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            let Inst::CallKnown(cdst, cfn, cargs) = inst else {
+                continue;
+            };
+            match cfn {
+                // (count seq) where seq = (filter pred coll)
+                KnownFn::Count if cargs.len() == 1 => {
+                    if let Some((KnownFn::Filter, pred, coll)) = producers.get(&cargs[0]) {
+                        rewrites.insert(*cdst, (KnownFn::CountFilter, vec![*pred, *coll]));
+                        remove_seqs.insert(cargs[0]);
+                    }
+                }
+                // (into to seq) where seq = (filter pred coll) | (mapcat f coll)
+                KnownFn::Into if cargs.len() == 2 => {
+                    let to = cargs[0];
+                    if let Some((prod, a0, a1)) = producers.get(&cargs[1]) {
+                        let fused = match prod {
+                            KnownFn::Filter => KnownFn::IntoFilter,
+                            KnownFn::Mapcat => KnownFn::IntoMapcat,
+                            _ => continue,
+                        };
+                        rewrites.insert(*cdst, (fused, vec![to, *a0, *a1]));
+                        remove_seqs.insert(cargs[1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return ir_func;
+    }
+
     for block in &mut ir_func.blocks {
+        // Drop the now-dead producer instructions.
         block.insts.retain(|inst| match inst {
-            Inst::CallKnown(dst, KnownFn::Filter, _) => !filter_defs.contains_key(dst),
+            Inst::CallKnown(dst, KnownFn::Filter | KnownFn::Mapcat, _) => {
+                !remove_seqs.contains(dst)
+            }
             _ => true,
         });
+        // Rewrite each fused consumer in place.
         for inst in &mut block.insts {
-            if let Inst::CallKnown(_, kfn @ KnownFn::Count, args) = inst
-                && args.len() == 1
-                && let Some(&(pred, coll)) = filter_defs.get(&args[0])
+            if let Inst::CallKnown(dst, cfn, cargs) = inst
+                && let Some((fused_fn, fused_args)) = rewrites.get(dst)
             {
-                *kfn = KnownFn::CountFilter;
-                *args = vec![pred, coll];
+                *cfn = fused_fn.clone();
+                *cargs = fused_args.clone();
             }
         }
     }
@@ -725,7 +750,7 @@ fn fuse_eager_count_consumers(mut ir_func: IrFunction) -> IrFunction {
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
-///   0. Eager HOF fusion (`fuse_eager_count_consumers`) — fuse
+///   0. Eager HOF fusion (`fuse_eager_hofs`) — fuse count(filter),
 ///      `count(filter …)` into the allocation-free `CountFilter`.
 ///   1. Inlining — splice eligible callees into call sites so their
 ///      allocations are visible as local to the caller.
@@ -738,7 +763,7 @@ fn fuse_eager_count_consumers(mut ir_func: IrFunction) -> IrFunction {
 ///      bodies of provably scalar-returning functions so their intermediate
 ///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
-    let ir_func = fuse_eager_count_consumers(ir_func);
+    let ir_func = fuse_eager_hofs(ir_func);
     let ir_func = inline_pass(ir_func);
     let ctx = make_context(&ir_func);
     let ir_func = optimize_tree(ir_func, &ctx);

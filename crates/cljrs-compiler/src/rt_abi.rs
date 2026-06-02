@@ -806,6 +806,169 @@ fn stash_pending_exception(val: Value) {
     });
 }
 
+/// Apply a filter predicate to `elem`.  Returns `Some(keep)`, or `None` if the
+/// predicate threw (exception already stashed).  `Set`/`Map` predicates are
+/// tested directly; others are `invoke`d.
+#[inline]
+fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
+    match pred {
+        Value::Set(s) => Some(s.contains(elem)),
+        Value::Map(m) => Some(
+            m.get(elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+        ),
+        _ => match cljrs_env::callback::invoke(pred, vec![elem.clone()]) {
+            Ok(r) => Some(!matches!(r, Value::Nil | Value::Bool(false))),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                None
+            }
+            Err(_) => None,
+        },
+    }
+}
+
+/// `(into to (filter pred coll))` fused — eager, no intermediate lazy seq.
+///
+/// Iterates `coll`, conj-ing matching elements straight into `to`.  Set and
+/// Vector targets are built natively; other targets fall back to interpreted
+/// `into` over an eagerly-filtered vector.  Avoids the interpreted lazy
+/// `filter` + `into` realization that dominates `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_filter(
+    to: *const Value,
+    pred: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => {
+                        s.conj_mut(elem);
+                    }
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => r = r.conj(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let mut kept = Vec::new();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => kept.push(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(kept)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// `(into to (mapcat f coll))` fused — eager, no intermediate lazy seq.
+///
+/// For each element of `coll`, calls `f` (which must return a collection) and
+/// conj-es its elements into `to`.  Set and Vector targets are built natively.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_mapcat(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    // Fall back to interpreted `mapcat` + `into` if any input isn't directly
+    // iterable.
+    let fallback = || {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+    };
+
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        return fallback();
+    };
+    let mut elements: Vec<Value> = Vec::new();
+    for elem in elems {
+        let r = match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => v,
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        };
+        match eager_seq_elems(&r) {
+            Some(inner) => elements.extend(inner),
+            // `f` returned a non-directly-iterable collection: bail out.  (`f`
+            // is pure in the fused patterns we target, so re-running it in the
+            // fallback is safe.)
+            None => return fallback(),
+        }
+    }
+
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for x in elements {
+                s.conj_mut(x);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for x in elements {
+                r = r.conj(x);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(elements)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
 /// `(empty? coll)` — returns Bool without converting to a seq.
 ///
 /// The KnownFn::IsEmpty codegen dispatches here so that BFS loops do not
