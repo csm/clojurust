@@ -3,6 +3,9 @@ name: Stress Test
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CLJRS_GC_STATS: "-"
