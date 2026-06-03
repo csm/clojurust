@@ -1292,6 +1292,80 @@ fn test_into_basic() {
     );
 }
 
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_set() {
+    // Exercises the hash-set target fast path in `rt_into`.
+    assert_output(
+        "into_set",
+        r#"
+(println (sort (into #{} [1 2 3 2 1])))
+(println (sort (into #{1 2} [2 3 4])))
+(println (sort (into #{} (list 5 6 5))))
+(println (into #{} nil))
+"#,
+        "(1 2 3)\n(1 2 3 4)\n(5 6)\n#{}",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_map() {
+    // Exercises the map target fast path in `rt_into`: eager pair sources and
+    // a source map, with last-wins on conflicting keys.
+    assert_output(
+        "into_map",
+        r#"
+(println (into {} [[:a 1] [:b 2]]))
+(println (into {:a 1 :b 2} [[:b 9] [:c 3]]))
+(println (into {} (list [:p 1] [:q 2])))
+(println (into {} {:x 1 :y 2}))
+(println (into {} nil))
+(println (get (into {} (mapv (fn [i] [i (* i i)]) (range 4))) 3))
+"#,
+        "{:a 1, :b 2}\n{:a 1, :b 9, :c 3}\n{:p 1, :q 2}\n{:x 1, :y 2}\n{}\n9",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_for_comprehension_fusion() {
+    // `for` expands to `map`, so these exercise the `(into to (map f coll))`
+    // IntoMap fusion — including a lazy `range` source and a map target.
+    assert_output(
+        "for_comprehension_fusion",
+        r#"
+(println (into {} (for [i (range 5)] [i (* i i)])))
+(println (into [] (for [x [1 2 3]] (* x 10))))
+(println (sort (into #{} (for [x [1 1 2 3 3]] x))))
+(println (into {} (map (fn [i] [i (+ i 1)]) [10 20])))
+(let [c (atom 0)]
+  (into [] (for [x (range 6)] (swap! c inc)))
+  (println @c))
+"#,
+        "{0 0, 1 1, 2 4, 3 9, 4 16}\n[10 20 30]\n(1 2 3)\n{10 11, 20 21}\n6",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_repeatedly_count() {
+    // Exercises the finite-count fast path in `rt_repeatedly`: the result is
+    // realized eagerly into a vector and `f` runs exactly n times.
+    assert_output(
+        "repeatedly_count",
+        r#"
+(println (into [] (repeatedly 3 (fn [] :x))))
+(println (count (repeatedly 0 (fn [] 1))))
+(println (sort (into #{} (repeatedly 5 (fn [] 7)))))
+(let [a (atom 0)]
+  (dorun (repeatedly 4 (fn [] (swap! a inc))))
+  (println @a))
+"#,
+        "[:x :x :x]\n0\n(7)\n4",
+    );
+}
+
 // ── Inline expansion tests ──────────────────────────────────────────────────
 
 #[test]

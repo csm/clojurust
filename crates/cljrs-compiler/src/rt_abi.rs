@@ -969,6 +969,140 @@ pub unsafe extern "C" fn rt_into_mapcat(
     }
 }
 
+/// Eagerly realize the elements of any seqable `coll` — including lazy
+/// `Cons`/`LazySeq` chains such as `range`/`map` results — into a `Vec`.
+/// Returns `None` for genuinely non-seqable values so the caller can fall
+/// back to the interpreter.  Unlike [`eager_seq_elems`], this forces lazy
+/// thunks; it is used where the caller is an eager consumer that would fully
+/// realize the source anyway.
+fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut out = Vec::new();
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        out.push(c.get().head.clone());
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        out.extend(l.get().iter().cloned());
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        out.extend(v.get().iter().cloned());
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// `(into to (map f coll))` fused — eager, region-aware, and realizes lazy
+/// `coll` sources (e.g. `range`) natively.  Because the minimal `for` macro
+/// expands to `map`, this is the fused form of the `(into {} (for [x coll]
+/// [k v]))` map-comprehension idiom that dominates `samples/graph.cljrs`.
+///
+/// Applies `f` to each element and builds the target directly: map targets via
+/// `MapValue::from_pairs` (last-wins, size-optimal), set/vector targets via
+/// `conj`.  Falls back to interpreted `map` + `into` for inputs it can't walk
+/// (non-seqable `coll`) or targets it doesn't build natively.  `f` is invoked
+/// at most once per element; the map-target "not a pair" case routes the
+/// already-mapped values through interpreted `into` rather than re-running `f`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_map(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    let Some(elems) = realize_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "map", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+
+    let mut mapped: Vec<Value> = Vec::with_capacity(elems.len());
+    for elem in elems {
+        match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => mapped.push(v),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        }
+    }
+
+    match to_ref {
+        Value::Map(to_map) => {
+            // Existing entries first so the mapped pairs win on key conflict.
+            let mut pairs: Vec<(Value, Value)> =
+                to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut all_pairs = true;
+            for m in &mapped {
+                match as_pair(m) {
+                    Some(p) => pairs.push(p),
+                    None => {
+                        all_pairs = false;
+                        break;
+                    }
+                }
+            }
+            if all_pairs {
+                box_coll_val(Value::Map(MapValue::from_pairs(pairs)))
+            } else {
+                // Mapped values aren't all key/value pairs — let interpreted
+                // `into` handle map-entries/merging, without re-invoking `f`.
+                let to_val = to_ref.clone();
+                let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+                call_global_fn("clojure.core", "into", vec![to_val, src])
+            }
+        }
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for m in mapped {
+                s.conj_mut(m);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for m in mapped {
+                r = r.conj(m);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
 /// `(empty? coll)` — returns Bool without converting to a seq.
 ///
 /// The KnownFn::IsEmpty codegen dispatches here so that BFS loops do not
@@ -2349,9 +2483,74 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         }
         return box_coll_val(Value::Vector(alloc_inner_coll(result)));
     }
+    // Fast path: hash-set target.  `into` always fully realizes its source, so
+    // there is no laziness to preserve; iterating an eagerly-walkable source
+    // and conj-ing straight into the set avoids the interpreted `into` +
+    // lazy-`seq` realization that otherwise allocates every intermediate cons
+    // cell on the GC heap (the dominant cost of `(into #{} (repeatedly …))` in
+    // `samples/graph.cljrs`).  All allocations land in the active region.
+    if let Value::Set(SetValue::Hash(h)) = to_ref
+        && let Some(elems) = eager_seq_elems(from_ref)
+    {
+        let mut result = h.get().clone();
+        for elem in elems {
+            result.conj_mut(elem);
+        }
+        return box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(result))));
+    }
+    // Fast path: map target.  `(into {} pairs)` — the very common idiom behind
+    // `(into {} (for …))` map comprehensions — otherwise falls through to the
+    // interpreted `into`, whose lazy realization allocates on the GC heap.  We
+    // build the result in one shot via `MapValue::from_pairs` (last-wins, like
+    // `assoc`, and size-optimal) rather than per-element `assoc` so there are
+    // no intermediate map boxes; the result is region-boxed when a region is
+    // open.  Only taken when every source element is a clean key/value pair
+    // (a 2-element vector/list) or the source is itself a map.
+    if let Value::Map(to_map) = to_ref
+        && let Some(new_pairs) = into_map_pairs(from_ref)
+    {
+        // Existing entries first, then the new pairs so they win on conflict.
+        let mut pairs: Vec<(Value, Value)> =
+            to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.extend(new_pairs);
+        return box_coll_val(Value::Map(MapValue::from_pairs(pairs)));
+    }
     let to_val = to_ref.clone();
     let from_val = from_ref.clone();
     call_global_fn("clojure.core", "into", vec![to_val, from_val])
+}
+
+/// Collect a sequence of key/value pairs from `from` for the map-target `into`
+/// fast path, or `None` if `from` isn't eagerly walkable or any element isn't a
+/// clean 2-element pair (in which case the caller falls back to the
+/// interpreter, which handles map-entries, map merging, and lazy sources).
+fn into_map_pairs(from: &Value) -> Option<Vec<(Value, Value)>> {
+    // A source map contributes its entries directly.
+    if let Value::Map(m) = from {
+        return Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+    let elems = eager_seq_elems(from)?;
+    let mut pairs = Vec::with_capacity(elems.len());
+    for elem in elems {
+        pairs.push(as_pair(&elem)?);
+    }
+    Some(pairs)
+}
+
+/// Extract a `(key, value)` pair from a 2-element vector or list, else `None`.
+fn as_pair(v: &Value) -> Option<(Value, Value)> {
+    match v {
+        Value::Vector(vec) if vec.get().count() == 2 => {
+            Some((vec.get().nth(0)?.clone(), vec.get().nth(1)?.clone()))
+        }
+        Value::List(l) if l.get().count() == 2 => {
+            let mut it = l.get().iter();
+            let k = it.next()?.clone();
+            let val = it.next()?.clone();
+            Some((k, val))
+        }
+        _ => None,
+    }
 }
 
 /// `(into to xform from)`.
@@ -2466,8 +2665,34 @@ pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *cons
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
-    let n = unsafe { val_ref(n) }.clone();
-    let f = unsafe { val_ref(f) }.clone();
+    let n_ref = unsafe { val_ref(n) };
+    let f_ref = unsafe { val_ref(f) };
+    // Fast path: explicit count.  `(repeatedly n f)` with a fixed count is a
+    // finite sequence, so realizing it eagerly into a region-allocated vector
+    // is observationally compatible with the lazy seq for the eager consumers
+    // it is used with (`into`, `count`, `reduce`, `vec`, …) — the same liberty
+    // the eager `mapcat`/`map` fast paths already take.  This keeps the per-
+    // element results in the active region instead of allocating interpreted
+    // lazy-seq cons cells on the GC heap.
+    if let Value::Long(k) = n_ref
+        && *k >= 0
+    {
+        let mut items: Vec<Value> = Vec::with_capacity(*k as usize);
+        for _ in 0..*k {
+            match cljrs_env::callback::invoke(f_ref, vec![]) {
+                Ok(v) => items.push(v),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            }
+        }
+        let pv = PersistentVector::from_iter(items);
+        return box_coll_val(Value::Vector(alloc_inner_coll(pv)));
+    }
+    let n = n_ref.clone();
+    let f = f_ref.clone();
     call_global_fn("clojure.core", "repeatedly", vec![n, f])
 }
 

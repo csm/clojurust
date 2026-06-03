@@ -872,12 +872,12 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let seq = apply_value(&filter_fn, args, env)?;
             builtin_call_native("count", &[seq])
         }
-        KnownFn::IntoFilter | KnownFn::IntoMapcat => {
-            // Synthesized fused ops == (into to (filter|mapcat f coll)).
-            let hof = if matches!(known_fn, KnownFn::IntoFilter) {
-                "filter"
-            } else {
-                "mapcat"
+        KnownFn::IntoFilter | KnownFn::IntoMapcat | KnownFn::IntoMap => {
+            // Synthesized fused ops == (into to (filter|mapcat|map f coll)).
+            let hof = match known_fn {
+                KnownFn::IntoFilter => "filter",
+                KnownFn::IntoMapcat => "mapcat",
+                _ => "map",
             };
             let mut args = args;
             let to = args.remove(0);
