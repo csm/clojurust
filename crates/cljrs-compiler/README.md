@@ -95,8 +95,12 @@ survivors into the region:
   `MapValue::from_pairs` (last-wins, size-optimal) so there are no intermediate
   map boxes. Only fires for eager sources — a lazy `for`/`map` source still
   falls back to the interpreter.
-- `rt_count_filter` / `rt_into_filter` / `rt_into_mapcat` — fused
-  `count`/`into` over `filter`/`mapcat`, no intermediate seq.
+- `rt_count_filter` / `rt_into_filter` / `rt_into_mapcat` / `rt_into_map` —
+  fused `count`/`into` over `filter`/`mapcat`/`map`, no intermediate seq.
+  `rt_into_map` also fuses `(into to (for [x coll] body))` (the minimal `for`
+  expands to `map`) and, uniquely, realizes lazy `coll` sources such as
+  `range` natively so `(into {} (for [i (range n)] …))` avoids the interpreter
+  end to end.
 - `rt_repeatedly(n, f)` — `n` a non-negative `Long`: invoke `f` exactly `n`
   times into a `Vector` (finite, so equivalent to the lazy seq for the eager
   consumers it feeds).

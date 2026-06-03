@@ -1329,6 +1329,26 @@ fn test_into_map() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_for_comprehension_fusion() {
+    // `for` expands to `map`, so these exercise the `(into to (map f coll))`
+    // IntoMap fusion — including a lazy `range` source and a map target.
+    assert_output(
+        "for_comprehension_fusion",
+        r#"
+(println (into {} (for [i (range 5)] [i (* i i)])))
+(println (into [] (for [x [1 2 3]] (* x 10))))
+(println (sort (into #{} (for [x [1 1 2 3 3]] x))))
+(println (into {} (map (fn [i] [i (+ i 1)]) [10 20])))
+(let [c (atom 0)]
+  (into [] (for [x (range 6)] (swap! c inc)))
+  (println @c))
+"#,
+        "{0 0, 1 1, 2 4, 3 9, 4 16}\n[10 20 30]\n(1 2 3)\n{10 11, 20 21}\n6",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_repeatedly_count() {
     // Exercises the finite-count fast path in `rt_repeatedly`: the result is
     // realized eagerly into a vector and `f` runs exactly n times.

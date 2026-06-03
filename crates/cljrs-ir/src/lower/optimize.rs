@@ -650,6 +650,9 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
 /// * `(count  (filter pred coll))` → `CountFilter(pred, coll)`
 /// * `(into to (filter pred coll))` → `IntoFilter(to, pred, coll)`
 /// * `(into to (mapcat f  coll))`   → `IntoMapcat(to, f, coll)`
+/// * `(into to (map f  coll))`      → `IntoMap(to, f, coll)`  — also fuses
+///   `(into to (for [x coll] body))`, since the minimal `for` macro expands
+///   to `map`.
 ///
 /// fired only when the lazy producer's result is consumed *exactly once*, by
 /// the consumer it fuses with — so no laziness or seq identity is relied upon.
@@ -673,7 +676,8 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
     let mut producers: HashMap<VarId, (KnownFn, VarId, VarId)> = HashMap::new();
     for block in &ir_func.blocks {
         for inst in &block.insts {
-            if let Inst::CallKnown(dst, kfn @ (KnownFn::Filter | KnownFn::Mapcat), args) = inst
+            if let Inst::CallKnown(dst, kfn @ (KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map), args) =
+                inst
                 && args.len() == 2
                 && uses.get(dst).map(|u| u.len() == 1).unwrap_or(false)
             {
@@ -709,6 +713,7 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
                         let fused = match prod {
                             KnownFn::Filter => KnownFn::IntoFilter,
                             KnownFn::Mapcat => KnownFn::IntoMapcat,
+                            KnownFn::Map => KnownFn::IntoMap,
                             _ => continue,
                         };
                         rewrites.insert(*cdst, (fused, vec![to, *a0, *a1]));
@@ -726,7 +731,7 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
     for block in &mut ir_func.blocks {
         // Drop the now-dead producer instructions.
         block.insts.retain(|inst| match inst {
-            Inst::CallKnown(dst, KnownFn::Filter | KnownFn::Mapcat, _) => {
+            Inst::CallKnown(dst, KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map, _) => {
                 !remove_seqs.contains(dst)
             }
             _ => true,

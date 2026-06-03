@@ -229,6 +229,13 @@ pub enum KnownFn {
     /// in compiled Rust — no intermediate lazy seq, no interpreted realization.
     IntoFilter,
     IntoMapcat,
+    /// `IntoMap(to, f, coll)` == `(into to (map f coll))`, built eagerly in
+    /// compiled Rust.  Because the minimal `for` macro expands to `map`, this
+    /// also fuses `(into to (for [x coll] body))`.  Unlike the other fused
+    /// consumers it realizes lazy `coll` sources (e.g. `range`) natively so the
+    /// common `(into {} (for [i (range n)] …))` map-comprehension idiom avoids
+    /// the interpreter entirely.
+    IntoMap,
 }
 
 // ── Effect metadata ──────────────────────────────────────────────────────────
@@ -895,6 +902,7 @@ impl KnownFn {
             | KnownFn::CountFilter
             | KnownFn::IntoFilter
             | KnownFn::IntoMapcat
+            | KnownFn::IntoMap
             | KnownFn::Some
             | KnownFn::Every
             | KnownFn::Into
