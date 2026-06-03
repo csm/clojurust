@@ -1292,6 +1292,41 @@ fn test_into_basic() {
     );
 }
 
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_set() {
+    // Exercises the hash-set target fast path in `rt_into`.
+    assert_output(
+        "into_set",
+        r#"
+(println (sort (into #{} [1 2 3 2 1])))
+(println (sort (into #{1 2} [2 3 4])))
+(println (sort (into #{} (list 5 6 5))))
+(println (into #{} nil))
+"#,
+        "(1 2 3)\n(1 2 3 4)\n(5 6)\n#{}",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_repeatedly_count() {
+    // Exercises the finite-count fast path in `rt_repeatedly`: the result is
+    // realized eagerly into a vector and `f` runs exactly n times.
+    assert_output(
+        "repeatedly_count",
+        r#"
+(println (into [] (repeatedly 3 (fn [] :x))))
+(println (count (repeatedly 0 (fn [] 1))))
+(println (sort (into #{} (repeatedly 5 (fn [] 7)))))
+(let [a (atom 0)]
+  (dorun (repeatedly 4 (fn [] (swap! a inc))))
+  (println @a))
+"#,
+        "[:x :x :x]\n0\n(7)\n4",
+    );
+}
+
 // ── Inline expansion tests ──────────────────────────────────────────────────
 
 #[test]

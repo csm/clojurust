@@ -2349,6 +2349,21 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         }
         return box_coll_val(Value::Vector(alloc_inner_coll(result)));
     }
+    // Fast path: hash-set target.  `into` always fully realizes its source, so
+    // there is no laziness to preserve; iterating an eagerly-walkable source
+    // and conj-ing straight into the set avoids the interpreted `into` +
+    // lazy-`seq` realization that otherwise allocates every intermediate cons
+    // cell on the GC heap (the dominant cost of `(into #{} (repeatedly …))` in
+    // `samples/graph.cljrs`).  All allocations land in the active region.
+    if let Value::Set(SetValue::Hash(h)) = to_ref
+        && let Some(elems) = eager_seq_elems(from_ref)
+    {
+        let mut result = h.get().clone();
+        for elem in elems {
+            result.conj_mut(elem);
+        }
+        return box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(result))));
+    }
     let to_val = to_ref.clone();
     let from_val = from_ref.clone();
     call_global_fn("clojure.core", "into", vec![to_val, from_val])
@@ -2466,8 +2481,34 @@ pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *cons
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
-    let n = unsafe { val_ref(n) }.clone();
-    let f = unsafe { val_ref(f) }.clone();
+    let n_ref = unsafe { val_ref(n) };
+    let f_ref = unsafe { val_ref(f) };
+    // Fast path: explicit count.  `(repeatedly n f)` with a fixed count is a
+    // finite sequence, so realizing it eagerly into a region-allocated vector
+    // is observationally compatible with the lazy seq for the eager consumers
+    // it is used with (`into`, `count`, `reduce`, `vec`, …) — the same liberty
+    // the eager `mapcat`/`map` fast paths already take.  This keeps the per-
+    // element results in the active region instead of allocating interpreted
+    // lazy-seq cons cells on the GC heap.
+    if let Value::Long(k) = n_ref
+        && *k >= 0
+    {
+        let mut items: Vec<Value> = Vec::with_capacity(*k as usize);
+        for _ in 0..*k {
+            match cljrs_env::callback::invoke(f_ref, vec![]) {
+                Ok(v) => items.push(v),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            }
+        }
+        let pv = PersistentVector::from_iter(items);
+        return box_coll_val(Value::Vector(alloc_inner_coll(pv)));
+    }
+    let n = n_ref.clone();
+    let f = f_ref.clone();
     call_global_fn("clojure.core", "repeatedly", vec![n, f])
 }
 

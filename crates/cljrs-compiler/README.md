@@ -76,6 +76,29 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
 - **Region alloc:** `rt_region_start`, `rt_region_end`, `rt_region_alloc_vector`, `rt_region_alloc_map`, `rt_region_alloc_set`, `rt_region_alloc_list`, `rt_region_alloc_cons`
 - **Dispatch:** `rt_call(callee, args, nargs)`, `rt_deref(v)`, `rt_load_global(ns, ns_len, name, name_len)`
+
+#### Eager region-aware fast paths
+
+Several higher-order/collection builtins carry a native Rust fast path that
+realizes their result directly (via `box_coll_val` / `alloc_inner_coll`, which
+route into the active bump region when one is open) instead of calling back
+into the tree-walking interpreter (`call_global_fn`). The interpreted path
+allocates every intermediate lazy-seq cons cell on the GC heap and is blind to
+the active region, so these fast paths both eliminate allocations and move the
+survivors into the region:
+
+- `rt_mapcat(f, coll)` — `f` a `Map`, `coll` a `Vector`: concatenate looked-up
+  collections into a fresh `Vector`.
+- `rt_into(to, from)` — `Vector` target (any eager `from`) **or** hash-`Set`
+  target (eager `from`): conj each element straight into the target.
+- `rt_count_filter` / `rt_into_filter` / `rt_into_mapcat` — fused
+  `count`/`into` over `filter`/`mapcat`, no intermediate seq.
+- `rt_repeatedly(n, f)` — `n` a non-negative `Long`: invoke `f` exactly `n`
+  times into a `Vector` (finite, so equivalent to the lazy seq for the eager
+  consumers it feeds).
+
+Each falls back to `call_global_fn("clojure.core", …)` for inputs it cannot
+walk directly, preserving full semantics.
 - **Output:** `rt_println(v)`, `rt_pr(v)`, `rt_str(v)`
 - **Type checks:** `rt_is_nil`, `rt_is_vector`, `rt_is_map`, `rt_is_seq`, `rt_identical`
 - **Linker anchor:** `anchor_rt_symbols()` — call from harness to prevent dead-code elimination
