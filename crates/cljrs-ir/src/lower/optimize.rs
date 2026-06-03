@@ -676,8 +676,11 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
     let mut producers: HashMap<VarId, (KnownFn, VarId, VarId)> = HashMap::new();
     for block in &ir_func.blocks {
         for inst in &block.insts {
-            if let Inst::CallKnown(dst, kfn @ (KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map), args) =
-                inst
+            if let Inst::CallKnown(
+                dst,
+                kfn @ (KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map),
+                args,
+            ) = inst
                 && args.len() == 2
                 && uses.get(dst).map(|u| u.len() == 1).unwrap_or(false)
             {

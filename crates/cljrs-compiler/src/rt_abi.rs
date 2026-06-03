@@ -2510,7 +2510,8 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         && let Some(new_pairs) = into_map_pairs(from_ref)
     {
         // Existing entries first, then the new pairs so they win on conflict.
-        let mut pairs: Vec<(Value, Value)> = to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut pairs: Vec<(Value, Value)> =
+            to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         pairs.extend(new_pairs);
         return box_coll_val(Value::Map(MapValue::from_pairs(pairs)));
     }
