@@ -21,7 +21,10 @@ src/
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
   lower/
     mod.rs      — re-exports: lower_fn_body, analyze, inline, optimize, EscapeContext …
-    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust)
+    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
+                  capture only the enclosing locals their (fully macro-expanded)
+                  body references (`collect_symbol_names`, a conservative
+                  free-variable over-approximation), not every local in scope.
     context.rs  — LowerCtx builder state used by anf.rs
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites

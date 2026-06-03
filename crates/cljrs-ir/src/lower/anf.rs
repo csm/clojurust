@@ -3,6 +3,7 @@
 //! Mirrors `cljrs.compiler.anf`. Receives fully macro-expanded `Form` nodes
 //! and produces a well-formed SSA IR in A-normal form.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cljrs_reader::form::{Form, FormKind};
@@ -11,6 +12,52 @@ use crate::{BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, Terminat
 
 use super::context::{LowerCtx, fresh_global_name_id};
 use super::known::{resolve_known_fn, strip_ns_prefix};
+
+// ── Free-variable approximation for closure captures ─────────────────────────
+
+/// Collect every symbol name that appears anywhere in `forms`, recursing into
+/// all nested forms — including quoted forms and nested `fn` bodies, whose free
+/// variables a closure must capture transitively.
+///
+/// This is a deliberate *over*-approximation of a closure's free variables.
+/// Lowering only ever uses it to *remove* locals that provably cannot be
+/// referenced (their name never appears) from a closure's capture list:
+/// capturing a local whose name merely appears textually is wasteful but safe,
+/// whereas missing a genuine reference would leave the variable unbound at
+/// runtime.  Relies on the module invariant that bodies are fully
+/// macro-expanded, so every real reference is an explicit symbol.
+fn collect_symbol_names<'a>(forms: &'a [Form], out: &mut HashSet<&'a str>) {
+    for form in forms {
+        collect_symbol_names_form(form, out);
+    }
+}
+
+fn collect_symbol_names_form<'a>(form: &'a Form, out: &mut HashSet<&'a str>) {
+    match &form.kind {
+        FormKind::Symbol(s) => {
+            out.insert(s.as_str());
+        }
+        FormKind::List(v)
+        | FormKind::Vector(v)
+        | FormKind::Map(v)
+        | FormKind::Set(v)
+        | FormKind::AnonFn(v) => collect_symbol_names(v, out),
+        FormKind::Quote(b)
+        | FormKind::SyntaxQuote(b)
+        | FormKind::Unquote(b)
+        | FormKind::UnquoteSplice(b)
+        | FormKind::Deref(b)
+        | FormKind::Var(b)
+        | FormKind::TaggedLiteral(_, b) => collect_symbol_names_form(b, out),
+        FormKind::Meta(m, f) => {
+            collect_symbol_names_form(m, out);
+            collect_symbol_names_form(f, out);
+        }
+        FormKind::ReaderCond { clauses, .. } => collect_symbol_names(clauses, out),
+        // Atoms (Nil, Bool, Int, …, Keyword, …) contain no symbol references.
+        _ => {}
+    }
+}
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
@@ -889,10 +936,20 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
         None
     };
 
-    // Capture all locals (after self-ref scope is pushed).
+    // Capture only the enclosing locals the body actually references (after the
+    // self-ref scope is pushed).  `collect_symbol_names` over-approximates the
+    // free variables, so this only ever *removes* provably-unreferenced locals
+    // — never a real capture.  Capturing every in-scope local (the previous
+    // behaviour) inflates the compiled arity (captures + params), wasting
+    // allocations and, past 16, exceeding the call trampoline's maximum.
     let all_locals = ctx.get_all_locals();
-    let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
-    let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
+    let mut referenced: HashSet<&str> = HashSet::new();
+    collect_symbol_names(&args[body_start..], &mut referenced);
+    let (capture_names, capture_vars): (Vec<Arc<str>>, Vec<VarId>) = all_locals
+        .iter()
+        .filter(|(n, _)| referenced.contains(n.as_ref()))
+        .map(|(n, v)| (n.clone(), *v))
+        .unzip();
 
     // Pop self-ref scope now that captures are computed.
     if self_var_reg.is_some() {
