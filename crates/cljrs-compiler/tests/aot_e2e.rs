@@ -1294,6 +1294,28 @@ fn test_into_basic() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_high_arity_closure_call() {
+    // Regression: a closure passed to a HOF (reduce) inside a loop over a
+    // let-bound collection over-captures enclosing locals, so its compiled
+    // arity (captures + params) exceeded the call trampoline's old 8-arg
+    // ceiling, which silently returned nil.  All of these must compute the
+    // real result, not nil.
+    assert_output(
+        "high_arity_closure_call",
+        r#"
+(let [v [10 20 30]]
+  (println (loop [i 0 r 0]
+             (if (= i 2) r (recur (inc i) (reduce (fn [a x] x) 0 v))))))
+(let [v (vec (range 100))]
+  (println (loop [i 0 r 0]
+             (if (= i 3) r (recur (inc i) (reduce (fn [a x] (+ a x)) 0 v))))))
+"#,
+        "30\n4950",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_into_set() {
     // Exercises the hash-set target fast path in `rt_into`.
     assert_output(

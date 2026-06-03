@@ -1620,10 +1620,161 @@ unsafe fn rt_call_compiled(
                 args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
             )
         }
+        9 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8])
+        }
+        10 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9])
+        }
+        11 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10])
+        }
+        12 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11])
+        }
+        13 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12])
+        }
+        14 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13])
+        }
+        15 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14])
+        }
+        16 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15])
+        }
         _ => {
-            // For functions with more than 8 params, fall back to rt_call style.
-            // This shouldn't happen in practice for most Clojure code.
-            eprintln!("[rt] warning: compiled function with {nargs} args, falling back");
+            // The compiled-function trampoline supports up to a fixed maximum
+            // arity (captures + params).  Exceeding it is rare but must never
+            // silently corrupt results (the previous behaviour returned nil,
+            // which produced wrong answers, e.g. a reduce over a let-bound
+            // collection whose closure over-captures enclosing locals).  Log
+            // loudly and surface a thrown error.  `total_params = ncaptures +
+            // param_count`, so this only triggers for closures that capture an
+            // unusually large number of enclosing locals.
+            eprintln!(
+                "[rt] error: compiled function arity {nargs} exceeds trampoline maximum (16)"
+            );
+            stash_pending_exception(Value::Str(GcPtr::new(format!(
+                "compiled function arity {nargs} exceeds trampoline maximum (16)"
+            ))));
             rt_const_nil()
         }
     }
