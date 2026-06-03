@@ -89,8 +89,12 @@ survivors into the region:
 
 - `rt_mapcat(f, coll)` — `f` a `Map`, `coll` a `Vector`: concatenate looked-up
   collections into a fresh `Vector`.
-- `rt_into(to, from)` — `Vector` target (any eager `from`) **or** hash-`Set`
-  target (eager `from`): conj each element straight into the target.
+- `rt_into(to, from)` — `Vector` target (any eager `from`), hash-`Set` target
+  (eager `from`), or `Map` target (eager `from` of key/value pairs, or a source
+  map): build the target directly. The map path realizes via
+  `MapValue::from_pairs` (last-wins, size-optimal) so there are no intermediate
+  map boxes. Only fires for eager sources — a lazy `for`/`map` source still
+  falls back to the interpreter.
 - `rt_count_filter` / `rt_into_filter` / `rt_into_mapcat` — fused
   `count`/`into` over `filter`/`mapcat`, no intermediate seq.
 - `rt_repeatedly(n, f)` — `n` a non-negative `Long`: invoke `f` exactly `n`

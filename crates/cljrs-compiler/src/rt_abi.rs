@@ -2364,9 +2364,58 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         }
         return box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(result))));
     }
+    // Fast path: map target.  `(into {} pairs)` — the very common idiom behind
+    // `(into {} (for …))` map comprehensions — otherwise falls through to the
+    // interpreted `into`, whose lazy realization allocates on the GC heap.  We
+    // build the result in one shot via `MapValue::from_pairs` (last-wins, like
+    // `assoc`, and size-optimal) rather than per-element `assoc` so there are
+    // no intermediate map boxes; the result is region-boxed when a region is
+    // open.  Only taken when every source element is a clean key/value pair
+    // (a 2-element vector/list) or the source is itself a map.
+    if let Value::Map(to_map) = to_ref
+        && let Some(new_pairs) = into_map_pairs(from_ref)
+    {
+        // Existing entries first, then the new pairs so they win on conflict.
+        let mut pairs: Vec<(Value, Value)> = to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.extend(new_pairs);
+        return box_coll_val(Value::Map(MapValue::from_pairs(pairs)));
+    }
     let to_val = to_ref.clone();
     let from_val = from_ref.clone();
     call_global_fn("clojure.core", "into", vec![to_val, from_val])
+}
+
+/// Collect a sequence of key/value pairs from `from` for the map-target `into`
+/// fast path, or `None` if `from` isn't eagerly walkable or any element isn't a
+/// clean 2-element pair (in which case the caller falls back to the
+/// interpreter, which handles map-entries, map merging, and lazy sources).
+fn into_map_pairs(from: &Value) -> Option<Vec<(Value, Value)>> {
+    // A source map contributes its entries directly.
+    if let Value::Map(m) = from {
+        return Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+    let elems = eager_seq_elems(from)?;
+    let mut pairs = Vec::with_capacity(elems.len());
+    for elem in elems {
+        pairs.push(as_pair(&elem)?);
+    }
+    Some(pairs)
+}
+
+/// Extract a `(key, value)` pair from a 2-element vector or list, else `None`.
+fn as_pair(v: &Value) -> Option<(Value, Value)> {
+    match v {
+        Value::Vector(vec) if vec.get().count() == 2 => {
+            Some((vec.get().nth(0)?.clone(), vec.get().nth(1)?.clone()))
+        }
+        Value::List(l) if l.get().count() == 2 => {
+            let mut it = l.get().iter();
+            let k = it.next()?.clone();
+            let val = it.next()?.clone();
+            Some((k, val))
+        }
+        _ => None,
+    }
 }
 
 /// `(into to xform from)`.

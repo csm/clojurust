@@ -1310,6 +1310,25 @@ fn test_into_set() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_into_map() {
+    // Exercises the map target fast path in `rt_into`: eager pair sources and
+    // a source map, with last-wins on conflicting keys.
+    assert_output(
+        "into_map",
+        r#"
+(println (into {} [[:a 1] [:b 2]]))
+(println (into {:a 1 :b 2} [[:b 9] [:c 3]]))
+(println (into {} (list [:p 1] [:q 2])))
+(println (into {} {:x 1 :y 2}))
+(println (into {} nil))
+(println (get (into {} (mapv (fn [i] [i (* i i)]) (range 4))) 3))
+"#,
+        "{:a 1, :b 2}\n{:a 1, :b 9, :c 3}\n{:p 1, :q 2}\n{:x 1, :y 2}\n{}\n9",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_repeatedly_count() {
     // Exercises the finite-count fast path in `rt_repeatedly`: the result is
     // realized eagerly into a vector and `f` runs exactly n times.
