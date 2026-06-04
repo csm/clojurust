@@ -81,3 +81,36 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 - **Persistent collections are the default** — mutability only via `atom`/`ref`/`agent` or transients
 - **Rust interop is safe-by-default** — unsafe Rust APIs accessible only through an explicit `cljx.rust/unsafe` boundary
 - **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:rust`
+
+## Memory Management
+
+The runtime supports two allocation strategies, selected at compile time via Cargo features.
+
+### Tracing GC (default / interpreter mode)
+
+All Clojure values are heap-allocated behind `GcPtr<T>`. The GC is a stop-the-world tracing collector (`crates/cljrs-gc/src/lib.rs`). `GcPtr::clone` is O(1) and `GcPtr::drop` is a no-op — the collector reclaims unreachable objects during a collection pause. Collection triggers are threshold-based: a soft limit (75% of the hard limit) and a hard limit (defaulting to ¼ of available RAM, minimum 256 MB).
+
+### Bump allocator (AOT mode only)
+
+**The bump allocator is only available when the crate is compiled with the `no-gc` feature, which is only activated during AOT compilation (`cljrs compile`). It is not available in interpreter or REPL mode.**
+
+The bump allocator is implemented in `crates/cljrs-gc/src/region.rs` as the `Region` struct. It works by maintaining a pointer into a contiguous memory chunk and advancing ("bumping") that pointer on each allocation — no per-object bookkeeping, no mutex contention. When the current chunk is exhausted a new chunk is appended; the default initial chunk size is 4 KiB. Resetting a region (e.g. at the end of a function call) runs destructors in LIFO order and then reclaims all chunks in one shot.
+
+There are two region flavours:
+
+| Type | Location | Lifetime | Use |
+|---|---|---|---|
+| `Region` / `ScratchGuard` | `crates/cljrs-gc/src/region.rs` + `alloc_ctx.rs` | Scoped to a call frame | Intermediate values that don't escape |
+| `StaticArena` | `crates/cljrs-gc/src/static_arena.rs` | Program lifetime | Interned symbols, compiled code, constants |
+
+The **allocation context stack** (`crates/cljrs-gc/src/alloc_ctx.rs`) routes each allocation to the currently-active context. In AOT-compiled code the compiler inserts `RegionStart`/`RegionEnd` IR nodes (see `crates/cljrs-ir/src/lower/regionalize.rs`) around call sites whose return values are proven non-escaping, so intermediate allocations land in the scratch region rather than the GC heap.
+
+The **return-expression protocol** ensures the tail value of a function body is allocated in the *caller's* context, not the callee's scratch region:
+
+1. `ScratchGuard` is pushed — body allocations enter the scratch region.
+2. Non-tail sub-expressions are evaluated; intermediates land in scratch.
+3. `pop_for_return()` removes scratch from the active context stack.
+4. The tail expression is evaluated — its result lands in the caller's context.
+5. `ScratchGuard` drops — scratch memory is reset and all intermediates are freed.
+
+This protocol is verified by the integration tests in `crates/cljrs-gc/tests/no_gc_alloc.rs`.
