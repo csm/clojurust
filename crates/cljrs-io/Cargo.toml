@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-io"
-version = "0.1.0"
+version = "0.1.122"
 edition = "2024"
 description = "Asynchronous file I/O for clojurust — tokio-backed reads/writes delivered over core.async channels"
 license.workspace = true
