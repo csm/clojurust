@@ -26,7 +26,8 @@ members = [
     "crates/cljrs-async",
     "crates/cljrs-io",
     "crates/cljrs-net",
-    "crates/cljrs-charset"]
+    "crates/cljrs-charset",
+    "crates/cljrs-lsp"]
 resolver = "2"
 
 [workspace.package]
@@ -57,6 +58,7 @@ cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0" }
 cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0" }
 cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
 cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
+cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
@@ -78,6 +80,8 @@ postcard     = "1.1.3"
 rustyline    = "18.0.0"
 libloading   = "0.8"
 arc-swap     = "1"
+tower-lsp     = "0.20"
+dashmap       = "6"
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"

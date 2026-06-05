@@ -40,6 +40,7 @@ cljrs-interop  = { workspace = true }
 cljrs-logging  = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-vcs      = { workspace = true }
+cljrs-lsp      = { workspace = true }
 clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"

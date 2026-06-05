@@ -1,0 +1,30 @@
+[package]
+name = "cljrs-lsp"
+version = "0.1.0"
+edition = "2024"
+description = "Language Server Protocol implementation for clojurust (.cljrs/.cljc)"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cljrs-lsp"
+path = "src/main.rs"
+
+[dependencies]
+cljrs-types  = { workspace = true }
+cljrs-reader = { workspace = true }
+tower-lsp = { workspace = true }
+dashmap   = { workspace = true }
+# The LSP server needs async stdio plus a runtime, so it pins a richer tokio
+# feature set than the workspace default (which omits io-std/io-util and the
+# multi-thread runtime). Feature unification keeps this to a single tokio build.
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "io-std", "io-util", "macros"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+serde_json = "1"
+futures = "0.3"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
