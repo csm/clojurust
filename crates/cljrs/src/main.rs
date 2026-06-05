@@ -183,6 +183,12 @@ enum Commands {
         #[arg(long)]
         release: bool,
     },
+    /// Run the clojurust language server (LSP) over stdio.
+    ///
+    /// Speaks the Language Server Protocol on stdin/stdout for editor
+    /// integration, providing parse diagnostics and a document-symbol outline
+    /// for `.cljrs` / `.cljc` files. Editors normally launch this for you.
+    Lsp,
 }
 
 #[derive(Subcommand)]
@@ -396,6 +402,13 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             DepsCommands::Status => run_deps_status(),
         },
         Commands::BuildNative { release } => run_build_native(release),
+        Commands::Lsp => {
+            // cljrs-lsp owns its own runtime; this is safe because `run` never
+            // enters the interpreter's async driver runtime.
+            cljrs_lsp::run_stdio_blocking()
+                .map_err(|e| miette::miette!("lsp server error: {e}"))?;
+            Ok(0)
+        }
     }
 }
 

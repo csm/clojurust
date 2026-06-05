@@ -459,5 +459,11 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 - [ ] ClojureScript-style source-to-source compiler targeting WebAssembly
 - [ ] `clojure.core.async` compatible CSP channels (`go`, `chan`, `<!`, `>!`, `alts!`)
 - [ ] Native image / musl-linked static binaries for minimal deployment
-- [ ] Language Server Protocol (LSP) implementation for editor support
+- [~] Language Server Protocol (LSP) implementation for editor support
+  - [x] v1 (`cljrs-lsp` crate + `cljrs lsp` subcommand, syntactic/reader-based): parse
+        diagnostics (with per-top-level-form error recovery) and document-symbol outline;
+        UTF-8/UTF-16 position-encoding negotiation; FULL text sync
+  - [ ] v2 (semantic, evaluator-backed via `cljrs-eval` `GlobalEnv`): hover, completion,
+        go-to-definition, find-references
+  - [ ] INCREMENTAL text sync, semantic tokens
 - [ ] Transducers in core collection ops
