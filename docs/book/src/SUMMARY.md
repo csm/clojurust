@@ -38,3 +38,8 @@
 - [The `#[export]` macro](rust-interop/export-macro.md)
 - [Interpreter mode](rust-interop/interpreter.md)
 - [AOT mode](rust-interop/aot.md)
+
+# Memory Management
+
+- [Overview](memory/index.md)
+- [The bump allocator](memory/bump-allocator.md)

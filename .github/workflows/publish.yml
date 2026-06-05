@@ -3,6 +3,13 @@ name: Publish
 on:
   push:
     branches: [main]
+    # Skip publishing when a push only touches documentation or the website.
+    # GitHub skips the workflow only when *every* changed file matches one of
+    # these globs, so a push that also touches code still publishes. Manual
+    # workflow_dispatch runs always publish, ignoring these filters.
+    paths-ignore:
+      - 'docs/**'
+      - 'www/**'
   workflow_dispatch:
 
 env:
