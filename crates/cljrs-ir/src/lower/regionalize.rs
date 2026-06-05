@@ -25,11 +25,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::{Inst, IrFunction, RegionAllocKind, VarId};
+use crate::{Inst, IrFunction, KnownFn, RegionAllocKind, VarId};
 
 use super::escape::{
-    ClosureInfo, EscapeContext, EscapeMode, EscapeState, build_use_chains, build_var_defs,
-    classify_escape_with_ctx, collect_allocs,
+    ClosureInfo, EscapeContext, EscapeMode, EscapeState, UseInfo, UseKind, build_use_chains,
+    build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes,
 };
 use super::optimize::{
     blocks_on_path, collect_use_blocks, dominators, has_back_edge, lca_of_many, post_dominators,
@@ -108,6 +108,189 @@ fn returns_allocs_of(callee: &IrFunction, ctx: &EscapeContext) -> HashSet<VarId>
             }
         })
         .collect()
+}
+
+// ── Deep (container-contained) promotion ─────────────────────────────────────
+//
+// A `Returns` allocation is the return value of the callee; today only that
+// root is region-promoted.  But the elements stored *into* it (e.g. the eight
+// `[r c]` coordinate vectors inside `neighbours`' result vector) are reachable
+// only through the returned container, so their lifetime is bounded by it.
+// When the container is region-allocated, those elements can live in the same
+// region — provided the caller never extracts one and lets it outlive the
+// region (guarded separately by [`call_result_safe_for_deep`]).
+
+/// Build `element_var → [container dsts that store it]` for every
+/// region-promotable aggregate allocation in `callee`.
+fn build_containment(callee: &IrFunction) -> HashMap<VarId, Vec<VarId>> {
+    let mut m: HashMap<VarId, Vec<VarId>> = HashMap::new();
+    for block in &callee.blocks {
+        for inst in block.phis.iter().chain(block.insts.iter()) {
+            if alloc_to_region_kind(inst).is_some()
+                && let Some(dst) = inst.dst()
+            {
+                for op in alloc_operands(inst) {
+                    m.entry(op).or_default().push(dst);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Compute the allocations that are reachable *only* through the `shallow`
+/// returned containers, walking the containment graph outward from them.
+///
+/// An allocation is included when every one of its uses is `StoredInHeap`
+/// (it never escapes, is never returned separately, and is never extracted)
+/// **and** every aggregate it is stored into is itself already part of the
+/// returned structure.  This guarantees its lifetime is bounded by the
+/// returned value, so it is safe to co-promote into the same region.
+fn deep_returns_allocs(callee: &IrFunction, shallow: &HashSet<VarId>) -> HashSet<VarId> {
+    let var_defs = build_var_defs(callee);
+    let uses = build_use_chains(callee);
+    let containment = build_containment(callee);
+
+    let mut collected: HashSet<VarId> = shallow.clone();
+    let mut result: HashSet<VarId> = HashSet::new();
+    let mut worklist: Vec<VarId> = shallow.iter().copied().collect();
+    let mut visited: HashSet<VarId> = HashSet::new();
+
+    while let Some(container) = worklist.pop() {
+        if !visited.insert(container) {
+            continue;
+        }
+        let Some(inst) = var_defs.get(&container) else {
+            continue;
+        };
+        for op in alloc_operands(inst) {
+            // Only region-promotable allocations are candidates.
+            let is_promotable_alloc = var_defs
+                .get(&op)
+                .map(|i| alloc_to_region_kind(i).is_some())
+                .unwrap_or(false);
+            if !is_promotable_alloc {
+                continue;
+            }
+            if collected.contains(&op) {
+                // Already part of the structure; still expand its contents.
+                if visited.contains(&op) {
+                    continue;
+                }
+                worklist.push(op);
+                continue;
+            }
+            // Every use must be a store into the returned structure.
+            let op_uses = match uses.get(&op) {
+                Some(u) if !u.is_empty() => u,
+                _ => continue,
+            };
+            if !op_uses
+                .iter()
+                .all(|u| matches!(u.kind, UseKind::StoredInHeap))
+            {
+                continue;
+            }
+            let containers_ok = containment
+                .get(&op)
+                .map(|cs| cs.iter().all(|c| collected.contains(c)))
+                .unwrap_or(false);
+            if !containers_ok {
+                continue;
+            }
+            result.insert(op);
+            collected.insert(op);
+            worklist.push(op);
+        }
+    }
+
+    result
+}
+
+/// Locate the result of a `CallKnown(_, kf, args)` in `block_id` whose
+/// arguments include `used_var`.
+fn find_known_call_result(
+    func: &IrFunction,
+    used_var: VarId,
+    kf: &KnownFn,
+    block_id: crate::BlockId,
+) -> Option<VarId> {
+    let block = func.blocks.iter().find(|b| b.id == block_id)?;
+    for inst in &block.insts {
+        if let Inst::CallKnown(dst, f, args) = inst
+            && f == kf
+            && args.contains(&used_var)
+        {
+            return Some(*dst);
+        }
+    }
+    None
+}
+
+/// Returns `true` when it is safe to co-promote the deep (container-contained)
+/// allocations of a call whose result is `dst`.
+///
+/// Walks forward from `dst` through value-forwarding known calls and phis.
+/// Co-promotion is unsafe if any reachable value is element-*extracted*
+/// (`first`/`nth`/`get`/`peek`) or flows into an opaque call: those paths can
+/// pull an inner pointer out of the container and keep it alive past the
+/// caller's region, leaving it dangling.  Forwarding fns (`filter`, `into`,
+/// `seq`, …) are followed transitively; their use blocks are already covered
+/// by the region scope computed in [`rewrite_call_with_region_scope`].
+fn call_result_safe_for_deep(
+    func: &IrFunction,
+    dst: VarId,
+    uses: &HashMap<VarId, Vec<UseInfo>>,
+) -> bool {
+    let mut worklist = vec![dst];
+    let mut seen: HashSet<VarId> = HashSet::new();
+
+    while let Some(v) = worklist.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for use_info in uses.get(&v).into_iter().flatten() {
+            match &use_info.kind {
+                UseKind::KnownCallArg {
+                    func: kf,
+                    arg_index,
+                } => {
+                    // Element extractors return an inner pointer by reference.
+                    if matches!(
+                        kf,
+                        KnownFn::First | KnownFn::Nth | KnownFn::Get | KnownFn::Peek
+                    ) {
+                        return false;
+                    }
+                    // Forwarding fns: follow into the call result.
+                    if known_fn_arg_escapes(kf, *arg_index) {
+                        match find_known_call_result(func, v, kf, use_info.block) {
+                            Some(r) => worklist.push(r),
+                            None => return false,
+                        }
+                    }
+                }
+                UseKind::PhiInput => {
+                    if let Some(block) = func.blocks.iter().find(|b| b.id == use_info.block) {
+                        for phi in &block.phis {
+                            if let Inst::Phi(d, entries) = phi
+                                && entries.iter().any(|(_, x)| *x == v)
+                            {
+                                worklist.push(*d);
+                            }
+                        }
+                    }
+                }
+                // Inspection-only uses cannot leak an element.
+                UseKind::BranchCond | UseKind::Deref => {}
+                // Anything else (opaque call, capture, store, return, recur)
+                // could retain an extracted element — be conservative.
+                _ => return false,
+            }
+        }
+    }
+
+    true
 }
 
 // ── Specialised-callee construction ──────────────────────────────────────────
@@ -417,7 +600,7 @@ fn collect_candidates_in(
             if capture_count > 1 {
                 continue;
             }
-            let returns_allocs = returns_allocs_of(callee_fn, ctx);
+            let mut returns_allocs = returns_allocs_of(callee_fn, ctx);
             if returns_allocs.is_empty() {
                 continue;
             }
@@ -432,6 +615,14 @@ fn collect_candidates_in(
             });
             if !any_promotable {
                 continue;
+            }
+            // Co-promote allocations reachable only through the returned
+            // container (e.g. the inner coordinate vectors of `neighbours`),
+            // but only when the call result cannot leak an inner pointer past
+            // the caller's region scope.
+            if call_result_safe_for_deep(func, *dst, &uses) {
+                let deep = deep_returns_allocs(callee_fn, &returns_allocs);
+                returns_allocs.extend(deep);
             }
             out.push(CandidateLoc {
                 path: path.clone(),

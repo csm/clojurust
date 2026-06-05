@@ -23,7 +23,12 @@ members = [
     "crates/cljrs-vcs",
     "crates/cljrs-blake3",
     "crates/cljrs-wasm",
-    "crates/cljrs-async", "crates/cljrs-base64"]
+    "crates/cljrs-async",
+    "crates/cljrs-io",
+    "crates/cljrs-net",
+    "crates/cljrs-charset",
+    "crates/cljrs-lsp",
+    "crates/cljrs-base64"]
 resolver = "2"
 
 [workspace.package]
@@ -51,6 +56,10 @@ cljrs-ir-viz       = { path = "crates/cljrs-ir-viz",       version = "0.1.0" }
 cljrs-deps         = { path = "crates/cljrs-deps",         version = "0.1.0" }
 cljrs-vcs          = { path = "crates/cljrs-vcs",          version = "0.1.0" }
 cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0" }
+cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0" }
+cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
+cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
+cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
@@ -63,13 +72,17 @@ bigdecimal   = "0.4"
 rand         = "0.10.1"
 rpds         = "1"
 uuid         = "1.22.0"
-tokio        = { version = "1.50.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio        = { version = "1.50.0", features = ["rt", "sync", "time", "macros"] }
 futures-util = "0.3"
+encoding_rs  = "0.8"
 regex        = "1.12.3"
 serde        = "1.0.228"
 postcard     = "1.1.3"
 rustyline    = "18.0.0"
 libloading   = "0.8"
+arc-swap     = "1"
+tower-lsp     = "0.20"
+dashmap       = "6"
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"

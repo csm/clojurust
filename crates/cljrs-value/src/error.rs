@@ -164,6 +164,10 @@ impl Trace for ExceptionInfo {
             visitor.visit(cause);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        self.message.capacity()
+    }
 }
 
 impl ClojureHash for ExceptionInfo {

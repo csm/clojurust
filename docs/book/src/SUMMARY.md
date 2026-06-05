@@ -22,6 +22,14 @@
 - [Differences from Clojure](language/differences.md)
 - [New built-in functions](language/builtins.md)
 
+# Async & I/O
+
+- [Overview](async-io/index.md)
+- [core.async](async-io/async.md)
+- [Asynchronous I/O](async-io/io.md)
+- [Charset encoding](async-io/charset.md)
+- [Networking](async-io/net.md)
+
 # Rust Interop
 
 - [Overview](rust-interop/index.md)
@@ -30,3 +38,8 @@
 - [The `#[export]` macro](rust-interop/export-macro.md)
 - [Interpreter mode](rust-interop/interpreter.md)
 - [AOT mode](rust-interop/aot.md)
+
+# Memory Management
+
+- [Overview](memory/index.md)
+- [The bump allocator](memory/bump-allocator.md)

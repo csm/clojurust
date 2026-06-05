@@ -705,9 +705,402 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::List(l) => l.get().count(),
         Value::Str(s) => s.get().len(),
         Value::Nil => 0,
+        // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
+        // be walked and realized to be counted.  Without this arm `count`
+        // returns 0 for every lazy seq, silently corrupting any
+        // `(count (filter …))` computation.
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut count = 0usize;
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        count += 1;
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        count += l.get().count();
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        count += v.get().count();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            count
+        }
         _ => 0,
     };
     intern_long(n as i64)
+}
+
+/// `(count (filter pred coll))` fused — count matching elements without
+/// materializing the intermediate sequence.
+///
+/// `Set`/`Map` predicates are tested directly; other predicates are `invoke`d
+/// per element.  Iterates concrete collections in compiled Rust; falls back to
+/// the interpreted lazy `filter` + `count` for inputs `eager_seq_elems` can't
+/// walk directly.  Allocates nothing in the common path — the key win over the
+/// lazy path, whose per-element cons cells dominate `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        // Fall back to the interpreter for lazy/cons inputs, then count.
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        return unsafe { rt_count(seq) };
+    };
+    let mut n: usize = 0;
+    for elem in elems {
+        let keep = match pred_ref {
+            Value::Set(s) => s.contains(&elem),
+            Value::Map(m) => m
+                .get(&elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+            _ => match cljrs_env::callback::invoke(pred_ref, vec![elem]) {
+                Ok(r) => !matches!(r, Value::Nil | Value::Bool(false)),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            },
+        };
+        if keep {
+            n += 1;
+        }
+    }
+    intern_long(n as i64)
+}
+
+/// Eagerly collect the elements of a directly-iterable collection, or `None`
+/// for inputs that need the interpreter's full `seq` machinery.
+fn eager_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Store a thrown value in the pending-exception slot (mirrors `rt_call`).
+#[inline]
+fn stash_pending_exception(val: Value) {
+    PENDING_EXCEPTION.with(|cell| {
+        *cell.borrow_mut() = Some(box_val(val));
+    });
+}
+
+/// Apply a filter predicate to `elem`.  Returns `Some(keep)`, or `None` if the
+/// predicate threw (exception already stashed).  `Set`/`Map` predicates are
+/// tested directly; others are `invoke`d.
+#[inline]
+fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
+    match pred {
+        Value::Set(s) => Some(s.contains(elem)),
+        Value::Map(m) => Some(
+            m.get(elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+        ),
+        _ => match cljrs_env::callback::invoke(pred, vec![elem.clone()]) {
+            Ok(r) => Some(!matches!(r, Value::Nil | Value::Bool(false))),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                None
+            }
+            Err(_) => None,
+        },
+    }
+}
+
+/// `(into to (filter pred coll))` fused — eager, no intermediate lazy seq.
+///
+/// Iterates `coll`, conj-ing matching elements straight into `to`.  Set and
+/// Vector targets are built natively; other targets fall back to interpreted
+/// `into` over an eagerly-filtered vector.  Avoids the interpreted lazy
+/// `filter` + `into` realization that dominates `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_filter(
+    to: *const Value,
+    pred: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => {
+                        s.conj_mut(elem);
+                    }
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => r = r.conj(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let mut kept = Vec::new();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => kept.push(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(kept)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// `(into to (mapcat f coll))` fused — eager, no intermediate lazy seq.
+///
+/// For each element of `coll`, calls `f` (which must return a collection) and
+/// conj-es its elements into `to`.  Set and Vector targets are built natively.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_mapcat(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    // Fall back to interpreted `mapcat` + `into` if any input isn't directly
+    // iterable.
+    let fallback = || {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+    };
+
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        return fallback();
+    };
+    let mut elements: Vec<Value> = Vec::new();
+    for elem in elems {
+        let r = match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => v,
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        };
+        match eager_seq_elems(&r) {
+            Some(inner) => elements.extend(inner),
+            // `f` returned a non-directly-iterable collection: bail out.  (`f`
+            // is pure in the fused patterns we target, so re-running it in the
+            // fallback is safe.)
+            None => return fallback(),
+        }
+    }
+
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for x in elements {
+                s.conj_mut(x);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for x in elements {
+                r = r.conj(x);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(elements)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// Eagerly realize the elements of any seqable `coll` — including lazy
+/// `Cons`/`LazySeq` chains such as `range`/`map` results — into a `Vec`.
+/// Returns `None` for genuinely non-seqable values so the caller can fall
+/// back to the interpreter.  Unlike [`eager_seq_elems`], this forces lazy
+/// thunks; it is used where the caller is an eager consumer that would fully
+/// realize the source anyway.
+fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut out = Vec::new();
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        out.push(c.get().head.clone());
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        out.extend(l.get().iter().cloned());
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        out.extend(v.get().iter().cloned());
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// `(into to (map f coll))` fused — eager, region-aware, and realizes lazy
+/// `coll` sources (e.g. `range`) natively.  Because the minimal `for` macro
+/// expands to `map`, this is the fused form of the `(into {} (for [x coll]
+/// [k v]))` map-comprehension idiom that dominates `samples/graph.cljrs`.
+///
+/// Applies `f` to each element and builds the target directly: map targets via
+/// `MapValue::from_pairs` (last-wins, size-optimal), set/vector targets via
+/// `conj`.  Falls back to interpreted `map` + `into` for inputs it can't walk
+/// (non-seqable `coll`) or targets it doesn't build natively.  `f` is invoked
+/// at most once per element; the map-target "not a pair" case routes the
+/// already-mapped values through interpreted `into` rather than re-running `f`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_map(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    let Some(elems) = realize_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "map", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+
+    let mut mapped: Vec<Value> = Vec::with_capacity(elems.len());
+    for elem in elems {
+        match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => mapped.push(v),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        }
+    }
+
+    match to_ref {
+        Value::Map(to_map) => {
+            // Existing entries first so the mapped pairs win on key conflict.
+            let mut pairs: Vec<(Value, Value)> =
+                to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut all_pairs = true;
+            for m in &mapped {
+                match as_pair(m) {
+                    Some(p) => pairs.push(p),
+                    None => {
+                        all_pairs = false;
+                        break;
+                    }
+                }
+            }
+            if all_pairs {
+                box_coll_val(Value::Map(MapValue::from_pairs(pairs)))
+            } else {
+                // Mapped values aren't all key/value pairs — let interpreted
+                // `into` handle map-entries/merging, without re-invoking `f`.
+                let to_val = to_ref.clone();
+                let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+                call_global_fn("clojure.core", "into", vec![to_val, src])
+            }
+        }
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for m in mapped {
+                s.conj_mut(m);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for m in mapped {
+                r = r.conj(m);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
 }
 
 /// `(empty? coll)` — returns Bool without converting to a seq.
@@ -1227,10 +1620,184 @@ unsafe fn rt_call_compiled(
                 args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
             )
         }
+        9 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+            )
+        }
+        10 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9],
+            )
+        }
+        11 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10],
+            )
+        }
+        12 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11],
+            )
+        }
+        13 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12],
+            )
+        }
+        14 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13],
+            )
+        }
+        15 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13], args[14],
+            )
+        }
+        16 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13], args[14], args[15],
+            )
+        }
         _ => {
-            // For functions with more than 8 params, fall back to rt_call style.
-            // This shouldn't happen in practice for most Clojure code.
-            eprintln!("[rt] warning: compiled function with {nargs} args, falling back");
+            // The compiled-function trampoline supports up to a fixed maximum
+            // arity (captures + params).  Exceeding it is rare but must never
+            // silently corrupt results (the previous behaviour returned nil,
+            // which produced wrong answers, e.g. a reduce over a let-bound
+            // collection whose closure over-captures enclosing locals).  Log
+            // loudly and surface a thrown error.  `total_params = ncaptures +
+            // param_count`, so this only triggers for closures that capture an
+            // unusually large number of enclosing locals.
+            eprintln!(
+                "[rt] error: compiled function arity {nargs} exceeds trampoline maximum (16)"
+            );
+            stash_pending_exception(Value::Str(GcPtr::new(format!(
+                "compiled function arity {nargs} exceeds trampoline maximum (16)"
+            ))));
             rt_const_nil()
         }
     }
@@ -2090,9 +2657,74 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         }
         return box_coll_val(Value::Vector(alloc_inner_coll(result)));
     }
+    // Fast path: hash-set target.  `into` always fully realizes its source, so
+    // there is no laziness to preserve; iterating an eagerly-walkable source
+    // and conj-ing straight into the set avoids the interpreted `into` +
+    // lazy-`seq` realization that otherwise allocates every intermediate cons
+    // cell on the GC heap (the dominant cost of `(into #{} (repeatedly …))` in
+    // `samples/graph.cljrs`).  All allocations land in the active region.
+    if let Value::Set(SetValue::Hash(h)) = to_ref
+        && let Some(elems) = eager_seq_elems(from_ref)
+    {
+        let mut result = h.get().clone();
+        for elem in elems {
+            result.conj_mut(elem);
+        }
+        return box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(result))));
+    }
+    // Fast path: map target.  `(into {} pairs)` — the very common idiom behind
+    // `(into {} (for …))` map comprehensions — otherwise falls through to the
+    // interpreted `into`, whose lazy realization allocates on the GC heap.  We
+    // build the result in one shot via `MapValue::from_pairs` (last-wins, like
+    // `assoc`, and size-optimal) rather than per-element `assoc` so there are
+    // no intermediate map boxes; the result is region-boxed when a region is
+    // open.  Only taken when every source element is a clean key/value pair
+    // (a 2-element vector/list) or the source is itself a map.
+    if let Value::Map(to_map) = to_ref
+        && let Some(new_pairs) = into_map_pairs(from_ref)
+    {
+        // Existing entries first, then the new pairs so they win on conflict.
+        let mut pairs: Vec<(Value, Value)> =
+            to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.extend(new_pairs);
+        return box_coll_val(Value::Map(MapValue::from_pairs(pairs)));
+    }
     let to_val = to_ref.clone();
     let from_val = from_ref.clone();
     call_global_fn("clojure.core", "into", vec![to_val, from_val])
+}
+
+/// Collect a sequence of key/value pairs from `from` for the map-target `into`
+/// fast path, or `None` if `from` isn't eagerly walkable or any element isn't a
+/// clean 2-element pair (in which case the caller falls back to the
+/// interpreter, which handles map-entries, map merging, and lazy sources).
+fn into_map_pairs(from: &Value) -> Option<Vec<(Value, Value)>> {
+    // A source map contributes its entries directly.
+    if let Value::Map(m) = from {
+        return Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+    let elems = eager_seq_elems(from)?;
+    let mut pairs = Vec::with_capacity(elems.len());
+    for elem in elems {
+        pairs.push(as_pair(&elem)?);
+    }
+    Some(pairs)
+}
+
+/// Extract a `(key, value)` pair from a 2-element vector or list, else `None`.
+fn as_pair(v: &Value) -> Option<(Value, Value)> {
+    match v {
+        Value::Vector(vec) if vec.get().count() == 2 => {
+            Some((vec.get().nth(0)?.clone(), vec.get().nth(1)?.clone()))
+        }
+        Value::List(l) if l.get().count() == 2 => {
+            let mut it = l.get().iter();
+            let k = it.next()?.clone();
+            let val = it.next()?.clone();
+            Some((k, val))
+        }
+        _ => None,
+    }
 }
 
 /// `(into to xform from)`.
@@ -2207,8 +2839,34 @@ pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *cons
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
-    let n = unsafe { val_ref(n) }.clone();
-    let f = unsafe { val_ref(f) }.clone();
+    let n_ref = unsafe { val_ref(n) };
+    let f_ref = unsafe { val_ref(f) };
+    // Fast path: explicit count.  `(repeatedly n f)` with a fixed count is a
+    // finite sequence, so realizing it eagerly into a region-allocated vector
+    // is observationally compatible with the lazy seq for the eager consumers
+    // it is used with (`into`, `count`, `reduce`, `vec`, …) — the same liberty
+    // the eager `mapcat`/`map` fast paths already take.  This keeps the per-
+    // element results in the active region instead of allocating interpreted
+    // lazy-seq cons cells on the GC heap.
+    if let Value::Long(k) = n_ref
+        && *k >= 0
+    {
+        let mut items: Vec<Value> = Vec::with_capacity(*k as usize);
+        for _ in 0..*k {
+            match cljrs_env::callback::invoke(f_ref, vec![]) {
+                Ok(v) => items.push(v),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            }
+        }
+        let pv = PersistentVector::from_iter(items);
+        return box_coll_val(Value::Vector(alloc_inner_coll(pv)));
+    }
+    let n = n_ref.clone();
+    let f = f_ref.clone();
     call_global_fn("clojure.core", "repeatedly", vec![n, f])
 }
 
@@ -2955,5 +3613,21 @@ mod tests {
         let v = unsafe { rt_alloc_vector(elems.as_ptr(), 2) };
         let n = unsafe { rt_count(v) };
         assert!(matches!(unsafe { &*n }, Value::Long(2)));
+    }
+
+    #[test]
+    fn test_count_cons_chain() {
+        // Regression: `count` over a cons/seq chain (e.g. the result of
+        // `filter`/`map`) must walk the chain, not return 0.
+        let nil = rt_const_nil();
+        let c1 = unsafe { rt_alloc_cons(rt_const_long(3), nil) };
+        let c2 = unsafe { rt_alloc_cons(rt_const_long(2), c1) };
+        let c3 = unsafe { rt_alloc_cons(rt_const_long(1), c2) };
+        let n = unsafe { rt_count(c3) };
+        assert!(
+            matches!(unsafe { &*n }, Value::Long(3)),
+            "count of a 3-element cons chain must be 3, got {:?}",
+            unsafe { &*n }
+        );
     }
 }

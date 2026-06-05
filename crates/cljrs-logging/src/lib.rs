@@ -117,6 +117,13 @@ macro_rules! feat_trace {
     };
 }
 
+pub fn set_feature_levels_from_env() -> Result<(), String> {
+    if let Ok(env) = std::env::var("CLJRS_X_FLAG") {
+        parse_x_flag(&env)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

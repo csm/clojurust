@@ -18,16 +18,14 @@ use crate::transients::{
 };
 use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
-use cljrs_env::callback::{capture_eval_context, install_eval_context};
-use cljrs_env::dynamics;
 use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    Agent, AgentFn, AgentMsg, Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo,
-    FutureState, Keyword, LazySeq, MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap,
-    PersistentHashSet, PersistentList, PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk,
-    TypeInstance, Value, ValueError, ValueResult, Volatile,
+    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError,
+    ValueResult, Volatile,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -39,7 +37,6 @@ use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
@@ -343,22 +340,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("ensure-reduced", Arity::Fixed(1), builtin_ensure_reduced),
         ("promise", Arity::Fixed(0), builtin_promise),
         ("deliver", Arity::Fixed(2), builtin_deliver),
-        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
-        (
-            "future-cancelled?",
-            Arity::Fixed(1),
-            builtin_future_cancelled_q,
-        ),
-        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
-        ("future-call*", Arity::Fixed(2), builtin_future_call_star),
-        ("agent", Arity::Fixed(1), builtin_agent),
-        (
-            "await-agent",
-            Arity::Variadic { min: 1 },
-            builtin_await_agent,
-        ),
-        ("agent-error", Arity::Fixed(1), builtin_agent_error),
-        ("restart-agent", Arity::Fixed(2), builtin_restart_agent),
+        // future/agent: not yet implemented — omitted from namespace
+        // future-done?, future-cancelled?, future-cancel, future-call* are stubs
+        // agent, await-agent, agent-error, restart-agent are stubs
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
         (
             "send-off",
@@ -4919,8 +4903,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                 let timeout_val = args[2].clone();
                 let guard = f.get().state.lock().unwrap();
                 match &*guard {
-                    FutureState::Done(v) => Ok(v.clone()),
-                    FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
+                    FutureState::Done(v) => {
+                        f.get().mark_observed();
+                        Ok(v.clone())
+                    }
+                    FutureState::Failed(v) => {
+                        f.get().mark_observed();
+                        Err(ValueError::Thrown(v.clone()))
+                    }
                     FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
                     FutureState::Running => {
                         let (guard, _) = f
@@ -4929,8 +4919,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
                             .unwrap();
                         match &*guard {
-                            FutureState::Done(v) => Ok(v.clone()),
-                            FutureState::Failed(e) => Err(ValueError::Other(e.clone())),
+                            FutureState::Done(v) => {
+                                f.get().mark_observed();
+                                Ok(v.clone())
+                            }
+                            FutureState::Failed(v) => {
+                                f.get().mark_observed();
+                                Err(ValueError::Thrown(v.clone()))
+                            }
                             FutureState::Cancelled => {
                                 Err(ValueError::Other("future was cancelled".into()))
                             }
@@ -4942,8 +4938,14 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                 let mut guard = f.get().state.lock().unwrap();
                 loop {
                     match &*guard {
-                        FutureState::Done(v) => return Ok(v.clone()),
-                        FutureState::Failed(e) => return Err(ValueError::Other(e.clone())),
+                        FutureState::Done(v) => {
+                            f.get().mark_observed();
+                            return Ok(v.clone());
+                        }
+                        FutureState::Failed(v) => {
+                            f.get().mark_observed();
+                            return Err(ValueError::Thrown(v.clone()));
+                        }
                         FutureState::Cancelled => {
                             return Err(ValueError::Other("future was cancelled".into()));
                         }
@@ -6433,6 +6435,8 @@ fn builtin_deliver(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+// These functions are kept for future use but are not currently registered.
+#[allow(dead_code)]
 fn builtin_future_done_q(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Future(f) => Ok(Value::Bool(f.get().is_done())),
@@ -6443,6 +6447,7 @@ fn builtin_future_done_q(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+#[allow(dead_code)]
 fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Future(f) => Ok(Value::Bool(f.get().is_cancelled())),
@@ -6453,6 +6458,7 @@ fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+#[allow(dead_code)]
 fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Future(f) => {
@@ -6470,118 +6476,22 @@ fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn builtin_future_call_star(args: &[Value]) -> ValueResult<Value> {
-    let future = CljxFuture::new();
-    let future_ptr = GcPtr::new(future);
-    let thunk_ptr = future_ptr.clone();
-    let env = match capture_eval_context() {
-        Some(env) => env,
-        None => {
-            return Err(ValueError::Other(
-                "future-call* called without eval context".to_string(),
-            ));
-        }
-    };
-    let func = match &args[0] {
-        Value::Fn(f) => Value::Fn(f.clone()),
-        _ => {
-            return Err(ValueError::WrongType {
-                expected: "fn",
-                got: args[0].type_name().to_string(),
-            });
-        }
-    };
-    let args: Vec<Value> = match &args[1] {
-        Value::Vector(v) => v.get().iter().cloned().collect(),
-        _ => {
-            return Err(ValueError::WrongType {
-                expected: "vector",
-                got: args[1].type_name().to_string(),
-            });
-        }
-    };
-    let captured_bindings = dynamics::capture_current();
-    thread::spawn(move || {
-        install_eval_context(env.0, env.1.clone());
-        dynamics::install_frames(captured_bindings);
-        match cljrs_env::callback::invoke(&func, args) {
-            Ok(result) => {
-                let mut state = thunk_ptr.get().state.lock().unwrap();
-                if matches!(&*state, FutureState::Running) {
-                    *state = FutureState::Done(result);
-                }
-            }
-            Err(e) => {
-                let mut state = thunk_ptr.get().state.lock().unwrap();
-                if matches!(&*state, FutureState::Running) {
-                    *state = FutureState::Failed(format!("{}", e));
-                }
-            }
-        }
-
-        thunk_ptr.get().cond.notify_all();
-    });
-    Ok(Value::Future(future_ptr))
+#[allow(dead_code)]
+fn builtin_future_call_star(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other("future is not yet implemented".into()))
 }
 
-fn builtin_agent(args: &[Value]) -> ValueResult<Value> {
-    let init = args[0].clone();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<AgentMsg>(1024);
-    let state_arc = Arc::new(std::sync::Mutex::new(init.clone()));
-    let error_arc: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
-    let worker_state = state_arc.clone();
-    let worker_error = error_arc.clone();
-    std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            match msg {
-                AgentMsg::Update(f) => {
-                    let cur = worker_state.lock().unwrap().clone();
-                    match f(cur) {
-                        Ok(next) => *worker_state.lock().unwrap() = next,
-                        Err(e) => *worker_error.lock().unwrap() = Some(e),
-                    }
-                }
-                AgentMsg::Shutdown => break,
-            }
-        }
-    });
-    Ok(Value::Agent(GcPtr::new(Agent {
-        state: state_arc,
-        error: error_arc,
-        sender: std::sync::Mutex::new(tx),
-        watches: std::sync::Mutex::new(Vec::new()),
-    })))
+#[allow(dead_code)]
+fn builtin_agent(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::Other("agent is not yet implemented".into()))
 }
 
-fn builtin_await_agent(args: &[Value]) -> ValueResult<Value> {
-    for agent_val in args {
-        match agent_val {
-            Value::Agent(a) => {
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                let sync_fn: AgentFn = Box::new(move |state| {
-                    let _ = tx.send(());
-                    Ok(state)
-                });
-                a.get()
-                    .sender
-                    .lock()
-                    .unwrap()
-                    .send(AgentMsg::Update(sync_fn))
-                    .map_err(|_| ValueError::Other("await-agent: agent is shut down".into()))?;
-                rx.recv()
-                    .map_err(|_| ValueError::Other("await-agent: agent thread died".into()))?;
-            }
-            v => {
-                return Err(ValueError::WrongType {
-                    expected: "agent",
-                    got: v.type_name().to_string(),
-                });
-            }
-        }
-    }
+#[allow(dead_code)]
+fn builtin_await_agent(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Nil)
 }
 
+#[allow(dead_code)]
 fn builtin_agent_error(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Agent(a) => match a.get().get_error() {
@@ -6595,6 +6505,7 @@ fn builtin_agent_error(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+#[allow(dead_code)]
 fn builtin_restart_agent(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Agent(a) => {

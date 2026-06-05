@@ -32,7 +32,9 @@ pub use cancellation::{
 pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
 
 #[cfg(not(feature = "no-gc"))]
-pub use gc_full::{AllocRootGuard, GcHeap, HEAP, push_alloc_frame, trace_thread_alloc_roots};
+pub use gc_full::{
+    AllocRootGuard, GcHeap, HEAP, HeapProxy, push_alloc_frame, trace_thread_alloc_roots,
+};
 #[cfg(feature = "no-gc")]
 pub use nogc_stubs::{
     AllocRootGuard, CONFIG_CANCELLATION, CancellableGuard, GcConfig, GcHeap, GcParked, HEAP,
@@ -53,14 +55,32 @@ pub fn is_static_addr(addr: usize) -> bool {
 // ── Trace trait ───────────────────────────────────────────────────────────────
 
 /// Implemented by every type that can be stored behind a [`GcPtr`].
-pub trait Trace: Send + Sync {
+///
+/// The `gc_size_extra` method accounts for heap bytes owned by the value that
+/// are NOT captured by `size_of::<GcBox<T>>()` (e.g. `Vec` buffers, `String`
+/// capacity, `Form` AST trees stored inline).  The default returns 0, which is
+/// correct for primitives and types with no out-of-line heap.
+///
+/// Rules for implementors of `gc_size_extra`:
+/// - Count only bytes THIS value owns and will free when dropped.
+/// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
+///   separately when it is allocated.
+pub trait Trace {
     fn trace(&self, visitor: &mut MarkVisitor);
+
+    fn gc_size_extra(&self) -> usize {
+        0
+    }
 }
 
 // ── Leaf Trace impls ──────────────────────────────────────────────────────────
 
 impl Trace for String {
     fn trace(&self, _: &mut MarkVisitor) {}
+
+    fn gc_size_extra(&self) -> usize {
+        self.capacity()
+    }
 }
 impl Trace for i64 {
     fn trace(&self, _: &mut MarkVisitor) {}
@@ -83,30 +103,24 @@ impl Trace for num_rational::Ratio<num_bigint::BigInt> {
 impl Trace for regex::Regex {
     fn trace(&self, _: &mut MarkVisitor) {}
 }
-impl Trace for std::sync::Mutex<Vec<i32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
+macro_rules! impl_trace_prim_array {
+    ($t:ty) => {
+        impl Trace for std::sync::Mutex<Vec<$t>> {
+            fn trace(&self, _: &mut MarkVisitor) {}
+            fn gc_size_extra(&self) -> usize {
+                self.lock().unwrap().capacity() * std::mem::size_of::<$t>()
+            }
+        }
+    };
 }
-impl Trace for std::sync::Mutex<Vec<i64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i16>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<i8>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<char>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f64>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<f32>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
-impl Trace for std::sync::Mutex<Vec<bool>> {
-    fn trace(&self, _: &mut MarkVisitor) {}
-}
+impl_trace_prim_array!(i32);
+impl_trace_prim_array!(i64);
+impl_trace_prim_array!(i16);
+impl_trace_prim_array!(i8);
+impl_trace_prim_array!(char);
+impl_trace_prim_array!(f64);
+impl_trace_prim_array!(f32);
+impl_trace_prim_array!(bool);
 
 // ── GcVisitor ─────────────────────────────────────────────────────────────────
 
@@ -126,7 +140,14 @@ mod gc_header {
     use crate::{MarkVisitor, Trace};
     use std::cell::Cell;
 
-    pub(crate) const GC_INITIAL_LIVES: u8 = 10;
+    // Objects start at lives = GC_INITIAL_LIVES - 1.  The mark phase sets
+    // lives = GC_INITIAL_LIVES for reachable objects; sweep frees objects
+    // whose lives reach 0.  A value of 2 gives exactly one cycle of grace:
+    // enough to cover the window between an alloc frame dropping and the
+    // next GC safepoint (where VALUE_ROOTS or a new alloc frame re-roots it).
+    // 10 was chosen conservatively but keeps 9× more garbage in RAM than
+    // necessary, worsening OOM pressure under test suites with many forms.
+    pub(crate) const GC_INITIAL_LIVES: u8 = 2;
 
     #[cfg(debug_assertions)]
     pub(crate) const GC_MAGIC_ALIVE: u64 = 0xCAFE_BABE_DEAD_BEEF;
@@ -137,6 +158,8 @@ mod gc_header {
     pub struct GcBoxHeader {
         #[cfg(debug_assertions)]
         pub(crate) magic: Cell<u64>,
+        /// Exact size of the GcBox<T> allocation in bytes.
+        pub(crate) size: usize,
         pub(crate) lives: Cell<u8>,
         pub(crate) next: Cell<*mut GcBoxHeader>,
         pub(crate) trace_fn: unsafe fn(*const GcBoxHeader, &mut MarkVisitor),
@@ -144,10 +167,11 @@ mod gc_header {
     }
 
     impl GcBoxHeader {
-        pub(crate) fn new<T: Trace + 'static>() -> Self {
+        pub(crate) fn new<T: Trace + 'static>(heap_extra: usize) -> Self {
             Self {
                 #[cfg(debug_assertions)]
                 magic: Cell::new(GC_MAGIC_ALIVE),
+                size: std::mem::size_of::<GcBox<T>>() + heap_extra,
                 lives: Cell::new(GC_INITIAL_LIVES - 1),
                 next: Cell::new(std::ptr::null_mut()),
                 trace_fn: trace_gc_box::<T>,
@@ -250,10 +274,21 @@ impl MarkVisitor {
 impl GcVisitor for MarkVisitor {
     fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
         use gc_header::GC_INITIAL_LIVES;
-        let header = unsafe { &(*ptr.0.as_ptr()).header };
+        // Region-allocated objects are not on the GC heap; their lifetime is
+        // bounded by the enclosing `Region`, not the collector.  Never
+        // dereference one here: once the region's scope ends its memory is
+        // freed/reused, so the header would be garbage and we'd follow a
+        // dangling `trace_fn`.  Live regions are traced as roots separately
+        // (see `region::trace_active_regions`), so a region's heap-allocated
+        // children are still kept alive.
+        if ptr.is_region_alloc() {
+            return;
+        }
+        let raw = ptr.raw();
+        let header = unsafe { &(*raw).header };
         if header.lives.get() < GC_INITIAL_LIVES {
             header.lives.set(GC_INITIAL_LIVES);
-            self.grey.push(ptr.0.as_ptr() as *mut GcBoxHeader);
+            self.grey.push(raw as *mut GcBoxHeader);
         }
     }
 }
@@ -277,8 +312,16 @@ impl GcVisitor for MarkVisitor {
 
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
-unsafe impl<T: Trace + 'static> Send for GcPtr<T> {}
-unsafe impl<T: Trace + 'static> Sync for GcPtr<T> {}
+/// Low pointer bit reserved to mark region-allocated `GcPtr`s in GC builds.
+///
+/// `GcBox<T>` (a `GcBoxHeader` followed by the value) is always ≥8-byte
+/// aligned in GC builds, so bit 0 is free.  Region-allocated pointers set it;
+/// GC-heap pointers leave it clear.  This lets the mark phase distinguish a
+/// region object from a heap object **without dereferencing it** — essential,
+/// because a region whose scope has ended leaves dangling pointers whose
+/// headers point at freed (or reused) memory.
+#[cfg(not(feature = "no-gc"))]
+pub(crate) const REGION_PTR_TAG: usize = 1;
 
 impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(not(feature = "no-gc"))]
@@ -291,11 +334,45 @@ impl<T: Trace + 'static> GcPtr<T> {
         alloc_ctx::alloc_in_ctx(value)
     }
 
+    /// The untagged `GcBox<T>` address.  In GC builds this masks off the
+    /// region-provenance tag bit; in no-gc builds pointers are never tagged.
+    #[inline]
+    fn raw(&self) -> *mut GcBox<T> {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            (self.0.as_ptr() as usize & !REGION_PTR_TAG) as *mut GcBox<T>
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            self.0.as_ptr()
+        }
+    }
+
+    /// `true` if this pointer was bump-allocated in a [`region::Region`]
+    /// rather than the GC heap.  Region objects are not GC-managed.
+    #[cfg(not(feature = "no-gc"))]
+    #[inline]
+    pub fn is_region_alloc(&self) -> bool {
+        (self.0.as_ptr() as usize & REGION_PTR_TAG) != 0
+    }
+
+    /// Construct a region-tagged pointer from a raw `GcBox<T>` allocated in a
+    /// bump region.
+    ///
+    /// # Safety
+    /// `raw` must be a valid, non-null, ≥8-aligned `GcBox<T>` whose header was
+    /// initialised by [`region::Region::alloc`].
+    #[cfg(not(feature = "no-gc"))]
+    #[inline]
+    pub(crate) unsafe fn from_region_raw(raw: *mut GcBox<T>) -> Self {
+        GcPtr(unsafe { NonNull::new_unchecked((raw as usize | REGION_PTR_TAG) as *mut GcBox<T>) })
+    }
+
     pub fn get(&self) -> &T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
             use gc_header::GC_MAGIC_ALIVE;
-            let header = unsafe { &(*self.0.as_ptr()).header };
+            let header = unsafe { &(*self.raw()).header };
             assert_eq!(
                 header.magic.get(),
                 GC_MAGIC_ALIVE,
@@ -303,14 +380,14 @@ impl<T: Trace + 'static> GcPtr<T> {
                 header.magic.get(),
             );
         }
-        unsafe { &(*self.0.as_ptr()).value }
+        unsafe { &(*self.raw()).value }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
             use gc_header::GC_MAGIC_ALIVE;
-            let header = unsafe { &(*self.0.as_ptr()).header };
+            let header = unsafe { &(*self.raw()).header };
             assert_eq!(
                 header.magic.get(),
                 GC_MAGIC_ALIVE,
@@ -318,7 +395,7 @@ impl<T: Trace + 'static> GcPtr<T> {
                 header.magic.get(),
             );
         }
-        unsafe { &mut (*self.0.as_ptr()).value }
+        unsafe { &mut (*self.raw()).value }
     }
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
@@ -344,12 +421,75 @@ impl<T: Trace + 'static> Clone for GcPtr<T> {
 
 impl<T: Trace + 'static + std::fmt::Debug> std::fmt::Debug for GcPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe { (*self.0.as_ptr()).value.fmt(f) }
+        unsafe { (*self.raw()).value.fmt(f) }
     }
 }
 
 impl<T: Trace + 'static> Drop for GcPtr<T> {
     fn drop(&mut self) {}
+}
+
+// =============================================================================
+// StaticGcPtr — Send+Sync pointer to program-lifetime data
+// =============================================================================
+
+/// A raw pointer to a value that lives for the entire program lifetime.
+///
+/// Backed by the global `StaticArena` (in `no-gc` builds) or by `Box::leak`
+/// (in GC builds).  Either way the pointee is never freed and never moved, so
+/// it is safe to share across isolate threads.
+///
+/// `StaticGcPtr<T>` wraps `*const T` — it does **not** involve a `GcBox`
+/// header — so it is independent of the GC build mode and carries no GC
+/// overhead.
+pub struct StaticGcPtr<T: 'static>(NonNull<T>);
+
+// SAFETY: program-lifetime allocations are never moved, freed, or mutated
+// after the initial write.  The stored types (Keyword, Symbol, …) are
+// themselves `Sync` (no unsynchronised interior mutability).
+unsafe impl<T: 'static> Send for StaticGcPtr<T> {}
+unsafe impl<T: 'static> Sync for StaticGcPtr<T> {}
+
+impl<T: 'static> StaticGcPtr<T> {
+    /// Borrow the contained value.
+    pub fn get(&self) -> &T {
+        // SAFETY: pointer is program-lifetime, always valid.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Pointer equality: `true` iff both `StaticGcPtr`s point to the exact
+    /// same allocation (i.e. the same interned entry).
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.0 == b.0
+    }
+}
+
+impl<T: 'static> Clone for StaticGcPtr<T> {
+    fn clone(&self) -> Self {
+        StaticGcPtr(self.0)
+    }
+}
+
+impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { self.0.as_ref().fmt(f) }
+    }
+}
+
+/// Allocate `value` as program-lifetime memory and return a [`StaticGcPtr`].
+///
+/// In `no-gc` builds the allocation comes from the global bump-allocated
+/// `StaticArena` (never freed, no GC header overhead).  In GC builds
+/// `Box::leak` is used instead — the memory lives until the process exits.
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        static_arena::static_alloc_val(value)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))
+    }
 }
 
 // =============================================================================
@@ -367,8 +507,7 @@ mod gc_full {
     use crate::gc_header::GC_INITIAL_LIVES;
     use crate::{GcBox, GcBoxHeader, GcPtr, MarkVisitor, Trace};
 
-    const ESTIMATED_OBJECT_SIZE: usize = 48;
-    type RootTracer = Box<dyn Fn(&mut MarkVisitor) + Send + Sync>;
+    type RootTracer = Box<dyn Fn(&mut MarkVisitor)>;
 
     pub struct GcHeap {
         inner: Mutex<GcHeapInner>,
@@ -377,7 +516,15 @@ mod gc_full {
         total_allocated_bytes: AtomicUsize,
         root_tracers: Mutex<Vec<RootTracer>>,
         gc_suppressed: std::sync::atomic::AtomicBool,
-        last_alloc_root_len: AtomicUsize,
+        /// memory_in_use threshold above which GC is re-enabled after a
+        /// zero-yield collection.  The headroom doubles on each consecutive
+        /// zero-yield cycle (exponential backoff, capped at soft_limit) so a
+        /// long computation where all objects are live doesn't spin in a
+        /// constant GC storm of O(N) sweeps.  Resets to the base headroom
+        /// (soft_limit / 10) once GC actually frees something.
+        suppressed_threshold: AtomicUsize,
+        /// Current headroom used for exponential backoff after zero-yield cycles.
+        zero_yield_headroom: AtomicUsize,
     }
 
     struct GcHeapInner {
@@ -417,7 +564,8 @@ mod gc_full {
                 total_allocated_bytes: AtomicUsize::new(0),
                 root_tracers: Mutex::new(Vec::new()),
                 gc_suppressed: std::sync::atomic::AtomicBool::new(false),
-                last_alloc_root_len: AtomicUsize::new(0),
+                suppressed_threshold: AtomicUsize::new(0),
+                zero_yield_headroom: AtomicUsize::new(0),
             }
         }
 
@@ -425,10 +573,27 @@ mod gc_full {
             *self.config.lock().unwrap() = Some(config);
         }
 
-        pub fn register_root_tracer(
-            &self,
-            tracer: impl Fn(&mut MarkVisitor) + Send + Sync + 'static,
-        ) {
+        pub fn set_config_from_env(&self) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let default_soft_limit: usize = (system_memory::total() / 3) as usize;
+            #[cfg(target_arch = "wasm32")]
+            let default_soft_limit: usize = 64 * 1024 * 1024;
+
+            let soft_limit_mb: usize = match std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => default_soft_limit,
+            };
+            let hard_limit_mb: usize = match std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok() {
+                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
+                None => soft_limit_mb,
+            };
+            self.set_config(Arc::new(GcConfig::with_limits(
+                soft_limit_mb,
+                hard_limit_mb,
+            )));
+        }
+
+        pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static) {
             self.root_tracers.lock().unwrap().push(Box::new(tracer));
         }
 
@@ -450,10 +615,12 @@ mod gc_full {
 
         pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
             crate::cancellation::safepoint();
+            let heap_extra = value.gc_size_extra();
             let gc_box = Box::new(GcBox {
-                header: GcBoxHeader::new::<T>(),
+                header: GcBoxHeader::new::<T>(heap_extra),
                 value,
             });
+            let obj_size = gc_box.header.size; // GcBox<T> size + gc_size_extra()
             let raw: *mut GcBox<T> = Box::into_raw(gc_box);
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -465,20 +632,20 @@ mod gc_full {
                 inner.total_allocated += 1;
             }
             self.total_allocated_bytes
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed);
-            crate::stats::GC_STATS.record_gc_alloc(ESTIMATED_OBJECT_SIZE);
-            let current_usage = self
-                .memory_in_use
-                .fetch_add(ESTIMATED_OBJECT_SIZE, Ordering::Relaxed)
-                + ESTIMATED_OBJECT_SIZE;
+                .fetch_add(obj_size, Ordering::Relaxed);
+            crate::stats::GC_STATS.record_gc_alloc(obj_size);
+            let current_usage =
+                self.memory_in_use.fetch_add(obj_size, Ordering::Relaxed) + obj_size;
 
             if let Some(config) = self.config.lock().unwrap().as_ref()
                 && config.soft_limit_exceeded(current_usage)
             {
                 if self.gc_suppressed.load(Ordering::Relaxed) {
-                    let current_roots = ALLOC_ROOTS.with(|r| r.borrow().len());
-                    let last = self.last_alloc_root_len.load(Ordering::Relaxed);
-                    if current_roots < last {
+                    // Suppression active: only re-enable GC once memory has
+                    // grown past the threshold set by the last zero-yield
+                    // collection (current_memory + soft_limit/10).
+                    let threshold = self.suppressed_threshold.load(Ordering::Relaxed);
+                    if current_usage > threshold {
                         self.gc_suppressed.store(false, Ordering::Relaxed);
                         crate::cancellation::request_gc();
                     }
@@ -503,6 +670,12 @@ mod gc_full {
             let mark_start = std::time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
+            // Active bump regions are additional roots: a live region object
+            // may hold `GcPtr`s into the heap, and those heap objects must not
+            // be collected while the region can still reach them.  The mark
+            // phase skips region objects themselves (they are not heap-managed),
+            // so we trace their children here instead.
+            crate::region::trace_active_regions(&mut visitor);
             cljrs_logging::feat_debug!(
                 "gc",
                 "starting drain with {} grey objects",
@@ -515,18 +688,25 @@ mod gc_full {
             let mut inner = self.inner.lock().unwrap();
             let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
+            // Bytes of objects with lives==0 that will be freed now.
+            let mut freed_bytes: usize = 0;
             let mut current = inner.head;
             while !current.is_null() {
                 let header = unsafe { &*current };
                 let next = header.next.get();
                 let lives = header.lives.get();
+                let obj_size = header.size;
                 if lives >= GC_INITIAL_LIVES {
+                    // Marked reachable this cycle — reset grace counter.
                     header.lives.set(GC_INITIAL_LIVES - 1);
                     live.push(current);
                 } else if lives > 0 {
+                    // In grace period (unreachable but not yet freed).
                     header.lives.set(lives - 1);
                     live.push(current);
                 } else {
+                    // Grace period exhausted — collect now.
+                    freed_bytes += obj_size;
                     dead.push(current);
                 }
                 current = next;
@@ -544,7 +724,10 @@ mod gc_full {
                 header.next.set(inner.head);
                 inner.head = ptr;
             }
-            let freed_bytes = freed_count * ESTIMATED_OBJECT_SIZE;
+            // Decrement memory_in_use by the bytes actually freed.  All heap
+            // objects (live + grace-period) remain counted; only physically
+            // freed objects are subtracted.  This keeps memory pressure
+            // accurate so GC fires again when the heap genuinely grows.
             self.memory_in_use.fetch_sub(freed_bytes, Ordering::Relaxed);
             let sweep_elapsed = sweep_start.elapsed();
             crate::stats::GC_STATS.record_gc_pause(
@@ -564,10 +747,38 @@ mod gc_full {
                 sweep_elapsed
             );
             if freed_count == 0 {
-                let root_len = ALLOC_ROOTS.with(|r| r.borrow().len());
-                self.last_alloc_root_len.store(root_len, Ordering::Relaxed);
+                // Zero-yield collection: exponential-backoff suppression.
+                // Each consecutive zero-yield cycle doubles the headroom before
+                // the next GC attempt (capped at soft_limit/4).  This prevents a
+                // GC storm during deep recursion where all objects are live —
+                // without backoff, GC fires every soft_limit/10 bytes, tracing
+                // the entire live set O(N) times to no benefit.
+                // The headroom resets to soft_limit/10 when GC frees something.
+                // Cap at soft_limit/4 (not soft_limit) so that GC still fires
+                // frequently enough to catch short-lived test allocations after
+                // a long namespace-loading phase of zero-yield cycles.
+                let soft_limit = self
+                    .config
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.soft_limit())
+                    .unwrap_or(64 * 1024 * 1024);
+                let base_headroom = (soft_limit / 10).max(1);
+                let max_headroom = (soft_limit / 4).max(base_headroom);
+                let prev_headroom = self.zero_yield_headroom.load(Ordering::Relaxed);
+                let headroom = if prev_headroom == 0 {
+                    base_headroom
+                } else {
+                    prev_headroom.saturating_mul(2).min(max_headroom)
+                };
+                self.zero_yield_headroom.store(headroom, Ordering::Relaxed);
+                self.suppressed_threshold
+                    .store(post_memory + headroom, Ordering::Relaxed);
                 self.gc_suppressed.store(true, Ordering::Relaxed);
             } else {
+                // GC freed something: reset exponential backoff.
+                self.zero_yield_headroom.store(0, Ordering::Relaxed);
                 self.gc_suppressed.store(false, Ordering::Relaxed);
             }
         }
@@ -593,7 +804,73 @@ mod gc_full {
         }
     }
 
-    pub static HEAP: GcHeap = GcHeap::new();
+    thread_local! {
+        static ISOLATE_HEAP: GcHeap = const { GcHeap::new() };
+    }
+
+    /// Zero-sized proxy that dispatches all heap operations to the calling
+    /// thread's [`GcHeap`] via the `ISOLATE_HEAP` thread-local.
+    ///
+    /// This means every isolate (OS thread) owns an independent heap; GC runs
+    /// fully in parallel on different threads with no cross-isolate coordination.
+    pub struct HeapProxy;
+
+    impl HeapProxy {
+        pub fn alloc<T: Trace + 'static>(&self, value: T) -> GcPtr<T> {
+            ISOLATE_HEAP.with(|h| h.alloc(value))
+        }
+
+        pub fn set_config(&self, config: Arc<GcConfig>) {
+            ISOLATE_HEAP.with(|h| h.set_config(config));
+        }
+
+        pub fn set_config_from_env(&self) {
+            ISOLATE_HEAP.with(|h| h.set_config_from_env());
+        }
+
+        pub fn register_root_tracer(&self, tracer: impl Fn(&mut MarkVisitor) + 'static) {
+            ISOLATE_HEAP.with(|h| h.register_root_tracer(tracer));
+        }
+
+        pub fn trace_registered_roots(&self, visitor: &mut MarkVisitor) {
+            ISOLATE_HEAP.with(|h| h.trace_registered_roots(visitor));
+        }
+
+        pub fn memory_in_use(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.memory_in_use())
+        }
+
+        pub fn count(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.count())
+        }
+
+        pub fn total_allocated(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.total_allocated())
+        }
+
+        pub fn total_freed(&self) -> usize {
+            ISOLATE_HEAP.with(|h| h.total_freed())
+        }
+
+        pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F) {
+            ISOLATE_HEAP.with(|h| h.collect(trace_roots));
+        }
+
+        pub fn collect_auto(&self) -> bool {
+            ISOLATE_HEAP.with(|h| h.collect_auto())
+        }
+
+        #[cfg(test)]
+        pub fn set_memory_in_use(&self, bytes: usize) {
+            ISOLATE_HEAP.with(|h| h.set_memory_in_use(bytes));
+        }
+    }
+
+    // SAFETY: HeapProxy is zero-sized; all state lives in a thread-local GcHeap.
+    // The Send + Sync impls are needed so `pub static HEAP: HeapProxy` is valid.
+    unsafe impl Sync for HeapProxy {}
+
+    pub static HEAP: HeapProxy = HeapProxy;
 
     thread_local! {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
@@ -667,7 +944,7 @@ mod nogc_stubs {
             Self
         }
         pub fn set_config(&self, _: Arc<GcConfig>) {}
-        pub fn register_root_tracer(&self, _: impl Fn(&mut MarkVisitor) + Send + Sync + 'static) {}
+        pub fn register_root_tracer(&self, _: impl Fn(&mut MarkVisitor) + 'static) {}
         pub fn trace_registered_roots(&self, _: &mut MarkVisitor) {}
         pub fn memory_in_use(&self) -> usize {
             0
@@ -812,6 +1089,94 @@ mod tests {
         heap.collect(|vis| vis.visit(&p));
         assert_eq!(heap.count(), 1);
         assert!(!*dropped.lock().unwrap());
+    }
+
+    #[test]
+    fn b1_two_isolates_independent_heaps() {
+        use std::sync::{Arc, Barrier};
+        // Each thread has its own ISOLATE_HEAP; allocations on one do not appear
+        // in the other.
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let h1 = std::thread::Builder::new()
+            .name("isolate-1".into())
+            .spawn(move || {
+                let _mutator = crate::register_mutator();
+                // Allocate 100 objects on this isolate's heap
+                let _ptrs: Vec<_> = (0_i64..100)
+                    .map(|i| crate::gc_full::HEAP.alloc(i))
+                    .collect();
+                b1.wait(); // both threads are now at peak allocation
+                // This isolate has exactly 100 live objects
+                assert_eq!(
+                    crate::gc_full::HEAP.count(),
+                    100,
+                    "isolate-1 heap count should be 100"
+                );
+            })
+            .unwrap();
+
+        let b2 = barrier.clone();
+        let h2 = std::thread::Builder::new()
+            .name("isolate-2".into())
+            .spawn(move || {
+                let _mutator = crate::register_mutator();
+                // Allocate 200 objects on this isolate's heap
+                let _ptrs: Vec<_> = (0_i64..200)
+                    .map(|i| crate::gc_full::HEAP.alloc(i))
+                    .collect();
+                b2.wait();
+                // This isolate has exactly 200 live objects, unaffected by isolate-1
+                assert_eq!(
+                    crate::gc_full::HEAP.count(),
+                    200,
+                    "isolate-2 heap count should be 200"
+                );
+            })
+            .unwrap();
+
+        h1.join().expect("isolate-1 panicked");
+        h2.join().expect("isolate-2 panicked");
+    }
+
+    #[test]
+    fn b1_two_isolates_gc_independently() {
+        // Two threads run allocation-heavy loops and GC their own heaps independently.
+        let h1 = std::thread::Builder::new()
+            .name("gc-isolate-1".into())
+            .spawn(|| {
+                let _mutator = crate::register_mutator();
+                let heap = &crate::gc_full::HEAP;
+                heap.set_config(Arc::new(GcConfig::with_limits(16_384, 65_536)));
+                // Allocate in batches and collect; each collection touches only this heap
+                for _ in 0..5 {
+                    let _ptrs: Vec<_> = (0_i64..50).map(|i| heap.alloc(i)).collect();
+                    // drive a manual collect with no roots so objects are freed
+                    heap.collect(|_| {});
+                    heap.collect(|_| {}); // second pass clears grace-period objects
+                }
+                // After all collections the heap should be empty (or close to it).
+                // We don't assert an exact count because alloc_frame roots may keep
+                // some alive; just assert we can collect without panicking.
+            })
+            .unwrap();
+
+        let h2 = std::thread::Builder::new()
+            .name("gc-isolate-2".into())
+            .spawn(|| {
+                let _mutator = crate::register_mutator();
+                let heap = &crate::gc_full::HEAP;
+                heap.set_config(Arc::new(GcConfig::with_limits(16_384, 65_536)));
+                for _ in 0..5 {
+                    let _ptrs: Vec<_> = (0_i64..50).map(|i| heap.alloc(i)).collect();
+                    heap.collect(|_| {});
+                    heap.collect(|_| {});
+                }
+            })
+            .unwrap();
+
+        h1.join().expect("gc-isolate-1 panicked");
+        h2.join().expect("gc-isolate-2 panicked");
     }
 }
 

@@ -21,3 +21,4 @@ thiserror    = { workspace = true }
 rpds         = { workspace = true }
 uuid         = { workspace = true }
 regex        = { workspace = true }
+arc-swap     = { workspace = true }

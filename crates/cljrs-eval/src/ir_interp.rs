@@ -411,6 +411,60 @@ fn execute_inst(
             let result = interpret_ir(target, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
         }
+
+        // ── Async instructions ───────────────────────────────────────────
+        //
+        // Async IR functions are routed to tree-walking eval_async (via the
+        // `try_ir_path` bypass in apply.rs), so these arms are rarely reached
+        // in practice.  They provide a graceful sync-context fallback for the
+        // cases where they are reached (e.g. in tests or non-async callers).
+        Inst::Await { src, dst } => {
+            // Sync fallback: block the OS thread until the future/promise resolves.
+            let val = regs.get_cloned(*src);
+            let resolved = cljrs_interp::eval::deref_value(val)?;
+            regs.set(*dst, resolved);
+        }
+
+        Inst::Spawn { fn_reg, args, dst } => {
+            // Dispatch through the async runtime hook if available; otherwise error.
+            let callee = regs.get_cloned(*fn_reg);
+            let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
+            let result = if let Some(rt) = globals.async_runtime() {
+                // Build a minimal env carrying globals; run_async_fn will construct
+                // the closure env from the callee's captured bindings.
+                let spawn_env = Env::new(globals.clone(), ns);
+                rt.spawn_async_call(callee, arg_vals, spawn_env)
+            } else {
+                return Err(EvalError::Runtime(
+                    "IR interpreter: Spawn instruction requires async runtime (cljrs-async)".into(),
+                ));
+            };
+            regs.set(*dst, result);
+        }
+
+        Inst::ChanTake { chan, dst } => {
+            let chan_val = regs.get_cloned(*chan);
+            let result = if let Some(rt) = globals.async_runtime() {
+                rt.chan_take_blocking(chan_val)?
+            } else {
+                return Err(EvalError::Runtime(
+                    "IR interpreter: ChanTake requires async runtime (cljrs-async)".into(),
+                ));
+            };
+            regs.set(*dst, result);
+        }
+
+        Inst::ChanPut { chan, val } => {
+            let chan_val = regs.get_cloned(*chan);
+            let put_val = regs.get_cloned(*val);
+            if let Some(rt) = globals.async_runtime() {
+                rt.chan_put_blocking(chan_val, put_val)?;
+            } else {
+                return Err(EvalError::Runtime(
+                    "IR interpreter: ChanPut requires async runtime (cljrs-async)".into(),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -659,6 +713,7 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
         next_block: f.next_block,
         span: f.span.clone(),
         subfunctions: f.subfunctions.iter().map(clone_ir_function).collect(),
+        is_async: f.is_async,
     }
 }
 
@@ -811,6 +866,26 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
         KnownFn::Count => builtin_call_native("count", &args),
+        KnownFn::CountFilter => {
+            // Synthesized fused op == (count (filter pred coll)).
+            let filter_fn = load_builtin(env, "filter")?;
+            let seq = apply_value(&filter_fn, args, env)?;
+            builtin_call_native("count", &[seq])
+        }
+        KnownFn::IntoFilter | KnownFn::IntoMapcat | KnownFn::IntoMap => {
+            // Synthesized fused ops == (into to (filter|mapcat|map f coll)).
+            let hof = match known_fn {
+                KnownFn::IntoFilter => "filter",
+                KnownFn::IntoMapcat => "mapcat",
+                _ => "map",
+            };
+            let mut args = args;
+            let to = args.remove(0);
+            let hof_fn = load_builtin(env, hof)?;
+            let seq = apply_value(&hof_fn, args, env)?;
+            let into_fn = load_builtin(env, "into")?;
+            apply_value(&into_fn, vec![to, seq], env)
+        }
         KnownFn::Contains => builtin_call_native("contains?", &args),
         KnownFn::Assoc => builtin_call_native("assoc", &args),
         KnownFn::Dissoc => builtin_call_native("dissoc", &args),
@@ -1241,6 +1316,7 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             &arity.body,
             &f.defining_ns,
             env,
+            f.is_async,
         ) {
             Ok(ir_func) => {
                 crate::ir_cache::store_cached(arity_id, Arc::new(ir_func));

@@ -147,6 +147,23 @@ fn clone_inst(
             name.clone(),
             args.iter().map(|&v| rv(var_map, v)).collect(),
         ),
+        Inst::Await { src, dst } => Inst::Await {
+            src: rv(var_map, *src),
+            dst: rv(var_map, *dst),
+        },
+        Inst::Spawn { fn_reg, args, dst } => Inst::Spawn {
+            fn_reg: rv(var_map, *fn_reg),
+            args: args.iter().map(|&v| rv(var_map, v)).collect(),
+            dst: rv(var_map, *dst),
+        },
+        Inst::ChanTake { chan, dst } => Inst::ChanTake {
+            chan: rv(var_map, *chan),
+            dst: rv(var_map, *dst),
+        },
+        Inst::ChanPut { chan, val } => Inst::ChanPut {
+            chan: rv(var_map, *chan),
+            val: rv(var_map, *val),
+        },
     }
 }
 
@@ -330,7 +347,7 @@ fn do_inline(
             vec![Inst::Phi(call_dst, return_sites)]
         },
         insts: post_insts,
-        terminator: post_term,
+        terminator: post_term.clone(),
     };
 
     // ── Append cloned + continuation blocks ─────────────────────────────────
@@ -338,7 +355,44 @@ fn do_inline(
     caller.blocks.extend(cloned_blocks);
     caller.blocks.push(cont_block);
 
+    // ── Fix up stale phi predecessors ────────────────────────────────────────
+    // B_pre's old terminator pointed to some successor block(s) (e.g. an
+    // epilogue phi-return block created by ANF lowering).  Those blocks still
+    // have phi entries recording B_pre as a predecessor, but after the split
+    // B_pre jumps into the callee — it is B_post (cont_id) that now jumps to
+    // those successors.  Rewrite every such phi entry to name cont_id instead.
+    let bpre_id = caller.blocks[block_idx].id;
+    let post_targets = terminator_targets(&post_term);
+    for target_id in post_targets {
+        if let Some(blk) = caller.blocks.iter_mut().find(|b| b.id == target_id) {
+            for inst in &mut blk.phis {
+                if let Inst::Phi(_, entries) = inst {
+                    for (pred, _) in entries.iter_mut() {
+                        if *pred == bpre_id {
+                            *pred = cont_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     caller
+}
+
+/// Collect the block IDs that a terminator may jump to (excluding RecurJump
+/// targets, which are back-edges that cannot carry stale phi predecessors in
+/// this context).
+fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
+    match term {
+        Terminator::Jump(b) => vec![*b],
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::Return(_) | Terminator::RecurJump { .. } | Terminator::Unreachable => vec![],
+    }
 }
 
 // ── Pass driver ──────────────────────────────────────────────────────────────

@@ -1,0 +1,29 @@
+;; clojure.rust.net.udp — UDP datagram sockets.
+;;
+;; A UDP socket is a map:
+;;   {:in          <chan>   ; yields {:data <byte-array> :addr "ip:port"}
+;;    :out         <chan>   ; put {:data <byte-array> :addr "ip:port"}
+;;    :local-addr  "ip:port"
+;;    :resource    <handle>}
+;;
+;; Native builtins (registered from Rust):
+;;   socket  — (socket {:port p}) => socket-map
+;;   close   — (close sock) => nil
+;;
+;; Usage:
+;;
+;;   ;; Echo responder
+;;   (let [s (clojure.rust.net.udp/socket {:port 9000})]
+;;     (clojure.core.async/go
+;;       (loop []
+;;         (when-let [{:keys [data addr]} (await (clojure.core.async/take! (:in s)))]
+;;           (await (clojure.core.async/put! (:out s) {:data data :addr addr}))
+;;           (recur))))
+;;     s)
+;;
+;;   ;; Send a datagram
+;;   (await (clojure.core.async/put! (:out s) {:data some-bytes :addr "1.2.3.4:5000"}))
+;;
+;;   ;; Receive a datagram
+;;   (let [{:keys [data addr]} (await (clojure.core.async/take! (:in s)))]
+;;     (println "got" (count data) "bytes from" addr))

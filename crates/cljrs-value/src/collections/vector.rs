@@ -95,6 +95,12 @@ impl cljrs_gc::Trace for PersistentVector {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Per element: Arc<T> allocation (16 overhead) + thin ptr in leaf node (8).
+        let n = self.inner.len();
+        n * (24 + std::mem::size_of::<Value>())
+    }
 }
 
 #[cfg(test)]

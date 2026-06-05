@@ -183,6 +183,12 @@ enum Commands {
         #[arg(long)]
         release: bool,
     },
+    /// Run the clojurust language server (LSP) over stdio.
+    ///
+    /// Speaks the Language Server Protocol on stdin/stdout for editor
+    /// integration, providing parse diagnostics and a document-symbol outline
+    /// for `.cljrs` / `.cljc` files. Editors normally launch this for you.
+    Lsp,
 }
 
 #[derive(Subcommand)]
@@ -252,12 +258,23 @@ fn main() -> miette::Result<()> {
         .spawn(move || {
             #[cfg(feature = "async")]
             {
+                // Build the single-threaded runtime + LocalSet that every async
+                // task (core.async producers, ^:async calls, cljrs-io readers)
+                // runs on, and stash it so `eval_in` can drive each top-level
+                // form on it. We deliberately do *not* wrap `run` in a single
+                // `block_on`/`run_until`: top-level evaluation is synchronous
+                // (it reads stdin, dispatches commands), and each form is driven
+                // individually via `LocalSet::block_on`, which would panic if
+                // nested inside an outer `block_on`.
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("failed to build Tokio runtime");
                 let local = tokio::task::LocalSet::new();
-                rt.block_on(local.run_until(async move { run(cli) }))
+                ASYNC_DRIVER.with(|d| *d.borrow_mut() = Some(AsyncDriver { rt, local }));
+                let result = run(cli);
+                ASYNC_DRIVER.with(|d| *d.borrow_mut() = None);
+                result
             }
             #[cfg(not(feature = "async"))]
             run(cli)
@@ -385,6 +402,13 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             DepsCommands::Status => run_deps_status(),
         },
         Commands::BuildNative { release } => run_build_native(release),
+        Commands::Lsp => {
+            // cljrs-lsp owns its own runtime; this is safe because `run` never
+            // enters the interpreter's async driver runtime.
+            cljrs_lsp::run_stdio_blocking()
+                .map_err(|e| miette::miette!("lsp server error: {e}"))?;
+            Ok(0)
+        }
     }
 }
 
@@ -460,8 +484,26 @@ fn setup_globals(
     if let Ok(cwd) = std::env::current_dir() {
         apply_deps_config(&globals, &cwd);
     }
+    // Initialise async inside the LocalSet so `cljrs_async::init` can spawn its
+    // background GC-service task (it calls `spawn_local`, which requires a
+    // LocalSet context). The task persists on the LocalSet and is serviced by
+    // each subsequent per-form drive in `eval_form`.
     #[cfg(feature = "async")]
-    cljrs_async::init(&globals);
+    ASYNC_DRIVER.with(|d| {
+        let guard = d.borrow();
+        let init = |g: &Arc<GlobalEnv>| {
+            cljrs_async::init(g);
+            cljrs_io::init(g);
+            #[cfg(feature = "net")]
+            cljrs_net::init(g);
+            #[cfg(feature = "charset")]
+            cljrs_charset::init(g);
+        };
+        match guard.as_ref() {
+            Some(drv) => drv.local.block_on(&drv.rt, async { init(&globals) }),
+            None => init(&globals),
+        }
+    });
     globals
 }
 
@@ -559,9 +601,54 @@ fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
     let mut result = Value::Nil;
     for form in forms {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        result = eval(&form, env).map_err(format_eval_error)?;
+        result = eval_form(&form, env).map_err(format_eval_error)?;
     }
     Ok(result)
+}
+
+/// The Tokio runtime + `LocalSet` that drive async evaluation, set up once in
+/// `main` and reused for the lifetime of the process.
+#[cfg(feature = "async")]
+struct AsyncDriver {
+    rt: tokio::runtime::Runtime,
+    local: tokio::task::LocalSet,
+}
+
+#[cfg(feature = "async")]
+thread_local! {
+    static ASYNC_DRIVER: std::cell::RefCell<Option<AsyncDriver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Evaluate a single top-level form.
+///
+/// With the `async` feature, the form is driven on the shared `LocalSet` via
+/// [`tokio::task::LocalSet::block_on`], so spawned tasks — core.async channel
+/// producers, `^:async` calls, the `cljrs-io` readers/writers — make progress
+/// and a top-level `await` resolves. Tasks that outlive a form (e.g. a producer
+/// feeding a channel `def`d in one REPL line and consumed in the next) stay
+/// queued on the `LocalSet` and continue on the next form's drive. Without the
+/// feature it is a plain synchronous `eval`.
+#[cfg(feature = "async")]
+#[allow(clippy::result_large_err)]
+fn eval_form(form: &cljrs_reader::Form, env: &mut Env) -> Result<Value, EvalError> {
+    ASYNC_DRIVER.with(|d| {
+        let guard = d.borrow();
+        match guard.as_ref() {
+            Some(drv) => drv
+                .local
+                .block_on(&drv.rt, cljrs_async::eval_async::eval_async(form, env)),
+            // No driver installed (shouldn't happen once `main` runs): fall back
+            // to a synchronous evaluation rather than panicking.
+            None => eval(form, env),
+        }
+    })
+}
+
+#[cfg(not(feature = "async"))]
+#[allow(clippy::result_large_err)]
+fn eval_form(form: &cljrs_reader::Form, env: &mut Env) -> Result<Value, EvalError> {
+    eval(form, env)
 }
 
 fn format_eval_error(e: EvalError) -> miette::Report {
@@ -947,6 +1034,16 @@ fn run_tests_command(
 
     for ns in &namespaces {
         let result = run_single_ns_tests(&mut env, ns);
+        // Remove the namespace after testing so its closures and form-trees can
+        // be reclaimed by GC.  Without this all 233 namespaces accumulate
+        // simultaneously and peak RSS can exceed 15 GB.
+        // Two force_collect calls are required: GC_INITIAL_LIVES=2 means an
+        // unreachable object survives one cycle in the grace period before being
+        // freed on the second cycle.
+        env.globals.namespaces.write().unwrap().remove(ns.as_str());
+        env.globals.loaded.lock().unwrap().remove(ns.as_str());
+        cljrs_eval::force_collect(&env);
+        cljrs_eval::force_collect(&env);
         results.push(result);
     }
 

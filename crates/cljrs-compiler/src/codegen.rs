@@ -23,6 +23,7 @@ use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Term
 pub enum CodegenError {
     Module(cranelift_module::ModuleError),
     Codegen(String),
+    UnsupportedInst(String),
 }
 
 impl From<cranelift_module::ModuleError> for CodegenError {
@@ -65,6 +66,10 @@ struct RuntimeFuncs {
     rt_alloc_cons: FuncId,
     rt_get: FuncId,
     rt_count: FuncId,
+    rt_count_filter: FuncId,
+    rt_into_filter: FuncId,
+    rt_into_mapcat: FuncId,
+    rt_into_map: FuncId,
     rt_first: FuncId,
     rt_rest: FuncId,
     rt_assoc: FuncId,
@@ -715,6 +720,19 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
+
+            // Async instructions are not compiled to native code in Phase H.
+            // Async IrFunctions are excluded from AOT by the caller (any function
+            // with `is_async = true` should not reach the codegen pipeline yet).
+            Inst::Await { .. }
+            | Inst::Spawn { .. }
+            | Inst::ChanTake { .. }
+            | Inst::ChanPut { .. } => {
+                return Err(CodegenError::UnsupportedInst(
+                    "async instructions (Await/Spawn/ChanTake/ChanPut) require JIT compilation"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1131,6 +1149,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             KnownFn::Gte => self.rt.rt_gte,
             KnownFn::Get => self.rt.rt_get,
             KnownFn::Count => self.rt.rt_count,
+            KnownFn::CountFilter => self.rt.rt_count_filter,
+            KnownFn::IntoFilter => self.rt.rt_into_filter,
+            KnownFn::IntoMapcat => self.rt.rt_into_mapcat,
+            KnownFn::IntoMap => self.rt.rt_into_map,
             KnownFn::First => self.rt.rt_first,
             KnownFn::Rest | KnownFn::Next => self.rt.rt_rest,
             KnownFn::Assoc => self.rt.rt_assoc,
@@ -1471,6 +1493,10 @@ fn declare_runtime_funcs(
         rt_alloc_cons: declare_rt(module, "rt_alloc_cons", &[ptr, ptr], ptr)?,
         rt_get: declare_rt(module, "rt_get", &[ptr, ptr], ptr)?,
         rt_count: declare_rt(module, "rt_count", &[ptr], ptr)?,
+        rt_count_filter: declare_rt(module, "rt_count_filter", &[ptr, ptr], ptr)?,
+        rt_into_filter: declare_rt(module, "rt_into_filter", &[ptr, ptr, ptr], ptr)?,
+        rt_into_mapcat: declare_rt(module, "rt_into_mapcat", &[ptr, ptr, ptr], ptr)?,
+        rt_into_map: declare_rt(module, "rt_into_map", &[ptr, ptr, ptr], ptr)?,
         rt_first: declare_rt(module, "rt_first", &[ptr], ptr)?,
         rt_rest: declare_rt(module, "rt_rest", &[ptr], ptr)?,
         rt_assoc: declare_rt(module, "rt_assoc", &[ptr, ptr, ptr], ptr)?,

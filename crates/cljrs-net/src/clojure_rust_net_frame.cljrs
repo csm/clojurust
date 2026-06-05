@@ -1,0 +1,85 @@
+;; clojure.rust.net.frame — framing transducers and pipe-fns.
+;;
+;; Native primitives registered from Rust:
+;;   lines              — (lines) => framer-spec
+;;   by-delimiter       — (by-delimiter b) => framer-spec
+;;   length-prefixed    — (length-prefixed {:bytes n :endian :big}) => framer-spec
+;;   frame              — (frame in-chan spec-or-fn) => out-chan of messages
+;;   lines-encode       — (lines-encode str) => byte-array (UTF-8 + \n)
+;;   length-prefixed-encode — (length-prefixed-encode ba opts) => byte-array (header + data)
+;;
+;; The `frame` function accepts either:
+;;   - A native framer spec ((lines), (by-delimiter b), (length-prefixed opts))
+;;   - A Clojure pipe function (fn [in-chan] -> out-chan)
+;;
+;; This means new framers can be written entirely in Clojure without touching
+;; any Rust code:
+;;
+;;   (defn crlf-framer [in-chan]
+;;     "Decode a CRLF line protocol."
+;;     (let [out (clojure.core.async/chan 8)]
+;;       (clojure.core.async/go
+;;         (loop [buf ""]
+;;           (let [chunk (await (clojure.core.async/take! in-chan))]
+;;             (if (nil? chunk)
+;;               (do
+;;                 (when (seq buf) (await (clojure.core.async/put! out buf)))
+;;                 (clojure.core.async/close! out))
+;;               (let [s (String. chunk "UTF-8")
+;;                     combined (str buf s)]
+;;                 (loop [s combined]
+;;                   (let [pos (.indexOf s "\r\n")]
+;;                     (if (neg? pos)
+;;                       (recur combined)  ;; no complete line yet, wait for more
+;;                       (do
+;;                         (await (clojure.core.async/put! out (subs s 0 pos)))
+;;                         (recur (subs s (+ pos 2))))))))))))
+;;       out))
+;;
+;;   ;; Use it just like a native framer spec:
+;;   (let [msgs (frame (:in conn) crlf-framer)]
+;;     (go-loop [] (when-let [m (<! msgs)] (handle m) (recur))))
+;;
+;; Usage — native specs:
+;;
+;;   (let [msgs (frame (:in conn) (lines))]
+;;     (go-loop []
+;;       (when-let [m (<! msgs)]
+;;         (handle m)
+;;         (recur))))
+;;
+;; Usage — encode side:
+;;
+;;   ;; Line protocol:
+;;   (>! (:out conn) (lines-encode "hello"))
+;;
+;;   ;; Length-prefixed protocol:
+;;   (>! (:out conn) (length-prefixed-encode msg-bytes {:bytes 4}))
+
+(defn pipe-map
+  "Create a new channel that contains the result of applying `f` to each value
+  from `in-chan`. Closes when `in-chan` closes. Errors on `in-chan` are forwarded
+  unchanged. `out-buf` controls the output channel buffer depth (default 8).
+
+  This is the async pipe-fn pattern: (fn [in-chan] -> out-chan)."
+  ([in-chan f]
+   (pipe-map in-chan f 8))
+  ([in-chan f out-buf]
+   (let [out (clojure.core.async/chan out-buf)]
+     (clojure.core.async/go
+       (loop []
+         (let [v (await (clojure.core.async/take! in-chan))]
+           (cond
+             (nil? v)
+             (clojure.core.async/close! out)
+
+             (clojure.rust.error/error? v)
+             (do
+               (await (clojure.core.async/put! out v))
+               (clojure.core.async/close! out))
+
+             :else
+             (do
+               (await (clojure.core.async/put! out (f v)))
+               (recur))))))
+     out)))

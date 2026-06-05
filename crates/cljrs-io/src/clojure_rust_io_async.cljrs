@@ -1,0 +1,17 @@
+;; clojure.rust.io.async — Clojure-level helpers over the native async I/O
+;; primitives. The reading/writing functions themselves (chunk-chan, byte-chan,
+;; char-chan, line-chan, slurp, slurp-bytes, read-bytes, spit) are registered
+;; natively by cljrs-io; this file adds small conveniences on top.
+
+;; Results are delivered on core.async channels. A failed I/O step delivers an
+;; error value (an exception) on the channel instead of a normal result; use
+;; `error?` to distinguish the two after taking a value.
+(defn error?
+  "True if x is an I/O error value delivered on a result channel."
+  [x]
+  (instance? Exception x))
+
+(defn ok?
+  "True if x is a non-error, non-nil result value."
+  [x]
+  (and (some? x) (not (error? x))))

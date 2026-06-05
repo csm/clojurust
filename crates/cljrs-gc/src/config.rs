@@ -158,11 +158,12 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
-/// Coordination state for stop-the-world GC.
+/// Per-isolate coordination state for stop-the-world GC.
 ///
+/// Each OS thread (isolate) has its own instance in a thread-local.
 /// Tracks how many mutator threads are registered, how many have parked
 /// at safepoints, and whether a GC has been requested or is in progress.
-pub struct GcCancellation {
+pub(crate) struct IsolateCancellation {
     /// Whether a GC collection is currently in progress (STW phase).
     in_progress: AtomicBool,
     /// Number of threads currently parked at a safepoint.
@@ -174,9 +175,8 @@ pub struct GcCancellation {
     gc_requested: AtomicBool,
 }
 
-impl GcCancellation {
-    /// Create a new cancellation coordinator.
-    pub const fn new() -> Self {
+impl IsolateCancellation {
+    const fn new() -> Self {
         Self {
             in_progress: AtomicBool::new(false),
             parked_threads: AtomicUsize::new(0),
@@ -185,72 +185,152 @@ impl GcCancellation {
         }
     }
 
-    /// Check if a GC is currently in progress.
-    pub fn in_progress(&self) -> bool {
+    fn in_progress(&self) -> bool {
         self.in_progress.load(Ordering::SeqCst)
     }
 
-    /// Increment the parked thread count.
-    pub fn park(&self) {
+    fn park(&self) {
         self.parked_threads.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Decrement the parked thread count.
-    pub fn unpark(&self) {
+    fn unpark(&self) {
         self.parked_threads.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Get the number of parked threads.
-    pub fn parked_threads(&self) -> usize {
+    fn parked_threads(&self) -> usize {
         self.parked_threads.load(Ordering::SeqCst)
     }
 
-    /// Set whether GC is in progress.
-    pub fn set_in_progress(&self, value: bool) {
+    fn set_in_progress(&self, value: bool) {
         self.in_progress.store(value, Ordering::SeqCst);
     }
 
-    /// Atomically try to set `in_progress` from `false` to `true`.
-    /// Returns `true` if this thread won the race, `false` if another
-    /// thread is already collecting.
-    pub fn try_begin_collection(&self) -> bool {
+    fn try_begin_collection(&self) -> bool {
         self.in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
-    /// Register a mutator thread. Must be called before the thread begins
-    /// executing Clojure code (interpreter or AOT).
-    pub fn register_thread(&self) {
+    fn register_thread(&self) {
         self.registered_threads.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Unregister a mutator thread. Must be called when the thread is done
-    /// executing Clojure code.
-    pub fn unregister_thread(&self) {
+    fn unregister_thread(&self) {
         self.registered_threads.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Get the number of registered mutator threads.
-    pub fn registered_threads(&self) -> usize {
+    fn registered_threads(&self) -> usize {
         self.registered_threads.load(Ordering::SeqCst)
     }
 
-    /// Request a GC collection. The next interpreter safepoint will initiate it.
-    pub fn request_gc(&self) {
+    fn request_gc(&self) {
         self.gc_requested.store(true, Ordering::SeqCst);
     }
 
-    /// Check and clear the GC request flag. Returns true if a GC was requested.
-    pub fn take_gc_request(&self) -> bool {
+    fn take_gc_request(&self) -> bool {
         self.gc_requested.swap(false, Ordering::SeqCst)
     }
 
-    /// Check if a GC has been requested but not yet started.
-    pub fn gc_requested(&self) -> bool {
+    fn gc_requested(&self) -> bool {
         self.gc_requested.load(Ordering::SeqCst)
     }
 }
+
+thread_local! {
+    static ISOLATE_CANCELLATION: IsolateCancellation = const { IsolateCancellation::new() };
+}
+
+/// Invoke `f` with a reference to this thread's `IsolateCancellation`.
+pub(crate) fn with_cancellation<T>(f: impl FnOnce(&IsolateCancellation) -> T) -> T {
+    ISOLATE_CANCELLATION.with(f)
+}
+
+/// Zero-sized proxy that dispatches every GC-coordination method to the
+/// calling thread's [`IsolateCancellation`] via `with_cancellation`.
+///
+/// Keeping the public API as a `pub static GC_CANCELLATION: GcCancellation`
+/// preserves all existing call sites while making the underlying state
+/// per-isolate (thread-local).
+pub struct GcCancellation;
+
+impl GcCancellation {
+    /// Create the zero-sized proxy.  The actual state lives in a thread-local.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Check if a GC is currently in progress on this thread's isolate.
+    pub fn in_progress(&self) -> bool {
+        with_cancellation(|c| c.in_progress())
+    }
+
+    /// Increment the parked thread count for this isolate.
+    pub fn park(&self) {
+        with_cancellation(|c| c.park());
+    }
+
+    /// Decrement the parked thread count for this isolate.
+    pub fn unpark(&self) {
+        with_cancellation(|c| c.unpark());
+    }
+
+    /// Get the number of parked threads for this isolate.
+    pub fn parked_threads(&self) -> usize {
+        with_cancellation(|c| c.parked_threads())
+    }
+
+    /// Set whether GC is in progress on this isolate.
+    pub fn set_in_progress(&self, value: bool) {
+        with_cancellation(|c| c.set_in_progress(value));
+    }
+
+    /// Atomically try to set `in_progress` from `false` to `true` on this isolate.
+    /// Returns `true` if this thread won the race, `false` if another
+    /// thread is already collecting.
+    pub fn try_begin_collection(&self) -> bool {
+        with_cancellation(|c| c.try_begin_collection())
+    }
+
+    /// Register a mutator thread on this isolate. Must be called before the
+    /// thread begins executing Clojure code (interpreter or AOT).
+    pub fn register_thread(&self) {
+        with_cancellation(|c| c.register_thread());
+    }
+
+    /// Unregister a mutator thread on this isolate. Must be called when the
+    /// thread is done executing Clojure code.
+    pub fn unregister_thread(&self) {
+        with_cancellation(|c| c.unregister_thread());
+    }
+
+    /// Get the number of registered mutator threads on this isolate.
+    pub fn registered_threads(&self) -> usize {
+        with_cancellation(|c| c.registered_threads())
+    }
+
+    /// Request a GC collection on this isolate. The next interpreter safepoint
+    /// will initiate it.
+    pub fn request_gc(&self) {
+        with_cancellation(|c| c.request_gc());
+    }
+
+    /// Check and clear the GC request flag for this isolate. Returns true if a
+    /// GC was requested.
+    pub fn take_gc_request(&self) -> bool {
+        with_cancellation(|c| c.take_gc_request())
+    }
+
+    /// Check if a GC has been requested but not yet started on this isolate.
+    pub fn gc_requested(&self) -> bool {
+        with_cancellation(|c| c.gc_requested())
+    }
+}
+
+// SAFETY: GcCancellation is zero-sized and carries no data; all state is in
+// a thread-local. The Send + Sync impls are needed so the static can be
+// referenced from any thread.
+unsafe impl Sync for GcCancellation {}
+unsafe impl Send for GcCancellation {}
 
 impl Default for GcCancellation {
     fn default() -> Self {
@@ -258,10 +338,11 @@ impl Default for GcCancellation {
     }
 }
 
-/// Global GC cancellation coordinator.
+/// Global GC cancellation coordinator (dispatches to per-isolate thread-local).
 pub static GC_CANCELLATION: GcCancellation = GcCancellation::new();
 
-/// Check if a GC is in progress and the current thread should park.
+/// Check if a GC is in progress on this thread's isolate and return an error
+/// if so.
 ///
 /// Returns `Ok(())` if execution can continue, `Err(GcParked)` if the
 /// thread should park until GC completes.

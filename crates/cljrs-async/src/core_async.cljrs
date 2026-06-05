@@ -1,8 +1,9 @@
 ;; clojure.core.async — Clojure-level definitions.
 ;;
 ;; Native primitives (timeout, alts, chan, take!, put!, close!, poll!, offer!,
-;; async-spawn) are registered from Rust before this file is evaluated. This
-;; file adds the macros built on top of them.
+;; async-spawn, join-all, thread-call, onto-chan!, to-chan!, mult, tap!,
+;; untap!, untap-all!, <!!, >!!) are registered from Rust before this file is
+;; evaluated. This file adds the macros and higher-level functions built on top.
 
 ;; (go body...)
 ;;
@@ -23,6 +24,114 @@
         futs     (vec (map first pairs))
         handlers (vec (map second pairs))
         r        (gensym "alt_r__")]
-    (list 'let (vector r (list 'await (list 'alts futs)))
+    (list 'let (vector r (list 'await (list 'clojure.core.async/alts futs)))
           (list (list 'nth handlers (list 'second r))
                 (list 'first r)))))
+
+;; ── Phase F: higher-level async utilities ─────────────────────────────────────
+
+;; (async-pmap f coll)
+;;
+;; Map an ^:async function `f` over `coll` concurrently, collecting all results
+;; into a vector. Each element is dispatched as an independent async task; all
+;; tasks run in parallel on the LocalSet. An error in any task propagates.
+(defn ^:async async-pmap [f coll]
+  (let [futs (map (fn [x] (async-spawn (fn ^:async [] (await (f x))))) coll)]
+    (await (join-all futs))))
+
+;; (thread body...)
+;;
+;; Run `body` as an async task, returning a channel that delivers the result.
+;; Analogous to clojure.core.async/thread but backed by the LocalSet executor.
+(defmacro thread [& body]
+  (list 'clojure.core.async/thread-call
+        (cons 'fn (cons [] body))))
+
+;; (merge chs)
+;;
+;; Merge multiple input channels into a single output channel. Each input
+;; channel is consumed by a go block that relays values to `out`. When all
+;; input channels close, `out` is automatically closed. Returns `out`.
+(defn merge [chs]
+  (let [n         (count chs)
+        out       (chan n)
+        remaining (atom n)]
+    (doseq [ch chs]
+      (go (loop []
+            (let [v (await (take! ch))]
+              (if (nil? v)
+                (when (= (swap! remaining dec) 0)
+                  (close! out))
+                (do (await (put! out v))
+                    (recur)))))))
+    out))
+
+;; (reduce f init ch)
+;;
+;; Fold all values from channel `ch` through `(f acc v)`, starting with `init`.
+;; Returns the final accumulator when `ch` closes. Must be called inside an
+;; ^:async context (it awaits each value).
+(defn ^:async reduce [f init ch]
+  (loop [acc init]
+    (let [v (await (take! ch))]
+      (if (nil? v)
+        acc
+        (recur (f acc v))))))
+
+;; (into coll ch)
+;;
+;; Drain channel `ch` into collection `coll` using `conj`, returning the grown
+;; collection. Must be called inside an ^:async context.
+(defn ^:async into [coll ch]
+  (await (reduce conj coll ch)))
+
+;; ── Error propagation: the `<?` family ────────────────────────────────────────
+;;
+;; Channel APIs deliver failures in band (an error value on the channel). The
+;; `<?` family is the consumption-side sugar: take a value and, if it is an
+;; error, throw it — otherwise return it. This mirrors Rust's `?`: `<?` is
+;; unwrap-or-short-circuit (the short-circuit is a throw that unwinds to the
+;; nearest try / go-try), and `go-try` is the boundary that catches the throw
+;; and turns it back into an in-band error on its result channel, so a pipeline
+;; of channels propagates errors automatically.
+;;
+;; `throw-err`/`error?`/`ok?` live in clojure.rust.error.
+
+;; (<? ch)
+;;
+;; Async take: `(await (take! ch))`, then throw if the value is an error. Use
+;; inside a go / ^:async body.
+(defmacro <? [ch]
+  (list 'clojure.rust.error/throw-err
+        (list 'await (list 'clojure.core.async/take! ch))))
+
+;; (<?? ch)
+;;
+;; Blocking take: `(<!! ch)`, then throw if the value is an error. The
+;; synchronous / REPL / test counterpart of `<?`. Must not be called inside an
+;; ^:async body (it parks the OS thread, like <!!).
+(defmacro <?? [ch]
+  (list 'clojure.rust.error/throw-err
+        (list 'clojure.core.async/<!! ch)))
+
+;; (go-try body...)
+;;
+;; Like `go`, but returns a result channel: the body's value is delivered on it,
+;; and a thrown exception is caught and delivered as an in-band error value
+;; instead. The channel carries exactly one value (result or error), then
+;; closes. Consume with `<?` to re-throw the error at the boundary — the CSP
+;; equivalent of a function that returns a Result.
+(defmacro go-try [& body]
+  (let [c (gensym "go_try_c__")
+        r (gensym "go_try_r__")]
+    (list 'let (vector c (list 'clojure.core.async/chan 1))
+          (list 'clojure.core.async/go
+                (list 'let (vector r (concat (list 'try)
+                                             body
+                                             (list (list 'catch 'Exception 'e 'e))))
+                      ;; nil can't ride a channel; a nil result just closes c,
+                      ;; so a taker sees nil — matching core.async's go channel.
+                      (list 'when (list 'some? r)
+                            (list 'await (list 'clojure.core.async/put! c r)))
+                      (list 'clojure.core.async/close! c)))
+          c)))

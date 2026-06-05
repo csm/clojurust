@@ -16,3 +16,9 @@ cljrs-builtins = { workspace = true }
 cljrs-interp   = { workspace = true }
 tokio          = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 futures-util   = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }

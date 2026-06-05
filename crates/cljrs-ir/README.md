@@ -21,7 +21,10 @@ src/
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
   lower/
     mod.rs      — re-exports: lower_fn_body, analyze, inline, optimize, EscapeContext …
-    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust)
+    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
+                  capture only the enclosing locals their (fully macro-expanded)
+                  body references (`collect_symbol_names`, a conservative
+                  free-variable over-approximation), not every local in scope.
     context.rs  — LowerCtx builder state used by anf.rs
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites
@@ -30,7 +33,12 @@ src/
     regionalize.rs — stage-4 cross-function region promotion: clones callees
                      whose `Returns` allocs are NoEscape at a call site, wraps
                      the call site in RegionStart/RegionEnd, rewrites Call →
-                     CallWithRegion targeting the cloned variant by name
+                     CallWithRegion targeting the cloned variant by name.
+                     Also co-promotes allocations reachable only through the
+                     returned container (e.g. the inner coordinate vectors of
+                     `neighbours`), guarded by a caller-side check that the
+                     result is never element-extracted (first/nth/get/peek) or
+                     passed to an opaque call
   cljrs/compiler/
     ir.cljrs       — IR data constructors + mutable builder context (atom-based)
     known.cljrs    — symbol-name → KnownFn keyword resolution
@@ -77,6 +85,10 @@ pub struct IrFunction {
     pub next_block: u32,
     pub span: Option<Span>,
     pub subfunctions: Vec<IrFunction>,
+    /// Whether this function was declared `^:async`.
+    /// Async IR functions fall back to tree-walking `eval_async`; Phase H JIT
+    /// will emit Cranelift state machines with explicit resume points.
+    pub is_async: bool,
 }
 
 pub struct Block {
@@ -94,6 +106,18 @@ pub struct Block {
 `CallDirect`, `Deref`, `DefVar`, `SetBang`, `Throw`, `Phi`, `Recur`,
 `SourceLoc`, `RegionStart`, `RegionAlloc`, `RegionEnd`, `RegionParam`,
 `CallWithRegion`
+
+**Async instructions** (Phase H):
+
+- `Await { src, dst }` — yield point inside `^:async` fn; `dst` receives the
+  resolved `Future`/`Promise` value.  IR interpreter uses blocking deref;
+  `eval_async` yields to the Tokio executor.
+- `Spawn { fn_reg, args, dst }` — spawn an `^:async` call as a LocalSet task;
+  `dst` receives a `Value::Future` immediately.
+- `ChanTake { chan, dst }` — async take from a channel; parks until a value is
+  available.
+- `ChanPut { chan, val }` — async put into a channel; parks if the buffer is
+  full (no result value).
 
 ### Terminators
 
@@ -166,6 +190,17 @@ pub fn inline(ir: IrFunction) -> IrFunction;
    region stack, so its `RegionAlloc` instructions bump-allocate into the
    caller's region.  Variants are attached as subfunctions of the calling
    function so both the IR interpreter and codegen can resolve them by name.
+   The clone also co-promotes allocations reachable *only* through the
+   returned container (e.g. the eight inner `[r c]` vectors stored inside
+   `neighbours`' result vector): their lifetime is bounded by the returned
+   value, so they live in the same region.  This is gated by a caller-side
+   check that the call result is never element-extracted (`first`/`nth`/
+   `get`/`peek`) or passed to an opaque call, either of which could keep an
+   inner pointer alive past `RegionEnd`.  Note: this sharpens the IR (and
+   benefits the tree-walking interpreter, where `AllocVector` is not
+   region-aware); the AOT backend already bump-allocates any collection
+   built while a region scope is active, so the win there comes from region
+   *scope* coverage rather than the per-allocation kind.
 
 ### Analysis (re-exported from `lower::`)
 

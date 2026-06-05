@@ -1,0 +1,136 @@
+;; core.async sample — CSP pipeline and concurrency showcase.
+;;
+;; Why this is a good async/channel showcase:
+;;
+;;   The pipeline demo fans work across k workers via a shared buffered
+;;   channel: a producer puts integers onto work-ch, each worker squares
+;;   its input and forwards the result to result-ch, and a supervisor
+;;   closes result-ch once all workers drain. The main goroutine sums the
+;;   results with a tail-recursive drain loop.
+;;
+;;   The broadcast demo wires a mult to two taps: values forwarded by the
+;;   mult background task appear on both taps concurrently.
+;;
+;;   The race demo shows alt/timeout for deadline-aware channel selects.
+;;
+;;   async-pmap demonstrates the high-level parallel-map combinator.
+
+(ns core-async-sample)
+
+(require '[clojure.core.async
+           :refer [chan go take! put! close! timeout alt
+                   join-all async-pmap mult tap!]])
+
+;; ── Pipeline helpers ──────────────────────────────────────────────────────────
+
+(defn ^:async producer
+  "Put integers [0, n) onto work-ch and then close it."
+  [n work-ch]
+  (loop [i 0]
+    (when (< i n)
+      (await (put! work-ch i))
+      (recur (inc i))))
+  (close! work-ch))
+
+(defn ^:async worker
+  "Take values from in-ch, apply f, put results on out-ch until in-ch closes."
+  [f in-ch out-ch]
+  (loop []
+    (let [v (await (take! in-ch))]
+      (when-not (nil? v)
+        (await (put! out-ch (f v)))
+        (recur)))))
+
+(defn ^:async drain-sum
+  "Drain all longs from ch until it closes and return their sum."
+  [ch]
+  (loop [acc 0]
+    (let [v (await (take! ch))]
+      (if (nil? v)
+        acc
+        (recur (+ acc v))))))
+
+(defn ^:async pipeline
+  "Compute sum of (f i) for i in [0, n) using k parallel workers."
+  [n k f]
+  (let [work-ch   (chan k)
+        result-ch (chan k)
+        ;; Calling a ^:async fn spawns it on the LocalSet and returns a Future.
+        workers   (mapv (fn [_] (worker f work-ch result-ch)) (range k))]
+    (go (await (producer n work-ch)))
+    (go (await (join-all workers))
+        (close! result-ch))
+    (await (drain-sum result-ch))))
+
+;; ── Broadcast helpers ─────────────────────────────────────────────────────────
+
+(defn ^:async drain-n
+  "Take exactly n values from ch and return them as a vector."
+  [ch n]
+  (loop [acc [] i 0]
+    (if (= i n)
+      acc
+      ;; Use a let binding so (await ...) is evaluated in the async context
+      ;; before recur — await inside recur args goes through sync eval.
+      (let [v (await (take! ch))]
+        (recur (conj acc v) (inc i))))))
+
+(defn ^:async broadcast-demo
+  "Fan-out values over a mult to two taps; return [tap1-vals tap2-vals]."
+  [values]
+  (let [n    (count values)
+        src  (chan n)
+        m    (mult src)
+        tap1 (chan n)
+        tap2 (chan n)]
+    (tap! m tap1)
+    (tap! m tap2)
+    ;; Fill src using an explicit loop so `await` runs in the async context.
+    ;; (doseq with await inside doesn't work: doseq expands to a callback
+    ;; that the sync evaluator handles, so the await would block.)
+    (loop [vs (seq values)]
+      (when vs
+        (await (put! src (first vs)))
+        (recur (next vs))))
+    (close! src)
+    ;; Drain taps — yields here let the mult task forward the buffered values.
+    [(await (drain-n tap1 n))
+     (await (drain-n tap2 n))]))
+
+;; ── Main ─────────────────────────────────────────────────────────────────────
+
+(defn ^:async -main [& _args]
+  (println "=== core.async sample ===")
+
+  ;; 1. Parallel pipeline: sum of squares 0..99 across 4 workers.
+  (println "\n[pipeline] summing squares of 0..99 with 4 workers")
+  (let [start   (nanotime)
+        result  (await (pipeline 100 4 (fn [x] (* x x))))
+        elapsed (/ (- (nanotime) start) 1e6)
+        expected (reduce + (map (fn [x] (* x x)) (range 100)))]
+    (println "Sum of squares:" result)
+    (println "Expected:      " expected)
+    (println "Match?         " (= result expected))
+    (println "Time (ms):     " elapsed))
+
+  ;; 2. async-pmap: double each element of a small vector concurrently.
+  (println "\n[async-pmap] doubling [1 2 3 4 5] concurrently")
+  (let [doubled (await (async-pmap (fn ^:async [x] (* 2 x)) [1 2 3 4 5]))]
+    (println "Doubled:" doubled))
+
+  ;; 3. Broadcast: one source channel, two taps via mult.
+  (println "\n[broadcast] sending [:a :b :c] to two taps via mult")
+  (let [[t1 t2] (await (broadcast-demo [:a :b :c]))]
+    (println "Tap 1:" t1)
+    (println "Tap 2:" t2)
+    (println "Taps equal?" (= t1 t2)))
+
+  ;; 4. Deadline race: fast channel wins over a 1-second timeout.
+  (println "\n[alt/timeout] racing fast computation vs 1s timeout")
+  (let [fast-ch (chan 1)]
+    (go (await (put! fast-ch :done)))
+    (let [winner (alt (take! fast-ch) (fn [_] :fast-wins)
+                      (timeout 1000)  (fn [_] :timed-out))]
+      (println "Winner:" winner)))
+
+  (println "\n=== done ==="))

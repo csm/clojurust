@@ -37,8 +37,8 @@ pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
         | Value::Double(_)
         | Value::Char(_)
         | Value::Uuid(_) => true,
-        // Arc-managed — not GcPtr.
-        Value::Resource(_) => true,
+        // Arc-managed — not GcPtr; always considered static.
+        Value::Resource(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
         // GcPtr variants.
         Value::BigInt(p) => p.is_static_alloc(),
         Value::BigDecimal(p) => p.is_static_alloc(),
@@ -453,7 +453,7 @@ pub type NativeFnPtr = fn(&[Value]) -> crate::error::ValueResult<Value>;
 
 /// The callable stored inside a `NativeFn`. Supports both bare function
 /// pointers and closures that capture state.
-pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync>;
+pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value>>;
 
 #[derive(Clone, Debug)]
 pub enum Arity {
@@ -481,7 +481,7 @@ impl NativeFn {
     pub fn with_closure(
         name: impl Into<Arc<str>>,
         arity: Arity,
-        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + Send + Sync + 'static,
+        func: impl Fn(&[Value]) -> crate::error::ValueResult<Value> + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -525,6 +525,23 @@ pub struct CljxFnArity {
     pub destructure_rest: Option<Form>,
     /// Unique ID for IR cache lookup (assigned by the evaluator).
     pub ir_arity_id: u64,
+}
+
+impl CljxFnArity {
+    /// Heap bytes owned by this arity, not counting the `CljxFnArity` struct itself.
+    pub fn heap_size(&self) -> usize {
+        // params Vec buffer (Arc<str> pointers; the str data is shared, skip it)
+        self.params.capacity() * mem::size_of::<Arc<str>>()
+        // body: the dominant consumer — Form AST trees stored inline
+        + self.body.capacity() * mem::size_of::<Form>()
+        + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
+        // destructure_params
+        + self.destructure_params.capacity() * mem::size_of::<(usize, Form)>()
+        + self.destructure_params.iter().map(|(_, f)| f.heap_size()).sum::<usize>()
+        // destructure_rest
+        + self.destructure_rest.as_ref()
+            .map_or(0, |f| mem::size_of::<Form>() + f.heap_size())
+    }
 }
 
 // ── CljxFn ────────────────────────────────────────────────────────────────────
@@ -576,6 +593,16 @@ impl cljrs_gc::Trace for CljxFn {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Vec<CljxFnArity> buffer + each arity's inline-owned heap
+        self.arities.capacity() * mem::size_of::<CljxFnArity>()
+            + self
+                .arities
+                .iter()
+                .map(CljxFnArity::heap_size)
+                .sum::<usize>()
+    }
 }
 
 // ── BoundFn ──────────────────────────────────────────────────────────────────
@@ -599,12 +626,17 @@ impl cljrs_gc::Trace for BoundFn {
             val.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // HashMap<usize, Value>: hashbrown open-addressing, ~1 control byte + entry per slot.
+        self.captured_bindings.capacity() * (1 + mem::size_of::<usize>() + mem::size_of::<Value>())
+    }
 }
 
 // ── Thunk / LazySeq ───────────────────────────────────────────────────────────
 
 /// A deferred computation that produces a `Value` when forced.
-pub trait Thunk: Send + Sync + std::fmt::Debug + cljrs_gc::Trace {
+pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
     fn force(&self) -> Result<Value, String>;
 }
 
@@ -896,7 +928,10 @@ impl cljrs_gc::Trace for CljxPromise {
 pub enum FutureState {
     Running,
     Done(Value),
-    Failed(String),
+    /// The future's body threw. Holds the thrown Clojure value (a
+    /// `Value::Error`) so `await`/`deref` can re-throw it with its
+    /// `ex-data`/`ex-cause` intact, rather than a stringified message.
+    Failed(Value),
     Cancelled,
 }
 
@@ -904,6 +939,10 @@ pub enum FutureState {
 pub struct CljxFuture {
     pub state: Mutex<FutureState>,
     pub cond: Condvar,
+    /// Set once a consumer has read the settled result (via `await`/`deref`).
+    /// Used to warn about a `Failed` future that is discarded without anyone
+    /// ever observing its error (the fire-and-forget footgun).
+    observed: std::sync::atomic::AtomicBool,
 }
 
 impl CljxFuture {
@@ -911,6 +950,7 @@ impl CljxFuture {
         Self {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
+            observed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -922,6 +962,38 @@ impl CljxFuture {
     /// True if explicitly cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+    }
+
+    /// Mark this future's result as observed. Call when a consumer reads the
+    /// settled value (`await`/`deref`), so a later drop doesn't warn about an
+    /// unobserved error.
+    pub fn mark_observed(&self) {
+        self.observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for CljxFuture {
+    fn drop(&mut self) {
+        // Warn if a future failed but nobody ever observed the error — the
+        // fire-and-forget case where a thrown error would otherwise vanish.
+        // Tied to GC sweep timing: only fires once the future is unreachable,
+        // so a not-yet-awaited (still reachable) failed future won't warn.
+        //
+        // SAFETY: this Drop can run during GC sweep. The thrown value held in
+        // `Failed(v)` is itself a GC value whose backing box may be freed in
+        // the *same* sweep, so we must NOT dereference it here (no `{v}`). We
+        // only inspect the state discriminant, which is inline in our own
+        // (still-valid) allocation.
+        if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(state) = self.state.lock()
+            && matches!(&*state, FutureState::Failed(_))
+        {
+            eprintln!(
+                "[clojurust warning] a failed future was discarded without its error \
+                 being observed (no await/deref); the thrown exception was lost"
+            );
+        }
     }
 }
 
@@ -941,7 +1013,9 @@ impl cljrs_gc::Trace for CljxFuture {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let state = self.state.lock().unwrap();
-            if let FutureState::Done(v) = &*state {
+            // Both Done and Failed hold a Value (the result or the thrown
+            // error); trace either so the GC keeps it alive until observed.
+            if let FutureState::Done(v) | FutureState::Failed(v) = &*state {
                 v.trace(visitor);
             }
         }
@@ -950,23 +1024,12 @@ impl cljrs_gc::Trace for CljxFuture {
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
-/// A Clojure agent action: takes the current state, returns the new state.
-pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, Value> + Send>;
-
-/// Messages sent to an agent's worker thread.
-pub enum AgentMsg {
-    Update(AgentFn),
-    Shutdown,
-}
-
-/// A Clojure agent — asynchronous state update queue.
+/// A Clojure agent — asynchronous state update queue (stub: not yet implemented).
 pub struct Agent {
-    /// Current state, shared between the Value::Agent handle and the worker thread.
+    /// Current state.
     pub state: Arc<Mutex<Value>>,
-    /// Last error, shared similarly.
+    /// Last error.
     pub error: Arc<Mutex<Option<Value>>>,
-    /// Channel to send actions to the worker thread.
-    pub sender: Mutex<std::sync::mpsc::SyncSender<AgentMsg>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
 }
 

@@ -356,6 +356,7 @@
     }
 
     #repl-status.ready { color: var(--accent2); opacity: 1; }
+    #repl-status.busy  { color: var(--accent);  opacity: 1; }
     #repl-status.err   { color: var(--accent4);   opacity: 1; }
 
     #repl-eval {
@@ -390,7 +391,7 @@
     }
 
     .repl-divider::after {
-      content: ';; REPL - compiled as WASM, runs in your browser';
+      content: ';; REPL — compiled to WASM · clojure.core.async supported';
       margin-left: 0.75rem;
       font-size: 0.72rem;
       color: var(--text-faint);
@@ -692,17 +693,37 @@
     }
 
     // ── Evaluate current input ────────────────────────────────
-    function evalInput() {
+    // repl.eval() is async (returns a Promise); disable controls while
+    // in-flight to prevent concurrent submissions racing on the LocalSet.
+    async function evalInput() {
       var code = input.value;
       if (!code.trim() || !repl) return;
       if (history[history.length - 1] !== code) history.push(code);
       historyIdx = -1;
       liveDraft = '';
-      var res = repl.eval(code);
-      appendEntry(code, res.output, res.result, res.is_error);
+
+      // Clear immediately so the user sees the form was accepted.
       input.value = '';
       resize();
       renderHighlights();
+
+      input.disabled = true;
+      btn.disabled   = true;
+      status.textContent = '● eval…';
+      status.className   = 'busy';
+
+      try {
+        var res = await repl.eval(code);
+        appendEntry(code, res.output, res.result, res.is_error);
+      } catch (err) {
+        appendEntry(code, '', String(err), true);
+      } finally {
+        input.disabled = false;
+        btn.disabled   = false;
+        status.textContent = '● ready';
+        status.className   = 'ready';
+        input.focus();
+      }
     }
 
     btn.addEventListener('click', evalInput);

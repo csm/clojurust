@@ -20,5 +20,3 @@ cljrs-env      = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-interp   = { workspace = true }
 
-[dev-dependencies]
-cljrs-stdlib   = { path = "../cljrs-stdlib" }

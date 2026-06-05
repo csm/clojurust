@@ -20,7 +20,7 @@ fn main() {
 "#;
     let mut parser = Parser::new(src.to_string(), "<example>".to_string());
     let forms = parser.parse_all().unwrap();
-    let ir = lower_fn_body(Some("__example"), "user", &[], &forms).unwrap();
+    let ir = lower_fn_body(Some("__example"), "user", &[], &forms, false).unwrap();
     let ir = optimize(ir);
     let html = render_html(
         &ir,

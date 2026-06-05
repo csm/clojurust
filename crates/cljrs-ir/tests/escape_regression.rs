@@ -22,7 +22,7 @@ use std::sync::Arc;
 fn lower(source: &str) -> IrFunction {
     let mut parser = Parser::new(source.to_string(), "<test>".to_string());
     let forms = parser.parse_all().expect("parse");
-    lower_fn_body(Some("test"), "user", &[], &forms).expect("lower")
+    lower_fn_body(Some("test"), "user", &[], &forms, false).expect("lower")
 }
 
 /// Count `Inst::RegionAlloc` insts in `ir` plus all subfunctions.
@@ -440,6 +440,125 @@ fn stage4_handles_callee_with_self_capture() {
     assert_eq!(
         arg_count, param_count,
         "CallWithRegion to {name} passes {arg_count} args but the target expects {param_count}",
+    );
+}
+
+#[test]
+fn stage4_co_promotes_container_contained_allocs() {
+    // `make-grid` returns a vector of three inner coordinate vectors.  The
+    // inner vectors are stored only into the returned outer vector, so they
+    // are reachable solely through it.  When the call result feeds `count`
+    // (a structural, non-extracting consumer) stage 4 should co-promote the
+    // whole nest: the outer vector AND all three inner vectors.  This is the
+    // `neighbours` showcase pattern in miniature.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn use-grid [a] (count (make-grid a))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        call_with_region_count(&optimized) >= 1,
+        "stage 4 should rewrite the call to CallWithRegion; IR:\n{optimized}"
+    );
+    assert!(
+        region_alloc_count(&optimized) >= 4,
+        "outer vector + three inner vectors should all be region-promoted \
+         (expected >= 4 RegionAllocs); IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn stage4_deep_promotion_skipped_when_result_is_extracted() {
+    // Same nest, but the call result is element-*extracted* via `first` before
+    // being consumed.  The extracted inner vector could outlive the caller's
+    // region, so deep co-promotion must be skipped: only the outer container
+    // (the shallow `Returns` alloc) is region-promoted, leaving exactly one
+    // RegionAlloc.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn pick [a] (count (first (make-grid a)))))",
+    );
+    let optimized = optimize(ir);
+    assert_eq!(
+        region_alloc_count(&optimized),
+        1,
+        "only the outer container should be promoted when the result is \
+         element-extracted; IR:\n{optimized}"
+    );
+}
+
+// ── Eager HOF fusion tests ───────────────────────────────────────────────────
+
+/// Count `CallKnown` insts whose known fn debug-prints as `name`, across tree.
+fn known_call_count(ir: &IrFunction, name: &str) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(_, kfn, _) = inst
+                && format!("{kfn:?}") == name
+            {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += known_call_count(sub, name);
+    }
+    n
+}
+
+#[test]
+fn count_filter_is_fused_to_count_filter() {
+    // `count` is the sole consumer of `filter`, so the pair fuses into the
+    // allocation-free `CountFilter` and the dead `filter` is removed.
+    let ir = lower("(count (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "Filter"),
+        0,
+        "the fused filter should be removed; IR:\n{optimized}"
+    );
+    assert_eq!(
+        known_call_count(&optimized, "Count"),
+        0,
+        "the count should become CountFilter; IR:\n{optimized}"
+    );
+    assert_eq!(known_call_count(&optimized, "CountFilter"), 1);
+}
+
+#[test]
+fn into_filter_is_fused() {
+    let ir = lower("(into [] (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Filter"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoFilter"), 1);
+}
+
+#[test]
+fn into_mapcat_is_fused() {
+    let ir = lower("(into #{} (mapcat (fn [x] [x x]) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Mapcat"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoMapcat"), 1);
+}
+
+#[test]
+fn count_filter_not_fused_when_filter_escapes() {
+    // The filter result is used twice (count + returned), so it must not fuse.
+    let ir = lower("(let [s (filter (fn [x] x) [1 2 3])] [(count s) s])");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "CountFilter"),
+        0,
+        "filter with a non-count use must not fuse; IR:\n{optimized}"
     );
 }
 

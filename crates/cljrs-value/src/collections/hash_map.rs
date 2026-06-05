@@ -113,6 +113,13 @@ impl cljrs_gc::Trace for PersistentHashMap {
             v.trace(visitor);
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        // Per entry: Arc<(K,V)> allocation (16 overhead) + EntryWithHash (16)
+        // + tree-node share (~8). Values stored inline (not behind GcPtr).
+        let n = self.inner.size();
+        n * (40 + 2 * std::mem::size_of::<Value>())
+    }
 }
 
 #[cfg(test)]

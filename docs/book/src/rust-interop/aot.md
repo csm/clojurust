@@ -97,3 +97,12 @@ The AOT harness uses `cargo build --release --offline` by default. All
 dependencies (the clojurust crates and the user crate) must be resolvable
 without network access. Point to local paths in `Cargo.toml` as shown in
 [Project setup](project-setup.md).
+
+## Memory management
+
+AOT-compiled binaries get an extra allocation fast path that the interpreter
+does not: the **bump allocator**. The AOT compiler's escape analysis promotes
+short-lived, non-escaping objects into bump-allocated regions, leaving the
+tracing GC to handle everything else. See
+[Memory Management](../memory/index.md) and
+[The bump allocator](../memory/bump-allocator.md) for details.

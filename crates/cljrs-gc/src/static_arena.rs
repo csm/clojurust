@@ -124,6 +124,20 @@ impl StaticArena {
         GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
     }
 
+    /// Allocate `value` directly (no `GcBox` wrapper) and return a
+    /// [`StaticGcPtr`].
+    ///
+    /// Use this when the caller needs a `Send + Sync` program-lifetime pointer
+    /// but does **not** need `GcPtr` interoperability — e.g. keyword/symbol
+    /// intern tables.  The allocation is never freed.
+    pub fn alloc_val<T: 'static>(&self, value: T) -> crate::StaticGcPtr<T> {
+        let layout = std::alloc::Layout::new::<T>();
+        let raw = self.inner.lock().unwrap().alloc_raw(layout) as *mut T;
+        // SAFETY: raw is properly aligned and sized for T.
+        unsafe { std::ptr::write(raw, value) };
+        crate::StaticGcPtr(unsafe { NonNull::new_unchecked(raw) })
+    }
+
     /// Return `true` if `addr` was allocated by this arena.
     ///
     /// Used by debug-mode provenance assertions to distinguish static-arena
@@ -139,6 +153,13 @@ static STATIC_ARENA: OnceLock<StaticArena> = OnceLock::new();
 /// Return the global static arena singleton.
 pub fn static_arena() -> &'static StaticArena {
     STATIC_ARENA.get_or_init(StaticArena::new)
+}
+
+/// Allocate `value` into the global static arena (no `GcBox` wrapper) and
+/// return a [`StaticGcPtr`].  Convenience wrapper around
+/// `static_arena().alloc_val(value)`.
+pub fn static_alloc_val<T: 'static>(value: T) -> crate::StaticGcPtr<T> {
+    static_arena().alloc_val(value)
 }
 
 /// Return `true` if the raw pointer address was allocated by the static arena.

@@ -1,0 +1,47 @@
+;; http-get.cljrs — HTTP GET (plain TCP) and HTTPS GET (TLS) using cljrs-net and cljrs-charset.
+;;
+;; Makes two requests to clj.rs and prints the first response line of each:
+;;   1. Plain HTTP on port 80 over TCP.
+;;   2. HTTPS on port 443 over TLS — passes :transport :tls to net/connect, which
+;;      performs a TLS handshake verified against webpki root certificates before
+;;      the HTTP exchange; the connection map shape is identical to plain TCP.
+;;
+;; The request encoding and response decoding are done explicitly through
+;; cljrs-charset to show the encode/decode cycle.
+
+(ns http-get-sample)
+
+(require '[clojure.rust.net     :as net])
+(require '[clojure.rust.charset :as charset])
+(require '[clojure.core.async   :refer [take! put!]])
+(require '[clojure.string       :as str])
+
+(def ^:private host "clj.rs")
+
+(defn ^:async fetch-first-line
+  "Open `conn-chan`, send an HTTP/1.0 GET /, drain the response, and return
+  the first response line.  Closes the connection before returning."
+  [conn-chan]
+  (let [conn (await (take! conn-chan))]
+    ;; Encode the request to UTF-8 bytes and send it.  Do not close :out before
+    ;; draining :in — closing :out prematurely sends TCP FIN and can trigger RST
+    ;; from the server before the response arrives.
+    (await (put! (:out conn)
+                 (charset/encode (str "GET / HTTP/1.0\r\n"
+                                       "Host: " host "\r\n"
+                                       "Connection: close\r\n"
+                                       "\r\n"))))
+    (let [{:keys [values]} (await (net/drain-to (:in conn)))
+          response         (reduce str "" (map charset/decode values))
+          first-line       (first (str/split-lines response))]
+      (net/close conn)
+      first-line)))
+
+(defn ^:async -main [& _args]
+  ;; Plain HTTP over TCP
+  (let [line (await (fetch-first-line (net/connect {:host host :port 80})))]
+    (println "HTTP :" line))
+
+  ;; HTTPS over TLS — webpki root certificates are used for server verification
+  (let [line (await (fetch-first-line (net/connect {:host host :port 443 :transport :tls})))]
+    (println "HTTPS:" line)))

@@ -41,4 +41,27 @@ pub enum EvalError {
     CommitSignatureVerificationFailed { commit: String, reason: String },
 }
 
+impl EvalError {
+    /// Convert this error into a Clojure error *value* (`Value::Error`).
+    ///
+    /// A `Thrown` value is returned unchanged (preserving its `ex-data` /
+    /// `ex-cause`); any other error is wrapped in a fresh `ExceptionInfo` with
+    /// the error's display string as the message. Used where an error must be
+    /// stored as a value and later re-thrown — e.g. a failed `Future`'s state.
+    pub fn to_error_value(self) -> Value {
+        match self {
+            EvalError::Thrown(v) => v,
+            other => {
+                let msg = other.to_string();
+                Value::Error(cljrs_gc::GcPtr::new(cljrs_value::ExceptionInfo::new(
+                    cljrs_value::ValueError::Other(msg.clone()),
+                    msg,
+                    None,
+                    None,
+                )))
+            }
+        }
+    }
+}
+
 pub type EvalResult<T = Value> = Result<T, EvalError>;

@@ -54,6 +54,10 @@ pub struct LowerCtx {
     /// the current block.  Reset on `start_block`.  Used to dedupe
     /// consecutive `SourceLoc` insts on the same line.
     pub(crate) last_source_loc: Option<(Arc<String>, u32)>,
+
+    /// Whether this function body was declared `^:async`.
+    /// Set by `lower_fn_arity` and propagated to `IrFunction::is_async`.
+    pub(crate) is_async: bool,
 }
 
 impl LowerCtx {
@@ -73,6 +77,7 @@ impl LowerCtx {
             next_block: 1,
             subfunctions: Vec::new(),
             last_source_loc: None,
+            is_async: false,
         }
     }
 
@@ -239,6 +244,7 @@ impl LowerCtx {
             next_block: self.next_block,
             span: None,
             subfunctions: self.subfunctions,
+            is_async: self.is_async,
         }
     }
 }

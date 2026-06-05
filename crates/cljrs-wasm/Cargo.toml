@@ -18,8 +18,11 @@ cljrs-reader   = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-gc       = { workspace = true }
 cljrs-types    = { workspace = true }
-wasm-bindgen = "0.2"
+cljrs-async    = { workspace = true }
+wasm-bindgen          = "0.2"
+wasm-bindgen-futures  = "0.4"
 console_error_panic_hook = "0.1"
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 
 # Activate getrandom's JS/browser entropy source for rand on wasm32.
 # rand uses getrandom 0.4; declaring it here with wasm_js unifies the feature

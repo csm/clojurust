@@ -56,6 +56,13 @@ fn try_ir_path(
 
     // Only use IR if already cached (eagerly lowered at definition time).
     let ir_func = crate::ir_cache::get_cached(arity_id)?;
+
+    // Async IR functions fall back to tree-walking (eval_async in cljrs-async).
+    // The IR interpreter is synchronous and cannot yield to the Tokio executor.
+    if ir_func.is_async {
+        return None;
+    }
+
     Some(execute_ir(f, arity, &ir_func, args, caller_env))
 }
 

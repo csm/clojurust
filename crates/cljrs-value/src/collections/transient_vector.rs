@@ -102,6 +102,11 @@ impl cljrs_gc::Trace for TransientVector {
             }
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        let n = self.vector.lock().unwrap().len();
+        n * (24 + std::mem::size_of::<crate::Value>())
+    }
 }
 
 impl Default for TransientVector {

@@ -180,6 +180,10 @@ pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction> {
         vec![]
     };
 
+    let is_async = get_field_opt(map, "is-async")
+        .map(|v| matches!(v, Value::Bool(true)))
+        .unwrap_or(false);
+
     Ok(IrFunction {
         name,
         params,
@@ -188,6 +192,7 @@ pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction> {
         next_block,
         span: None,
         subfunctions,
+        is_async,
     })
 }
 
@@ -427,6 +432,27 @@ fn value_to_inst(val: &Value) -> ConvertResult<Inst> {
         "region-end" => {
             let region = as_var_id(&get_field(map, "region")?)?;
             Ok(Inst::RegionEnd(region))
+        }
+        "await" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            let src = as_var_id(&get_field(map, "src")?)?;
+            Ok(Inst::Await { src, dst })
+        }
+        "spawn" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            let fn_reg = as_var_id(&get_field(map, "fn-reg")?)?;
+            let args = as_var_id_vec(&get_field(map, "args")?)?;
+            Ok(Inst::Spawn { fn_reg, args, dst })
+        }
+        "chan-take" => {
+            let dst = as_var_id(&get_field(map, "dst")?)?;
+            let chan = as_var_id(&get_field(map, "chan")?)?;
+            Ok(Inst::ChanTake { chan, dst })
+        }
+        "chan-put" => {
+            let chan = as_var_id(&get_field(map, "chan")?)?;
+            let val = as_var_id(&get_field(map, "val")?)?;
+            Ok(Inst::ChanPut { chan, val })
         }
         other => Err(ConvertError::UnknownVariant(format!(
             "unknown inst op: {other}"

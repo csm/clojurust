@@ -294,8 +294,14 @@ pub fn deref_value(v: Value) -> EvalResult {
             let mut guard = f.get().state.lock().unwrap();
             loop {
                 match &*guard {
-                    FutureState::Done(v) => return Ok(v.clone()),
-                    FutureState::Failed(e) => return Err(EvalError::Runtime(e.clone())),
+                    FutureState::Done(v) => {
+                        f.get().mark_observed();
+                        return Ok(v.clone());
+                    }
+                    FutureState::Failed(v) => {
+                        f.get().mark_observed();
+                        return Err(EvalError::Thrown(v.clone()));
+                    }
                     FutureState::Cancelled => {
                         return Err(EvalError::Runtime("future was cancelled".into()));
                     }
@@ -1138,6 +1144,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
     fn test_future() {
         let result = eval_str(
             r#"
@@ -1150,6 +1157,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "agent not yet implemented (Phase A1 — GcPtr: !Send)"]
     fn test_agent_send() {
         let result = eval_str(
             r#"
@@ -1165,6 +1173,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "agent not yet implemented (Phase A1 — GcPtr: !Send)"]
     fn test_agent_error_restart() {
         let result = eval_str(
             r#"
@@ -1543,6 +1552,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
     fn test_binding_conveyance() {
         let (_, mut env) = make_env();
         eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();

@@ -1,3 +1,4 @@
+#![allow(clippy::arc_with_non_send_sync)]
 //! IR-accelerated evaluation for clojurust.
 //!
 //! Wraps the tree-walking interpreter (`cljrs-interp`) with IR lowering and
@@ -26,6 +27,7 @@ pub mod lower;
 pub use cljrs_env::callback::invoke;
 pub use cljrs_env::env::{Env, GlobalEnv};
 pub use cljrs_env::error::{EvalError, EvalResult};
+pub use cljrs_env::gc_roots::force_collect;
 pub use cljrs_env::loader::load_ns;
 pub use cljrs_interp::eval::eval;
 
@@ -105,6 +107,13 @@ pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
 
 pub fn standard_env_minimal() -> Arc<GlobalEnv> {
     cljrs_interp::standard_env_minimal(Some(eval), Some(apply::call_cljrs_fn), Some(eager_lower_fn))
+}
+
+/// Like `standard_env_minimal` but without IR lowering.  Use this when IR
+/// generation is not needed (e.g. the AOT test harness) to avoid populating
+/// the IR cache with entries that will never be evicted.
+pub fn standard_env_minimal_no_ir() -> Arc<GlobalEnv> {
+    cljrs_interp::standard_env_minimal(Some(eval), Some(apply::call_cljrs_fn), None)
 }
 
 pub fn standard_env() -> Arc<GlobalEnv> {

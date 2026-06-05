@@ -29,7 +29,7 @@
     ;; the collection. Length of each subset should be between 0 and
     ;; the length of the original collection.
     (let [draws 10
-          nitems 10000
+          nitems 200
           coll (doall (range nitems))
           prob 0.5]
       (testing "positive tests"

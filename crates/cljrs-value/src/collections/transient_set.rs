@@ -83,6 +83,11 @@ impl cljrs_gc::Trace for TransientSet {
             }
         }
     }
+
+    fn gc_size_extra(&self) -> usize {
+        let n = self.set.lock().unwrap().size();
+        n * (40 + std::mem::size_of::<crate::Value>())
+    }
 }
 
 impl Default for TransientSet {

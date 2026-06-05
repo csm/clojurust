@@ -1,0 +1,32 @@
+;; clojure.rust.net.tls — TLS client/server.
+;;
+;; Phase E (TLS):
+;;   connect      — (connect {:host h :port p}) => promise-chan -> conn-map
+;;   close        — (close conn) => nil
+;;   listen       — (listen {:port p :cert "cert.pem" :key "key.pem"}) => server-map
+;;   listen-close — (listen-close server) => nil
+;;   start-server — (start-server handler opts) => server-map
+
+(defn start-server
+  "Start a TLS server with `handler` called for each accepted connection.
+  Returns the server map {:conns <chan> :local-addr str :resource handle}.
+
+  Opts (same as listen):
+    :port     integer (required, 1-65535)
+    :cert     path to PEM certificate file (required)
+    :key      path to PEM private key file (required)
+    :host     string (default \"0.0.0.0\")
+    :alpn     vector of ALPN protocol strings
+    :conns-buf  buffer depth for :conns (default 8)
+    :in-buf     per-connection :in buffer (default 8)
+    :out-buf    per-connection :out buffer (default 8)"
+  [handler opts]
+  (let [server (clojure.rust.net.tls/listen opts)
+        conns  (:conns server)]
+    (clojure.core.async/go
+      (loop []
+        (let [conn (await (clojure.core.async/take! conns))]
+          (when (some? conn)
+            (handler conn)
+            (recur)))))
+    server))

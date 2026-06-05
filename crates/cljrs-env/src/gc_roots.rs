@@ -118,6 +118,36 @@ pub fn root_option_values(vals: &[Option<cljrs_value::Value>]) -> OptionValueRoo
     OptionValueRootGuard { pushed: true }
 }
 
+/// Force an immediate GC collection, bypassing the memory-pressure threshold.
+///
+/// Unlike `gc_safepoint`, this always initiates collection regardless of
+/// `gc_requested()`. Use this after removing namespaces from globals to ensure
+/// their closures and form-trees are freed before the next namespace is loaded.
+///
+/// Under `no-gc` this is a no-op.
+#[cfg(feature = "no-gc")]
+pub fn force_collect(_env: &Env) {}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn force_collect(env: &Env) {
+    let Some(_stw_guard) = cljrs_gc::begin_stw() else {
+        // Another thread is already collecting — just wait for it.
+        cljrs_gc::safepoint();
+        return;
+    };
+
+    cljrs_gc::HEAP.collect(|visitor| {
+        cljrs_gc::HEAP.trace_registered_roots(visitor);
+        trace_env_roots(env, visitor);
+        trace_thread_env_roots(visitor);
+        trace_value_roots(visitor);
+        trace_option_value_roots(visitor);
+        dynamics::trace_current(visitor);
+        crate::taps::trace_roots(visitor);
+        cljrs_gc::trace_thread_alloc_roots(visitor);
+    });
+}
+
 /// Interpreter-level GC safepoint.
 ///
 /// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection
@@ -253,4 +283,43 @@ fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
     for (_name, ns_ptr) in namespaces.iter() {
         visitor.visit(ns_ptr);
     }
+}
+
+/// Service a pending GC request from an async (LocalSet) context.
+///
+/// Safe to call from within a Tokio `LocalSet` task at any cooperative yield
+/// point: when this executes, no other tasks are polling, so thread-local root
+/// stacks (ENV_ROOTS, VALUE_ROOTS, ALLOC_ROOTS) fully describe all GcPtrs held
+/// by suspended tasks and can be scanned safely.
+///
+/// Under `no-gc` this is a no-op.
+#[cfg(feature = "no-gc")]
+pub fn async_gc_collect() {}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn async_gc_collect() {
+    if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        return;
+    }
+    if cljrs_gc::CONFIG_CANCELLATION.in_progress() {
+        cljrs_gc::safepoint();
+        return;
+    }
+    if !cljrs_gc::take_gc_request() {
+        cljrs_gc::safepoint();
+        return;
+    }
+    let Some(_stw_guard) = cljrs_gc::begin_stw() else {
+        cljrs_gc::safepoint();
+        return;
+    };
+    cljrs_gc::HEAP.collect(|visitor| {
+        cljrs_gc::HEAP.trace_registered_roots(visitor);
+        trace_thread_env_roots(visitor);
+        trace_value_roots(visitor);
+        trace_option_value_roots(visitor);
+        dynamics::trace_current(visitor);
+        crate::taps::trace_roots(visitor);
+        cljrs_gc::trace_thread_alloc_roots(visitor);
+    });
 }

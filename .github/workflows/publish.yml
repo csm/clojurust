@@ -3,6 +3,13 @@ name: Publish
 on:
   push:
     branches: [main]
+    # Skip publishing when a push only touches documentation or the website.
+    # GitHub skips the workflow only when *every* changed file matches one of
+    # these globs, so a push that also touches code still publishes. Manual
+    # workflow_dispatch runs always publish, ignoring these filters.
+    paths-ignore:
+      - 'docs/**'
+      - 'www/**'
   workflow_dispatch:
 
 env:
@@ -48,6 +55,9 @@ jobs:
         with:
           tool: cargo-release
 
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
       - name: Set crate versions
         run: |
           VERSION="${BASE_VERSION}.${{ github.run_number }}"
@@ -62,11 +72,44 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -A
-          git commit -m "chore: release $VERSION"
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
+          # Always commit the version bump so cargo publish sees a clean tree.
+          # On a fresh re-run the files are re-edited from 0.1.0, so there will
+          # always be staged changes to commit.
+          git diff --cached --quiet || git commit -m "chore: release $VERSION"
+          # Only create and push the tag if it doesn't already exist on the remote,
+          # making retries safe after a partial publish failure.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists on remote — skipping tag push"
+          else
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release publish --execute --no-confirm
+        run: |
+          # Build --exclude list for packages already live at this version.
+          # Makes the step idempotent so a retry after a partial failure is safe.
+          EXCLUDE=()
+          while IFS= read -r pkg; do
+            name="${pkg%%@*}"
+            ver="${pkg##*@}"
+            if curl -sf "https://crates.io/api/v1/crates/${name}/${ver}" \
+                 -H "User-Agent: clojurust-publish/1.0" | grep -q '"num"'; then
+              echo "Already published: ${name}@${ver} — skipping"
+              EXCLUDE+=(--exclude "${name}")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 \
+                     | jq -r '.packages[] | "\(.name)@\(.version)"')
+
+          # Use nightly cargo for -Zpublish-timeout, which extends the
+          # per-crate registry confirmation wait to 600 s.  Without this,
+          # a slow crates.io response causes "no packages ready to publish
+          # … 1 awaiting confirmation" (rust-lang/cargo#17028).
+          # --no-verify is safe here because CI already ran checks above.
+          cargo +nightly publish --workspace \
+            -Zpublish-timeout \
+            --config 'publish.timeout=600' \
+            --no-verify \
+            "${EXCLUDE[@]}"

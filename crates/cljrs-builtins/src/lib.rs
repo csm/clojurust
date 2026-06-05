@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::type_complexity)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 mod array_list;
 mod bitops;

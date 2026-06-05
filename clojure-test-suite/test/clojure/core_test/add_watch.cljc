@@ -221,105 +221,106 @@
     #?@(:cljs []
         :lpy []
         :default
-        [(testing "watch agent"
-           (let [state (volatile! [])
-                 tester1 (fn [key _ref old new]
-                           (when (not= old new)
-                             (vswap! state conj {:key key :old old :new new :tester 1})))
-                 tester2 (fn [key _ref old new]
-                           (when (not= old new)
-                             (vswap! state conj {:key key :old old :new new :tester 2})))
-                 agent-end (promise)
-                 err (fn [key _ref old new]
-                       (deliver agent-end :done)
-                       (throw (ex-info "test" {:key key :old old :new new :tester :err})))
-                 g (agent 20)
-                 update! (fn []
-                           (when-let [e (agent-error g)]
-                             (vswap! state conj (ex-data e))
-                             (restart-agent g :ready))
-                           (send g inc))
-                 _keyed (fn [k s] (set (filter #(= k (:key %)) s)))]
+        [(when-var-exists agent
+           (testing "watch agent"
+             (let [state (volatile! [])
+                   tester1 (fn [key _ref old new]
+                             (when (not= old new)
+                               (vswap! state conj {:key key :old old :new new :tester 1})))
+                   tester2 (fn [key _ref old new]
+                             (when (not= old new)
+                               (vswap! state conj {:key key :old old :new new :tester 2})))
+                   agent-end (promise)
+                   err (fn [key _ref old new]
+                         (deliver agent-end :done)
+                         (throw (ex-info "test" {:key key :old old :new new :tester :err})))
+                   g (agent 20)
+                   update! (fn []
+                             (when-let [e (agent-error g)]
+                               (vswap! state conj (ex-data e))
+                               (restart-agent g :ready))
+                             (send g inc))
+                   _keyed (fn [k s] (set (filter #(= k (:key %)) s)))]
 
-             ;; add a watch to the agent
-             (is (= g (add-watch g :g tester1)))
-             (update!)
-             (await g)
-             (is (= [{:key :g :old 20 :new 21 :tester 1}]
-                    @state))
+               ;; add a watch to the agent
+               (is (= g (add-watch g :g tester1)))
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= [{:key :g :old 20 :new 21 :tester 1}]
+                      @state))
 
-             ;; add a second watch - new key
-             (add-watch g :s tester2)
-             (update!)
-             (await g)
-             (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                      {:key :g :old 21 :new 22 :tester 1}
-                      {:key :s :old 21 :new 22 :tester 2}}
-                    (set @state)))
+               ;; add a second watch - new key
+               (add-watch g :s tester2)
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                        {:key :g :old 21 :new 22 :tester 1}
+                        {:key :s :old 21 :new 22 :tester 2}}
+                      (set @state)))
 
-             ;; replace the first watch by reusing the key
-             (add-watch g :g tester2)
-             (update!)
-             (await g)
-             (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                      {:key :g :old 21 :new 22 :tester 1}
-                      {:key :s :old 21 :new 22 :tester 2}
-                      {:key :g :old 22 :new 23 :tester 2}
-                      {:key :s :old 22 :new 23 :tester 2}}
-                    (set @state)))
+               ;; replace the first watch by reusing the key
+               (add-watch g :g tester2)
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                        {:key :g :old 21 :new 22 :tester 1}
+                        {:key :s :old 21 :new 22 :tester 2}
+                        {:key :g :old 22 :new 23 :tester 2}
+                        {:key :s :old 22 :new 23 :tester 2}}
+                      (set @state)))
 
-             ;; remove the first watch
-             (is (= g (remove-watch g :g)))
-             (update!)
-             (await g)
-             (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                      {:key :g :old 21 :new 22 :tester 1}
-                      {:key :s :old 21 :new 22 :tester 2}
-                      {:key :g :old 22 :new 23 :tester 2}
-                      {:key :s :old 22 :new 23 :tester 2}
-                      {:key :s :old 23 :new 24 :tester 2}}
-                    (set @state)))
+               ;; remove the first watch
+               (is (= g (remove-watch g :g)))
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                        {:key :g :old 21 :new 22 :tester 1}
+                        {:key :s :old 21 :new 22 :tester 2}
+                        {:key :g :old 22 :new 23 :tester 2}
+                        {:key :s :old 22 :new 23 :tester 2}
+                        {:key :s :old 23 :new 24 :tester 2}}
+                      (set @state)))
 
-             ;; remove the second watches - should be no updates
-             (remove-watch g :s)
-             (update!)
-             (await g)
-             (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                      {:key :g :old 21 :new 22 :tester 1}
-                      {:key :s :old 21 :new 22 :tester 2}
-                      {:key :g :old 22 :new 23 :tester 2}
-                      {:key :s :old 22 :new 23 :tester 2}
-                      {:key :s :old 23 :new 24 :tester 2}}
-                    (set @state)))
+               ;; remove the second watches - should be no updates
+               (remove-watch g :s)
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                        {:key :g :old 21 :new 22 :tester 1}
+                        {:key :s :old 21 :new 22 :tester 2}
+                        {:key :g :old 22 :new 23 :tester 2}
+                        {:key :s :old 22 :new 23 :tester 2}
+                        {:key :s :old 23 :new 24 :tester 2}}
+                      (set @state)))
 
-             ;; add the first again, and check if it still works
-             (add-watch g :g tester1)
-             (update!)
-             (await g)
-             (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                      {:key :g :old 21 :new 22 :tester 1}
-                      {:key :s :old 21 :new 22 :tester 2}
-                      {:key :g :old 22 :new 23 :tester 2}
-                      {:key :s :old 22 :new 23 :tester 2}
-                      {:key :s :old 23 :new 24 :tester 2}
-                      {:key :g :old 25 :new 26 :tester 1}}
-                    (set @state)))
+               ;; add the first again, and check if it still works
+               (add-watch g :g tester1)
+               (update!)
+               (#?(:rust await-agent :default await) g)
+               (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                        {:key :g :old 21 :new 22 :tester 1}
+                        {:key :s :old 21 :new 22 :tester 2}
+                        {:key :g :old 22 :new 23 :tester 2}
+                        {:key :s :old 22 :new 23 :tester 2}
+                        {:key :s :old 23 :new 24 :tester 2}
+                        {:key :g :old 25 :new 26 :tester 1}}
+                      (set @state)))
 
-             ;; add error watches
-             (add-watch g :e err)
-             (update!)
-             (deref agent-end)
-             (sleep 1)
-             (if-let [e (agent-error g)]
-               (do
-                 (is (= {:key :e :old 26 :new 27 :tester :err} (ex-data e)))
-                 ;; The final call may not have gone to tester 1
-                 (is (= #{{:key :g :old 20 :new 21 :tester 1}
-                          {:key :g :old 21 :new 22 :tester 1}
-                          {:key :s :old 21 :new 22 :tester 2}
-                          {:key :g :old 22 :new 23 :tester 2}
-                          {:key :s :old 22 :new 23 :tester 2}
-                          {:key :s :old 23 :new 24 :tester 2}
-                          {:key :g :old 25 :new 26 :tester 1}}
-                        (disj (set @state) {:key :g :old 26 :new 27 :tester 1}))))
-               (println "Unexpected lack of error"))))])))
+               ;; add error watches
+               (add-watch g :e err)
+               (update!)
+               (deref agent-end)
+               (sleep 1)
+               (if-let [e (agent-error g)]
+                 (do
+                   (is (= {:key :e :old 26 :new 27 :tester :err} (ex-data e)))
+                   ;; The final call may not have gone to tester 1
+                   (is (= #{{:key :g :old 20 :new 21 :tester 1}
+                            {:key :g :old 21 :new 22 :tester 1}
+                            {:key :s :old 21 :new 22 :tester 2}
+                            {:key :g :old 22 :new 23 :tester 2}
+                            {:key :s :old 22 :new 23 :tester 2}
+                            {:key :s :old 23 :new 24 :tester 2}
+                            {:key :g :old 25 :new 26 :tester 1}}
+                          (disj (set @state) {:key :g :old 26 :new 27 :tester 1}))))
+                 (println "Unexpected lack of error"))))])))
