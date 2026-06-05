@@ -84,17 +84,15 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 
 ## Memory Management
 
-The runtime supports two allocation strategies, selected at compile time via Cargo features.
+The runtime uses a tracing GC as its primary allocator, with an optional bump allocator that can bypass the GC for values proven not to escape their call frame.
 
-### Tracing GC (default / interpreter mode)
+### Tracing GC
 
 All Clojure values are heap-allocated behind `GcPtr<T>`. The GC is a stop-the-world tracing collector (`crates/cljrs-gc/src/lib.rs`). `GcPtr::clone` is O(1) and `GcPtr::drop` is a no-op — the collector reclaims unreachable objects during a collection pause. Collection triggers are threshold-based: a soft limit (75% of the hard limit) and a hard limit (defaulting to ¼ of available RAM, minimum 256 MB).
 
-### Bump allocator (AOT mode only)
+### Bump allocator
 
-**The bump allocator is only available when the crate is compiled with the `no-gc` feature, which is only activated during AOT compilation (`cljrs compile`). It is not available in interpreter or REPL mode.**
-
-The bump allocator is implemented in `crates/cljrs-gc/src/region.rs` as the `Region` struct. It works by maintaining a pointer into a contiguous memory chunk and advancing ("bumping") that pointer on each allocation — no per-object bookkeeping, no mutex contention. When the current chunk is exhausted a new chunk is appended; the default initial chunk size is 4 KiB. Resetting a region (e.g. at the end of a function call) runs destructors in LIFO order and then reclaims all chunks in one shot.
+The bump allocator is implemented in `crates/cljrs-gc/src/region.rs` as the `Region` struct. It is available alongside the GC — allocations that are proven non-escaping skip the GC heap entirely and land in a scratch region instead. It works by maintaining a pointer into a contiguous memory chunk and advancing ("bumping") that pointer on each allocation — no per-object bookkeeping, no mutex contention. When the current chunk is exhausted a new chunk is appended; the default initial chunk size is 4 KiB. Resetting a region (e.g. at the end of a function call) runs destructors in LIFO order and then reclaims all chunks in one shot.
 
 There are two region flavours:
 
@@ -103,7 +101,7 @@ There are two region flavours:
 | `Region` / `ScratchGuard` | `crates/cljrs-gc/src/region.rs` + `alloc_ctx.rs` | Scoped to a call frame | Intermediate values that don't escape |
 | `StaticArena` | `crates/cljrs-gc/src/static_arena.rs` | Program lifetime | Interned symbols, compiled code, constants |
 
-The **allocation context stack** (`crates/cljrs-gc/src/alloc_ctx.rs`) routes each allocation to the currently-active context. In AOT-compiled code the compiler inserts `RegionStart`/`RegionEnd` IR nodes (see `crates/cljrs-ir/src/lower/regionalize.rs`) around call sites whose return values are proven non-escaping, so intermediate allocations land in the scratch region rather than the GC heap.
+The **allocation context stack** (`crates/cljrs-gc/src/alloc_ctx.rs`) routes each allocation to the currently-active context. The compiler inserts `RegionStart`/`RegionEnd` IR nodes (see `crates/cljrs-ir/src/lower/regionalize.rs`) around call sites whose return values are proven non-escaping, so intermediate allocations land in the scratch region rather than the GC heap. In AOT mode (`no-gc` feature, activated by `cljrs compile`) the GC is disabled entirely and all allocations go through regions or the static arena.
 
 The **return-expression protocol** ensures the tail value of a function body is allocated in the *caller's* context, not the callee's scratch region:
 
