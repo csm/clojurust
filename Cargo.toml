@@ -27,7 +27,8 @@ members = [
     "crates/cljrs-io",
     "crates/cljrs-net",
     "crates/cljrs-charset",
-    "crates/cljrs-lsp"]
+    "crates/cljrs-lsp",
+    "crates/cljrs-base64"]
 resolver = "2"
 
 [workspace.package]

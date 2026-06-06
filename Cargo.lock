@@ -381,6 +381,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cljrs-base64"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cljrs-env",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-interop",
+ "cljrs-reader",
+ "cljrs-stdlib",
+ "cljrs-value",
+]
+
+[[package]]
 name = "cljrs-blake3"
 version = "0.1.0"
 dependencies = [

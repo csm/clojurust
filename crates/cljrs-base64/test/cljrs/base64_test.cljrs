@@ -1,0 +1,108 @@
+(ns cljrs.base64-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [cljrs.base64 :as base64]))
+
+(deftest test-encode
+  (testing "empty input"
+    (is (= "" (base64/encode ""))))
+
+  (testing "basic string input"
+    (is (= "aGVsbG8gd29ybGQ=" (base64/encode "hello world"))))
+
+  (testing "basic bytes input"
+    (is (= "AAECAwQ=" (base64/encode (byte-array [0 1 2 3 4])))))
+
+  (testing "single byte — two padding chars"
+    (is (= "AA==" (base64/encode (byte-array [0]))))
+    ;; byte-array uses signed i8 storage; use vector for values > 127
+    (is (= "/w==" (base64/encode [255]))))
+
+  (testing "two bytes — one padding char"
+    (is (= "AAE=" (base64/encode (byte-array [0 1])))))
+
+  (testing "three bytes — no padding"
+    (is (= "AAEC" (base64/encode (byte-array [0 1 2])))))
+
+  (testing "all-zeros byte array"
+    (is (= "AAAA" (base64/encode (byte-array [0 0 0])))))
+
+  (testing "known string"
+    (is (= "SGVsbG8sIFdvcmxkIQ==" (base64/encode "Hello, World!"))))
+
+  (testing "vector of byte values"
+    (is (= "aGVsbG8=" (base64/encode [104 101 108 108 111]))))
+
+  (testing "bytes that map to + and / in standard encoding"
+    ;; [251 239 255] -> 6-bit groups 62,62,63,63 -> "++//"
+    ;; use vector since byte-array uses signed i8 (values > 127 need vector)
+    (is (= "++//" (base64/encode [251 239 255])))))
+
+(deftest test-decode
+  (testing "empty string decodes to empty bytes, re-encodes to empty string"
+    (is (= "" (base64/encode (base64/decode "")))))
+
+  (testing "round-trip: decode then re-encode preserves base64 string"
+    (is (= "aGVsbG8gd29ybGQ="
+           (base64/encode (base64/decode "aGVsbG8gd29ybGQ="))))
+    (is (= "SGVsbG8sIFdvcmxkIQ=="
+           (base64/encode (base64/decode "SGVsbG8sIFdvcmxkIQ=="))))
+    (is (= "AAECAwQ="
+           (base64/encode (base64/decode "AAECAwQ=")))))
+
+  (testing "round-trip preserves various padding lengths"
+    (is (= "AA==" (base64/encode (base64/decode "AA=="))))
+    (is (= "AAE=" (base64/encode (base64/decode "AAE="))))
+    (is (= "AAEC" (base64/encode (base64/decode "AAEC")))))
+
+  (testing "decode output can be passed directly back to encode"
+    (let [original "++//"
+          decoded  (base64/decode original)
+          reencoded (base64/encode decoded)]
+      (is (= original reencoded)))))
+
+(deftest test-encode-url
+  (testing "empty input"
+    (is (= "" (base64/encode-url ""))))
+
+  (testing "basic string — no padding chars"
+    ;; standard "aGVsbG8gd29ybGQ=" minus the trailing =
+    (is (= "aGVsbG8gd29ybGQ" (base64/encode-url "hello world"))))
+
+  (testing "bytes that produce - and _ instead of + and /"
+    ;; [251 239 255] -> standard "++//" -> url-safe "--__"
+    (is (= "--__" (base64/encode-url [251 239 255]))))
+
+  (testing "url-safe output contains no + or / characters"
+    (let [encoded (base64/encode-url [251 239 255])]
+      (is (not (str/includes? encoded "+")))
+      (is (not (str/includes? encoded "/")))))
+
+  (testing "url-safe output contains no = padding"
+    (is (not (str/includes? (base64/encode-url "a") "=")))
+    (is (not (str/includes? (base64/encode-url "ab") "=")))
+    (is (not (str/includes? (base64/encode-url "abc") "="))))
+
+  (testing "three-byte input produces four chars, no padding"
+    (is (= 4 (count (base64/encode-url (byte-array [0 0 0])))))))
+
+(deftest test-decode-url
+  (testing "empty string"
+    (is (= "" (base64/encode-url (base64/decode-url "")))))
+
+  (testing "round-trip url-safe: decode then re-encode"
+    (is (= "aGVsbG8gd29ybGQ"
+           (base64/encode-url (base64/decode-url "aGVsbG8gd29ybGQ"))))
+    (is (= "--__"
+           (base64/encode-url (base64/decode-url "--__")))))
+
+  (testing "url-safe and standard decode the same bytes for non-special chars"
+    ;; "AAEC" uses only alphabet chars present in both encodings
+    (is (= (base64/encode (base64/decode "AAEC"))
+           (base64/encode (base64/decode-url "AAEC")))))
+
+  (testing "decode-url handles - and _ correctly"
+    ;; "--__" url-safe -> bytes [251 239 255] -> standard encode "++//"
+    (is (= "++//" (base64/encode (base64/decode-url "--__"))))
+    ;; cross-check: standard decode of "++//" gives the same bytes
+    (is (= "++//" (base64/encode (base64/decode "++//"))))))

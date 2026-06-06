@@ -1,0 +1,24 @@
+[package]
+name = "cljrs-base64"
+version = "0.1.0"
+edition = "2024"
+description = "Base64 library for Clojurust wrapping rust-base64"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cljrs-interop = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-value   = { workspace = true }
+base64 = "0.22.1"
+
+[dev-dependencies]
+cljrs-eval    = { workspace = true }
+cljrs-stdlib  = { workspace = true }
+cljrs-env     = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-interop = { workspace = true }
+cljrs-reader  = { workspace = true }
