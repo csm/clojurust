@@ -370,25 +370,65 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 
 ## Phase 10 — JIT Compiler
 
-- [x] Choose JIT backend (Cranelift recommended; LLVM as alternative)
-- [x] Define intermediate representation (IR) for clojurust forms
+A fourth execution tier that compiles hot functions and hot loops to native
+code in-process, so ad-hoc code (`cljrs run`, the REPL, `eval`) reaches
+AOT-class speed with no explicit compile step. Full architecture and rationale:
+[`docs/jit-plan.md`](docs/jit-plan.md). Milestones below map 1:1 to that
+document's layers.
+
+Foundations already in place:
+
+- [x] Choose JIT backend (Cranelift)
+- [x] Define intermediate representation (IR) for clojurust forms (ANF + SSA + CFG, `cljrs-ir`)
 - [x] Emit IR for core special forms and function calls
-- [ ] Type inference / specialization for numeric code paths
+
+### Phase 10.0 — Backend refactor
+
+- [ ] Make `codegen.rs` generic over `cranelift_module::Module` (drives both `ObjectModule` for AOT and `JITModule` for JIT); AOT behavior unchanged
+
+### Phase 10.1 — Minimal JIT tier (first working JIT)
+
+- [ ] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder`; materialize constants via runtime calls (no `GcPtr`s in code)
+- [ ] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, CLI flag) in a `JitState` keyed by `ir_arity_id`
+- [ ] Background-thread compilation with atomic code-pointer swap (never stall a hot call)
+- [ ] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam
+- [ ] Conservative stack scanning of JIT frames for GC roots (sound under the non-moving collector); safepoint polls at loop back-edges and function entry
+- [ ] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest)
+
+### Phase 10.2 — Code unloading
+
+- [ ] Per-version code tagged with `ir_arity_id` + epoch; mark prior arity stale on redefinition
+- [ ] Reclaim stale epochs at the existing STW safepoint, freeing only epochs with no live JIT frame (resolves the unload-vs-execute race)
+
+### Phase 10.3 — Shrink the interpreter seam (ROI order)
+
+- [ ] Destructured params: expand destructuring to explicit let-bindings in the IR prologue (lowering-only)
+- [ ] Closures with captured bindings: complete capture lowering + closure-alloc codegen
+- [ ] Variadic / rest params through codegen
+- [ ] Promote special-cased ops (`apply`, `atom`, `swap!`/`reset!`, `volatile!`, `vswap!`) to first-class `KnownFn`/IR instructions
+
+### Phase 10.4 — OSR (on-stack replacement)
+
+- [ ] Loop back-edge counters at loop headers
+- [ ] OSR-entry compilation (entry block = loop header; live-ins as params) and mid-loop transfer of the interpreter register file into the native frame — promotes single-call hot loops typical of scripts/REPL
+
+### Phase 10.5 — Context-driven bump allocation
+
+- [ ] Thread the active region pointer as a hidden parameter into JIT'd calls so callees bump-allocate into the caller's region when escape analysis + call-site context prove safety
+- [ ] Call-site monomorphization of allocation strategy (static arena / caller region / GC heap)
+- [ ] Treat each REPL form / script run as an arena scope; promote the result out before reset
+- [ ] Extend profile-driven scratch regions to the default GC build (coexist with the tracing collector; heap-promotion fallback for escapers)
+
+### Phase 10.6 — Specialization & inline caches
+
+- [ ] Type inference / primitive unboxing (`i64`/`f64` in registers, no boxing, no GC alloc)
 - [ ] Inline caches for protocol dispatch and keyword lookup
-- [ ] OSR (on-stack replacement) to transition from interpreter to JIT mid-execution
-- [ ] Deoptimization path back to interpreter when assumptions are violated
-- [ ] JIT compilation threshold (invocation count trigger)
-- [ ] Integration with GC: patch compiled code roots, handle safepoints in native frames
-- [ ] Primitive unboxing: where type feedback confirms a value is always `i64` or `f64`, emit raw arithmetic on machine registers — no `Value` boxing, no GC allocation
-- [ ] Escape analysis: values that do not escape their defining scope (not returned, not captured, not stored) may be stack-allocated rather than heap-allocated through the GC
-- [ ] Call-site monomorphization: generate type-specialized copies of hot functions when call-site type profiles are stable (e.g. `(map inc xs)` where `xs` is always `Vec<i64>`)
+- [ ] Call-site monomorphization on stable type profiles
+- [ ] Deoptimization path back to Tier 1 when assumptions are violated
 
-### Phase 10.1 — JIT Optimization
+### Phase H (deferred) — Async JIT
 
-- [ ] Profile allocation escape rates.
-- [ ] Speculate region allocation.
-- [ ] Guard and promote to heap if needed.
-- [ ] Specialize hot lookup sites further.
+- [ ] Emit Cranelift state machines with explicit resume points for `^:async` functions, integrating with the Tokio executor
 
 ---
 

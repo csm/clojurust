@@ -43,3 +43,4 @@
 
 - [Overview](memory/index.md)
 - [The bump allocator](memory/bump-allocator.md)
+- [JIT & tiered execution](memory/jit.md)
