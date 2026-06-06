@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>clj.rs</title>
+  <title>cljrs REPL</title>
   <link rel="icon" href="/favicon.ico" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -87,7 +87,6 @@
       line-height: 1.65;
       min-height: 100vh;
       -webkit-font-smoothing: antialiased;
-      padding-bottom: 60px;
     }
 
     /* ── Layout ─────────────────────────────────────────────── */
@@ -250,30 +249,52 @@
       outline-offset: 3px;
     }
 
-    /* ── REPL bar (fixed, bottom of viewport) ───────────────── */
-    #repl-bar {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      z-index: 100;
+    /* ── REPL result entries ─────────────────────────────────── */
+    .repl-divider {
+      border: none;
+      border-top: 1px solid var(--rule);
+      margin: 2.5rem 0 1.5rem;
+      display: flex;
+      align-items: center;
+    }
+
+    .repl-divider::after {
+      content: ';; REPL — compiled to WASM · clojure.core.async supported';
+      margin-left: 0.75rem;
+      font-size: 0.72rem;
+      color: var(--text-faint);
+      white-space: nowrap;
+    }
+
+    .repl-entry {
+      margin: 0.6rem 0;
+      padding-left: 1rem;
+      border-left: 2px solid var(--accent2);
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }
+
+    .repl-in { color: var(--accent2); white-space: pre-wrap; word-break: break-word; }
+    .repl-in::before { content: 'user=> '; opacity: 0.5; }
+
+    .repl-print { color: var(--text-dim);  white-space: pre-wrap; word-break: break-word; }
+    .repl-val   { color: var(--accent);  white-space: pre-wrap; word-break: break-word; }
+    .repl-err   { color: var(--accent4);     white-space: pre-wrap; word-break: break-word; }
+
+    /* ── Inline REPL input area ──────────────────────────────── */
+    #repl-input-area {
+      margin-top: 1.5rem;
       background: var(--surface1);
       border-top: 1px solid var(--rule);
     }
 
     #repl-bar-inner {
-      max-width: 740px;
-      margin: 0 auto;
       display: flex;
       align-items: flex-start;
       gap: 8px;
-      padding: 7px 1.5rem;
+      padding: 7px 0;
       font-family: inherit;
       font-size: 0.9rem;
-    }
-
-    @media (min-width: 900px) {
-      #repl-bar-inner { padding-left: 0; padding-right: 0; }
     }
 
     #repl-prompt {
@@ -380,116 +401,72 @@
     }
 
     #repl-eval:disabled { opacity: 0.3; cursor: not-allowed; }
-
-    /* ── REPL result entries ─────────────────────────────────── */
-    .repl-divider {
-      border: none;
-      border-top: 1px solid var(--rule);
-      margin: 2.5rem 0 1.5rem;
-      display: flex;
-      align-items: center;
-    }
-
-    .repl-divider::after {
-      content: ';; REPL — compiled to WASM · clojure.core.async supported';
-      margin-left: 0.75rem;
-      font-size: 0.72rem;
-      color: var(--text-faint);
-      white-space: nowrap;
-    }
-
-    .repl-entry {
-      margin: 0.6rem 0;
-      padding-left: 1rem;
-      border-left: 2px solid var(--accent2);
-      font-size: 0.88rem;
-      line-height: 1.55;
-    }
-
-    .repl-in { color: var(--accent2); white-space: pre-wrap; word-break: break-word; }
-    .repl-in::before { content: 'user=> '; opacity: 0.5; }
-
-    .repl-print { color: var(--text-dim);  white-space: pre-wrap; word-break: break-word; }
-    .repl-val   { color: var(--accent);  white-space: pre-wrap; word-break: break-word; }
-    .repl-err   { color: var(--accent4);     white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
   <div class="wrapper">
 
     <header>
-      <div class="site-title">cljrs <span class="badge badge-alpha">alpha</span></div>
-      <div class="tagline">a Clojure dialect implemented in Rust</div>
+      <div class="site-title">cljrs <span>repl</span> <span class="badge badge-alpha">alpha</span></div>
+      <div class="tagline">interactive Clojure dialect in your browser — compiled to WASM</div>
     </header>
 
     <section>
       <div class="section-label">about</div>
       <p>
-        cljrs is an experimental Clojure dialect targeting the Rust ecosystem.
-        It aims to be a capable Lisp runtime with persistent data structures,
-        a hosted macro system, and native interop — compiled or interpreted,
-        suitable for use as an agentic coding runtime.
+        This REPL runs the cljrs interpreter compiled to WebAssembly entirely in
+        your browser — no server, no installation. Type any Clojure expression and
+        press <code>Shift+Enter</code> or the <code>eval</code> button to run it.
+        Persistent data structures, <code>clojure.core.async</code>, and the full
+        cljrs standard library are available.
       </p>
       <p>
-        Available on <code>crates.io</code>. Early stage; expect rough edges.
+        Use <code>Tab</code> to indent, <code>↑</code>/<code>↓</code> to navigate
+        history. Matching brackets are highlighted as you type.
       </p>
     </section>
 
     <section>
-      <div class="section-label">get it</div>
+      <div class="section-label">links</div>
       <ul class="link-list">
         <li>
           <a href="https://crates.io/crates/cljrs" target="_blank" rel="noopener">crates.io/crates/cljrs</a>
           <span class="desc">published crate</span>
         </li>
         <li>
-          <a href="/repl.html">clj.rs/repl</a>
-          <span class="desc">try it in your browser</span>
-        </li>
-        <li>
-          <a href="https://github.com/csm/clojurust" target="_blank" rel="noopener">github.com/csm/clojurust</a>
-          <span class="desc">source repository</span>
+          <a href="/">clj.rs</a>
+          <span class="desc">project home</span>
         </li>
       </ul>
     </section>
 
-    <section>
-      <div class="section-label">docs &amp; resources</div>
-      <ul class="link-list">
-        <li>
-          <a href="https://docs.clj.rs" >docs.clj.rs</a>
-          <span class="desc">language reference</span>
-        </li>
-      </ul>
-    </section>
+    <div id="repl-out"></div>
+
+    <div id="repl-input-area">
+      <div id="repl-bar-inner">
+        <span id="repl-prompt">user=>&nbsp;</span>
+        <div id="repl-input-wrap">
+          <div id="repl-highlights" aria-hidden="true"></div>
+          <textarea id="repl-input"
+            rows="1"
+            disabled
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Loading REPL…"
+            aria-label="Clojure REPL input"
+          ></textarea>
+        </div>
+        <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
+        <span id="repl-status">loading…</span>
+      </div>
+    </div>
 
     <footer>
       <span>clj.rs &mdash; open source &mdash; </span>
       <a href="https://github.com/csm/clojurust/blob/main/COPYING.md" target="_blank" rel="noopener">license</a>
     </footer>
 
-    <div id="repl-out"></div>
-
   </div><!-- /.wrapper -->
-
-  <div id="repl-bar">
-    <div id="repl-bar-inner">
-      <span id="repl-prompt">user=>&nbsp;</span>
-      <div id="repl-input-wrap">
-        <div id="repl-highlights" aria-hidden="true"></div>
-        <textarea id="repl-input"
-          rows="1"
-          disabled
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="Loading REPL…"
-          aria-label="Clojure REPL input"
-        ></textarea>
-      </div>
-      <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
-      <span id="repl-status">loading…</span>
-    </div>
-  </div>
 
   <script>
   (function () {
@@ -514,8 +491,6 @@
     function resize() {
       input.style.height = 'auto';
       input.style.height = Math.min(input.scrollHeight, 200) + 'px';
-      var bar = document.getElementById('repl-bar');
-      if (bar) document.body.style.paddingBottom = (bar.offsetHeight + 4) + 'px';
     }
 
     // ── Cursor-position helpers ───────────────────────────────
@@ -678,21 +653,15 @@
       }
 
       out.appendChild(entry);
-      scrollToBottom();
+      scrollToInput();
     }
 
-    // ── Scroll the page to the very bottom ────────────────────
-    // The page (not a container) scrolls, and #repl-bar is fixed over
-    // the bottom of the viewport. scrollIntoView would tuck the newest
-    // entry behind the bar, so scroll to the full document height — the
-    // body's bottom padding leaves room for the entry to clear the bar.
-    // rAF lets resize() finalize that padding before we read scrollHeight.
-    function scrollToBottom() {
+    // ── Scroll so the REPL input area stays visible ───────────
+    function scrollToInput() {
       requestAnimationFrame(function () {
-        window.scrollTo({
-          top: document.documentElement.scrollHeight,
-          behavior: 'smooth'
-        });
+        document.getElementById('repl-input-area').scrollIntoView(
+          { behavior: 'smooth', block: 'nearest' }
+        );
       });
     }
 
