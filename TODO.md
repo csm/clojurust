@@ -384,7 +384,7 @@ Foundations already in place:
 
 ### Phase 10.0 — Backend refactor
 
-- [ ] Make `codegen.rs` generic over `cranelift_module::Module` (drives both `ObjectModule` for AOT and `JITModule` for JIT); AOT behavior unchanged
+- [x] Make `codegen.rs` generic over `cranelift_module::Module` (drives both `ObjectModule` for AOT and `JITModule` for JIT); AOT behavior unchanged
 
 ### Phase 10.1 — Minimal JIT tier (first working JIT)
 

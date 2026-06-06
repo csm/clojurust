@@ -9,7 +9,9 @@ ANF lowering and escape analysis are written in Clojure (`cljrs.compiler.anf`,
 layer (`ir_convert.rs`) translates these back to the `IrFunction` structs that the
 Cranelift codegen backend consumes.
 
-**Phase:** 8.1 (optimization) + 11 (AOT compilation) + no-gc phases 6–7 — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs, sequence/collection ops, type predicates, atom constructor, and inline expansions.  Under the `no-gc` feature the AOT driver also runs the **blacklist analysis** (`escape.rs`) which rejects programs that cannot be safely compiled without a GC.
+**Phase:** 8.1 (optimization) + 10.0 (backend refactor) + 11 (AOT compilation) + no-gc phases 6–7 — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs, sequence/collection ops, type predicates, atom constructor, and inline expansions.  Under the `no-gc` feature the AOT driver also runs the **blacklist analysis** (`escape.rs`) which rejects programs that cannot be safely compiled without a GC.
+
+**Phase 10.0 (backend refactor):** `Compiler` and `FunctionTranslator` are now generic over `cranelift_module::Module` (`Compiler<M: Module = ObjectModule>`).  The shared CLIF-emitting logic (`compile_function`, `declare_function`) and the full `rt_abi` symbol declaration table (`declare_runtime_funcs`) work with any `Module` backend.  AOT-specific construction (`Compiler::new`) and finalisation (`Compiler::finish`) live in `impl Compiler<ObjectModule>`; the free function `new_compiler_from_module` lets the upcoming `cljrs-jit` crate hand a pre-built `JITModule` to the shared codegen.
 
 ---
 
@@ -114,13 +116,23 @@ walk directly, preserving full semantics.
 ### Cranelift codegen (`codegen.rs`)
 
 ```rust
-pub struct Compiler { ... }
-impl Compiler {
-    pub fn new() -> CodegenResult<Self>;
+// Generic over any cranelift_module::Module backend (defaults to ObjectModule for AOT).
+pub struct Compiler<M: Module = ObjectModule> { ... }
+
+// Works with any backend:
+impl<M: Module> Compiler<M> {
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
+}
+
+// AOT-specific (ObjectModule only):
+impl Compiler<ObjectModule> {
+    pub fn new() -> CodegenResult<Self>;
     pub fn finish(self) -> Vec<u8>;
 }
+
+// Entry point for JIT and other backends that supply their own Module:
+pub fn new_compiler_from_module<M: Module>(module: M, ptr_type: types::Type) -> CodegenResult<Compiler<M>>;
 ```
 
 ### AOT driver (`aot.rs`)
@@ -191,5 +203,5 @@ Optimization passes on IR data maps. Currently implements region allocation: rew
 | `cljrs-reader` (workspace) | `Form`, `FormKind` — input AST for lowering |
 | `cljrs-eval` (workspace) | `Env`, `GlobalEnv`, macros, callback — macro expansion + rt_call dispatch |
 | `cljrs-stdlib` (workspace) | `standard_env` — bootstrap environment for macro expansion + harness |
-| `cranelift-*` (workspace) | Cranelift compiler infrastructure |
+| `cranelift-*` (workspace) | Cranelift compiler infrastructure (`cranelift-jit` registered in workspace deps for Phase 10.1 `cljrs-jit`) |
 | `target-lexicon` (workspace) | Target triple detection |
