@@ -21,7 +21,7 @@ src/
   ir.rs         — re-exports all types from cljrs-ir crate
   ir_convert.rs — Value → IrFunction conversion (Clojure data → Rust IR types)
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
-  codegen.rs    — Cranelift code generator: IrFunction → native object code
+  codegen.rs    — Cranelift code generator: IrFunction → native code, generic over cranelift_module::Module (AOT ObjectModule / future JIT JITModule)
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
   cljrs/compiler/
@@ -113,13 +113,28 @@ walk directly, preserving full semantics.
 
 ### Cranelift codegen (`codegen.rs`)
 
+`Compiler<M>` is **generic over `cranelift_module::Module`** (defaulting to
+`ObjectModule`) so the same CLIF-emitting core drives both the AOT backend
+(`ObjectModule`) and a future JIT backend (`JITModule`); the lowering logic and
+`rt_abi` signatures are shared verbatim. Backend-agnostic methods live in
+`impl<M: Module> Compiler<M>`; only construction and finalization are
+backend-specific.
+
 ```rust
-pub struct Compiler { ... }
-impl Compiler {
-    pub fn new() -> CodegenResult<Self>;
+pub struct Compiler<M: Module = ObjectModule> { ... }
+
+// Backend-agnostic (shared by AOT and JIT):
+impl<M: Module> Compiler<M> {
+    pub fn from_module(module: M) -> CodegenResult<Self>;       // declares rt_abi bridge
+    pub fn module_mut(&mut self) -> &mut M;
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
-    pub fn finish(self) -> Vec<u8>;
+}
+
+// AOT-specific (ObjectModule):
+impl Compiler<ObjectModule> {
+    pub fn new() -> CodegenResult<Self>;   // host-targeted ObjectModule
+    pub fn finish(self) -> Vec<u8>;        // emit relocatable object code
 }
 ```
 
