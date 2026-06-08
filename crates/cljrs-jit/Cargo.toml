@@ -1,0 +1,24 @@
+[package]
+name = "cljrs-jit"
+version = "0.1.0"
+edition = "2024"
+description = "In-process JIT (Cranelift) tier for clojurust — compiles hot function arities to native code on a background thread"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-logging  = { workspace = true }
+cljrs-ir       = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-compiler = { workspace = true }
+
+cranelift-codegen  = { workspace = true }
+cranelift-module   = { workspace = true }
+cranelift-jit      = { workspace = true }
+cranelift-native   = { workspace = true }
+
+[dev-dependencies]
+cljrs-stdlib = { workspace = true }
+cljrs-reader = { workspace = true }

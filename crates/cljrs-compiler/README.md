@@ -112,6 +112,12 @@ walk directly, preserving full semantics.
 - **Output:** `rt_println(v)`, `rt_pr(v)`, `rt_str(v)`
 - **Type checks:** `rt_is_nil`, `rt_is_vector`, `rt_is_map`, `rt_is_seq`, `rt_identical`
 - **Linker anchor:** `anchor_rt_symbols()` — call from harness to prevent dead-code elimination
+- **Symbol table:** `rt_symbols() -> Vec<(&'static str, *const u8)>` — single source of truth for the
+  runtime ABI surface; backs both `anchor_rt_symbols` (AOT) and JIT symbol registration with
+  `JITBuilder` (`cljrs-jit`).
+- **Exceptions:** `take_pending_exception_value() -> Option<Value>` — take/clear the exception stashed
+  by `rt_throw`; the JIT/AOT call boundary uses it to surface a `(throw ...)` that unwound to the
+  function's `Unreachable` terminator as a proper error rather than nil.
 
 ### Cranelift codegen (`codegen.rs`)
 
@@ -123,6 +129,9 @@ pub struct Compiler<M: Module = ObjectModule> { ... }
 impl<M: Module> Compiler<M> {
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
+    /// Access the backing module — the JIT uses this on its concrete
+    /// `JITModule` to `finalize_definitions()` and `get_finalized_function()`.
+    pub fn module_mut(&mut self) -> &mut M;
 }
 
 // AOT-specific (ObjectModule only):

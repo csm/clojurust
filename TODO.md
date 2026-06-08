@@ -386,14 +386,14 @@ Foundations already in place:
 
 - [x] Make `codegen.rs` generic over `cranelift_module::Module` (drives both `ObjectModule` for AOT and `JITModule` for JIT); AOT behavior unchanged
 
-### Phase 10.1 — Minimal JIT tier (first working JIT)
+### Phase 10.1 — Minimal JIT tier (first working JIT) ✓
 
-- [ ] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder`; materialize constants via runtime calls (no `GcPtr`s in code)
-- [ ] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, CLI flag) in a `JitState` keyed by `ir_arity_id`
-- [ ] Background-thread compilation with atomic code-pointer swap (never stall a hot call)
-- [ ] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam
-- [ ] Conservative stack scanning of JIT frames for GC roots (sound under the non-moving collector); safepoint polls at loop back-edges and function entry
-- [ ] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest)
+- [x] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder` (`rt_abi::rt_symbols`); materialize constants via runtime calls (no `GcPtr`s in code)
+- [x] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, `--jit` CLI flag / `CLJRS_JIT` env) in a `JitState` keyed by `ir_arity_id` (`cljrs-eval/src/jit_state.rs`)
+- [x] Background-thread compilation with atomic code-pointer swap (never stall a hot call) — `cljrs-jit` worker thread + `AtomicPtr` slot; calls keep running Tier-1/0 until native code is published
+- [x] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam (`cljrs-eval/src/apply.rs`)
+- [x] Safepoint polls at loop back-edges and function entry (reuses the shared codegen's `rt_safepoint`). Call-boundary GC roots are handled soundly under the non-moving collector by rooting argument `Value`s (`gc_roots::root_values`) and holding an open alloc frame for the duration of the native call, so heap allocations made by native code stay reachable via `trace_thread_alloc_roots`. **Precise/conservative scanning of live native-frame slots is deferred** (a refinement for long-running OSR loops and tighter retention; not needed for the current "collect only at interpreter safepoints" model).
+- [x] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest); additionally restricted to flat functions (no `subfunctions`/closures) — closures/destructuring/variadics arrive in Phase 10.3. The JIT path **never mutates the shared `ir_cache`**, so interpreter tier selection is unchanged whether the JIT is on or off.
 
 ### Phase 10.2 — Code unloading
 

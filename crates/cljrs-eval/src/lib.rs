@@ -22,6 +22,7 @@ pub mod apply;
 pub mod ir_cache;
 pub mod ir_convert;
 pub mod ir_interp;
+pub mod jit_state;
 pub mod lower;
 
 pub use cljrs_env::callback::invoke;

@@ -2973,6 +2973,17 @@ fn take_pending_exception() -> Option<*const Value> {
     PENDING_EXCEPTION.with(|cell| cell.borrow_mut().take())
 }
 
+/// Take and clear any pending exception stashed by `rt_throw`, cloning the
+/// thrown `Value` out.
+///
+/// The JIT (and any other) call boundary calls this immediately after invoking
+/// compiled code so a `(throw ...)` that unwound to the function's
+/// `Unreachable` terminator (returning nil) is surfaced as a proper error
+/// rather than silently producing nil.
+pub fn take_pending_exception_value() -> Option<Value> {
+    take_pending_exception().map(|p| unsafe { (*p).clone() })
+}
+
 /// `(try body (catch Ex e handler) (finally cleanup))` — exception handling.
 ///
 /// `body_fn`: a zero-arg Clojure function for the try body.
@@ -3421,6 +3432,162 @@ pub extern "C" fn rt_atom(v: *const Value) -> *const Value {
 
 // ── Symbol anchor ────────────────────────────────────────────────────────────
 
+/// Every `rt_*` runtime-bridge symbol paired with its function pointer.
+///
+/// This is the single source of truth for the runtime ABI surface.  It backs
+/// two consumers:
+///
+/// - AOT: `anchor_rt_symbols` black-boxes each pointer so the linker keeps the
+///   functions in the final binary.
+/// - JIT (`cljrs-jit`): registers each `(name, ptr)` with `JITBuilder` so
+///   in-process emitted calls resolve to these functions.
+///
+/// Keep this in sync with the `declare_rt` calls in `codegen.rs` — any symbol
+/// the codegen references must appear here, or JIT finalization will fail to
+/// resolve it (which degrades gracefully to the interpreter, but loses the
+/// function to the JIT).
+pub fn rt_symbols() -> Vec<(&'static str, *const u8)> {
+    macro_rules! syms {
+        ($($f:ident),* $(,)?) => {
+            vec![ $( (stringify!($f), $f as *const u8) ),* ]
+        };
+    }
+    syms![
+        rt_safepoint,
+        rt_const_nil,
+        rt_const_true,
+        rt_const_false,
+        rt_const_long,
+        rt_const_double,
+        rt_const_char,
+        rt_const_string,
+        rt_const_keyword,
+        rt_const_symbol,
+        rt_truthiness,
+        rt_add,
+        rt_sub,
+        rt_mul,
+        rt_div,
+        rt_rem,
+        rt_eq,
+        rt_lt,
+        rt_gt,
+        rt_lte,
+        rt_gte,
+        rt_region_start,
+        rt_region_end,
+        rt_region_alloc_vector,
+        rt_region_alloc_map,
+        rt_region_alloc_set,
+        rt_region_alloc_list,
+        rt_region_alloc_cons,
+        rt_alloc_vector,
+        rt_alloc_map,
+        rt_alloc_set,
+        rt_alloc_list,
+        rt_alloc_cons,
+        rt_get,
+        rt_count,
+        rt_count_filter,
+        rt_into_filter,
+        rt_into_mapcat,
+        rt_into_map,
+        rt_is_empty,
+        rt_first,
+        rt_rest,
+        rt_assoc,
+        rt_conj,
+        rt_make_fn,
+        rt_make_fn_variadic,
+        rt_make_fn_multi,
+        rt_load_global,
+        rt_def_var,
+        rt_load_var,
+        rt_call,
+        rt_deref,
+        rt_println,
+        rt_pr,
+        rt_is_nil,
+        rt_is_seq,
+        rt_is_vector,
+        rt_is_map,
+        rt_identical,
+        rt_str,
+        rt_str_n,
+        rt_println_n,
+        rt_with_out_str,
+        rt_dissoc,
+        rt_disj,
+        rt_nth,
+        rt_contains,
+        rt_seq,
+        rt_lazy_seq,
+        rt_transient,
+        rt_assoc_bang,
+        rt_conj_bang,
+        rt_persistent_bang,
+        rt_atom_reset,
+        rt_atom_swap,
+        rt_apply,
+        rt_reduce2,
+        rt_reduce3,
+        rt_map,
+        rt_filter,
+        rt_mapv,
+        rt_filterv,
+        rt_some,
+        rt_every,
+        rt_into,
+        rt_into3,
+        rt_peek,
+        rt_pop,
+        rt_vec,
+        rt_mapcat,
+        rt_repeatedly,
+        rt_set_bang,
+        rt_with_bindings,
+        rt_throw,
+        rt_try,
+        rt_group_by,
+        rt_partition2,
+        rt_partition3,
+        rt_partition4,
+        rt_frequencies,
+        rt_keep,
+        rt_remove,
+        rt_map_indexed,
+        rt_zipmap,
+        rt_juxt,
+        rt_comp,
+        rt_partial,
+        rt_complement,
+        rt_concat,
+        rt_range1,
+        rt_range2,
+        rt_range3,
+        rt_take,
+        rt_drop,
+        rt_reverse,
+        rt_sort,
+        rt_sort_by,
+        rt_keys,
+        rt_vals,
+        rt_merge,
+        rt_update,
+        rt_get_in,
+        rt_assoc_in,
+        rt_is_number,
+        rt_is_string,
+        rt_is_keyword,
+        rt_is_symbol,
+        rt_is_bool,
+        rt_is_int,
+        rt_prn,
+        rt_print,
+        rt_atom,
+    ]
+}
+
 /// Force the linker to include all `rt_*` symbols.
 ///
 /// Call this from the AOT harness `main()` so the linker doesn't strip the
@@ -3429,125 +3596,9 @@ pub extern "C" fn rt_atom(v: *const Value) -> *const Value {
 /// `std::hint::black_box` fence.
 #[inline(never)]
 pub fn anchor_rt_symbols() {
-    std::hint::black_box(rt_const_nil as *const () as usize);
-    std::hint::black_box(rt_const_true as *const () as usize);
-    std::hint::black_box(rt_const_false as *const () as usize);
-    std::hint::black_box(rt_const_long as *const () as usize);
-    std::hint::black_box(rt_const_double as *const () as usize);
-    std::hint::black_box(rt_const_char as *const () as usize);
-    std::hint::black_box(rt_const_string as *const () as usize);
-    std::hint::black_box(rt_const_keyword as *const () as usize);
-    std::hint::black_box(rt_const_symbol as *const () as usize);
-    std::hint::black_box(rt_truthiness as *const () as usize);
-    std::hint::black_box(rt_add as *const () as usize);
-    std::hint::black_box(rt_sub as *const () as usize);
-    std::hint::black_box(rt_mul as *const () as usize);
-    std::hint::black_box(rt_div as *const () as usize);
-    std::hint::black_box(rt_rem as *const () as usize);
-    std::hint::black_box(rt_eq as *const () as usize);
-    std::hint::black_box(rt_lt as *const () as usize);
-    std::hint::black_box(rt_gt as *const () as usize);
-    std::hint::black_box(rt_lte as *const () as usize);
-    std::hint::black_box(rt_gte as *const () as usize);
-    std::hint::black_box(rt_alloc_vector as *const () as usize);
-    std::hint::black_box(rt_alloc_map as *const () as usize);
-    std::hint::black_box(rt_alloc_set as *const () as usize);
-    std::hint::black_box(rt_alloc_list as *const () as usize);
-    std::hint::black_box(rt_alloc_cons as *const () as usize);
-    std::hint::black_box(rt_get as *const () as usize);
-    std::hint::black_box(rt_count as *const () as usize);
-    std::hint::black_box(rt_first as *const () as usize);
-    std::hint::black_box(rt_rest as *const () as usize);
-    std::hint::black_box(rt_assoc as *const () as usize);
-    std::hint::black_box(rt_conj as *const () as usize);
-    std::hint::black_box(rt_call as *const () as usize);
-    std::hint::black_box(rt_deref as *const () as usize);
-    std::hint::black_box(rt_load_global as *const () as usize);
-    std::hint::black_box(rt_def_var as *const () as usize);
-    std::hint::black_box(rt_println as *const () as usize);
-    std::hint::black_box(rt_pr as *const () as usize);
-    std::hint::black_box(rt_is_nil as *const () as usize);
-    std::hint::black_box(rt_is_vector as *const () as usize);
-    std::hint::black_box(rt_is_map as *const () as usize);
-    std::hint::black_box(rt_is_seq as *const () as usize);
-    std::hint::black_box(rt_identical as *const () as usize);
-    std::hint::black_box(rt_str as *const () as usize);
-    std::hint::black_box(rt_str_n as *const () as usize);
-    std::hint::black_box(rt_println_n as *const () as usize);
-    std::hint::black_box(rt_with_out_str as *const () as usize);
-    std::hint::black_box(rt_make_fn as *const () as usize);
-    std::hint::black_box(rt_make_fn_variadic as *const () as usize);
-    std::hint::black_box(rt_make_fn_multi as *const () as usize);
-    std::hint::black_box(rt_throw as *const () as usize);
-    std::hint::black_box(rt_try as *const () as usize);
-    std::hint::black_box(rt_dissoc as *const () as usize);
-    std::hint::black_box(rt_disj as *const () as usize);
-    std::hint::black_box(rt_nth as *const () as usize);
-    std::hint::black_box(rt_contains as *const () as usize);
-    std::hint::black_box(rt_seq as *const () as usize);
-    std::hint::black_box(rt_lazy_seq as *const () as usize);
-    std::hint::black_box(rt_transient as *const () as usize);
-    std::hint::black_box(rt_assoc_bang as *const () as usize);
-    std::hint::black_box(rt_conj_bang as *const () as usize);
-    std::hint::black_box(rt_persistent_bang as *const () as usize);
-    std::hint::black_box(rt_atom_reset as *const () as usize);
-    std::hint::black_box(rt_atom_swap as *const () as usize);
-    std::hint::black_box(rt_apply as *const () as usize);
-    std::hint::black_box(rt_reduce2 as *const () as usize);
-    std::hint::black_box(rt_reduce3 as *const () as usize);
-    std::hint::black_box(rt_map as *const () as usize);
-    std::hint::black_box(rt_filter as *const () as usize);
-    std::hint::black_box(rt_mapv as *const () as usize);
-    std::hint::black_box(rt_filterv as *const () as usize);
-    std::hint::black_box(rt_some as *const () as usize);
-    std::hint::black_box(rt_every as *const () as usize);
-    std::hint::black_box(rt_into as *const () as usize);
-    std::hint::black_box(rt_into3 as *const () as usize);
-    std::hint::black_box(rt_set_bang as *const () as usize);
-    std::hint::black_box(rt_with_bindings as *const () as usize);
-    std::hint::black_box(rt_load_var as *const () as usize);
-    std::hint::black_box(rt_concat as *const () as usize);
-    std::hint::black_box(rt_range1 as *const () as usize);
-    std::hint::black_box(rt_range2 as *const () as usize);
-    std::hint::black_box(rt_range3 as *const () as usize);
-    std::hint::black_box(rt_take as *const () as usize);
-    std::hint::black_box(rt_drop as *const () as usize);
-    std::hint::black_box(rt_reverse as *const () as usize);
-    std::hint::black_box(rt_sort as *const () as usize);
-    std::hint::black_box(rt_sort_by as *const () as usize);
-    std::hint::black_box(rt_keys as *const () as usize);
-    std::hint::black_box(rt_vals as *const () as usize);
-    std::hint::black_box(rt_merge as *const () as usize);
-    std::hint::black_box(rt_update as *const () as usize);
-    std::hint::black_box(rt_get_in as *const () as usize);
-    std::hint::black_box(rt_assoc_in as *const () as usize);
-    std::hint::black_box(rt_is_number as *const () as usize);
-    std::hint::black_box(rt_is_string as *const () as usize);
-    std::hint::black_box(rt_is_keyword as *const () as usize);
-    std::hint::black_box(rt_is_symbol as *const () as usize);
-    std::hint::black_box(rt_is_bool as *const () as usize);
-    std::hint::black_box(rt_is_int as *const () as usize);
-    std::hint::black_box(rt_prn as *const () as usize);
-    std::hint::black_box(rt_print as *const () as usize);
-    std::hint::black_box(rt_atom as *const () as usize);
-    std::hint::black_box(rt_group_by as *const () as usize);
-    std::hint::black_box(rt_partition2 as *const () as usize);
-    std::hint::black_box(rt_partition3 as *const () as usize);
-    std::hint::black_box(rt_partition4 as *const () as usize);
-    std::hint::black_box(rt_frequencies as *const () as usize);
-    std::hint::black_box(rt_keep as *const () as usize);
-    std::hint::black_box(rt_remove as *const () as usize);
-    std::hint::black_box(rt_map_indexed as *const () as usize);
-    std::hint::black_box(rt_zipmap as *const () as usize);
-    std::hint::black_box(rt_juxt as *const () as usize);
-    std::hint::black_box(rt_comp as *const () as usize);
-    std::hint::black_box(rt_partial as *const () as usize);
-    std::hint::black_box(rt_complement as *const () as usize);
-    std::hint::black_box(rt_peek as *const () as usize);
-    std::hint::black_box(rt_pop as *const () as usize);
-    std::hint::black_box(rt_vec as *const () as usize);
-    std::hint::black_box(rt_mapcat as *const () as usize);
-    std::hint::black_box(rt_repeatedly as *const () as usize);
+    for (_, ptr) in rt_symbols() {
+        std::hint::black_box(ptr as usize);
+    }
 }
 
 #[cfg(test)]

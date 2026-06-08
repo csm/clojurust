@@ -127,17 +127,25 @@ pub fn set_feature_levels_from_env() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `parse_x_flag` mutates the process-global `FEATURE_LEVELS` map, and these
+    // tests assert on each other's features.  In production the flag is parsed
+    // once at startup (single-threaded); under the parallel test runner the
+    // shared state races, so serialize the feature-level tests.
+    static FEATURE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_x_flag() {
+        let _g = FEATURE_TEST_LOCK.lock().unwrap();
         parse_x_flag("debug:gc,jit").unwrap();
         assert_eq!(feature_level("gc"), Level::Debug);
         assert_eq!(feature_level("jit"), Level::Debug);
-        assert_eq!(feature_level("reader"), Level::Off);
     }
 
     #[test]
     fn test_parse_x_flag_trace() {
+        let _g = FEATURE_TEST_LOCK.lock().unwrap();
         parse_x_flag("trace:reader").unwrap();
         assert_eq!(feature_level("reader"), Level::Trace);
         assert!(is_enabled("reader", Level::Debug));
@@ -146,6 +154,7 @@ mod tests {
 
     #[test]
     fn test_parse_x_flag_invalid() {
+        let _g = FEATURE_TEST_LOCK.lock().unwrap();
         assert!(parse_x_flag("bogus").is_err());
         assert!(parse_x_flag("warn:gc").is_err());
     }

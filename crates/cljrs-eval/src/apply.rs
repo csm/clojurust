@@ -1,9 +1,14 @@
 //! Extended apply routines, tries IR evaluation and falls back to tree-walking.
+use std::sync::Arc;
+
 use cljrs_env::env::Env;
-use cljrs_env::error::EvalResult;
+use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
 use cljrs_interp::apply::select_arity;
-use cljrs_value::{CljxFn, PersistentList, Value};
+use cljrs_ir::IrFunction;
+use cljrs_value::{CljxFn, CljxFnArity, PersistentList, Value};
+
+use crate::jit_state;
 
 /// Whether eager IR lowering at function definition time is enabled.
 ///
@@ -21,14 +26,22 @@ pub(crate) fn eager_lower_enabled() -> bool {
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
     let arity = select_arity(f, args.len())?;
 
-    // Try IR path if this isn't a macro and IR is cached (e.g. prebuilt).
-    if !f.is_macro
-        && let Some(result) = try_ir_path(f, arity, args, caller_env)
-    {
-        return result;
+    if !f.is_macro {
+        // Tier 2 — JIT-native.  When enabled, the hottest arities run native
+        // code; this also drives invocation counting and background queueing.
+        if jit_state::enabled()
+            && let Some(result) = try_jit_path(f, arity, args, caller_env)
+        {
+            return result;
+        }
+
+        // Tier 1 — IR interpreter (cached / prebuilt IR).
+        if let Some(result) = try_ir_path(f, arity, args, caller_env) {
+            return result;
+        }
     }
 
-    // Tree-walking interpreter.
+    // Tier 0 — tree-walking interpreter.
     cljrs_interp::apply::call_cljrs_fn(f, args, caller_env)
 }
 
@@ -119,4 +132,155 @@ fn execute_ir(
     cljrs_env::callback::pop_eval_context();
     env.pop_frame();
     result
+}
+
+// ── Tier 2 — JIT-native dispatch ─────────────────────────────────────────────
+
+/// Whether an arity is in the set the JIT can compile in Phase 10.1: the same
+/// set Tier-1 already handles — no captures, no destructuring, no rest param.
+fn jit_eligible_arity(f: &CljxFn, arity: &CljxFnArity) -> bool {
+    !f.is_async
+        && f.closed_over_names.is_empty()
+        && arity.rest_param.is_none()
+        && arity.destructure_params.is_empty()
+        && arity.destructure_rest.is_none()
+}
+
+/// Whether a lowered IR function is JIT-able in Phase 10.1: a flat function
+/// with no nested closures (subfunctions are deferred to Phase 10.3) and no
+/// async yield points.
+fn jit_eligible_ir(ir: &IrFunction) -> bool {
+    ir.subfunctions.is_empty() && !ir.is_async
+}
+
+/// Attempt the JIT-native execution path.
+///
+/// - If native code is ready for this arity, runs it and returns the result.
+/// - Otherwise bumps the invocation counter and, on crossing the threshold,
+///   lowers the arity (if needed) and queues it for background compilation.
+///
+/// Returns `Some(result)` only when native code actually ran; `None` means the
+/// caller should fall through to Tier 1 / Tier 0 for this call.
+fn try_jit_path(
+    f: &CljxFn,
+    arity: &CljxFnArity,
+    args: &[Value],
+    caller_env: &mut Env,
+) -> Option<EvalResult> {
+    if !jit_eligible_arity(f, arity) {
+        return None;
+    }
+
+    let arity_id = arity.ir_arity_id;
+    let entry = jit_state::get_or_create(arity_id);
+
+    // Already compiled → run native code.
+    if let Some((code, _n_params)) = entry.ready_code() {
+        return Some(call_native(f, code, args, caller_env));
+    }
+
+    // Count this invocation; queue for compilation on threshold crossing.
+    let count = entry.bump();
+    if count == jit_state::threshold() && entry.try_begin_queue(arity.params.len() as u8) {
+        match lower_for_jit(f, arity, caller_env) {
+            Some(ir) if jit_eligible_ir(&ir) => {
+                jit_state::enqueue(arity_id, ir, arity.params.len() as u8);
+            }
+            _ => jit_state::mark_failed(arity_id),
+        }
+    }
+
+    None
+}
+
+/// Obtain IR for an arity to hand to the JIT, lowering it on demand if needed.
+///
+/// Lowering runs on the calling (mutator) thread because it drives the
+/// Clojure-implemented compiler front-end, which needs an eval context; the
+/// background JIT thread only runs pure IR → native codegen.
+///
+/// This deliberately **never mutates the shared `ir_cache`**: the JIT must not
+/// change which tier the interpreter chooses for a function.  It only *reads*
+/// the cache so an already-lowered (eager/prebuilt) IR can be reused; otherwise
+/// it lowers a private copy for the JIT.  `try_begin_queue` guarantees this runs
+/// at most once per arity, so there is no repeated-lowering cost.
+fn lower_for_jit(f: &CljxFn, arity: &CljxFnArity, caller_env: &mut Env) -> Option<Arc<IrFunction>> {
+    let arity_id = arity.ir_arity_id;
+
+    // Reuse IR the interpreter already lowered (eagerly or prebuilt).
+    if let Some(ir) = crate::ir_cache::get_cached(arity_id) {
+        return Some(ir);
+    }
+    // A prior interpreter attempt marked it unsupported — don't bother.
+    if !crate::ir_cache::should_attempt(arity_id) {
+        return None;
+    }
+
+    // Don't nest lowering calls (the compiler front-end is itself Clojure code).
+    if IR_LOWERING_ACTIVE.get() {
+        return None;
+    }
+
+    // Make sure the Clojure compiler namespaces are loaded.
+    let globals = caller_env.globals.clone();
+    if !crate::ensure_compiler_loaded(&globals, caller_env) {
+        return None;
+    }
+
+    IR_LOWERING_ACTIVE.set(true);
+    let result = crate::lower::lower_and_optimize_arity(
+        f.name.as_deref(),
+        &arity.params,
+        arity.rest_param.as_ref(),
+        &arity.body,
+        &f.defining_ns,
+        caller_env,
+        f.is_async,
+    );
+    IR_LOWERING_ACTIVE.set(false);
+
+    result.ok().map(Arc::new)
+}
+
+/// Execute finalized JIT-native code for one arity.
+///
+/// Mirrors the runtime setup the AOT harness performs: it installs an eval
+/// context so the `rt_*` runtime bridge can resolve globals and dispatch
+/// callbacks, roots the argument values for the GC, then invokes the native
+/// `extern "C" fn(*const Value, ...) -> *const Value` through the registered
+/// invoke hook.
+fn call_native(f: &CljxFn, code: *const u8, args: &[Value], caller_env: &mut Env) -> EvalResult {
+    // Root the caller's environment for the duration of any nested callbacks.
+    let _caller_root = cljrs_env::gc_roots::push_env_root(caller_env);
+
+    // Install the eval context (globals + defining namespace) the runtime
+    // bridge reads via `capture_eval_context` / `invoke`.
+    let env = Env::new(caller_env.globals.clone(), &f.defining_ns);
+    cljrs_env::callback::push_eval_context(&env);
+
+    // Root the arguments and hand the native code stable pointers into the
+    // rooted Vec.  `rt_*` always clones values out of these pointers, so they
+    // need only stay valid (and marked) for the duration of the call.
+    let arg_values: Vec<Value> = args.to_vec();
+    let _arg_root = cljrs_env::gc_roots::root_values(&arg_values);
+    let arg_ptrs: Vec<*const Value> = arg_values.iter().map(|v| v as *const Value).collect();
+
+    // Bound the in-flight allocations the native call registers as roots.
+    let _alloc_frame = cljrs_gc::push_alloc_frame();
+
+    let outcome = jit_state::invoke_native(code, &arg_ptrs);
+
+    cljrs_env::callback::pop_eval_context();
+
+    match outcome {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(thrown)) => Err(EvalError::Thrown(thrown)),
+        // No invoke hook registered: should not happen once `ready_code` is
+        // set, but fall back to the interpreter rather than panicking.
+        None => {
+            let arity = select_arity(f, args.len())?;
+            try_ir_path(f, arity, args, caller_env)
+                .unwrap_or_else(|| cljrs_interp::apply::call_cljrs_fn(f, args, caller_env))
+        }
+    }
 }

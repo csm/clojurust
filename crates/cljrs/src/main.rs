@@ -47,6 +47,13 @@ struct Cli {
     #[arg(short = 'X', global = true, value_name = "LEVEL:FEATURES")]
     x_flags: Vec<String>,
 
+    /// Enable the in-process JIT tier: hot function arities are compiled to
+    /// native code on a background thread (`run`, `repl`, `eval`).  Also
+    /// enabled by setting the `CLJRS_JIT` environment variable; tune the
+    /// promotion threshold with `CLJRS_JIT_THRESHOLD`.
+    #[arg(long, global = true)]
+    jit: bool,
+
     /// Print GC statistics on exit. Pass a path to write them to a file;
     /// pass the flag without a value to write them to stdout. Only the
     /// `run`, `eval`, and `test` subcommands honour this flag.
@@ -239,9 +246,27 @@ fn main() -> miette::Result<()> {
         })
         .try_init();
 
+    // Quiet noisy `log`-based output from third-party crates (notably
+    // cranelift-jit, which logs every "defining function ..." at INFO via the
+    // tracing-log bridge).  Our own logging uses `tracing` / `cljrs_logging`
+    // directly and is unaffected.  `--trace` lifts the cap for debugging.
+    log::set_max_level(if cli.trace {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Warn
+    });
+
     // Parse -X feature logging flags
     for flag in &cli.x_flags {
         cljrs_logging::parse_x_flag(flag).map_err(|e| miette::miette!("invalid -X flag: {e}"))?;
+    }
+
+    // Enable the in-process JIT tier if requested (via --jit or CLJRS_JIT) and
+    // start its background compile worker.  No-op otherwise — the interpreter
+    // tiers are unchanged.
+    if cli.jit || std::env::var("CLJRS_JIT").is_ok() {
+        cljrs_eval::jit_state::set_enabled(true);
+        cljrs_jit::init();
     }
 
     let stack_size = cli

@@ -206,6 +206,14 @@ impl<M: Module> Compiler<M> {
         Ok(func_id)
     }
 
+    /// Access the underlying module.
+    ///
+    /// The JIT backend (`cljrs-jit`) uses this to finalize definitions and
+    /// fetch finalized function pointers from a `JITModule` after compilation.
+    pub fn module_mut(&mut self) -> &mut M {
+        &mut self.module
+    }
+
     /// Compile an IR function and define it in the module.
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()> {
         self.ctx.func.signature = self

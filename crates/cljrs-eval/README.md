@@ -27,10 +27,13 @@ Clojure source to the IR representation defined in `cljrs-ir`.
 src/
   lib.rs          — module declarations, re-exports, standard_env_minimal/standard_env/standard_env_with_paths,
                     register_compiler_sources, ensure_compiler_loaded
-  apply.rs        — IR-aware function dispatch: tries IR cache, falls back to cljrs_interp::apply
+  apply.rs        — IR-aware function dispatch: JIT-native → tier-1 IR → tree-walk; on-demand lowering for JIT promotion
   ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file
   ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
+  jit_state.rs    — JIT tiering state (Phase 10.1): per-arity invocation counters + code-pointer slots
+                    keyed by ir_arity_id, threshold/enable config, and the compile/invoke hooks the
+                    `cljrs-jit` backend registers (it sits above this crate, so the link is via hooks)
   lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction
 ```
 
@@ -86,9 +89,14 @@ pub mod lower {
 ## IR dispatch flow
 
 1. `apply::call_cljrs_fn` is registered as the `call_cljrs_fn` function pointer in `GlobalEnv`
-2. On each call, it checks `ir_cache::get_cached(arity_id)` for a pre-lowered IR function
-3. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
-4. If not cached **or async**: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking).
+2. **JIT tier (when enabled, Phase 10.1):** for eligible arities (no captures/destructuring/rest),
+   `try_jit_path` runs published native code if ready; otherwise it bumps the `jit_state` counter
+   and, on crossing `CLJRS_JIT_THRESHOLD`, lowers a private IR copy and queues it with the
+   `cljrs-jit` backend. This path **never mutates `ir_cache`**, so the interpreter tiers below are
+   unaffected whether the JIT is on or off.
+3. On each call, it checks `ir_cache::get_cached(arity_id)` for a pre-lowered IR function
+4. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
+5. If not cached **or async**: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking).
    For `^:async` functions the tree-walking path dispatches to `eval_async` in `cljrs-async`,
    which cooperatively yields to the Tokio `LocalSet` executor.
 5. Eager lowering: `ir_interp::eager_lower_fn` is registered as the `on_fn_defined` hook;
