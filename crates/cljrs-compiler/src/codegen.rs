@@ -175,9 +175,14 @@ struct RuntimeFuncs {
 
 // ── Compiler context ────────────────────────────────────────────────────────
 
-/// AOT compiler: translates IR functions to native object code via Cranelift.
-pub struct Compiler {
-    module: ObjectModule,
+/// Cranelift compiler: translates [`IrFunction`]s to native code via any
+/// [`Module`] backend.  Parameterised over `M` so the same CLIF-emitting logic
+/// drives both `ObjectModule` (AOT) and `JITModule` (in-process JIT).
+///
+/// AOT-specific construction and finalisation live in the
+/// `impl Compiler<ObjectModule>` block below.
+pub struct Compiler<M: Module = ObjectModule> {
+    module: M,
     ctx: cranelift_codegen::Context,
     fb_ctx: FunctionBuilderContext,
     rt: RuntimeFuncs,
@@ -186,40 +191,9 @@ pub struct Compiler {
     user_funcs: HashMap<Arc<str>, FuncId>,
 }
 
-impl Compiler {
-    /// Create a new compiler targeting the host architecture.
-    pub fn new() -> CodegenResult<Self> {
-        let mut flag_builder = settings::builder();
-        flag_builder.set("opt_level", "speed").unwrap();
-        flag_builder.set("is_pic", "true").unwrap();
+// ── Generic methods (work with any Module backend) ──────────────────────────
 
-        let isa_builder = cranelift_native::builder()
-            .map_err(|e| CodegenError::Codegen(format!("failed to create ISA builder: {e}")))?;
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .map_err(|e| CodegenError::Codegen(format!("failed to build ISA: {e}")))?;
-
-        let ptr_type = isa.pointer_type();
-
-        let obj_builder = ObjectBuilder::new(
-            isa,
-            "clojurust_aot",
-            cranelift_module::default_libcall_names(),
-        )?;
-        let mut module = ObjectModule::new(obj_builder);
-
-        let rt = declare_runtime_funcs(&mut module, ptr_type)?;
-
-        Ok(Self {
-            ctx: module.make_context(),
-            fb_ctx: FunctionBuilderContext::new(),
-            module,
-            rt,
-            ptr_type,
-            user_funcs: HashMap::new(),
-        })
-    }
-
+impl<M: Module> Compiler<M> {
     /// Declare a user function (makes it available for calls before definition).
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId> {
         let mut sig = self.module.make_signature();
@@ -263,6 +237,43 @@ impl Compiler {
         self.ctx.clear();
         Ok(())
     }
+}
+
+// ── AOT-specific methods (ObjectModule only) ────────────────────────────────
+
+impl Compiler<ObjectModule> {
+    /// Create a new AOT compiler targeting the host architecture.
+    pub fn new() -> CodegenResult<Self> {
+        let mut flag_builder = settings::builder();
+        flag_builder.set("opt_level", "speed").unwrap();
+        flag_builder.set("is_pic", "true").unwrap();
+
+        let isa_builder = cranelift_native::builder()
+            .map_err(|e| CodegenError::Codegen(format!("failed to create ISA builder: {e}")))?;
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|e| CodegenError::Codegen(format!("failed to build ISA: {e}")))?;
+
+        let ptr_type = isa.pointer_type();
+
+        let obj_builder = ObjectBuilder::new(
+            isa,
+            "clojurust_aot",
+            cranelift_module::default_libcall_names(),
+        )?;
+        let mut module = ObjectModule::new(obj_builder);
+
+        let rt = declare_runtime_funcs(&mut module, ptr_type)?;
+
+        Ok(Self {
+            ctx: module.make_context(),
+            fb_ctx: FunctionBuilderContext::new(),
+            module,
+            rt,
+            ptr_type,
+            user_funcs: HashMap::new(),
+        })
+    }
 
     /// Finish compilation and return the object code bytes.
     pub fn finish(self) -> Vec<u8> {
@@ -271,13 +282,33 @@ impl Compiler {
     }
 }
 
+/// Build a `Compiler<M>` from a caller-supplied `module` and `ptr_type`.
+///
+/// This constructor is used by the JIT backend (`cljrs-jit`) which constructs
+/// its own `JITModule` before handing it to the shared codegen.
+pub fn new_compiler_from_module<M: Module>(
+    mut module: M,
+    ptr_type: types::Type,
+) -> CodegenResult<Compiler<M>> {
+    let rt = declare_runtime_funcs(&mut module, ptr_type)?;
+    Ok(Compiler {
+        ctx: module.make_context(),
+        fb_ctx: FunctionBuilderContext::new(),
+        module,
+        rt,
+        ptr_type,
+        user_funcs: HashMap::new(),
+    })
+}
+
 // ── Function translator ─────────────────────────────────────────────────────
 
 /// Translates a single [`IrFunction`] into Cranelift IR using a
-/// [`FunctionBuilder`].
-struct FunctionTranslator<'a, 'b> {
+/// [`FunctionBuilder`].  Generic over `M: Module` so it works with both the
+/// AOT `ObjectModule` and the JIT `JITModule`.
+struct FunctionTranslator<'a, 'b, M: Module> {
     builder: &'b mut FunctionBuilder<'a>,
-    module: &'b mut ObjectModule,
+    module: &'b mut M,
     rt: &'b RuntimeFuncs,
     ptr_type: types::Type,
     /// Maps IR VarId → Cranelift Variable.
@@ -288,7 +319,7 @@ struct FunctionTranslator<'a, 'b> {
     block_map: HashMap<BlockId, cranelift_codegen::ir::Block>,
 }
 
-impl<'a, 'b> FunctionTranslator<'a, 'b> {
+impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn translate(&mut self, ir_func: &IrFunction) -> CodegenResult<()> {
         // Create all CLIF blocks upfront.
         for block in &ir_func.blocks {
@@ -1435,9 +1466,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
 // ── Runtime function declaration ────────────────────────────────────────────
 
-/// Helper to declare a single runtime function.
-fn declare_rt(
-    module: &mut ObjectModule,
+/// Helper to declare a single runtime function.  Generic over `M: Module` so
+/// it works for both AOT (`ObjectModule`) and JIT (`JITModule`).
+fn declare_rt<M: Module>(
+    module: &mut M,
     name: &str,
     params: &[types::Type],
     ret: types::Type,
@@ -1451,9 +1483,11 @@ fn declare_rt(
     Ok(module.declare_function(name, Linkage::Import, &sig)?)
 }
 
-/// Declare all runtime bridge functions and return cached FuncIds.
-fn declare_runtime_funcs(
-    module: &mut ObjectModule,
+/// Declare all runtime bridge functions and return cached FuncIds.  Generic
+/// over `M: Module` so the same set of ~80 `rt_*` symbols is declared for
+/// both the AOT and JIT backends.
+fn declare_runtime_funcs<M: Module>(
+    module: &mut M,
     ptr: types::Type,
 ) -> CodegenResult<RuntimeFuncs> {
     // Declare rt_safepoint: void -> void.  We declare it as returning ptr
