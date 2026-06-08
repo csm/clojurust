@@ -72,7 +72,10 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
     // All rt_abi functions are safe `extern "C"` fn; the cast is well-defined.
     macro_rules! sym {
         ($f:ident) => {
-            (stringify!($f), rt_abi::$f as *const () as usize as *const u8)
+            (
+                stringify!($f),
+                rt_abi::$f as *const () as usize as *const u8,
+            )
         };
     }
 

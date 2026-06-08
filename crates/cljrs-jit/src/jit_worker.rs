@@ -8,8 +8,8 @@
 //! for the lifetime of the process.  Phase 10.2 will add epoch-tagged
 //! unloading at STW safepoints.
 
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 
 use cljrs_ir::IrFunction;
 
@@ -51,12 +51,7 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
                 live.push(compiled);
             }
             Err(e) => {
-                cljrs_logging::feat_debug!(
-                    "jit",
-                    "compile error arity_id={}: {}",
-                    req.arity_id,
-                    e,
-                );
+                cljrs_logging::feat_debug!("jit", "compile error arity_id={}: {}", req.arity_id, e,);
                 // Don't retry; the function stays at Tier 1.
             }
         }

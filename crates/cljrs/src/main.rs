@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use miette::IntoDiagnostic as _;
 
 use cljrs_eval::{Env, EvalError, GlobalEnv, eval};
-use cljrs_jit;
 use cljrs_gc::GcConfig;
 use cljrs_stdlib::{self as cljrs_stdlib};
 use cljrs_value::Value;

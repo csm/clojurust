@@ -101,9 +101,7 @@ pub fn get_native_fn(arity_id: u64) -> Option<*const ()> {
 /// Called by the JIT worker thread after successful compilation.
 pub fn store_native_fn(arity_id: u64, ptr: *const ()) {
     let entry = get_or_create_entry(arity_id);
-    entry
-        .native_fn_ptr
-        .store(ptr as *mut (), Ordering::Release);
+    entry.native_fn_ptr.store(ptr as *mut (), Ordering::Release);
 }
 
 // ── Enqueue hook ──────────────────────────────────────────────────────────────
@@ -223,7 +221,9 @@ pub unsafe fn dispatch_jit_call(fn_ptr: *const (), args: &[*const Value]) -> *co
                     *const Value,
                     *const Value,
                 ) -> *const Value = std::mem::transmute(fn_ptr);
-                f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+                f(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                )
             }
             8 => {
                 let f: unsafe extern "C" fn(
