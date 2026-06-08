@@ -16,6 +16,7 @@ no-gc = [
     "cljrs-compiler/no-gc",
     "cljrs-runtime/no-gc",
     "cljrs-stdlib/no-gc",
+    "cljrs-jit/no-gc",
 ]
 enable-rustyline = ["rustyline"]
 async = ["dep:cljrs-async", "dep:cljrs-io", "dep:tokio"]
@@ -41,6 +42,7 @@ cljrs-logging  = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-vcs      = { workspace = true }
 cljrs-lsp      = { workspace = true }
+cljrs-jit      = { workspace = true }
 clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"

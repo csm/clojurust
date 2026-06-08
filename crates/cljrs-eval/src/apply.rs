@@ -1,9 +1,20 @@
 //! Extended apply routines, tries IR evaluation and falls back to tree-walking.
+use std::sync::Arc;
+
 use cljrs_env::env::Env;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_interp::apply::select_arity;
 use cljrs_value::{CljxFn, PersistentList, Value};
+
+static EAGER_LOWER_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force eager IR lowering to be enabled for all threads, regardless of
+/// the `CLJRS_EAGER_LOWER` environment variable.  Called by `cljrs_jit::init`.
+pub fn force_eager_lowering() {
+    EAGER_LOWER_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether eager IR lowering at function definition time is enabled.
 ///
@@ -11,24 +22,33 @@ use cljrs_value::{CljxFn, PersistentList, Value};
 /// which is expensive.  Disabled by default; set `CLJRS_EAGER_LOWER=1` to
 /// enable.  (Or set `CLJRS_NO_IR=1` to disable all IR functionality.)
 pub(crate) fn eager_lower_enabled() -> bool {
-    thread_local! {
-        static ENABLED: bool = std::env::var("CLJRS_EAGER_LOWER").is_ok()
-            && std::env::var("CLJRS_NO_IR").is_err();
+    if std::env::var("CLJRS_NO_IR").is_ok() {
+        return false;
     }
-    ENABLED.with(|e| *e)
+    if EAGER_LOWER_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var("CLJRS_EAGER_LOWER").is_ok()
 }
 
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
     let arity = select_arity(f, args.len())?;
 
-    // Try IR path if this isn't a macro and IR is cached (e.g. prebuilt).
-    if !f.is_macro
-        && let Some(result) = try_ir_path(f, arity, args, caller_env)
-    {
-        return result;
+    if !f.is_macro {
+        let arity_id = arity.ir_arity_id;
+
+        // 1. JIT-native: fastest path — skip interpreter entirely.
+        if let Some(fn_ptr) = crate::jit_state::get_native_fn(arity_id) {
+            return call_jit_native(fn_ptr, args, caller_env);
+        }
+
+        // 2. IR interpreter (also bumps invocation counter).
+        if let Some(result) = try_ir_path(f, arity, args, caller_env) {
+            return result;
+        }
     }
 
-    // Tree-walking interpreter.
+    // 3. Tree-walking interpreter.
     cljrs_interp::apply::call_cljrs_fn(f, args, caller_env)
 }
 
@@ -57,11 +77,13 @@ fn try_ir_path(
     // Only use IR if already cached (eagerly lowered at definition time).
     let ir_func = crate::ir_cache::get_cached(arity_id)?;
 
-    // Async IR functions fall back to tree-walking (eval_async in cljrs-async).
-    // The IR interpreter is synchronous and cannot yield to the Tokio executor.
+    // Async IR functions fall back to tree-walking.
     if ir_func.is_async {
         return None;
     }
+
+    // Bump invocation counter; enqueue JIT compilation when hot.
+    crate::jit_state::record_call(arity_id, Arc::clone(&ir_func));
 
     Some(execute_ir(f, arity, &ir_func, args, caller_env))
 }
@@ -119,4 +141,32 @@ fn execute_ir(
     cljrs_env::callback::pop_eval_context();
     env.pop_frame();
     result
+}
+
+/// Invoke a JIT-compiled native function.
+///
+/// Roots the caller env and the argument slice on the GC shadow stack before
+/// entering native code, so GC safepoints inside the JIT frame can find them.
+fn call_jit_native(fn_ptr: *const (), args: &[Value], caller_env: &mut Env) -> EvalResult {
+    // Register the caller env so its GcPtrs survive any GC triggered inside
+    // the JIT frame (at rt_safepoint calls).
+    let _caller_root = cljrs_env::gc_roots::push_env_root(caller_env);
+    // Register the arg slice on the shadow stack.
+    let _arg_roots = cljrs_env::gc_roots::root_values(args);
+    // Track all allocations made inside the JIT frame.
+    let _alloc_frame = cljrs_gc::push_alloc_frame();
+
+    // Pass raw pointers to the args.  These are valid for the duration of
+    // this call because the args slice is borrowed from the caller's frame
+    // and `_arg_roots` roots the underlying Values.
+    let arg_ptrs: Vec<*const Value> = args.iter().map(|v| v as *const Value).collect();
+
+    // SAFETY: fn_ptr was produced by Cranelift JIT with SystemV ABI and the
+    // correct number of *const Value params; all arg pointers are live.
+    let result_ptr = unsafe { crate::jit_state::dispatch_jit_call(fn_ptr, &arg_ptrs) };
+
+    // SAFETY: result_ptr was returned by rt_abi; it points to a live Value
+    // in ALLOC_ROOTS.  Clone it before the alloc frame drops.
+    let result = unsafe { (*result_ptr).clone() };
+    Ok(result)
 }

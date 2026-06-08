@@ -206,6 +206,15 @@ impl<M: Module> Compiler<M> {
         Ok(func_id)
     }
 
+    /// Consume the compiler and return the underlying module.
+    ///
+    /// Used by the JIT backend: after all functions are compiled, call this to
+    /// get the `JITModule` back, then call `finalize_definitions()` and
+    /// `get_finalized_function()` on it.
+    pub fn into_inner_module(self) -> M {
+        self.module
+    }
+
     /// Compile an IR function and define it in the module.
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()> {
         self.ctx.func.signature = self
