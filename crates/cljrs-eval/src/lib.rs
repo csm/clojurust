@@ -22,6 +22,7 @@ pub mod apply;
 pub mod ir_cache;
 pub mod ir_convert;
 pub mod ir_interp;
+pub mod jit_state;
 pub mod lower;
 
 pub use cljrs_env::callback::invoke;
@@ -30,6 +31,9 @@ pub use cljrs_env::error::{EvalError, EvalResult};
 pub use cljrs_env::gc_roots::force_collect;
 pub use cljrs_env::loader::load_ns;
 pub use cljrs_interp::eval::eval;
+
+pub use apply::force_eager_lowering;
+pub use jit_state::{set_enqueue_hook, set_jit_threshold, store_native_fn};
 
 use crate::ir_interp::eager_lower_fn;
 use std::sync::Arc;

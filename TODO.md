@@ -388,12 +388,12 @@ Foundations already in place:
 
 ### Phase 10.1 — Minimal JIT tier (first working JIT)
 
-- [ ] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder`; materialize constants via runtime calls (no `GcPtr`s in code)
-- [ ] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, CLI flag) in a `JitState` keyed by `ir_arity_id`
-- [ ] Background-thread compilation with atomic code-pointer swap (never stall a hot call)
-- [ ] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam
-- [ ] Conservative stack scanning of JIT frames for GC roots (sound under the non-moving collector); safepoint polls at loop back-edges and function entry
-- [ ] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest)
+- [x] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder`; materialize constants via runtime calls (no `GcPtr`s in code)
+- [x] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, CLI flag) in a `JitState` keyed by `ir_arity_id`
+- [x] Background-thread compilation with atomic code-pointer swap (never stall a hot call)
+- [x] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam
+- [x] Conservative stack scanning of JIT frames for GC roots (sound under the non-moving collector); safepoint polls at loop back-edges and function entry
+- [x] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest)
 
 ### Phase 10.2 — Code unloading
 

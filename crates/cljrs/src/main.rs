@@ -40,6 +40,16 @@ struct Cli {
     #[arg(long, global = true)]
     verify_commit_signatures: bool,
 
+    /// JIT compilation invocation threshold (default 1000; 0 = disable JIT).
+    /// Also read from CLJRS_JIT_THRESHOLD env var.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "JIT invocation threshold (0 to disable, default 1000)"
+    )]
+    jit_threshold: Option<u32>,
+
     /// Feature-level logging flags: -X debug:gc,jit or -X trace:reader
     ///
     /// Format: <level>:<feature1>,<feature2>,...
@@ -296,6 +306,9 @@ fn run(cli: Cli) -> miette::Result<i32> {
     // how many threads to wait for during stop-the-world collection.
     let _mutator = cljrs_gc::register_mutator();
 
+    // Initialise the JIT tier (unless explicitly disabled).
+    init_jit(cli.jit_threshold.as_ref().copied());
+
     let gc_stats_target = cli.gc_stats.clone();
     let verify_commit_signatures = cli.verify_commit_signatures;
     let supports_gc_stats = matches!(
@@ -313,6 +326,22 @@ fn run(cli: Cli) -> miette::Result<i32> {
     }
 
     result
+}
+
+/// Initialise the JIT tier based on CLI flags and env vars.
+///
+/// JIT is enabled by default; disable with `CLJRS_NO_JIT=1` or `--jit-threshold 0`.
+fn init_jit(threshold: Option<u32>) {
+    if std::env::var("CLJRS_NO_JIT").is_ok() {
+        return;
+    }
+    if let Some(0) = threshold {
+        return; // Explicitly disabled via --jit-threshold 0.
+    }
+    if let Some(t) = threshold {
+        cljrs_eval::jit_state::set_jit_threshold(t);
+    }
+    cljrs_jit::init();
 }
 
 fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Result<i32> {
