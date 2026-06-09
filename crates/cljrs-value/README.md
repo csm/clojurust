@@ -24,6 +24,7 @@ src/
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
+  jit_hooks.rs                   — (Phase 10.2) var-rebind hook the JIT installs to stale superseded native code; set_var_rebind_hook, notify_var_rebind (fired by Var::bind)
   keyword.rs                     — Keyword { namespace, name }
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
   symbol.rs                      — Symbol { namespace, name }
@@ -239,6 +240,18 @@ pub struct CljxFn {
 `is_async` is set by the interpreter when a `fn`/`defn` carries `^:async` (or an
 `{:async true}` attr-map). `CljxFn::new` defaults it to `false`; `cljrs-env`'s
 `dispatch_if_async` checks it at call time.
+
+### JIT rebind hook (`jit_hooks`, Phase 10.2)
+
+```rust
+/// Installed once by cljrs_jit::init. Called with (old_value, new_value).
+pub fn set_var_rebind_hook(f: impl Fn(&Value, &Value) + Send + Sync + 'static);
+```
+
+`Var::bind` invokes the hook (via `notify_var_rebind`) whenever it overwrites an
+existing binding, so the JIT can stale and reclaim native code compiled for a
+superseded function definition. When no JIT is active the cost is a single
+relaxed atomic load.
 
 ### `Namespace` (Phase 4)
 

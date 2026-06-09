@@ -4,6 +4,7 @@ pub mod collections;
 pub mod error;
 pub mod hash;
 pub mod intern;
+pub mod jit_hooks;
 pub mod keyword;
 pub mod native_object;
 pub mod regex;
@@ -20,6 +21,7 @@ pub use collections::{
 pub use error::{ExceptionInfo, ValueError, ValueResult};
 pub use hash::ClojureHash;
 pub use intern::{intern_keyword, intern_symbol};
+pub use jit_hooks::set_var_rebind_hook;
 pub use keyword::Keyword;
 pub use native_object::{NativeObject, NativeObjectBox, gc_native_object};
 pub use resource::{Resource, ResourceHandle};

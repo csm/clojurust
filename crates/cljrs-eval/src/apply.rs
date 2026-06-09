@@ -38,8 +38,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         let arity_id = arity.ir_arity_id;
 
         // 1. JIT-native: fastest path — skip interpreter entirely.
-        if let Some(fn_ptr) = crate::jit_state::get_native_fn(arity_id) {
-            return call_jit_native(fn_ptr, args, caller_env);
+        if let Some((fn_ptr, epoch)) = crate::jit_state::get_native_fn(arity_id) {
+            return call_jit_native(fn_ptr, epoch, args, caller_env);
         }
 
         // 2. IR interpreter (also bumps invocation counter).
@@ -147,7 +147,16 @@ fn execute_ir(
 ///
 /// Roots the caller env and the argument slice on the GC shadow stack before
 /// entering native code, so GC safepoints inside the JIT frame can find them.
-fn call_jit_native(fn_ptr: *const (), args: &[Value], caller_env: &mut Env) -> EvalResult {
+fn call_jit_native(
+    fn_ptr: *const (),
+    epoch: u64,
+    args: &[Value],
+    caller_env: &mut Env,
+) -> EvalResult {
+    // Register this native frame's code epoch so code unloading cannot free the
+    // backing module while it executes.  Pushed *before* entering native code
+    // and *before* any safepoint can occur, and popped on return/unwind.
+    let _jit_frame = crate::jit_state::push_jit_frame(epoch);
     // Register the caller env so its GcPtrs survive any GC triggered inside
     // the JIT frame (at rt_safepoint calls).
     let _caller_root = cljrs_env::gc_roots::push_env_root(caller_env);

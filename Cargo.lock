@@ -612,6 +612,8 @@ dependencies = [
  "cljrs-gc",
  "cljrs-ir",
  "cljrs-logging",
+ "cljrs-reader",
+ "cljrs-stdlib",
  "cljrs-value",
  "cranelift-codegen",
  "cranelift-frontend",

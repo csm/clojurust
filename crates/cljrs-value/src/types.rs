@@ -251,7 +251,18 @@ impl Var {
             self.namespace,
             self.name
         );
-        *self.value.lock().unwrap() = Some(v);
+        // Replace the binding, holding the lock only across the swap.  The
+        // previous value (if any) is handed to the JIT rebind hook so it can
+        // reclaim native code compiled for a now-superseded definition
+        // (Phase 10.2 — code unloading).  `v.clone()` is O(1) for the only
+        // values that carry compiled code (`Value::Fn`, a `GcPtr` clone).
+        let prev = {
+            let mut slot = self.value.lock().unwrap();
+            slot.replace(v.clone())
+        };
+        if let Some(prev) = prev {
+            crate::jit_hooks::notify_var_rebind(&prev, &v);
+        }
     }
 
     pub fn get_meta(&self) -> Option<Value> {

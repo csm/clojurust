@@ -189,6 +189,10 @@ pub struct Compiler<M: Module = ObjectModule> {
     ptr_type: types::Type,
     /// Maps user-defined function names to their FuncIds.
     user_funcs: HashMap<Arc<str>, FuncId>,
+    /// Total machine-code size (bytes) of the most recently compiled function,
+    /// captured before `ctx` is cleared.  Used by the JIT to account for the
+    /// executable memory backing each compiled arity.
+    last_code_size: u32,
 }
 
 // ── Generic methods (work with any Module backend) ──────────────────────────
@@ -213,6 +217,12 @@ impl<M: Module> Compiler<M> {
     /// `get_finalized_function()` on it.
     pub fn into_inner_module(self) -> M {
         self.module
+    }
+
+    /// Machine-code size in bytes of the function compiled by the most recent
+    /// [`compile_function`](Self::compile_function) call (0 if none).
+    pub fn last_code_size(&self) -> u32 {
+        self.last_code_size
     }
 
     /// Compile an IR function and define it in the module.
@@ -243,6 +253,12 @@ impl<M: Module> Compiler<M> {
         }
 
         self.module.define_function(func_id, &mut self.ctx)?;
+        // Capture the emitted code size before clearing the context.
+        self.last_code_size = self
+            .ctx
+            .compiled_code()
+            .map(|c| c.code_info().total_size)
+            .unwrap_or(0);
         self.ctx.clear();
         Ok(())
     }
@@ -281,6 +297,7 @@ impl Compiler<ObjectModule> {
             rt,
             ptr_type,
             user_funcs: HashMap::new(),
+            last_code_size: 0,
         })
     }
 
@@ -307,6 +324,7 @@ pub fn new_compiler_from_module<M: Module>(
         rt,
         ptr_type,
         user_funcs: HashMap::new(),
+        last_code_size: 0,
     })
 }
 
