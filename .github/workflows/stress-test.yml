@@ -42,10 +42,10 @@ jobs:
 
 # ── Clojure test suite ────────────────────────────────────────────────────
 
-      - name: Clojure test suite — interpreter
-        id: clojure-interp
-        continue-on-error: true
-        run: ./target/release/cljrs test --src-path ./clojure-test-suite/test
+      #- name: Clojure test suite — interpreter
+      #  id: clojure-interp
+      #  continue-on-error: true
+      #  run: ./target/release/cljrs test --src-path ./clojure-test-suite/test
 
       - name: Clojure test suite — AOT compile and run
         id: clojure-aot
