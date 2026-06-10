@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-charset"
-version = "0.1.0"
+version = "0.1.130"
 edition = "2024"
 description = "Charset encoding and decoding with stream support — clojure.rust.charset"
 license.workspace = true
