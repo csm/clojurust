@@ -461,17 +461,16 @@ fn stage4_handles_callee_with_self_capture() {
 
     // Find the rewritten CallWithRegion and verify its arg count matches the
     // target subfunction's params count.
-    fn find_target_and_call<'a>(ir: &'a IrFunction) -> Option<(&'a Arc<str>, usize, usize)> {
+    fn find_target_and_call(ir: &IrFunction) -> Option<(&Arc<str>, usize, usize)> {
         for block in &ir.blocks {
             for inst in &block.insts {
-                if let Inst::CallWithRegion(_, name, args, _) = inst {
-                    if let Some(target) = ir
+                if let Inst::CallWithRegion(_, name, args, _) = inst
+                    && let Some(target) = ir
                         .subfunctions
                         .iter()
                         .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
-                    {
-                        return Some((name, args.len(), target.params.len()));
-                    }
+                {
+                    return Some((name, args.len(), target.params.len()));
                 }
             }
         }

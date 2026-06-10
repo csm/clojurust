@@ -578,9 +578,7 @@ fn collect_candidates_in(
             if dst_state != EscapeState::NoEscape {
                 continue;
             }
-            let Some(callee_name) =
-                resolve_callee_name(*callee, args.len(), &var_defs, ctx)
-            else {
+            let Some(callee_name) = resolve_callee_name(*callee, args.len(), &var_defs, ctx) else {
                 continue;
             };
             let Some(callee_fn) = ctx.registry.get(&callee_name) else {

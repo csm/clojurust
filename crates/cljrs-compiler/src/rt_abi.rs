@@ -484,19 +484,20 @@ pub extern "C" fn rt_region_start() -> *mut Region {
 /// call's return value.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_region_end(handle: *mut Region) -> *const Value {
-    cljrs_gc::region::pop_region_guard();
-    RT_REGION_STACK.with(|s| {
-        // Dropping the Box<Region> runs Region::drop which runs
-        // destructors and frees chunks.
-        let _popped = s.borrow_mut().pop();
-        debug_assert!(
-            _popped
-                .as_ref()
-                .map(|r| std::ptr::eq(r.as_ref(), handle.cast_const()))
-                .unwrap_or(false),
-            "rt_region_end: handle does not match the innermost open region"
-        );
-    });
+    let popped = RT_REGION_STACK.with(|s| s.borrow_mut().pop());
+    debug_assert!(
+        popped
+            .as_ref()
+            .map(|r| std::ptr::eq(r.as_ref(), handle.cast_const()))
+            .unwrap_or(false),
+        "rt_region_end: handle does not match the innermost open region"
+    );
+    if let Some(region) = popped {
+        // Pops the thread-local stack entry, then resets the region — or
+        // retires it if a publish barrier poisoned it (Phase 10.5
+        // heap-promotion fallback).
+        cljrs_gc::region::close_region(region);
+    }
     rt_const_nil()
 }
 
@@ -631,13 +632,26 @@ pub unsafe extern "C" fn rt_region_alloc_cons(
 /// top-level form scope, so its depth is not in general equal to the rt_abi
 /// stack's depth.
 fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
-    cljrs_gc::region::unwind_region_stack_to(gc_depth);
-    RT_REGION_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        while stack.len() > rt_depth {
-            stack.pop(); // Drop<Region> handles cleanup
+    loop {
+        let popped = RT_REGION_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            if stack.len() > rt_depth {
+                stack.pop()
+            } else {
+                None
+            }
+        });
+        match popped {
+            // Honours the poison protocol (reset vs retire) and pops the
+            // matching gc-side stack entry.
+            Some(region) => cljrs_gc::region::close_region(region),
+            None => break,
         }
-    });
+    }
+    // Belt-and-braces: drop any non-rt entries left above the saved gc depth
+    // (interpreter frames clean their own regions on unwind, so this is
+    // normally a no-op).
+    cljrs_gc::region::unwind_region_stack_to(gc_depth);
 }
 
 // ── Collection construction ─────────────────────────────────────────────────

@@ -64,7 +64,10 @@ src/
   alloc_ctx.rs    — (no-gc mode) thread-local allocation context stack;
                     ScratchGuard, StaticCtxGuard
   region.rs       — Region bump allocator, RegionGuard, thread-local region
-                    stack; trace_active_regions() (GC-root scan of live regions)
+                    stack; trace_active_regions() (GC-root scan of live regions);
+                    poison/retire protocol (Phase 10.5 heap-promotion fallback):
+                    poison_active_regions(), close_region(), retired-region
+                    root tracing
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
   config.rs       — (GC mode) GcConfig, GcCancellation (zero-sized proxy),
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
@@ -250,6 +253,26 @@ Destructors run on `reset()` or `drop`.
 RAII guard that pushes a `Region` onto the thread-local stack. Use with
 `try_alloc_in_region()` for opportunistic region allocation.
 
+### Region poisoning / retirement (Phase 10.5)
+
+```rust
+/// Mark every region currently active on this thread: each will be *retired*
+/// (kept alive forever and traced as a GC root) instead of reset when its
+/// scope closes.  No-op when no region is active.
+pub fn poison_active_regions();
+
+/// Close a region whose scope ended: pop the thread-local stack entry, then
+/// reset/drop the region — or retire it if poisoned.  All owners of
+/// stack-registered regions (rt_abi, the IR interpreter) close through here.
+pub fn close_region(region: Box<Region>);
+```
+
+The heap-promotion fallback: when a publish barrier
+(`cljrs_value::publish::publish_value`) meets a value it can neither verify
+nor deep-copy while regions are open, it poisons them.  Retired regions are a
+deliberate bounded leak (mirroring the JIT's pinned epochs) that can never
+dangle; `GcHeap::collect` traces them as roots alongside the active stack.
+
 ### `stats::GcStats` and `GC_STATS`
 
 ```rust
@@ -259,6 +282,7 @@ impl GcStats {
     pub const fn new() -> Self
     pub fn record_gc_alloc(&self, bytes: usize)
     pub fn record_region_alloc(&self, bytes: usize)
+    pub fn record_region_poison(&self)
     pub fn record_gc_pause(&self, pause: Duration, freed_objects: u64, freed_bytes: u64)
     pub fn snapshot(&self) -> GcStatsSnapshot
 }

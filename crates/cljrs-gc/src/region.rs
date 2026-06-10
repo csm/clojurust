@@ -296,6 +296,93 @@ impl Drop for RegionGuard {
     }
 }
 
+// ── Poisoned / retired regions (GC build) ───────────────────────────────────
+//
+// The heap-promotion fallback (Phase 10.5): when a value that is *opaque* to
+// the promotion scan (e.g. an unrealized lazy seq) is published to a
+// program-lifetime cell while regions are active, we can no longer prove the
+// active regions hold only non-escaping values.  Rather than risk a dangling
+// pointer, the publisher "poisons" the active regions: each one is *retired*
+// when its scope closes — its memory is kept alive forever (and traced as a
+// GC root so heap children stay live) instead of being reset.  A deliberate,
+// bounded leak, mirroring the JIT's pinned-epoch precedent.
+
+#[cfg(not(feature = "no-gc"))]
+thread_local! {
+    /// Regions whose scopes have closed but which may still be referenced —
+    /// kept alive for the rest of the process and traced as roots.  Moving
+    /// the `Region` struct out of its `Box` is safe: object memory lives in
+    /// separately-allocated chunks, and no raw pointer to the struct itself
+    /// survives once it has left the active stack.
+    static RETIRED_REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    /// Poison watermark: every region at stack depth ≤ this value must be
+    /// retired (not reset) when it closes.
+    static POISON_WATERMARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Poison every region currently active on this thread: each will be retired
+/// instead of reset when its scope closes.  No-op when no region is active.
+#[cfg(not(feature = "no-gc"))]
+pub fn poison_active_regions() {
+    let depth = region_stack_depth();
+    if depth == 0 {
+        return;
+    }
+    POISON_WATERMARK.with(|w| w.set(w.get().max(depth)));
+    crate::stats::GC_STATS.record_region_poison();
+}
+
+#[cfg(feature = "no-gc")]
+pub fn poison_active_regions() {}
+
+/// Close a region whose scope has ended: pop it from the thread-local stack,
+/// then either drop it (running destructors, freeing memory) or — if it was
+/// poisoned — retire it.
+///
+/// All owners of stack-registered regions (the rt_abi bridge, the IR
+/// interpreter, scratch guards) must close through here so the poison
+/// protocol is honoured.
+#[cfg(not(feature = "no-gc"))]
+pub fn close_region(region: Box<Region>) {
+    let depth = region_stack_depth();
+    pop_region_guard();
+    let poisoned = POISON_WATERMARK.with(|w| {
+        if depth != 0 && depth <= w.get() {
+            w.set(depth - 1);
+            true
+        } else {
+            false
+        }
+    });
+    if poisoned {
+        cljrs_logging::feat_debug!(
+            "gc",
+            "retiring poisoned region ({} objects, {} bytes)",
+            region.object_count(),
+            region.bytes_used()
+        );
+        RETIRED_REGIONS.with(|r| r.borrow_mut().push(*region));
+    }
+    // else: `region` drops here — destructors run, chunks are freed.
+}
+
+#[cfg(feature = "no-gc")]
+pub fn close_region(region: Box<Region>) {
+    pop_region_guard();
+    drop(region);
+}
+
+/// Trace every retired region's objects (their heap children must stay
+/// alive).  Called by `GcHeap::collect` alongside [`trace_active_regions`].
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn trace_retired_regions(visitor: &mut crate::MarkVisitor) {
+    RETIRED_REGIONS.with(|r| {
+        for region in r.borrow().iter() {
+            region.trace_live(visitor);
+        }
+    });
+}
+
 /// Trace every object in every region on this thread's active region stack,
 /// marking the GC-heap objects they reference.
 ///
@@ -680,6 +767,68 @@ mod tests {
         region.alloc(2i64);
         // At least 2 * size_of::<GcBox<i64>> bytes used.
         assert!(region.bytes_used() >= size * 2);
+    }
+
+    #[test]
+    fn close_region_resets_when_not_poisoned() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut region = Box::new(Region::new());
+        region.alloc(Tracked {
+            id: 1,
+            dropped: dropped.clone(),
+        });
+        unsafe { push_region_raw(region.as_mut() as *mut Region) };
+        close_region(region);
+        assert_eq!(*dropped.lock().unwrap(), vec![1], "destructor must run");
+        assert!(!region_is_active());
+    }
+
+    #[test]
+    fn poisoned_region_is_retired_not_reset() {
+        // A publish barrier hit an opaque value while this region was open:
+        // the region must be kept alive (its objects remain valid) rather
+        // than reset when its scope closes.
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut region = Box::new(Region::new());
+        let p = region.alloc(Tracked {
+            id: 7,
+            dropped: dropped.clone(),
+        });
+        unsafe { push_region_raw(region.as_mut() as *mut Region) };
+        poison_active_regions();
+        close_region(region);
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "poisoned region must not run destructors"
+        );
+        // The object is still readable — retirement means the memory lives on.
+        assert_eq!(p.get().id, 7);
+        assert!(!region_is_active());
+
+        // A region opened *after* the poison closes normally.
+        let dropped2 = Arc::new(Mutex::new(Vec::new()));
+        let mut r2 = Box::new(Region::new());
+        r2.alloc(Tracked {
+            id: 9,
+            dropped: dropped2.clone(),
+        });
+        unsafe { push_region_raw(r2.as_mut() as *mut Region) };
+        close_region(r2);
+        assert_eq!(*dropped2.lock().unwrap(), vec![9]);
+    }
+
+    #[test]
+    fn poison_with_no_active_region_is_a_no_op() {
+        poison_active_regions();
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut region = Box::new(Region::new());
+        region.alloc(Tracked {
+            id: 3,
+            dropped: dropped.clone(),
+        });
+        unsafe { push_region_raw(region.as_mut() as *mut Region) };
+        close_region(region);
+        assert_eq!(*dropped.lock().unwrap(), vec![3]);
     }
 
     #[test]

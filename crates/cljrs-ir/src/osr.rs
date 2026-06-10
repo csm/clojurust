@@ -103,10 +103,9 @@ fn plain_alloc(dst: VarId, kind: RegionAllocKind, ops: Vec<VarId>) -> Inst {
         RegionAllocKind::Vector => Inst::AllocVector(dst, ops),
         RegionAllocKind::Set => Inst::AllocSet(dst, ops),
         RegionAllocKind::List => Inst::AllocList(dst, ops),
-        RegionAllocKind::Map => Inst::AllocMap(
-            dst,
-            ops.chunks(2).map(|pair| (pair[0], pair[1])).collect(),
-        ),
+        RegionAllocKind::Map => {
+            Inst::AllocMap(dst, ops.chunks(2).map(|pair| (pair[0], pair[1])).collect())
+        }
         RegionAllocKind::Cons => Inst::AllocCons(dst, ops[0], ops[1]),
     }
 }

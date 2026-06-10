@@ -100,9 +100,10 @@ without network access. Point to local paths in `Cargo.toml` as shown in
 
 ## Memory management
 
-AOT-compiled binaries get an extra allocation fast path that the interpreter
-does not: the **bump allocator**. The AOT compiler's escape analysis promotes
-short-lived, non-escaping objects into bump-allocated regions, leaving the
-tracing GC to handle everything else. See
+AOT-compiled binaries use the **bump allocator** fast path: escape analysis
+promotes short-lived, non-escaping objects into bump-allocated regions,
+leaving the tracing GC to handle everything else. (Since JIT phase 10.5 the
+same machinery also runs under `cljrs run`/`repl`/`eval`; AOT still sees the
+most opportunities because the whole program is analyzed as one unit.) See
 [Memory Management](../memory/index.md) and
 [The bump allocator](../memory/bump-allocator.md) for details.

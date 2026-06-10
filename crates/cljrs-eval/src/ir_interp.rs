@@ -65,16 +65,19 @@ impl Registers {
 
 /// A region entry in the interpreter's local region stack.
 struct RegionEntry {
-    _region: Box<cljrs_gc::region::Region>,
-    // The region is also pushed onto the cljrs_gc thread-local REGION_STACK
-    // via push_region_raw.  We track it here for cleanup.
+    /// `Some` until closed; taken by `Drop`.  The region is also pushed onto
+    /// the cljrs_gc thread-local REGION_STACK via `push_region_raw`.
+    region: Option<Box<cljrs_gc::region::Region>>,
 }
 
 impl Drop for RegionEntry {
     fn drop(&mut self) {
-        // Pop from cljrs_gc's thread-local stack.
-        cljrs_gc::region::pop_region_guard();
-        // Box<Region> drop handles destructor execution and chunk freeing.
+        if let Some(region) = self.region.take() {
+            // Pops the thread-local stack entry, then resets the region — or
+            // retires it if a publish barrier poisoned it (Phase 10.5
+            // heap-promotion fallback).
+            cljrs_gc::region::close_region(region);
+        }
     }
 }
 
@@ -613,7 +616,9 @@ fn execute_inst(
             let mut region = Box::new(cljrs_gc::region::Region::new());
             let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
             unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
-            regions.stack.push(RegionEntry { _region: region });
+            regions.stack.push(RegionEntry {
+                region: Some(region),
+            });
             regions.bind(*dst, region_ptr);
             regs.set(*dst, Value::Nil);
         }

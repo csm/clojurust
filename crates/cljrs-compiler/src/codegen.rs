@@ -375,8 +375,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         // Region-parameterised variants carry the caller's region as a hidden
         // trailing parameter; `Inst::RegionParam` binds it.
         if ir_func.takes_region_param() {
-            self.region_param =
-                Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
+            self.region_param = Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
         }
 
         // GC safepoint at function entry.

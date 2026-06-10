@@ -9,11 +9,14 @@ at once when the region's scope ends.
 It is roughly **2.6× faster** than a GC-heap allocation: there is no mutex, no
 per-object `Box::new`, and no collection pause.
 
-> **The bump allocator only works in AOT mode right now.** It is enabled only
-> in binaries produced by [`cljrs compile`](../rust-interop/aot.md). When you
-> run code through the interpreter — `cljrs run`, `cljrs repl`, or
-> `cljrs eval` — every allocation goes to the GC heap. The [Why AOT
-> only?](#why-aot-only) section explains the reason.
+> **The bump allocator runs in both AOT and JIT/interpreted modes.** Binaries
+> produced by [`cljrs compile`](../rust-interop/aot.md) have always used it;
+> since JIT phase 10.5, `cljrs run`, `cljrs repl`, and `cljrs eval` use it
+> too: eager IR lowering runs the same escape-optimization pass per `defn`
+> (consulting previously-lowered defns through a cross-defn registry), the
+> Tier-1 IR interpreter executes the region instructions, and JIT-compiled
+> code threads the active region into callees as a hidden argument. See
+> [Which tiers use regions?](#which-tiers-use-regions).
 
 ## How it works
 
@@ -99,28 +102,31 @@ can be specialized to inherit the caller's region, so a helper that builds and
 returns a short-lived vector can still be bump-allocated at a call site that
 immediately discards it.
 
-## Why AOT only?
+## Which tiers use regions?
 
-The bump allocator depends on **compile-time** escape analysis, and that pass
-runs only in the AOT compilation pipeline. The decision of *what* may be
-region-allocated, and *where* the `rt_region_start` / `rt_region_end` brackets
-go, is baked statically into the generated machine code.
+The bump allocator depends on **compile-time** escape analysis. The decision
+of *what* may be region-allocated, and *where* the `rt_region_start` /
+`rt_region_end` brackets go, is decided when code is lowered and optimized:
 
-The interpreter takes a different path: Clojure source is read, macro-expanded,
-and lowered to IR, but the escape-optimization pass is **not** run, so the IR
-the tree-walking evaluator executes contains no region instructions. With no
-escape information available, the interpreter cannot safely decide at runtime
-which objects outlive their scope, so it allocates everything on the GC heap —
-the always-correct default. (The IR interpreter *can* execute region
-instructions if they are already present in the IR, but the interpreter's own
-front end never emits them.)
+- **`cljrs compile` (AOT):** the whole program is one IR tree; escape analysis
+  and region promotion see every callee.
+- **`cljrs run` / `repl` / `eval` with eager lowering (the JIT default):**
+  each top-level `defn` is lowered and optimized at definition time. A
+  cross-defn registry makes previously-lowered defns visible, so calls into
+  other defns can be region-promoted too (the callee variant receives the
+  caller's region as a hidden trailing argument once JIT-compiled). The Tier-1
+  IR interpreter executes the same region instructions before native code is
+  published.
+- **Pure tree-walking** (no IR): no escape information, everything on the GC
+  heap — the always-correct default.
 
-In short:
-
-- **`cljrs compile` (AOT):** escape analysis runs, regions are used, GC handles
-  the rest.
-- **`cljrs run` / `repl` / `eval` (interpreter):** no escape analysis,
-  everything on the GC heap, no bump allocation.
+Because the analysis can be wrong in principle, the GC build carries a runtime
+safety net: storing a value into a program-lifetime cell (`def`, atoms,
+volatiles, promises, channel puts) passes a **publish barrier** that promotes
+any region-allocated parts to the GC heap with a deep copy — and when a value
+is opaque to that scan (a closure, an unrealized lazy seq), the active regions
+are *retired* (kept alive forever and traced as GC roots) instead of being
+reset. Correctness never depends on the analysis being perfect.
 
 ## Relationship to the GC
 

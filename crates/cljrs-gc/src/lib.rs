@@ -676,6 +676,9 @@ mod gc_full {
             // phase skips region objects themselves (they are not heap-managed),
             // so we trace their children here instead.
             crate::region::trace_active_regions(&mut visitor);
+            // Retired (poisoned) regions are immortal roots: their objects may
+            // still be referenced and may hold `GcPtr`s into the heap.
+            crate::region::trace_retired_regions(&mut visitor);
             cljrs_logging::feat_debug!(
                 "gc",
                 "starting drain with {} grey objects",

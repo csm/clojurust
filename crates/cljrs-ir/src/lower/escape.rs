@@ -532,7 +532,9 @@ pub(crate) fn make_context_with_externals(
             },
         );
         for (fn_name, ir) in ext.arity_fn_names.iter().zip(&ext.arity_irs) {
-            registry.entry(fn_name.clone()).or_insert_with(|| ir.clone());
+            registry
+                .entry(fn_name.clone())
+                .or_insert_with(|| ir.clone());
         }
         external_names.insert(key);
     }
@@ -849,8 +851,7 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
                 if dst_state != EscapeState::NoEscape {
                     continue;
                 }
-                let Some(callee_name) =
-                    resolve_call_target(*callee, args.len(), &var_defs, ectx)
+                let Some(callee_name) = resolve_call_target(*callee, args.len(), &var_defs, ectx)
                 else {
                     continue;
                 };

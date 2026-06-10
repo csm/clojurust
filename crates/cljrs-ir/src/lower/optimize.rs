@@ -767,6 +767,9 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
 
 // ── Top-level pass ───────────────────────────────────────────────────────────
 
+/// The `(ns, name)` set of cross-defn externals an optimization run consulted.
+pub type UsedExternals = HashSet<(Arc<str>, Arc<str>)>;
+
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
@@ -796,7 +799,7 @@ pub fn optimize(ir_func: IrFunction) -> IrFunction {
 pub fn optimize_with_externals(
     ir_func: IrFunction,
     externals: &[super::escape::ExternalDefn],
-) -> (IrFunction, HashSet<(Arc<str>, Arc<str>)>) {
+) -> (IrFunction, UsedExternals) {
     let ir_func = fuse_eager_hofs(ir_func);
     // Inlining is deliberately unit-local (it builds its own registry):
     // splicing an external body into the caller would carry the same

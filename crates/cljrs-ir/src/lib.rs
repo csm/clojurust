@@ -1024,7 +1024,10 @@ impl Display for Inst {
             Inst::RegionEnd(region) => write!(f, "region_end {region}"),
             Inst::RegionParam(dst) => write!(f, "{dst} = region_param"),
             Inst::CallWithRegion(dst, name, args, region) => {
-                write!(f, "{dst} = call_with_region {name} {args:?} region={region}")
+                write!(
+                    f,
+                    "{dst} = call_with_region {name} {args:?} region={region}"
+                )
             }
             Inst::Await { src, dst } => write!(f, "{dst} = await {src}"),
             Inst::Spawn { fn_reg, args, dst } => {
