@@ -12,6 +12,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod lower;
+pub mod osr;
 
 use cljrs_types::error::CljxError::SerializationError;
 use cljrs_types::error::CljxResult;
