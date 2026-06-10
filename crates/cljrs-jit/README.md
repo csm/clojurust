@@ -4,7 +4,7 @@
 native code via Cranelift, making `cljrs run` and the REPL approach AOT-class
 throughput with no explicit compile step.
 
-**Status:** Phase 10.5 — functional for top-level `defn`s **including
+**Status:** Phase 10.6 — functional for top-level `defn`s **including
 closure-bearing functions** (closure subfunctions are declared and compiled
 into the same module, as AOT does; modules that materialize closure values are
 pinned against unloading), with epoch-tagged **code unloading** (redefined
@@ -15,15 +15,24 @@ mid-run via loop back-edge counters and an OSR-entry compile, and
 **context-driven bump allocation**: region-parameterised callee variants
 (stage-4 cross-defn promotion, fed by `cljrs_eval::defn_registry`) compile
 with the caller's region as a hidden trailing argument and bump-allocate into
-it directly.
+it directly.  Phase 10.6 adds **type specialization & inline caches**: the
+worker reads each hot arity's Tier-1 argument-type profile and compiles
+monomorphic `Long`/`Double` parameters into a specialized entry (guard +
+unbox; the body then runs unboxed arithmetic in registers per
+`cljrs_compiler::typeinfer`), with a **deoptimization path** — a failed entry
+guard returns the rt_abi sentinel and the dispatch seam re-runs the call at
+Tier 1; repeated violations discard the specialization and ban the arity from
+re-specializing (`jit_state::record_deopt`).  Keyword constants and call
+sites compile through per-call-site inline caches (`rt_kw_ic_fill`,
+`rt_call_ic`).
 
 ## File layout
 
 | File | Description |
 |------|-------------|
 | `src/lib.rs` | Public API: `init()` — installs the enqueue (function + OSR), var-rebind, STW-reclaim, pending-exception, and closure-escape hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition (whole-function and OSR epochs) |
-| `src/jit_compiler.rs` | `compile_jit(func_name, ir_func)` — builds `JITModule`, registers rt_abi symbols, recursively declares + compiles closure subfunctions into the same module (mirroring AOT), calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
-| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
+| `src/jit_compiler.rs` | `compile_jit(func_name, ir_func, specs)` — builds `JITModule`, registers rt_abi symbols, recursively declares + compiles closure subfunctions into the same module (mirroring AOT; subfunctions always compile generic), calls shared codegen (`compile_function_with_specs` for the top-level function); returns `CompiledFn { fn_ptr, module, code_size }` |
+| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). `specs_from_profile` maps the arity's Tier-1 type profile to per-parameter specializations (skipped when banned by deopts or `CLJRS_JIT_NO_SPEC=1`; OSR entries are never specialized). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
 | `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `pin_epoch` for modules whose code leaked into a closure value, `reclaim_at_stw` frees stale, unpinned modules with no live frame via `JITModule::free_memory` |
 | `src/osr_integration.rs` | (test-only) end-to-end OSR test: lowers a real `loop*` from source, builds + compiles the OSR entry, and calls the native code with a mid-loop register snapshot |
 
@@ -63,6 +72,8 @@ call_cljrs_fn
 | `CLJRS_OSR_THRESHOLD` | = JIT threshold | Loop back-edges (within one call) before an OSR entry is compiled |
 | `CLJRS_NO_JIT` | unset | Set to any value to disable JIT init |
 | `CLJRS_NO_IR` | unset | Disables IR lowering (also disables JIT) |
+| `CLJRS_JIT_NO_SPEC` | unset | Disable type specialization (compile everything generic) |
+| `CLJRS_JIT_DEOPT_LIMIT` | `10` | Entry-guard failures before a specialization is discarded |
 
 ## GC integration
 
@@ -128,3 +139,28 @@ above can never promote it.  OSR promotes it mid-run:
 
 Failures anywhere (transform declined, codegen error, panic) mark the
 `(arity_id, header)` slot failed; the loop simply finishes at Tier 1.
+
+## Specialization & deoptimization (Phase 10.6)
+
+1. **Profile.** Tier-1 dispatch accumulates each call's argument types into a
+   per-parameter bitmask (`jit_state::record_call`) until the compile is
+   queued.
+2. **Specialize.** `specs_from_profile` turns a monomorphic `Long`/`Double`
+   profile byte into a `cljrs_compiler::typeinfer::Repr` spec for that
+   parameter.  The compiled prologue guards each specialized parameter with
+   `rt_value_tag` and unboxes it into a register; type inference then keeps
+   loop counters/accumulators unboxed through the whole body.
+3. **Deopt.** A failed guard returns rt_abi's sentinel (`rt_deopt`) before any
+   side effect; `call_jit_native` (cljrs-eval) detects it via the
+   `set_deopt_sentinel_hook` installed by `init()` and re-executes the call at
+   Tier 1.  `record_deopt` discards the specialization past
+   `CLJRS_JIT_DEOPT_LIMIT` failures: the module is staled through the normal
+   epoch path and the arity recompiles generically when hot again.
+
+Inline caches (keyword constants, protocol dispatch) live in the shared
+codegen + rt_abi (`cljrs-compiler`), so AOT binaries get them too; this crate
+only registers the new bridge symbols (`rt_value_tag`, `rt_unbox_long`,
+`rt_unbox_double`, `rt_box_bool`, `rt_deopt`, `rt_kw_ic_fill`, `rt_call_ic`)
+with the `JITBuilder`.
+
+End-to-end evidence: `crates/cljrs/tests/jit_specialization.rs`.

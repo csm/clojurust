@@ -1472,6 +1472,8 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
                     .entry(type_tag.clone())
                     .or_default()
                     .insert(method_name, fn_val);
+                drop(impls);
+                cljrs_value::bump_protocol_generation();
             }
             _ => {}
         }
@@ -1532,6 +1534,8 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
                     .entry(type_tag.clone())
                     .or_default()
                     .insert(method_name, fn_val);
+                drop(impls);
+                cljrs_value::bump_protocol_generation();
             }
             _ => {}
         }
@@ -1882,6 +1886,8 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
                     .entry(type_tag.clone())
                     .or_default()
                     .insert(method_name, fn_val);
+                drop(impls);
+                cljrs_value::bump_protocol_generation();
             }
             _ => {}
         }

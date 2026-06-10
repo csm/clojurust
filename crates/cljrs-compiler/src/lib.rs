@@ -18,6 +18,7 @@ pub mod codegen;
 pub mod escape;
 pub mod ir;
 pub mod rt_abi;
+pub mod typeinfer;
 
 /// Register all compiler Clojure source files as builtin sources in the
 /// given `GlobalEnv`, so that `require` can load them without filesystem access.

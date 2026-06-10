@@ -54,6 +54,14 @@ pub struct JitEntry {
     /// unloading to identify which `JITModule` backs this pointer and to track
     /// whether a frame executing this code is live at a safepoint.
     pub epoch: AtomicU64,
+    /// Observed argument-type bitmasks, one byte per IR parameter (Phase
+    /// 10.6).  OR-accumulated by [`record_call`] until the compile is
+    /// queued; the JIT worker reads it to decide per-parameter
+    /// specializations ([`arg_type_profile`]).
+    pub arg_profile: Mutex<Vec<u8>>,
+    /// Entry-guard failures of the published specialized code.  Crossing
+    /// [`deopt_limit`] discards the specialization (see [`record_deopt`]).
+    pub deopt_count: AtomicU32,
 }
 
 impl JitEntry {
@@ -63,7 +71,40 @@ impl JitEntry {
             compile_queued: AtomicBool::new(false),
             native_fn_ptr: AtomicPtr::new(std::ptr::null_mut()),
             epoch: AtomicU64::new(0),
+            arg_profile: Mutex::new(Vec::new()),
+            deopt_count: AtomicU32::new(0),
         }
+    }
+}
+
+// ── Argument type profiles (Phase 10.6) ──────────────────────────────────────
+
+/// Profile bitmask bits: the observed type classes of one argument position.
+pub const PROFILE_LONG: u8 = 1;
+pub const PROFILE_DOUBLE: u8 = 2;
+pub const PROFILE_OTHER: u8 = 0x80;
+
+/// Classify a value for the argument-type profile.
+#[inline]
+fn profile_tag(v: &Value) -> u8 {
+    match v {
+        Value::Long(_) => PROFILE_LONG,
+        Value::Double(_) => PROFILE_DOUBLE,
+        _ => PROFILE_OTHER,
+    }
+}
+
+/// Snapshot the accumulated argument-type profile for `arity_id` (one
+/// bitmask byte per IR parameter), if any calls were profiled.
+pub fn arg_type_profile(arity_id: u64) -> Option<Vec<u8>> {
+    let guard = JIT_TABLE.read().unwrap();
+    let entry = guard.as_ref()?.get(&arity_id)?.clone();
+    drop(guard);
+    let prof = entry.arg_profile.lock().unwrap();
+    if prof.is_empty() {
+        None
+    } else {
+        Some(prof.clone())
     }
 }
 
@@ -192,14 +233,34 @@ pub fn set_enqueue_hook(f: impl Fn(u64, Arc<IrFunction>) + Send + Sync + 'static
 
 /// Record a call to `arity_id`.
 ///
-/// Bumps the invocation counter.  When the counter crosses [`jit_threshold`]
-/// for the first time, submits a compilation request via the enqueue hook.
+/// Bumps the invocation counter and folds the call's argument types into the
+/// arity's type profile (`profile_args` are the positional call arguments
+/// matching the IR parameters; for a variadic arity the caller passes only
+/// the fixed prefix, leaving the rest-list parameter unprofiled — it is
+/// padded with [`PROFILE_OTHER`] so it can never be specialized).  When the
+/// counter crosses [`jit_threshold`] for the first time, submits a
+/// compilation request via the enqueue hook.
 ///
-/// Called on every Tier-1 IR dispatch; must be cheap (one atomic increment +
-/// one compare on the fast path).
-pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>) {
+/// Called on every Tier-1 IR dispatch; must be cheap.  Profiling stops once
+/// the compile is queued, so the steady-state cost is one atomic increment,
+/// one compare, and one relaxed load.
+pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>, profile_args: &[Value]) {
     let entry = get_or_create_entry(arity_id);
     let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+    if !entry.compile_queued.load(Ordering::Relaxed) {
+        let n_params = ir_func.params.len();
+        let mut prof = entry.arg_profile.lock().unwrap();
+        if prof.len() < n_params {
+            prof.resize(n_params, 0);
+        }
+        for (i, slot) in prof.iter_mut().enumerate().take(n_params) {
+            *slot |= profile_args
+                .get(i)
+                .map(profile_tag)
+                .unwrap_or(PROFILE_OTHER);
+        }
+    }
 
     if count < jit_threshold() {
         return;
@@ -237,6 +298,91 @@ pub fn set_pending_exception_hook(f: PendingExceptionFn) {
 /// code returns.  Returns `None` when no hook is installed (no JIT linked).
 pub fn take_pending_exception() -> Option<Value> {
     PENDING_EXCEPTION_HOOK.get().and_then(|f| f())
+}
+
+// ── Deoptimization (Phase 10.6) ──────────────────────────────────────────────
+//
+// A specialized compilation guards its parameter types at entry; on a guard
+// failure the native code returns a unique sentinel pointer (owned by
+// rt_abi, which cljrs-eval cannot depend on — hence the hook).  The dispatch
+// seam detects the sentinel, re-executes the call at Tier 1 (sound: guards
+// precede all side effects), and counts the failure.  Crossing the deopt
+// limit discards the specialized code and bans the arity from further
+// specialization, so the next compile is generic.
+
+type DeoptSentinelFn = fn() -> usize;
+static DEOPT_SENTINEL_HOOK: OnceLock<DeoptSentinelFn> = OnceLock::new();
+
+/// Install the deopt-sentinel address provider (installed once by
+/// `cljrs_jit::init`).
+pub fn set_deopt_sentinel_hook(f: DeoptSentinelFn) {
+    let _ = DEOPT_SENTINEL_HOOK.set(f);
+}
+
+/// Whether `result` is the deopt sentinel returned by a failed entry guard.
+#[inline]
+pub fn is_deopt_result(result: *const Value) -> bool {
+    DEOPT_SENTINEL_HOOK
+        .get()
+        .is_some_and(|f| f() == result as usize)
+}
+
+/// Arities whose specialization repeatedly deoptimized; the JIT worker
+/// compiles these generically (all parameters boxed).
+static SPEC_BANNED: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
+
+/// Whether `arity_id` may be compiled with type specializations.
+pub fn specialization_allowed(arity_id: u64) -> bool {
+    let guard = SPEC_BANNED.read().unwrap();
+    !guard.as_ref().is_some_and(|s| s.contains(&arity_id))
+}
+
+/// Entry-guard failures tolerated before a specialization is discarded.
+pub fn deopt_limit() -> u32 {
+    std::env::var("CLJRS_JIT_DEOPT_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10)
+}
+
+/// Record an entry-guard deopt for `arity_id`.
+///
+/// Once the failure count crosses [`deopt_limit`], the specialized code is
+/// unpublished (dispatch falls back to Tier 1 immediately), its module is
+/// handed to the code cache for reclamation, the arity is banned from
+/// re-specialization, and its invocation counter restarts so the generic
+/// recompile triggers through the ordinary hot path.
+pub fn record_deopt(arity_id: u64) {
+    let entry = get_or_create_entry(arity_id);
+    let failures = entry.deopt_count.fetch_add(1, Ordering::Relaxed) + 1;
+    cljrs_logging::feat_debug!(
+        "jit",
+        "deopt arity_id={} (failure #{} of {})",
+        arity_id,
+        failures,
+        deopt_limit()
+    );
+    if failures < deopt_limit() {
+        return;
+    }
+    {
+        let mut guard = SPEC_BANNED.write().unwrap();
+        guard.get_or_insert_with(HashSet::new).insert(arity_id);
+    }
+    // Unpublish + reclaim the specialized code.  `take_native_epoch` also
+    // drops the JitEntry, so the arity re-counts from zero and re-enqueues a
+    // (now generic) compile when hot again.
+    if let Some(epoch) = take_native_epoch(arity_id)
+        && let Some(hook) = STALE_EPOCH_HOOK.get()
+    {
+        cljrs_logging::feat_debug!(
+            "jit",
+            "specialization discarded arity_id={} epoch={}",
+            arity_id,
+            epoch
+        );
+        hook(epoch);
+    }
 }
 
 // ── OSR (on-stack replacement) state — Phase 10.4 ────────────────────────────
