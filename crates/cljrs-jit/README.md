@@ -4,8 +4,10 @@
 native code via Cranelift, making `cljrs run` and the REPL approach AOT-class
 throughput with no explicit compile step.
 
-**Status:** Phase 10.4 — functional for non-capturing top-level `defn`s (the
-same set that Tier-1 handles), with epoch-tagged **code unloading** (redefined
+**Status:** Phase 10.4 — functional for top-level `defn`s **including
+closure-bearing functions** (closure subfunctions are declared and compiled
+into the same module, as AOT does; modules that materialize closure values are
+pinned against unloading), with epoch-tagged **code unloading** (redefined
 functions' native code is reclaimed at stop-the-world GC safepoints, keeping
 executable memory bounded across a long REPL session) and **OSR** (on-stack
 replacement): a single-call hot `loop*`/`recur` is promoted to native code
@@ -15,10 +17,10 @@ mid-run via loop back-edge counters and an OSR-entry compile.
 
 | File | Description |
 |------|-------------|
-| `src/lib.rs` | Public API: `init()` — installs the enqueue (function + OSR), var-rebind, and STW-reclaim hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition (whole-function and OSR epochs) |
-| `src/jit_compiler.rs` | `compile_jit(func_name, ir_func)` — builds `JITModule`, registers rt_abi symbols, calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
+| `src/lib.rs` | Public API: `init()` — installs the enqueue (function + OSR), var-rebind, STW-reclaim, pending-exception, and closure-escape hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition (whole-function and OSR epochs) |
+| `src/jit_compiler.rs` | `compile_jit(func_name, ir_func)` — builds `JITModule`, registers rt_abi symbols, recursively declares + compiles closure subfunctions into the same module (mirroring AOT), calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
 | `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
-| `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `reclaim_at_stw` frees stale modules with no live frame via `JITModule::free_memory` |
+| `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `pin_epoch` for modules whose code leaked into a closure value, `reclaim_at_stw` frees stale, unpinned modules with no live frame via `JITModule::free_memory` |
 | `src/osr_integration.rs` | (test-only) end-to-end OSR test: lowers a real `loop*` from source, builds + compiles the OSR entry, and calls the native code with a mid-loop register snapshot |
 
 ## Public API
@@ -80,6 +82,14 @@ lifecycle of a compiled arity's native code:
    With all mutators parked, it scans active frames across all threads
    (`jit_state::live_epochs`) and frees every stale module whose epoch has **no**
    live frame — resolving the unload-vs-execute race without a separate protocol.
+5. **Closure pinning.** A closure value built by `rt_make_fn*` inside JIT code
+   captures a raw pointer into the executing module and lives on the GC heap,
+   where the frame scan cannot see it (it may be called long after every frame
+   returned).  The closure-escape hook (installed by `init()`, fired by
+   `rt_make_fn`/`rt_make_fn_variadic`/`rt_make_fn_multi`) therefore pins the
+   executing frame's epoch (`code_cache::pin_epoch`): a pinned module is never
+   freed.  This is a deliberate, bounded leak — precise reclamation would
+   require the GC to report when the closure value dies.
 
 ## OSR — on-stack replacement (Phase 10.4)
 

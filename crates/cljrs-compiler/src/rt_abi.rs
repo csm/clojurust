@@ -1234,6 +1234,27 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
 
 // ── Function/closure construction ───────────────────────────────────────────
 
+/// Hook invoked whenever `rt_make_fn*` wraps a compiled function pointer into
+/// a closure value.
+///
+/// Installed by `cljrs_jit::init`: the resulting `Value::NativeFunction` lives
+/// on the GC heap and captures a raw pointer into the executing JIT module, so
+/// the JIT pins that module's reclamation epoch.  Unset under AOT, where code
+/// is never unloaded.
+static CLOSURE_ESCAPE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the closure-escape hook (installed once by `cljrs_jit::init`).
+pub fn set_closure_escape_hook(f: fn()) {
+    let _ = CLOSURE_ESCAPE_HOOK.set(f);
+}
+
+#[inline]
+fn notify_closure_escape() {
+    if let Some(hook) = CLOSURE_ESCAPE_HOOK.get() {
+        hook();
+    }
+}
+
 /// Create a `Value::NativeFunction` wrapping a compiled function pointer.
 ///
 /// `fn_ptr` is a pointer to a compiled Cranelift function with signature:
@@ -1258,6 +1279,7 @@ pub unsafe extern "C" fn rt_make_fn(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -1334,6 +1356,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -1417,6 +1440,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -2971,6 +2995,17 @@ pub unsafe extern "C" fn rt_throw(val: *const Value) -> *const Value {
 /// Check if a thrown exception is pending and clear it.
 fn take_pending_exception() -> Option<*const Value> {
     PENDING_EXCEPTION.with(|cell| cell.borrow_mut().take())
+}
+
+/// Take (and clear) the thread's pending exception as an owned `Value`.
+///
+/// Called by the JIT-native dispatch seam (via the hook installed by
+/// `cljrs_jit::init`) right after native code returns, so an uncaught throw
+/// propagates to the interpreter caller instead of being swallowed as nil.
+/// The caller must invoke this while the JIT frame's alloc roots are still
+/// live (the pending pointer targets a Value boxed inside the native frame).
+pub fn take_pending_exception_value() -> Option<Value> {
+    take_pending_exception().map(|ptr| unsafe { val_ref(ptr) }.clone())
 }
 
 /// `(try body (catch Ex e handler) (finally cleanup))` — exception handling.

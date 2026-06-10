@@ -112,6 +112,15 @@ walk directly, preserving full semantics.
 - **Output:** `rt_println(v)`, `rt_pr(v)`, `rt_str(v)`
 - **Type checks:** `rt_is_nil`, `rt_is_vector`, `rt_is_map`, `rt_is_seq`, `rt_identical`
 - **Linker anchor:** `anchor_rt_symbols()` — call from harness to prevent dead-code elimination
+- **JIT hooks (safe Rust, not `extern "C"`):**
+  `take_pending_exception_value() -> Option<Value>` — take + clear the thread's pending
+  exception as an owned `Value`; the JIT dispatch seam calls it (via a hook installed by
+  `cljrs_jit::init`) right after native code returns, so an uncaught `(throw …)` propagates
+  as `EvalError::Thrown` instead of a nil return.
+  `set_closure_escape_hook(fn())` — installed by `cljrs_jit::init`; `rt_make_fn`,
+  `rt_make_fn_variadic`, and `rt_make_fn_multi` fire it whenever they wrap a compiled
+  function pointer into a GC-managed closure value, so the JIT can pin the executing
+  module's reclamation epoch (unset under AOT, where code is never unloaded).
 
 ### Cranelift codegen (`codegen.rs`)
 

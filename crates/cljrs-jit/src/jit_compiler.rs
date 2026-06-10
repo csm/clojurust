@@ -50,6 +50,14 @@ pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<Compi
         .declare_function(func_name, param_count)
         .map_err(|e| format!("declare_function: {e:?}"))?;
 
+    // Declare and compile closure subfunctions into the same module (exactly
+    // as AOT does), so `AllocClosure` codegen can resolve each arity's
+    // function by name.  Closure values built from these pointers may outlive
+    // the call — `rt_make_fn*` fires the closure-escape hook, which pins this
+    // module's reclamation epoch (see `code_cache::pin_epoch`).
+    declare_subfunctions(ir_func, &mut compiler)?;
+    compile_subfunctions(ir_func, &mut compiler)?;
+
     compiler
         .compile_function(ir_func, func_id)
         .map_err(|e| format!("compile_function: {e:?}"))?;
@@ -69,6 +77,41 @@ pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<Compi
         module: jit_module,
         code_size,
     })
+}
+
+/// Recursively declare all closure subfunctions so they can reference each
+/// other (mirrors `aot.rs::declare_subfunctions`).
+fn declare_subfunctions<M: cranelift_module::Module>(
+    ir_func: &IrFunction,
+    compiler: &mut cljrs_compiler::codegen::Compiler<M>,
+) -> Result<(), String> {
+    for sub in &ir_func.subfunctions {
+        let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
+        compiler
+            .declare_function(name, sub.params.len())
+            .map_err(|e| format!("declare sub {name}: {e:?}"))?;
+        declare_subfunctions(sub, compiler)?;
+    }
+    Ok(())
+}
+
+/// Recursively compile all closure subfunctions, innermost first (mirrors
+/// `aot.rs::compile_subfunctions`).
+fn compile_subfunctions<M: cranelift_module::Module>(
+    ir_func: &IrFunction,
+    compiler: &mut cljrs_compiler::codegen::Compiler<M>,
+) -> Result<(), String> {
+    for sub in &ir_func.subfunctions {
+        compile_subfunctions(sub, compiler)?;
+        let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
+        let func_id = compiler
+            .declare_function(name, sub.params.len())
+            .map_err(|e| format!("redeclare sub {name}: {e:?}"))?;
+        compiler
+            .compile_function(sub, func_id)
+            .map_err(|e| format!("compile sub {name}: {e:?}"))?;
+    }
+    Ok(())
 }
 
 // ── rt_abi symbol registration ────────────────────────────────────────────────

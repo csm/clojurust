@@ -1,17 +1,17 @@
-//! Phase 10.3 — the JIT declines functions it cannot yet compile correctly
-//! (e.g. those containing inner closures) *gracefully*, rather than panicking.
+//! Phase 10.3 — the JIT worker survives functions it cannot compile: codegen
+//! declines with a clean error (never a panic), and a worker panic from any
+//! other cause is caught so one bad function cannot disable the JIT for the
+//! rest of the session.
 //!
-//! The JIT compiles a single arity at a time and does not declare a function's
-//! closure subfunctions, so `AllocClosure` codegen cannot resolve them.  This
-//! used to index a missing map key and panic — and because the panic happened
-//! on the background JIT worker thread, the *first* hot closure-bearing function
-//! killed the worker and silently disabled the JIT for the rest of the session.
-//!
-//! Codegen now returns a clean error for an undeclared subfunction, so such
-//! functions fall back to the (correct) interpreter and the worker keeps
-//! compiling everything else.  This test exercises a script that mixes a
-//! closure-bearing function with a closure-free one and asserts: results are
-//! correct, no panic surfaces, and the program completes normally.
+//! Historical note: closure-bearing functions used to be the trigger — the JIT
+//! compiled a single arity without declaring its closure subfunctions, so
+//! `AllocClosure` codegen indexed a missing map key and panicked on the
+//! background worker thread.  Closures now compile (subfunctions are declared
+//! and compiled into the same module, as AOT does), but the decline-gracefully
+//! behavior still guards everything codegen cannot express
+//! (`lookup_user_func` returns `Err`, the worker `catch_unwind`s).  This test
+//! mixes a closure-bearing function with a closure-free one and asserts:
+//! results are correct, no panic surfaces, and the program completes normally.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,10 +57,11 @@ fn run_jit(src: &str) -> Run {
 }
 
 #[test]
-fn closure_bearing_fn_declines_without_panicking() {
-    // `make-adder` returns an inner closure → the JIT must decline it and fall
-    // back to the interpreter.  `vsum` is closure-free → it may JIT-compile.
-    // Both run hot so the JIT engages.
+fn closure_bearing_fn_runs_correctly_without_panicking() {
+    // `make-adder` returns an inner closure → it now JIT-compiles (closure
+    // subfunctions are compiled into the same module); whichever tier runs it
+    // must produce correct results without killing the worker.  `vsum` is
+    // closure-free → it may JIT-compile.  Both run hot so the JIT engages.
     let src = r#"
         (defn make-adder [n] (fn [x] (+ x n)))
         (defn vsum [a b & xs] [a b (count xs)])

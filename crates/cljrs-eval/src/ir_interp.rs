@@ -188,6 +188,13 @@ fn try_osr_enter(
     // SAFETY: result_ptr points to a live Value in ALLOC_ROOTS; clone it
     // before the alloc frame drops.
     let result = unsafe { (*result_ptr).clone() };
+
+    // Same as `call_jit_native`: an uncaught `(throw …)` inside native code
+    // stashes the thrown value and returns the nil sentinel — surface it as an
+    // error while the alloc frame still roots it.
+    if let Some(thrown) = crate::jit_state::take_pending_exception() {
+        return Some(Err(cljrs_env::error::EvalError::Thrown(thrown)));
+    }
     Some(Ok(result))
 }
 

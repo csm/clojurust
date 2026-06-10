@@ -183,6 +183,31 @@ pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>) {
     }
 }
 
+// ── Pending-exception hook ────────────────────────────────────────────────────
+//
+// Compiled code signals `(throw …)` by stashing the thrown value in a
+// thread-local owned by `cljrs-compiler`'s rt_abi (this crate cannot depend on
+// it).  `cljrs_jit::init` installs a taker so the dispatch seam can convert an
+// uncaught native throw back into `Err(EvalError::Thrown)` instead of silently
+// returning the nil sentinel (and leaking the stale pending slot into the next
+// `rt_try` on this thread).
+
+type PendingExceptionFn = fn() -> Option<Value>;
+static PENDING_EXCEPTION_HOOK: OnceLock<PendingExceptionFn> = OnceLock::new();
+
+/// Install the pending-exception taker (installed once by `cljrs_jit::init`).
+pub fn set_pending_exception_hook(f: PendingExceptionFn) {
+    let _ = PENDING_EXCEPTION_HOOK.set(f);
+}
+
+/// Take (and clear) the thread's pending exception, if any.
+///
+/// Called by the JIT-native and OSR dispatch seams immediately after native
+/// code returns.  Returns `None` when no hook is installed (no JIT linked).
+pub fn take_pending_exception() -> Option<Value> {
+    PENDING_EXCEPTION_HOOK.get().and_then(|f| f())
+}
+
 // ── OSR (on-stack replacement) state — Phase 10.4 ────────────────────────────
 //
 // A single hot call containing a `loop*`/`recur` never returns to re-dispatch,
@@ -414,6 +439,16 @@ impl Drop for JitFrameGuard {
 pub fn push_jit_frame(epoch: u64) -> JitFrameGuard {
     MY_FRAMES.with(|f| f.stack.lock().unwrap().push(epoch));
     JitFrameGuard { epoch }
+}
+
+/// The epoch of the innermost native frame on this thread, if any.
+///
+/// Used by the closure-escape hook: a closure value materialized by
+/// `rt_make_fn*` captures a raw pointer into the module of the currently
+/// executing native code, so that module (this epoch) must be pinned against
+/// reclamation.
+pub fn current_jit_epoch() -> Option<u64> {
+    MY_FRAMES.with(|f| f.stack.lock().unwrap().last().copied())
 }
 
 /// Collect the set of epochs with at least one active native frame across all

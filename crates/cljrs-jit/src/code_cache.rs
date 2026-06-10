@@ -51,6 +51,11 @@ struct CacheState {
     live: HashMap<u64, CodeRecord>,
     /// Superseded code awaiting reclamation, keyed by epoch.
     stale: HashMap<u64, CodeRecord>,
+    /// Epochs that may never be freed: a closure value built by `rt_make_fn*`
+    /// inside this module's code captured a raw pointer into it, and that
+    /// value's lifetime is GC-managed — invisible to the frame scan.  Pinning
+    /// trades a bounded leak for soundness (see [`pin_epoch`]).
+    pinned: HashSet<u64>,
     /// Cumulative count of modules whose memory has been freed.
     reclaimed_count: u64,
     /// Cumulative bytes of machine code freed.
@@ -90,15 +95,35 @@ pub(crate) fn mark_stale(epoch: u64) {
     }
 }
 
-/// Decide which stale epochs are safe to free: those with no active frame.
+/// Pin `epoch` so its module is never freed.
+///
+/// Called (via the closure-escape hook installed in `init`) whenever JIT code
+/// materializes a closure value through `rt_make_fn*`: the resulting
+/// `NativeFunction` captures a raw pointer into the module and lives on the GC
+/// heap, where the active-frame scan cannot see it.  A pinned module survives
+/// `mark_stale` indefinitely — a deliberate, bounded leak; precise reclamation
+/// would need the GC to tell us when the closure value dies.
+pub(crate) fn pin_epoch(epoch: u64) {
+    let mut state = cache().lock().unwrap();
+    if state.pinned.insert(epoch) {
+        cljrs_logging::feat_debug!("jit", "pin epoch={} (closure escaped)", epoch);
+    }
+}
+
+/// Decide which stale epochs are safe to free: those with no active frame and
+/// no pinned (escaped-closure) reference.
 ///
 /// Factored out as a pure function over epoch sets so the safety rule is
 /// directly unit-testable without constructing real modules.
-fn select_reclaimable(stale_epochs: &HashSet<u64>, live_frames: &HashSet<u64>) -> Vec<u64> {
+fn select_reclaimable(
+    stale_epochs: &HashSet<u64>,
+    live_frames: &HashSet<u64>,
+    pinned: &HashSet<u64>,
+) -> Vec<u64> {
     stale_epochs
         .iter()
         .copied()
-        .filter(|e| !live_frames.contains(e))
+        .filter(|e| !live_frames.contains(e) && !pinned.contains(e))
         .collect()
 }
 
@@ -112,7 +137,7 @@ pub fn reclaim_at_stw() -> usize {
     let mut state = cache().lock().unwrap();
 
     let stale_epochs: HashSet<u64> = state.stale.keys().copied().collect();
-    let to_free = select_reclaimable(&stale_epochs, &live_frames);
+    let to_free = select_reclaimable(&stale_epochs, &live_frames, &state.pinned);
 
     let mut freed = 0usize;
     for epoch in to_free {
@@ -194,7 +219,7 @@ mod tests {
     fn reclaimable_excludes_live_frames() {
         let stale: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
         let live: HashSet<u64> = [2, 4].into_iter().collect();
-        let mut got = select_reclaimable(&stale, &live);
+        let mut got = select_reclaimable(&stale, &live, &HashSet::new());
         got.sort_unstable();
         assert_eq!(
             got,
@@ -207,16 +232,27 @@ mod tests {
     fn reclaimable_empty_when_all_live() {
         let stale: HashSet<u64> = [5, 6].into_iter().collect();
         let live: HashSet<u64> = [5, 6, 7].into_iter().collect();
-        assert!(select_reclaimable(&stale, &live).is_empty());
+        assert!(select_reclaimable(&stale, &live, &HashSet::new()).is_empty());
     }
 
     #[test]
     fn reclaimable_all_when_none_live() {
         let stale: HashSet<u64> = [8, 9].into_iter().collect();
         let live: HashSet<u64> = HashSet::new();
-        let mut got = select_reclaimable(&stale, &live);
+        let mut got = select_reclaimable(&stale, &live, &HashSet::new());
         got.sort_unstable();
         assert_eq!(got, vec![8, 9]);
+    }
+
+    #[test]
+    fn reclaimable_excludes_pinned_epochs() {
+        // An escaped closure pins its module: even with no live frame the
+        // epoch must never free.
+        let stale: HashSet<u64> = [10, 11].into_iter().collect();
+        let live: HashSet<u64> = HashSet::new();
+        let pinned: HashSet<u64> = [10].into_iter().collect();
+        let got = select_reclaimable(&stale, &live, &pinned);
+        assert_eq!(got, vec![11], "pinned epoch must not be reclaimed");
     }
 }
 
