@@ -39,7 +39,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 
         // 1. JIT-native: fastest path — skip interpreter entirely.
         if let Some((fn_ptr, epoch)) = crate::jit_state::get_native_fn(arity_id) {
-            return call_jit_native(fn_ptr, epoch, args, caller_env);
+            return call_jit_native(fn_ptr, epoch, arity, args, caller_env);
         }
 
         // 2. IR interpreter (also bumps invocation counter).
@@ -147,9 +147,17 @@ fn execute_ir(
 ///
 /// Roots the caller env and the argument slice on the GC shadow stack before
 /// entering native code, so GC safepoints inside the JIT frame can find them.
+///
+/// For a variadic arity the compiled function's signature is
+/// `(fixed…, rest_list)` — the IR lowers the rest parameter to a single value
+/// that receives a list of the trailing arguments.  We therefore pack the
+/// trailing args into a list here, exactly as [`execute_ir`] does for the IR
+/// interpreter, so the native call receives the `arity.params.len() + 1`
+/// arguments it was compiled for instead of the raw call argument count.
 fn call_jit_native(
     fn_ptr: *const (),
     epoch: u64,
+    arity: &cljrs_value::CljxFnArity,
     args: &[Value],
     caller_env: &mut Env,
 ) -> EvalResult {
@@ -160,15 +168,36 @@ fn call_jit_native(
     // Register the caller env so its GcPtrs survive any GC triggered inside
     // the JIT frame (at rt_safepoint calls).
     let _caller_root = cljrs_env::gc_roots::push_env_root(caller_env);
-    // Register the arg slice on the shadow stack.
-    let _arg_roots = cljrs_env::gc_roots::root_values(args);
+
+    // Build the argument list the native code expects.  Fixed arities pass args
+    // through unchanged; variadic arities pack the trailing args into the rest
+    // list so the native arg count matches the compiled signature.
+    let call_args: Vec<Value> = if arity.rest_param.is_some() {
+        let n = arity.params.len();
+        let split = n.min(args.len());
+        let mut v = args[..split].to_vec();
+        let rest_items = &args[split..];
+        let rest_val = if rest_items.is_empty() {
+            Value::Nil
+        } else {
+            Value::List(GcPtr::new(PersistentList::from_iter(rest_items.to_vec())))
+        };
+        v.push(rest_val);
+        v
+    } else {
+        args.to_vec()
+    };
+
+    // Register the (owned) arg values on the shadow stack — including the freshly
+    // built rest list — so they survive any GC triggered inside the JIT frame.
+    let _arg_roots = cljrs_env::gc_roots::root_values(&call_args);
     // Track all allocations made inside the JIT frame.
     let _alloc_frame = cljrs_gc::push_alloc_frame();
 
-    // Pass raw pointers to the args.  These are valid for the duration of
-    // this call because the args slice is borrowed from the caller's frame
-    // and `_arg_roots` roots the underlying Values.
-    let arg_ptrs: Vec<*const Value> = args.iter().map(|v| v as *const Value).collect();
+    // Pass raw pointers to the args.  These are valid for the duration of this
+    // call because `call_args` outlives the call and `_arg_roots` roots the
+    // underlying Values.
+    let arg_ptrs: Vec<*const Value> = call_args.iter().map(|v| v as *const Value).collect();
 
     // SAFETY: fn_ptr was produced by Cranelift JIT with SystemV ABI and the
     // correct number of *const Value params; all arg pointers are live.

@@ -404,7 +404,7 @@ Foundations already in place:
 
 - [x] Destructured params: expand destructuring to explicit let-bindings in the IR prologue (lowering-only) — `lower_fn_body_destructured` runs the same prologue as inner `fn*` forms (`lower_destructure_binding`), driven by `CljxFnArity.destructure_params`/`destructure_rest` threaded through `lower_arity`; gate in `eager_lower_fn` removed
 - [ ] Closures with captured bindings: complete capture lowering + closure-alloc codegen
-- [ ] Variadic / rest params through codegen
+- [x] Variadic / rest params through codegen — codegen already compiles the `(fixed…, rest_list)` signature; the JIT-native dispatch path (`call_jit_native`) now packs the trailing call args into the rest list before invoking native code (mirroring `execute_ir`), fixing silently-dropped rest args (`(mixed 10 20 30 40 50)` → `[10 20 3 30]`, not `[10 20 0 nil]`)
 - [ ] Promote special-cased ops (`apply`, `atom`, `swap!`/`reset!`, `volatile!`, `vswap!`) to first-class `KnownFn`/IR instructions
 
 ### Phase 10.4 — OSR (on-stack replacement)
