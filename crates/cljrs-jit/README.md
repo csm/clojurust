@@ -4,20 +4,22 @@
 native code via Cranelift, making `cljrs run` and the REPL approach AOT-class
 throughput with no explicit compile step.
 
-**Status:** Phase 10.2 — functional for non-capturing, non-variadic,
-non-destructuring top-level `defn`s (the same set that Tier-1 handles), with
-epoch-tagged **code unloading**: redefined functions' native code is reclaimed
-at stop-the-world GC safepoints, keeping executable memory bounded across a long
-REPL session.
+**Status:** Phase 10.4 — functional for non-capturing top-level `defn`s (the
+same set that Tier-1 handles), with epoch-tagged **code unloading** (redefined
+functions' native code is reclaimed at stop-the-world GC safepoints, keeping
+executable memory bounded across a long REPL session) and **OSR** (on-stack
+replacement): a single-call hot `loop*`/`recur` is promoted to native code
+mid-run via loop back-edge counters and an OSR-entry compile.
 
 ## File layout
 
 | File | Description |
 |------|-------------|
-| `src/lib.rs` | Public API: `init()` — installs the enqueue, var-rebind, and STW-reclaim hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition |
-| `src/jit_compiler.rs` | `compile_jit(arity_id, ir_func)` — builds `JITModule`, registers rt_abi symbols, calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
-| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest`s, registers each module in `code_cache`, publishes the function pointer + epoch to `cljrs_eval::jit_state`. Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1) |
+| `src/lib.rs` | Public API: `init()` — installs the enqueue (function + OSR), var-rebind, and STW-reclaim hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition (whole-function and OSR epochs) |
+| `src/jit_compiler.rs` | `compile_jit(func_name, ir_func)` — builds `JITModule`, registers rt_abi symbols, calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
+| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
 | `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `reclaim_at_stw` frees stale modules with no live frame via `JITModule::free_memory` |
+| `src/osr_integration.rs` | (test-only) end-to-end OSR test: lowers a real `loop*` from source, builds + compiles the OSR entry, and calls the native code with a mid-loop register snapshot |
 
 ## Public API
 
@@ -48,6 +50,7 @@ call_cljrs_fn
 | Env var | Default | Description |
 |---------|---------|-------------|
 | `CLJRS_JIT_THRESHOLD` | `1000` | Calls before a function is JIT-compiled |
+| `CLJRS_OSR_THRESHOLD` | = JIT threshold | Loop back-edges (within one call) before an OSR entry is compiled |
 | `CLJRS_NO_JIT` | unset | Set to any value to disable JIT init |
 | `CLJRS_NO_IR` | unset | Disables IR lowering (also disables JIT) |
 
@@ -77,3 +80,33 @@ lifecycle of a compiled arity's native code:
    With all mutators parked, it scans active frames across all threads
    (`jit_state::live_epochs`) and frees every stale module whose epoch has **no**
    live frame — resolving the unload-vs-execute race without a separate protocol.
+
+## OSR — on-stack replacement (Phase 10.4)
+
+A script or REPL form is often a *single* call containing one very hot
+`loop*`/`recur`; it never returns to re-dispatch, so the invocation counter
+above can never promote it.  OSR promotes it mid-run:
+
+1. **Back-edge counters.** `interpret_ir_with_osr` (Tier 1, `cljrs-eval`)
+   counts `RecurJump`s per loop header within one execution.  Crossing
+   `osr_threshold()` calls `jit_state::osr_request`, whose hook (installed by
+   `init()`) enqueues `CompileRequest::Osr { arity_id, header, ir_func }`.
+2. **OSR-entry compile.** The worker calls
+   `cljrs_ir::osr::build_osr_function`, which keeps only the blocks reachable
+   from the loop header and turns the loop's live-in values (the header φs +
+   pre-loop defs the loop reads) into parameters.  The variant is compiled by
+   the ordinary backend and registered in the `code_cache` under its own
+   epoch; `jit_state::store_osr_fn` publishes `(fn_ptr, epoch, live_ins)`.
+3. **Mid-loop transfer.** At its next loop-header entry (after φ resolution,
+   so the loop variables are current), the interpreter snapshots the live-in
+   registers and calls the native entry; the native frame runs the remaining
+   iterations *and* everything after the loop, and its return value becomes
+   the call's result.  The transfer uses the same rooting + frame-epoch
+   protocol as ordinary JIT-native calls, so GC and code unloading see OSR
+   frames like any other native frame.
+4. **Unloading.** On var rebind, `jit_state::take_osr_epochs` drops the
+   arity's OSR entries and their epochs are staled alongside the
+   whole-function epoch.
+
+Failures anywhere (transform declined, codegen error, panic) mark the
+`(arity_id, header)` slot failed; the loop simply finishes at Tier 1.

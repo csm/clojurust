@@ -411,8 +411,8 @@ Foundations already in place:
 
 ### Phase 10.4 — OSR (on-stack replacement)
 
-- [ ] Loop back-edge counters at loop headers
-- [ ] OSR-entry compilation (entry block = loop header; live-ins as params) and mid-loop transfer of the interpreter register file into the native frame — promotes single-call hot loops typical of scripts/REPL
+- [x] Loop back-edge counters at loop headers — `interpret_ir_with_osr` counts `RecurJump`s per header within one execution (lazily allocated; straight-line code pays nothing); crossing `osr_threshold()` (override → `CLJRS_OSR_THRESHOLD` → JIT threshold) issues an idempotent `jit_state::osr_request` to the background worker. Per-execution counting is deliberate: hot-within-one-call is exactly the case invocation tiering misses; loops spread over many short calls are already covered by the invocation counter
+- [x] OSR-entry compilation (entry block = loop header; live-ins as params) and mid-loop transfer of the interpreter register file into the native frame — `cljrs_ir::osr::build_osr_function` keeps the blocks reachable from the header, rewires header φs to take an extra edge from a fresh entry block (loop variables arrive as fresh params), passes other pre-loop values as params bound to their original `VarId`s, and drops `RegionEnd`s whose `RegionStart` ran in the interpreter (the interpreter frame closes those regions after the transfer). The worker compiles the variant through the ordinary backend, registers it under its own reclamation epoch (rebind staling covers OSR epochs via `take_osr_epochs`), and publishes `(fn_ptr, epoch, live_ins)`; the interpreter polls at loop-header entry (after φ resolution) and, on `Ready`, snapshots the live-in registers and calls native code with the same rooting + frame-epoch protocol as ordinary JIT-native calls. *Milestone holds:* a single-call 2M-iteration `loop`/`recur` script promotes to native mid-run (`crates/cljrs/tests/osr_promotion.rs`); any transform/compile failure marks the slot failed and the loop finishes at Tier 1
 
 ### Phase 10.5 — Context-driven bump allocation
 

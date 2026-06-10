@@ -31,3 +31,4 @@ cranelift-native   = { workspace = true }
 [dev-dependencies]
 cljrs-stdlib = { workspace = true }
 cljrs-reader = { workspace = true }
+cljrs-env    = { workspace = true }
