@@ -44,7 +44,10 @@ pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<Compi
     let mut compiler = new_compiler_from_module(jit_module, ptr_type)
         .map_err(|e| format!("new_compiler_from_module: {e:?}"))?;
 
-    let param_count = ir_func.params.len();
+    // `abi_param_count` includes the hidden trailing region parameter of
+    // region-parameterised variants (the top-level function never has one,
+    // but its `__rg` subfunction variants do).
+    let param_count = ir_func.abi_param_count();
 
     let func_id: FuncId = compiler
         .declare_function(func_name, param_count)
@@ -88,7 +91,7 @@ fn declare_subfunctions<M: cranelift_module::Module>(
     for sub in &ir_func.subfunctions {
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
         compiler
-            .declare_function(name, sub.params.len())
+            .declare_function(name, sub.abi_param_count())
             .map_err(|e| format!("declare sub {name}: {e:?}"))?;
         declare_subfunctions(sub, compiler)?;
     }
@@ -105,7 +108,7 @@ fn compile_subfunctions<M: cranelift_module::Module>(
         compile_subfunctions(sub, compiler)?;
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
         let func_id = compiler
-            .declare_function(name, sub.params.len())
+            .declare_function(name, sub.abi_param_count())
             .map_err(|e| format!("redeclare sub {name}: {e:?}"))?;
         compiler
             .compile_function(sub, func_id)

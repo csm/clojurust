@@ -626,7 +626,9 @@ fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
 fn declare_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotResult<()> {
     for sub in &ir_func.subfunctions {
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
-        compiler.declare_function(name, sub.params.len())?;
+        // `abi_param_count` adds the hidden trailing region parameter for
+        // region-parameterised (`__rg`) variants.
+        compiler.declare_function(name, sub.abi_param_count())?;
         declare_subfunctions(sub, compiler)?;
     }
     Ok(())
@@ -637,7 +639,7 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
     for sub in &ir_func.subfunctions {
         compile_subfunctions(sub, compiler)?;
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
-        let func_id = compiler.declare_function(name, sub.params.len())?;
+        let func_id = compiler.declare_function(name, sub.abi_param_count())?;
         compiler.compile_function(sub, func_id)?;
     }
     Ok(())

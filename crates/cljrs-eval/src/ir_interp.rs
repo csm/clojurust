@@ -566,7 +566,10 @@ fn execute_inst(
             regs.set(*dst, Value::Nil);
         }
 
-        Inst::CallWithRegion(dst, name, args) => {
+        // The region operand is ignored here: the interpreter inherits the
+        // region via the thread-local region stack (the handle register holds
+        // nil).  Only compiled code threads it as a hidden argument.
+        Inst::CallWithRegion(dst, name, args, _region) => {
             cljrs_env::gc_roots::gc_safepoint(env);
             let target = ir_func
                 .subfunctions

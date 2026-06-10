@@ -568,7 +568,7 @@ fn inst_dst(inst: &Inst) -> Option<VarId> {
         | Inst::RegionStart(d)
         | Inst::RegionAlloc(d, _, _, _)
         | Inst::RegionParam(d)
-        | Inst::CallWithRegion(d, _, _) => Some(*d),
+        | Inst::CallWithRegion(d, _, _, _) => Some(*d),
         Inst::Await { dst, .. } => Some(*dst),
         Inst::Spawn { dst, .. } => Some(*dst),
         Inst::ChanTake { dst, .. } => Some(*dst),

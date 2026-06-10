@@ -444,7 +444,7 @@ fn find_call_by_dst(func: &IrFunction, dst: VarId) -> Option<(usize, usize)> {
 /// `Call` site in place.  Returns `true` if the rewrite succeeded.
 ///
 /// On success: replaces the `Call` with `CallWithRegion(dst, target_name,
-/// args)`, prepends `RegionStart(rv)` to the LCA-block's prologue, and
+/// args, rv)`, prepends `RegionStart(rv)` to the LCA-block's prologue, and
 /// appends `RegionEnd(rv)` to the LCA-postdom's instruction list (before
 /// the terminator).  Bails out without mutation if back-edges or `throw`
 /// instructions cross the candidate region — matching the safety
@@ -522,7 +522,8 @@ fn rewrite_call_with_region_scope(
     } else {
         args
     };
-    func.blocks[block_idx].insts[inst_idx] = Inst::CallWithRegion(dst, target_name, full_args);
+    func.blocks[block_idx].insts[inst_idx] =
+        Inst::CallWithRegion(dst, target_name, full_args, region_var);
 
     // Insert RegionStart at the head of `start_block`.
     if let Some(b) = func.blocks.iter_mut().find(|b| b.id == start_block) {

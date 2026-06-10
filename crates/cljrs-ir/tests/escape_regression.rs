@@ -313,6 +313,54 @@ fn stage4_promotes_non_inlineable_callee() {
 }
 
 #[test]
+fn stage4_call_with_region_threads_the_region_start_handle() {
+    // The rewritten `CallWithRegion` must carry the handle of the
+    // `RegionStart` the rewrite inserted, and the cloned variant must report
+    // a hidden region parameter — compiled code threads the handle as a
+    // trailing argument bound to the variant's `RegionParam`.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+
+    fn check(ir: &IrFunction) -> bool {
+        for block in &ir.blocks {
+            for inst in &block.insts {
+                if let Inst::CallWithRegion(_, name, _, region) = inst {
+                    // The region operand must be defined by a RegionStart in
+                    // the same function…
+                    let started = ir.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i, Inst::RegionStart(h) if h == region))
+                    });
+                    // …and the target variant must take the hidden parameter.
+                    let target_takes_param = ir
+                        .subfunctions
+                        .iter()
+                        .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
+                        .map(|sf| sf.takes_region_param())
+                        .unwrap_or(false);
+                    if started && target_takes_param {
+                        return true;
+                    }
+                }
+            }
+        }
+        ir.subfunctions.iter().any(check)
+    }
+    assert!(
+        check(&optimized),
+        "CallWithRegion must thread its RegionStart handle into a \
+         region-parameterised target; IR:\n{optimized}"
+    );
+}
+
+#[test]
 fn stage4_skipped_when_callee_result_escapes() {
     // The caller returns make-pair's result directly — call_dst is `Returns`,
     // not `NoEscape`.  Stage 4 must NOT rewrite the call site.
@@ -416,7 +464,7 @@ fn stage4_handles_callee_with_self_capture() {
     fn find_target_and_call<'a>(ir: &'a IrFunction) -> Option<(&'a Arc<str>, usize, usize)> {
         for block in &ir.blocks {
             for inst in &block.insts {
-                if let Inst::CallWithRegion(_, name, args) = inst {
+                if let Inst::CallWithRegion(_, name, args, _) = inst {
                     if let Some(target) = ir
                         .subfunctions
                         .iter()
