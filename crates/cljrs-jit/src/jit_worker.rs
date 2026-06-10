@@ -33,7 +33,26 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
     for req in &rx {
         cljrs_logging::feat_debug!("jit", "compiling arity_id={}", req.arity_id);
 
-        match compile_jit(req.arity_id, &req.ir_func) {
+        // Isolate each compilation: a panic in codegen (e.g. an unsupported IR
+        // shape that trips a Cranelift assertion) must not kill the worker
+        // thread and silently disable the JIT for the rest of the session.  On
+        // panic the function simply stays at Tier 1, exactly like a clean
+        // compile error.
+        let compiled = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compile_jit(req.arity_id, &req.ir_func)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                cljrs_logging::feat_debug!(
+                    "jit",
+                    "compile panicked arity_id={}; staying at Tier 1",
+                    req.arity_id
+                );
+                continue;
+            }
+        };
+
+        match compiled {
             Ok(compiled) => {
                 let fn_ptr = compiled.fn_ptr;
                 // Hand ownership of the module to the code cache; it returns the

@@ -16,7 +16,7 @@ REPL session.
 |------|-------------|
 | `src/lib.rs` | Public API: `init()` — installs the enqueue, var-rebind, and STW-reclaim hooks and spawns the worker; `on_var_rebind`/`arity_ids` drive staling on redefinition |
 | `src/jit_compiler.rs` | `compile_jit(arity_id, ir_func)` — builds `JITModule`, registers rt_abi symbols, calls shared codegen; returns `CompiledFn { fn_ptr, module, code_size }` |
-| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest`s, registers each module in `code_cache`, publishes the function pointer + epoch to `cljrs_eval::jit_state` |
+| `src/jit_worker.rs` | Background worker thread: receives `CompileRequest`s, registers each module in `code_cache`, publishes the function pointer + epoch to `cljrs_eval::jit_state`. Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1) |
 | `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `reclaim_at_stw` frees stale modules with no live frame via `JITModule::free_memory` |
 
 ## Public API
