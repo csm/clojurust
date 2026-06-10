@@ -19,6 +19,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod apply;
+pub mod defn_registry;
 pub mod ir_cache;
 pub mod ir_convert;
 pub mod ir_interp;

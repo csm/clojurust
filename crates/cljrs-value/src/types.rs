@@ -251,6 +251,11 @@ impl Var {
             self.namespace,
             self.name
         );
+        // GC builds: heap-promotion fallback — a region-allocated value bound
+        // to a program-lifetime var is deep-copied to the heap (or the active
+        // regions are retired when it cannot be).  One depth check when no
+        // region is open.
+        let v = crate::publish::publish_value(v);
         // Replace the binding, holding the lock only across the swap.  The
         // previous value (if any) is handed to the JIT rebind hook so it can
         // reclaim native code compiled for a now-superseded definition
@@ -315,6 +320,9 @@ pub struct Atom {
 
 impl Atom {
     pub fn new(v: Value) -> Self {
+        // Heap-promotion fallback (GC builds): an atom is program-lifetime
+        // shared state, so its initial value must not be region-allocated.
+        let v = crate::publish::publish_value(v);
         Self {
             value: Mutex::new(v),
             meta: Mutex::new(None),
@@ -336,6 +344,8 @@ impl Atom {
              expression must be computed inside a StaticCtxGuard (i.e. inside \
              the swap! / reset! call) so it is allocated in the static arena"
         );
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         let mut guard = self.value.lock().unwrap();
         *guard = v.clone();
         v
@@ -765,6 +775,8 @@ pub struct Volatile {
 
 impl Volatile {
     pub fn new(v: Value) -> Self {
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         Self {
             value: Mutex::new(v),
         }
@@ -782,6 +794,8 @@ impl Volatile {
             "no-gc: Volatile::reset() received a region-local value — ensure the \
              new-value expression is inside a StaticCtxGuard (vreset! handles this)"
         );
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         *self.value.lock().unwrap() = v.clone();
         v
     }
@@ -888,6 +902,9 @@ impl CljxPromise {
 
     /// Deliver a value (no-op if already delivered).
     pub fn deliver(&self, v: Value) {
+        // GC builds: heap-promotion fallback — the promise may outlive (and be
+        // read from outside) any region scope active at delivery time.
+        let v = crate::publish::publish_value(v);
         let mut guard = self.value.lock().unwrap();
         if guard.is_none() {
             *guard = Some(v);

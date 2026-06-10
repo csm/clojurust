@@ -24,8 +24,9 @@ src/
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
-  jit_hooks.rs                   — (Phase 10.2) var-rebind hook the JIT installs to stale superseded native code; set_var_rebind_hook, notify_var_rebind (fired by Var::bind)
+  jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the JIT stales superseded native code; cljrs-eval invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
+  publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
   symbol.rs                      — Symbol { namespace, name }
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
@@ -241,17 +242,39 @@ pub struct CljxFn {
 `{:async true}` attr-map). `CljxFn::new` defaults it to `false`; `cljrs-env`'s
 `dispatch_if_async` checks it at call time.
 
-### JIT rebind hook (`jit_hooks`, Phase 10.2)
+### Var-rebind hooks (`jit_hooks`, Phases 10.2/10.5)
 
 ```rust
-/// Installed once by cljrs_jit::init. Called with (old_value, new_value).
+/// Register a rebind hook. Multiple hooks may be registered; each is called
+/// with (old_value, new_value) in registration order.
 pub fn set_var_rebind_hook(f: impl Fn(&Value, &Value) + Send + Sync + 'static);
 ```
 
-`Var::bind` invokes the hook (via `notify_var_rebind`) whenever it overwrites an
-existing binding, so the JIT can stale and reclaim native code compiled for a
-superseded function definition. When no JIT is active the cost is a single
-relaxed atomic load.
+`Var::bind` invokes every registered hook (via `notify_var_rebind`) whenever
+it overwrites an existing binding.  Two consumers exist: the JIT stales and
+reclaims native code compiled for the superseded definition (10.2), and
+`cljrs-eval`'s defn registry invalidates lowerings of *other* functions that
+specialized against it (10.5).  When no hook is registered the cost is a
+single atomic flag load.
+
+### Heap-promotion publish barrier (`publish`, Phase 10.5 — GC builds)
+
+```rust
+/// Prepare a value for publication into a program-lifetime cell (or another
+/// thread): returns the value to store — the original when no region-
+/// allocated box is reachable, or a heap deep-copy when one is.  Values
+/// opaque to the scan (closures, unrealized lazy seqs, native objects)
+/// poison the thread's active regions instead
+/// (cljrs_gc::region::poison_active_regions), retiring them at scope close.
+/// One thread-local depth check when no region is open.
+pub fn publish_value(v: Value) -> Value;
+```
+
+The runtime safety net for bump regions coexisting with the tracing GC:
+correctness never depends on escape analysis being perfect.  Invoked by
+`Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
+`CljxPromise::deliver`, and `cljrs-async`'s channel puts.  Under `no-gc` the
+module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
 
 ### `Namespace` (Phase 4)
 

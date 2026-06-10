@@ -81,7 +81,10 @@ pub(crate) fn register(arity_id: u64, compiled: CompiledFn) -> u64 {
 /// Move the module for `epoch` from the live set to the stale set, scheduling it
 /// for reclamation at the next safepoint.  No-op if the epoch is unknown or
 /// already stale.
-pub(crate) fn mark_stale(epoch: u64) {
+///
+/// Public (beyond the crate) only as the stale-epoch hook target installed
+/// into `cljrs_eval::jit_state` by [`crate::init`].
+pub fn mark_stale(epoch: u64) {
     let mut state = cache().lock().unwrap();
     if let Some(record) = state.live.remove(&epoch) {
         cljrs_logging::feat_debug!(

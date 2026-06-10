@@ -7,12 +7,23 @@ pub mod intern;
 pub mod jit_hooks;
 pub mod keyword;
 pub mod native_object;
+#[cfg(not(feature = "no-gc"))]
+pub mod publish;
 pub mod regex;
 pub mod resource;
 pub mod shared;
 pub mod symbol;
 pub mod types;
 pub mod value;
+
+/// `no-gc` builds keep their `StaticCtxGuard` discipline; the publish barrier
+/// is an identity function there.
+#[cfg(feature = "no-gc")]
+pub mod publish {
+    pub fn publish_value(v: crate::Value) -> crate::Value {
+        v
+    }
+}
 
 pub use collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,

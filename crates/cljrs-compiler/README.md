@@ -76,7 +76,7 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul`, `rt_div`, `rt_rem`
 - **Comparison:** `rt_eq`, `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
-- **Region alloc:** `rt_region_start`, `rt_region_end`, `rt_region_alloc_vector`, `rt_region_alloc_map`, `rt_region_alloc_set`, `rt_region_alloc_list`, `rt_region_alloc_cons`
+- **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
 - **Dispatch:** `rt_call(callee, args, nargs)`, `rt_deref(v)`, `rt_load_global(ns, ns_len, name, name_len)`
 
 #### Eager region-aware fast paths
@@ -130,6 +130,8 @@ pub struct Compiler<M: Module = ObjectModule> { ... }
 
 // Works with any backend:
 impl<M: Module> Compiler<M> {
+    // param_count must be IrFunction::abi_param_count() — it includes the
+    // hidden trailing region parameter of region-parameterised variants.
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
     pub fn into_inner_module(self) -> M;        // JIT: reclaim the module after compiling

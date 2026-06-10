@@ -306,11 +306,11 @@ pub(crate) fn build_defn_map(root: &IrFunction) -> HashMap<(Arc<str>, Arc<str>),
 }
 
 /// Build `{arity_fn_name → IrFunction}` registry.
-pub(crate) fn build_fn_registry(root: &IrFunction) -> HashMap<Arc<str>, IrFunction> {
+pub(crate) fn build_fn_registry(root: &IrFunction) -> HashMap<Arc<str>, Arc<IrFunction>> {
     let mut result = HashMap::new();
     for func in walk_functions(root) {
         if let Some(name) = &func.name {
-            result.insert(name.clone(), func.clone());
+            result.insert(name.clone(), Arc::new(func.clone()));
         }
     }
     result
@@ -326,12 +326,30 @@ fn pick_arity(info: &ClosureInfo, arg_count: usize) -> Option<Arc<str>> {
     None
 }
 
+/// Look up `(ns, name)` in the context's defn-map, recording the hit when the
+/// entry came from another lowering unit (an *external* — see
+/// [`ExternalDefn`]).  The recorded set lets the caller register an
+/// invalidation dependency: if the external is redefined, this lowering is
+/// stale.
+pub(crate) fn lookup_defn<'c>(
+    ctx: &'c EscapeContext,
+    ns: &Arc<str>,
+    name: &Arc<str>,
+) -> Option<&'c ClosureInfo> {
+    let key = (ns.clone(), name.clone());
+    let info = ctx.defn_map.get(&key)?;
+    if ctx.external_names.contains(&key) {
+        ctx.used_externals.borrow_mut().insert(key);
+    }
+    Some(info)
+}
+
 /// Resolve the callee of a `Call` instruction to a concrete arity-fn-name.
 fn resolve_call_target(
     callee_var: VarId,
     arg_count: usize,
     var_defs: &HashMap<VarId, &Inst>,
-    defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
+    ctx: &EscapeContext,
 ) -> Option<Arc<str>> {
     let def_inst = var_defs.get(&callee_var)?;
     match def_inst {
@@ -344,14 +362,14 @@ fn resolve_call_target(
             pick_arity(&info, arg_count)
         }
         Inst::LoadGlobal(_, ns, name) => {
-            let info = defn_map.get(&(ns.clone(), name.clone()))?;
+            let info = lookup_defn(ctx, ns, name)?;
             pick_arity(info, arg_count)
         }
         Inst::Deref(_, src) => {
             let src_def = var_defs.get(src)?;
             match src_def {
                 Inst::LoadGlobal(_, ns, name) | Inst::LoadVar(_, ns, name) => {
-                    let info = defn_map.get(&(ns.clone(), name.clone()))?;
+                    let info = lookup_defn(ctx, ns, name)?;
                     pick_arity(info, arg_count)
                 }
                 _ => None,
@@ -440,22 +458,93 @@ pub(crate) enum EscapeMode {
 
 // ── Inter-procedural context ─────────────────────────────────────────────────
 
+/// A previously-lowered top-level `defn` from *another* lowering unit, made
+/// visible to escape analysis and stage-4 region promotion.
+///
+/// In the AOT flow the whole program is one IR tree, so cross-function
+/// promotion sees every callee.  In the script/REPL flow each `defn` lowers
+/// separately; the IR tier (`cljrs-eval`) registers each lowered defn and
+/// supplies the registry to later lowerings through this type.  Consumers of
+/// an external must invalidate themselves when it is redefined — the
+/// `used` set returned by `optimize_with_externals` identifies what to watch.
+#[derive(Clone)]
+pub struct ExternalDefn {
+    pub ns: Arc<str>,
+    pub name: Arc<str>,
+    /// Registry key per arity.  Must be unique across the process (the
+    /// supplier mangles them); never emitted as a symbol — stage-4 clones get
+    /// fresh `__rgN`-suffixed names.
+    pub arity_fn_names: Vec<Arc<str>>,
+    /// Callable (visible) parameter count per arity.
+    pub param_counts: Vec<usize>,
+    pub is_variadic: Vec<bool>,
+    /// Lowered (and optimized) IR per arity, parallel to `arity_fn_names`.
+    pub arity_irs: Vec<Arc<IrFunction>>,
+}
+
 /// Inter-procedural escape-analysis context.  Carries a registry of all
 /// functions in the IR tree (including subfunctions) so that calls to
-/// known closures can be resolved precisely.
+/// known closures can be resolved precisely, plus any externally-registered
+/// defns from other lowering units.
 pub struct EscapeContext {
-    pub(crate) registry: HashMap<Arc<str>, IrFunction>,
+    pub(crate) registry: HashMap<Arc<str>, Arc<IrFunction>>,
     pub(crate) defn_map: HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
     pub(crate) cache: RefCell<HashMap<Arc<str>, Vec<EscapeState>>>,
     pub(crate) computing: RefCell<HashSet<Arc<str>>>,
+    /// `(ns, name)` keys in `defn_map` that came from externals.
+    pub(crate) external_names: HashSet<(Arc<str>, Arc<str>)>,
+    /// Externals actually consulted during analysis/promotion (dependency
+    /// edges for redefinition invalidation).
+    pub(crate) used_externals: RefCell<HashSet<(Arc<str>, Arc<str>)>>,
+}
+
+impl EscapeContext {
+    /// Drain the set of externals consulted so far.
+    pub(crate) fn take_used_externals(&self) -> HashSet<(Arc<str>, Arc<str>)> {
+        std::mem::take(&mut self.used_externals.borrow_mut())
+    }
 }
 
 pub(crate) fn make_context(root: &IrFunction) -> EscapeContext {
+    make_context_with_externals(root, &[])
+}
+
+pub(crate) fn make_context_with_externals(
+    root: &IrFunction,
+    externals: &[ExternalDefn],
+) -> EscapeContext {
+    let mut registry = build_fn_registry(root);
+    let mut defn_map = build_defn_map(root);
+    let mut external_names = HashSet::new();
+    for ext in externals {
+        let key = (ext.ns.clone(), ext.name.clone());
+        // An in-tree definition of the same var is more current than the
+        // registered external — never shadow it.
+        if defn_map.contains_key(&key) {
+            continue;
+        }
+        defn_map.insert(
+            key.clone(),
+            ClosureInfo {
+                arity_fn_names: ext.arity_fn_names.clone(),
+                param_counts: ext.param_counts.clone(),
+                is_variadic: ext.is_variadic.clone(),
+            },
+        );
+        for (fn_name, ir) in ext.arity_fn_names.iter().zip(&ext.arity_irs) {
+            registry
+                .entry(fn_name.clone())
+                .or_insert_with(|| ir.clone());
+        }
+        external_names.insert(key);
+    }
     EscapeContext {
-        registry: build_fn_registry(root),
-        defn_map: build_defn_map(root),
+        registry,
+        defn_map,
         cache: RefCell::new(HashMap::new()),
         computing: RefCell::new(HashSet::new()),
+        external_names,
+        used_externals: RefCell::new(HashSet::new()),
     }
 }
 
@@ -563,7 +652,7 @@ pub(crate) fn classify_escape_with_ctx(
                         if let Some((_, arg_count)) =
                             find_unknown_call_with_arg(ir_func, *callee, current, use_info.block)
                         {
-                            resolve_call_target(*callee, arg_count, vd, &ctx.defn_map)
+                            resolve_call_target(*callee, arg_count, vd, ctx)
                                 .and_then(|name| ctx.registry.get(&name).cloned())
                         } else {
                             None
@@ -762,8 +851,7 @@ pub fn analyze(ir_func: &IrFunction, ctx: Option<&EscapeContext>) -> AnalysisRes
                 if dst_state != EscapeState::NoEscape {
                     continue;
                 }
-                let Some(callee_name) =
-                    resolve_call_target(*callee, args.len(), &var_defs, &ectx.defn_map)
+                let Some(callee_name) = resolve_call_target(*callee, args.len(), &var_defs, ectx)
                 else {
                     continue;
                 };

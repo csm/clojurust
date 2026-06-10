@@ -29,7 +29,7 @@ use crate::{Inst, IrFunction, KnownFn, RegionAllocKind, VarId};
 
 use super::escape::{
     ClosureInfo, EscapeContext, EscapeMode, EscapeState, UseInfo, UseKind, build_use_chains,
-    build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes,
+    build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes, lookup_defn,
 };
 use super::optimize::{
     blocks_on_path, collect_use_blocks, dominators, has_back_edge, lca_of_many, post_dominators,
@@ -58,20 +58,21 @@ struct Candidate {
 // ── Resolution helpers ──────────────────────────────────────────────────────
 
 /// Walk `(LoadGlobal | Deref(LoadGlobal|LoadVar))` and look up the callee
-/// function via `defn_map`.  Returns the arity-fn name matching the call's
-/// arg count (non-variadic only).
+/// function via the context's defn-map (recording external hits for
+/// invalidation).  Returns the arity-fn name matching the call's arg count
+/// (non-variadic only).
 fn resolve_callee_name(
     callee_var: VarId,
     arg_count: usize,
     var_defs: &HashMap<VarId, &Inst>,
-    defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
+    ctx: &EscapeContext,
 ) -> Option<Arc<str>> {
     let def_inst = var_defs.get(&callee_var)?;
     let info: &ClosureInfo = match def_inst {
-        Inst::LoadGlobal(_, ns, name) => defn_map.get(&(ns.clone(), name.clone()))?,
+        Inst::LoadGlobal(_, ns, name) => lookup_defn(ctx, ns, name)?,
         Inst::Deref(_, src) => match var_defs.get(src)? {
             Inst::LoadGlobal(_, ns, name) | Inst::LoadVar(_, ns, name) => {
-                defn_map.get(&(ns.clone(), name.clone()))?
+                lookup_defn(ctx, ns, name)?
             }
             _ => return None,
         },
@@ -444,7 +445,7 @@ fn find_call_by_dst(func: &IrFunction, dst: VarId) -> Option<(usize, usize)> {
 /// `Call` site in place.  Returns `true` if the rewrite succeeded.
 ///
 /// On success: replaces the `Call` with `CallWithRegion(dst, target_name,
-/// args)`, prepends `RegionStart(rv)` to the LCA-block's prologue, and
+/// args, rv)`, prepends `RegionStart(rv)` to the LCA-block's prologue, and
 /// appends `RegionEnd(rv)` to the LCA-postdom's instruction list (before
 /// the terminator).  Bails out without mutation if back-edges or `throw`
 /// instructions cross the candidate region — matching the safety
@@ -522,7 +523,8 @@ fn rewrite_call_with_region_scope(
     } else {
         args
     };
-    func.blocks[block_idx].insts[inst_idx] = Inst::CallWithRegion(dst, target_name, full_args);
+    func.blocks[block_idx].insts[inst_idx] =
+        Inst::CallWithRegion(dst, target_name, full_args, region_var);
 
     // Insert RegionStart at the head of `start_block`.
     if let Some(b) = func.blocks.iter_mut().find(|b| b.id == start_block) {
@@ -576,9 +578,7 @@ fn collect_candidates_in(
             if dst_state != EscapeState::NoEscape {
                 continue;
             }
-            let Some(callee_name) =
-                resolve_callee_name(*callee, args.len(), &var_defs, &ctx.defn_map)
-            else {
+            let Some(callee_name) = resolve_callee_name(*callee, args.len(), &var_defs, ctx) else {
                 continue;
             };
             let Some(callee_fn) = ctx.registry.get(&callee_name) else {

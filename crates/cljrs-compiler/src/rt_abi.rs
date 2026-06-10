@@ -412,6 +412,7 @@ pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Valu
 
 // ── Region allocation ───────────────────────────────────────────────────────
 
+use cljrs_gc::region::Region;
 use std::cell::RefCell;
 
 thread_local! {
@@ -420,22 +421,58 @@ thread_local! {
     /// Box is intentional: we hand out raw pointers via `push_region_raw`,
     /// so the Region must not move if the Vec grows.
     #[allow(clippy::vec_box)]
-    static RT_REGION_STACK: RefCell<Vec<Box<cljrs_gc::region::Region>>> =
+    static RT_REGION_STACK: RefCell<Vec<Box<Region>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// Allocate `val` directly into the region named by `handle`, falling back to
+/// the active thread-local region (then the GC heap) when `handle` is null.
+///
+/// A null handle is never produced by compiled `RegionStart`/`RegionParam`
+/// code today; the fallback keeps the bridge total should a future caller
+/// pass one.
+#[inline]
+fn region_alloc_box<T: cljrs_gc::Trace + 'static>(handle: *mut Region, val: T) -> GcPtr<T> {
+    if handle.is_null() {
+        alloc_inner_coll(val)
+    } else {
+        // SAFETY: `handle` was produced by `rt_region_start` (or arrived as
+        // the hidden region parameter of a region-parameterised variant) and
+        // stays alive until the matching `rt_region_end`.
+        unsafe { (*handle).alloc(val) }
+    }
+}
+
+/// Box a collection `Value` into the region named by `handle` (same fallback
+/// rules as [`region_alloc_box`]).
+#[inline]
+fn region_box_val(handle: *mut Region, v: Value) -> *const Value {
+    if handle.is_null() {
+        box_coll_val(v)
+    } else {
+        // SAFETY: see `region_alloc_box`.
+        let ptr: GcPtr<Value> = unsafe { (*handle).alloc(v) };
+        ptr.get() as *const Value
+    }
 }
 
 /// Begin a region scope — allocates a new bump region and activates it.
 ///
-/// Returns nil (the region handle is implicit via the thread-local stack).
+/// Returns the region pointer.  Compiled code passes it back to
+/// `rt_region_alloc_*` / `rt_region_end`, and threads it into
+/// region-parameterised callees as a hidden trailing argument
+/// (`CallWithRegion`).  The region is *also* pushed onto the thread-local
+/// region stack so opportunistic rt_abi allocation (`box_coll_val`) and GC
+/// root tracing see it.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_region_start() -> *const Value {
-    let mut region = Box::new(cljrs_gc::region::Region::new());
+pub extern "C" fn rt_region_start() -> *mut Region {
+    let mut region = Box::new(Region::new());
     // SAFETY: the Region lives in the Box on RT_REGION_STACK until
     // rt_region_end pops it.
-    let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
+    let region_ptr: *mut Region = &mut *region;
     unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
     RT_REGION_STACK.with(|s| s.borrow_mut().push(region));
-    rt_const_nil()
+    region_ptr
 }
 
 /// End a region scope — pops the region, runs destructors, frees memory.
@@ -443,25 +480,35 @@ pub extern "C" fn rt_region_start() -> *const Value {
 /// Returns nil.
 ///
 /// # Safety
-/// Must be paired with a prior `rt_region_start` call.
+/// Must be paired with a prior `rt_region_start` call; `handle` must be that
+/// call's return value.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_region_end(_handle: *const Value) -> *const Value {
-    cljrs_gc::region::pop_region_guard();
-    RT_REGION_STACK.with(|s| {
-        // Dropping the Box<Region> runs Region::drop which runs
-        // destructors and frees chunks.
-        s.borrow_mut().pop();
-    });
+pub extern "C" fn rt_region_end(handle: *mut Region) -> *const Value {
+    let popped = RT_REGION_STACK.with(|s| s.borrow_mut().pop());
+    debug_assert!(
+        popped
+            .as_ref()
+            .map(|r| std::ptr::eq(r.as_ref(), handle.cast_const()))
+            .unwrap_or(false),
+        "rt_region_end: handle does not match the innermost open region"
+    );
+    if let Some(region) = popped {
+        // Pops the thread-local stack entry, then resets the region — or
+        // retires it if a publish barrier poisoned it (Phase 10.5
+        // heap-promotion fallback).
+        cljrs_gc::region::close_region(region);
+    }
     rt_const_nil()
 }
 
-/// Allocate a vector in the active region (falling back to GC heap).
+/// Allocate a vector directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_vector(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -476,17 +523,18 @@ pub unsafe extern "C" fn rt_region_alloc_vector(
         Vec::new()
     };
     let pv = PersistentVector::from_iter(items);
-    let ptr = alloc_inner_coll(pv);
-    box_coll_val(Value::Vector(ptr))
+    let ptr = region_alloc_box(handle, pv);
+    region_box_val(handle, Value::Vector(ptr))
 }
 
-/// Allocate a map in the active region (falling back to GC heap).
+/// Allocate a map directly into the region named by `handle`.
 ///
 /// # Safety
-/// `pairs` must point to `2*n` valid `*const Value` pointers.
+/// `pairs` must point to `2*n` valid `*const Value` pointers; `handle` must
+/// be a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_map(
-    _handle: *const Value,
+    handle: *mut Region,
     pairs: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -503,16 +551,17 @@ pub unsafe extern "C" fn rt_region_alloc_map(
     } else {
         Vec::new()
     };
-    box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
+    region_box_val(handle, Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
-/// Allocate a set in the active region (falling back to GC heap).
+/// Allocate a set directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_set(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -527,17 +576,18 @@ pub unsafe extern "C" fn rt_region_alloc_set(
         Vec::new()
     };
     let set = PersistentHashSet::from_iter(items);
-    let ptr = alloc_inner_coll(set);
-    box_coll_val(Value::Set(SetValue::Hash(ptr)))
+    let ptr = region_alloc_box(handle, set);
+    region_box_val(handle, Value::Set(SetValue::Hash(ptr)))
 }
 
-/// Allocate a list in the active region (falling back to GC heap).
+/// Allocate a list directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_list(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -552,39 +602,56 @@ pub unsafe extern "C" fn rt_region_alloc_list(
         Vec::new()
     };
     let list = PersistentList::from_iter(items);
-    let ptr = alloc_inner_coll(list);
-    box_coll_val(Value::List(ptr))
+    let ptr = region_alloc_box(handle, list);
+    region_box_val(handle, Value::List(ptr))
 }
 
-/// Allocate a cons cell in the active region (falling back to GC heap).
+/// Allocate a cons cell directly into the region named by `handle`.
 ///
 /// # Safety
-/// Both pointers must be valid.
+/// Both value pointers must be valid; `handle` must be a live region (see
+/// [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_cons(
-    _handle: *const Value,
+    handle: *mut Region,
     head: *const Value,
     tail: *const Value,
 ) -> *const Value {
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
     let cons = CljxCons { head: h, tail: t };
-    let ptr = alloc_inner_coll(cons);
-    box_coll_val(Value::Cons(ptr))
+    let ptr = region_alloc_box(handle, cons);
+    region_box_val(handle, Value::Cons(ptr))
 }
 
-/// Unwind the region stack to the given depth on exception.
+/// Unwind both region stacks to the given depths on exception.
 ///
-/// Called by `rt_try` to clean up regions that were opened inside a
-/// try body that threw.
-fn unwind_regions_to(depth: usize) {
-    cljrs_gc::region::unwind_region_stack_to(depth);
-    RT_REGION_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        while stack.len() > depth {
-            stack.pop(); // Drop<Region> handles cleanup
+/// Called by `rt_try` to clean up regions that were opened inside a try body
+/// that threw.  The two depths are saved (and restored) independently: the
+/// gc-side stack can also hold regions pushed by the IR interpreter or the
+/// top-level form scope, so its depth is not in general equal to the rt_abi
+/// stack's depth.
+fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
+    loop {
+        let popped = RT_REGION_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            if stack.len() > rt_depth {
+                stack.pop()
+            } else {
+                None
+            }
+        });
+        match popped {
+            // Honours the poison protocol (reset vs retire) and pops the
+            // matching gc-side stack entry.
+            Some(region) => cljrs_gc::region::close_region(region),
+            None => break,
         }
-    });
+    }
+    // Belt-and-braces: drop any non-rt entries left above the saved gc depth
+    // (interpreter frames clean their own regions on unwind, so this is
+    // normally a no-op).
+    cljrs_gc::region::unwind_region_stack_to(gc_depth);
 }
 
 // ── Collection construction ─────────────────────────────────────────────────
@@ -3028,8 +3095,9 @@ pub unsafe extern "C" fn rt_try(
     let catch = unsafe { val_ref(catch_fn) }.clone();
     let finally = unsafe { val_ref(finally_fn) }.clone();
 
-    // Save region stack depth so we can unwind on exception.
+    // Save both region-stack depths so we can unwind on exception.
     let region_depth = cljrs_gc::region::region_stack_depth();
+    let rt_region_depth = RT_REGION_STACK.with(|s| s.borrow().len());
 
     // Call the body.
     let body_result = cljrs_env::callback::invoke(&body, vec![]);
@@ -3037,7 +3105,7 @@ pub unsafe extern "C" fn rt_try(
     // Check for thrown exception (set by rt_throw in compiled code).
     let ret = if let Some(thrown_ptr) = take_pending_exception() {
         // Unwind any regions opened inside the try body.
-        unwind_regions_to(region_depth);
+        unwind_regions_to(region_depth, rt_region_depth);
         // Exception was thrown from compiled code.
         if !matches!(catch, Value::Nil) {
             let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
@@ -3053,7 +3121,7 @@ pub unsafe extern "C" fn rt_try(
             Ok(val) => box_val(val),
             Err(val_err) => {
                 // Unwind any regions opened inside the try body.
-                unwind_regions_to(region_depth);
+                unwind_regions_to(region_depth, rt_region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
                 if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {

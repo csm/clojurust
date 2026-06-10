@@ -67,6 +67,7 @@ pub fn lower_arity(
         false,
         is_async,
     )
+    .map(|(ir, _)| ir)
 }
 
 /// Like [`lower_arity`], but also runs the region-optimization pass.
@@ -82,6 +83,35 @@ pub fn lower_and_optimize_arity(
     env: &mut Env,
     is_async: bool,
 ) -> Result<IrFunction, LowerError> {
+    lower_and_optimize_arity_tracked(
+        name,
+        params,
+        rest_param,
+        destructure_params,
+        destructure_rest,
+        body,
+        ns,
+        env,
+        is_async,
+    )
+    .map(|(ir, _)| ir)
+}
+
+/// Like [`lower_and_optimize_arity`], but also returns the `(ns, name)` set
+/// of cross-defn externals (see [`crate::defn_registry`]) the optimizer
+/// consulted — the caller must register those as invalidation dependencies.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_and_optimize_arity_tracked(
+    name: Option<&str>,
+    params: &[Arc<str>],
+    rest_param: Option<&Arc<str>>,
+    destructure_params: &[(usize, Form)],
+    destructure_rest: Option<&Form>,
+    body: &[Form],
+    ns: &Arc<str>,
+    env: &mut Env,
+    is_async: bool,
+) -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError> {
     lower_arity_inner(
         name,
         params,
@@ -108,7 +138,7 @@ fn lower_arity_inner(
     env: &mut Env,
     do_optimize: bool,
     is_async: bool,
-) -> Result<IrFunction, LowerError> {
+) -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError> {
     cljrs_logging::feat_debug!(
         "lower",
         "lowering {:?}/{:?} optimize? {}",
@@ -154,9 +184,42 @@ fn lower_arity_inner(
     )
     .map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
 
-    Ok(if do_optimize {
-        cljrs_ir::lower::optimize(ir)
-    } else {
-        ir
-    })
+    if !do_optimize {
+        return Ok((ir, Vec::new()));
+    }
+
+    // Make previously-lowered defns this function references visible to
+    // escape analysis and stage-4 cross-function region promotion (the
+    // script/REPL counterpart of AOT's whole-program lowering).
+    let referenced = referenced_globals(&ir);
+    let externals = crate::defn_registry::externals_for(globals_id(env), &referenced);
+    let (ir, used) = cljrs_ir::lower::optimize_with_externals(ir, &externals);
+    Ok((ir, used.into_iter().collect()))
+}
+
+/// Identity of the `GlobalEnv` behind `env`, used to scope the cross-defn
+/// registry per isolate.
+pub(crate) fn globals_id(env: &Env) -> usize {
+    Arc::as_ptr(&env.globals) as usize
+}
+
+/// Collect every `(ns, name)` pair the IR tree loads as a global — the
+/// candidate set of cross-defn externals.
+fn referenced_globals(ir: &IrFunction) -> std::collections::HashSet<(Arc<str>, Arc<str>)> {
+    use cljrs_ir::Inst;
+    let mut out = std::collections::HashSet::new();
+    fn walk(f: &IrFunction, out: &mut std::collections::HashSet<(Arc<str>, Arc<str>)>) {
+        for block in &f.blocks {
+            for inst in block.phis.iter().chain(block.insts.iter()) {
+                if let Inst::LoadGlobal(_, ns, name) | Inst::LoadVar(_, ns, name) = inst {
+                    out.insert((ns.clone(), name.clone()));
+                }
+            }
+        }
+        for sub in &f.subfunctions {
+            walk(sub, out);
+        }
+    }
+    walk(ir, &mut out);
+    out
 }

@@ -102,6 +102,10 @@ pub fn init() {
     // 1. When a var holding a function is redefined, mark the old definition's
     //    compiled arities stale and stop dispatching to them.
     cljrs_value::set_var_rebind_hook(on_var_rebind);
+    //    Cross-defn invalidation (Phase 10.5) also stales native code of
+    //    *dependents* of a rebound defn; it runs in cljrs-eval, which routes
+    //    the staled epochs here through this hook.
+    cljrs_eval::jit_state::set_stale_epoch_hook(code_cache::mark_stale);
     // 2. At each stop-the-world GC safepoint, reclaim stale modules that no
     //    frame is executing.
     cljrs_eval::set_stw_reclaim_hook(|| {

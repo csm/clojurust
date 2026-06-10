@@ -246,6 +246,7 @@ impl<M: Module> Compiler<M> {
                     var_map: HashMap::new(),
                     block_map: HashMap::new(),
                     user_funcs: &self.user_funcs,
+                    region_param: None,
                 };
                 translator.translate(ir_func)?;
             }
@@ -344,6 +345,10 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     user_funcs: &'b HashMap<Arc<str>, FuncId>,
     /// Maps IR BlockId → Cranelift Block.
     block_map: HashMap<BlockId, cranelift_codegen::ir::Block>,
+    /// The hidden trailing region parameter (`*mut Region`), present iff the
+    /// function being translated is a region-parameterised variant
+    /// (`IrFunction::takes_region_param`).  Bound by `Inst::RegionParam`.
+    region_param: Option<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
@@ -365,6 +370,12 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             let var = self.ensure_var(*var_id);
             let param_val = self.builder.block_params(entry_block)[i];
             self.builder.def_var(var, param_val);
+        }
+
+        // Region-parameterised variants carry the caller's region as a hidden
+        // trailing parameter; `Inst::RegionParam` binds it.
+        if ir_func.takes_region_param() {
+            self.region_param = Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
         }
 
         // GC safepoint at function entry.
@@ -762,19 +773,26 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             Inst::RegionParam(dst) => {
-                // Marker bound at the entry of a region-parameterised callee
-                // variant.  The actual region is inherited via the
-                // thread-local region stack, so the operand is just nil.
-                let val = self.call_rt_0(self.rt.rt_const_nil)?;
+                // Bind the caller's region, received as the hidden trailing
+                // function parameter (a `*mut Region`).
+                let val = self.region_param.ok_or_else(|| {
+                    CodegenError::Codegen(
+                        "RegionParam in a function compiled without a region parameter".into(),
+                    )
+                })?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
-            Inst::CallWithRegion(dst, fn_name, args) => {
-                // Direct call to a region-parameterised variant.  The caller's
-                // surrounding `RegionStart`/`RegionEnd` keeps the region
-                // active on the thread-local stack across this call.
-                let val = self.emit_direct_call(fn_name, args)?;
+            Inst::CallWithRegion(dst, fn_name, args, region) => {
+                // Direct call to a region-parameterised variant, passing the
+                // caller's region handle as a hidden trailing argument so the
+                // callee bump-allocates into it directly.  The surrounding
+                // `RegionStart`/`RegionEnd` additionally keeps the region
+                // active on the thread-local stack across this call (for
+                // opportunistic rt_abi allocation and GC root tracing).
+                let region_val = self.use_var(*region);
+                let val = self.emit_direct_call_with_extra(fn_name, args, region_val)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
@@ -1407,6 +1425,25 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         })?;
         let func_ref = self.import_func(*func_id);
         let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        let call = self.builder.ins().call(func_ref, &arg_vals);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Like [`emit_direct_call`](Self::emit_direct_call) but appends one
+    /// extra raw argument — the hidden region parameter of a
+    /// region-parameterised variant.
+    fn emit_direct_call_with_extra(
+        &mut self,
+        fn_name: &str,
+        args: &[VarId],
+        extra: cranelift_codegen::ir::Value,
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let func_id = self.user_funcs.get(fn_name).ok_or_else(|| {
+            CodegenError::Codegen(format!("CallWithRegion: unknown function {fn_name}"))
+        })?;
+        let func_ref = self.import_func(*func_id);
+        let mut arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        arg_vals.push(extra);
         let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
     }

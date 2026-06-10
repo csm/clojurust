@@ -30,12 +30,20 @@ src/
   apply.rs        — IR-aware function dispatch: tries IR cache, falls back to cljrs_interp::apply
   ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file;
                     counts loop back-edges and transfers into compiled OSR entries (Phase 10.4)
-  ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported)
+  ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported);
+                    invalidate(id) drops an entry back to NotAttempted (cross-defn invalidation)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
-  lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction
+  lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction;
+                    threads cross-defn externals into cljrs_ir::lower::optimize_with_externals (Phase 10.5)
+  defn_registry.rs— (Phase 10.5) cross-defn IR registry: registers each eagerly-lowered top-level defn
+                    (keyed by GlobalEnv identity + ns + name), supplies ExternalDefns to later lowerings
+                    so stage-4 region promotion fires in the script/REPL flow, tracks inverse dependency
+                    edges, and invalidates dependents on var rebind (cached IR dropped, native code
+                    staled, lazy re-lower on next dispatch)
   jit_state.rs    — JIT invocation counters, native-fn-pointer dispatch table (keyed by ir_arity_id),
-                    per-arity epoch, active-frame tracking for code unloading (Phase 10.2), and the
-                    OSR slot table keyed by (arity_id, loop header) (Phase 10.4)
+                    per-arity epoch, active-frame tracking for code unloading (Phase 10.2), the
+                    OSR slot table keyed by (arity_id, loop header) (Phase 10.4), and the stale-epoch
+                    hook + stale_native_code(arity_id) used by cross-defn invalidation (Phase 10.5)
 ```
 
 ---
@@ -92,6 +100,21 @@ pub fn load_prebuilt_ir(globals: &Arc<GlobalEnv>, bundle: &IrBundle) -> usize;
 pub mod lower {
     pub fn lower_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;
     pub fn lower_and_optimize_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;
+    /// Like lower_and_optimize_arity, but also returns the (ns, name) set of
+    /// cross-defn externals the optimizer consulted (invalidation deps).
+    pub fn lower_and_optimize_arity_tracked(..., is_async: bool)
+        -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError>;
+}
+
+/// Cross-defn IR registry (in module `defn_registry`, Phase 10.5):
+pub mod defn_registry {
+    pub fn register_defn(globals_id, ns, name, arities: Vec<(usize, bool, Arc<IrFunction>)>);
+    pub fn externals_for(globals_id, referenced) -> Vec<ExternalDefn>;
+    pub fn record_dependents(arity_id, used);
+    pub fn on_redefined(ns, name) -> Vec<u64>;   // dependents to invalidate
+    pub fn relower_pending() -> bool;            // dispatch fast-path check
+    pub fn take_relower(arity_id) -> bool;
+    pub fn install_invalidation_hook();          // idempotent; var-rebind hook
 }
 ```
 
@@ -137,6 +160,8 @@ pub fn current_jit_epoch() -> Option<u64>;         // innermost native frame's e
 pub fn live_epochs() -> HashSet<u64>;              // epochs with a live frame (call at STW only)
 pub fn set_pending_exception_hook(f);              // installed by cljrs_jit::init (rt_abi taker)
 pub fn take_pending_exception() -> Option<Value>;  // uncaught native throw, taken at the dispatch seam
+pub fn set_stale_epoch_hook(f);                    // installed by cljrs_jit::init (code_cache::mark_stale)
+pub fn stale_native_code(arity_id);                // null ptr + route epochs to the stale hook (10.5)
 pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
 ```
 

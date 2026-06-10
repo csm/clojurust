@@ -144,7 +144,10 @@ impl CljChannel {
             return Some(false);
         }
         if st.queue.len() < st.capacity {
-            st.queue.push_back(v.clone());
+            // GC builds: heap-promotion fallback — the taker may hold the
+            // value past any region scope active on the putting side.
+            st.queue
+                .push_back(cljrs_value::publish::publish_value(v.clone()));
             drop(st);
             self.not_empty.notify_all();
             self.async_not_empty.notify_one();
@@ -161,7 +164,9 @@ impl CljChannel {
         }
         if st.queue.is_empty() {
             let token = st.taken;
-            st.queue.push_back(v.clone());
+            // GC builds: heap-promotion fallback (see `try_put_buffered`).
+            st.queue
+                .push_back(cljrs_value::publish::publish_value(v.clone()));
             drop(st);
             self.not_empty.notify_all();
             self.async_not_empty.notify_one();
@@ -205,6 +210,10 @@ impl CljChannel {
     /// handed off in a rendezvous) or the channel is closed.
     /// Returns `true` on success, `false` if the channel was closed.
     pub fn put_blocking(&self, v: Value) -> bool {
+        // GC builds: heap-promotion fallback — the taker may hold the value
+        // past any region scope active on the putting side (or run on another
+        // thread entirely).
+        let v = cljrs_value::publish::publish_value(v);
         let mut guard = self.state.lock().unwrap();
         let cap = guard.capacity;
 

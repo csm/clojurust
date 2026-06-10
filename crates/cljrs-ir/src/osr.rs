@@ -36,17 +36,24 @@
 //! `RegionStart` already executed *in the interpreter*.  The interpreter owns
 //! that region (its frame closes it on unwind), so the OSR variant must not
 //! close it again: such unmatched `RegionEnd`s are dropped, and `RegionAlloc`s
-//! that name an interpreter-owned handle have the handle operand replaced with
-//! a local nil (the handle is a placeholder — region allocation targets the
-//! thread-local region stack).  This only *extends* the region's lifetime to
-//! the end of the interpreter frame, which is safe: escape analysis already
-//! guarantees nothing allocated under the region outlives its original
-//! `RegionEnd`.  Region pairs entirely inside the loop are kept as-is.
+//! that name an interpreter-owned handle are rewritten to the corresponding
+//! plain `Alloc*` instructions.  In compiled code a region handle is a real
+//! `*mut Region` (returned by `rt_region_start` or arriving as the hidden
+//! `RegionParam` argument), and the interpreter's handle register holds nil —
+//! so it cannot be forwarded into native code.  The plain-alloc bridges are
+//! region-aware (they consult the thread-local region stack, where the
+//! interpreter's region is still active), so the allocations still land in
+//! the interpreter-owned region; in the worst case they fall back to the GC
+//! heap, which only extends lifetimes and is always sound.  Region pairs
+//! entirely inside the loop are kept as-is.  A `CallWithRegion` naming an
+//! interpreter-owned handle aborts the transform (the loop stays at Tier 1);
+//! the stage-4 rewrite never produces one whose region scope crosses a loop
+//! back-edge, so this is defensive.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::{Block, BlockId, Inst, IrFunction, Terminator, VarId};
+use crate::{Block, BlockId, Inst, IrFunction, RegionAllocKind, Terminator, VarId};
 
 /// Hard cap on OSR-function parameters: the dispatch shim
 /// (`cljrs_eval::jit_state::dispatch_jit_call`) supports at most 8 native
@@ -85,6 +92,21 @@ fn terminator_uses(term: &Terminator) -> Vec<VarId> {
         Terminator::Branch { cond, .. } => vec![*cond],
         Terminator::Return(v) => vec![*v],
         Terminator::RecurJump { args, .. } => args.clone(),
+    }
+}
+
+/// The plain (GC-heap / thread-local-region) allocation equivalent of a
+/// `RegionAlloc`, used when the region handle is interpreter-owned and so
+/// cannot be materialised in compiled code.
+fn plain_alloc(dst: VarId, kind: RegionAllocKind, ops: Vec<VarId>) -> Inst {
+    match kind {
+        RegionAllocKind::Vector => Inst::AllocVector(dst, ops),
+        RegionAllocKind::Set => Inst::AllocSet(dst, ops),
+        RegionAllocKind::List => Inst::AllocList(dst, ops),
+        RegionAllocKind::Map => {
+            Inst::AllocMap(dst, ops.chunks(2).map(|pair| (pair[0], pair[1])).collect())
+        }
+        RegionAllocKind::Cons => Inst::AllocCons(dst, ops[0], ops[1]),
     }
 }
 
@@ -204,17 +226,20 @@ pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunct
     // 4. Blocks: a fresh entry that jumps to the header, then the reachable
     //    blocks in their original order with φ edges rewired and
     //    interpreter-owned region references dropped/rewritten.
-    let needs_nil_handle = orig
+    //
+    //    A `CallWithRegion` threading an interpreter-owned handle cannot be
+    //    compiled: native code needs a real `*mut Region` for the hidden
+    //    argument and the interpreter's handle register holds nil.  The
+    //    stage-4 rewrite never lets a region scope cross a loop back-edge, so
+    //    this bail-out is defensive.
+    if orig
         .blocks
         .iter()
         .filter(|b| reach.contains(&b.id))
         .flat_map(|b| &b.insts)
-        .any(|inst| matches!(inst, Inst::RegionAlloc(_, r, _, _) if outer_handles.contains(r)));
-    let nil_handle = VarId(next_var);
-    let mut entry_insts = Vec::new();
-    if needs_nil_handle {
-        next_var += 1;
-        entry_insts.push(Inst::Const(nil_handle, crate::Const::Nil));
+        .any(|inst| matches!(inst, Inst::CallWithRegion(_, _, _, r) if outer_handles.contains(r)))
+    {
+        return Err("OSR: CallWithRegion references an interpreter-owned region".into());
     }
 
     let entry_id = BlockId(orig.next_block);
@@ -222,7 +247,7 @@ pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunct
     blocks.push(Block {
         id: entry_id,
         phis: vec![],
-        insts: entry_insts,
+        insts: Vec::new(),
         terminator: Terminator::Jump(header),
     });
     for block in orig.blocks.iter().filter(|b| reach.contains(&b.id)) {
@@ -244,13 +269,15 @@ pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunct
         // must not close them again.
         b.insts
             .retain(|inst| !matches!(inst, Inst::RegionEnd(r) if outer_handles.contains(r)));
-        // Region handles are placeholders (allocation targets the thread-local
-        // region stack); rebind interpreter-owned ones to a local nil.
+        // A compiled region handle is a real `*mut Region`, which the
+        // interpreter cannot supply for regions it opened itself — rewrite
+        // those `RegionAlloc`s to plain allocs (the region-aware bridges pick
+        // the interpreter's still-active region off the thread-local stack).
         for inst in &mut b.insts {
-            if let Inst::RegionAlloc(_, r, _, _) = inst
+            if let Inst::RegionAlloc(dst, r, kind, ops) = inst
                 && outer_handles.contains(r)
             {
-                *r = nil_handle;
+                *inst = plain_alloc(*dst, *kind, std::mem::take(ops));
             }
         }
         blocks.push(b);
@@ -416,6 +443,60 @@ mod tests {
             !exit.insts.iter().any(|i| matches!(i, Inst::RegionEnd(_))),
             "unmatched RegionEnd must be dropped from the OSR variant"
         );
+    }
+
+    #[test]
+    fn interpreter_owned_region_alloc_is_rewritten_to_plain_alloc() {
+        // RegionStart in the pre-loop entry, RegionAlloc inside the loop body
+        // naming that handle.  Compiled region handles are real `*mut Region`
+        // values the interpreter cannot supply, so the OSR variant must
+        // rewrite the alloc to a plain (region-stack-aware) AllocVector.
+        let mut orig = sum_loop_fn();
+        let handle = VarId(20);
+        let dst = VarId(21);
+        orig.next_var = 22;
+        orig.blocks[0].insts.insert(0, Inst::RegionStart(handle));
+        orig.blocks[2].insts.insert(
+            0,
+            Inst::RegionAlloc(dst, handle, crate::RegionAllocKind::Vector, vec![VarId(3)]),
+        );
+        orig.blocks[3].insts.push(Inst::RegionEnd(handle));
+
+        let osr = build_osr_function(&orig, BlockId(1)).unwrap();
+        assert!(!osr.live_ins.contains(&handle));
+        let body = osr.func.blocks.iter().find(|b| b.id == BlockId(2)).unwrap();
+        assert!(
+            body.insts.iter().any(
+                |i| matches!(i, Inst::AllocVector(d, ops) if *d == dst && ops == &vec![VarId(3)])
+            ),
+            "interpreter-owned RegionAlloc must become a plain AllocVector"
+        );
+        assert!(
+            !body
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::RegionAlloc(..))),
+            "no RegionAlloc naming an interpreter-owned handle may survive"
+        );
+    }
+
+    #[test]
+    fn call_with_region_naming_outer_handle_declines() {
+        // A CallWithRegion threading an interpreter-owned handle cannot be
+        // compiled (native code needs a real region pointer for the hidden
+        // argument) — the transform must decline so the loop stays at Tier 1.
+        let mut orig = sum_loop_fn();
+        let handle = VarId(20);
+        let dst = VarId(21);
+        orig.next_var = 22;
+        orig.blocks[0].insts.insert(0, Inst::RegionStart(handle));
+        orig.blocks[2].insts.insert(
+            0,
+            Inst::CallWithRegion(dst, Arc::from("callee__rg1"), vec![VarId(3)], handle),
+        );
+        orig.blocks[3].insts.push(Inst::RegionEnd(handle));
+
+        assert!(build_osr_function(&orig, BlockId(1)).is_err());
     }
 
     #[test]

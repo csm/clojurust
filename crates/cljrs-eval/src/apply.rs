@@ -74,6 +74,16 @@ fn try_ir_path(
 ) -> Option<EvalResult> {
     let arity_id = arity.ir_arity_id;
 
+    // Cross-defn invalidation: if a defn this arity's lowering specialized
+    // against was rebound, the cached IR was dropped and the arity marked for
+    // re-lowering — do that now (one relaxed atomic load on the fast path).
+    if crate::defn_registry::relower_pending()
+        && crate::defn_registry::take_relower(arity_id)
+        && !IR_LOWERING_ACTIVE.get()
+    {
+        crate::ir_interp::eager_lower_fn(f, caller_env);
+    }
+
     // Only use IR if already cached (eagerly lowered at definition time).
     let ir_func = crate::ir_cache::get_cached(arity_id)?;
 

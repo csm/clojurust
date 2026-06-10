@@ -254,6 +254,9 @@ pub mod channel {
         /// Async put: yield to the LocalSet until the value is accepted (buffered
         /// or handed off). `true` on success, `false` if the channel is closed.
         /// The building block other crates use to stream produced values.
+        /// Enqueued values pass through the Phase 10.5 publish barrier
+        /// (cljrs_value::publish::publish_value): the taker may outlive any
+        /// bump-region scope active on the putting side.
         pub async fn put(&self, v: Value) -> bool;
         /// Close the channel (idempotent). Buffered values still drain to takers.
         pub fn close(&self);

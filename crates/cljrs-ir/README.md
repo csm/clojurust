@@ -95,6 +95,14 @@ pub struct IrFunction {
     pub is_async: bool,
 }
 
+impl IrFunction {
+    /// True for region-parameterised variants (entry block binds RegionParam):
+    /// compiled code receives the caller's region as a hidden trailing param.
+    pub fn takes_region_param(&self) -> bool;
+    /// Compiled-signature param count: params.len() + the hidden region param.
+    pub fn abi_param_count(&self) -> usize;
+}
+
 pub struct Block {
     pub id: BlockId,
     pub phis: Vec<Inst>,
@@ -165,9 +173,29 @@ to reach `NoEscape` and get promoted to a region.
 /// non-escaping allocations to region (bump) allocation.
 pub fn optimize(ir: IrFunction) -> IrFunction;
 
+/// Like `optimize`, but makes previously-lowered defns from other lowering
+/// units visible to escape analysis and stage-4 promotion (the script/REPL
+/// counterpart of AOT's whole-program tree; supplied by cljrs-eval's defn
+/// registry).  Returns the (ns, name) set of externals actually consulted —
+/// the caller must invalidate this lowering when any of them is redefined.
+pub fn optimize_with_externals(
+    ir: IrFunction,
+    externals: &[ExternalDefn],
+) -> (IrFunction, HashSet<(Arc<str>, Arc<str>)>);
+
+/// One registered cross-unit defn: per-arity registry names (process-unique,
+/// never emitted as symbols), callable param counts, variadic flags, and the
+/// lowered IR.
+pub struct ExternalDefn { pub ns, pub name, pub arity_fn_names,
+                          pub param_counts, pub is_variadic, pub arity_irs }
+
 /// Run only the inlining pass (before escape analysis).
 pub fn inline(ir: IrFunction) -> IrFunction;
 ```
+
+Inlining is deliberately *not* externals-aware: splicing another unit's body
+into the caller would carry the same redefinition-staleness obligations for a
+much larger set of call shapes.
 
 **Pipeline order** inside `optimize`:
 1. **Inlining** (`lower::inline`) — resolves `Call` sites whose callee is a
@@ -187,13 +215,17 @@ pub fn inline(ir: IrFunction) -> IrFunction;
    sites whose result is `NoEscape` and whose callee has `Returns`-tagged
    allocations, clones a region-parameterised variant of the callee
    (`<orig>__rgN`) where those allocations become `RegionAlloc` and the entry
-   block carries a `RegionParam` marker.  The call site is rewritten to
-   `CallWithRegion(dst, target_name, args)` and bracketed by
+   block carries a `RegionParam` binding.  The call site is rewritten to
+   `CallWithRegion(dst, target_name, args, region)` — carrying the handle of
+   the `RegionStart` the rewrite inserts — and bracketed by
    `RegionStart`/`RegionEnd` over the dom/postdom-LCA scope of `dst`'s uses.
-   At runtime the callee inherits the caller's region via the thread-local
-   region stack, so its `RegionAlloc` instructions bump-allocate into the
-   caller's region.  Variants are attached as subfunctions of the calling
-   function so both the IR interpreter and codegen can resolve them by name.
+   In compiled code the region travels as a **hidden trailing argument**
+   (`IrFunction::abi_param_count` = `params.len() + 1` for such variants;
+   `takes_region_param()` detects them), so the callee bump-allocates
+   directly into the caller's region without a thread-local lookup; the IR
+   interpreter threads the same handle through its per-frame handle map.
+   Variants are attached as subfunctions of the calling function so both the
+   IR interpreter and codegen can resolve them by name.
    The clone also co-promotes allocations reachable *only* through the
    returned container (e.g. the eight inner `[r c]` vectors stored inside
    `neighbours`' result vector): their lifetime is bounded by the returned

@@ -4,14 +4,18 @@
 native code via Cranelift, making `cljrs run` and the REPL approach AOT-class
 throughput with no explicit compile step.
 
-**Status:** Phase 10.4 — functional for top-level `defn`s **including
+**Status:** Phase 10.5 — functional for top-level `defn`s **including
 closure-bearing functions** (closure subfunctions are declared and compiled
 into the same module, as AOT does; modules that materialize closure values are
 pinned against unloading), with epoch-tagged **code unloading** (redefined
 functions' native code is reclaimed at stop-the-world GC safepoints, keeping
-executable memory bounded across a long REPL session) and **OSR** (on-stack
+executable memory bounded across a long REPL session), **OSR** (on-stack
 replacement): a single-call hot `loop*`/`recur` is promoted to native code
-mid-run via loop back-edge counters and an OSR-entry compile.
+mid-run via loop back-edge counters and an OSR-entry compile, and
+**context-driven bump allocation**: region-parameterised callee variants
+(stage-4 cross-defn promotion, fed by `cljrs_eval::defn_registry`) compile
+with the caller's region as a hidden trailing argument and bump-allocate into
+it directly.
 
 ## File layout
 
@@ -36,6 +40,10 @@ pub fn live_count() -> usize;       // live (in-use) modules
 pub fn stale_count() -> usize;      // modules awaiting reclamation
 pub fn reclaimed_count() -> u64;    // cumulative modules freed
 pub fn reclaimed_bytes() -> u64;    // cumulative machine-code bytes freed
+pub fn mark_stale(epoch: u64);      // also the stale-epoch hook target that
+                                    // init() installs into cljrs_eval::jit_state,
+                                    // so cross-defn invalidation (10.5) can stale
+                                    // dependents' native code
 ```
 
 ## Execution tiers (after `init()`)
