@@ -12,7 +12,7 @@ pub mod known;
 pub mod optimize;
 pub mod regionalize;
 
-pub use anf::{LowerError, lower_fn_body};
+pub use anf::{LowerError, lower_fn_body, lower_fn_body_destructured};
 pub use escape::{AnalysisResult, EscapeContext, EscapeState, UseInfo, UseKind, analyze};
 pub use inline::inline;
 pub use optimize::optimize;

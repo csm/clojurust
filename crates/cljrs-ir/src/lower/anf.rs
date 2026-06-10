@@ -115,13 +115,38 @@ fn is_meta_async(meta: &Form) -> bool {
 /// `name`     — function name (for diagnostics), or `None` for anonymous.
 /// `ns`       — current Clojure namespace name.
 /// `params`   — flat parameter name list, including the rest param if variadic
-///              (the rest param is the last element).
+///              (the rest param is the last element).  When a parameter is a
+///              destructuring pattern, the interpreter has already replaced it
+///              with a gensym placeholder name here and recorded the original
+///              pattern in `destructures` (see below).
 /// `body`     — sequence of already macro-expanded body forms (implicit `do`).
 /// `is_async` — whether the function was declared `^:async`.
 pub fn lower_fn_body(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
+    body: &[Form],
+    is_async: bool,
+) -> Result<IrFunction, LowerError> {
+    lower_fn_body_destructured(name, ns, params, &[], body, is_async)
+}
+
+/// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
+/// into explicit bindings at the top of the body.
+///
+/// `destructures` pairs a parameter index (into `params`) with the original
+/// destructuring pattern form.  The interpreter splits a destructured parameter
+/// such as `[a b]` into a gensym placeholder name (stored in `params`) plus the
+/// pattern (passed here); this prologue binds the gensym to the incoming
+/// argument and then expands the pattern against it, exactly as
+/// `lower_fn_arity` does for inner `fn*` forms.  The result is that the body's
+/// references to the destructured names (`a`, `b`, …) resolve to real IR locals
+/// instead of being emitted as `LoadGlobal` for non-existent vars.
+pub fn lower_fn_body_destructured(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
     body: &[Form],
     is_async: bool,
 ) -> Result<IrFunction, LowerError> {
@@ -134,6 +159,13 @@ pub fn lower_fn_body(
         let id = ctx.fresh_var();
         ctx.bind_local(pname.clone(), id);
         bound_params.push((pname.clone(), id));
+    }
+
+    // Expand any destructuring patterns into explicit bindings in the prologue,
+    // before the body is lowered, so the body sees the pattern's names.
+    for (idx, pattern) in destructures {
+        let var = bound_params[*idx].1;
+        lower_destructure_binding(&mut ctx, pattern, var)?;
     }
 
     // Lower the body; emit a Return terminator.

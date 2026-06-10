@@ -576,7 +576,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                         // Single fixed arity — use rt_make_fn (simpler path).
                         let arity_fn_name = &template.arity_fn_names[0];
                         let param_count = template.param_counts[0];
-                        let arity_func_id = self.user_funcs[arity_fn_name];
+                        let arity_func_id = self.lookup_user_func(arity_fn_name)?;
                         let func_ref = self
                             .module
                             .declare_func_in_func(arity_func_id, self.builder.func);
@@ -603,7 +603,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                         // Single variadic arity — use rt_make_fn_variadic.
                         let arity_fn_name = &template.arity_fn_names[0];
                         let param_count = template.param_counts[0];
-                        let arity_func_id = self.user_funcs[arity_fn_name];
+                        let arity_func_id = self.lookup_user_func(arity_fn_name)?;
                         let func_ref = self
                             .module
                             .declare_func_in_func(arity_func_id, self.builder.func);
@@ -639,7 +639,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                             ),
                         );
                         for (i, arity_fn_name) in template.arity_fn_names.iter().enumerate() {
-                            let arity_func_id = self.user_funcs[arity_fn_name];
+                            let arity_func_id = self.lookup_user_func(arity_fn_name)?;
                             let func_ref = self
                                 .module
                                 .declare_func_in_func(arity_func_id, self.builder.func);
@@ -1379,6 +1379,21 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .ins()
             .call(func_ref, &[bindings_ptr, npairs_val, body_val]);
         Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Resolve a subfunction name to its declared `FuncId`, or return a clean
+    /// codegen error instead of panicking.
+    ///
+    /// A closure's arity subfunctions are only declared when the whole function
+    /// tree is compiled into one module (the AOT path).  The JIT currently
+    /// compiles a single arity at a time and does not declare subfunctions, so
+    /// `AllocClosure` codegen would otherwise index a missing key and panic —
+    /// killing the background worker.  Returning `Err` lets the caller decline
+    /// the compilation and fall back to the interpreter cleanly.
+    fn lookup_user_func(&self, fn_name: &str) -> CodegenResult<FuncId> {
+        self.user_funcs.get(fn_name).copied().ok_or_else(|| {
+            CodegenError::Codegen(format!("AllocClosure: undeclared subfunction {fn_name}"))
+        })
     }
 
     /// Emit a direct function call (bypasses rt_call dynamic dispatch).

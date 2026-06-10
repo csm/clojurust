@@ -20,7 +20,8 @@ src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
   lower/
-    mod.rs      — re-exports: lower_fn_body, analyze, inline, optimize, EscapeContext …
+    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured, analyze,
+                  inline, optimize, EscapeContext …
     anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
                   capture only the enclosing locals their (fully macro-expanded)
                   body references (`collect_symbol_names`, a conservative
