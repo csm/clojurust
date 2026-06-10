@@ -79,6 +79,24 @@ pub fn init() {
         },
     );
 
+    // Exception propagation: let the dispatch seam (call_jit_native / OSR
+    // entry) take an uncaught `(throw …)` stashed by native code and re-raise
+    // it as `EvalError::Thrown`.  cljrs-eval cannot depend on cljrs-compiler,
+    // so the taker is threaded through as a hook here.
+    cljrs_eval::jit_state::set_pending_exception_hook(
+        cljrs_compiler::rt_abi::take_pending_exception_value,
+    );
+
+    // Closure escape: when JIT code materializes a closure via `rt_make_fn*`,
+    // the resulting GC-managed value captures a raw pointer into the executing
+    // module.  The frame scan cannot see such values, so pin the module's
+    // epoch — it is never unloaded (bounded leak, sound).
+    cljrs_compiler::rt_abi::set_closure_escape_hook(|| {
+        if let Some(epoch) = cljrs_eval::jit_state::current_jit_epoch() {
+            code_cache::pin_epoch(epoch);
+        }
+    });
+
     // Code unloading (Phase 10.2):
     //
     // 1. When a var holding a function is redefined, mark the old definition's

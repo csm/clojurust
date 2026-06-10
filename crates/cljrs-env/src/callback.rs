@@ -76,6 +76,31 @@ pub fn install_eval_context(globals: Arc<GlobalEnv>, ns: Arc<str>) {
     });
 }
 
+/// RAII guard that pops one eval context on drop (including on unwind).
+///
+/// Returned by [`install_eval_context_guard`]; use it when the push and pop
+/// must stay balanced across early returns or panics.
+pub struct EvalContextGuard {
+    _priv: (),
+}
+
+impl Drop for EvalContextGuard {
+    fn drop(&mut self) {
+        pop_eval_context();
+    }
+}
+
+/// Like [`install_eval_context`], but returns a guard that pops the context
+/// when dropped.
+///
+/// Used by the JIT-native dispatch seam: native code resolves globals and
+/// calls function values through rt_abi bridges that all require an eval
+/// context on the calling thread.
+pub fn install_eval_context_guard(globals: Arc<GlobalEnv>, ns: Arc<str>) -> EvalContextGuard {
+    install_eval_context(globals, ns);
+    EvalContextGuard { _priv: () }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Call a Clojure-callable `Value` with the given arguments.

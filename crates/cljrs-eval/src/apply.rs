@@ -39,7 +39,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 
         // 1. JIT-native: fastest path — skip interpreter entirely.
         if let Some((fn_ptr, epoch)) = crate::jit_state::get_native_fn(arity_id) {
-            return call_jit_native(fn_ptr, epoch, arity, args, caller_env);
+            return call_jit_native(f, fn_ptr, epoch, arity, args, caller_env);
         }
 
         // 2. IR interpreter (also bumps invocation counter).
@@ -159,6 +159,7 @@ fn execute_ir(
 /// interpreter, so the native call receives the `arity.params.len() + 1`
 /// arguments it was compiled for instead of the raw call argument count.
 fn call_jit_native(
+    f: &CljxFn,
     fn_ptr: *const (),
     epoch: u64,
     arity: &cljrs_value::CljxFnArity,
@@ -172,6 +173,16 @@ fn call_jit_native(
     // Register the caller env so its GcPtrs survive any GC triggered inside
     // the JIT frame (at rt_safepoint calls).
     let _caller_root = cljrs_env::gc_roots::push_env_root(caller_env);
+
+    // Native code resolves globals (rt_load_global) and calls function values
+    // (rt_call, the HOF bridges) through rt_abi, which dispatches via the
+    // thread-local eval context — exactly as `execute_ir` pushes one for the
+    // Tier-1 interpreter.  Without it every such bridge fails and silently
+    // yields nil.
+    let _eval_ctx = cljrs_env::callback::install_eval_context_guard(
+        caller_env.globals.clone(),
+        f.defining_ns.clone(),
+    );
 
     // Build the argument list the native code expects.  Fixed arities pass args
     // through unchanged; variadic arities pack the trailing args into the rest
@@ -210,5 +221,13 @@ fn call_jit_native(
     // SAFETY: result_ptr was returned by rt_abi; it points to a live Value
     // in ALLOC_ROOTS.  Clone it before the alloc frame drops.
     let result = unsafe { (*result_ptr).clone() };
+
+    // An uncaught `(throw …)` inside native code stashes the thrown value in a
+    // thread-local and returns the nil sentinel.  Surface it as an error here
+    // (while the alloc frame still roots it), exactly as Tier-1 would have
+    // propagated it — and so a stale slot cannot misfire a later `rt_try`.
+    if let Some(thrown) = crate::jit_state::take_pending_exception() {
+        return Err(cljrs_env::error::EvalError::Thrown(thrown));
+    }
     Ok(result)
 }

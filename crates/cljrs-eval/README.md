@@ -112,8 +112,13 @@ pub mod lower {
    (the registered hook) rather than calling the tree-walker directly, so IR-cached
    arities are used on direct call paths too
 7. JIT tier: before the IR cache, `call_cljrs_fn` checks `jit_state::get_native_fn(arity_id)`
-   for compiled native code and, if present, dispatches to it (rooting args + pushing a
-   frame epoch for code unloading first)
+   for compiled native code and, if present, dispatches to it.  `call_jit_native` brackets
+   the native call with: a frame epoch (code unloading), GC roots for the caller env and
+   args, **an eval context** (rt_abi bridges — `rt_call`, `rt_load_global`, the HOF
+   bridges — dispatch through `cljrs_env::callback`; without it they silently return nil),
+   and an alloc frame.  After the call it takes any pending exception stashed by an
+   uncaught native `(throw …)` and re-raises it as `EvalError::Thrown` (same in
+   `try_osr_enter` for OSR entries)
 
 ## JIT state & code unloading (`jit_state`)
 
@@ -128,7 +133,10 @@ pub fn store_native_fn(arity_id, ptr, epoch);      // worker publishes compiled 
 pub fn get_native_fn(arity_id) -> Option<(*const (), u64)>;   // (fn_ptr, epoch)
 pub fn take_native_epoch(arity_id) -> Option<u64>; // on redefinition: null ptr, drop entry, return epoch
 pub fn push_jit_frame(epoch) -> JitFrameGuard;     // mark a native frame live for its call
+pub fn current_jit_epoch() -> Option<u64>;         // innermost native frame's epoch (closure-escape pinning)
 pub fn live_epochs() -> HashSet<u64>;              // epochs with a live frame (call at STW only)
+pub fn set_pending_exception_hook(f);              // installed by cljrs_jit::init (rt_abi taker)
+pub fn take_pending_exception() -> Option<Value>;  // uncaught native throw, taken at the dispatch seam
 pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
 ```
 

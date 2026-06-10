@@ -1384,12 +1384,12 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     /// Resolve a subfunction name to its declared `FuncId`, or return a clean
     /// codegen error instead of panicking.
     ///
-    /// A closure's arity subfunctions are only declared when the whole function
-    /// tree is compiled into one module (the AOT path).  The JIT currently
-    /// compiles a single arity at a time and does not declare subfunctions, so
-    /// `AllocClosure` codegen would otherwise index a missing key and panic —
-    /// killing the background worker.  Returning `Err` lets the caller decline
-    /// the compilation and fall back to the interpreter cleanly.
+    /// Both the AOT path and the JIT declare a function's closure subfunctions
+    /// into the module before compiling (`aot.rs` / `jit_compiler.rs`).  If a
+    /// name is nevertheless missing, `AllocClosure` codegen must not index a
+    /// missing key and panic — on the JIT that would kill the background
+    /// worker.  Returning `Err` lets the caller decline the compilation and
+    /// fall back to the interpreter cleanly.
     fn lookup_user_func(&self, fn_name: &str) -> CodegenResult<FuncId> {
         self.user_funcs.get(fn_name).copied().ok_or_else(|| {
             CodegenError::Codegen(format!("AllocClosure: undeclared subfunction {fn_name}"))
