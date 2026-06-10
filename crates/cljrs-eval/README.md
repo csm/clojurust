@@ -73,10 +73,20 @@ pub fn load_prebuilt_ir(globals: &Arc<GlobalEnv>, bundle: &IrBundle) -> usize;
 
 /// IR lowering helpers (in module `lower`):
 ///
-/// `lower_arity(name, params, rest, body, ns, env, is_async)` — ANF lowering only.
-/// `lower_and_optimize_arity(name, params, rest, body, ns, env, is_async)` — also
-///     runs region-optimization.  Both accept `is_async: bool` from the `CljxFn`
-///     and propagate it to `IrFunction::is_async`.
+/// `lower_arity(name, params, rest, destructure_params, destructure_rest, body,
+///     ns, env, is_async)` — ANF lowering only.
+/// `lower_and_optimize_arity(name, params, rest, destructure_params,
+///     destructure_rest, body, ns, env, is_async)` — also runs
+///     region-optimization.  Both accept `is_async: bool` from the `CljxFn` and
+///     propagate it to `IrFunction::is_async`.
+///
+/// `destructure_params: &[(usize, Form)]` carries the original destructuring
+/// patterns for parameters the interpreter replaced with gensym placeholders
+/// (paired with their index into `params`); `destructure_rest: Option<&Form>`
+/// is the rest parameter's pattern when it is itself destructured.  Both are
+/// expanded into explicit bindings in the IR prologue, so destructured-param
+/// arities now lower to the IR/JIT tiers instead of falling back to the
+/// tree-walker.
 pub mod lower {
     pub fn lower_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;
     pub fn lower_and_optimize_arity(..., is_async: bool) -> Result<IrFunction, LowerError>;

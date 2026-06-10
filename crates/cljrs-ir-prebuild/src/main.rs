@@ -292,6 +292,8 @@ fn lower_function(
             f.name.as_deref(),
             &arity.params,
             arity.rest_param.as_ref(),
+            &arity.destructure_params,
+            arity.destructure_rest.as_ref(),
             &arity.body,
             &ns_arc,
             env,

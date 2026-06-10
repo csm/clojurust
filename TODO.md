@@ -402,7 +402,7 @@ Foundations already in place:
 
 ### Phase 10.3 — Shrink the interpreter seam (ROI order)
 
-- [ ] Destructured params: expand destructuring to explicit let-bindings in the IR prologue (lowering-only)
+- [x] Destructured params: expand destructuring to explicit let-bindings in the IR prologue (lowering-only) — `lower_fn_body_destructured` runs the same prologue as inner `fn*` forms (`lower_destructure_binding`), driven by `CljxFnArity.destructure_params`/`destructure_rest` threaded through `lower_arity`; gate in `eager_lower_fn` removed
 - [ ] Closures with captured bindings: complete capture lowering + closure-alloc codegen
 - [ ] Variadic / rest params through codegen
 - [ ] Promote special-cased ops (`apply`, `atom`, `swap!`/`reset!`, `volatile!`, `vswap!`) to first-class `KnownFn`/IR instructions
