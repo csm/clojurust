@@ -33,7 +33,7 @@ pub use cljrs_env::loader::load_ns;
 pub use cljrs_interp::eval::eval;
 
 pub use apply::force_eager_lowering;
-pub use jit_state::{set_enqueue_hook, set_jit_threshold, store_native_fn};
+pub use jit_state::{set_enqueue_hook, set_jit_threshold, set_osr_threshold, store_native_fn};
 
 use crate::ir_interp::eager_lower_fn;
 use std::sync::Arc;

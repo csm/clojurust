@@ -28,12 +28,14 @@ src/
   lib.rs          — module declarations, re-exports, standard_env_minimal/standard_env/standard_env_with_paths,
                     register_compiler_sources, ensure_compiler_loaded
   apply.rs        — IR-aware function dispatch: tries IR cache, falls back to cljrs_interp::apply
-  ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file
+  ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file;
+                    counts loop back-edges and transfers into compiled OSR entries (Phase 10.4)
   ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
   lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction
   jit_state.rs    — JIT invocation counters, native-fn-pointer dispatch table (keyed by ir_arity_id),
-                    per-arity epoch, and active-frame tracking for code unloading (Phase 10.2)
+                    per-arity epoch, active-frame tracking for code unloading (Phase 10.2), and the
+                    OSR slot table keyed by (arity_id, loop header) (Phase 10.4)
 ```
 
 ---
@@ -133,6 +135,44 @@ pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
 Each native call brackets itself with `push_jit_frame(epoch)` so the JIT code
 cache can free a superseded module only once no frame is executing it
 (`live_epochs` scanned at the stop-the-world GC safepoint).
+
+## OSR — on-stack replacement (Phase 10.4)
+
+A single hot call containing a `loop*`/`recur` never returns to re-dispatch, so
+the invocation counter cannot promote it.  Instead:
+
+1. `interpret_ir_with_osr` (the dispatch path used by `apply::execute_ir`,
+   which passes the arity ID) counts back-edges per `RecurJump` target.  The
+   counters are local to one execution on purpose: hot-within-one-call is
+   exactly the case invocation tiering misses.
+2. Crossing `osr_threshold()` calls `jit_state::osr_request`, which enqueues
+   `(arity_id, header_block, IrFunction)` to the JIT worker exactly once.
+3. The worker builds the OSR-entry variant (`cljrs_ir::osr::build_osr_function`),
+   compiles it, and publishes `(fn_ptr, epoch, live_ins)` via `store_osr_fn`.
+4. At each subsequent loop-header entry (after φ resolution, so the loop
+   variables are current), the interpreter polls `osr_poll`; on `Ready` it
+   snapshots the live-in registers and calls the native entry
+   (`try_osr_enter`) — the native frame finishes the loop *and* the rest of
+   the function, and its return value becomes the call's result.
+
+OSR `jit_state` surface:
+
+```rust
+pub fn set_osr_threshold(t: u32);                  // back-edges before compile
+pub fn osr_threshold() -> u32;                     // override → CLJRS_OSR_THRESHOLD → jit_threshold()
+pub fn set_osr_enqueue_hook(f);                    // installed by cljrs_jit::init
+pub fn osr_request(arity_id, header, ir_func);     // idempotent compile request
+pub fn osr_poll(arity_id, header) -> OsrPoll;      // NotRequested | Pending | Ready(OsrSlot) | Failed
+pub fn store_osr_fn(arity_id, header, ptr, epoch, live_ins);  // worker publishes
+pub fn mark_osr_failed(arity_id, header);          // worker declines; interpreters stop polling
+pub fn take_osr_epochs(arity_id) -> Vec<u64>;      // on redefinition: drop entries, return epochs
+```
+
+`OsrSlot { fn_ptr, epoch, live_ins }` carries the interpreter registers to pass
+(in parameter order); the transfer uses the same rooting + `push_jit_frame`
+protocol as ordinary JIT-native calls.  Scratch regions opened before the loop
+stay open across the transfer (the OSR variant drops their `RegionEnd`s) and
+unwind with the interpreter frame.
 
 ## Special-form coverage in the IR interpreter
 

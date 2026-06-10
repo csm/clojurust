@@ -130,12 +130,16 @@ fn execute_ir(
         args.to_vec()
     };
 
-    let result = crate::ir_interp::interpret_ir(
+    // OSR (Phase 10.4) is enabled here — this path has a stable arity
+    // identity, so a hot loop inside a single call can promote to native
+    // code mid-run.
+    let result = crate::ir_interp::interpret_ir_with_osr(
         ir_func,
         ir_args,
         &caller_env.globals,
         &f.defining_ns,
         &mut env,
+        Some(arity.ir_arity_id),
     );
 
     cljrs_env::callback::pop_eval_context();
