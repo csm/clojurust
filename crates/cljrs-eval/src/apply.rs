@@ -92,8 +92,16 @@ fn try_ir_path(
         return None;
     }
 
-    // Bump invocation counter; enqueue JIT compilation when hot.
-    crate::jit_state::record_call(arity_id, Arc::clone(&ir_func));
+    // Bump invocation counter and the argument-type profile (drives
+    // specialized compilation, Phase 10.6); enqueue JIT compilation when
+    // hot.  Variadic arities profile only the fixed prefix — the rest-list
+    // parameter is synthesized and must never be specialized.
+    let profile_args = if arity.rest_param.is_some() {
+        &args[..arity.params.len().min(args.len())]
+    } else {
+        args
+    };
+    crate::jit_state::record_call(arity_id, Arc::clone(&ir_func), profile_args);
 
     Some(execute_ir(f, arity, &ir_func, args, caller_env))
 }
@@ -227,6 +235,20 @@ fn call_jit_native(
     // SAFETY: fn_ptr was produced by Cranelift JIT with SystemV ABI and the
     // correct number of *const Value params; all arg pointers are live.
     let result_ptr = unsafe { crate::jit_state::dispatch_jit_call(fn_ptr, &arg_ptrs) };
+
+    // Deoptimization (Phase 10.6): a specialized compilation whose entry
+    // type guard failed returns the deopt sentinel.  Guards run before any
+    // side effect, so re-executing the whole call at Tier 1 is sound.  The
+    // failure is counted; repeated violations discard the specialization
+    // (record_deopt), after which dispatch returns to Tier 1 until a generic
+    // recompile is published.
+    if crate::jit_state::is_deopt_result(result_ptr) {
+        crate::jit_state::record_deopt(arity.ir_arity_id);
+        if let Some(ir_func) = crate::ir_cache::get_cached(arity.ir_arity_id) {
+            return execute_ir(f, arity, &ir_func, args, caller_env);
+        }
+        return cljrs_interp::apply::call_cljrs_fn(f, args, caller_env);
+    }
 
     // SAFETY: result_ptr was returned by rt_abi; it points to a live Value
     // in ALLOC_ROOTS.  Clone it before the alloc frame drops.

@@ -41,6 +41,7 @@ pub use symbol::Symbol;
 pub use types::{
     Agent, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture, CljxPromise, Delay,
     DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnFunc, NativeFnPtr,
-    Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile,
+    Protocol, ProtocolFn, ProtocolMethod, Thunk, Var, Volatile, bump_protocol_generation,
+    protocol_generation,
 };
 pub use value::{MapValue, ObjectArray, SetValue, TypeInstance, Value};

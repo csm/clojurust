@@ -300,7 +300,7 @@ mod reclaim_integration {
 
         // Emulate the worker: compile, register (→ epoch), publish ptr + epoch.
         let compiled =
-            crate::jit_compiler::compile_jit(&format!("__cljrs_jit_{arity_id}"), &ir).unwrap();
+            crate::jit_compiler::compile_jit(&format!("__cljrs_jit_{arity_id}"), &ir, &[]).unwrap();
         let fn_ptr = compiled.fn_ptr;
         let epoch = crate::code_cache::register(arity_id, compiled);
         cljrs_eval::jit_state::store_native_fn(arity_id, fn_ptr, epoch);

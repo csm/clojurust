@@ -16,6 +16,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ir::{BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
+use crate::typeinfer::{self, Repr};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -46,6 +47,10 @@ struct RuntimeFuncs {
     rt_const_double: FuncId,
     rt_const_char: FuncId,
     rt_const_string: FuncId,
+    /// Still declared for completeness (the rt_abi symbol exists), but
+    /// keyword constants now go through the per-site inline cache
+    /// (`rt_kw_ic_fill`); see `emit_keyword_ic`.
+    #[allow(dead_code)]
     rt_const_keyword: FuncId,
     rt_const_symbol: FuncId,
     rt_truthiness: FuncId,
@@ -171,6 +176,14 @@ struct RuntimeFuncs {
     rt_region_alloc_set: FuncId,
     rt_region_alloc_list: FuncId,
     rt_region_alloc_cons: FuncId,
+    // Specialization & inline caches (Phase 10.6)
+    rt_value_tag: FuncId,
+    rt_unbox_long: FuncId,
+    rt_unbox_double: FuncId,
+    rt_box_bool: FuncId,
+    rt_deopt: FuncId,
+    rt_kw_ic_fill: FuncId,
+    rt_call_ic: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -227,6 +240,25 @@ impl<M: Module> Compiler<M> {
 
     /// Compile an IR function and define it in the module.
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()> {
+        self.compile_function_with_specs(ir_func, func_id, &[])
+    }
+
+    /// Compile an IR function with per-parameter type specializations
+    /// (Phase 10.6).
+    ///
+    /// `specs` seeds type inference positionally (`Repr::Long` / `Repr::Double`
+    /// for parameters whose Tier-1 profile was monomorphic; missing entries
+    /// are `Repr::Boxed`).  When any spec is non-boxed, the emitted prologue
+    /// guards each specialized parameter's runtime tag and returns the deopt
+    /// sentinel (`rt_deopt`) on mismatch — the dispatch seam then re-executes
+    /// the call at Tier 1, so guards must run before any side effect (they
+    /// do: the prologue precedes the function body entirely).
+    pub fn compile_function_with_specs(
+        &mut self,
+        ir_func: &IrFunction,
+        func_id: FuncId,
+        specs: &[Repr],
+    ) -> CodegenResult<()> {
         self.ctx.func.signature = self
             .module
             .declarations()
@@ -234,6 +266,8 @@ impl<M: Module> Compiler<M> {
             .signature
             .clone();
         self.ctx.func.name = cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32());
+
+        let reprs = typeinfer::infer(ir_func, specs);
 
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.fb_ctx);
@@ -247,6 +281,8 @@ impl<M: Module> Compiler<M> {
                     block_map: HashMap::new(),
                     user_funcs: &self.user_funcs,
                     region_param: None,
+                    reprs,
+                    specs,
                 };
                 translator.translate(ir_func)?;
             }
@@ -349,43 +385,68 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// function being translated is a region-parameterised variant
     /// (`IrFunction::takes_region_param`).  Bound by `Inst::RegionParam`.
     region_param: Option<cranelift_codegen::ir::Value>,
+    /// Inferred machine representation per VarId (Phase 10.6).  Vars absent
+    /// from the map are boxed (`*const Value`).
+    reprs: HashMap<VarId, Repr>,
+    /// Per-parameter specializations driving the entry guards (positional;
+    /// missing entries are boxed).
+    specs: &'b [Repr],
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn translate(&mut self, ir_func: &IrFunction) -> CodegenResult<()> {
+        let n_params = ir_func.params.len();
+        let specialized = self.specs[..self.specs.len().min(n_params)]
+            .iter()
+            .any(|s| *s != Repr::Boxed);
+
+        // With specializations, function params land in a separate prologue
+        // block that guards + unboxes them before jumping into the body; the
+        // prologue is created first so it is the function's entry in layout.
+        let prologue = if specialized {
+            Some(self.builder.create_block())
+        } else {
+            None
+        };
+
         // Create all CLIF blocks upfront.
         for block in &ir_func.blocks {
             let clif_block = self.builder.create_block();
             self.block_map.insert(block.id, clif_block);
         }
 
-        // Entry block: append params.
-        let entry_block = self.block_map[&ir_func.blocks[0].id];
-        self.builder.switch_to_block(entry_block);
-        self.builder
-            .append_block_params_for_function_params(entry_block);
+        if let Some(prologue) = prologue {
+            self.translate_specialized_prologue(ir_func, prologue)?;
+        } else {
+            // Entry block: append params.
+            let entry_block = self.block_map[&ir_func.blocks[0].id];
+            self.builder.switch_to_block(entry_block);
+            self.builder
+                .append_block_params_for_function_params(entry_block);
 
-        // Bind function parameters to variables.
-        for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
-            let var = self.ensure_var(*var_id);
-            let param_val = self.builder.block_params(entry_block)[i];
-            self.builder.def_var(var, param_val);
+            // Bind function parameters to variables.
+            for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
+                let var = self.ensure_var(*var_id);
+                let param_val = self.builder.block_params(entry_block)[i];
+                self.builder.def_var(var, param_val);
+            }
+
+            // Region-parameterised variants carry the caller's region as a
+            // hidden trailing parameter; `Inst::RegionParam` binds it.
+            if ir_func.takes_region_param() {
+                self.region_param =
+                    Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
+            }
+
+            // GC safepoint at function entry.
+            self.emit_safepoint();
         }
-
-        // Region-parameterised variants carry the caller's region as a hidden
-        // trailing parameter; `Inst::RegionParam` binds it.
-        if ir_func.takes_region_param() {
-            self.region_param = Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
-        }
-
-        // GC safepoint at function entry.
-        self.emit_safepoint();
 
         // Translate each block.
         for (block_idx, ir_block) in ir_func.blocks.iter().enumerate() {
             let clif_block = self.block_map[&ir_block.id];
 
-            if block_idx > 0 {
+            if block_idx > 0 || specialized {
                 self.builder.switch_to_block(clif_block);
             }
 
@@ -395,8 +456,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             // For now, phi values are pre-declared as variables.
             for inst in &ir_block.phis {
                 if let Inst::Phi(dst, _) = inst {
+                    let ty = self.clif_ty(self.repr_of(*dst));
                     let var = self.ensure_var(*dst);
-                    let param = self.builder.append_block_param(clif_block, self.ptr_type);
+                    let param = self.builder.append_block_param(clif_block, ty);
                     self.builder.def_var(var, param);
                 }
             }
@@ -414,10 +476,87 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         Ok(())
     }
 
+    /// Emit the entry prologue of a type-specialized function: bind boxed
+    /// params, guard each specialized param's runtime tag, and unbox it into
+    /// its register representation.  Any guard failure branches to a shared
+    /// deopt block that returns the sentinel (`rt_deopt`) — the dispatch seam
+    /// re-runs the call at Tier 1.  Guards precede the entire body, so no
+    /// side effect can occur before a deopt.
+    fn translate_specialized_prologue(
+        &mut self,
+        ir_func: &IrFunction,
+        prologue: cranelift_codegen::ir::Block,
+    ) -> CodegenResult<()> {
+        self.builder.switch_to_block(prologue);
+        self.builder
+            .append_block_params_for_function_params(prologue);
+        let params: Vec<cranelift_codegen::ir::Value> =
+            self.builder.block_params(prologue).to_vec();
+
+        let deopt_block = self.builder.create_block();
+
+        for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
+            let raw = params[i];
+            let spec = self.specs.get(i).copied().unwrap_or(Repr::Boxed);
+            match spec {
+                Repr::Long | Repr::Double => {
+                    let expected = if spec == Repr::Long {
+                        crate::rt_abi::TAG_LONG
+                    } else {
+                        crate::rt_abi::TAG_DOUBLE
+                    };
+                    let tag = self.call_rt_1(self.rt.rt_value_tag, raw)?;
+                    let ok = self.builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        tag,
+                        expected,
+                    );
+                    let cont = self.builder.create_block();
+                    self.builder.ins().brif(ok, cont, &[], deopt_block, &[]);
+                    self.builder.switch_to_block(cont);
+                    let unbox_fn = if spec == Repr::Long {
+                        self.rt.rt_unbox_long
+                    } else {
+                        self.rt.rt_unbox_double
+                    };
+                    let unboxed = self.call_rt_1(unbox_fn, raw)?;
+                    let var = self.ensure_var(*var_id);
+                    self.builder.def_var(var, unboxed);
+                }
+                _ => {
+                    let var = self.ensure_var(*var_id);
+                    self.builder.def_var(var, raw);
+                }
+            }
+        }
+
+        if ir_func.takes_region_param() {
+            self.region_param = Some(params[ir_func.params.len()]);
+        }
+
+        self.emit_safepoint();
+        let entry = self.block_map[&ir_func.blocks[0].id];
+        self.builder.ins().jump(entry, &[]);
+
+        // Shared deopt exit: return the sentinel.
+        self.builder.switch_to_block(deopt_block);
+        let sentinel = self.call_rt_0(self.rt.rt_deopt)?;
+        self.builder.ins().return_(&[sentinel]);
+        Ok(())
+    }
+
     fn translate_inst(&mut self, inst: &Inst) -> CodegenResult<()> {
         match inst {
             Inst::Const(dst, c) => {
-                let val = self.emit_const(c)?;
+                // Unboxed constants materialize directly in registers.
+                let val = match (self.repr_of(*dst), c) {
+                    (Repr::Long, Const::Long(n)) => self.builder.ins().iconst(types::I64, *n),
+                    (Repr::Double, Const::Double(f)) => self.builder.ins().f64const(*f),
+                    (Repr::Bool, Const::Bool(b)) => {
+                        self.builder.ins().iconst(types::I8, i64::from(*b))
+                    }
+                    _ => self.emit_const(c)?,
+                };
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
@@ -469,15 +608,15 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             Inst::AllocCons(dst, head, tail) => {
-                let h = self.use_var(*head);
-                let t = self.use_var(*tail);
+                let h = self.use_var_boxed(*head)?;
+                let t = self.use_var_boxed(*tail)?;
                 let val = self.call_rt_2(self.rt.rt_alloc_cons, h, t)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
             Inst::CallKnown(dst, known_fn, args) => {
-                let val = self.emit_known_call(known_fn, args)?;
+                let val = self.emit_known_call(*dst, known_fn, args)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
@@ -495,7 +634,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             Inst::Deref(dst, src) => {
-                let s = self.use_var(*src);
+                let s = self.use_var_boxed(*src)?;
                 let val = self.call_rt_1(self.rt.rt_deref, s)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
@@ -508,14 +647,14 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             Inst::SetBang(var, val) => {
-                let var_v = self.use_var(*var);
-                let val_v = self.use_var(*val);
+                let var_v = self.use_var_boxed(*var)?;
+                let val_v = self.use_var_boxed(*val)?;
                 let func_ref = self.import_func(self.rt.rt_set_bang);
                 self.builder.ins().call(func_ref, &[var_v, val_v]);
             }
 
             Inst::Throw(val) => {
-                let v = self.use_var(*val);
+                let v = self.use_var_boxed(*val)?;
                 let func_ref = self.import_func(self.rt.rt_throw);
                 self.builder.ins().call(func_ref, &[v]);
                 // rt_throw stores the exception in a thread-local and returns.
@@ -572,7 +711,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                             ),
                         );
                         for (i, cap_var) in captures.iter().enumerate() {
-                            let cap_val = self.use_var(*cap_var);
+                            let cap_val = self.use_var_boxed(*cap_var)?;
                             self.builder
                                 .ins()
                                 .stack_store(cap_val, slot, (i * 8) as i32);
@@ -751,8 +890,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     )?,
                     RegionAllocKind::Cons => {
                         if operands.len() == 2 {
-                            let h = self.use_var(operands[0]);
-                            let t = self.use_var(operands[1]);
+                            let h = self.use_var_boxed(operands[0])?;
+                            let t = self.use_var_boxed(operands[1])?;
                             let func_ref = self.import_func(self.rt.rt_region_alloc_cons);
                             let call = self.builder.ins().call(func_ref, &[region_handle, h, t]);
                             self.builder.inst_results(call)[0]
@@ -821,13 +960,13 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     ) -> CodegenResult<()> {
         match term {
             Terminator::Return(var_id) => {
-                let val = self.use_var(*var_id);
+                let val = self.use_var_boxed(*var_id)?;
                 self.builder.ins().return_(&[val]);
             }
 
             Terminator::Jump(target) => {
                 let clif_block = self.block_map[target];
-                let phi_args = self.collect_phi_args(*target, current_block_id, ir_func);
+                let phi_args = self.collect_phi_args(*target, current_block_id, ir_func)?;
                 self.builder.ins().jump(clif_block, &phi_args);
             }
 
@@ -836,15 +975,31 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 then_block,
                 else_block,
             } => {
-                let cond_val = self.use_var(*cond);
-                let truthy = self.call_rt_1_i8(self.rt.rt_truthiness, cond_val)?;
                 let then_b = self.block_map[then_block];
                 let else_b = self.block_map[else_block];
-                let then_args = self.collect_phi_args(*then_block, current_block_id, ir_func);
-                let else_args = self.collect_phi_args(*else_block, current_block_id, ir_func);
-                self.builder
-                    .ins()
-                    .brif(truthy, then_b, &then_args, else_b, &else_args);
+                let then_args = self.collect_phi_args(*then_block, current_block_id, ir_func)?;
+                let else_args = self.collect_phi_args(*else_block, current_block_id, ir_func)?;
+                match self.repr_of(*cond) {
+                    // Unboxed booleans branch on the raw i8, skipping
+                    // rt_truthiness entirely.
+                    Repr::Bool => {
+                        let raw = self.use_var(*cond);
+                        self.builder
+                            .ins()
+                            .brif(raw, then_b, &then_args, else_b, &else_args);
+                    }
+                    // Numbers are always truthy in Clojure.
+                    Repr::Long | Repr::Double => {
+                        self.builder.ins().jump(then_b, &then_args);
+                    }
+                    Repr::Boxed => {
+                        let cond_val = self.use_var(*cond);
+                        let truthy = self.call_rt_1_i8(self.rt.rt_truthiness, cond_val)?;
+                        self.builder
+                            .ins()
+                            .brif(truthy, then_b, &then_args, else_b, &else_args);
+                    }
+                }
             }
 
             Terminator::RecurJump { target, args } => {
@@ -852,10 +1007,26 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 // loops cooperate with the collector.
                 self.emit_safepoint();
                 let clif_block = self.block_map[target];
-                let arg_vals: Vec<BlockArg> = args
-                    .iter()
-                    .map(|a| BlockArg::Value(self.use_var(*a)))
-                    .collect();
+                // Recur args feed the target's phis positionally; coerce each
+                // to its phi's representation (boxing into boxed phis).
+                let target_block = ir_func.blocks.iter().find(|b| b.id == *target);
+                let mut arg_vals: Vec<BlockArg> = Vec::with_capacity(args.len());
+                match target_block {
+                    Some(tb) => {
+                        for (a, phi) in args.iter().zip(tb.phis.iter()) {
+                            let target_repr = match phi {
+                                Inst::Phi(dst, _) => self.repr_of(*dst),
+                                _ => Repr::Boxed,
+                            };
+                            arg_vals.push(BlockArg::Value(self.coerce_to(*a, target_repr)?));
+                        }
+                    }
+                    None => {
+                        for a in args {
+                            arg_vals.push(BlockArg::Value(self.use_var_boxed(*a)?));
+                        }
+                    }
+                }
                 self.builder.ins().jump(clif_block, &arg_vals);
             }
 
@@ -872,31 +1043,30 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     }
 
     /// Collect phi arguments needed when jumping from `from_block` to `to_block`.
+    ///
+    /// Each argument is coerced to the phi's inferred representation (an
+    /// unboxed value joining a boxed phi is boxed on the edge).
     fn collect_phi_args(
         &mut self,
         to_block: BlockId,
         from_block: BlockId,
         ir_func: &IrFunction,
-    ) -> Vec<BlockArg> {
+    ) -> CodegenResult<Vec<BlockArg>> {
         let target = ir_func.blocks.iter().find(|b| b.id == to_block);
         let Some(target) = target else {
-            return vec![];
+            return Ok(vec![]);
         };
-        target
-            .phis
-            .iter()
-            .filter_map(|inst| {
-                if let Inst::Phi(_, entries) = inst {
-                    // Find the entry for the predecessor block.
-                    entries
-                        .iter()
-                        .find(|(pred, _)| *pred == from_block)
-                        .map(|(_, var_id)| BlockArg::Value(self.use_var(*var_id)))
-                } else {
-                    None
+        let mut out = Vec::new();
+        for inst in &target.phis {
+            if let Inst::Phi(dst, entries) = inst {
+                // Find the entry for the predecessor block.
+                if let Some((_, var_id)) = entries.iter().find(|(pred, _)| *pred == from_block) {
+                    let target_repr = self.repr_of(*dst);
+                    out.push(BlockArg::Value(self.coerce_to(*var_id, target_repr)?));
                 }
-            })
-            .collect()
+            }
+        }
+        Ok(out)
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -907,19 +1077,82 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         self.builder.ins().call(func_ref, &[]);
     }
 
+    /// Inferred machine representation of `var_id` (Boxed if unknown).
+    fn repr_of(&self, var_id: VarId) -> Repr {
+        self.reprs.get(&var_id).copied().unwrap_or(Repr::Boxed)
+    }
+
+    /// CLIF type backing a [`Repr`].
+    fn clif_ty(&self, repr: Repr) -> types::Type {
+        match repr {
+            Repr::Boxed => self.ptr_type,
+            Repr::Long => types::I64,
+            Repr::Double => types::F64,
+            Repr::Bool => types::I8,
+        }
+    }
+
     fn ensure_var(&mut self, var_id: VarId) -> Variable {
         if let Some(&var) = self.var_map.get(&var_id) {
             var
         } else {
-            let var = self.builder.declare_var(self.ptr_type);
+            let ty = self.clif_ty(self.repr_of(var_id));
+            let var = self.builder.declare_var(ty);
             self.var_map.insert(var_id, var);
             var
         }
     }
 
+    /// Read `var_id` in its natural representation (raw `i64`/`f64`/`i8` for
+    /// unboxed vars, `*const Value` otherwise).
     fn use_var(&mut self, var_id: VarId) -> cranelift_codegen::ir::Value {
         let var = self.ensure_var(var_id);
         self.builder.use_var(var)
+    }
+
+    /// Read `var_id` as a boxed `*const Value`, boxing an unboxed var at this
+    /// use site (`rt_const_long` interns small longs; `rt_box_bool` returns
+    /// the interned booleans).
+    fn use_var_boxed(&mut self, var_id: VarId) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let raw = self.use_var(var_id);
+        match self.repr_of(var_id) {
+            Repr::Boxed => Ok(raw),
+            Repr::Long => self.call_rt_1(self.rt.rt_const_long, raw),
+            Repr::Double => self.call_rt_1(self.rt.rt_const_double, raw),
+            Repr::Bool => self.call_rt_1(self.rt.rt_box_bool, raw),
+        }
+    }
+
+    /// Read `var_id` coerced to `target` — used when passing block (phi)
+    /// arguments.  Inference guarantees an unboxed phi only joins same-repr
+    /// inputs, so the only coercion is boxing into a boxed phi.
+    fn coerce_to(
+        &mut self,
+        var_id: VarId,
+        target: Repr,
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let src = self.repr_of(var_id);
+        if src == target {
+            Ok(self.use_var(var_id))
+        } else if target == Repr::Boxed {
+            self.use_var_boxed(var_id)
+        } else {
+            Err(CodegenError::Codegen(format!(
+                "phi repr mismatch: {var_id} is {src:?}, phi expects {target:?}"
+            )))
+        }
+    }
+
+    /// Read `var_id` as a raw `f64`, converting an unboxed long.
+    fn use_var_f64(&mut self, var_id: VarId) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let raw = self.use_var(var_id);
+        match self.repr_of(var_id) {
+            Repr::Double => Ok(raw),
+            Repr::Long => Ok(self.builder.ins().fcvt_from_sint(types::F64, raw)),
+            other => Err(CodegenError::Codegen(format!(
+                "cannot widen {other:?} var {var_id} to f64"
+            ))),
+        }
     }
 
     /// Emit a constant value.
@@ -947,9 +1180,68 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 Ok(self.builder.inst_results(call)[0])
             }
             Const::Str(s) => self.emit_string_const(self.rt.rt_const_string, s),
-            Const::Keyword(s) => self.emit_string_const(self.rt.rt_const_keyword, s),
+            Const::Keyword(s) => self.emit_keyword_ic(s),
             Const::Symbol(s) => self.emit_string_const(self.rt.rt_const_symbol, s),
         }
+    }
+
+    /// Emit a keyword constant through a per-call-site inline cache.
+    ///
+    /// The site owns an 8-byte writable data slot.  Fast path: one load and a
+    /// branch on the cached interned-keyword pointer.  First execution takes
+    /// the miss edge into `rt_kw_ic_fill`, which interns the keyword globally
+    /// (permanently rooted, so the cached pointer can never dangle) and
+    /// stores it into the slot.  Compared to the old per-execution
+    /// `rt_const_keyword` call this removes both the bridge call and a GC
+    /// allocation from every subsequent execution.
+    fn emit_keyword_ic(&mut self, s: &str) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Writable zero-initialised slot for this call site.
+        let slot_data = self.module.declare_anonymous_data(true, false)?;
+        let mut slot_desc = cranelift_module::DataDescription::new();
+        slot_desc.define_zeroinit(8);
+        self.module.define_data(slot_data, &slot_desc)?;
+        let slot_gv = self
+            .module
+            .declare_data_in_func(slot_data, self.builder.func);
+        let slot_addr = self.builder.ins().global_value(self.ptr_type, slot_gv);
+
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let cached = self.builder.ins().load(self.ptr_type, flags, slot_addr, 0);
+
+        let miss_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+        let merge_param = self.builder.append_block_param(merge_block, self.ptr_type);
+        self.builder.ins().brif(
+            cached,
+            merge_block,
+            &[BlockArg::Value(cached)],
+            miss_block,
+            &[],
+        );
+
+        // Miss: intern + fill the slot.
+        self.builder.switch_to_block(miss_block);
+        let name_data = self.module.declare_anonymous_data(false, false)?;
+        let mut name_desc = cranelift_module::DataDescription::new();
+        name_desc.define(s.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(name_data, &name_desc)?;
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data, self.builder.func);
+        let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
+        let name_len = self.builder.ins().iconst(types::I64, s.len() as i64);
+        let fill_ref = self.import_func(self.rt.rt_kw_ic_fill);
+        let call = self
+            .builder
+            .ins()
+            .call(fill_ref, &[name_ptr, name_len, slot_addr]);
+        let filled = self.builder.inst_results(call)[0];
+        self.builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(filled)]);
+
+        self.builder.switch_to_block(merge_block);
+        Ok(merge_param)
     }
 
     /// Emit a call to a runtime function that takes (ptr, len) for a string.
@@ -1075,7 +1367,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
         let name_len = self.builder.ins().iconst(types::I64, name.len() as i64);
 
-        let val = self.use_var(val_var);
+        let val = self.use_var_boxed(val_var)?;
 
         let func_ref = self.import_func(self.rt.rt_def_var);
         let call = self
@@ -1113,7 +1405,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
 
         // Store each element pointer.
         for (i, elem_var) in elems.iter().enumerate() {
-            let val = self.use_var(*elem_var);
+            let val = self.use_var_boxed(*elem_var)?;
             self.builder.ins().stack_store(val, slot, (i * 8) as i32);
         }
 
@@ -1166,7 +1458,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             ));
 
         for (i, elem_var) in elems.iter().enumerate() {
-            let val = self.use_var(*elem_var);
+            let val = self.use_var_boxed(*elem_var)?;
             self.builder.ins().stack_store(val, slot, (i * 8) as i32);
         }
 
@@ -1184,12 +1476,89 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         Ok(self.builder.inst_results(call)[0])
     }
 
-    /// Emit a call to a known function.
-    fn emit_known_call(
+    /// Emit an unboxed arithmetic/comparison op (Phase 10.6).  Only reached
+    /// when type inference assigned `dst` an unboxed repr, which it does only
+    /// for the operand-repr combinations handled here (see `typeinfer.rs` for
+    /// the semantic-equivalence argument vs. the rt_abi bridges).
+    fn emit_unboxed_known(
         &mut self,
+        dst_repr: Repr,
         known_fn: &KnownFn,
         args: &[VarId],
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+        let (a, b) = (args[0], args[1]);
+        match (known_fn, dst_repr) {
+            (KnownFn::Add | KnownFn::Sub | KnownFn::Mul, Repr::Long) => {
+                let av = self.use_var(a);
+                let bv = self.use_var(b);
+                Ok(match known_fn {
+                    KnownFn::Add => self.builder.ins().iadd(av, bv),
+                    KnownFn::Sub => self.builder.ins().isub(av, bv),
+                    _ => self.builder.ins().imul(av, bv),
+                })
+            }
+            (KnownFn::Add | KnownFn::Sub | KnownFn::Mul | KnownFn::Div, Repr::Double) => {
+                let av = self.use_var_f64(a)?;
+                let bv = self.use_var_f64(b)?;
+                Ok(match known_fn {
+                    KnownFn::Add => self.builder.ins().fadd(av, bv),
+                    KnownFn::Sub => self.builder.ins().fsub(av, bv),
+                    KnownFn::Mul => self.builder.ins().fmul(av, bv),
+                    _ => self.builder.ins().fdiv(av, bv),
+                })
+            }
+            (KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte, Repr::Bool) => {
+                if self.repr_of(a) == Repr::Long && self.repr_of(b) == Repr::Long {
+                    let cc = match known_fn {
+                        KnownFn::Lt => IntCC::SignedLessThan,
+                        KnownFn::Gt => IntCC::SignedGreaterThan,
+                        KnownFn::Lte => IntCC::SignedLessThanOrEqual,
+                        _ => IntCC::SignedGreaterThanOrEqual,
+                    };
+                    let av = self.use_var(a);
+                    let bv = self.use_var(b);
+                    Ok(self.builder.ins().icmp(cc, av, bv))
+                } else {
+                    // Mixed long/double — promote to f64, exactly as rt_lt &
+                    // co. do.  Ordered compares: NaN yields false either way.
+                    let cc = match known_fn {
+                        KnownFn::Lt => FloatCC::LessThan,
+                        KnownFn::Gt => FloatCC::GreaterThan,
+                        KnownFn::Lte => FloatCC::LessThanOrEqual,
+                        _ => FloatCC::GreaterThanOrEqual,
+                    };
+                    let av = self.use_var_f64(a)?;
+                    let bv = self.use_var_f64(b)?;
+                    Ok(self.builder.ins().fcmp(cc, av, bv))
+                }
+            }
+            // Inference only assigns Bool to Eq when both operands are Long.
+            (KnownFn::Eq, Repr::Bool) => {
+                let av = self.use_var(a);
+                let bv = self.use_var(b);
+                Ok(self.builder.ins().icmp(IntCC::Equal, av, bv))
+            }
+            other => Err(CodegenError::Codegen(format!(
+                "unboxed known-call combination not supported: {other:?}"
+            ))),
+        }
+    }
+
+    /// Emit a call to a known function.
+    fn emit_known_call(
+        &mut self,
+        dst: VarId,
+        known_fn: &KnownFn,
+        args: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Unboxed arithmetic/comparisons compile to native instructions —
+        // no bridge call, no boxing, no GC allocation.
+        let dst_repr = self.repr_of(dst);
+        if dst_repr != Repr::Boxed && args.len() == 2 {
+            return self.emit_unboxed_known(dst_repr, known_fn, args);
+        }
+
         // Collection constructors use variadic stack-spill pattern.
         match known_fn {
             KnownFn::Vector => return self.emit_alloc_collection(self.rt.rt_alloc_vector, args),
@@ -1312,7 +1681,10 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         };
 
         // Call the specific runtime function with the right arity.
-        let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        let mut arg_vals = Vec::with_capacity(args.len());
+        for a in args {
+            arg_vals.push(self.use_var_boxed(*a)?);
+        }
         let func_ref = self.import_func(rt_func);
         let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
@@ -1321,8 +1693,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     /// Emit `(swap! atom f extra-args...)` — variadic via stack-spill.
     fn emit_atom_swap(&mut self, args: &[VarId]) -> CodegenResult<cranelift_codegen::ir::Value> {
         // args[0] = atom, args[1] = f, args[2..] = extra args
-        let atom_val = self.use_var(args[0]);
-        let f_val = self.use_var(args[1]);
+        let atom_val = self.use_var_boxed(args[0])?;
+        let f_val = self.use_var_boxed(args[1])?;
         let extra = &args[2..];
         let n = extra.len();
 
@@ -1335,7 +1707,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                         3,
                     ));
             for (i, arg) in extra.iter().enumerate() {
-                let val = self.use_var(*arg);
+                let val = self.use_var_boxed(*arg)?;
                 self.builder.ins().stack_store(val, slot, (i * 8) as i32);
             }
             let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
@@ -1367,7 +1739,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let binding_args = &args[..args.len() - 1];
         let npairs = binding_args.len() / 2;
 
-        let body_val = self.use_var(body_var);
+        let body_val = self.use_var_boxed(body_var)?;
 
         let (bindings_ptr, npairs_val) = if npairs > 0 {
             let n = binding_args.len();
@@ -1379,7 +1751,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                         3,
                     ));
             for (i, arg) in binding_args.iter().enumerate() {
-                let val = self.use_var(*arg);
+                let val = self.use_var_boxed(*arg)?;
                 self.builder.ins().stack_store(val, slot, (i * 8) as i32);
             }
             let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
@@ -1424,7 +1796,10 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             CodegenError::Codegen(format!("CallDirect: unknown function {fn_name}"))
         })?;
         let func_ref = self.import_func(*func_id);
-        let arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        let mut arg_vals = Vec::with_capacity(args.len());
+        for a in args {
+            arg_vals.push(self.use_var_boxed(*a)?);
+        }
         let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
     }
@@ -1442,19 +1817,26 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             CodegenError::Codegen(format!("CallWithRegion: unknown function {fn_name}"))
         })?;
         let func_ref = self.import_func(*func_id);
-        let mut arg_vals: Vec<_> = args.iter().map(|a| self.use_var(*a)).collect();
+        let mut arg_vals = Vec::with_capacity(args.len() + 1);
+        for a in args {
+            arg_vals.push(self.use_var_boxed(*a)?);
+        }
         arg_vals.push(extra);
         let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
     }
 
-    /// Emit an unknown function call through rt_call.
+    /// Emit an unknown function call through `rt_call_ic` — `rt_call` with a
+    /// per-call-site inline cache for protocol dispatch (Phase 10.6).  The
+    /// 8-byte writable IC slot holds an index into the runtime's IC entry
+    /// table (never a GC pointer, so compiled modules stay free of GC roots).
+    /// Zero-arg calls cannot be protocol dispatches and keep plain `rt_call`.
     fn emit_unknown_call(
         &mut self,
         callee: VarId,
         args: &[VarId],
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
-        let callee_val = self.use_var(callee);
+        let callee_val = self.use_var_boxed(callee)?;
         let n = args.len();
 
         if n == 0 {
@@ -1474,17 +1856,25 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 3,
             ));
         for (i, arg) in args.iter().enumerate() {
-            let val = self.use_var(*arg);
+            let val = self.use_var_boxed(*arg)?;
             self.builder.ins().stack_store(val, slot, (i * 8) as i32);
         }
         let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
         let count = self.builder.ins().iconst(types::I64, n as i64);
 
-        let func_ref = self.import_func(self.rt.rt_call);
+        // Per-call-site IC slot (zero-initialised = empty).
+        let ic_data = self.module.declare_anonymous_data(true, false)?;
+        let mut ic_desc = cranelift_module::DataDescription::new();
+        ic_desc.define_zeroinit(8);
+        self.module.define_data(ic_data, &ic_desc)?;
+        let ic_gv = self.module.declare_data_in_func(ic_data, self.builder.func);
+        let ic_addr = self.builder.ins().global_value(self.ptr_type, ic_gv);
+
+        let func_ref = self.import_func(self.rt.rt_call_ic);
         let call = self
             .builder
             .ins()
-            .call(func_ref, &[callee_val, slot_addr, count]);
+            .call(func_ref, &[callee_val, slot_addr, count, ic_addr]);
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1763,6 +2153,14 @@ fn declare_runtime_funcs<M: Module>(
             ptr,
         )?,
         rt_region_alloc_cons: declare_rt(module, "rt_region_alloc_cons", &[ptr, ptr, ptr], ptr)?,
+        // Specialization & inline caches (Phase 10.6)
+        rt_value_tag: declare_rt(module, "rt_value_tag", &[ptr], types::I64)?,
+        rt_unbox_long: declare_rt(module, "rt_unbox_long", &[ptr], types::I64)?,
+        rt_unbox_double: declare_rt(module, "rt_unbox_double", &[ptr], types::F64)?,
+        rt_box_bool: declare_rt(module, "rt_box_bool", &[types::I8], ptr)?,
+        rt_deopt: declare_rt(module, "rt_deopt", &[], ptr)?,
+        rt_kw_ic_fill: declare_rt(module, "rt_kw_ic_fill", &[ptr, types::I64, ptr], ptr)?,
+        rt_call_ic: declare_rt(module, "rt_call_ic", &[ptr, ptr, types::I64, ptr], ptr)?,
     })
 }
 
@@ -1867,6 +2265,55 @@ mod tests {
 
         let mut compiler = Compiler::new().unwrap();
         let func_id = compiler.declare_function("sum", 1).unwrap();
+        compiler.compile_function(&ir, func_id).unwrap();
+        let obj = compiler.finish();
+        assert!(!obj.is_empty());
+    }
+
+    /// Phase 10.6: the same loop compiled with the parameter specialized to
+    /// Long must pass the Cranelift verifier — entry guard, unboxed loop
+    /// phis, raw iadd/icmp arithmetic, and boxing on the return edge.
+    #[test]
+    fn test_compile_loop_recur_specialized_long() {
+        let body = parse_body("(loop [i 0 acc 0] (if (< i n) (recur (+ i 1) (+ acc i)) acc))");
+        let params: Vec<Arc<str>> = vec![Arc::from("n")];
+        let ir = lower("sum", &params, &body);
+
+        let mut compiler = Compiler::new().unwrap();
+        let func_id = compiler.declare_function("sum", 1).unwrap();
+        compiler
+            .compile_function_with_specs(&ir, func_id, &[Repr::Long])
+            .unwrap();
+        let obj = compiler.finish();
+        assert!(!obj.is_empty());
+    }
+
+    /// Phase 10.6: double specialization (f64 registers, fadd/fcmp).
+    #[test]
+    fn test_compile_specialized_double_arith() {
+        let body = parse_body("(if (< x 10.0) (* x 2.0) (- x 1.0))");
+        let params: Vec<Arc<str>> = vec![Arc::from("x")];
+        let ir = lower("f", &params, &body);
+
+        let mut compiler = Compiler::new().unwrap();
+        let func_id = compiler.declare_function("f", 1).unwrap();
+        compiler
+            .compile_function_with_specs(&ir, func_id, &[Repr::Double])
+            .unwrap();
+        let obj = compiler.finish();
+        assert!(!obj.is_empty());
+    }
+
+    /// Phase 10.6: keyword lookup compiles through the per-site inline cache
+    /// (writable data slot + miss block) on the AOT backend too.
+    #[test]
+    fn test_compile_keyword_lookup_ic() {
+        let body = parse_body("(:name m)");
+        let params: Vec<Arc<str>> = vec![Arc::from("m")];
+        let ir = lower("get-name", &params, &body);
+
+        let mut compiler = Compiler::new().unwrap();
+        let func_id = compiler.declare_function("get-name", 1).unwrap();
         compiler.compile_function(&ir, func_id).unwrap();
         let obj = compiler.finish();
         assert!(!obj.is_empty());

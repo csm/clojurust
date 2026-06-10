@@ -150,7 +150,8 @@ pub mod defn_registry {
 
 ```rust
 pub fn set_jit_threshold(t: u32);                 // calls before compile (default 1000)
-pub fn record_call(arity_id, ir_func);            // bump counter; enqueue when hot
+pub fn record_call(arity_id, ir_func, profile_args);  // bump counter + arg-type profile; enqueue when hot
+pub fn arg_type_profile(arity_id) -> Option<Vec<u8>>; // per-param type bitmasks (PROFILE_LONG/_DOUBLE/_OTHER)
 pub fn set_enqueue_hook(f);                        // installed by cljrs_jit::init
 pub fn store_native_fn(arity_id, ptr, epoch);      // worker publishes compiled code
 pub fn get_native_fn(arity_id) -> Option<(*const (), u64)>;   // (fn_ptr, epoch)
@@ -163,7 +164,28 @@ pub fn take_pending_exception() -> Option<Value>;  // uncaught native throw, tak
 pub fn set_stale_epoch_hook(f);                    // installed by cljrs_jit::init (code_cache::mark_stale)
 pub fn stale_native_code(arity_id);                // null ptr + route epochs to the stale hook (10.5)
 pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
+
+// Deoptimization (Phase 10.6):
+pub fn set_deopt_sentinel_hook(f: fn() -> usize);  // installed by cljrs_jit::init (rt_abi sentinel addr)
+pub fn is_deopt_result(ptr: *const Value) -> bool; // dispatch seam: did the entry guard fail?
+pub fn record_deopt(arity_id);                     // count a guard failure; past deopt_limit():
+                                                   // unpublish + stale the specialized code, ban
+                                                   // the arity from re-specialization
+pub fn specialization_allowed(arity_id) -> bool;   // worker: may this arity be specialized?
+pub fn deopt_limit() -> u32;                       // CLJRS_JIT_DEOPT_LIMIT (default 10)
 ```
+
+`call_jit_native` checks `is_deopt_result` on every native return: a
+specialized function whose entry type guard failed returns rt_abi's sentinel
+*before any side effect*, so the seam simply re-executes the call at Tier 1
+(`execute_ir`) — exact interpreter semantics for the violating call.
+
+Type profiles (Phase 10.6): `record_call` ORs each positional argument's type
+class (`PROFILE_LONG` / `PROFILE_DOUBLE` / `PROFILE_OTHER`) into
+`JitEntry::arg_profile` until the compile is queued; variadic arities profile
+only the fixed prefix (the rest-list param is padded `PROFILE_OTHER` so it can
+never be specialized).  The JIT worker reads the snapshot via
+`arg_type_profile` to choose per-parameter specializations.
 
 Each native call brackets itself with `push_jit_frame(epoch)` so the JIT code
 cache can free a superseded module only once no frame is executing it

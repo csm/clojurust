@@ -13,6 +13,8 @@ Cranelift codegen backend consumes.
 
 **Phase 10.0 (backend refactor):** `Compiler` and `FunctionTranslator` are now generic over `cranelift_module::Module` (`Compiler<M: Module = ObjectModule>`).  The shared CLIF-emitting logic (`compile_function`, `declare_function`) and the full `rt_abi` symbol declaration table (`declare_runtime_funcs`) work with any `Module` backend.  AOT-specific construction (`Compiler::new`) and finalisation (`Compiler::finish`) live in `impl Compiler<ObjectModule>`; the free function `new_compiler_from_module` lets the upcoming `cljrs-jit` crate hand a pre-built `JITModule` to the shared codegen.
 
+**Phase 10.6 (specialization & inline caches):** `typeinfer.rs` infers a machine representation (`Repr::{Boxed, Long, Double, Bool}`) for every IR var; codegen keeps unboxed values in registers (`iadd`/`fadd`/`icmp` instead of `rt_add`/`rt_lt` bridge calls), boxing only at boxed-context uses.  `compile_function_with_specs` compiles a type-specialized entry whose prologue guards each specialized parameter's runtime tag and returns the deopt sentinel on mismatch.  Keyword constants and `Inst::Call` sites compile through per-call-site inline caches (writable module data slots + the `rt_kw_ic_fill` / `rt_call_ic` bridges).
+
 ---
 
 ## File layout
@@ -24,6 +26,7 @@ src/
   ir_convert.rs — Value → IrFunction conversion (Clojure data → Rust IR types)
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
   codegen.rs    — Cranelift code generator: IrFunction → native object code
+  typeinfer.rs  — Phase 10.6 scalar representation inference (Repr lattice, fixpoint dataflow)
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
   cljrs/compiler/
@@ -112,6 +115,23 @@ walk directly, preserving full semantics.
 - **Output:** `rt_println(v)`, `rt_pr(v)`, `rt_str(v)`
 - **Type checks:** `rt_is_nil`, `rt_is_vector`, `rt_is_map`, `rt_is_seq`, `rt_identical`
 - **Linker anchor:** `anchor_rt_symbols()` — call from harness to prevent dead-code elimination
+- **Specialization & inline caches (Phase 10.6):**
+  `rt_value_tag(v) -> i64` (tag classes `TAG_LONG`/`TAG_DOUBLE`/`TAG_BOOL`/`TAG_NIL`/`TAG_OTHER`,
+  `pub const`s) — entry-guard type test; `rt_unbox_long(v) -> i64` / `rt_unbox_double(v) -> f64` —
+  payload extraction after a successful guard; `rt_box_bool(u8)` — interned bool boxing for
+  unboxed `i8` booleans; `rt_deopt()` — counts a guard failure and returns the deopt sentinel
+  (a `Box::leak`ed non-GC address; `deopt_sentinel_addr() -> usize` exposes it to the dispatch
+  seam via a `cljrs_eval::jit_state` hook); `rt_kw_ic_fill(ptr, len, slot)` — keyword-constant
+  inline-cache fill: interns the keyword into a permanently rooted global table and stores the
+  stable pointer into the call site's data slot (`rt_const_keyword` itself now interns too);
+  `rt_call_ic(callee, args, nargs, slot)` — `rt_call` with a per-call-site protocol-dispatch
+  inline cache keyed `(ProtocolFn identity, dispatch type-tag, protocol generation)`, falling
+  through to `rt_call` for non-protocol callees.  Cached values (interned keywords, impl fns)
+  are kept alive by an IC root tracer registered per allocating thread; IC slots in compiled
+  modules hold only indices/interned pointers, never GC roots.
+  `jit_stats` module — relaxed diagnostic counters (`BOXED_ARITH_CALLS`, `GUARD_DEOPTS`,
+  `KW_IC_FILLS`, `PROTO_IC_HITS`, `PROTO_IC_MISSES`) and `jit_stats::snapshot() -> String`
+  (written by `cljrs --jit-stats`).
 - **JIT hooks (safe Rust, not `extern "C"`):**
   `take_pending_exception_value() -> Option<Value>` — take + clear the thread's pending
   exception as an owned `Value`; the JIT dispatch seam calls it (via a hook installed by
@@ -134,6 +154,9 @@ impl<M: Module> Compiler<M> {
     // hidden trailing region parameter of region-parameterised variants.
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
+    // Phase 10.6: per-parameter type specializations (entry guards + unboxing);
+    // compile_function delegates here with empty specs.
+    pub fn compile_function_with_specs(&mut self, ir_func: &IrFunction, func_id: FuncId, specs: &[Repr]) -> CodegenResult<()>;
     pub fn into_inner_module(self) -> M;        // JIT: reclaim the module after compiling
     pub fn last_code_size(&self) -> u32;        // machine-code bytes of the last compiled fn (JIT memory accounting)
 }
@@ -147,6 +170,21 @@ impl Compiler<ObjectModule> {
 // Entry point for JIT and other backends that supply their own Module:
 pub fn new_compiler_from_module<M: Module>(module: M, ptr_type: types::Type) -> CodegenResult<Compiler<M>>;
 ```
+
+### Type inference (`typeinfer.rs`, Phase 10.6)
+
+```rust
+pub enum Repr { Boxed, Long, Double, Bool }
+pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr>;
+```
+
+Forward fixpoint dataflow over the CFG (including `RecurJump` back-edges into
+loop-header phis).  Parameters are seeded from `specs`; constants and the
+arithmetic/comparison `KnownFn`s propagate; phis meet (mixed reprs fall back to
+`Boxed`).  A var gets an unboxed repr only where codegen can emit semantics
+bit-identical to the boxed rt_abi bridge (`wrapping` long arithmetic, f64
+promotion for mixed operands, ordered float compares); `Div`/`Rem` and
+cross-type `Eq` always stay boxed.
 
 ### AOT driver (`aot.rs`)
 
@@ -217,4 +255,5 @@ Optimization passes on IR data maps. Currently implements region allocation: rew
 | `cljrs-eval` (workspace) | `Env`, `GlobalEnv`, macros, callback — macro expansion + rt_call dispatch |
 | `cljrs-stdlib` (workspace) | `standard_env` — bootstrap environment for macro expansion + harness |
 | `cranelift-*` (workspace) | Cranelift compiler infrastructure (`cranelift-jit` registered in workspace deps for Phase 10.1 `cljrs-jit`) |
+| `cljrs-env` (via `cljrs-eval`) | `callback::invoke`, `apply::{type_tag_of, type_tag_matches}` — rt_call dispatch + protocol IC tag validation |
 | `target-lexicon` (workspace) | Target triple detection |

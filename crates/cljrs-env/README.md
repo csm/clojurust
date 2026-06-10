@@ -15,6 +15,18 @@ The `gc_roots` module manages GC root registration for the interpreter's Rust ca
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
 - `set_stw_reclaim_hook(f)` — (Phase 10.2) installs a stop-the-world reclaim hook the JIT uses to free superseded native code; runs inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked
 
+## apply module
+
+`apply_value` applies an evaluated callee to evaluated args (functions,
+keywords, maps, sets, vars, protocol/multimethod dispatch). Protocol dispatch
+helpers shared with the Phase 10.6 inline caches:
+
+- `type_tag_of(val: &Value) -> Arc<str>` — canonical protocol dispatch tag of a value
+- `type_tag_matches(val: &Value, tag: &str) -> bool` — allocation-free equality
+  against a cached tag; must agree exactly with `type_tag_of` (used by
+  `rt_call_ic`'s hot path in `cljrs-compiler`)
+- `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
+
 ## callback module
 
 Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_context`). The context is pushed automatically around native builtin calls and by the Tier-1 IR executor; rt_abi bridges (`rt_call`, `rt_load_global`, the HOF bridges) dispatch through it. Public API includes:

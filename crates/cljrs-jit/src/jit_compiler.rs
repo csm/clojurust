@@ -5,6 +5,7 @@ use cranelift_module::{FuncId, Module};
 
 use cljrs_compiler::codegen::new_compiler_from_module;
 use cljrs_compiler::rt_abi;
+use cljrs_compiler::typeinfer::Repr;
 use cljrs_ir::IrFunction;
 
 /// A successfully compiled JIT function.
@@ -29,7 +30,15 @@ unsafe impl Send for CompiledFn {}
 /// Compile `ir_func` to native code, returning the function pointer and the
 /// owning module.  `func_name` only names the symbol inside this module
 /// (each compilation gets its own `JITModule`).
-pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<CompiledFn, String> {
+///
+/// `specs` are the per-parameter type specializations (Phase 10.6) for the
+/// *top-level* function only; subfunctions (closures, region variants) are
+/// always compiled generically.  Pass `&[]` for an unspecialized compile.
+pub(crate) fn compile_jit(
+    func_name: &str,
+    ir_func: &IrFunction,
+    specs: &[Repr],
+) -> Result<CompiledFn, String> {
     let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
         .map_err(|e| format!("JITBuilder::new: {e}"))?;
 
@@ -62,7 +71,7 @@ pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<Compi
     compile_subfunctions(ir_func, &mut compiler)?;
 
     compiler
-        .compile_function(ir_func, func_id)
+        .compile_function_with_specs(ir_func, func_id, specs)
         .map_err(|e| format!("compile_function: {e:?}"))?;
 
     let code_size = compiler.last_code_size();
@@ -266,6 +275,14 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_region_alloc_set),
         sym!(rt_region_alloc_list),
         sym!(rt_region_alloc_cons),
+        // Specialization & inline caches (Phase 10.6)
+        sym!(rt_value_tag),
+        sym!(rt_unbox_long),
+        sym!(rt_unbox_double),
+        sym!(rt_box_bool),
+        sym!(rt_deopt),
+        sym!(rt_kw_ic_fill),
+        sym!(rt_call_ic),
     ];
 
     builder.symbols(symbols.iter().map(|&(n, p)| (n, p)));

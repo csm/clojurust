@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use cljrs_compiler::typeinfer::Repr;
 use cljrs_ir::{BlockId, IrFunction};
 
 use crate::code_cache;
@@ -61,8 +62,40 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
     }
 }
 
+/// Map the Tier-1 argument-type profile onto per-parameter specializations
+/// (Phase 10.6).  A parameter specializes only when every profiled call saw
+/// exactly one scalar class (`PROFILE_LONG` or `PROFILE_DOUBLE`); anything
+/// mixed or non-scalar stays boxed.  Returns `None` when nothing would be
+/// specialized — the compile is then fully generic and needs no guards.
+fn specs_from_profile(arity_id: u64, ir_func: &IrFunction) -> Option<Vec<Repr>> {
+    if std::env::var("CLJRS_JIT_NO_SPEC").is_ok() {
+        return None;
+    }
+    if !cljrs_eval::jit_state::specialization_allowed(arity_id) {
+        return None;
+    }
+    let profile = cljrs_eval::jit_state::arg_type_profile(arity_id)?;
+    if profile.len() != ir_func.params.len() {
+        return None;
+    }
+    let specs: Vec<Repr> = profile
+        .iter()
+        .map(|&bits| match bits {
+            cljrs_eval::jit_state::PROFILE_LONG => Repr::Long,
+            cljrs_eval::jit_state::PROFILE_DOUBLE => Repr::Double,
+            _ => Repr::Boxed,
+        })
+        .collect();
+    if specs.iter().all(|s| *s == Repr::Boxed) {
+        None
+    } else {
+        Some(specs)
+    }
+}
+
 fn compile_function_request(arity_id: u64, ir_func: &IrFunction) {
-    cljrs_logging::feat_debug!("jit", "compiling arity_id={}", arity_id);
+    let specs = specs_from_profile(arity_id, ir_func).unwrap_or_default();
+    cljrs_logging::feat_debug!("jit", "compiling arity_id={} specs={:?}", arity_id, specs);
 
     // Isolate each compilation: a panic in codegen (e.g. an unsupported IR
     // shape that trips a Cranelift assertion) must not kill the worker
@@ -70,7 +103,7 @@ fn compile_function_request(arity_id: u64, ir_func: &IrFunction) {
     // panic the function simply stays at Tier 1, exactly like a clean
     // compile error.
     let compiled = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compile_jit(&format!("__cljrs_jit_{arity_id}"), ir_func)
+        compile_jit(&format!("__cljrs_jit_{arity_id}"), ir_func, &specs)
     })) {
         Ok(result) => result,
         Err(_) => {
@@ -120,7 +153,10 @@ fn compile_osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let osr = cljrs_ir::osr::build_osr_function(ir_func, BlockId(header))?;
         let name = format!("__cljrs_jit_{arity_id}_osr{header}");
-        let compiled = compile_jit(&name, &osr.func)?;
+        // OSR variants are never specialized: their parameters are the loop
+        // live-ins transferred from the interpreter register file, for which
+        // no type profile exists.
+        let compiled = compile_jit(&name, &osr.func, &[])?;
         Ok::<_, String>((compiled, osr.live_ins))
     }));
 

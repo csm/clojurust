@@ -93,6 +93,7 @@ These appear before the subcommand and apply to every command:
 - `--trace` — enable trace logging (implies `--debug`)
 - `-X <LEVEL:FEATURES>` — feature-level logging, repeatable.  Format: `<level>:<feat1>,<feat2>,…`.  Levels: `debug`, `trace`.  Example: `-X debug:gc,jit`.
 - `--gc-stats [FILE]` — print a `cljrs_gc::GC_STATS` snapshot at program exit (allocations, region/bump usage, GC pause count + total duration, freed objects/bytes).  No value → stdout; with a path → that file.  Honoured by `run`, `eval`, and `test`.
+- `--jit-stats [FILE]` — print a JIT specialization / inline-cache counter snapshot at program exit (boxed arithmetic bridge calls, entry-guard deopts, keyword IC fills, protocol IC hits/misses; Phase 10.6, `cljrs_compiler::rt_abi::jit_stats`).  No value → stdout; with a path → that file.  Honoured by `run`, `eval`, and `test`.
 
 ---
 

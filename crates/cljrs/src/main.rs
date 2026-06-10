@@ -69,6 +69,19 @@ struct Cli {
     )]
     gc_stats: Option<String>,
 
+    /// Print JIT specialization / inline-cache statistics on exit (Phase
+    /// 10.6).  Pass a path to write them to a file; pass the flag without a
+    /// value to write them to stdout.  Only the `run`, `eval`, and `test`
+    /// subcommands honour this flag.
+    #[arg(
+        long = "jit-stats",
+        global = true,
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "",
+    )]
+    jit_stats: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -310,6 +323,7 @@ fn run(cli: Cli) -> miette::Result<i32> {
     init_jit(cli.jit_threshold.as_ref().copied());
 
     let gc_stats_target = cli.gc_stats.clone();
+    let jit_stats_target = cli.jit_stats.clone();
     let verify_commit_signatures = cli.verify_commit_signatures;
     let supports_gc_stats = matches!(
         &cli.command,
@@ -324,8 +338,29 @@ fn run(cli: Cli) -> miette::Result<i32> {
     {
         eprintln!("cljrs: failed to write GC stats: {e}");
     }
+    if supports_gc_stats
+        && let Some(target) = jit_stats_target.as_deref()
+        && let Err(e) = write_jit_stats(target)
+    {
+        eprintln!("cljrs: failed to write JIT stats: {e}");
+    }
 
     result
+}
+
+/// Write a snapshot of the JIT specialization / inline-cache counters
+/// (`cljrs_compiler::rt_abi::jit_stats`) to `target`.
+///
+/// An empty target (the flag was passed without a value) writes to stdout;
+/// any other value is treated as a filesystem path.
+fn write_jit_stats(target: &str) -> std::io::Result<()> {
+    let snapshot = cljrs_compiler::rt_abi::jit_stats::snapshot();
+    if target.is_empty() {
+        println!("{snapshot}");
+        Ok(())
+    } else {
+        std::fs::write(target, snapshot)
+    }
 }
 
 /// Initialise the JIT tier based on CLI flags and env vars.

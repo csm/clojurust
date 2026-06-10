@@ -123,6 +123,27 @@ impl Protocol {
     }
 }
 
+/// Global protocol-extension generation, bumped on every `impls` mutation
+/// (`extend-type`, `extend-protocol`, `defrecord`/`reify` inline impls).
+///
+/// Inline caches for protocol dispatch (Phase 10.6, `rt_call_ic` in
+/// `cljrs-compiler`'s rt_abi) tag each cached `(dispatch type → impl fn)`
+/// entry with the generation observed at fill time; a later bump invalidates
+/// every cache entry at once, so re-extending a protocol mid-session is
+/// picked up on the next dispatch through any call site.
+static PROTOCOL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current protocol-extension generation (see [`bump_protocol_generation`]).
+pub fn protocol_generation() -> u64 {
+    PROTOCOL_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Invalidate all protocol-dispatch inline caches.  Must be called after
+/// every mutation of any [`Protocol::impls`] map.
+pub fn bump_protocol_generation() {
+    PROTOCOL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 impl cljrs_gc::Trace for Protocol {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {

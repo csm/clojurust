@@ -225,13 +225,19 @@ pub unsafe extern "C" fn rt_const_string(ptr: *const u8, len: u64) -> *const Val
 
 /// Create a keyword.  `ptr`/`len` is the simple name (no colon prefix).
 ///
+/// Interned globally (Phase 10.6): every distinct keyword literal is boxed
+/// once per process and permanently rooted, instead of allocating a fresh
+/// `Value::Keyword` on every execution of the constant.  This is also what
+/// makes the keyword-constant inline cache sound — the cached pointer can
+/// never be swept.
+///
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
-    box_val(Value::Keyword(GcPtr::new(Keyword::simple(name))))
+    intern_keyword(name)
 }
 
 /// Create a symbol.  `ptr`/`len` is the simple name.
@@ -266,6 +272,7 @@ pub unsafe extern "C" fn rt_truthiness(v: *const Value) -> u8 {
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -281,6 +288,7 @@ pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -296,6 +304,7 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -311,6 +320,7 @@ pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -326,6 +336,7 @@ pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -341,6 +352,7 @@ pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     intern_bool(a == b)
@@ -350,6 +362,7 @@ pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -366,6 +379,7 @@ pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -382,6 +396,7 @@ pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -398,6 +413,7 @@ pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -3651,6 +3667,369 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_vec as *const () as usize);
     std::hint::black_box(rt_mapcat as *const () as usize);
     std::hint::black_box(rt_repeatedly as *const () as usize);
+    std::hint::black_box(rt_value_tag as *const () as usize);
+    std::hint::black_box(rt_unbox_long as *const () as usize);
+    std::hint::black_box(rt_unbox_double as *const () as usize);
+    std::hint::black_box(rt_box_bool as *const () as usize);
+    std::hint::black_box(rt_deopt as *const () as usize);
+    std::hint::black_box(rt_kw_ic_fill as *const () as usize);
+    std::hint::black_box(rt_call_ic as *const () as usize);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 10.6 — specialization & inline caches
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Runtime-type tag classes used by specialization entry guards
+/// (`rt_value_tag` result; must match `codegen.rs`'s guard constants).
+pub const TAG_OTHER: i64 = 0;
+pub const TAG_LONG: i64 = 1;
+pub const TAG_DOUBLE: i64 = 2;
+pub const TAG_BOOL: i64 = 3;
+pub const TAG_NIL: i64 = 4;
+
+/// Classify a value's runtime type for specialization guards.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_value_tag(v: *const Value) -> i64 {
+    match unsafe { val_ref(v) } {
+        Value::Long(_) => TAG_LONG,
+        Value::Double(_) => TAG_DOUBLE,
+        Value::Bool(_) => TAG_BOOL,
+        Value::Nil => TAG_NIL,
+        _ => TAG_OTHER,
+    }
+}
+
+/// Extract the raw `i64` payload of a `Value::Long`.
+///
+/// Only emitted after a successful `rt_value_tag(v) == TAG_LONG` guard.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_long(v: *const Value) -> i64 {
+    match unsafe { val_ref(v) } {
+        Value::Long(n) => *n,
+        _ => 0,
+    }
+}
+
+/// Extract the raw `f64` payload of a `Value::Double`.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_double(v: *const Value) -> f64 {
+    match unsafe { val_ref(v) } {
+        Value::Double(n) => *n,
+        _ => 0.0,
+    }
+}
+
+/// Box a raw boolean (0/1) as an interned `Value::Bool`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
+    intern_bool(b != 0)
+}
+
+/// The deoptimization sentinel: a unique, process-lifetime `Value` address
+/// that compiled code can never produce as an ordinary result.
+///
+/// A specialized function whose entry type guard fails returns this pointer;
+/// the dispatch seam (`call_jit_native`, cljrs-eval/src/apply.rs) compares
+/// the raw result address against it and, on a match, re-executes the call at
+/// Tier 1.  The sentinel is `Box::leak`ed — deliberately **not** a GC heap
+/// object — so it can never be swept, reused, or aliased by a real result.
+fn deopt_sentinel() -> *const Value {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    *PTR.get_or_init(|| Box::leak(Box::new(Value::Nil)) as *const Value as usize) as *const Value
+}
+
+/// Address of the deopt sentinel, for the dispatch seam's pointer compare
+/// (installed into `cljrs_eval::jit_state` as a hook by `cljrs_jit::init`).
+pub fn deopt_sentinel_addr() -> usize {
+    deopt_sentinel() as usize
+}
+
+/// Entry-guard failure: count it and return the deopt sentinel.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_deopt() -> *const Value {
+    jit_stats::GUARD_DEOPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    deopt_sentinel()
+}
+
+// ── Specialization / IC statistics ───────────────────────────────────────────
+
+/// Counters behind `--jit-stats` and the Phase 10.6 milestone tests.  All
+/// relaxed: they are diagnostics, never control flow.
+pub mod jit_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Boxed arithmetic/comparison bridge calls (`rt_add`, `rt_lt`, …).
+    /// Unboxed compiled code stops bumping this — the unboxing evidence.
+    pub static BOXED_ARITH_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Specialization entry-guard failures (deopts to Tier 1).
+    pub static GUARD_DEOPTS: AtomicU64 = AtomicU64::new(0);
+    /// Keyword-constant inline-cache fills (slow path; once per call site).
+    pub static KW_IC_FILLS: AtomicU64 = AtomicU64::new(0);
+    /// Protocol-dispatch inline-cache hits / misses in `rt_call_ic`.
+    pub static PROTO_IC_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static PROTO_IC_MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// Human-readable snapshot (written by `cljrs --jit-stats`).
+    pub fn snapshot() -> String {
+        format!(
+            "JIT specialization stats:\n  Boxed arith calls:    {}\n  Guard deopts:         {}\n  Keyword IC fills:     {}\n  Protocol IC hits:     {}\n  Protocol IC misses:   {}\n",
+            BOXED_ARITH_CALLS.load(Ordering::Relaxed),
+            GUARD_DEOPTS.load(Ordering::Relaxed),
+            KW_IC_FILLS.load(Ordering::Relaxed),
+            PROTO_IC_HITS.load(Ordering::Relaxed),
+            PROTO_IC_MISSES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[inline]
+fn bump_boxed_arith() {
+    jit_stats::BOXED_ARITH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── IC value registry (GC rooting for cached values) ─────────────────────────
+//
+// Inline-cache slots live in compiled-module data sections, invisible to the
+// collector.  Every Value an IC hands back to compiled code (interned keyword
+// constants) or holds for later dispatch (cached protocol impl fns) is
+// therefore *also* owned by the global tables below, and a root tracer
+// registered on each allocating thread's heap keeps those objects alive
+// permanently.  Both tables are bounded: keyword constants by the program's
+// distinct keyword literals, protocol IC entries by compiled call sites.
+
+/// A `GcPtr<Value>` shared through a global table.
+///
+/// SAFETY: the pointee is immutable after construction and kept alive by the
+/// table's root tracer; collections are stop-the-world, so cross-thread reads
+/// of the pointer never race a sweep.
+struct SharedVal(GcPtr<Value>);
+unsafe impl Send for SharedVal {}
+unsafe impl Sync for SharedVal {}
+
+/// One protocol-dispatch inline-cache entry (per compiled call site).
+struct ProtoIcEntry {
+    /// Identity of the `ProtocolFn` this site last dispatched (the
+    /// `GcPtr<ProtocolFn>` target address).
+    callee: usize,
+    /// `cljrs_value::protocol_generation()` at fill time.
+    generation: u64,
+    /// Dispatch type tag of the cached impl.
+    tag: Arc<str>,
+    /// The resolved impl fn.  Rooted by the IC root tracer.
+    impl_fn: Value,
+}
+
+/// SAFETY: same argument as [`SharedVal`]; the entry is only read/replaced
+/// under its `Mutex`.
+struct ProtoIcCell(std::sync::Mutex<Option<ProtoIcEntry>>);
+unsafe impl Send for ProtoIcCell {}
+unsafe impl Sync for ProtoIcCell {}
+
+use std::sync::RwLock;
+
+static KW_INTERN: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> = OnceLock::new();
+static PROTO_ICS: OnceLock<RwLock<Vec<Arc<ProtoIcCell>>>> = OnceLock::new();
+
+fn kw_intern_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
+    KW_INTERN.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn proto_ic_table() -> &'static RwLock<Vec<Arc<ProtoIcCell>>> {
+    PROTO_ICS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+thread_local! {
+    static IC_TRACER_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Register the IC root tracer on the current thread's heap (once per
+/// thread).  Must be called by any thread that *allocates* into the IC
+/// tables — only the owning thread's collector can free its objects, so the
+/// tracer has to run there.
+fn ensure_ic_tracer_registered() {
+    IC_TRACER_REGISTERED.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        flag.set(true);
+        cljrs_gc::HEAP.register_root_tracer(|visitor| {
+            use cljrs_gc::{GcVisitor as _, Trace as _};
+            if let Some(table) = KW_INTERN.get() {
+                for v in table.read().unwrap().values() {
+                    visitor.visit(&v.0);
+                }
+            }
+            if let Some(ics) = PROTO_ICS.get() {
+                for cell in ics.read().unwrap().iter() {
+                    if let Some(entry) = cell.0.lock().unwrap().as_ref() {
+                        entry.impl_fn.trace(visitor);
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// Intern a keyword `Value` by name, returning a stable, permanently rooted
+/// pointer.  Every call site (and `rt_const_keyword` itself) shares one
+/// allocation per distinct keyword instead of boxing a fresh
+/// `Value::Keyword` per execution.
+fn intern_keyword(name: &str) -> *const Value {
+    if let Some(v) = kw_intern_table().read().unwrap().get(name) {
+        return v.0.get() as *const Value;
+    }
+    ensure_ic_tracer_registered();
+    let mut table = kw_intern_table().write().unwrap();
+    // Re-check under the write lock so a racing intern of the same name
+    // cannot replace (and un-root) a pointer already handed out.
+    if let Some(v) = table.get(name) {
+        return v.0.get() as *const Value;
+    }
+    let ptr = GcPtr::new(Value::Keyword(GcPtr::new(Keyword::simple(name))));
+    let raw = ptr.get() as *const Value;
+    table.insert(name.to_string(), SharedVal(ptr));
+    raw
+}
+
+/// Keyword-constant inline-cache fill (slow path, once per call site).
+///
+/// Compiled code keeps an 8-byte writable slot per `Const::Keyword` site:
+/// the fast path is an inline load + branch on the slot; on the first
+/// execution the slot is zero and this fill interns the keyword, stores the
+/// stable pointer into the slot, and returns it.
+///
+/// # Safety
+/// `ptr`/`len` must describe valid UTF-8; `slot` must point to the call
+/// site's 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usize) -> *const Value {
+    jit_stats::KW_IC_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let name = std::str::from_utf8(bytes).unwrap_or("??");
+    let interned = intern_keyword(name);
+    // Plain (possibly racy) store: every filler stores the same interned
+    // pointer, and aligned 8-byte stores cannot tear.
+    unsafe { *slot = interned as usize };
+    interned
+}
+
+/// Invoke `callee` with already-cloned args, boxing the result and stashing a
+/// thrown value exactly like `rt_call` (shared tail of the call bridges).
+fn invoke_boxed(callee: &Value, args: Vec<Value>) -> *const Value {
+    match cljrs_env::callback::invoke(callee, args) {
+        Ok(result) => box_invoke_result(result),
+        Err(cljrs_value::ValueError::Thrown(val)) => {
+            stash_pending_exception(val);
+            rt_const_nil()
+        }
+        Err(_e) => rt_const_nil(),
+    }
+}
+
+/// `rt_call` with a per-call-site inline cache for protocol dispatch.
+///
+/// For a `Value::ProtocolFn` callee, the uncached path computes the dispatch
+/// type tag (allocating an `Arc<str>`), locks the protocol's impl map, and
+/// performs two hash lookups — on *every* call.  This bridge caches the
+/// resolved `(callee, dispatch tag) → impl fn` per call site, validated by
+/// the global protocol generation (bumped on every `extend-type` /
+/// `extend-protocol` / inline impl), and on a hit invokes the impl directly.
+/// Non-protocol callees fall through to `rt_call` unchanged.
+///
+/// `slot` holds `0` (empty) or `index + 1` into the global IC entry table —
+/// never a GC pointer, so compiled modules stay free of GC roots.
+///
+/// # Safety
+/// Same contract as `rt_call`, plus `slot` must point to the call site's
+/// 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_call_ic(
+    callee: *const Value,
+    args: *const *const Value,
+    nargs: u64,
+    slot: *mut usize,
+) -> *const Value {
+    let callee_ref = unsafe { val_ref(callee) };
+    if let Value::ProtocolFn(pf) = callee_ref
+        && nargs >= 1
+    {
+        let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs as usize) };
+        let dispatch_val = unsafe { val_ref(arg_slice[0]) };
+        let generation = cljrs_value::protocol_generation();
+        let callee_id = pf.get() as *const _ as usize;
+
+        // Fast path: validate the cached entry.
+        let idx = unsafe { *slot };
+        if idx != 0 {
+            let cell = {
+                let table = proto_ic_table().read().unwrap();
+                table.get(idx - 1).cloned()
+            };
+            if let Some(cell) = cell {
+                let guard = cell.0.lock().unwrap();
+                if let Some(entry) = guard.as_ref()
+                    && entry.callee == callee_id
+                    && entry.generation == generation
+                    && cljrs_env::apply::type_tag_matches(dispatch_val, &entry.tag)
+                {
+                    let impl_fn = entry.impl_fn.clone();
+                    drop(guard);
+                    jit_stats::PROTO_IC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
+                }
+            }
+        }
+
+        // Miss: resolve the impl the same way `apply_value` does, refill the
+        // cache, and invoke directly.  An unimplemented type falls through to
+        // `rt_call` for the canonical error path.
+        jit_stats::PROTO_IC_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tag = cljrs_env::apply::type_tag_of(dispatch_val);
+        let pf_ref = pf.get();
+        let impl_fn = {
+            let impls = pf_ref.protocol.get().impls.lock().unwrap();
+            impls
+                .get(tag.as_ref())
+                .and_then(|m| m.get(pf_ref.method_name.as_ref()))
+                .cloned()
+        };
+        if let Some(impl_fn) = impl_fn {
+            ensure_ic_tracer_registered();
+            let entry = ProtoIcEntry {
+                callee: callee_id,
+                generation,
+                tag,
+                impl_fn: impl_fn.clone(),
+            };
+            if idx != 0 {
+                let cell = {
+                    let table = proto_ic_table().read().unwrap();
+                    table.get(idx - 1).cloned()
+                };
+                if let Some(cell) = cell {
+                    *cell.0.lock().unwrap() = Some(entry);
+                }
+            } else {
+                let mut table = proto_ic_table().write().unwrap();
+                table.push(Arc::new(ProtoIcCell(std::sync::Mutex::new(Some(entry)))));
+                let new_idx = table.len(); // index + 1
+                drop(table);
+                unsafe { *slot = new_idx };
+            }
+            return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
+        }
+    }
+    unsafe { rt_call(callee, args, nargs) }
 }
 
 #[cfg(test)]

@@ -55,6 +55,54 @@ pub fn type_tag_of(val: &Value) -> Arc<str> {
     }
 }
 
+/// Allocation-free check that `val`'s protocol dispatch tag equals `tag`.
+///
+/// Must agree exactly with [`type_tag_of`] — it exists so inline caches
+/// (`rt_call_ic` in `cljrs-compiler`'s rt_abi) can validate a cached dispatch
+/// tag on the hot path without building a fresh `Arc<str>` per call.
+pub fn type_tag_matches(val: &Value, tag: &str) -> bool {
+    match val {
+        Value::TypeInstance(ti) => &*ti.get().type_tag == tag,
+        Value::NativeObject(obj) => obj.get().type_tag() == tag,
+        _ => {
+            // All remaining variants map to a static tag; compare without
+            // allocating.  `type_tag_of` is the source of truth.
+            match val {
+                Value::Nil => "nil",
+                Value::Bool(_) => "Boolean",
+                Value::Long(_) => "Long",
+                Value::Double(_) => "Double",
+                Value::BigInt(_) => "BigInt",
+                Value::BigDecimal(_) => "BigDecimal",
+                Value::Ratio(_) => "Ratio",
+                Value::Char(_) => "Character",
+                Value::Str(_) => "String",
+                Value::Keyword(_) => "Keyword",
+                Value::Symbol(_) => "Symbol",
+                Value::List(_) | Value::Cons(_) | Value::LazySeq(_) => "List",
+                Value::Vector(_) => "Vector",
+                Value::Map(_) => "Map",
+                Value::Set(_) => "Set",
+                Value::Fn(_)
+                | Value::NativeFunction(_)
+                | Value::ProtocolFn(_)
+                | Value::MultiFn(_) => "Fn",
+                Value::Atom(_) => "Atom",
+                Value::Var(_) => "Var",
+                Value::Protocol(_) => "Protocol",
+                Value::Volatile(_) => "Volatile",
+                Value::Delay(_) => "Delay",
+                Value::Promise(_) => "Promise",
+                Value::Future(_) => "Future",
+                Value::Agent(_) => "Agent",
+                Value::Resource(_) => "Resource",
+                _ => "Object",
+            }
+        }
+        .eq(tag),
+    }
+}
+
 /// If `callee` is an `^:async` Clojure function and an async runtime is
 /// registered, spawn its body as a task and return a `Value::Future`.
 ///

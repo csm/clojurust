@@ -87,6 +87,12 @@ pub fn init() {
         cljrs_compiler::rt_abi::take_pending_exception_value,
     );
 
+    // Deoptimization (Phase 10.6): a specialized compilation's failed entry
+    // guard returns rt_abi's sentinel pointer; the dispatch seam compares
+    // result addresses against it via this hook and re-runs the call at
+    // Tier 1.
+    cljrs_eval::jit_state::set_deopt_sentinel_hook(cljrs_compiler::rt_abi::deopt_sentinel_addr);
+
     // Closure escape: when JIT code materializes a closure via `rt_make_fn*`,
     // the resulting GC-managed value captures a raw pointer into the executing
     // module.  The frame scan cannot see such values, so pin the module's

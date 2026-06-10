@@ -67,7 +67,7 @@ fn osr_entry_compiles_and_resumes_natively_mid_loop() {
     );
 
     let compiled =
-        crate::jit_compiler::compile_jit("__cljrs_jit_osr_test", &osr.func).expect("compile");
+        crate::jit_compiler::compile_jit("__cljrs_jit_osr_test", &osr.func, &[]).expect("compile");
     let fn_ptr = compiled.fn_ptr;
     let epoch = crate::code_cache::register(0xC0DE_0540, compiled);
 
