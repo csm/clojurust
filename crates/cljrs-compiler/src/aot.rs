@@ -1032,24 +1032,66 @@ fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResul
     Ok(())
 }
 
-/// Walk up from the current directory to find the workspace root
-/// (the directory containing Cargo.toml with [workspace]).
+/// Locate the clojurust workspace root — the directory whose `Cargo.toml`
+/// declares the `[workspace]` that owns the `cljrs-*` crates the generated
+/// harness depends on.
+///
+/// The harness references the runtime crates by absolute path
+/// (`<workspace>/crates/cljrs-*`), so we must find that *specific* checkout,
+/// not merely "some" enclosing Cargo workspace.  Resolution order:
+///
+/// 1. `CLJRS_WORKSPACE_ROOT` env var — an explicit override for unusual
+///    layouts (e.g. an installed `cljrs` pointed at a relocated source tree).
+/// 2. The compiler crate's own compile-time location.  `cljrs-compiler` lives
+///    at `<workspace>/crates/cljrs-compiler`, so its `CARGO_MANIFEST_DIR` is
+///    two levels below the root.  This works no matter the current directory,
+///    which is what lets `cljrs compile` run on a *bare* `.cljrs` file with no
+///    surrounding Cargo workspace.
+/// 3. As a last resort, walk up from the current directory.  This keeps
+///    working in exotic setups where the source tree was moved after build
+///    but the user runs `cljrs` from inside the checkout.
 fn find_workspace_root() -> AotResult<PathBuf> {
+    // 1. Explicit override.
+    if let Some(root) = std::env::var_os("CLJRS_WORKSPACE_ROOT") {
+        let dir = PathBuf::from(root);
+        if is_workspace_manifest(&dir.join("Cargo.toml")) {
+            return Ok(dir);
+        }
+        return Err(AotError::Link(format!(
+            "CLJRS_WORKSPACE_ROOT={} does not contain a Cargo.toml with [workspace]",
+            dir.display()
+        )));
+    }
+
+    // 2. Compile-time location of this crate: <workspace>/crates/cljrs-compiler.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(root) = manifest_dir.parent().and_then(Path::parent)
+        && is_workspace_manifest(&root.join("Cargo.toml"))
+    {
+        return Ok(root.to_path_buf());
+    }
+
+    // 3. Walk up from the current directory.
     let mut dir = std::env::current_dir()?;
     loop {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            let contents = std::fs::read_to_string(&cargo_toml)?;
-            if contents.contains("[workspace") {
-                return Ok(dir);
-            }
+        if is_workspace_manifest(&dir.join("Cargo.toml")) {
+            return Ok(dir);
         }
         if !dir.pop() {
             return Err(AotError::Link(
-                "could not find workspace root (no Cargo.toml with [workspace])".to_string(),
+                "could not find the clojurust workspace root (no Cargo.toml with [workspace]); \
+                 set CLJRS_WORKSPACE_ROOT to point at your clojurust checkout"
+                    .to_string(),
             ));
         }
     }
+}
+
+/// Returns true when `cargo_toml` exists and declares a `[workspace]` table.
+fn is_workspace_manifest(cargo_toml: &Path) -> bool {
+    std::fs::read_to_string(cargo_toml)
+        .map(|contents| contents.contains("[workspace"))
+        .unwrap_or(false)
 }
 
 // ── Test harness generation ─────────────────────────────────────────────────
