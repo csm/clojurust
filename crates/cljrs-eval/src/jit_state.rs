@@ -143,6 +143,37 @@ pub fn take_native_epoch(arity_id: u64) -> Option<u64> {
     }
 }
 
+// ── Stale-epoch hook ──────────────────────────────────────────────────────────
+//
+// Routing staled module epochs to the JIT's code cache without depending on
+// `cljrs-jit`: the JIT installs `code_cache::mark_stale` here at init.
+
+type StaleEpochFn = fn(u64);
+static STALE_EPOCH_HOOK: OnceLock<StaleEpochFn> = OnceLock::new();
+
+/// Install the stale-epoch sink (installed once by `cljrs_jit::init`).
+pub fn set_stale_epoch_hook(f: StaleEpochFn) {
+    let _ = STALE_EPOCH_HOOK.set(f);
+}
+
+/// Null any published native code for `arity_id` (whole-function and OSR
+/// entries) and hand the backing epochs to the code cache for reclamation.
+///
+/// Used by cross-defn invalidation; a no-op when nothing was compiled or no
+/// JIT is linked.
+pub fn stale_native_code(arity_id: u64) {
+    let mut epochs = Vec::new();
+    if let Some(epoch) = take_native_epoch(arity_id) {
+        epochs.push(epoch);
+    }
+    epochs.extend(take_osr_epochs(arity_id));
+    if let Some(hook) = STALE_EPOCH_HOOK.get() {
+        for epoch in epochs {
+            hook(epoch);
+        }
+    }
+}
+
 // ── Enqueue hook ──────────────────────────────────────────────────────────────
 
 type EnqueueFn = Box<dyn Fn(u64, Arc<IrFunction>) + Send + Sync + 'static>;

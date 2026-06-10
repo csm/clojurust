@@ -204,7 +204,7 @@ fn resolve<'r>(
     arg_count: usize,
     var_defs: &HashMap<VarId, &Inst>,
     defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
-    registry: &'r HashMap<Arc<str>, IrFunction>,
+    registry: &'r HashMap<Arc<str>, Arc<IrFunction>>,
 ) -> Option<(Arc<str>, &'r IrFunction)> {
     // callee_var must be defined by LoadGlobal in the same function.
     let fn_name = match var_defs.get(&callee_var)? {
@@ -221,7 +221,7 @@ fn resolve<'r>(
         _ => return None,
     };
     let callee = registry.get(&fn_name)?;
-    Some((fn_name, callee))
+    Some((fn_name, callee.as_ref()))
 }
 
 // ── Core inline operation ────────────────────────────────────────────────────
@@ -402,7 +402,7 @@ fn terminator_targets(term: &Terminator) -> Vec<BlockId> {
 /// Returns `(updated_func, changed)`.
 fn inline_one_round(
     mut func: IrFunction,
-    registry: &HashMap<Arc<str>, IrFunction>,
+    registry: &HashMap<Arc<str>, Arc<IrFunction>>,
     defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
     forbidden: &HashSet<Arc<str>>,
 ) -> (IrFunction, bool) {
@@ -460,7 +460,7 @@ fn inline_one_round(
 /// Run the inlining pass on one `IrFunction` (subfunctions handled separately).
 fn inline_fn(
     func: IrFunction,
-    registry: &HashMap<Arc<str>, IrFunction>,
+    registry: &HashMap<Arc<str>, Arc<IrFunction>>,
     defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
     forbidden: &HashSet<Arc<str>>,
 ) -> IrFunction {
@@ -478,7 +478,7 @@ fn inline_fn(
 /// Walk the function tree bottom-up, inlining at each level.
 fn inline_tree(
     mut func: IrFunction,
-    registry: &HashMap<Arc<str>, IrFunction>,
+    registry: &HashMap<Arc<str>, Arc<IrFunction>>,
     defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
 ) -> IrFunction {
     // Bottom-up: process subfunctions first.

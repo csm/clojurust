@@ -67,3 +67,15 @@ pub fn store_unsupported(id: u64) {
     let cache = guard.get_or_insert_with(HashMap::new);
     cache.insert(id, IrCacheEntry::Unsupported);
 }
+
+/// Drop the cache entry for an arity entirely (back to `NotAttempted`), so a
+/// later [`should_attempt`] returns `true` and the arity can be re-lowered.
+///
+/// Used by cross-defn invalidation: a lowering that specialized against
+/// another defn is stale once that defn is rebound.
+pub fn invalidate(id: u64) {
+    let mut guard = IR_CACHE.write().unwrap();
+    if let Some(cache) = guard.as_mut() {
+        cache.remove(&id);
+    }
+}

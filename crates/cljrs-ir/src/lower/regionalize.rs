@@ -29,7 +29,7 @@ use crate::{Inst, IrFunction, KnownFn, RegionAllocKind, VarId};
 
 use super::escape::{
     ClosureInfo, EscapeContext, EscapeMode, EscapeState, UseInfo, UseKind, build_use_chains,
-    build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes,
+    build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes, lookup_defn,
 };
 use super::optimize::{
     blocks_on_path, collect_use_blocks, dominators, has_back_edge, lca_of_many, post_dominators,
@@ -58,20 +58,21 @@ struct Candidate {
 // ── Resolution helpers ──────────────────────────────────────────────────────
 
 /// Walk `(LoadGlobal | Deref(LoadGlobal|LoadVar))` and look up the callee
-/// function via `defn_map`.  Returns the arity-fn name matching the call's
-/// arg count (non-variadic only).
+/// function via the context's defn-map (recording external hits for
+/// invalidation).  Returns the arity-fn name matching the call's arg count
+/// (non-variadic only).
 fn resolve_callee_name(
     callee_var: VarId,
     arg_count: usize,
     var_defs: &HashMap<VarId, &Inst>,
-    defn_map: &HashMap<(Arc<str>, Arc<str>), ClosureInfo>,
+    ctx: &EscapeContext,
 ) -> Option<Arc<str>> {
     let def_inst = var_defs.get(&callee_var)?;
     let info: &ClosureInfo = match def_inst {
-        Inst::LoadGlobal(_, ns, name) => defn_map.get(&(ns.clone(), name.clone()))?,
+        Inst::LoadGlobal(_, ns, name) => lookup_defn(ctx, ns, name)?,
         Inst::Deref(_, src) => match var_defs.get(src)? {
             Inst::LoadGlobal(_, ns, name) | Inst::LoadVar(_, ns, name) => {
-                defn_map.get(&(ns.clone(), name.clone()))?
+                lookup_defn(ctx, ns, name)?
             }
             _ => return None,
         },
@@ -578,7 +579,7 @@ fn collect_candidates_in(
                 continue;
             }
             let Some(callee_name) =
-                resolve_callee_name(*callee, args.len(), &var_defs, &ctx.defn_map)
+                resolve_callee_name(*callee, args.len(), &var_defs, ctx)
             else {
                 continue;
             };

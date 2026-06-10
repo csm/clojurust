@@ -6,7 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::escape::{EscapeContext, EscapeState, analyze, build_use_chains, make_context};
+use std::sync::Arc;
+
+use super::escape::{
+    EscapeContext, EscapeState, analyze, build_use_chains, make_context_with_externals,
+};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
@@ -407,9 +411,9 @@ fn emit_region_for_alloc(
     }
 
     let region_var = VarId(*next_var);
-    *next_var += 1;
 
     // Rewrite the alloc instruction in alloc_block → RegionAlloc
+    let mut rewrote = false;
     for block in &mut ir_func.blocks {
         if block.id == alloc_block {
             for inst in &mut block.insts {
@@ -418,10 +422,18 @@ fn emit_region_for_alloc(
                 {
                     let operands = alloc_operands(inst);
                     *inst = Inst::RegionAlloc(alloc_var, region_var, kind, operands);
+                    rewrote = true;
                 }
             }
         }
     }
+    // A non-promotable alloc (e.g. a closure) must not leave an *empty*
+    // scope behind: in compiled code any escaping collection boxed while the
+    // scope is active (`box_coll_val`) would die at its RegionEnd.
+    if !rewrote {
+        return ir_func;
+    }
+    *next_var += 1;
 
     // Insert RegionStart at head of `start` block
     for block in &mut ir_func.blocks {
@@ -771,17 +783,36 @@ fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
 ///      bodies of provably scalar-returning functions so their intermediate
 ///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
+    optimize_with_externals(ir_func, &[]).0
+}
+
+/// Like [`optimize`], but makes previously-lowered defns from *other* lowering
+/// units visible to escape analysis and stage-4 cross-function promotion.
+///
+/// Returns the optimized tree plus the `(ns, name)` set of externals the
+/// passes actually consulted — the caller must invalidate this lowering when
+/// any of them is redefined, because stage 4 clones the external's body into
+/// the tree (and escape summaries derived from it shaped the optimization).
+pub fn optimize_with_externals(
+    ir_func: IrFunction,
+    externals: &[super::escape::ExternalDefn],
+) -> (IrFunction, HashSet<(Arc<str>, Arc<str>)>) {
     let ir_func = fuse_eager_hofs(ir_func);
+    // Inlining is deliberately unit-local (it builds its own registry):
+    // splicing an external body into the caller would carry the same
+    // staleness obligations for a much larger set of call shapes.
     let ir_func = inline_pass(ir_func);
-    let ctx = make_context(&ir_func);
+    let ctx = make_context_with_externals(&ir_func, externals);
     let ir_func = optimize_tree(ir_func, &ctx);
+    let mut used = ctx.take_used_externals();
 
     // Stage 4 needs a fresh analysis context because the local pass may have
     // rewritten allocations (and added blocks), invalidating the cached
     // per-function summaries the original `ctx` carries.
-    let ctx2 = make_context(&ir_func);
+    let ctx2 = make_context_with_externals(&ir_func, externals);
     let ir_func = promote_cross_fn_allocs(ir_func, &ctx2);
+    used.extend(ctx2.take_used_externals());
 
     // Stage 5: function-scope regions for scalar-returning functions.
-    wrap_scalar_returning(ir_func)
+    (wrap_scalar_returning(ir_func), used)
 }
