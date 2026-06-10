@@ -26,11 +26,14 @@
 //! `CLJRS_JIT_THRESHOLD`, default 1000) are compiled in the background;
 //! subsequent calls dispatch directly to native code.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use cljrs_ir::IrFunction;
+use cljrs_value::Value;
 
+pub mod code_cache;
 mod jit_compiler;
 mod jit_worker;
 
@@ -61,6 +64,51 @@ pub fn init() {
         let _ = tx.try_send(jit_worker::CompileRequest { arity_id, ir_func });
     });
 
+    // Code unloading (Phase 10.2):
+    //
+    // 1. When a var holding a function is redefined, mark the old definition's
+    //    compiled arities stale and stop dispatching to them.
+    cljrs_value::set_var_rebind_hook(on_var_rebind);
+    // 2. At each stop-the-world GC safepoint, reclaim stale modules that no
+    //    frame is executing.
+    cljrs_eval::set_stw_reclaim_hook(|| {
+        code_cache::reclaim_at_stw();
+    });
+
     // Spawn the background compilation thread.
     jit_worker::start_worker(rx);
+}
+
+/// Var-rebind hook: stale the native code of any arity that the *old* function
+/// value carried but the *new* value does not.
+///
+/// Nulling the dispatch pointer ([`jit_state::take_native_epoch`]) makes future
+/// calls fall back to the interpreter immediately; the returned epoch is handed
+/// to the code cache for reclamation once no frame is executing it.
+fn on_var_rebind(old: &Value, new: &Value) {
+    let old_fn = match old {
+        Value::Fn(f) => f,
+        _ => return,
+    };
+    // Arities still present in the new binding must not be staled (e.g. when a
+    // var is rebound to the same function object).
+    let new_ids: HashSet<u64> = arity_ids(new);
+    for arity in &old_fn.get().arities {
+        let id = arity.ir_arity_id;
+        if new_ids.contains(&id) {
+            continue;
+        }
+        if let Some(epoch) = cljrs_eval::jit_state::take_native_epoch(id) {
+            code_cache::mark_stale(epoch);
+        }
+    }
+}
+
+/// Collect the set of `ir_arity_id`s carried by a function value (empty for
+/// non-function values).
+fn arity_ids(value: &Value) -> HashSet<u64> {
+    match value {
+        Value::Fn(f) => f.get().arities.iter().map(|a| a.ir_arity_id).collect(),
+        _ => HashSet::new(),
+    }
 }

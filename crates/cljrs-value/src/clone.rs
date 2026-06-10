@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn fn_not_shareable() {
-        use crate::types::{Arity, CljxFn, NativeFn};
+        use crate::types::{Arity, NativeFn};
         let nf = Value::NativeFunction(GcPtr::new(NativeFn::new("test", Arity::Fixed(0), |_| {
             Ok(Value::Nil)
         })));

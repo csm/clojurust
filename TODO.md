@@ -397,8 +397,8 @@ Foundations already in place:
 
 ### Phase 10.2 — Code unloading
 
-- [ ] Per-version code tagged with `ir_arity_id` + epoch; mark prior arity stale on redefinition
-- [ ] Reclaim stale epochs at the existing STW safepoint, freeing only epochs with no live JIT frame (resolves the unload-vs-execute race)
+- [x] Per-version code tagged with `ir_arity_id` + epoch; mark prior arity stale on redefinition (var-rebind hook in `cljrs-value` `Var::bind` → `cljrs-jit` `on_var_rebind` → `code_cache::mark_stale`; dispatch pointer nulled so future calls fall back to the interpreter)
+- [x] Reclaim stale epochs at the existing STW safepoint, freeing only epochs with no live JIT frame (resolves the unload-vs-execute race) — per-thread active-frame tracking (`jit_state::push_jit_frame`/`live_epochs`) + `code_cache::reclaim_at_stw` (calls `JITModule::free_memory`), installed via `set_stw_reclaim_hook`
 
 ### Phase 10.3 — Shrink the interpreter seam (ROI order)
 

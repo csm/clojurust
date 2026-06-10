@@ -9,17 +9,21 @@ use cljrs_ir::IrFunction;
 
 /// A successfully compiled JIT function.
 ///
-/// The `JITModule` inside owns the executable memory; it must remain alive
-/// for as long as `fn_ptr` may be called.  Phase 10.2 implements unloading.
+/// The `JITModule` inside owns the executable memory; it must remain alive for
+/// as long as `fn_ptr` may be called.  The code cache (`code_cache.rs`) takes
+/// ownership and, once the code is stale and no frame executes it, reclaims the
+/// memory via [`JITModule::free_memory`] at a stop-the-world safepoint.
 pub(crate) struct CompiledFn {
     pub(crate) fn_ptr: *const (),
-    /// Keeps the executable memory alive.
-    pub(crate) _module: JITModule,
+    /// Owns the executable memory; reclaimed via `module.free_memory()`.
+    pub(crate) module: JITModule,
+    /// Machine-code size in bytes (for memory accounting / diagnostics).
+    pub(crate) code_size: u32,
 }
 
-// SAFETY: `fn_ptr` points into `JITModule`'s memory-mapped code section.
-// The JITModule is stored alongside the pointer and never freed here.
-// The function can be called from any thread that holds the pointer.
+// SAFETY: `fn_ptr` points into `JITModule`'s memory-mapped code section, which
+// the owned `JITModule` keeps alive.  The function can be called from any thread
+// that holds the pointer; the module is `Send`.
 unsafe impl Send for CompiledFn {}
 
 /// Compile `ir_func` to native code, returning the function pointer and the
@@ -50,6 +54,8 @@ pub(crate) fn compile_jit(arity_id: u64, ir_func: &IrFunction) -> Result<Compile
         .compile_function(ir_func, func_id)
         .map_err(|e| format!("compile_function: {e:?}"))?;
 
+    let code_size = compiler.last_code_size();
+
     let mut jit_module = compiler.into_inner_module();
 
     jit_module
@@ -60,7 +66,8 @@ pub(crate) fn compile_jit(arity_id: u64, ir_func: &IrFunction) -> Result<Compile
 
     Ok(CompiledFn {
         fn_ptr,
-        _module: jit_module,
+        module: jit_module,
+        code_size,
     })
 }
 

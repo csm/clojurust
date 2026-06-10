@@ -32,6 +32,8 @@ src/
   ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
   lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction
+  jit_state.rs    — JIT invocation counters, native-fn-pointer dispatch table (keyed by ir_arity_id),
+                    per-arity epoch, and active-frame tracking for code unloading (Phase 10.2)
 ```
 
 ---
@@ -97,6 +99,30 @@ pub mod lower {
 6. `eval_call` in `cljrs_interp` routes `Value::Fn` calls through `globals.call_cljrs_fn`
    (the registered hook) rather than calling the tree-walker directly, so IR-cached
    arities are used on direct call paths too
+7. JIT tier: before the IR cache, `call_cljrs_fn` checks `jit_state::get_native_fn(arity_id)`
+   for compiled native code and, if present, dispatches to it (rooting args + pushing a
+   frame epoch for code unloading first)
+
+## JIT state & code unloading (`jit_state`)
+
+`jit_state` is the seam between the Tier-1 interpreter and the background JIT
+(`cljrs-jit`). Public surface:
+
+```rust
+pub fn set_jit_threshold(t: u32);                 // calls before compile (default 1000)
+pub fn record_call(arity_id, ir_func);            // bump counter; enqueue when hot
+pub fn set_enqueue_hook(f);                        // installed by cljrs_jit::init
+pub fn store_native_fn(arity_id, ptr, epoch);      // worker publishes compiled code
+pub fn get_native_fn(arity_id) -> Option<(*const (), u64)>;   // (fn_ptr, epoch)
+pub fn take_native_epoch(arity_id) -> Option<u64>; // on redefinition: null ptr, drop entry, return epoch
+pub fn push_jit_frame(epoch) -> JitFrameGuard;     // mark a native frame live for its call
+pub fn live_epochs() -> HashSet<u64>;              // epochs with a live frame (call at STW only)
+pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
+```
+
+Each native call brackets itself with `push_jit_frame(epoch)` so the JIT code
+cache can free a superseded module only once no frame is executing it
+(`live_epochs` scanned at the stop-the-world GC safepoint).
 
 ## Special-form coverage in the IR interpreter
 

@@ -1,19 +1,20 @@
 //! Background JIT compilation worker thread.
 //!
 //! Receives compilation requests on a channel, compiles each `IrFunction` via
-//! Cranelift, and atomically publishes the result via
+//! Cranelift, hands the module to the epoch-tagged [`code_cache`](crate::code_cache),
+//! and atomically publishes the resulting function pointer + epoch via
 //! `cljrs_eval::jit_state::store_native_fn`.
 //!
-//! The compiled `JITModule`s are kept in a local `Vec` on the worker thread
-//! for the lifetime of the process.  Phase 10.2 will add epoch-tagged
-//! unloading at STW safepoints.
+//! Ownership of every compiled `JITModule` lives in the `code_cache`, which
+//! reclaims superseded modules at stop-the-world safepoints (Phase 10.2).
 
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use cljrs_ir::IrFunction;
 
-use crate::jit_compiler::{CompiledFn, compile_jit};
+use crate::code_cache;
+use crate::jit_compiler::compile_jit;
 
 pub(crate) struct CompileRequest {
     pub(crate) arity_id: u64,
@@ -29,26 +30,25 @@ pub(crate) fn start_worker(rx: Receiver<CompileRequest>) {
 }
 
 fn worker_loop(rx: Receiver<CompileRequest>) {
-    // Keep JITModules alive here so their executable memory is never freed.
-    // Function pointers stored in jit_state remain valid for the process lifetime.
-    // Phase 10.2 implements proper reclamation.
-    let mut live: Vec<CompiledFn> = Vec::new();
-
     for req in &rx {
         cljrs_logging::feat_debug!("jit", "compiling arity_id={}", req.arity_id);
 
         match compile_jit(req.arity_id, &req.ir_func) {
             Ok(compiled) => {
+                let fn_ptr = compiled.fn_ptr;
+                // Hand ownership of the module to the code cache; it returns the
+                // epoch that identifies this code for later reclamation.
+                let epoch = code_cache::register(req.arity_id, compiled);
                 cljrs_logging::feat_debug!(
                     "jit",
-                    "compiled  arity_id={} fn_ptr={:p}",
+                    "compiled  arity_id={} epoch={} fn_ptr={:p}",
                     req.arity_id,
-                    compiled.fn_ptr,
+                    epoch,
+                    fn_ptr,
                 );
-                // Atomically publish the function pointer so future calls
-                // on the main thread skip the interpreter.
-                cljrs_eval::jit_state::store_native_fn(req.arity_id, compiled.fn_ptr);
-                live.push(compiled);
+                // Atomically publish the function pointer + epoch so future
+                // calls on mutator threads skip the interpreter.
+                cljrs_eval::jit_state::store_native_fn(req.arity_id, fn_ptr, epoch);
             }
             Err(e) => {
                 cljrs_logging::feat_debug!("jit", "compile error arity_id={}: {}", req.arity_id, e,);
@@ -56,6 +56,4 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
             }
         }
     }
-    // Channel closed (program exit) → drop JITModules.
-    drop(live);
 }

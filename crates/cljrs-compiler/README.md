@@ -123,6 +123,8 @@ pub struct Compiler<M: Module = ObjectModule> { ... }
 impl<M: Module> Compiler<M> {
     pub fn declare_function(&mut self, name: &str, param_count: usize) -> CodegenResult<FuncId>;
     pub fn compile_function(&mut self, ir_func: &IrFunction, func_id: FuncId) -> CodegenResult<()>;
+    pub fn into_inner_module(self) -> M;        // JIT: reclaim the module after compiling
+    pub fn last_code_size(&self) -> u32;        // machine-code bytes of the last compiled fn (JIT memory accounting)
 }
 
 // AOT-specific (ObjectModule only):

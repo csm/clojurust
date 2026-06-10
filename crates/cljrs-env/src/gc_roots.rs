@@ -4,6 +4,34 @@ use crate::env::Env;
 #[cfg(not(feature = "no-gc"))]
 use crate::env::GlobalEnv;
 use std::cell::RefCell;
+use std::sync::OnceLock;
+
+// ── Stop-the-world reclaim hook (JIT code unloading) ────────────────────────
+//
+// The JIT tier (`cljrs-jit`) reclaims superseded native code only at a
+// stop-the-world safepoint, when every mutator thread is parked and active JIT
+// frames can be scanned safely.  GC collection is the existing STW point, so
+// the JIT installs a hook here that runs at the tail of every collection while
+// the STW guard is still held.
+
+type StwReclaimHook = Box<dyn Fn() + Send + Sync + 'static>;
+static STW_RECLAIM_HOOK: OnceLock<StwReclaimHook> = OnceLock::new();
+
+/// Install the stop-the-world reclaim hook (called once by `cljrs_jit::init`).
+///
+/// The hook runs inside the STW guard after each collection, so it may assume
+/// all other mutator threads are parked.
+pub fn set_stw_reclaim_hook(f: impl Fn() + Send + Sync + 'static) {
+    let _ = STW_RECLAIM_HOOK.set(Box::new(f));
+}
+
+/// Run the STW reclaim hook if one is installed.  Caller must hold the STW guard.
+#[cfg(not(feature = "no-gc"))]
+fn run_stw_reclaim() {
+    if let Some(hook) = STW_RECLAIM_HOOK.get() {
+        hook();
+    }
+}
 
 // ── Thread-local Env root registry ──────────────────────────────────────────
 //
@@ -146,6 +174,8 @@ pub fn force_collect(env: &Env) {
         crate::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });
+    // Reclaim superseded JIT code while the world is still stopped.
+    run_stw_reclaim();
 }
 
 /// Interpreter-level GC safepoint.
@@ -202,6 +232,8 @@ pub fn gc_safepoint(env: &Env) {
         // Trace in-flight allocations from this thread's alloc root frames
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });
+    // Reclaim superseded JIT code while the world is still stopped.
+    run_stw_reclaim();
     // _stw_guard drop clears in_progress, waking parked threads.
 }
 
@@ -322,4 +354,6 @@ pub fn async_gc_collect() {
         crate::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });
+    // Reclaim superseded JIT code while the world is still stopped.
+    run_stw_reclaim();
 }
