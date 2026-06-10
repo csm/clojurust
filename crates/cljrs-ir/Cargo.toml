@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-ir"
-version = "0.1.0"
+version = "0.1.129"
 edition = "2024"
 description = "Intermediate representation types for clojurust compiler and interpreter"
 license.workspace = true
