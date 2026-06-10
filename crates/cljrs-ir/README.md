@@ -19,6 +19,9 @@ can depend on the same types without a circular dependency.
 src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
+  osr.rs  — OSR-entry transform (Phase 10.4): build_osr_function rewrites a
+             function so its entry jumps straight to a hot loop header, with
+             live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
     mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured, analyze,
                   inline, optimize, EscapeContext …
@@ -227,6 +230,31 @@ pub struct AnalysisResult {
 These are the same types the optimizer uses internally; they are exposed
 publicly so downstream tooling (e.g. `cljrs-ir-viz`) can present
 escape-analysis results without re-implementing the use-chain walk.
+
+### OSR-entry construction (`osr` module, Phase 10.4)
+
+```rust
+/// Cap on OSR parameters (the JIT dispatch shim supports 8 native args).
+pub const MAX_OSR_PARAMS: usize = 8;
+
+pub struct OsrFunction {
+    /// Entry block jumps to the loop header; loop state arrives as params.
+    pub func: IrFunction,
+    /// For each param (in order), the original VarId whose current value the
+    /// interpreter must pass when transferring into the native frame.
+    pub live_ins: Vec<VarId>,
+}
+
+/// Build the OSR-entry variant of `orig` for the loop header `header`
+/// (a `RecurJump` target).  Keeps only blocks reachable from the header;
+/// header φs get a new incoming edge from the fresh entry block fed by fresh
+/// parameters (loop variables), other live-ins become parameters bound to
+/// their original VarIds.  `RegionEnd`s whose `RegionStart` executed before
+/// the loop (i.e. in the interpreter) are dropped — the interpreter frame
+/// closes those regions after the transfer returns.  Errs (caller stays at
+/// Tier 1) if the header is unknown or live-ins exceed MAX_OSR_PARAMS.
+pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunction, String>;
+```
 
 ### Source mapping
 

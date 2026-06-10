@@ -27,8 +27,9 @@ pub(crate) struct CompiledFn {
 unsafe impl Send for CompiledFn {}
 
 /// Compile `ir_func` to native code, returning the function pointer and the
-/// owning module.
-pub(crate) fn compile_jit(arity_id: u64, ir_func: &IrFunction) -> Result<CompiledFn, String> {
+/// owning module.  `func_name` only names the symbol inside this module
+/// (each compilation gets its own `JITModule`).
+pub(crate) fn compile_jit(func_name: &str, ir_func: &IrFunction) -> Result<CompiledFn, String> {
     let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
         .map_err(|e| format!("JITBuilder::new: {e}"))?;
 
@@ -43,11 +44,10 @@ pub(crate) fn compile_jit(arity_id: u64, ir_func: &IrFunction) -> Result<Compile
     let mut compiler = new_compiler_from_module(jit_module, ptr_type)
         .map_err(|e| format!("new_compiler_from_module: {e:?}"))?;
 
-    let func_name = format!("__cljrs_jit_{arity_id}");
     let param_count = ir_func.params.len();
 
     let func_id: FuncId = compiler
-        .declare_function(&func_name, param_count)
+        .declare_function(func_name, param_count)
         .map_err(|e| format!("declare_function: {e:?}"))?;
 
     compiler

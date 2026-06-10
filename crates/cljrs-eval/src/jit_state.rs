@@ -183,6 +183,176 @@ pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>) {
     }
 }
 
+// ── OSR (on-stack replacement) state — Phase 10.4 ────────────────────────────
+//
+// A single hot call containing a `loop*`/`recur` never returns to re-dispatch,
+// so the invocation counter above can never promote it.  The IR interpreter
+// instead counts loop back-edges per execution; when a header crosses
+// [`osr_threshold`] it requests compilation of an OSR-entry variant (built by
+// `cljrs_ir::osr::build_osr_function` on the JIT worker).  Once the worker
+// publishes the compiled entry here, the interpreter transfers its register
+// file into the native frame at the next loop-header entry.
+
+/// A published, compiled OSR entry for one `(arity_id, loop header)` pair.
+#[derive(Clone)]
+pub struct OsrSlot {
+    /// Native OSR-entry code: C ABI, `live_ins.len()` `*const Value` params,
+    /// one `*const Value` return.
+    pub fn_ptr: *const (),
+    /// Reclamation epoch of the backing module (see [`push_jit_frame`]).
+    pub epoch: u64,
+    /// Interpreter registers to pass, in parameter order
+    /// (`cljrs_ir::osr::OsrFunction::live_ins`).
+    pub live_ins: Arc<[cljrs_ir::VarId]>,
+}
+
+// SAFETY: `fn_ptr` is executable code owned by the JIT code cache; it carries
+// no thread affinity.  All other fields are plain data.
+unsafe impl Send for OsrSlot {}
+unsafe impl Sync for OsrSlot {}
+
+enum OsrState {
+    /// Compilation requested, worker has not finished yet.
+    Queued,
+    /// Native entry published.
+    Ready(OsrSlot),
+    /// Compilation declined or failed — stop polling, stay at Tier 1.
+    Failed,
+}
+
+/// Result of polling for a compiled OSR entry.
+pub enum OsrPoll {
+    NotRequested,
+    Pending,
+    Ready(OsrSlot),
+    Failed,
+}
+
+static OSR_TABLE: RwLock<Option<HashMap<(u64, u32), OsrState>>> = RwLock::new(None);
+
+type OsrEnqueueFn = Box<dyn Fn(u64, u32, Arc<IrFunction>) + Send + Sync + 'static>;
+static OSR_ENQUEUE_HOOK: OnceLock<OsrEnqueueFn> = OnceLock::new();
+
+/// Install the OSR compilation enqueue hook (installed once by
+/// `cljrs_jit::init`).  Receives `(arity_id, header_block, function)`; must be
+/// non-blocking.
+pub fn set_osr_enqueue_hook(f: impl Fn(u64, u32, Arc<IrFunction>) + Send + Sync + 'static) {
+    let _ = OSR_ENQUEUE_HOOK.set(Box::new(f));
+}
+
+/// Per-process override; 0 means "env var or default".
+static OSR_THRESHOLD_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_osr_threshold(t: u32) {
+    OSR_THRESHOLD_OVERRIDE.store(t, Ordering::Relaxed);
+}
+
+/// Back-edge count at which a loop header is considered hot.  Defaults to the
+/// invocation threshold ([`jit_threshold`]); override with
+/// `CLJRS_OSR_THRESHOLD` or [`set_osr_threshold`].
+pub fn osr_threshold() -> u32 {
+    let v = OSR_THRESHOLD_OVERRIDE.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    std::env::var("CLJRS_OSR_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(jit_threshold)
+}
+
+/// Poll for a compiled OSR entry for the loop at `header` in `arity_id`.
+pub fn osr_poll(arity_id: u64, header: u32) -> OsrPoll {
+    let guard = OSR_TABLE.read().unwrap();
+    match guard.as_ref().and_then(|m| m.get(&(arity_id, header))) {
+        None => OsrPoll::NotRequested,
+        Some(OsrState::Queued) => OsrPoll::Pending,
+        Some(OsrState::Ready(slot)) => OsrPoll::Ready(slot.clone()),
+        Some(OsrState::Failed) => OsrPoll::Failed,
+    }
+}
+
+/// Request OSR compilation for the loop at `header` in `arity_id`.  Idempotent:
+/// only the first request per `(arity_id, header)` enqueues (and pays for one
+/// `IrFunction` clone); with no JIT installed the entry is marked failed so
+/// callers stop polling.
+pub fn osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
+    let hook = OSR_ENQUEUE_HOOK.get();
+    {
+        let mut guard = OSR_TABLE.write().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        match map.entry((arity_id, header)) {
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(if hook.is_some() {
+                    OsrState::Queued
+                } else {
+                    OsrState::Failed
+                });
+            }
+        }
+    }
+    if let Some(hook) = hook {
+        cljrs_logging::feat_debug!(
+            "jit",
+            "osr enqueue arity_id={} header=bb{}",
+            arity_id,
+            header
+        );
+        hook(arity_id, header, Arc::new(ir_func.clone()));
+    }
+}
+
+/// Publish a compiled OSR entry.  Called by the JIT worker thread.
+pub fn store_osr_fn(
+    arity_id: u64,
+    header: u32,
+    ptr: *const (),
+    epoch: u64,
+    live_ins: Vec<cljrs_ir::VarId>,
+) {
+    let mut guard = OSR_TABLE.write().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(
+        (arity_id, header),
+        OsrState::Ready(OsrSlot {
+            fn_ptr: ptr,
+            epoch,
+            live_ins: live_ins.into(),
+        }),
+    );
+}
+
+/// Record that OSR compilation for `(arity_id, header)` declined or failed, so
+/// interpreters stop polling and the loop stays at Tier 1.
+pub fn mark_osr_failed(arity_id: u64, header: u32) {
+    let mut guard = OSR_TABLE.write().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert((arity_id, header), OsrState::Failed);
+}
+
+/// Drop all OSR entries for `arity_id` (the owning var was rebound), returning
+/// the epochs of published code so the caller can hand them to the code cache
+/// for reclamation once no frame executes them.
+pub fn take_osr_epochs(arity_id: u64) -> Vec<u64> {
+    let mut guard = OSR_TABLE.write().unwrap();
+    let Some(map) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let keys: Vec<(u64, u32)> = map
+        .keys()
+        .filter(|(a, _)| *a == arity_id)
+        .copied()
+        .collect();
+    let mut epochs = Vec::new();
+    for key in keys {
+        if let Some(OsrState::Ready(slot)) = map.remove(&key) {
+            epochs.push(slot.epoch);
+        }
+    }
+    epochs
+}
+
 // ── Active JIT frame tracking (for code unloading) ──────────────────────────────
 //
 // Code unloading (Phase 10.2) frees a superseded `JITModule` only once no frame
@@ -391,6 +561,47 @@ mod tests {
         assert!(live_epochs().contains(&e));
         drop(guard);
         assert!(!live_epochs().contains(&e));
+    }
+
+    #[test]
+    fn osr_slot_round_trips_and_rebind_takes_epochs() {
+        use cljrs_ir::VarId;
+        let id = 0xF200_0001;
+        // Unpublished header polls as NotRequested.
+        assert!(matches!(osr_poll(id, 1), OsrPoll::NotRequested));
+
+        let ptr = 0x5678usize as *const ();
+        store_osr_fn(id, 1, ptr, 901, vec![VarId(3), VarId(4)]);
+        match osr_poll(id, 1) {
+            OsrPoll::Ready(slot) => {
+                assert_eq!(slot.fn_ptr, ptr);
+                assert_eq!(slot.epoch, 901);
+                assert_eq!(&*slot.live_ins, &[VarId(3), VarId(4)]);
+            }
+            _ => panic!("expected Ready"),
+        }
+
+        // A second loop in the same arity that failed to compile.
+        mark_osr_failed(id, 7);
+        assert!(matches!(osr_poll(id, 7), OsrPoll::Failed));
+
+        // Rebinding the var takes only the published epochs and clears all
+        // entries for the arity.
+        let epochs = take_osr_epochs(id);
+        assert_eq!(epochs, vec![901]);
+        assert!(matches!(osr_poll(id, 1), OsrPoll::NotRequested));
+        assert!(matches!(osr_poll(id, 7), OsrPoll::NotRequested));
+    }
+
+    #[test]
+    fn osr_request_without_hook_marks_failed() {
+        // The test binary never installs the OSR enqueue hook (that's
+        // cljrs_jit::init's job), so a request must immediately fail closed
+        // rather than leave interpreters polling forever.
+        let id = 0xF200_0002;
+        let ir = IrFunction::new(None, None);
+        osr_request(id, 2, &ir);
+        assert!(matches!(osr_poll(id, 2), OsrPoll::Failed));
     }
 
     #[test]

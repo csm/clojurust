@@ -78,6 +78,119 @@ impl Drop for RegionEntry {
     }
 }
 
+// ── OSR (on-stack replacement) bookkeeping ──────────────────────────────────
+
+/// Per-execution OSR state — Phase 10.4.
+///
+/// Allocated lazily on the first loop back-edge of an OSR-eligible execution
+/// (a top-level arity dispatched through `execute_ir`), so straight-line
+/// functions pay nothing.  Back-edge counts are local to one execution on
+/// purpose: a loop that is hot *within a single call* is exactly the case
+/// invocation-count tiering cannot promote; loops spread over many short
+/// calls are already covered by the invocation counter.
+struct OsrLocal {
+    arity_id: u64,
+    threshold: u32,
+    /// Back-edge count per loop header (`BlockId.0`).
+    counts: std::collections::HashMap<u32, u32>,
+    /// Header we are waiting on: compilation requested (or already published),
+    /// checked at each loop-header entry.
+    polling: Option<BlockId>,
+    /// Headers that must not be polled or re-requested in this execution
+    /// (compilation failed, or a transfer was declined).
+    dead: std::collections::HashSet<u32>,
+}
+
+/// Record one loop back-edge to `target`.  Crossing the threshold requests OSR
+/// compilation (idempotent across executions via the global table).
+fn record_back_edge(
+    osr: &mut Option<Box<OsrLocal>>,
+    arity_id: u64,
+    target: BlockId,
+    ir_func: &IrFunction,
+) {
+    let ol = osr.get_or_insert_with(|| {
+        Box::new(OsrLocal {
+            arity_id,
+            threshold: crate::jit_state::osr_threshold().max(1),
+            counts: std::collections::HashMap::new(),
+            polling: None,
+            dead: std::collections::HashSet::new(),
+        })
+    });
+    if ol.polling == Some(target) || ol.dead.contains(&target.0) {
+        return;
+    }
+    let count = {
+        let c = ol.counts.entry(target.0).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if count == 1 {
+        // A previous execution may already have requested (or finished)
+        // compilation of this loop — start polling right away.
+        match crate::jit_state::osr_poll(arity_id, target.0) {
+            crate::jit_state::OsrPoll::Ready(_) | crate::jit_state::OsrPoll::Pending => {
+                ol.polling = Some(target);
+                return;
+            }
+            crate::jit_state::OsrPoll::Failed => {
+                ol.dead.insert(target.0);
+                return;
+            }
+            crate::jit_state::OsrPoll::NotRequested => {}
+        }
+    }
+    if count >= ol.threshold {
+        crate::jit_state::osr_request(arity_id, target.0, ir_func);
+        ol.polling = Some(target);
+    }
+}
+
+/// Transfer this execution into compiled OSR-entry code: snapshot the live-in
+/// registers, call the native entry, and hand back its result as the result of
+/// the whole call.
+///
+/// Returns `None` (caller keeps interpreting) if any live-in register is not
+/// yet initialized — a conservatively declined transfer, not an error.
+fn try_osr_enter(
+    slot: &crate::jit_state::OsrSlot,
+    regs: &Registers,
+    env: &mut Env,
+) -> Option<EvalResult> {
+    let mut call_args: Vec<Value> = Vec::with_capacity(slot.live_ins.len());
+    for var in slot.live_ins.iter() {
+        match regs.values.get(var.0 as usize).and_then(|v| v.as_ref()) {
+            Some(v) => call_args.push(v.clone()),
+            None => return None,
+        }
+    }
+    cljrs_logging::feat_debug!(
+        "jit",
+        "osr entering native code ({} live-ins, epoch={})",
+        call_args.len(),
+        slot.epoch
+    );
+
+    // Same protocol as `call_jit_native` (apply.rs): keep the backing module
+    // alive for the duration of the frame, root the caller env and the
+    // snapshot, and track allocations made inside the native frame.
+    let _jit_frame = crate::jit_state::push_jit_frame(slot.epoch);
+    let _caller_root = cljrs_env::gc_roots::push_env_root(env);
+    let _arg_roots = cljrs_env::gc_roots::root_values(&call_args);
+    let _alloc_frame = cljrs_gc::push_alloc_frame();
+
+    let arg_ptrs: Vec<*const Value> = call_args.iter().map(|v| v as *const Value).collect();
+    // SAFETY: fn_ptr was produced by Cranelift JIT with the C ABI and exactly
+    // `live_ins.len()` `*const Value` params (`build_osr_function` caps this at
+    // the dispatch limit); all arg pointers are live for the call.
+    let result_ptr = unsafe { crate::jit_state::dispatch_jit_call(slot.fn_ptr, &arg_ptrs) };
+    // SAFETY: result_ptr points to a live Value in ALLOC_ROOTS; clone it
+    // before the alloc frame drops.
+    let result = unsafe { (*result_ptr).clone() };
+    Some(Ok(result))
+}
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Execute an IR function with the given arguments.
@@ -97,6 +210,23 @@ pub fn interpret_ir(
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
     env: &mut Env,
+) -> EvalResult {
+    interpret_ir_with_osr(ir_func, args, globals, ns, env, None)
+}
+
+/// Like [`interpret_ir`], with OSR enabled when `osr_arity_id` is given.
+///
+/// `osr_arity_id` is the `ir_arity_id` under which loop back-edges are counted
+/// and OSR-compiled entries are published.  Pass `None` (or use
+/// [`interpret_ir`]) for executions that have no stable arity identity, e.g.
+/// IR closures and region-parameterised subfunction calls.
+pub fn interpret_ir_with_osr(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
 ) -> EvalResult {
     // GC safepoint at function entry.
     cljrs_env::gc_roots::gc_safepoint(env);
@@ -134,6 +264,10 @@ pub fn interpret_ir(
     let mut current_block_idx: usize = 0;
     let mut prev_block_id = BlockId(u32::MAX); // sentinel
 
+    // Lazily allocated OSR back-edge state (only for OSR-eligible executions
+    // that actually take a loop back-edge).
+    let mut osr: Option<Box<OsrLocal>> = None;
+
     loop {
         let block = &ir_func.blocks[current_block_idx];
 
@@ -146,6 +280,32 @@ pub fn interpret_ir(
                         break;
                     }
                 }
+            }
+        }
+
+        // OSR transfer: once a hot loop header's compilation has been
+        // requested, check for published native code each time we re-enter the
+        // header (i.e. after its phis — the loop variables — are resolved).
+        if let Some(ol) = osr.as_deref_mut()
+            && ol.polling == Some(block.id)
+        {
+            match crate::jit_state::osr_poll(ol.arity_id, block.id.0) {
+                crate::jit_state::OsrPoll::Ready(slot) => {
+                    // Regions opened before the loop stay open across the
+                    // transfer (the OSR variant drops their RegionEnds) and
+                    // are closed as usual when `region_stack` unwinds after
+                    // the native call returns.
+                    if let Some(result) = try_osr_enter(&slot, &regs, env) {
+                        return result;
+                    }
+                    ol.polling = None;
+                    ol.dead.insert(block.id.0);
+                }
+                crate::jit_state::OsrPoll::Failed => {
+                    ol.polling = None;
+                    ol.dead.insert(block.id.0);
+                }
+                _ => {}
             }
         }
 
@@ -185,6 +345,12 @@ pub fn interpret_ir(
             Terminator::RecurJump { target, args: _ } => {
                 // GC safepoint at loop back-edge.
                 cljrs_env::gc_roots::gc_safepoint(env);
+
+                // Loop back-edge counter: a hot header triggers background OSR
+                // compilation; the transfer happens at the header entry above.
+                if let Some(arity_id) = osr_arity_id {
+                    record_back_edge(&mut osr, arity_id, *target, ir_func);
+                }
 
                 // Jump to the target (loop header) block.
                 // Phi nodes at the target block entry will resolve the new

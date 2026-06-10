@@ -36,6 +36,8 @@ use cljrs_value::Value;
 pub mod code_cache;
 mod jit_compiler;
 mod jit_worker;
+#[cfg(all(test, not(feature = "no-gc")))]
+mod osr_integration;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -58,11 +60,24 @@ pub fn init() {
 
     // Register the enqueue hook so the IR dispatch path can hand us hot
     // functions.
+    let fn_tx = tx.clone();
     cljrs_eval::set_enqueue_hook(move |arity_id, ir_func: Arc<IrFunction>| {
         // Non-blocking: if the queue is full, skip this compile request.
         // The function will keep running at Tier 1 until the queue drains.
-        let _ = tx.try_send(jit_worker::CompileRequest { arity_id, ir_func });
+        let _ = fn_tx.try_send(jit_worker::CompileRequest::Function { arity_id, ir_func });
     });
+
+    // Register the OSR enqueue hook (Phase 10.4) so a hot loop back-edge can
+    // request compilation of an OSR-entry variant mid-call.
+    cljrs_eval::jit_state::set_osr_enqueue_hook(
+        move |arity_id, header, ir_func: Arc<IrFunction>| {
+            let _ = tx.try_send(jit_worker::CompileRequest::Osr {
+                arity_id,
+                header,
+                ir_func,
+            });
+        },
+    );
 
     // Code unloading (Phase 10.2):
     //
@@ -99,6 +114,11 @@ fn on_var_rebind(old: &Value, new: &Value) {
             continue;
         }
         if let Some(epoch) = cljrs_eval::jit_state::take_native_epoch(id) {
+            code_cache::mark_stale(epoch);
+        }
+        // OSR-entry code for loops inside the old definition is superseded by
+        // the rebind just like its whole-function code.
+        for epoch in cljrs_eval::jit_state::take_osr_epochs(id) {
             code_cache::mark_stale(epoch);
         }
     }
