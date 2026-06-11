@@ -22,6 +22,12 @@ Clojure source fall back to the HEAD implementation. Public API:
 Sources fetched from git are recorded in `GlobalEnv::versioned_sources`
 (`record_versioned_source` / `versioned_sources_snapshot`) so the AOT
 compiler can embed them in produced binaries.
+`pin_if_available(globals, base_ns, commit) -> EvalResult<bool>` is the AOT
+discovery hook: force-loads a pin when its source is locatable, skips
+otherwise.  `GlobalEnv::set_versioned_offline(true)` (called by AOT harness
+binaries) restricts versioned loading to embedded sources — a missing
+embedding fails with a clear "was not embedded at compile time" error
+instead of fetching from git.
 
 ## gc_roots module
 

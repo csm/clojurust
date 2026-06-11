@@ -464,6 +464,7 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "target-lexicon",
+ "tempfile",
 ]
 
 [[package]]

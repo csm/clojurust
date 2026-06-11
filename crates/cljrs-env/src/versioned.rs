@@ -87,7 +87,19 @@ pub fn resolve_versioned_value(
     //    parse error) propagate rather than being masked by the fallback.
     if !globals.is_loaded(&versioned_ns) {
         if !versioned_source_available(globals, &base_ns, &versioned_ns) {
-            return native_head_fallback(globals, &base_ns, name, commit);
+            // In an AOT binary a missing embedded source most likely means
+            // the pin was not visible at compile time — make the fallback's
+            // failure say so instead of a bare "unbound symbol".
+            return native_head_fallback(globals, &base_ns, name, commit).map_err(|e| {
+                if globals.versioned_offline() {
+                    EvalError::Runtime(format!(
+                        "versioned namespace {versioned_ns} was not embedded at compile \
+                         time; AOT binaries cannot fetch from git at runtime ({e})"
+                    ))
+                } else {
+                    e
+                }
+            });
         }
         ensure_versioned_ns_loaded(globals, &base_ns, commit)?;
     }
@@ -101,12 +113,35 @@ pub fn resolve_versioned_value(
     native_head_fallback(globals, &base_ns, name, commit)
 }
 
+/// Pin `base_ns@commit` if any source for it is locatable, returning whether
+/// it was loaded.
+///
+/// Used by the AOT compiler's discovery pass: every versioned symbol found in
+/// the program is force-loaded at compile time so its source lands in
+/// `GlobalEnv::versioned_sources` for embedding.  Namespaces with no
+/// locatable Clojure source (pure-Rust packages, or quoted symbols that
+/// merely look versioned) are skipped — their resolution is a runtime
+/// concern.  Genuine load failures (missing commit, signature rejection,
+/// parse error) propagate.
+pub fn pin_if_available(globals: &Arc<GlobalEnv>, base_ns: &str, commit: &str) -> EvalResult<bool> {
+    let versioned_ns = format!("{base_ns}@{commit}");
+    if !versioned_source_available(globals, base_ns, &versioned_ns) {
+        return Ok(false);
+    }
+    ensure_versioned_ns_loaded(globals, base_ns, commit)?;
+    Ok(true)
+}
+
 /// True if source for `base_ns` at some commit could be obtained: either an
 /// embedded builtin source registered under the versioned name, or a source
 /// file on the source path that lives inside a git repository.
 fn versioned_source_available(globals: &GlobalEnv, base_ns: &str, versioned_ns: &str) -> bool {
     if globals.builtin_source(versioned_ns).is_some() {
         return true;
+    }
+    // Offline (AOT) binaries may only use embedded sources.
+    if globals.versioned_offline() {
+        return false;
     }
     let rel_path = base_ns.replace('.', "/").replace('-', "_");
     let src_paths = globals.source_paths.read().unwrap().clone();
@@ -171,6 +206,11 @@ fn do_versioned_load(
     let (src, git_location): (String, Option<(String, String)>) =
         if let Some(builtin) = globals.builtin_source(versioned_ns_name) {
             (builtin.to_owned(), None)
+        } else if globals.versioned_offline() {
+            return Err(EvalError::Runtime(format!(
+                "versioned namespace {versioned_ns_name} was not embedded at compile time; \
+                 AOT binaries cannot fetch from git at runtime"
+            )));
         } else {
             let (src, location) = fetch_versioned_source(globals, base_ns, commit)?;
             (src, Some(location))
@@ -290,5 +330,53 @@ fn native_head_fallback(
             "Cannot find definition of `{name}` in `{base_ns}@{commit}`"
         ))),
         None => Err(EvalError::UnboundSymbol(format!("{base_ns}/{name}"))),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cljrs_reader::Form;
+    use cljrs_value::CljxFn;
+
+    fn dummy_eval(_: &Form, _: &mut Env) -> EvalResult {
+        Ok(Value::Nil)
+    }
+    fn dummy_call(_: &CljxFn, _: &[Value], _: &mut Env) -> EvalResult {
+        Ok(Value::Nil)
+    }
+
+    /// In offline (AOT) mode a versioned namespace with no embedded source
+    /// fails with the clear "not embedded at compile time" error — never a
+    /// git fetch.
+    #[test]
+    fn offline_load_without_embedded_source_errors() {
+        let _mutator = cljrs_gc::register_mutator();
+        let globals = GlobalEnv::new(dummy_eval, dummy_call, None);
+        globals.set_versioned_offline(true);
+
+        let err = ensure_versioned_ns_loaded(&globals, "mylib", "abc1234abcdef")
+            .expect_err("offline load must fail without an embedded source");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("was not embedded at compile time"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Embedded sources satisfy offline mode (the AOT binary path).
+    #[test]
+    fn offline_load_with_embedded_source_succeeds() {
+        let _mutator = cljrs_gc::register_mutator();
+        let globals = GlobalEnv::new(dummy_eval, dummy_call, None);
+        globals.set_versioned_offline(true);
+        globals.register_builtin_source("mylib@abc1234abcdef", "(def x 1)");
+
+        let ns = ensure_versioned_ns_loaded(&globals, "mylib", "abc1234abcdef")
+            .expect("embedded source must load offline");
+        assert_eq!(ns.as_ref(), "mylib@abc1234abcdef");
+        assert!(globals.is_loaded("mylib@abc1234abcdef"));
     }
 }

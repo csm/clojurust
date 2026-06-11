@@ -427,8 +427,14 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
                 cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             } else {
-                cljrs_compiler::aot::compile_file(&file, &out, &src_paths, rust_config.as_ref())
-                    .map_err(|e| miette::miette!("{e}"))?;
+                cljrs_compiler::aot::compile_file(
+                    &file,
+                    &out,
+                    &src_paths,
+                    rust_config.as_ref(),
+                    verify_commit_signatures,
+                )
+                .map_err(|e| miette::miette!("{e}"))?;
             }
             Ok(0)
         }

@@ -120,6 +120,11 @@ pub struct GlobalEnv {
     /// `"<ns>@<commit>"`.  The AOT compiler embeds these in the produced
     /// binary so versioned namespaces resolve without git at runtime.
     pub versioned_sources: RwLock<HashMap<Arc<str>, Arc<str>>>,
+    /// When true (set by AOT harness main), versioned namespaces resolve
+    /// only from embedded builtin sources — never from git.  A versioned
+    /// namespace that was not embedded at compile time fails with a clear
+    /// error instead of attempting a fetch.
+    pub versioned_offline: AtomicBool,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -152,6 +157,7 @@ impl GlobalEnv {
             verify_commit_signatures: AtomicBool::new(false),
             sig_verify_cache: Mutex::new(HashSet::new()),
             versioned_sources: RwLock::new(HashMap::new()),
+            versioned_offline: AtomicBool::new(false),
         })
     }
 
@@ -425,6 +431,18 @@ impl GlobalEnv {
         let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
+    }
+
+    /// Restrict versioned-namespace resolution to embedded builtin sources
+    /// (no git).  Called by AOT harness binaries, which embed every pinned
+    /// source discovered at compile time.
+    pub fn set_versioned_offline(&self, offline: bool) {
+        self.versioned_offline.store(offline, Ordering::Relaxed);
+    }
+
+    /// True when versioned namespaces may only come from embedded sources.
+    pub fn versioned_offline(&self) -> bool {
+        self.versioned_offline.load(Ordering::Relaxed)
     }
 
     /// If `:verify-commit-signatures` is enabled, verify that `commit` inside

@@ -197,13 +197,27 @@ cross-type `Eq` always stay boxed.
 ### AOT driver (`aot.rs`)
 
 ```rust
-pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()>;
+pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf], rust_config: Option<&RustConfig>, verify_commit_signatures: bool) -> AotResult<()>;
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+
+**Versioned namespaces are snapshotted at compile time.** Versioned requires
+execute during expansion (fetching the pinned source from git); a discovery
+pass (`pin_versioned_references`) additionally walks the expanded program for
+bare versioned symbols (`mylib/foo@<sha>`) and force-loads each pin via
+`cljrs_env::versioned::pin_if_available`.  Every pinned source fetched this
+way is embedded in the binary under its versioned namespace name
+(`register_builtin_source("mylib@<sha>", …)`), so the produced binary is
+self-contained — the generated harness calls
+`globals.set_versioned_offline(true)`, and a versioned namespace that was not
+embedded fails with a clear error instead of attempting a git fetch.  A bad
+pin (missing commit, failed signature check) fails the *compile*.  When
+`verify_commit_signatures` is set, `git verify-commit` runs at compile time;
+the binary trusts its embedded sources.
 
 The generated harness `main()` calls `-main` (via `resolve`) after
 `__cljrs_main` returns, forwarding all command-line arguments (skipping the
