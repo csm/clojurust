@@ -362,7 +362,7 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 - [x] Calling Rust trait methods on `NativeObject` values via protocol dispatch
 - [ ] Safety restrictions: document which Rust APIs are safe to call from GC-managed code
 - [ ] `cljx.rust` namespace with intrinsics (`rust/cast`, `rust/ptr`, `rust/unsafe`, etc.)
-- [ ] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime
+- [x] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime — project-local lib via `cljrs build-native` + `load_native_lib`; **pinned native packages** (`:rust/load :dylib`) via `cljrs-dylib` (build the dep's crate at a pinned commit, ABI-fingerprint handshake, register into the `ns@<commit>` namespace). Deferred: statically linking pinned native crates into AOT harnesses (`#[export]` inventory collision between two versions of one crate), and a C-ABI vtable to replace the Rust-ABI `&mut Registry` boundary
 - [x] RAII resource management: `with-open` macro + `close` builtin for deterministic cleanup of `Resource` values
 - [ ] (Stretch) `#rust` typed sublanguage: functions annotated `#rust` receive Rust-typed arguments with lifetime bounds enforced at the interop boundary, bypassing `Value` boxing entirely for those call sites
 

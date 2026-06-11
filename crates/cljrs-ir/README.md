@@ -113,6 +113,11 @@ pub struct Block {
 
 ### Instructions (`Inst`)
 
+Versioned symbols need no dedicated instruction: the `@<sha>` suffix rides in
+the `LoadGlobal` name string, and lowering inside a versioned namespace
+(`"base@sha"`) rewrites base-qualified self-references (`base/x`) to the
+versioned namespace (see `split_sym` in `lower/anf.rs`).
+
 `Const`, `LoadLocal`, `LoadGlobal`, `LoadVar`, `AllocVector`, `AllocMap`,
 `AllocSet`, `AllocList`, `AllocCons`, `AllocClosure`, `CallKnown`, `Call`,
 `CallDirect`, `Deref`, `DefVar`, `SetBang`, `Throw`, `Phi`, `Recur`,

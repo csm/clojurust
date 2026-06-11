@@ -90,6 +90,7 @@ struct RuntimeFuncs {
     rt_identical: FuncId,
     rt_str: FuncId,
     rt_load_global: FuncId,
+    rt_load_global_versioned_ic: FuncId,
     rt_def_var: FuncId,
     rt_make_fn: FuncId,
     rt_make_fn_variadic: FuncId,
@@ -1277,6 +1278,13 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         ns: &str,
         name: &str,
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Versioned reference (`name@<sha>`): the binding is immutable for
+        // the lifetime of the process, so it goes through a fill-once
+        // per-call-site inline cache instead of a lookup on every execution.
+        if cljrs_value::symbol::split_version(name).1.is_some() {
+            return self.emit_load_global_versioned_ic(ns, name);
+        }
+
         // Create data objects for ns and name strings.
         let ns_data = self.module.declare_anonymous_data(false, false)?;
         let mut ns_desc = cranelift_module::DataDescription::new();
@@ -1304,6 +1312,79 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .ins()
             .call(func_ref, &[ns_ptr, ns_len, name_ptr, name_len]);
         Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Emit a versioned LoadGlobal (`ns/name@sha`) through a per-call-site
+    /// inline cache.
+    ///
+    /// Mirrors `emit_keyword_ic`: the site owns an 8-byte writable data slot.
+    /// Fast path: one load and a branch on the cached value pointer.  First
+    /// execution takes the miss edge into `rt_load_global_versioned_ic`,
+    /// which resolves the pinned symbol (lazily loading the `ns@sha`
+    /// namespace), permanently roots the boxed value, and stores it into the
+    /// slot.  Versioned bindings are immutable, so the slot never needs
+    /// invalidation.
+    fn emit_load_global_versioned_ic(
+        &mut self,
+        ns: &str,
+        name: &str,
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Writable zero-initialised slot for this call site.
+        let slot_data = self.module.declare_anonymous_data(true, false)?;
+        let mut slot_desc = cranelift_module::DataDescription::new();
+        slot_desc.define_zeroinit(8);
+        self.module.define_data(slot_data, &slot_desc)?;
+        let slot_gv = self
+            .module
+            .declare_data_in_func(slot_data, self.builder.func);
+        let slot_addr = self.builder.ins().global_value(self.ptr_type, slot_gv);
+
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let cached = self.builder.ins().load(self.ptr_type, flags, slot_addr, 0);
+
+        let miss_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+        let merge_param = self.builder.append_block_param(merge_block, self.ptr_type);
+        self.builder.ins().brif(
+            cached,
+            merge_block,
+            &[BlockArg::Value(cached)],
+            miss_block,
+            &[],
+        );
+
+        // Miss: resolve + fill the slot.
+        self.builder.switch_to_block(miss_block);
+        let ns_data = self.module.declare_anonymous_data(false, false)?;
+        let mut ns_desc = cranelift_module::DataDescription::new();
+        ns_desc.define(ns.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(ns_data, &ns_desc)?;
+        let ns_gv = self.module.declare_data_in_func(ns_data, self.builder.func);
+        let ns_ptr = self.builder.ins().global_value(self.ptr_type, ns_gv);
+        let ns_len = self.builder.ins().iconst(types::I64, ns.len() as i64);
+
+        let name_data = self.module.declare_anonymous_data(false, false)?;
+        let mut name_desc = cranelift_module::DataDescription::new();
+        name_desc.define(name.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(name_data, &name_desc)?;
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data, self.builder.func);
+        let name_ptr = self.builder.ins().global_value(self.ptr_type, name_gv);
+        let name_len = self.builder.ins().iconst(types::I64, name.len() as i64);
+
+        let fill_ref = self.import_func(self.rt.rt_load_global_versioned_ic);
+        let call = self
+            .builder
+            .ins()
+            .call(fill_ref, &[ns_ptr, ns_len, name_ptr, name_len, slot_addr]);
+        let filled = self.builder.inst_results(call)[0];
+        self.builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(filled)]);
+
+        self.builder.switch_to_block(merge_block);
+        Ok(merge_param)
     }
 
     /// Emit a LoadVar (ns/name lookup) — returns the Var object, not its value.
@@ -2018,6 +2099,12 @@ fn declare_runtime_funcs<M: Module>(
             module,
             "rt_load_global",
             &[ptr, types::I64, ptr, types::I64],
+            ptr,
+        )?,
+        rt_load_global_versioned_ic: declare_rt(
+            module,
+            "rt_load_global_versioned_ic",
+            &[ptr, types::I64, ptr, types::I64, ptr],
             ptr,
         )?,
         rt_def_var: declare_rt(

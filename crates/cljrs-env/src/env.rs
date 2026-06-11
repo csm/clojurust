@@ -1,9 +1,7 @@
 //! Lexical environment: local frames, global namespace table, and current Env.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::async_hook::AsyncRuntime;
@@ -116,7 +114,41 @@ pub struct GlobalEnv {
     /// Session-scoped cache of commits that have already passed signature
     /// verification this run, keyed by `(repo_root, commit_hash)`.
     pub sig_verify_cache: Mutex<HashSet<(Arc<str>, Arc<str>)>>,
+    /// Pinned source texts fetched from git this session, keyed by
+    /// `"<ns>@<commit>"`.  The AOT compiler embeds these in the produced
+    /// binary so versioned namespaces resolve without git at runtime.
+    pub versioned_sources: RwLock<HashMap<Arc<str>, Arc<str>>>,
+    /// When true (set by AOT harness main), versioned namespaces resolve
+    /// only from embedded builtin sources — never from git.  A versioned
+    /// namespace that was not embedded at compile time fails with a clear
+    /// error instead of attempting a fetch.
+    pub versioned_offline: AtomicBool,
+    /// Provenance of native (Rust-backed) packages recorded at registration:
+    /// namespace → the git commit the package was built from.  Consulted by
+    /// the versioned resolver's native HEAD fallback to detect pinned-commit
+    /// mismatches.
+    pub native_provenance: RwLock<HashMap<Arc<str>, Arc<str>>>,
+    /// When true, a pinned lookup of a native function whose recorded
+    /// provenance does not match the requested commit is an error instead of
+    /// a once-per-pin warning.  CLI: `--enforce-native-versions`; cljrs.edn:
+    /// `:enforce-native-versions true`.
+    pub enforce_native_versions: AtomicBool,
+    /// Pinned-native mismatches already warned about this session
+    /// (key: `"<ns>@<commit>"`), so each pin warns at most once.
+    pub provenance_warned: Mutex<HashSet<Arc<str>>>,
+    /// Optional loader for **pinned native packages** (`:rust/load :dylib`),
+    /// installed by `cljrs-dylib`.  Called by the versioned resolver with
+    /// `(globals, base_ns, commit)` before falling back to the HEAD native
+    /// binding; returns `Ok(true)` when it registered the package's pinned
+    /// implementations into the `"<base_ns>@<commit>"` namespace.
+    #[allow(clippy::type_complexity)]
+    pub pinned_native_loader: RwLock<Option<PinnedNativeLoader>>,
 }
+
+/// Loader callback for pinned native packages (see
+/// `GlobalEnv::pinned_native_loader`).
+pub type PinnedNativeLoader =
+    Arc<dyn Fn(&Arc<GlobalEnv>, &str, &str) -> EvalResult<bool> + Send + Sync>;
 
 impl std::fmt::Debug for GlobalEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -147,6 +179,12 @@ impl GlobalEnv {
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
             sig_verify_cache: Mutex::new(HashSet::new()),
+            versioned_sources: RwLock::new(HashMap::new()),
+            versioned_offline: AtomicBool::new(false),
+            native_provenance: RwLock::new(HashMap::new()),
+            enforce_native_versions: AtomicBool::new(false),
+            provenance_warned: Mutex::new(HashSet::new()),
+            pinned_native_loader: RwLock::new(None),
         })
     }
 
@@ -403,6 +441,70 @@ impl GlobalEnv {
     pub fn cache_versioned_ns(&self, ns: &str, commit: &str) {
         let key: Arc<str> = Arc::from(format!("{ns}@{commit}"));
         self.version_cache.lock().unwrap().insert(key, Value::Nil);
+    }
+
+    /// Record the source text of a versioned namespace fetched from git.
+    /// Key: `"<ns>@<commit>"`.  Consumed by the AOT compiler for embedding.
+    pub fn record_versioned_source(&self, versioned_ns: &str, src: &str) {
+        self.versioned_sources
+            .write()
+            .unwrap()
+            .insert(Arc::from(versioned_ns), Arc::from(src));
+    }
+
+    /// Snapshot of all versioned sources fetched this session, sorted by key.
+    pub fn versioned_sources_snapshot(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let map = self.versioned_sources.read().unwrap();
+        let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Restrict versioned-namespace resolution to embedded builtin sources
+    /// (no git).  Called by AOT harness binaries, which embed every pinned
+    /// source discovered at compile time.
+    pub fn set_versioned_offline(&self, offline: bool) {
+        self.versioned_offline.store(offline, Ordering::Relaxed);
+    }
+
+    /// True when versioned namespaces may only come from embedded sources.
+    pub fn versioned_offline(&self) -> bool {
+        self.versioned_offline.load(Ordering::Relaxed)
+    }
+
+    /// Record the git commit a native (Rust-backed) package was built from.
+    /// Called at registration time (`Registry::set_provenance` or the
+    /// `register_provenance!` inventory entry in cljrs-interop).
+    pub fn set_native_provenance(&self, ns: &str, commit: &str) {
+        self.native_provenance
+            .write()
+            .unwrap()
+            .insert(Arc::from(ns), Arc::from(commit));
+    }
+
+    /// The recorded provenance commit for a native package's namespace.
+    pub fn native_provenance_for(&self, ns: &str) -> Option<Arc<str>> {
+        self.native_provenance.read().unwrap().get(ns).cloned()
+    }
+
+    /// Make pinned-native provenance mismatches hard errors.
+    pub fn set_enforce_native_versions(&self, enforce: bool) {
+        self.enforce_native_versions
+            .store(enforce, Ordering::Relaxed);
+    }
+
+    /// True when pinned-native provenance mismatches are errors.
+    pub fn enforce_native_versions(&self) -> bool {
+        self.enforce_native_versions.load(Ordering::Relaxed)
+    }
+
+    /// Install the pinned-native package loader (called once by
+    /// `cljrs_dylib::install`; first writer wins).
+    pub fn set_pinned_native_loader(&self, loader: PinnedNativeLoader) {
+        let mut guard = self.pinned_native_loader.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(loader);
+        }
     }
 
     /// If `:verify-commit-signatures` is enabled, verify that `commit` inside

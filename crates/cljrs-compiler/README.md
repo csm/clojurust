@@ -129,6 +129,14 @@ walk directly, preserving full semantics.
   through to `rt_call` for non-protocol callees.  Cached values (interned keywords, impl fns)
   are kept alive by an IC root tracer registered per allocating thread; IC slots in compiled
   modules hold only indices/interned pointers, never GC roots.
+- **Versioned symbols:** `rt_load_global` detects a `name@<sha>` suffix and resolves it through
+  the shared `cljrs_env::versioned` resolver (lazily loading the immutable `ns@sha` namespace;
+  resolution failures surface as pending exceptions); lookups into a not-yet-loaded `ns@sha`
+  namespace trigger the same lazy load.  `rt_load_global_versioned_ic(ns, ns_len, name,
+  name_len, slot)` is the fast path emitted by codegen (`emit_load_global_versioned_ic`):
+  versioned bindings are immutable, so the per-call-site slot is filled once with a permanently
+  rooted boxed value (the `VERSIONED_IC` table, traced by the same IC root tracer) and never
+  invalidated.
   `jit_stats` module — relaxed diagnostic counters (`BOXED_ARITH_CALLS`, `GUARD_DEOPTS`,
   `KW_IC_FILLS`, `PROTO_IC_HITS`, `PROTO_IC_MISSES`) and `jit_stats::snapshot() -> String`
   (written by `cljrs --jit-stats`).
@@ -189,13 +197,27 @@ cross-type `Eq` always stay boxed.
 ### AOT driver (`aot.rs`)
 
 ```rust
-pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()>;
+pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf], rust_config: Option<&RustConfig>, verify_commit_signatures: bool) -> AotResult<()>;
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+
+**Versioned namespaces are snapshotted at compile time.** Versioned requires
+execute during expansion (fetching the pinned source from git); a discovery
+pass (`pin_versioned_references`) additionally walks the expanded program for
+bare versioned symbols (`mylib/foo@<sha>`) and force-loads each pin via
+`cljrs_env::versioned::pin_if_available`.  Every pinned source fetched this
+way is embedded in the binary under its versioned namespace name
+(`register_builtin_source("mylib@<sha>", …)`), so the produced binary is
+self-contained — the generated harness calls
+`globals.set_versioned_offline(true)`, and a versioned namespace that was not
+embedded fails with a clear error instead of attempting a git fetch.  A bad
+pin (missing commit, failed signature check) fails the *compile*.  When
+`verify_commit_signatures` is set, `git verify-commit` runs at compile time;
+the binary trusts its embedded sources.
 
 The generated harness `main()` calls `-main` (via `resolve`) after
 `__cljrs_main` returns, forwarding all command-line arguments (skipping the

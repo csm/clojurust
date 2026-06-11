@@ -10,6 +10,8 @@ pub mod error;
 pub mod gc_roots;
 pub mod loader;
 pub mod taps;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod versioned;
 
 pub use async_hook::AsyncRuntime;
 

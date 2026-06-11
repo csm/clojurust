@@ -2375,8 +2375,33 @@ fn split_sym(s: &str, current_ns: &Arc<str>) -> (Arc<str>, Arc<str>) {
         return (current_ns.clone(), Arc::from("/"));
     }
     match s.find('/') {
-        Some(pos) => (Arc::from(&s[..pos]), Arc::from(&s[pos + 1..])),
+        Some(pos) => {
+            let ns_part = &s[..pos];
+            // Inside a versioned namespace ("base@hash"), a qualified
+            // self-reference written with the base name ("base/x") must
+            // resolve at the pinned commit, i.e. inside the versioned
+            // namespace itself — mirroring the tree-walker's eval_symbol.
+            if let Some(base) = versioned_ns_base(current_ns)
+                && ns_part == base
+            {
+                return (current_ns.clone(), Arc::from(&s[pos + 1..]));
+            }
+            (Arc::from(ns_part), Arc::from(&s[pos + 1..]))
+        }
         None => (current_ns.clone(), Arc::from(s)),
+    }
+}
+
+/// If `ns` is a versioned namespace name (`"base@<7-40 hex>"`), return the
+/// base part.  Mirrors `cljrs_value::symbol::split_version` (cljrs-ir cannot
+/// depend on cljrs-value).
+fn versioned_ns_base(ns: &str) -> Option<&str> {
+    let pos = ns.rfind('@')?;
+    let hash = &ns[pos + 1..];
+    if (7..=40).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(&ns[..pos])
+    } else {
+        None
     }
 }
 

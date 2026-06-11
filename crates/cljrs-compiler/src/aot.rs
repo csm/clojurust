@@ -385,12 +385,16 @@ pub fn lower_file_to_ir(
 /// binary.  `src_dirs` are additional directories for `require` resolution
 /// during macro expansion.  `rust_config`, when present, causes the generated
 /// harness to depend on the user's Rust crate and call its `cljrs_init` hook
-/// before loading any Clojure code.
+/// before loading any Clojure code.  `verify_commit_signatures` enables
+/// `git verify-commit` on every versioned pin resolved during compilation
+/// (the produced binary trusts its embedded sources, so verification happens
+/// here, at compile time).
 pub fn compile_file(
     src_path: &Path,
     out_path: &Path,
     src_dirs: &[PathBuf],
     rust_config: Option<&cljrs_deps::RustConfig>,
+    verify_commit_signatures: bool,
 ) -> AotResult<()> {
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
@@ -408,6 +412,11 @@ pub fn compile_file(
     } else {
         cljrs_stdlib::standard_env_with_paths(src_dirs.to_vec())
     };
+    if verify_commit_signatures {
+        globals
+            .verify_commit_signatures
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Register clojure.core.async so that (require '[clojure.core.async ...])
     // and the `go`/`alt` macros resolve during macro-expansion. The GC
     // service is silently skipped when there is no LocalSet context.
@@ -442,8 +451,22 @@ pub fn compile_file(
     }
     eprintln!("[aot] macro-expanded {} form(s)", expanded.len());
 
-    // Discover user namespaces loaded during expansion (transitive deps).
-    let bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    // ── 2a. Pin versioned references ──────────────────────────────────
+    // Versioned requires already executed (and were fetched) during
+    // expansion.  This pass additionally catches bare versioned symbols
+    // (`mylib/foo@<sha>`) anywhere in the program, force-loading each pin
+    // now so the binary is self-contained: every pinned source is recorded
+    // in `versioned_sources` for embedding, and a bad pin (missing commit,
+    // failed signature) fails the compile instead of the deployed binary.
+    pin_versioned_references(&expanded, &mut env)?;
+
+    // Discover user namespaces loaded during expansion (transitive deps),
+    // plus every pinned source fetched from git (embedded under the
+    // versioned namespace name, e.g. "mylib@abc1234").
+    let mut bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    for (ns, src) in env.globals.versioned_sources_snapshot() {
+        bundled_sources.push((ns, src.to_string()));
+    }
     if !bundled_sources.is_empty() {
         eprintln!(
             "[aot] bundling {} required namespace(s): {}",
@@ -643,6 +666,94 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
         compiler.compile_function(sub, func_id)?;
     }
     Ok(())
+}
+
+// ── Versioned pin discovery ──────────────────────────────────────────────────
+
+/// Walk the macro-expanded program for versioned symbols (`name@<sha>`,
+/// `ns/name@<sha>`) and force-load each pin at compile time.
+///
+/// Loading records the pinned source in `GlobalEnv::versioned_sources` for
+/// embedding.  Pins whose namespace has no locatable Clojure source are
+/// skipped (pure-Rust packages resolve through the native HEAD fallback at
+/// runtime; quoted symbols that merely look versioned stay inert).  Genuine
+/// load failures abort the compile.
+fn pin_versioned_references(
+    forms: &[cljrs_reader::Form],
+    env: &mut cljrs_eval::Env,
+) -> AotResult<()> {
+    let mut pins: Vec<(Option<String>, String)> = Vec::new();
+    for form in forms {
+        collect_versioned_syms(form, &mut pins);
+    }
+    pins.sort();
+    pins.dedup();
+
+    for (ns_part, commit) in pins {
+        let base: Arc<str> = match &ns_part {
+            Some(p) => {
+                let resolved = env
+                    .globals
+                    .resolve_alias(&env.current_ns, p)
+                    .unwrap_or_else(|| Arc::from(p.as_str()));
+                Arc::from(cljrs_env::versioned::base_ns_name(&resolved))
+            }
+            None => Arc::from(cljrs_env::versioned::base_ns_name(&env.current_ns)),
+        };
+        match cljrs_env::versioned::pin_if_available(&env.globals, &base, &commit) {
+            Ok(true) => eprintln!("[aot] pinned {base}@{commit}"),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(AotError::Eval(format!(
+                    "failed to pin {base}@{commit}: {e:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect `(namespace-part, commit)` for every versioned symbol in the form
+/// tree (including quoted/metadata-wrapped positions).
+fn collect_versioned_syms(form: &cljrs_reader::Form, out: &mut Vec<(Option<String>, String)>) {
+    use cljrs_reader::form::FormKind;
+    match &form.kind {
+        FormKind::Symbol(s) => {
+            let sym = cljrs_value::Symbol::parse(s);
+            if let Some(v) = sym.version {
+                out.push((
+                    sym.namespace.as_deref().map(str::to_string),
+                    v.as_ref().to_string(),
+                ));
+            }
+        }
+        FormKind::List(items)
+        | FormKind::Vector(items)
+        | FormKind::Map(items)
+        | FormKind::Set(items)
+        | FormKind::AnonFn(items) => {
+            for item in items {
+                collect_versioned_syms(item, out);
+            }
+        }
+        FormKind::Quote(inner)
+        | FormKind::SyntaxQuote(inner)
+        | FormKind::Unquote(inner)
+        | FormKind::UnquoteSplice(inner)
+        | FormKind::Deref(inner)
+        | FormKind::Var(inner)
+        | FormKind::TaggedLiteral(_, inner) => collect_versioned_syms(inner, out),
+        FormKind::Meta(meta, inner) => {
+            collect_versioned_syms(meta, out);
+            collect_versioned_syms(inner, out);
+        }
+        FormKind::ReaderCond { clauses, .. } => {
+            for clause in clauses {
+                collect_versioned_syms(clause, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── Bundled source discovery ─────────────────────────────────────────────────
@@ -899,6 +1010,10 @@ async fn run() {{
     // Initialize the standard environment so that rt_call and other
     // runtime bridge functions can look up builtins.
     let globals = cljrs_stdlib::standard_env();
+
+    // Versioned namespaces resolve only from sources embedded at compile
+    // time — an AOT binary never fetches from git at runtime.
+    globals.set_versioned_offline(true);
 
     // Register the async runtime (clojure.core.async, ^:async dispatch, await).
     cljrs_async::init(&globals);

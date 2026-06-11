@@ -342,6 +342,7 @@ dependencies = [
  "cljrs-charset",
  "cljrs-compiler",
  "cljrs-deps",
+ "cljrs-dylib",
  "cljrs-eval",
  "cljrs-gc",
  "cljrs-interop",
@@ -464,6 +465,7 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "target-lexicon",
+ "tempfile",
 ]
 
 [[package]]
@@ -474,6 +476,23 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "thiserror",
+]
+
+[[package]]
+name = "cljrs-dylib"
+version = "0.1.0"
+dependencies = [
+ "cljrs-deps",
+ "cljrs-env",
+ "cljrs-gc",
+ "cljrs-interop",
+ "cljrs-interp",
+ "cljrs-logging",
+ "cljrs-reader",
+ "cljrs-value",
+ "cljrs-vcs",
+ "libloading",
+ "tempfile",
 ]
 
 [[package]]
@@ -504,6 +523,7 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+ "tempfile",
 ]
 
 [[package]]
@@ -552,6 +572,7 @@ dependencies = [
  "cljrs-value",
  "cljrs-vcs",
  "regex",
+ "tempfile",
  "uuid",
 ]
 
@@ -621,6 +642,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "tempfile",
 ]
 
 [[package]]
