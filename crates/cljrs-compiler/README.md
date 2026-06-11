@@ -206,6 +206,28 @@ The generated harness `main()` (and the `compile_test_harness` test runner)
 calls `cljrs_gc::dump_stats_from_env()` once at exit, so AOT binaries honor
 the `CLJRS_GC_STATS` env var (empty/`"-"` → stdout, otherwise a file path).
 
+**Harness dependency resolution.** The harness depends on the runtime crates,
+and `resolve_harness_deps()` decides *how*, independently of the current
+directory — so `cljrs compile` works on a bare `.cljrs` file with no
+surrounding `Cargo.toml`, inside an unrelated Cargo workspace, and from a
+`cargo install cljrs` binary with no checkout at all:
+
+- **Local checkout found → path deps** (`path = "<workspace>/crates/cljrs-*"`),
+  and the build runs `--offline`. `find_workspace_root()` locates the checkout
+  via, in order: (1) the `CLJRS_WORKSPACE_ROOT` env var (explicit override;
+  must point at a `Cargo.toml` with `[workspace]`); (2) the compiler crate's
+  compile-time `CARGO_MANIFEST_DIR` (`<workspace>/crates/cljrs-compiler`, so the
+  root is two levels up); (3) walking up from the current directory.
+- **No checkout → published deps** (`cljrs-* = "=<version>"`, pinned to this
+  `cljrs`'s own `CARGO_PKG_VERSION`, since the runtime crates share the
+  workspace version and publish in lock-step). The build is **not** `--offline`,
+  so Cargo may fetch the crates from crates.io. This is what makes
+  `cargo install cljrs` + `cljrs compile` self-sufficient (a Rust toolchain and
+  network access are still required at compile time).
+
+Setting `CLJRS_WORKSPACE_ROOT` forces path deps against that clone even from an
+installed binary.
+
 ### No-GC blacklist (`escape.rs`, no-gc only)
 
 ```rust
