@@ -2,6 +2,27 @@
 
 Environments for running programs in.
 
+## versioned module (non-WASM)
+
+Shared versioned-symbol/namespace resolution service used by **every**
+execution tier (tree-walker, IR interpreter, JIT/AOT `rt_load_global*`
+bridges). Resolving `ns/name@commit` ensures the immutable versioned
+namespace `"ns@commit"` is loaded — from an embedded builtin source first,
+falling back to fetching the file from git history — then performs a plain
+`lookup_in_ns("ns@commit", name)`. Native (Rust-backed) symbols with no
+Clojure source fall back to the HEAD implementation. Public API:
+
+- `resolve_versioned_value(globals, defining_ns, ns_part, name, commit) -> EvalResult<Value>`
+  — full resolution: alias handling, lazy namespace load, native HEAD fallback
+- `ensure_versioned_ns_loaded(globals, base_ns, commit) -> EvalResult<Arc<str>>`
+  — idempotent load of `"base_ns@commit"` (same cycle/cross-thread coordination
+  as the unversioned loader); returns the versioned namespace name
+- `base_ns_name(ns: &str) -> &str` — strip a trailing `@<commit>` suffix
+
+Sources fetched from git are recorded in `GlobalEnv::versioned_sources`
+(`record_versioned_source` / `versioned_sources_snapshot`) so the AOT
+compiler can embed them in produced binaries.
+
 ## gc_roots module
 
 The `gc_roots` module manages GC root registration for the interpreter's Rust call stack. Public API includes:
@@ -14,6 +35,11 @@ The `gc_roots` module manages GC root registration for the interpreter's Rust ca
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
 - `set_stw_reclaim_hook(f)` — (Phase 10.2) installs a stop-the-world reclaim hook the JIT uses to free superseded native code; runs inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked
+
+Root tracing covers all namespaces (including immutable `ns@commit`
+namespaces) **and** the values in `GlobalEnv::version_cache`, so versioned
+values that exist only in the cache (native HEAD fallbacks) survive
+collection.
 
 ## apply module
 

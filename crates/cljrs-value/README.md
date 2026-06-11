@@ -113,12 +113,16 @@ and sequential collection equality between `List` and `Vector`.
 ### `Symbol` / `Keyword`
 
 ```rust
-pub struct Symbol   { namespace: Option<Arc<str>>, name: Arc<str> }
+pub struct Symbol   { namespace: Option<Arc<str>>, name: Arc<str>, version: Option<Arc<str>> }
 pub struct Keyword  { namespace: Option<Arc<str>>, name: Arc<str> }
 ```
 
 Both support `simple(name)`, `qualified(ns, name)`, `parse(str)`, and
-`full_name() -> String`.
+`full_name() -> String`. `Symbol` additionally carries an optional git-commit
+`version` (the `@<hash>` suffix) with `versioned_name() -> String`. Free
+helpers used by all execution tiers to detect versioned names:
+`symbol::is_commit_hash(s) -> bool` and
+`symbol::split_version(name) -> (&str, Option<&str>)`.
 
 ### Phase B3 — Shared static arena
 

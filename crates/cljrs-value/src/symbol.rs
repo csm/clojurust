@@ -79,7 +79,7 @@ impl Symbol {
 
 /// Split `name_part` into `(base, Some(hash))` if the last `@` is followed by
 /// a valid commit hash (7–40 hex chars), otherwise return `(name_part, None)`.
-fn split_version(name_part: &str) -> (&str, Option<&str>) {
+pub fn split_version(name_part: &str) -> (&str, Option<&str>) {
     if let Some(at_pos) = name_part.rfind('@') {
         let candidate = &name_part[at_pos + 1..];
         if is_commit_hash(candidate) {

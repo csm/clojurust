@@ -116,6 +116,10 @@ pub struct GlobalEnv {
     /// Session-scoped cache of commits that have already passed signature
     /// verification this run, keyed by `(repo_root, commit_hash)`.
     pub sig_verify_cache: Mutex<HashSet<(Arc<str>, Arc<str>)>>,
+    /// Pinned source texts fetched from git this session, keyed by
+    /// `"<ns>@<commit>"`.  The AOT compiler embeds these in the produced
+    /// binary so versioned namespaces resolve without git at runtime.
+    pub versioned_sources: RwLock<HashMap<Arc<str>, Arc<str>>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -147,6 +151,7 @@ impl GlobalEnv {
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
             sig_verify_cache: Mutex::new(HashSet::new()),
+            versioned_sources: RwLock::new(HashMap::new()),
         })
     }
 
@@ -403,6 +408,23 @@ impl GlobalEnv {
     pub fn cache_versioned_ns(&self, ns: &str, commit: &str) {
         let key: Arc<str> = Arc::from(format!("{ns}@{commit}"));
         self.version_cache.lock().unwrap().insert(key, Value::Nil);
+    }
+
+    /// Record the source text of a versioned namespace fetched from git.
+    /// Key: `"<ns>@<commit>"`.  Consumed by the AOT compiler for embedding.
+    pub fn record_versioned_source(&self, versioned_ns: &str, src: &str) {
+        self.versioned_sources
+            .write()
+            .unwrap()
+            .insert(Arc::from(versioned_ns), Arc::from(src));
+    }
+
+    /// Snapshot of all versioned sources fetched this session, sorted by key.
+    pub fn versioned_sources_snapshot(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let map = self.versioned_sources.read().unwrap();
+        let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// If `:verify-commit-signatures` is enabled, verify that `commit` inside

@@ -37,12 +37,16 @@ src/
   macros.rs      — macro expansion helpers
   syntax_quote.rs — syntax-quote (backtick) expansion
   virtualize.rs  — let-chain virtualization: assoc/conj chains → transients
-  versioned.rs   — versioned symbol resolution: git-source fetch, native version
-                   registry lookup, HEAD fallback for stable native functions
+  versioned.rs   — tree-walker entry point for versioned symbol resolution;
+                   thin shim over the shared resolver in `cljrs_env::versioned`
+                   (whole-namespace `ns@commit` loading, native HEAD fallback)
 tests/
   no_gc_eval.rs  — (no-gc mode) integration tests: arithmetic, def/defn provenance,
                    function-call region stack, loop/recur accumulation,
                    atom/reset!/swap! static-sink correctness
+  versioned_resolution.rs — end-to-end versioned resolution against a real git
+                   fixture: pinned symbols, HEAD-clobber regression, versioned
+                   require, GC survival of versioned values
 ```
 
 ---
