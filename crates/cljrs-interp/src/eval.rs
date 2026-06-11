@@ -191,11 +191,14 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
 
     // Inherited versioned context: if we are evaluating inside a versioned
     // function body, unversioned same-namespace symbols resolve at the inherited
-    // commit rather than HEAD.
+    // commit rather than HEAD.  "Same namespace" includes a qualified
+    // self-reference written with the base name (`mylib/x` inside `mylib@hash`).
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(commit) = env.versioned_eval_commit.clone() {
-        let is_same_ns =
-            sym.namespace.is_none() || sym.namespace.as_deref() == Some(env.current_ns.as_ref());
+        let is_same_ns = sym.namespace.is_none()
+            || sym.namespace.as_deref() == Some(env.current_ns.as_ref())
+            || sym.namespace.as_deref()
+                == Some(cljrs_env::versioned::base_ns_name(&env.current_ns));
         if is_same_ns {
             return crate::versioned::resolve_versioned_symbol(&sym, &commit, env);
         }
@@ -215,6 +218,17 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
             .globals
             .resolve_alias(&env.current_ns, ns_part)
             .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
+        // Qualified self-reference inside a versioned namespace: `mylib/x`
+        // written in `mylib@hash`'s own source resolves at the pinned commit,
+        // i.e. inside the versioned namespace itself.
+        #[cfg(not(target_arch = "wasm32"))]
+        let resolved: Arc<str> = if env.current_ns.as_ref() != resolved.as_ref()
+            && cljrs_env::versioned::base_ns_name(&env.current_ns) == resolved.as_ref()
+        {
+            env.current_ns.clone()
+        } else {
+            resolved
+        };
         return env
             .globals
             .lookup_in_ns(&resolved, &sym.name)

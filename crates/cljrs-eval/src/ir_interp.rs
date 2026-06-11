@@ -746,7 +746,26 @@ fn const_to_value(c: &Const) -> Value {
 
 // ── Global value lookup ─────────────────────────────────────────────────────
 
-fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &str) -> EvalResult {
+fn load_global_value(
+    globals: &Arc<GlobalEnv>,
+    ns: &str,
+    name: &str,
+    defining_ns: &str,
+) -> EvalResult {
+    // Versioned reference (`name@hash`): resolve through the shared service,
+    // which lazily loads the immutable `ns@hash` namespace and looks up the
+    // base name in it (with the native HEAD fallback).
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (base_name, Some(commit)) = cljrs_value::symbol::split_version(name) {
+        return cljrs_env::versioned::resolve_versioned_value(
+            globals,
+            defining_ns,
+            Some(ns),
+            base_name,
+            commit,
+        );
+    }
+
     // Try direct namespace lookup first, then resolve as alias.
     let resolved_ns = globals
         .resolve_alias(defining_ns, ns)
@@ -760,6 +779,21 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
             "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
+
+    // Reference into a versioned namespace (`lib@hash`/name) that has not
+    // been loaded this session: load it lazily and retry the lookup.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (base, Some(commit)) = cljrs_value::symbol::split_version(&resolved_ns)
+        && !globals.is_loaded(&resolved_ns)
+    {
+        cljrs_env::versioned::ensure_versioned_ns_loaded(globals, base, commit)?;
+        if let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name)
+            && let Some(val) = cljrs_env::dynamics::deref_var(&var)
+        {
+            return Ok(val);
+        }
+    }
+
     // JVM class names resolve to themselves as symbols, mirroring eval_symbol.
     if cljrs_interp::eval::is_jvm_class_name(name) {
         return Ok(Value::symbol(cljrs_value::Symbol::simple(name)));

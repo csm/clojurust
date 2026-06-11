@@ -29,7 +29,10 @@ src/
                     register_compiler_sources, ensure_compiler_loaded
   apply.rs        — IR-aware function dispatch: tries IR cache, falls back to cljrs_interp::apply
   ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file;
-                    counts loop back-edges and transfers into compiled OSR entries (Phase 10.4)
+                    counts loop back-edges and transfers into compiled OSR entries (Phase 10.4);
+                    LoadGlobal is version-aware: `name@<sha>` resolves via
+                    cljrs_env::versioned, and lookups into a not-yet-loaded
+                    `ns@<sha>` namespace trigger a lazy versioned load
   ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported);
                     invalidate(id) drops an entry back to NotAttempted (cross-defn invalidation)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types

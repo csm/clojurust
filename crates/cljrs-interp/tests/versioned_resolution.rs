@@ -75,7 +75,9 @@ fn make_lib_repo() -> LibRepo {
     let lib_file = src_dir.join("mylib.cljrs");
     std::fs::write(
         &lib_file,
-        "(def the-answer 1)\n(defn describe [] (str \"v\" the-answer))\n",
+        "(def the-answer 1)\n\
+         (defn describe [] (str \"v\" the-answer))\n\
+         (defn qdescribe [] (str \"q\" mylib/the-answer))\n",
     )
     .unwrap();
     git_ok(&root, &["add", "."]);
@@ -84,7 +86,9 @@ fn make_lib_repo() -> LibRepo {
 
     std::fs::write(
         &lib_file,
-        "(def the-answer 2)\n(defn describe [] (str \"v\" the-answer))\n",
+        "(def the-answer 2)\n\
+         (defn describe [] (str \"v\" the-answer))\n\
+         (defn qdescribe [] (str \"q\" mylib/the-answer))\n",
     )
     .unwrap();
     git_ok(&root, &["add", "."]);
@@ -155,6 +159,22 @@ fn pinned_fn_sees_same_ns_helpers_at_commit() {
 
     let pinned = eval_str(&mut env, &format!("(mylib/describe@{})", repo.commit_v1));
     assert_eq!(pinned, Value::string("v1"));
+}
+
+/// A pinned function's *qualified* same-namespace references (`mylib/x`
+/// written inside mylib's own source) also resolve at the pinned commit —
+/// a namespace self-reference at commit C means that file's binding, not
+/// HEAD's.
+#[test]
+fn pinned_fn_sees_qualified_self_refs_at_commit() {
+    let repo = make_lib_repo();
+    let (_globals, mut env) = make_env(&repo.src_dir);
+
+    eval_str(&mut env, "(require 'mylib)");
+    assert_eq!(eval_str(&mut env, "(mylib/qdescribe)"), Value::string("q2"));
+
+    let pinned = eval_str(&mut env, &format!("(mylib/qdescribe@{})", repo.commit_v1));
+    assert_eq!(pinned, Value::string("q1"));
 }
 
 /// A versioned require pins the whole namespace under an alias.

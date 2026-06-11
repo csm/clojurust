@@ -504,6 +504,7 @@ dependencies = [
  "cljrs-reader",
  "cljrs-types",
  "cljrs-value",
+ "tempfile",
 ]
 
 [[package]]
