@@ -125,6 +125,19 @@ pub struct GlobalEnv {
     /// namespace that was not embedded at compile time fails with a clear
     /// error instead of attempting a fetch.
     pub versioned_offline: AtomicBool,
+    /// Provenance of native (Rust-backed) packages recorded at registration:
+    /// namespace → the git commit the package was built from.  Consulted by
+    /// the versioned resolver's native HEAD fallback to detect pinned-commit
+    /// mismatches.
+    pub native_provenance: RwLock<HashMap<Arc<str>, Arc<str>>>,
+    /// When true, a pinned lookup of a native function whose recorded
+    /// provenance does not match the requested commit is an error instead of
+    /// a once-per-pin warning.  CLI: `--enforce-native-versions`; cljrs.edn:
+    /// `:enforce-native-versions true`.
+    pub enforce_native_versions: AtomicBool,
+    /// Pinned-native mismatches already warned about this session
+    /// (key: `"<ns>@<commit>"`), so each pin warns at most once.
+    pub provenance_warned: Mutex<HashSet<Arc<str>>>,
 }
 
 impl std::fmt::Debug for GlobalEnv {
@@ -158,6 +171,9 @@ impl GlobalEnv {
             sig_verify_cache: Mutex::new(HashSet::new()),
             versioned_sources: RwLock::new(HashMap::new()),
             versioned_offline: AtomicBool::new(false),
+            native_provenance: RwLock::new(HashMap::new()),
+            enforce_native_versions: AtomicBool::new(false),
+            provenance_warned: Mutex::new(HashSet::new()),
         })
     }
 
@@ -443,6 +459,32 @@ impl GlobalEnv {
     /// True when versioned namespaces may only come from embedded sources.
     pub fn versioned_offline(&self) -> bool {
         self.versioned_offline.load(Ordering::Relaxed)
+    }
+
+    /// Record the git commit a native (Rust-backed) package was built from.
+    /// Called at registration time (`Registry::set_provenance` or the
+    /// `register_provenance!` inventory entry in cljrs-interop).
+    pub fn set_native_provenance(&self, ns: &str, commit: &str) {
+        self.native_provenance
+            .write()
+            .unwrap()
+            .insert(Arc::from(ns), Arc::from(commit));
+    }
+
+    /// The recorded provenance commit for a native package's namespace.
+    pub fn native_provenance_for(&self, ns: &str) -> Option<Arc<str>> {
+        self.native_provenance.read().unwrap().get(ns).cloned()
+    }
+
+    /// Make pinned-native provenance mismatches hard errors.
+    pub fn set_enforce_native_versions(&self, enforce: bool) {
+        self.enforce_native_versions
+            .store(enforce, Ordering::Relaxed);
+    }
+
+    /// True when pinned-native provenance mismatches are errors.
+    pub fn enforce_native_versions(&self) -> bool {
+        self.enforce_native_versions.load(Ordering::Relaxed)
     }
 
     /// If `:verify-commit-signatures` is enabled, verify that `commit` inside

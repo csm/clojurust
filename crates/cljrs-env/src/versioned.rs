@@ -323,6 +323,7 @@ fn native_head_fallback(
 ) -> EvalResult {
     match globals.lookup_in_ns(base_ns, name) {
         Some(val) if matches!(val, Value::NativeFunction(_)) => {
+            check_native_provenance(globals, base_ns, commit)?;
             globals.cache_versioned(base_ns, name, commit, val.clone());
             Ok(val)
         }
@@ -331,6 +332,46 @@ fn native_head_fallback(
         ))),
         None => Err(EvalError::UnboundSymbol(format!("{base_ns}/{name}"))),
     }
+}
+
+/// Verify the recorded provenance of a native package against a pinned
+/// commit ("verified HEAD binding").
+///
+/// Native functions always come from the current binary; this check makes
+/// the fallback explicit and auditable instead of silent.  The recorded and
+/// requested hashes match when either is a prefix of the other (either side
+/// may be abbreviated).  Mismatching or missing provenance warns once per
+/// `ns@commit` by default, and is an error when
+/// `GlobalEnv::enforce_native_versions` is set.
+fn check_native_provenance(globals: &GlobalEnv, base_ns: &str, commit: &str) -> EvalResult<()> {
+    let recorded = globals.native_provenance_for(base_ns);
+    if let Some(ref rec) = recorded {
+        let matches = rec.starts_with(commit) || commit.starts_with(rec.as_ref());
+        if matches {
+            return Ok(());
+        }
+    }
+
+    let described = match &recorded {
+        Some(rec) => format!("is built from commit {rec}"),
+        None => "has no recorded provenance".to_string(),
+    };
+    if globals.enforce_native_versions() {
+        return Err(EvalError::Runtime(format!(
+            "native package `{base_ns}` {described}; cannot satisfy pinned \
+             `{base_ns}@{commit}` (native functions always come from the current binary)"
+        )));
+    }
+
+    let warn_key: Arc<str> = Arc::from(format!("{base_ns}@{commit}"));
+    if globals.provenance_warned.lock().unwrap().insert(warn_key) {
+        eprintln!(
+            "cljrs: warning: native package `{base_ns}` {described}; pinned \
+             `{base_ns}@{commit}` resolves to the current binary's implementation \
+             (use --enforce-native-versions to make this an error)"
+        );
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

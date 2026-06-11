@@ -40,6 +40,13 @@ struct Cli {
     #[arg(long, global = true)]
     verify_commit_signatures: bool,
 
+    /// Make pinned lookups of native (Rust-backed) functions an error when
+    /// the package's recorded provenance does not match the requested
+    /// commit (default: warn once per pin).  Can also be enabled
+    /// per-project via `:enforce-native-versions true` in `cljrs.edn`.
+    #[arg(long, global = true)]
+    enforce_native_versions: bool,
+
     /// JIT compilation invocation threshold (default 1000; 0 = disable JIT).
     /// Also read from CLJRS_JIT_THRESHOLD env var.
     #[arg(
@@ -324,13 +331,16 @@ fn run(cli: Cli) -> miette::Result<i32> {
 
     let gc_stats_target = cli.gc_stats.clone();
     let jit_stats_target = cli.jit_stats.clone();
-    let verify_commit_signatures = cli.verify_commit_signatures;
+    let versioning = VersioningFlags {
+        verify_commit_signatures: cli.verify_commit_signatures,
+        enforce_native_versions: cli.enforce_native_versions,
+    };
     let supports_gc_stats = matches!(
         &cli.command,
         Commands::Run { .. } | Commands::Eval { .. } | Commands::Test { .. },
     );
 
-    let result = run_command(cli.command, verify_commit_signatures);
+    let result = run_command(cli.command, versioning);
 
     if supports_gc_stats
         && let Some(target) = gc_stats_target.as_deref()
@@ -379,7 +389,16 @@ fn init_jit(threshold: Option<u32>) {
     cljrs_jit::init();
 }
 
-fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Result<i32> {
+/// CLI-level versioned-symbol policy flags, threaded into `setup_globals`.
+#[derive(Clone, Copy, Default)]
+struct VersioningFlags {
+    /// `--verify-commit-signatures` / `:verify-commit-signatures`.
+    verify_commit_signatures: bool,
+    /// `--enforce-native-versions` / `:enforce-native-versions`.
+    enforce_native_versions: bool,
+}
+
+fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result<i32> {
     match command {
         Commands::Run {
             file,
@@ -392,7 +411,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+            let globals = setup_globals(src_paths, gc_config, versioning);
             run_source(&src, &filename, globals, &args)?;
             Ok(0)
         }
@@ -402,7 +421,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             gc_hard_limit_mb,
         } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+            let globals = setup_globals(src_paths, gc_config, versioning);
             run_repl(globals);
             Ok(0)
         }
@@ -432,7 +451,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
                     &out,
                     &src_paths,
                     rust_config.as_ref(),
-                    verify_commit_signatures,
+                    versioning.verify_commit_signatures,
                 )
                 .map_err(|e| miette::miette!("{e}"))?;
             }
@@ -440,7 +459,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
         }
         Commands::Eval { expr } => {
             let gc_config = Arc::new(GcConfig::new());
-            let globals = setup_globals(Vec::new(), gc_config, verify_commit_signatures);
+            let globals = setup_globals(Vec::new(), gc_config, versioning);
             let result = eval_source(&expr, "<eval>", globals)?;
             if result != Value::Nil {
                 println!("{}", result);
@@ -465,7 +484,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             verbose,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
-            verify_commit_signatures,
+            versioning,
         ),
         Commands::Deps { command } => match command {
             DepsCommands::Fetch { name } => run_deps_fetch(name),
@@ -543,13 +562,16 @@ fn write_gc_stats(target: &str) -> std::io::Result<()> {
 fn setup_globals(
     src_paths: Vec<PathBuf>,
     gc_config: Arc<GcConfig>,
-    verify_commit_signatures: bool,
+    versioning: VersioningFlags,
 ) -> Arc<GlobalEnv> {
     let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
-    if verify_commit_signatures {
+    if versioning.verify_commit_signatures {
         globals
             .verify_commit_signatures
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if versioning.enforce_native_versions {
+        globals.set_enforce_native_versions(true);
     }
     if let Ok(cwd) = std::env::current_dir() {
         apply_deps_config(&globals, &cwd);
@@ -597,6 +619,9 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                 globals
                     .verify_commit_signatures
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if config.enforce_native_versions {
+                globals.set_enforce_native_versions(true);
             }
             // Load the native shared library (if :rust is configured) so that
             // native functions are registered before any Clojure code runs.
@@ -1067,10 +1092,10 @@ fn run_tests_command(
     verbose: bool,
     gc_soft_limit_mb: Option<usize>,
     gc_hard_limit_mb: Option<usize>,
-    verify_commit_signatures: bool,
+    versioning: VersioningFlags,
 ) -> miette::Result<i32> {
     let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-    let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+    let globals = setup_globals(src_paths, gc_config, versioning);
 
     let namespaces = if namespaces.is_empty() {
         // Read the final source paths (which may include cljrs.edn :paths).

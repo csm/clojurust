@@ -56,6 +56,10 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
                 FormKind::Bool(b) => config.verify_commit_signatures = *b,
                 _ => return Err(":verify-commit-signatures must be true or false".to_string()),
             },
+            Some("enforce-native-versions") => match &val.kind {
+                FormKind::Bool(b) => config.enforce_native_versions = *b,
+                _ => return Err(":enforce-native-versions must be true or false".to_string()),
+            },
             Some("rust") => {
                 config.rust = Some(extract_rust_config(val, config_dir)?);
             }

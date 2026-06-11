@@ -35,6 +35,8 @@ pub struct DepsConfig {
     pub deps:                     Vec<(Arc<str>, Dependency)>,
     pub aliases:                  Vec<(Arc<str>, Alias)>,
     pub verify_commit_signatures: bool,
+    pub enforce_native_versions:  bool,  // :enforce-native-versions — pinned-native
+                                         // provenance mismatches error instead of warning
     pub rust:                     Option<RustConfig>,
 }
 

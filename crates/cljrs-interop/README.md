@@ -15,7 +15,8 @@ registration helpers, Registry, `#[export]` proc-macro).
 src/
   lib.rs       — re-exports, crate entry point
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
-  exports.rs   — ExportEntry, inventory::collect!, register_exports
+  exports.rs   — ExportEntry / ProvenanceEntry, inventory::collect!, register_exports,
+                 register_provenance! macro
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
   register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
   registry.rs  — Registry struct and InitFn type alias for cljrs_init convention
@@ -102,6 +103,25 @@ pub struct ExportEntry {
 }
 
 pub fn register_exports(registry: &mut Registry);
+```
+
+### Native provenance (verified HEAD binding)
+
+Pinned lookups of native functions (`math/add@<sha>`) always resolve to the
+current binary's implementation — but the resolver verifies the pin against
+the package's recorded provenance: a match (either side may be an
+abbreviated hash) is silent; a mismatch or missing provenance warns once per
+pin, or errors under `--enforce-native-versions` (cljrs.edn
+`:enforce-native-versions true`).
+
+```rust
+pub struct ProvenanceEntry { pub ns: &'static str, pub commit: &'static str }
+
+// Declare once per exported namespace (commit typically from build.rs):
+cljrs_interop::register_provenance!("math", env!("CLJRS_PKG_COMMIT"));
+
+// Or imperatively inside cljrs_init:
+registry.set_provenance("math", commit);
 ```
 
 ### Registry and InitFn

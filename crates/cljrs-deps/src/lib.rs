@@ -111,6 +111,11 @@ pub struct DepsConfig {
     /// must pass `git verify-commit` before historical code is executed.
     /// Equivalent to the `--verify-commit-signatures` CLI flag.
     pub verify_commit_signatures: bool,
+    /// When true, a pinned lookup of a native (Rust-backed) function whose
+    /// recorded provenance does not match the requested commit is an error
+    /// instead of a warning.  Equivalent to the `--enforce-native-versions`
+    /// CLI flag.
+    pub enforce_native_versions: bool,
     /// Optional Rust-crate configuration for mixed Rust/Clojure projects.
     pub rust: Option<RustConfig>,
 }

@@ -29,6 +29,14 @@ binaries) restricts versioned loading to embedded sources — a missing
 embedding fails with a clear "was not embedded at compile time" error
 instead of fetching from git.
 
+Native (Rust-backed) packages get a **verified HEAD binding**: the fallback
+checks the pin against `GlobalEnv::native_provenance` (recorded via
+`set_native_provenance` / `Registry::set_provenance`; prefix-match in either
+direction for abbreviated hashes).  Mismatching or missing provenance warns
+once per pin (`provenance_warned`), or errors when
+`set_enforce_native_versions(true)` is set (`--enforce-native-versions`,
+cljrs.edn `:enforce-native-versions`).
+
 ## gc_roots module
 
 The `gc_roots` module manages GC root registration for the interpreter's Rust call stack. Public API includes:

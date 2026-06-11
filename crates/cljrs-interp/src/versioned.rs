@@ -103,4 +103,84 @@ mod tests {
             "expected UnboundSymbol, got {err:?}"
         );
     }
+
+    // ── Native provenance (verified HEAD binding) ─────────────────────────────
+
+    fn versioned_sym(ns: &str, name: &str, commit: &str) -> cljrs_value::Symbol {
+        cljrs_value::Symbol {
+            namespace: Some(Arc::from(ns)),
+            name: Arc::from(name),
+            version: Some(Arc::from(commit)),
+        }
+    }
+
+    /// Matching provenance (either side may be abbreviated) resolves silently
+    /// — no entry lands in the warned set.
+    #[test]
+    fn matching_provenance_is_silent() {
+        let (globals, mut env) = make_env("provlib");
+        let full_commit = "deadbeef0123456789abcdef0123456789abcdef";
+
+        globals.intern(
+            "provlib",
+            Arc::from("f"),
+            Value::NativeFunction(GcPtr::new(const_native(1))),
+        );
+        globals.set_native_provenance("provlib", full_commit);
+
+        // Pin with an abbreviated prefix of the recorded commit.
+        let sym = versioned_sym("provlib", "f", "deadbeef012");
+        super::resolve_versioned_symbol(&sym, "deadbeef012", &mut env).expect("should resolve");
+
+        assert!(
+            globals.provenance_warned.lock().unwrap().is_empty(),
+            "matching provenance must not warn"
+        );
+    }
+
+    /// Mismatching provenance still resolves (HEAD binding) but records a
+    /// once-per-pin warning.
+    #[test]
+    fn mismatched_provenance_warns_once() {
+        let (globals, mut env) = make_env("provlib2");
+        globals.intern(
+            "provlib2",
+            Arc::from("f"),
+            Value::NativeFunction(GcPtr::new(const_native(2))),
+        );
+        globals.set_native_provenance("provlib2", "1111111111111111");
+
+        let commit = "2222222222222222";
+        let sym = versioned_sym("provlib2", "f", commit);
+        let val = super::resolve_versioned_symbol(&sym, commit, &mut env)
+            .expect("mismatch still resolves to HEAD by default");
+        assert!(matches!(val, Value::NativeFunction(_)));
+
+        let warned = globals.provenance_warned.lock().unwrap();
+        assert_eq!(warned.len(), 1, "exactly one warning per pin");
+        assert!(warned.contains(&Arc::<str>::from("provlib2@2222222222222222")));
+    }
+
+    /// Under --enforce-native-versions a provenance mismatch is an error.
+    #[test]
+    fn enforce_native_versions_makes_mismatch_an_error() {
+        let (globals, mut env) = make_env("provlib3");
+        globals.intern(
+            "provlib3",
+            Arc::from("f"),
+            Value::NativeFunction(GcPtr::new(const_native(3))),
+        );
+        globals.set_native_provenance("provlib3", "1111111111111111");
+        globals.set_enforce_native_versions(true);
+
+        let commit = "2222222222222222";
+        let sym = versioned_sym("provlib3", "f", commit);
+        let err = super::resolve_versioned_symbol(&sym, commit, &mut env)
+            .expect_err("strict mode must reject a provenance mismatch");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("provlib3") && msg.contains("1111111111111111"),
+            "error should describe the mismatch: {msg}"
+        );
+    }
 }

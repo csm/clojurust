@@ -88,6 +88,19 @@ impl Registry {
             .intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(f)));
     }
 
+    /// Record the git commit the native package providing namespace `ns` was
+    /// built from.
+    ///
+    /// The versioned resolver consults this when a pinned symbol
+    /// (`ns/name@<sha>`) falls back to a native function: a matching
+    /// provenance is silent; a mismatch warns (or errors under
+    /// `--enforce-native-versions`).  Typically driven by the
+    /// [`register_provenance!`][crate::register_provenance] macro with a
+    /// build-script-provided commit, e.g. `env!("CLJRS_PKG_COMMIT")`.
+    pub fn set_provenance(&self, ns: &str, commit: &str) {
+        self.env.set_native_provenance(ns, commit);
+    }
+
     /// Access the underlying `GlobalEnv` for operations beyond simple `define`
     /// (e.g. registering builtin namespace sources, setting aliases).
     pub fn env(&self) -> &Arc<GlobalEnv> {
