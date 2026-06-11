@@ -35,6 +35,7 @@ sites compile through per-call-site inline caches (`rt_kw_ic_fill`,
 | `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). `specs_from_profile` maps the arity's Tier-1 type profile to per-parameter specializations (skipped when banned by deopts or `CLJRS_JIT_NO_SPEC=1`; OSR entries are never specialized). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
 | `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `pin_epoch` for modules whose code leaked into a closure value, `reclaim_at_stw` frees stale, unpinned modules with no live frame via `JITModule::free_memory` |
 | `src/osr_integration.rs` | (test-only) end-to-end OSR test: lowers a real `loop*` from source, builds + compiles the OSR entry, and calls the native code with a mid-loop register snapshot |
+| `tests/versioned_jit.rs` | End-to-end versioned-symbol test: pinned references (`mylib/x@<sha>`) inside JIT-compiled functions resolve at the pinned commit through the `rt_load_global_versioned_ic` inline cache, agree with the interpreter tiers, survive a forced GC, and leave HEAD untouched |
 
 ## Public API
 

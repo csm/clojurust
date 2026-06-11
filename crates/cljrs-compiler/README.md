@@ -129,6 +129,14 @@ walk directly, preserving full semantics.
   through to `rt_call` for non-protocol callees.  Cached values (interned keywords, impl fns)
   are kept alive by an IC root tracer registered per allocating thread; IC slots in compiled
   modules hold only indices/interned pointers, never GC roots.
+- **Versioned symbols:** `rt_load_global` detects a `name@<sha>` suffix and resolves it through
+  the shared `cljrs_env::versioned` resolver (lazily loading the immutable `ns@sha` namespace;
+  resolution failures surface as pending exceptions); lookups into a not-yet-loaded `ns@sha`
+  namespace trigger the same lazy load.  `rt_load_global_versioned_ic(ns, ns_len, name,
+  name_len, slot)` is the fast path emitted by codegen (`emit_load_global_versioned_ic`):
+  versioned bindings are immutable, so the per-call-site slot is filled once with a permanently
+  rooted boxed value (the `VERSIONED_IC` table, traced by the same IC root tracer) and never
+  invalidated.
   `jit_stats` module — relaxed diagnostic counters (`BOXED_ARITH_CALLS`, `GUARD_DEOPTS`,
   `KW_IC_FILLS`, `PROTO_IC_HITS`, `PROTO_IC_MISSES`) and `jit_stats::snapshot() -> String`
   (written by `cljrs --jit-stats`).

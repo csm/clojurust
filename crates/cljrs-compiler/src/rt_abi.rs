@@ -1930,6 +1930,13 @@ pub unsafe extern "C" fn rt_load_global(
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
 
+    // Versioned reference (`name@<sha>`): resolve through the shared
+    // versioned-namespace service.  (The IC bridge below is the fast path
+    // for these; this covers any non-IC caller.)
+    if let (base_name, Some(commit)) = cljrs_value::symbol::split_version(name) {
+        return resolve_versioned_boxed(ns, base_name, commit);
+    }
+
     // Look up in the global environment via the thread-local eval context.
     if let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() {
         // Try the specified namespace first.
@@ -1948,8 +1955,48 @@ pub unsafe extern "C" fn rt_load_global(
         {
             return box_or_intern_val(val);
         }
+        // Reference into a versioned namespace (`lib@sha`/name) that has not
+        // been loaded this session: load it lazily and retry.
+        if let (base, Some(commit)) = cljrs_value::symbol::split_version(ns)
+            && !globals.is_loaded(ns)
+        {
+            match cljrs_env::versioned::ensure_versioned_ns_loaded(&globals, base, commit) {
+                Ok(_) => {
+                    if let Some(val) = globals.lookup_in_ns(ns, name) {
+                        return box_or_intern_val(val);
+                    }
+                }
+                Err(e) => {
+                    stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+                    return rt_const_nil();
+                }
+            }
+        }
     }
     rt_const_nil()
+}
+
+/// Resolve `ns/name@commit` through the shared versioned resolver, boxing the
+/// result.  Resolution failures surface as a pending exception (versioned
+/// bindings are pinned by the programmer; silently yielding nil would mask
+/// typos and missing commits).
+fn resolve_versioned_boxed(ns_part: &str, name: &str, commit: &str) -> *const Value {
+    let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() else {
+        return rt_const_nil();
+    };
+    match cljrs_env::versioned::resolve_versioned_value(
+        &globals,
+        &current_ns,
+        Some(ns_part),
+        name,
+        commit,
+    ) {
+        Ok(val) => box_or_intern_val(val),
+        Err(e) => {
+            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            rt_const_nil()
+        }
+    }
 }
 
 /// Define (intern) a global var.  Returns a pointer to the Var value.
@@ -2032,7 +2079,13 @@ pub unsafe extern "C" fn rt_call(
 ) -> *const Value {
     let callee = unsafe { val_ref(callee) };
     let nargs = nargs as usize;
-    let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs) };
+    // Zero-arg call sites pass a null args pointer (see emit_unknown_call);
+    // from_raw_parts requires non-null even for empty slices.
+    let arg_slice: &[*const Value] = if nargs == 0 || args.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, nargs) }
+    };
 
     // Fast paths for map/set callables — avoid interpreter + GC heap allocation.
     match callee {
@@ -3673,6 +3726,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_box_bool as *const () as usize);
     std::hint::black_box(rt_deopt as *const () as usize);
     std::hint::black_box(rt_kw_ic_fill as *const () as usize);
+    std::hint::black_box(rt_load_global_versioned_ic as *const () as usize);
     std::hint::black_box(rt_call_ic as *const () as usize);
 }
 
@@ -3839,9 +3893,18 @@ use std::sync::RwLock;
 
 static KW_INTERN: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> = OnceLock::new();
 static PROTO_ICS: OnceLock<RwLock<Vec<Arc<ProtoIcCell>>>> = OnceLock::new();
+/// Resolved versioned values cached by compiled call sites, keyed by
+/// `"<ns>/<name@commit>"`.  Versioned bindings are immutable, so entries are
+/// never invalidated; the table permanently roots each boxed value.
+static VERSIONED_IC: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> =
+    OnceLock::new();
 
 fn kw_intern_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
     KW_INTERN.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn versioned_ic_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
+    VERSIONED_IC.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
 fn proto_ic_table() -> &'static RwLock<Vec<Arc<ProtoIcCell>>> {
@@ -3865,6 +3928,11 @@ fn ensure_ic_tracer_registered() {
         cljrs_gc::HEAP.register_root_tracer(|visitor| {
             use cljrs_gc::{GcVisitor as _, Trace as _};
             if let Some(table) = KW_INTERN.get() {
+                for v in table.read().unwrap().values() {
+                    visitor.visit(&v.0);
+                }
+            }
+            if let Some(table) = VERSIONED_IC.get() {
                 for v in table.read().unwrap().values() {
                     visitor.visit(&v.0);
                 }
@@ -3921,6 +3989,86 @@ pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usiz
     // pointer, and aligned 8-byte stores cannot tear.
     unsafe { *slot = interned as usize };
     interned
+}
+
+/// Versioned-load inline-cache fill (slow path, once per call site).
+///
+/// Compiled code keeps an 8-byte writable slot per versioned `LoadGlobal`
+/// site (`ns/name@sha`).  Versioned bindings are immutable for the lifetime
+/// of the process, so the slot is filled once and never invalidated — no
+/// epoch or rebind machinery is needed.  On the first execution this bridge
+/// resolves the symbol through the shared versioned resolver (which may
+/// lazily load the `ns@sha` namespace from embedded source or git), interns
+/// the boxed value in a permanently rooted table, and stores the stable
+/// pointer into the slot.
+///
+/// Resolution failure leaves the slot empty (so a later execution retries)
+/// and surfaces a pending exception.
+///
+/// # Safety
+/// `ns_ptr`/`name_ptr` must describe valid UTF-8; `slot` must point to the
+/// call site's 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_load_global_versioned_ic(
+    ns_ptr: *const u8,
+    ns_len: u64,
+    name_ptr: *const u8,
+    name_len: u64,
+    slot: *mut usize,
+) -> *const Value {
+    let ns = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
+    };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+
+    let (base_name, version) = cljrs_value::symbol::split_version(name);
+    let Some(commit) = version else {
+        // Codegen only emits this bridge for versioned names; tolerate a
+        // stray unversioned call by deferring to the generic path (uncached).
+        return unsafe { rt_load_global(ns_ptr, ns_len, name_ptr, name_len) };
+    };
+
+    let key = format!("{ns}/{name}");
+    if let Some(v) = versioned_ic_table().read().unwrap().get(&key) {
+        let raw = v.0.get() as *const Value;
+        unsafe { *slot = raw as usize };
+        return raw;
+    }
+
+    let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() else {
+        return rt_const_nil();
+    };
+    match cljrs_env::versioned::resolve_versioned_value(
+        &globals,
+        &current_ns,
+        Some(ns),
+        base_name,
+        commit,
+    ) {
+        Ok(val) => {
+            ensure_ic_tracer_registered();
+            let mut table = versioned_ic_table().write().unwrap();
+            // Re-check under the write lock so a racing resolution of the
+            // same symbol cannot replace (and un-root) a pointer already
+            // handed out.
+            if let Some(v) = table.get(&key) {
+                let raw = v.0.get() as *const Value;
+                unsafe { *slot = raw as usize };
+                return raw;
+            }
+            let ptr = GcPtr::new(val);
+            let raw = ptr.get() as *const Value;
+            table.insert(key, SharedVal(ptr));
+            unsafe { *slot = raw as usize };
+            raw
+        }
+        Err(e) => {
+            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            rt_const_nil()
+        }
+    }
 }
 
 /// Invoke `callee` with already-cloned args, boxing the result and stashing a
