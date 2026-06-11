@@ -37,6 +37,11 @@ once per pin (`provenance_warned`), or errors when
 `set_enforce_native_versions(true)` is set (`--enforce-native-versions`,
 cljrs.edn `:enforce-native-versions`).
 
+Opt-in pinned native code: `GlobalEnv::set_pinned_native_loader` installs a
+`PinnedNativeLoader` callback (provided by `cljrs-dylib`); the resolver
+consults it before the HEAD fallback, and a successful load redirects the
+lookup into the freshly registered `"<ns>@<commit>"` namespace.
+
 ## gc_roots module
 
 The `gc_roots` module manages GC root registration for the interpreter's Rust call stack. Public API includes:

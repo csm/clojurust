@@ -1,5 +1,10 @@
 # Versioned Namespaces/Symbols for AOT, JIT, and Native (Rust-Interop) Packages
 
+> **Status:** Implemented (Phases 0–6).  The AOT *static-link* variant for
+> pinned native deps (end of Phase 5) is deferred — pinned native packages
+> use the dlopen path; see `crates/cljrs-dylib/README.md` and TODO.md
+> Phase 9 for the open `#[export]`-inventory-collision problem.
+
 ## Context
 
 Versioned symbols (`foo@abc1234`, `my.ns/foo@abc1234`) and versioned requires

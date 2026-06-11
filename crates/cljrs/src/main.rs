@@ -573,6 +573,8 @@ fn setup_globals(
     if versioning.enforce_native_versions {
         globals.set_enforce_native_versions(true);
     }
+    // Opt-in pinned native packages (:rust/load :dylib in cljrs.edn).
+    cljrs_dylib::install(&globals);
     if let Ok(cwd) = std::env::current_dir() {
         apply_deps_config(&globals, &cwd);
     }

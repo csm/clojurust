@@ -54,7 +54,13 @@ pub enum Dependency {
     Local { root: PathBuf },
 }
 
-pub struct GitDep { pub url: Arc<str>, pub sha: Arc<str> }
+pub struct GitDep {
+    pub url: Arc<str>,
+    pub sha: Arc<str>,
+    pub rust_init:       Option<Arc<str>>,  // :rust/init  — native init fn path
+    pub rust_crate_dir:  Option<Arc<str>>,  // :rust/crate — Cargo.toml subdir
+    pub rust_load_dylib: bool,              // :rust/load :dylib — pinned native code
+}
 
 pub struct Alias {
     pub extra_paths: Vec<PathBuf>,
@@ -68,7 +74,12 @@ pub struct Alias {
 {:paths ["src"]
 
  :deps
- {my.lib {:git/url "https://github.com/user/my-lib" :git/sha "abc1234ef"}}
+ {my.lib {:git/url "https://github.com/user/my-lib" :git/sha "abc1234ef"}
+  ;; Native dep with opt-in pinned native code (cljrs-dylib):
+  my.native.lib {:git/url   "https://github.com/user/my-native-lib"
+                 :git/sha   "abc1234ef"
+                 :rust/init "my_native_lib::cljrs_init"
+                 :rust/load :dylib}}
 
  ;; Optional: embed a Rust crate in this project.
  ;; :crate is the path (relative to cljrs.edn) to the directory holding Cargo.toml.

@@ -43,6 +43,7 @@ cljrs-deps     = { workspace = true }
 cljrs-vcs      = { workspace = true }
 cljrs-lsp      = { workspace = true }
 cljrs-jit      = { workspace = true }
+cljrs-dylib    = { workspace = true }
 clap          = { workspace = true }
 miette        = { workspace = true }
 tracing-subscriber = "0.3.23"

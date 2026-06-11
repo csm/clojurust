@@ -60,12 +60,103 @@ When a function body is evaluated in a versioned context (commit `C`):
 | Symbol form                        | Resolved at          |
 |------------------------------------|----------------------|
 | Unqualified / same-namespace, no `@` | Commit `C` (inherited) |
+| Qualified self-reference (`my.ns/x` inside `my.ns@C`) | Commit `C` |
 | Explicitly versioned `foo@D`       | Commit `D`           |
 | External / cross-namespace, no `@` | HEAD (current)       |
 
 This means a versioned call is a logical "snapshot": internal helpers are also
 drawn from the same commit, but the standard library and cross-namespace
 dependencies use their current values unless explicitly pinned.
+
+### Whole-namespace snapshots
+
+Resolving `ns/name@commit` — by any execution tier — loads the **whole
+namespace** at that commit into an immutable namespace named `"ns@commit"`,
+then performs a plain lookup in it.  Consequences:
+
+- Historical definitions never intern into the live namespace (HEAD bindings
+  are never clobbered by a pinned lookup).
+- Top-level side effects of the pinned file run once, when the versioned
+  namespace is first loaded (per session, cached thereafter).
+- Same-namespace commit inheritance is structural: functions defined while
+  loading `ns@commit` carry `defining_ns = "ns@commit"`, so their internal
+  references resolve at the pinned commit on every tier without extra
+  bookkeeping.
+
+---
+
+## Execution tiers
+
+Versioned symbols work identically on all four execution paths; the shared
+resolver lives in `cljrs_env::versioned`:
+
+| Tier | Mechanism |
+|------|-----------|
+| Tree-walking interpreter | `eval_symbol` → `resolve_versioned_symbol` (thin shim) |
+| IR interpreter (Tier 2) | `LoadGlobal` carries the `@sha` in its name string; `load_global_value` detects it |
+| JIT-native (Tier 1) | codegen emits a **fill-once inline cache** per call site (`rt_load_global_versioned_ic`): versioned bindings are immutable, so the slot never needs invalidation; the cached value is permanently GC-rooted |
+| AOT binaries | same codegen; pinned sources are **embedded at compile time** (below) |
+
+### AOT: compile-time snapshot
+
+`cljrs compile` resolves every versioned require and bare versioned symbol
+during compilation (the `pin_versioned_references` pass), fetches each pinned
+source from git, and embeds it in the binary under the versioned namespace
+name.  The produced binary is **self-contained**:
+
+- no git repository, source files, or `~/.cljrs` cache needed at runtime;
+- the harness sets `versioned_offline`, so a versioned namespace that was not
+  embedded fails with a clear error instead of attempting a fetch;
+- a bad pin (missing commit, failed signature check) fails the *compile*;
+- `--verify-commit-signatures` runs `git verify-commit` at compile time — the
+  binary trusts its embedded sources.
+
+---
+
+## Native (Rust-backed) functions
+
+Native functions live in the running binary; there is no Clojure source to
+re-evaluate at a commit.  Two modes:
+
+### Default: verified HEAD binding
+
+A pinned lookup that falls back to a native function resolves to the current
+binary's implementation, **verified against the package's recorded
+provenance** (the commit it was built from, registered via
+`cljrs_interop::register_provenance!("ns", env!("CLJRS_PKG_COMMIT"))` or
+`Registry::set_provenance`):
+
+- provenance matches the pin (either may be abbreviated) → silent;
+- mismatch or no recorded provenance → warning, once per pin;
+- with `--enforce-native-versions` (or `:enforce-native-versions true` in
+  `cljrs.edn`) → hard error.
+
+### Opt-in: pinned native code (`:rust/load :dylib`) — experimental
+
+```clojure
+{:deps
+ {my.native.lib {:git/url   "https://github.com/user/my-native-lib"
+                 :git/sha   "abc1234ef"
+                 :rust/init "my_native_lib::cljrs_init"
+                 :rust/load :dylib}}}
+```
+
+When a pinned symbol resolves into such a dep's namespace, `cljrs-dylib`
+fetches the repository at the pinned commit, generates a wrapper cdylib crate
+(pinning the exact same `cljrs-interop` as the host), builds it with cargo
+(cached under `~/.cljrs/cache/dylibs/<crate>@<commit>/`), `dlopen`s it, and
+registers its exports into the immutable `"<ns>@<commit>"` namespace via a
+versioned `Registry` view.
+
+**ABI discipline:** the wrapper exports `cljrs_dylib_abi()` returning a
+fingerprint (cljrs version + `rustc -V`, baked at the wrapper's build time);
+the host refuses to call the Rust-ABI `cljrs_dylib_init(*mut Registry)`
+unless the fingerprint equals its own exactly.  Feature-flag skew between
+host and wrapper is *not* detected; a Rust toolchain is required at runtime.
+A full C-ABI vtable is the safer long-term design and is deliberately
+deferred, as is statically linking pinned native crates into AOT harnesses
+(open problem: two statically linked versions of one crate submit `#[export]`
+inventory entries under the same unversioned names).
 
 ---
 

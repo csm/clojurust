@@ -104,6 +104,9 @@ fn extract_dependency(form: &Form, config_dir: &Path, name: &str) -> Result<Depe
     let mut git_url: Option<Arc<str>> = None;
     let mut git_sha: Option<Arc<str>> = None;
     let mut local_root: Option<PathBuf> = None;
+    let mut rust_init: Option<Arc<str>> = None;
+    let mut rust_crate_dir: Option<Arc<str>> = None;
+    let mut rust_load_dylib = false;
 
     let mut i = 0;
     while i + 1 < pairs.len() {
@@ -118,13 +121,29 @@ fn extract_dependency(form: &Form, config_dir: &Path, name: &str) -> Result<Depe
                 let rel = require_str(&pairs[i + 1], "local/root")?;
                 local_root = Some(config_dir.join(rel));
             }
+            Some("rust/init") => {
+                rust_init = Some(Arc::from(require_str(&pairs[i + 1], "rust/init")?));
+            }
+            Some("rust/crate") => {
+                rust_crate_dir = Some(Arc::from(require_str(&pairs[i + 1], "rust/crate")?));
+            }
+            Some("rust/load") => match keyword_name(&pairs[i + 1]) {
+                Some("dylib") => rust_load_dylib = true,
+                _ => return Err(format!("dep {name}: :rust/load must be :dylib")),
+            },
             _ => {}
         }
         i += 2;
     }
 
     match (git_url, git_sha, local_root) {
-        (Some(url), Some(sha), _) => Ok(Dependency::Git(GitDep { url, sha })),
+        (Some(url), Some(sha), _) => Ok(Dependency::Git(GitDep {
+            url,
+            sha,
+            rust_init,
+            rust_crate_dir,
+            rust_load_dylib,
+        })),
         (_, _, Some(root)) => Ok(Dependency::Local { root }),
         _ => Err(format!(
             "dep {name}: must specify either :git/url + :git/sha or :local/root"

@@ -90,16 +90,17 @@ pub fn resolve_versioned_value(
             // In an AOT binary a missing embedded source most likely means
             // the pin was not visible at compile time — make the fallback's
             // failure say so instead of a bare "unbound symbol".
-            return native_head_fallback(globals, &base_ns, name, commit).map_err(|e| {
-                if globals.versioned_offline() {
-                    EvalError::Runtime(format!(
-                        "versioned namespace {versioned_ns} was not embedded at compile \
-                         time; AOT binaries cannot fetch from git at runtime ({e})"
-                    ))
-                } else {
-                    e
-                }
-            });
+            return pinned_native_or_head_fallback(globals, &base_ns, &versioned_ns, name, commit)
+                .map_err(|e| {
+                    if globals.versioned_offline() {
+                        EvalError::Runtime(format!(
+                            "versioned namespace {versioned_ns} was not embedded at compile \
+                             time; AOT binaries cannot fetch from git at runtime ({e})"
+                        ))
+                    } else {
+                        e
+                    }
+                });
         }
         ensure_versioned_ns_loaded(globals, &base_ns, commit)?;
     }
@@ -110,7 +111,33 @@ pub fn resolve_versioned_value(
 
     // 5. The historical source exists but does not define `name`: the var may
     //    be backed by a native Rust function rather than Clojure source.
-    native_head_fallback(globals, &base_ns, name, commit)
+    pinned_native_or_head_fallback(globals, &base_ns, &versioned_ns, name, commit)
+}
+
+/// Resolve a pinned native symbol: first through the opt-in pinned-native
+/// package loader (`:rust/load :dylib`, installed by `cljrs-dylib`), then
+/// through the verified HEAD binding.
+///
+/// When the loader reports it registered the package at the pinned commit,
+/// the symbol is looked up in the versioned namespace and the HEAD fallback
+/// is *not* consulted — a pinned package that doesn't define the symbol is
+/// an error.
+fn pinned_native_or_head_fallback(
+    globals: &Arc<GlobalEnv>,
+    base_ns: &str,
+    versioned_ns: &str,
+    name: &str,
+    commit: &str,
+) -> EvalResult {
+    let loader = globals.pinned_native_loader.read().unwrap().clone();
+    if let Some(loader) = loader
+        && loader(globals, base_ns, commit)?
+    {
+        return globals
+            .lookup_in_ns(versioned_ns, name)
+            .ok_or_else(|| EvalError::UnboundSymbol(format!("{versioned_ns}/{name}")));
+    }
+    native_head_fallback(globals, base_ns, name, commit)
 }
 
 /// Pin `base_ns@commit` if any source for it is locatable, returning whether

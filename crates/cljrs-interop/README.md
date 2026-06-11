@@ -139,11 +139,20 @@ pub struct Registry { /* wraps Arc<GlobalEnv> */ }
 impl Registry {
     pub fn new(env: Arc<GlobalEnv>) -> Self;
 
+    /// Versioned view: registrations land in "<ns>@<commit>" namespaces.
+    /// Used by cljrs-dylib when loading a pinned native package; does NOT
+    /// auto-register the calling binary's #[export] inventory.
+    pub fn versioned(env: Arc<GlobalEnv>, commit: &str) -> Self;
+
     /// Register f under "my.ns/my-fn" (panics if no '/' present).
     pub fn define(&self, qualified: &str, f: NativeFn);
 
     /// Register f into an explicit namespace under a plain name.
     pub fn define_in(&self, ns: &str, name: &str, f: NativeFn);
+
+    /// Record the commit a native package was built from (no-op on a
+    /// versioned view, which registers a pinned package).
+    pub fn set_provenance(&self, ns: &str, commit: &str);
 
     /// Access the underlying GlobalEnv for advanced operations.
     pub fn env(&self) -> &Arc<GlobalEnv>;

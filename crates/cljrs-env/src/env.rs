@@ -138,7 +138,19 @@ pub struct GlobalEnv {
     /// Pinned-native mismatches already warned about this session
     /// (key: `"<ns>@<commit>"`), so each pin warns at most once.
     pub provenance_warned: Mutex<HashSet<Arc<str>>>,
+    /// Optional loader for **pinned native packages** (`:rust/load :dylib`),
+    /// installed by `cljrs-dylib`.  Called by the versioned resolver with
+    /// `(globals, base_ns, commit)` before falling back to the HEAD native
+    /// binding; returns `Ok(true)` when it registered the package's pinned
+    /// implementations into the `"<base_ns>@<commit>"` namespace.
+    #[allow(clippy::type_complexity)]
+    pub pinned_native_loader: RwLock<Option<PinnedNativeLoader>>,
 }
+
+/// Loader callback for pinned native packages (see
+/// `GlobalEnv::pinned_native_loader`).
+pub type PinnedNativeLoader =
+    Arc<dyn Fn(&Arc<GlobalEnv>, &str, &str) -> EvalResult<bool> + Send + Sync>;
 
 impl std::fmt::Debug for GlobalEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -174,6 +186,7 @@ impl GlobalEnv {
             native_provenance: RwLock::new(HashMap::new()),
             enforce_native_versions: AtomicBool::new(false),
             provenance_warned: Mutex::new(HashSet::new()),
+            pinned_native_loader: RwLock::new(None),
         })
     }
 
@@ -485,6 +498,15 @@ impl GlobalEnv {
     /// True when pinned-native provenance mismatches are errors.
     pub fn enforce_native_versions(&self) -> bool {
         self.enforce_native_versions.load(Ordering::Relaxed)
+    }
+
+    /// Install the pinned-native package loader (called once by
+    /// `cljrs_dylib::install`; first writer wins).
+    pub fn set_pinned_native_loader(&self, loader: PinnedNativeLoader) {
+        let mut guard = self.pinned_native_loader.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(loader);
+        }
     }
 
     /// If `:verify-commit-signatures` is enabled, verify that `commit` inside
