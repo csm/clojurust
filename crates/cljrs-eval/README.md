@@ -10,10 +10,11 @@ execution.
 
 ## Purpose
 
-When a Clojure function has been lowered to IR (eagerly at definition time via
-the `on_fn_defined` hook, or from a pre-built cache), calls are dispatched to
-the tier-1 IR interpreter. Otherwise they fall back to the tree-walking
-interpreter in `cljrs-interp`.
+When a Clojure function has been lowered to IR — by the warm-threshold
+background lowering worker (Phase 10.7, the default), eagerly at definition
+time via the `on_fn_defined` hook (`CLJRS_EAGER_LOWER=1`), or from a pre-built
+cache — calls are dispatched to the tier-1 IR interpreter. Otherwise they fall
+back to the tree-walking interpreter in `cljrs-interp`.
 
 The crate also manages the Clojure compiler namespaces (`cljrs.compiler.anf`,
 `cljrs.compiler.ir`, `cljrs.compiler.known`) that perform ANF lowering of
@@ -34,7 +35,13 @@ src/
                     cljrs_env::versioned, and lookups into a not-yet-loaded
                     `ns@<sha>` namespace trigger a lazy versioned load
   ir_cache.rs     — thread-safe cache of lowered IR keyed by arity ID (NotAttempted/Cached/Unsupported);
-                    invalidate(id) drops an entry back to NotAttempted (cross-defn invalidation)
+                    invalidate(id) drops an entry back to NotAttempted (cross-defn invalidation);
+                    Cached entries carry a last-access timestamp, and sweep_idle (run at the STW
+                    reclaim pass) evicts entries idle past CLJRS_IR_CACHE_TTL (Phase 10.7)
+  lower_worker.rs — (Phase 10.7) background IR-lowering worker thread ("cljrs-ir-lower"): receives
+                    macro-expanded LowerRequests from the dispatch seam, runs the Env-free half of
+                    lowering (ANF + optimize), publishes to ir_cache, and registers defns; sole
+                    consumer of relower marks (publish-validate-retry against concurrent rebinds)
   ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
   lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction;
                     threads cross-defn externals into cljrs_ir::lower::optimize_with_externals (Phase 10.5)
@@ -107,6 +114,20 @@ pub mod lower {
     /// cross-defn externals the optimizer consulted (invalidation deps).
     pub fn lower_and_optimize_arity_tracked(..., is_async: bool)
         -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError>;
+
+    // Phase 10.7 — the two halves of lowering, split for background use:
+    /// Macro-expand a body on the calling thread (macros need the interpreter).
+    pub fn macroexpand_body(body: &[Form], env: &mut Env) -> Vec<Form>;
+    /// Env-free lowering of an already-expanded body; callable off-thread.
+    /// `arity_id: Some(id)` uses defn_registry::snapshot_externals (atomic
+    /// dependent recording, required off the mutator thread); `None` uses the
+    /// legacy externals_for (synchronous callers record dependents themselves).
+    pub fn lower_expanded_arity(name, params, rest, destructure_params,
+        destructure_rest, expanded_body, ns, globals_id: usize,
+        arity_id: Option<u64>, do_optimize: bool, is_async: bool)
+        -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError>;
+    /// Identity of the GlobalEnv behind `env` (scopes the cross-defn registry).
+    pub fn globals_id(env: &Env) -> usize;
 }
 
 /// Cross-defn IR registry (in module `defn_registry`, Phase 10.5):
@@ -114,9 +135,14 @@ pub mod defn_registry {
     pub fn register_defn(globals_id, ns, name, arities: Vec<(usize, bool, Arc<IrFunction>)>);
     pub fn externals_for(globals_id, referenced) -> Vec<ExternalDefn>;
     pub fn record_dependents(arity_id, used);
+    /// Phase 10.7: externals_for + record_dependents in one step, atomic with
+    /// respect to on_redefined (holds the registry lock across the edge write).
+    /// The background worker must use this — see lower_worker.rs.
+    pub fn snapshot_externals(globals_id, arity_id, referenced) -> Vec<ExternalDefn>;
     pub fn on_redefined(ns, name) -> Vec<u64>;   // dependents to invalidate
     pub fn relower_pending() -> bool;            // dispatch fast-path check
-    pub fn take_relower(arity_id) -> bool;
+    pub fn relower_marked(arity_id) -> bool;     // peek without consuming (dispatch)
+    pub fn take_relower(arity_id) -> bool;       // consume (lowering worker only)
     pub fn install_invalidation_hook();          // idempotent; var-rebind hook
 }
 ```
@@ -126,13 +152,22 @@ pub mod defn_registry {
 ## IR dispatch flow
 
 1. `apply::call_cljrs_fn` is registered as the `call_cljrs_fn` function pointer in `GlobalEnv`
-2. On each call, it checks `ir_cache::get_cached(arity_id)` for a pre-lowered IR function
+2. On each call, it checks `ir_cache::get_cached(arity_id)` for a lowered IR function
 3. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
-4. If not cached **or async**: falls back to `cljrs_interp::apply::call_cljrs_fn` (tree-walking).
-   For `^:async` functions the tree-walking path dispatches to `eval_async` in `cljrs-async`,
-   which cooperatively yields to the Tokio `LocalSet` executor.
-5. Eager lowering: `ir_interp::eager_lower_fn` is registered as the `on_fn_defined` hook;
-   when `compiler_ready` is true, new `fn*` definitions are lowered immediately.
+4. If not cached **or async**: counts the call (`jit_state::record_interp_call`, Phase 10.7 —
+   see "Background lowering" below) and falls back to `cljrs_interp::apply::call_cljrs_fn`
+   (tree-walking).  For `^:async` functions the tree-walking path dispatches to `eval_async`
+   in `cljrs-async`, which cooperatively yields to the Tokio `LocalSet` executor.
+5. How IR gets into the cache:
+   - **Warm-threshold background lowering (default, Phase 10.7)**: when a function's
+     tree-walked call count crosses `ir_threshold()` (default 50), the dispatch seam
+     macro-expands its arity bodies on the calling thread and enqueues them to the
+     `cljrs-ir-lower` worker, which lowers + optimizes off-thread and publishes via
+     `ir_cache::store_cached`.
+   - **Eager lowering (opt-in, `CLJRS_EAGER_LOWER=1`)**: `ir_interp::eager_lower_fn` is
+     registered as the `on_fn_defined` hook; when `compiler_ready` is true, new `fn*`
+     definitions are lowered immediately.
+   - **Pre-built bundles**: `load_prebuilt_ir`.
    The resulting `IrFunction::is_async` flag matches the `CljxFn::is_async` attribute.
 6. `eval_call` in `cljrs_interp` routes `Value::Fn` calls through `globals.call_cljrs_fn`
    (the registered hook) rather than calling the tree-walker directly, so IR-cached
@@ -146,6 +181,43 @@ pub mod defn_registry {
    uncaught native `(throw …)` and re-raises it as `EvalError::Thrown` (same in
    `try_osr_enter` for OSR entries)
 
+## Background lowering & cold-IR eviction (Phase 10.7)
+
+The default tiering pipeline is count-driven end to end:
+
+```
+Tier 0 tree-walk ──(ir_threshold, 50 calls)──▶ background lower ──▶ Tier 1 IR
+Tier 1 IR ──(jit_threshold, 1000 calls; counter restarts at IR publish)──▶ Tier 2 JIT
+```
+
+- The crossing call macro-expands the fn's arity bodies **on the calling
+  thread** (macros are user Clojure functions and need the interpreter), then
+  ships a `LowerRequest` (plain `Form` data) to the `cljrs-ir-lower` worker.
+  The worker is not a GC mutator: it only runs the Env-free half of lowering.
+- Skipped: macros, async fns, capturing closures, bootstrap-era definitions
+  (arity id below the watermark snapshotted by `ensure_compiler_loaded`), and
+  fns defined in builtin-source namespaces (clojure.test, clojure.string, the
+  compiler namespaces, …).  Background lowering targets **user code only**:
+  shipped namespaces only ever reached the IR tiers under opt-in eager
+  lowering, and some of their patterns are known to miscompile (see TODO.md
+  Phase 10.7 notes).
+- Rebind safety: `snapshot_externals` records dependent edges atomically with
+  reading the registry, and the worker is the only consumer of relower marks —
+  after `store_cached` it re-peeks the mark and re-lowers (≤3 attempts) if a
+  rebind landed mid-flight.  The dispatch seam only peeks
+  (`relower_marked` + `lower_queued` dedup) and enqueues.
+- Cold eviction: `Cached` entries track last access; `ir_cache::sweep_idle`
+  runs at the stop-the-world reclaim pass and evicts entries idle past
+  `CLJRS_IR_CACHE_TTL` (default 600 s) — deliberately *colder* than native
+  code.  Entries backing published native code or an in-flight compile are
+  never evicted (deopt fallback); `Unsupported` markers are kept forever.
+  Eviction drops the `JitEntry` (the fn can re-warm) and stales any OSR code.
+- Knobs: `CLJRS_IR_THRESHOLD` / `set_ir_threshold` / `--ir-threshold N`
+  (0 disables background lowering), `CLJRS_IR_CACHE_TTL`, `CLJRS_NO_IR`
+  (kills all IR), `CLJRS_EAGER_LOWER=1` (restores eager lowering — also the
+  escape hatch for the known limitation that a long-running loop entered at
+  Tier 0 cannot tier up mid-call, since the tree-walker has no OSR).
+
 ## JIT state & code unloading (`jit_state`)
 
 `jit_state` is the seam between the Tier-1 interpreter and the background JIT
@@ -153,6 +225,18 @@ pub mod defn_registry {
 
 ```rust
 pub fn set_jit_threshold(t: u32);                 // calls before compile (default 1000)
+pub fn set_ir_threshold(t: u32);                  // Tier-0 calls before background lowering
+                                                  // (default 50; u32::MAX disables)
+pub fn record_interp_call(arity_id) -> bool;      // Tier-0 call accounting; true = snapshot+enqueue
+pub fn lower_queued(arity_id) -> bool;            // dedup gate for the warm/relower paths
+pub fn mark_lower_queued(arity_id);               // set on accepted enqueue
+pub fn clear_lower_queued(arity_id);              // worker re-arms after abandoning an arity
+pub fn on_ir_published(arity_id);                 // worker: restart counter at IR publish
+pub fn evict_entry_if_cold(arity_id) -> bool;     // TTL sweep: drop entry unless native/queued
+pub fn stale_osr_code(arity_id);                  // TTL sweep: stale published OSR entries
+pub fn compile_queued(arity_id) -> bool;          // TTL sweep: in-flight JIT needs the IR
+pub fn set_bootstrap_arity_watermark(w: u64);     // ensure_compiler_loaded snapshots the boundary
+pub fn is_bootstrap_arity(arity_id) -> bool;      // bootstrap fns excluded from background lowering
 pub fn record_call(arity_id, ir_func, profile_args);  // bump counter + arg-type profile; enqueue when hot
 pub fn arg_type_profile(arity_id) -> Option<Vec<u8>>; // per-param type bitmasks (PROFILE_LONG/_DOUBLE/_OTHER)
 pub fn set_enqueue_hook(f);                        // installed by cljrs_jit::init

@@ -93,7 +93,7 @@ fn specs_from_profile(arity_id: u64, ir_func: &IrFunction) -> Option<Vec<Repr>> 
     }
 }
 
-fn compile_function_request(arity_id: u64, ir_func: &IrFunction) {
+fn compile_function_request(arity_id: u64, ir_func: &Arc<IrFunction>) {
     let specs = specs_from_profile(arity_id, ir_func).unwrap_or_default();
     cljrs_logging::feat_debug!("jit", "compiling arity_id={} specs={:?}", arity_id, specs);
 
@@ -122,6 +122,22 @@ fn compile_function_request(arity_id: u64, ir_func: &IrFunction) {
             // Hand ownership of the module to the code cache; it returns the
             // epoch that identifies this code for later reclamation.
             let epoch = code_cache::register(arity_id, compiled);
+            // Publish guard: the IR this request was built from must still be
+            // the arity's current IR.  A rebind (cross-defn invalidation) or
+            // a cold-IR eviction while we compiled means publishing would
+            // resurrect stale code for a live arity id — mark the module
+            // stale instead; it is reclaimed at the next STW safepoint.
+            let current = cljrs_eval::ir_cache::get_cached(arity_id);
+            if !current.is_some_and(|cur| Arc::ptr_eq(&cur, ir_func)) {
+                cljrs_logging::feat_debug!(
+                    "jit",
+                    "discarding stale compile arity_id={} epoch={}",
+                    arity_id,
+                    epoch,
+                );
+                code_cache::mark_stale(epoch);
+                return;
+            }
             cljrs_logging::feat_debug!(
                 "jit",
                 "compiled  arity_id={} epoch={} fn_ptr={:p}",

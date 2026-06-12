@@ -57,6 +57,18 @@ struct Cli {
     )]
     jit_threshold: Option<u32>,
 
+    /// Warm threshold: tree-walked calls before a function is lowered to IR
+    /// in the background (default 50; 0 disables background lowering).
+    /// Also read from CLJRS_IR_THRESHOLD env var.  Applies even when the
+    /// JIT is disabled.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "Background IR lowering threshold (0 to disable, default 50)"
+    )]
+    ir_threshold: Option<u32>,
+
     /// Feature-level logging flags: -X debug:gc,jit or -X trace:reader
     ///
     /// Format: <level>:<feature1>,<feature2>,...
@@ -350,6 +362,15 @@ fn run(cli: Cli) -> miette::Result<i32> {
 
     // Initialise the JIT tier (unless explicitly disabled).
     init_jit(cli.jit_threshold.as_ref().copied());
+
+    // Configure background IR lowering (Phase 10.7); independent of the JIT.
+    match cli.ir_threshold {
+        // 0 disables background lowering entirely (functions stay at
+        // tree-walk unless eagerly lowered or pre-built).
+        Some(0) => cljrs_eval::set_ir_threshold(u32::MAX),
+        Some(t) => cljrs_eval::set_ir_threshold(t),
+        None => {}
+    }
 
     let gc_stats_target = cli.gc_stats.clone();
     let jit_stats_target = cli.jit_stats.clone();
