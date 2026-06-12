@@ -54,6 +54,8 @@ cljrs repl                   # start interactive REPL
 cljrs compile <file> -o <bin> # AOT compile to binary
 cljrs eval '<expr>'          # evaluate expression from shell
 cljrs test --src-path ...  # run clojure.test namespaces
+cljrs nrepl [--port N]       # start an nREPL server for editor integration
+
 ```
 
 ## Tooling
@@ -75,6 +77,7 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 | `interop` | Rust↔Clojure FFI; `#[cljx::export]` proc-macro; type marshalling; `NativeObject` |
 | `cli` | `cljx` command entry point; REPL; file runner; project tooling |
 | `lsp` | Language Server Protocol server (`cljrs-lsp` crate, `cljrs lsp` subcommand); parse diagnostics + document symbols |
+| `nrepl` | nREPL server (`cljrs-nrepl` crate, `cljrs nrepl` subcommand); bencode over TCP for editor integration |
 
 ### Key design constraints
 

@@ -352,6 +352,7 @@ dependencies = [
  "cljrs-logging",
  "cljrs-lsp",
  "cljrs-net",
+ "cljrs-nrepl",
  "cljrs-reader",
  "cljrs-runtime",
  "cljrs-stdlib",
@@ -682,6 +683,22 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "cljrs-nrepl"
+version = "0.1.0"
+dependencies = [
+ "cljrs-builtins",
+ "cljrs-env",
+ "cljrs-eval",
+ "cljrs-gc",
+ "cljrs-reader",
+ "cljrs-stdlib",
+ "cljrs-value",
+ "miette",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
