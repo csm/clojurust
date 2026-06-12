@@ -455,7 +455,7 @@ Foundations already in place:
 ## Phase 12 — REPL & Tooling
 
 - [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)
-- [ ] nREPL-compatible server for editor integration
+- [x] nREPL-compatible server for editor integration (`cljrs nrepl`, `cljrs-nrepl` crate)
 - [x] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
 - [x] `cljx eval '<expr>'` — evaluate expression from command line
 - [ ] Project / build system (`cljx.edn` project descriptor, dependency resolution)

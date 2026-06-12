@@ -219,6 +219,28 @@ enum Commands {
     /// integration, providing parse diagnostics and a document-symbol outline
     /// for `.cljrs` / `.cljc` files. Editors normally launch this for you.
     Lsp,
+    /// Start an nREPL server for editor integration (CIDER, Calva, Conjure).
+    ///
+    /// Listens for bencode-encoded nREPL messages over TCP and writes the
+    /// bound port to `.nrepl-port` in the current directory so clients can
+    /// auto-connect. Runs until interrupted.
+    Nrepl {
+        /// Port to listen on (0 = let the OS pick a free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -496,6 +518,33 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
             // enters the interpreter's async driver runtime.
             cljrs_lsp::run_stdio_blocking()
                 .map_err(|e| miette::miette!("lsp server error: {e}"))?;
+            Ok(0)
+        }
+        Commands::Nrepl {
+            port,
+            bind,
+            src_paths,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
+        } => {
+            let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+            let globals = setup_globals(src_paths, gc_config, versioning);
+            let addr: std::net::SocketAddr = format!("{bind}:{port}")
+                .parse()
+                .map_err(|e| miette::miette!("invalid bind address {bind}:{port}: {e}"))?;
+            let config = cljrs_nrepl::Config {
+                addr,
+                port_file: Some(PathBuf::from(".nrepl-port")),
+            };
+            let server = cljrs_nrepl::start(config, globals)?;
+            // Editors (CIDER, Calva) parse this exact line to auto-connect.
+            println!(
+                "nREPL server started on port {0} on host {bind} - nrepl://{bind}:{0}",
+                server.port()
+            );
+            // Evaluate forms through the CLI's async driver so core.async /
+            // ^:async code makes progress, exactly like `cljrs repl`.
+            server.serve_with(eval_form)?;
             Ok(0)
         }
     }
