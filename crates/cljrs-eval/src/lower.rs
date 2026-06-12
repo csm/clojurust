@@ -139,15 +139,29 @@ fn lower_arity_inner(
     do_optimize: bool,
     is_async: bool,
 ) -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError> {
-    cljrs_logging::feat_debug!(
-        "lower",
-        "lowering {:?}/{:?} optimize? {}",
-        ns,
+    let expanded_body = macroexpand_body(body, env);
+    lower_expanded_arity(
         name,
-        do_optimize
-    );
+        params,
+        rest_param,
+        destructure_params,
+        destructure_rest,
+        &expanded_body,
+        ns,
+        globals_id(env),
+        None,
+        do_optimize,
+        is_async,
+    )
+}
 
-    // Macro expansion still requires the interpreter.
+/// Macro-expand a function body on the calling thread.
+///
+/// Macros are user-defined Clojure functions, so expansion must run through
+/// the interpreter with a live `Env` — this is the only part of lowering that
+/// cannot move to the background worker.  Forms that fail to expand are kept
+/// unexpanded (lowering will reject them if they matter).
+pub fn macroexpand_body(body: &[Form], env: &mut Env) -> Vec<Form> {
     // Guard against re-entrant lowering during macro expansion.
     use crate::apply::IR_LOWERING_ACTIVE;
     let was_active = IR_LOWERING_ACTIVE.get();
@@ -159,6 +173,44 @@ fn lower_arity_inner(
         .collect();
 
     IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
+    expanded_body
+}
+
+/// Lower an already macro-expanded arity body to (optionally optimized) IR.
+///
+/// Env-free and callable from the background lowering worker (Phase 10.7):
+/// everything below operates on plain `Form`/IR data.  `globals_id` scopes
+/// the cross-defn registry lookups (see [`globals_id`]).
+///
+/// `arity_id` selects the externals protocol:
+/// - `Some(id)` (background worker): externals are fetched via
+///   `defn_registry::snapshot_externals`, which atomically records the
+///   dependent edges while holding the registry lock — required off the
+///   mutator thread, where a rebind can interleave with lowering.
+/// - `None` (synchronous mutator-thread callers): legacy `externals_for`;
+///   the caller records dependents from the returned `used` set, which is
+///   race-free on the single mutator thread.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_expanded_arity(
+    name: Option<&str>,
+    params: &[Arc<str>],
+    rest_param: Option<&Arc<str>>,
+    destructure_params: &[(usize, Form)],
+    destructure_rest: Option<&Form>,
+    expanded_body: &[Form],
+    ns: &Arc<str>,
+    globals_id: usize,
+    arity_id: Option<u64>,
+    do_optimize: bool,
+    is_async: bool,
+) -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError> {
+    cljrs_logging::feat_debug!(
+        "lower",
+        "lowering {:?}/{:?} optimize? {}",
+        ns,
+        name,
+        do_optimize
+    );
 
     // Build the flat params list (includes rest param as last element if present).
     let mut all_params: Vec<Arc<str>> = params.to_vec();
@@ -179,7 +231,7 @@ fn lower_arity_inner(
         ns,
         &all_params,
         &destructures,
-        &expanded_body,
+        expanded_body,
         is_async,
     )
     .map_err(|e| LowerError::LowerFailed(format!("{e:?}")))?;
@@ -192,14 +244,17 @@ fn lower_arity_inner(
     // escape analysis and stage-4 cross-function region promotion (the
     // script/REPL counterpart of AOT's whole-program lowering).
     let referenced = referenced_globals(&ir);
-    let externals = crate::defn_registry::externals_for(globals_id(env), &referenced);
+    let externals = match arity_id {
+        Some(id) => crate::defn_registry::snapshot_externals(globals_id, id, &referenced),
+        None => crate::defn_registry::externals_for(globals_id, &referenced),
+    };
     let (ir, used) = cljrs_ir::lower::optimize_with_externals(ir, &externals);
     Ok((ir, used.into_iter().collect()))
 }
 
 /// Identity of the `GlobalEnv` behind `env`, used to scope the cross-defn
 /// registry per isolate.
-pub(crate) fn globals_id(env: &Env) -> usize {
+pub fn globals_id(env: &Env) -> usize {
     Arc::as_ptr(&env.globals) as usize
 }
 

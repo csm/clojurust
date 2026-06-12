@@ -18,9 +18,40 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use cljrs_ir::IrFunction;
 use cljrs_value::Value;
 
-// ── Threshold ─────────────────────────────────────────────────────────────────
+// ── Thresholds ────────────────────────────────────────────────────────────────
 
 pub const DEFAULT_JIT_THRESHOLD: u32 = 1_000;
+
+/// Tier-0 invocation count at which a function is lowered to IR in the
+/// background (Phase 10.7).  Deliberately far below [`DEFAULT_JIT_THRESHOLD`]:
+/// tree-walking is slow, so warm functions should reach the IR interpreter
+/// quickly, while one-shot top-level code never pays for lowering.
+pub const DEFAULT_IR_THRESHOLD: u32 = 50;
+
+/// Per-process override set by the CLI or programmatic callers.
+/// 0 means "read from CLJRS_IR_THRESHOLD env var or use the default".
+/// `u32::MAX` disables background lowering entirely.
+static IR_THRESHOLD_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_ir_threshold(t: u32) {
+    IR_THRESHOLD_OVERRIDE.store(t, Ordering::Relaxed);
+}
+
+pub fn ir_threshold() -> u32 {
+    let v = IR_THRESHOLD_OVERRIDE.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    match std::env::var("CLJRS_IR_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        // Like `--ir-threshold 0`: disable background lowering entirely.
+        Some(0) => u32::MAX,
+        Some(t) => t,
+        None => DEFAULT_IR_THRESHOLD,
+    }
+}
 
 /// Per-process override set by the CLI or programmatic callers.
 /// 0 means "read from CLJRS_JIT_THRESHOLD env var or use the default".
@@ -45,6 +76,10 @@ pub fn jit_threshold() -> u32 {
 
 pub struct JitEntry {
     pub invocation_count: AtomicU32,
+    /// A background IR-lowering request has been enqueued for this arity
+    /// (Phase 10.7).  Set once when the warm threshold is crossed and the
+    /// request is accepted; keeps Tier-0 dispatch from re-enqueueing.
+    pub lower_queued: AtomicBool,
     pub compile_queued: AtomicBool,
     /// Finalized native function pointer, or null if not yet compiled.
     /// Calling convention: SystemV/C ABI, N ptr-sized params, one ptr-sized return.
@@ -68,6 +103,7 @@ impl JitEntry {
     fn new() -> Self {
         Self {
             invocation_count: AtomicU32::new(0),
+            lower_queued: AtomicBool::new(false),
             compile_queued: AtomicBool::new(false),
             native_fn_ptr: AtomicPtr::new(std::ptr::null_mut()),
             epoch: AtomicU64::new(0),
@@ -272,6 +308,141 @@ pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>, profile_args: &[Valu
     if let Some(hook) = ENQUEUE_HOOK.get() {
         cljrs_logging::feat_debug!("jit", "enqueue arity_id={} (count={})", arity_id, count);
         hook(arity_id, ir_func);
+    }
+}
+
+// ── Bootstrap watermark (Phase 10.7) ─────────────────────────────────────────
+//
+// Arity ids are minted from a monotonic counter, so a single snapshot taken
+// when the compiler becomes ready separates bootstrap-era definitions
+// (the clojure.core bootstrap and the cljrs.compiler.* namespaces) from
+// everything defined afterwards (user code).  Background lowering excludes
+// bootstrap arities: they were never lowered under eager lowering either
+// (the compiler was not ready when they were defined), and some bootstrap
+// patterns are known to miscompile under the JIT (see TODO.md Phase 10.7
+// notes).  User code gets the warm tier; the bootstrap stays at tree-walk,
+// exactly as before.
+
+static BOOTSTRAP_ARITY_WATERMARK: AtomicU64 = AtomicU64::new(0);
+
+/// Record the bootstrap/user boundary: every arity id strictly below `w` was
+/// defined before the compiler became ready.  Called by
+/// `ensure_compiler_loaded` with `cljrs_interp::arity::next_arity_id()`.
+pub fn set_bootstrap_arity_watermark(w: u64) {
+    BOOTSTRAP_ARITY_WATERMARK.store(w, Ordering::Relaxed);
+}
+
+/// Whether `arity_id` belongs to a bootstrap-era definition (excluded from
+/// background lowering).
+pub fn is_bootstrap_arity(arity_id: u64) -> bool {
+    arity_id < BOOTSTRAP_ARITY_WATERMARK.load(Ordering::Relaxed)
+}
+
+// ── Tier-0 warm-up accounting (Phase 10.7) ───────────────────────────────────
+//
+// Tree-walked calls (no cached IR yet) bump the same per-arity counter as
+// Tier-1 dispatch.  Crossing `ir_threshold` tells the dispatch seam to
+// snapshot the function (macroexpand on the calling thread — macros need the
+// interpreter) and enqueue background lowering.  Once the IR is published the
+// counter restarts so `jit_threshold` measures pure Tier-1 invocations and
+// the argument-type profile covers a full window.
+
+/// Record a Tier-0 (tree-walk) call to `arity_id`.
+///
+/// Returns `true` exactly when the warm threshold is crossed and no lowering
+/// request has been enqueued yet — the caller should snapshot the function
+/// and enqueue, then call [`mark_lower_queued`] on success.  Uses `>=` so a
+/// failed enqueue (full queue) retries on the next call.
+pub fn record_interp_call(arity_id: u64) -> bool {
+    let threshold = ir_threshold();
+    if threshold == u32::MAX {
+        return false;
+    }
+    let entry = get_or_create_entry(arity_id);
+    let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
+    count >= threshold && !entry.lower_queued.load(Ordering::Relaxed)
+}
+
+/// Whether a JIT compile has been queued (or published) for `arity_id`.
+/// Used by the cold-IR sweep: an arity with an in-flight compile still needs
+/// its IR as the deoptimization fallback.
+pub fn compile_queued(arity_id: u64) -> bool {
+    let guard = JIT_TABLE.read().unwrap();
+    guard
+        .as_ref()
+        .and_then(|c| c.get(&arity_id))
+        .is_some_and(|e| e.compile_queued.load(Ordering::Relaxed))
+}
+
+/// Whether a background lowering request is already queued for `arity_id`.
+/// Fast skip for the Tier-0 dispatch path.
+pub fn lower_queued(arity_id: u64) -> bool {
+    let guard = JIT_TABLE.read().unwrap();
+    guard
+        .as_ref()
+        .and_then(|c| c.get(&arity_id))
+        .is_some_and(|e| e.lower_queued.load(Ordering::Relaxed))
+}
+
+/// Mark that a background lowering request was accepted for `arity_id`.
+pub fn mark_lower_queued(arity_id: u64) {
+    let entry = get_or_create_entry(arity_id);
+    entry.lower_queued.store(true, Ordering::Relaxed);
+}
+
+/// Clear the lowering-queued flag for `arity_id`, re-arming the dispatch
+/// seam's enqueue.  Used by the lowering worker when it abandons an arity
+/// after exhausting its rebind-retry budget.
+pub fn clear_lower_queued(arity_id: u64) {
+    let guard = JIT_TABLE.read().unwrap();
+    if let Some(entry) = guard.as_ref().and_then(|c| c.get(&arity_id)) {
+        entry.lower_queued.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Called by the lowering worker when it publishes IR for `arity_id`.
+///
+/// Restarts the invocation counter so the JIT threshold counts pure Tier-1
+/// calls (and the argument-type profile gets a full window).  Deliberately
+/// does *not* drop the `JitEntry`: `lower_queued` must stay set, or the
+/// Tier-0 path could re-enqueue between publish and the next IR dispatch.
+pub fn on_ir_published(arity_id: u64) {
+    let entry = get_or_create_entry(arity_id);
+    entry.invocation_count.store(0, Ordering::Relaxed);
+}
+
+/// Drop the `JitEntry` for `arity_id` iff it has no published native code and
+/// no queued compile.  Returns whether it was dropped.
+///
+/// Used by the cold-IR TTL sweep: dropping the entry clears the counters and
+/// `lower_queued`, so an evicted function can re-warm from zero.
+pub fn evict_entry_if_cold(arity_id: u64) -> bool {
+    let mut guard = JIT_TABLE.write().unwrap();
+    let Some(cache) = guard.as_mut() else {
+        return false;
+    };
+    let Some(entry) = cache.get(&arity_id) else {
+        return false;
+    };
+    if !entry.native_fn_ptr.load(Ordering::Acquire).is_null()
+        || entry.compile_queued.load(Ordering::Relaxed)
+    {
+        return false;
+    }
+    cache.remove(&arity_id);
+    true
+}
+
+/// Drop all OSR entries for `arity_id` and hand their published epochs to the
+/// code cache for reclamation.  Used by the cold-IR TTL sweep: OSR-entry code
+/// is only reachable from Tier-1 interpretation of the evicted IR, so it is
+/// equally cold.  A no-op when nothing was compiled or no JIT is linked.
+pub fn stale_osr_code(arity_id: u64) {
+    let epochs = take_osr_epochs(arity_id);
+    if let Some(hook) = STALE_EPOCH_HOOK.get() {
+        for epoch in epochs {
+            hook(epoch);
+        }
     }
 }
 
@@ -814,6 +985,59 @@ mod tests {
         let ir = IrFunction::new(None, None);
         osr_request(id, 2, &ir);
         assert!(matches!(osr_poll(id, 2), OsrPoll::Failed));
+    }
+
+    #[test]
+    fn record_interp_call_warm_lifecycle() {
+        // Single test for the whole lifecycle: set_ir_threshold is a
+        // process-global override, so splitting this across tests would race.
+        set_ir_threshold(3);
+        let id = 0xF300_0001;
+
+        // Below the threshold: no trigger.
+        assert!(!record_interp_call(id));
+        assert!(!record_interp_call(id));
+        // Crossing (and staying past) the threshold triggers until a request
+        // is accepted — a full queue must be able to retry.
+        assert!(record_interp_call(id));
+        assert!(record_interp_call(id));
+
+        // Once queued, the trigger disarms.
+        mark_lower_queued(id);
+        assert!(lower_queued(id));
+        assert!(!record_interp_call(id));
+
+        // Worker abandons the request: re-armed.
+        clear_lower_queued(id);
+        assert!(record_interp_call(id));
+
+        // Worker publishes: counter restarts so jit_threshold measures pure
+        // Tier-1 calls; the (re-armed) trigger stays quiet below threshold.
+        on_ir_published(id);
+        assert!(!record_interp_call(id));
+
+        // u32::MAX disables background lowering entirely.
+        set_ir_threshold(u32::MAX);
+        for _ in 0..10 {
+            assert!(!record_interp_call(id));
+        }
+        set_ir_threshold(0); // restore env/default for other tests
+    }
+
+    #[test]
+    fn evict_entry_if_cold_respects_native_and_queued() {
+        let id = 0xF300_0002;
+        mark_lower_queued(id); // creates the entry
+        // Published native code pins the entry.
+        store_native_fn(id, 0x4242usize as *const (), 555);
+        assert!(!evict_entry_if_cold(id));
+        assert_eq!(take_native_epoch(id), Some(555)); // also drops the entry
+
+        // A fresh cold entry is evictable.
+        mark_lower_queued(id);
+        assert!(evict_entry_if_cold(id));
+        assert!(!lower_queued(id));
+        assert!(!evict_entry_if_cold(id)); // already gone
     }
 
     #[test]

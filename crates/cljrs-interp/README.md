@@ -32,7 +32,8 @@ src/
                    agent, send/send-off, with-bindings*, alter-var-root,
                    vary-meta, find-ns, all-ns, create-ns, ns-aliases, remove-ns,
                    alter-meta!, ns-resolve, resolve, intern, bound-fn*)
-  arity.rs       — fresh arity ID generator
+  arity.rs       — fresh arity ID generator (pub; `fresh_arity_id`, plus `next_arity_id`
+                   for the Phase 10.7 bootstrap watermark snapshot)
   destructure.rs — pattern destructuring (vector, map, & rest)
   macros.rs      — macro expansion helpers
   syntax_quote.rs — syntax-quote (backtick) expansion

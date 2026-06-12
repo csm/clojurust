@@ -53,7 +53,7 @@ The `gc_roots` module manages GC root registration for the interpreter's Rust ca
 - `gc_safepoint(env: &Env)` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
-- `set_stw_reclaim_hook(f)` — (Phase 10.2) installs a stop-the-world reclaim hook the JIT uses to free superseded native code; runs inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked
+- `set_stw_reclaim_hook(f)` — registers a stop-the-world reclaim hook; multiple hooks may be registered and each runs (in registration order) inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked.  Registrants: `cljrs-jit` frees superseded native code (Phase 10.2); `cljrs-eval`'s lowering worker sweeps idle Tier-1 IR (Phase 10.7)
 
 Root tracing covers all namespaces (including immutable `ns@commit`
 namespaces) **and** the values in `GlobalEnv::version_cache`, so versioned

@@ -675,15 +675,20 @@ fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
 /// Allocate a vector from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let pv = PersistentVector::from_iter(items);
     box_coll_val(Value::Vector(alloc_inner_coll(pv)))
 }
@@ -691,33 +696,43 @@ pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> 
 /// Allocate a map from `n` key-value pairs (2*n pointers: k0, v0, k1, v1, ...).
 ///
 /// # Safety
-/// `pairs` must point to `2*n` valid `*const Value` pointers.
+/// `pairs` must point to `2*n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(pairs, n * 2) };
-    let kv_pairs: Vec<(Value, Value)> = (0..n)
-        .map(|i| {
-            let k = unsafe { val_ref(slice[i * 2]) }.clone();
-            let v = unsafe { val_ref(slice[i * 2 + 1]) }.clone();
-            (k, v)
-        })
-        .collect();
+    let kv_pairs: Vec<(Value, Value)> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(pairs, n * 2) };
+        (0..n)
+            .map(|i| {
+                let k = unsafe { val_ref(slice[i * 2]) }.clone();
+                let v = unsafe { val_ref(slice[i * 2 + 1]) }.clone();
+                (k, v)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
 /// Allocate a set from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let set = PersistentHashSet::from_iter(items);
     box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(set))))
 }
@@ -725,15 +740,20 @@ pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *co
 /// Allocate a list from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let list = PersistentList::from_iter(items);
     box_coll_val(Value::List(alloc_inner_coll(list)))
 }

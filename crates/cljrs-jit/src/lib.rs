@@ -18,13 +18,17 @@
 //! ```
 //!
 //! This:
-//! 1. Forces eager IR lowering on (so functions get IR as they are defined).
-//! 2. Installs an enqueue hook in `cljrs_eval::jit_state`.
-//! 3. Spawns the background JIT worker thread.
+//! 1. Installs an enqueue hook in `cljrs_eval::jit_state`.
+//! 2. Spawns the background JIT worker thread.
 //!
-//! Hot functions (those whose Tier-1 call count exceeds
-//! `CLJRS_JIT_THRESHOLD`, default 1000) are compiled in the background;
-//! subsequent calls dispatch directly to native code.
+//! Functions reach IR via warm-threshold background lowering (Phase 10.7,
+//! owned by `cljrs-eval`): once a function's tree-walked call count exceeds
+//! `CLJRS_IR_THRESHOLD` (default 50) it is lowered to optimized IR in the
+//! background and dispatch switches to the Tier-1 IR interpreter.  Hot
+//! functions (Tier-1 call count exceeding `CLJRS_JIT_THRESHOLD`, default
+//! 1000) are then compiled in the background; subsequent calls dispatch
+//! directly to native code.  `CLJRS_EAGER_LOWER=1` restores eager lowering
+//! at definition time.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,9 +56,6 @@ pub fn init() {
     if INITIALIZED.swap(true, Ordering::AcqRel) {
         return;
     }
-
-    // Ensure IR is generated for newly-defined functions.
-    cljrs_eval::force_eager_lowering();
 
     let (tx, rx) = mpsc::sync_channel::<jit_worker::CompileRequest>(256);
 
