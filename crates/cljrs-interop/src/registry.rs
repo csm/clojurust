@@ -51,6 +51,9 @@ pub type InitFn = fn(&mut Registry);
 /// access available via [`Registry::env`].
 pub struct Registry {
     env: Arc<GlobalEnv>,
+    /// When set, every `define`/`define_in` registers into the versioned
+    /// namespace `"<ns>@<commit>"` instead of `<ns>` (pinned native code).
+    version: Option<Arc<str>>,
 }
 
 impl Registry {
@@ -60,9 +63,33 @@ impl Registry {
     /// the binary (via `inventory`).  Called by the generated `main.rs`; user
     /// code receives `&mut Registry` and never constructs one directly.
     pub fn new(env: Arc<GlobalEnv>) -> Self {
-        let r = Self { env };
+        let r = Self { env, version: None };
         register_exports(&r);
         r
+    }
+
+    /// Create a **versioned view**: every registration lands in the
+    /// immutable `"<ns>@<commit>"` namespace instead of `<ns>`.
+    ///
+    /// Used when loading a native package built at a pinned commit (the
+    /// `:rust/load :dylib` path), so the pinned implementations never
+    /// collide with the live ones.  Does **not** auto-register the calling
+    /// binary's `#[export]` inventory — the pinned package registers its own
+    /// exports from inside its dylib.
+    pub fn versioned(env: Arc<GlobalEnv>, commit: &str) -> Self {
+        Self {
+            env,
+            version: Some(Arc::from(commit)),
+        }
+    }
+
+    /// The target namespace for a registration, versioned when this is a
+    /// [`versioned`][Self::versioned] view.
+    fn target_ns(&self, ns: &str) -> Arc<str> {
+        match &self.version {
+            Some(commit) => Arc::from(format!("{ns}@{commit}")),
+            None => Arc::from(ns),
+        }
     }
 
     /// Register `f` under the fully-qualified Clojure name `"my.ns/my-fn"`.
@@ -75,8 +102,11 @@ impl Registry {
     pub fn define(&self, qualified: &str, f: NativeFn) {
         let (ns, sym) = split_qualified(qualified)
             .unwrap_or_else(|| panic!("Registry::define: {qualified:?} has no '/' separator"));
-        self.env
-            .intern(ns, Arc::from(sym), Value::NativeFunction(GcPtr::new(f)));
+        self.env.intern(
+            &self.target_ns(ns),
+            Arc::from(sym),
+            Value::NativeFunction(GcPtr::new(f)),
+        );
     }
 
     /// Register `f` into an explicit namespace under a plain (unqualified) name.
@@ -84,8 +114,29 @@ impl Registry {
     /// Equivalent to `define("ns/name", f)` but avoids string formatting when
     /// the parts are already separate.
     pub fn define_in(&self, ns: &str, name: &str, f: NativeFn) {
-        self.env
-            .intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(f)));
+        self.env.intern(
+            &self.target_ns(ns),
+            Arc::from(name),
+            Value::NativeFunction(GcPtr::new(f)),
+        );
+    }
+
+    /// Record the git commit the native package providing namespace `ns` was
+    /// built from.
+    ///
+    /// The versioned resolver consults this when a pinned symbol
+    /// (`ns/name@<sha>`) falls back to a native function: a matching
+    /// provenance is silent; a mismatch warns (or errors under
+    /// `--enforce-native-versions`).  Typically driven by the
+    /// [`register_provenance!`][crate::register_provenance] macro with a
+    /// build-script-provided commit, e.g. `env!("CLJRS_PKG_COMMIT")`.
+    pub fn set_provenance(&self, ns: &str, commit: &str) {
+        // A versioned view registers a *pinned* package; its provenance must
+        // not overwrite the host binary's record for the base namespace.
+        if self.version.is_some() {
+            return;
+        }
+        self.env.set_native_provenance(ns, commit);
     }
 
     /// Access the underlying `GlobalEnv` for operations beyond simple `define`

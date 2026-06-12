@@ -4,31 +4,34 @@ use crate::env::Env;
 #[cfg(not(feature = "no-gc"))]
 use crate::env::GlobalEnv;
 use std::cell::RefCell;
-use std::sync::OnceLock;
 
-// ── Stop-the-world reclaim hook (JIT code unloading) ────────────────────────
+// ── Stop-the-world reclaim hooks (JIT code unloading, cold-IR sweep) ────────
 //
-// The JIT tier (`cljrs-jit`) reclaims superseded native code only at a
-// stop-the-world safepoint, when every mutator thread is parked and active JIT
-// frames can be scanned safely.  GC collection is the existing STW point, so
-// the JIT installs a hook here that runs at the tail of every collection while
-// the STW guard is still held.
+// Reclamation of execution-engine caches runs only at a stop-the-world
+// safepoint, when every mutator thread is parked and active JIT frames can be
+// scanned safely.  GC collection is the existing STW point, so interested
+// tiers install hooks here that run at the tail of every collection while the
+// STW guard is still held.  Current registrants: `cljrs-jit` (superseded
+// native modules) and `cljrs-eval`'s lowering worker (idle Tier-1 IR,
+// Phase 10.7).
 
 type StwReclaimHook = Box<dyn Fn() + Send + Sync + 'static>;
-static STW_RECLAIM_HOOK: OnceLock<StwReclaimHook> = OnceLock::new();
+static STW_RECLAIM_HOOKS: std::sync::RwLock<Vec<StwReclaimHook>> =
+    std::sync::RwLock::new(Vec::new());
 
-/// Install the stop-the-world reclaim hook (called once by `cljrs_jit::init`).
+/// Register a stop-the-world reclaim hook.  Multiple hooks may be registered;
+/// each runs at every STW point, in registration order.
 ///
-/// The hook runs inside the STW guard after each collection, so it may assume
+/// Hooks run inside the STW guard after each collection, so they may assume
 /// all other mutator threads are parked.
 pub fn set_stw_reclaim_hook(f: impl Fn() + Send + Sync + 'static) {
-    let _ = STW_RECLAIM_HOOK.set(Box::new(f));
+    STW_RECLAIM_HOOKS.write().unwrap().push(Box::new(f));
 }
 
-/// Run the STW reclaim hook if one is installed.  Caller must hold the STW guard.
+/// Run the STW reclaim hooks, if any.  Caller must hold the STW guard.
 #[cfg(not(feature = "no-gc"))]
 fn run_stw_reclaim() {
-    if let Some(hook) = STW_RECLAIM_HOOK.get() {
+    for hook in STW_RECLAIM_HOOKS.read().unwrap().iter() {
         hook();
     }
 }
@@ -310,10 +313,17 @@ fn trace_thread_env_roots(visitor: &mut cljrs_gc::MarkVisitor) {
 /// Trace all namespaces and their contents.
 #[cfg(not(feature = "no-gc"))]
 fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
-    use cljrs_gc::GcVisitor as _;
+    use cljrs_gc::{GcVisitor as _, Trace};
     let namespaces = globals.namespaces.read().unwrap();
     for (_name, ns_ptr) in namespaces.iter() {
         visitor.visit(ns_ptr);
+    }
+    drop(namespaces);
+    // Values resolved at a pinned commit may live only in the version cache
+    // (e.g. native HEAD fallbacks) — without this they would be collected.
+    let version_cache = globals.version_cache.lock().unwrap();
+    for (_key, val) in version_cache.iter() {
+        val.trace(visitor);
     }
 }
 

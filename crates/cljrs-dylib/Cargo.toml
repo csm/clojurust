@@ -1,0 +1,22 @@
+[package]
+name = "cljrs-dylib"
+version = "0.1.0"
+edition = "2024"
+description = "Pinned native packages for clojurust: build a dependency's Rust crate at a pinned commit as a cdylib and load it (:rust/load :dylib)"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-env     = { workspace = true }
+cljrs-vcs     = { workspace = true }
+cljrs-deps    = { workspace = true }
+cljrs-interop = { workspace = true }
+cljrs-logging = { workspace = true }
+libloading    = "0.8"
+
+[dev-dependencies]
+cljrs-interp = { workspace = true }
+cljrs-value  = { workspace = true }
+cljrs-gc     = { workspace = true }
+cljrs-reader = { workspace = true }
+tempfile     = "3"

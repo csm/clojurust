@@ -25,6 +25,7 @@ pub mod ir_convert;
 pub mod ir_interp;
 pub mod jit_state;
 pub mod lower;
+mod lower_worker;
 
 pub use cljrs_env::callback::invoke;
 pub use cljrs_env::env::{Env, GlobalEnv};
@@ -34,7 +35,9 @@ pub use cljrs_env::loader::load_ns;
 pub use cljrs_interp::eval::eval;
 
 pub use apply::force_eager_lowering;
-pub use jit_state::{set_enqueue_hook, set_jit_threshold, set_osr_threshold, store_native_fn};
+pub use jit_state::{
+    set_enqueue_hook, set_ir_threshold, set_jit_threshold, set_osr_threshold, store_native_fn,
+};
 
 use crate::ir_interp::eager_lower_fn;
 use std::sync::Arc;
@@ -106,6 +109,11 @@ pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
     globals
         .compiler_ready
         .store(true, std::sync::atomic::Ordering::Release);
+    // Everything defined up to this point (the clojure.core bootstrap, the
+    // compiler namespaces) is bootstrap-era: excluded from background
+    // lowering (Phase 10.7), exactly as the compiler_ready gate excluded it
+    // from eager lowering at definition time.
+    jit_state::set_bootstrap_arity_watermark(cljrs_interp::arity::next_arity_id());
     LOADING.store(false, std::sync::atomic::Ordering::Release);
     true
 }

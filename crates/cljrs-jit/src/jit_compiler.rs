@@ -283,6 +283,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_deopt),
         sym!(rt_kw_ic_fill),
         sym!(rt_call_ic),
+        sym!(rt_load_global_versioned_ic),
     ];
 
     builder.symbols(symbols.iter().map(|&(n, p)| (n, p)));

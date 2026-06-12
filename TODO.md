@@ -362,7 +362,7 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 - [x] Calling Rust trait methods on `NativeObject` values via protocol dispatch
 - [ ] Safety restrictions: document which Rust APIs are safe to call from GC-managed code
 - [ ] `cljx.rust` namespace with intrinsics (`rust/cast`, `rust/ptr`, `rust/unsafe`, etc.)
-- [ ] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime
+- [x] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime — project-local lib via `cljrs build-native` + `load_native_lib`; **pinned native packages** (`:rust/load :dylib`) via `cljrs-dylib` (build the dep's crate at a pinned commit, ABI-fingerprint handshake, register into the `ns@<commit>` namespace). Deferred: statically linking pinned native crates into AOT harnesses (`#[export]` inventory collision between two versions of one crate), and a C-ABI vtable to replace the Rust-ABI `&mut Registry` boundary
 - [x] RAII resource management: `with-open` macro + `close` builtin for deterministic cleanup of `Resource` values
 - [ ] (Stretch) `#rust` typed sublanguage: functions annotated `#rust` receive Rust-typed arguments with lifetime bounds enforced at the interop boundary, bypassing `Value` boxing entirely for those call sites
 
@@ -432,6 +432,19 @@ Foundations already in place:
 
 *Milestone evidence:* `crates/cljrs/tests/jit_specialization.rs` — a hot monomorphic 20k-call loop's boxed-arithmetic bridge calls drop >5× vs the same run under `CLJRS_JIT_NO_SPEC=1`; Double calls against a Long-specialized function deopt with exact Tier-1 results and discard the specialization past the limit; keyword ICs fill once per call site across 20k iterations; protocol dispatch hits the IC and a mid-run `extend-type` is picked up at the same (already compiled) call site.
 
+### Phase 10.7 — Background IR lowering (warm tier) + cold IR eviction
+
+- [x] Warm threshold (Tier 0 → Tier 1) — tree-walked calls bump the per-arity counter (`jit_state::record_interp_call`); crossing `CLJRS_IR_THRESHOLD` (default 50; `--ir-threshold`; 0 disables) macro-expands the fn's arity bodies on the calling thread (macros need the interpreter — the runtime is single-mutator, so expansion cannot move off-thread) and enqueues the expanded `Form`s to the background `cljrs-ir-lower` worker (`cljrs-eval/src/lower_worker.rs`), which runs the Env-free half of lowering (ANF + inlining + escape analysis + region promotion, split out as `lower::lower_expanded_arity`) and publishes via `ir_cache::store_cached`. `cljrs_jit::init` no longer forces eager lowering; `CLJRS_EAGER_LOWER=1` restores it. The Tier-1 counter restarts at IR publish, so `CLJRS_JIT_THRESHOLD` measures pure Tier-1 calls with a full arg-type-profile window
+- [x] Scope: **user code only** — background lowering skips macros, async fns, capturing closures, bootstrap-era definitions (arity-id watermark snapshotted by `ensure_compiler_loaded`), and fns from builtin-source namespaces (clojure.test, clojure.string, compiler namespaces, …). Shipped namespaces keep their historical behavior (no IR unless opted in): they were never lowered by default before, and several of their patterns trip latent bugs (below)
+- [x] Rebind races — `defn_registry::snapshot_externals` records dependent edges atomically with reading the registry (REGISTRY read lock held across the DEPENDENTS write, serializing against `on_redefined`), and the lowering worker is the **only consumer** of relower marks: after `store_cached` it re-peeks `relower_marked` and re-lowers with fresh externals (≤3 attempts) if a rebind landed mid-flight. The dispatch seam only peeks (`relower_marked` + `lower_queued` dedup) — this also fixes the previously-broken relower path, which consumed the mark and then silently skipped re-lowering whenever eager lowering was off
+- [x] JIT publish guard — the worker publishes a whole-function compile only if the request's IR is still the arity's current cache entry (`Arc::ptr_eq`); otherwise the module is marked stale (fixes a pre-existing race where a compile from since-invalidated IR could resurrect stale native code)
+- [x] Cold IR eviction — `Cached` entries track coarse last-access; `ir_cache::sweep_idle` runs at the stop-the-world reclaim pass (`set_stw_reclaim_hook` is now a multi-hook registry) and evicts entries idle past `CLJRS_IR_CACHE_TTL` (default 600 s) — deliberately *colder* than native code. Arities with published native code or an in-flight compile are skipped (deopt fallback); `Unsupported` markers are kept; eviction drops the `JitEntry` (the fn re-warms from zero) and stales any OSR code
+- [x] Pre-existing bug fixed en route: `rt_alloc_vector`/`rt_alloc_map`/`rt_alloc_set`/`rt_alloc_list` formed `slice::from_raw_parts(null, 0)` for empty collection literals (codegen passes null for `n == 0`) — UB that aborts debug builds the moment any JIT-compiled fn builds an empty literal (e.g. a hot `(conj [] x)`)
+- [ ] Known pre-existing bugs surfaced (reproduce under `CLJRS_EAGER_LOWER=1` on older trees too; the reason builtin namespaces are excluded above): (1) JIT codegen of a seq-driven `loop*` (e.g. `(loop [s (seq coll) acc []] (if s (recur (next s) …) acc))`) compiles to an infinite loop — Tier-1 executes the same IR correctly; (2) Tier-1 IR closures in clojure.test patterns fail with `Arity { name: "<ir-closure>", expected: 2, got: 0 }` (`cargo test -p cljrs-stdlib --test compiler_clojure_tests` with `CLJRS_EAGER_LOWER=1`)
+- [ ] Known limitation: a long-running loop entered at Tier 0 cannot tier up mid-call (the tree-walker has no OSR); `CLJRS_EAGER_LOWER=1` is the escape hatch
+
+*Milestone evidence:* `crates/cljrs/tests/background_lowering.rs` — without `CLJRS_EAGER_LOWER`, a hot fn tiers tree-walk → background-lowered IR → JIT-native mid-run with per-iteration correctness; the debug log shows `background lower published`; rebinding a dependency mid-warm takes effect immediately; the worker runs without `cljrs_jit::init` (`CLJRS_NO_JIT=1`); `--ir-threshold 0` produces no lowering.
+
 ### Phase H (deferred) — Async JIT
 
 - [ ] Emit Cranelift state machines with explicit resume points for `^:async` functions, integrating with the Tokio executor
@@ -455,7 +468,7 @@ Foundations already in place:
 ## Phase 12 — REPL & Tooling
 
 - [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)
-- [ ] nREPL-compatible server for editor integration
+- [x] nREPL-compatible server for editor integration (`cljrs nrepl`, `cljrs-nrepl` crate)
 - [x] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
 - [x] `cljx eval '<expr>'` — evaluate expression from command line
 - [ ] Project / build system (`cljx.edn` project descriptor, dependency resolution)

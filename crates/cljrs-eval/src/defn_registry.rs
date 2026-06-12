@@ -138,6 +138,51 @@ pub fn record_dependents(arity_id: u64, used: impl IntoIterator<Item = (Arc<str>
     }
 }
 
+/// Atomically snapshot the externals for lowering `arity_id` *and* record the
+/// dependent edges (Phase 10.7).
+///
+/// Background lowering must not separate these steps: with
+/// `externals_for` → optimize → `record_dependents`, a rebind landing between
+/// the snapshot and the recording drains `DEPENDENTS` before our edge exists,
+/// so no relower mark is ever set and stale IR is published undetected.
+///
+/// Holding the `REGISTRY` read lock across the `DEPENDENTS` write serializes
+/// against [`on_redefined`] (which takes the `REGISTRY` write lock first):
+/// a rebind runs either entirely before this call (we see the updated
+/// registry and never consume the dead defn) or entirely after it (our edge
+/// exists, so the rebind sets the relower mark the worker checks after
+/// publishing).  Edges are recorded only for defns actually present in the
+/// registry — exactly the set the optimizer can inline.
+pub fn snapshot_externals(
+    globals_id: usize,
+    arity_id: u64,
+    referenced: &HashSet<(Arc<str>, Arc<str>)>,
+) -> Vec<ExternalDefn> {
+    if referenced.is_empty() {
+        return Vec::new();
+    }
+    let registry = REGISTRY.read().unwrap();
+    let mut out = Vec::new();
+    let mut deps = DEPENDENTS.write().unwrap();
+    for (ns, name) in referenced {
+        let Some(defn) = registry.get(&(globals_id, ns.clone(), name.clone())) else {
+            continue;
+        };
+        deps.entry((ns.clone(), name.clone()))
+            .or_default()
+            .insert(arity_id);
+        out.push(ExternalDefn {
+            ns: ns.clone(),
+            name: name.clone(),
+            arity_fn_names: defn.arities.iter().map(|a| a.fn_name.clone()).collect(),
+            param_counts: defn.arities.iter().map(|a| a.param_count).collect(),
+            is_variadic: defn.arities.iter().map(|a| a.is_variadic).collect(),
+            arity_irs: defn.arities.iter().map(|a| a.ir.clone()).collect(),
+        });
+    }
+    out
+}
+
 /// A var holding `(ns, name)` was rebound: drop every registration of it (all
 /// isolates) and drain its dependents, marking each for lazy re-lowering.
 /// Returns the dependent arity ids so the caller can also stale their
@@ -170,6 +215,16 @@ pub fn on_redefined(ns: &str, name: &str) -> Vec<u64> {
 #[inline]
 pub fn relower_pending() -> bool {
     RELOWER_PENDING.load(Ordering::Acquire) != 0
+}
+
+/// Peek the re-lower mark for `arity_id` without consuming it.
+///
+/// The dispatch seam uses this to decide whether to enqueue a background
+/// re-lower request; only the lowering worker consumes marks
+/// ([`take_relower`]), so a mark can never be lost between the worker
+/// publishing IR and validating it against concurrent rebinds.
+pub fn relower_marked(arity_id: u64) -> bool {
+    RELOWER.read().unwrap().contains(&arity_id)
 }
 
 /// Take the re-lower mark for `arity_id`, if set.
@@ -210,4 +265,51 @@ pub fn install_invalidation_hook() {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_ir() -> Arc<IrFunction> {
+        Arc::new(IrFunction::new(None, None))
+    }
+
+    #[test]
+    fn snapshot_externals_records_edges_drained_by_rebind() {
+        // Unique globals_id / names so parallel tests sharing the global
+        // registry never collide.
+        let gid = 0xD500_0001usize;
+        let ns: Arc<str> = Arc::from("test.snapshot-ns");
+        let name: Arc<str> = Arc::from("callee-fn");
+        let dep_id = 0xD500_0002u64;
+
+        register_defn(gid, &ns, &name, vec![(1, false, dummy_ir())]);
+
+        let mut referenced = HashSet::new();
+        referenced.insert((ns.clone(), name.clone()));
+        // An unregistered reference must not create an edge.
+        referenced.insert((ns.clone(), Arc::from("never-registered")));
+
+        let externals = snapshot_externals(gid, dep_id, &referenced);
+        assert_eq!(externals.len(), 1);
+        assert_eq!(externals[0].name, name);
+
+        // The dependent edge was recorded atomically with the snapshot:
+        // a rebind drains it and marks the dependent for re-lowering.
+        assert!(!relower_marked(dep_id));
+        let deps = on_redefined(&ns, &name);
+        assert!(deps.contains(&dep_id));
+        assert!(relower_marked(dep_id));
+
+        // Peeking does not consume; taking does.
+        assert!(relower_marked(dep_id));
+        assert!(take_relower(dep_id));
+        assert!(!relower_marked(dep_id));
+        assert!(!take_relower(dep_id));
+
+        // The registration itself is gone.
+        let externals = snapshot_externals(gid, dep_id, &referenced);
+        assert!(externals.is_empty());
+    }
 }

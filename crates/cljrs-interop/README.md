@@ -15,7 +15,8 @@ registration helpers, Registry, `#[export]` proc-macro).
 src/
   lib.rs       — re-exports, crate entry point
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
-  exports.rs   — ExportEntry, inventory::collect!, register_exports
+  exports.rs   — ExportEntry / ProvenanceEntry, inventory::collect!, register_exports,
+                 register_provenance! macro
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
   register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
   registry.rs  — Registry struct and InitFn type alias for cljrs_init convention
@@ -104,6 +105,25 @@ pub struct ExportEntry {
 pub fn register_exports(registry: &mut Registry);
 ```
 
+### Native provenance (verified HEAD binding)
+
+Pinned lookups of native functions (`math/add@<sha>`) always resolve to the
+current binary's implementation — but the resolver verifies the pin against
+the package's recorded provenance: a match (either side may be an
+abbreviated hash) is silent; a mismatch or missing provenance warns once per
+pin, or errors under `--enforce-native-versions` (cljrs.edn
+`:enforce-native-versions true`).
+
+```rust
+pub struct ProvenanceEntry { pub ns: &'static str, pub commit: &'static str }
+
+// Declare once per exported namespace (commit typically from build.rs):
+cljrs_interop::register_provenance!("math", env!("CLJRS_PKG_COMMIT"));
+
+// Or imperatively inside cljrs_init:
+registry.set_provenance("math", commit);
+```
+
 ### Registry and InitFn
 
 The entry point for mixed Rust/Clojure projects.  User crates implement a
@@ -119,11 +139,20 @@ pub struct Registry { /* wraps Arc<GlobalEnv> */ }
 impl Registry {
     pub fn new(env: Arc<GlobalEnv>) -> Self;
 
+    /// Versioned view: registrations land in "<ns>@<commit>" namespaces.
+    /// Used by cljrs-dylib when loading a pinned native package; does NOT
+    /// auto-register the calling binary's #[export] inventory.
+    pub fn versioned(env: Arc<GlobalEnv>, commit: &str) -> Self;
+
     /// Register f under "my.ns/my-fn" (panics if no '/' present).
     pub fn define(&self, qualified: &str, f: NativeFn);
 
     /// Register f into an explicit namespace under a plain name.
     pub fn define_in(&self, ns: &str, name: &str, f: NativeFn);
+
+    /// Record the commit a native package was built from (no-op on a
+    /// versioned view, which registers a pinned package).
+    pub fn set_provenance(&self, ns: &str, commit: &str);
 
     /// Access the underlying GlobalEnv for advanced operations.
     pub fn env(&self) -> &Arc<GlobalEnv>;

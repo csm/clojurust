@@ -26,7 +26,7 @@ pub use cljrs_value::native_object::{NativeObject, NativeObjectBox, gc_native_ob
 pub use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 
 pub use error::wrap_result;
-pub use exports::{ExportEntry, register_exports};
+pub use exports::{ExportEntry, ProvenanceEntry, register_exports};
 pub use marshal::{FromValue, IntoValue};
 pub use register::{wrap_fn_variadic, wrap_fn0, wrap_fn1, wrap_fn2, wrap_fn3};
 pub use registry::{InitFn, Registry};

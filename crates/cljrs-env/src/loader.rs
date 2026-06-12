@@ -73,7 +73,7 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
 /// Returns `Ok(true)` if the caller claimed the namespace and must load it.
 /// Returns `Ok(false)` if another thread loaded it while we waited.
 /// Returns `Err` on a genuine circular require (same thread).
-fn claim_or_wait(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<bool> {
+pub(crate) fn claim_or_wait(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<bool> {
     let tid = std::thread::current().id();
     loop {
         let mut loading = globals.loading.lock().unwrap();
@@ -168,7 +168,9 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
 /// `"<spec.ns>@<commit>"` in the global namespace table.
 ///
 /// Idempotent: if the versioned namespace is already loaded, only applies the
-/// alias/refer from `spec` in `current_ns`.
+/// alias/refer from `spec` in `current_ns`.  The actual loading lives in
+/// `crate::versioned::ensure_versioned_ns_loaded`, shared with the per-symbol
+/// resolver used by all execution tiers.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_versioned_ns(
     globals: Arc<GlobalEnv>,
@@ -176,86 +178,8 @@ pub fn load_versioned_ns(
     commit: &str,
     current_ns: &str,
 ) -> EvalResult<()> {
-    let base_ns = &spec.ns;
-    let versioned_ns_name: Arc<str> = Arc::from(format!("{base_ns}@{commit}"));
-
-    if globals.is_loaded(&versioned_ns_name) {
-        apply_alias_refer(&globals, &versioned_ns_name, current_ns, spec);
-        return Ok(());
-    }
-
-    // Locate the source file for the base namespace.
-    let rel_path = base_ns.replace('.', "/").replace('-', "_");
-    let src_paths = globals.source_paths.read().unwrap().clone();
-    let (_, file_path) = find_source_file(&rel_path, &src_paths).ok_or_else(|| {
-        EvalError::Runtime(format!(
-            "Cannot find source for namespace {base_ns} (needed for {base_ns}@{commit})"
-        ))
-    })?;
-
-    // Locate the git repository.
-    let repo_root = cljrs_vcs::find_repo_root(Path::new(&file_path)).ok_or_else(|| {
-        EvalError::Runtime(format!(
-            "Namespace {base_ns} (file {file_path}) is not in a git repository; \
-             cannot resolve {base_ns}@{commit}"
-        ))
-    })?;
-
-    // Verify commit signature before loading any historical code.
-    globals.check_commit_signature(&repo_root.to_string_lossy(), commit)?;
-
-    // Compute the path relative to the repo root.
-    let abs_file = std::path::Path::new(&file_path);
-    let rel_file = abs_file.strip_prefix(&repo_root).map_err(|_| {
-        EvalError::Runtime(format!(
-            "Cannot compute relative path for {file_path} within {}",
-            repo_root.display()
-        ))
-    })?;
-    let rel_file_str = rel_file.to_string_lossy();
-
-    // Fetch the source at the requested commit.
-    let src = cljrs_vcs::get_file_at_commit(&repo_root, &rel_file_str, commit)
-        .map_err(|e| EvalError::Runtime(format!("{e}")))?;
-
-    // Create the versioned namespace (immutable).
-    {
-        use cljrs_value::Namespace;
-        let ns = cljrs_gc::GcPtr::new(Namespace::new_versioned(versioned_ns_name.as_ref()));
-        ns.get()
-            .set_source_location(&file_path, Some(&repo_root.display().to_string()));
-        let mut map = globals.namespaces.write().unwrap();
-        map.entry(versioned_ns_name.clone()).or_insert(ns);
-    }
-
-    // Pre-refer clojure.core.
-    globals.refer_all(&versioned_ns_name, "clojure.core");
-
-    // Evaluate all forms with a versioned commit context so that
-    // same-namespace calls inside the historical source also resolve at
-    // `commit` rather than HEAD.
-    let saved_ns = globals
-        .lookup_var("clojure.core", "*ns*")
-        .and_then(|v| crate::dynamics::deref_var(&v));
-    {
-        let mut env = Env::new_versioned(globals.clone(), &versioned_ns_name, commit);
-        let file_label = format!("<{base_ns}@{commit}>");
-        let mut parser = cljrs_reader::Parser::new(src, file_label);
-        let forms = parser.parse_all().map_err(EvalError::Read)?;
-        for form in forms {
-            let _alloc_frame = cljrs_gc::push_alloc_frame();
-            globals
-                .eval(&form, &mut env)
-                .map_err(|e| annotate(e, &versioned_ns_name))?;
-        }
-    }
-    if let Some(saved) = saved_ns
-        && let Some(var) = globals.lookup_var("clojure.core", "*ns*")
-    {
-        var.get().bind(saved);
-    }
-
-    globals.mark_loaded(&versioned_ns_name);
+    let versioned_ns_name =
+        crate::versioned::ensure_versioned_ns_loaded(&globals, &spec.ns, commit)?;
     apply_alias_refer(&globals, &versioned_ns_name, current_ns, spec);
     Ok(())
 }
@@ -279,7 +203,10 @@ fn apply_alias_refer(
     }
 }
 
-fn find_source_file(rel: &str, src_paths: &[std::path::PathBuf]) -> Option<(String, String)> {
+pub(crate) fn find_source_file(
+    rel: &str,
+    src_paths: &[std::path::PathBuf],
+) -> Option<(String, String)> {
     for dir in src_paths {
         for ext in &[".cljrs", ".cljc"] {
             let path = dir.join(format!("{rel}{ext}"));
@@ -295,7 +222,7 @@ fn find_source_file(rel: &str, src_paths: &[std::path::PathBuf]) -> Option<(Stri
 /// Wrap an EvalError with namespace context.  Read errors (which carry
 /// file/line/col in CljxError) are passed through unchanged so the CLI can
 /// render them with full location information.
-fn annotate(e: EvalError, ns_name: &Arc<str>) -> EvalError {
+pub(crate) fn annotate(e: EvalError, ns_name: &Arc<str>) -> EvalError {
     match e {
         // Preserve read errors — they carry source location.
         EvalError::Read(_) => e,

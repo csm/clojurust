@@ -9,7 +9,7 @@ use cljrs_value::{CljxFn, Value};
 use std::sync::Arc;
 
 pub mod apply;
-mod arity;
+pub mod arity;
 pub mod destructure;
 pub mod eval;
 pub mod macros;

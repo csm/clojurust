@@ -46,9 +46,13 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         if let Some(result) = try_ir_path(f, arity, args, caller_env) {
             return result;
         }
+
+        // 3. No IR yet — count the tree-walked call; crossing the warm
+        //    threshold requests background lowering (Phase 10.7).
+        maybe_request_lowering(f, arity_id, caller_env);
     }
 
-    // 3. Tree-walking interpreter.
+    // 4. Tree-walking interpreter.
     cljrs_interp::apply::call_cljrs_fn(f, args, caller_env)
 }
 
@@ -63,9 +67,10 @@ thread_local! {
 /// Returns `None` if IR is not available (not cached, lowering failed, etc.).
 /// Returns `Some(result)` if IR execution was attempted.
 ///
-/// Only uses the IR path for functions that were eagerly lowered at definition
-/// time (in `eval_fn`).  Lazy on-call lowering is not done here because the
-/// IR interpreter doesn't yet handle all patterns (e.g., complex compiler code).
+/// Only executes IR that is already cached — published by the background
+/// lowering worker once the function crossed the warm threshold (Phase 10.7),
+/// eagerly lowered at definition time (`CLJRS_EAGER_LOWER`), or loaded from a
+/// pre-built bundle.
 fn try_ir_path(
     f: &CljxFn,
     arity: &cljrs_value::CljxFnArity,
@@ -75,16 +80,22 @@ fn try_ir_path(
     let arity_id = arity.ir_arity_id;
 
     // Cross-defn invalidation: if a defn this arity's lowering specialized
-    // against was rebound, the cached IR was dropped and the arity marked for
-    // re-lowering — do that now (one relaxed atomic load on the fast path).
+    // against was rebound, the cached IR was dropped and the arity marked
+    // for re-lowering — request a background re-lower (one relaxed atomic
+    // load on the fast path).  The mark is only *peeked* here; the lowering
+    // worker consumes it, so a mark can never be lost between the worker
+    // publishing IR and validating it against concurrent rebinds.
+    // `lower_queued` (cleared when the rebind dropped the JitEntry)
+    // deduplicates the request across calls.
     if crate::defn_registry::relower_pending()
-        && crate::defn_registry::take_relower(arity_id)
+        && crate::defn_registry::relower_marked(arity_id)
         && !IR_LOWERING_ACTIVE.get()
+        && !crate::jit_state::lower_queued(arity_id)
     {
-        crate::ir_interp::eager_lower_fn(f, caller_env);
+        request_background_lower(f, caller_env);
     }
 
-    // Only use IR if already cached (eagerly lowered at definition time).
+    // Only use IR if already cached.
     let ir_func = crate::ir_cache::get_cached(arity_id)?;
 
     // Async IR functions fall back to tree-walking.
@@ -104,6 +115,102 @@ fn try_ir_path(
     crate::jit_state::record_call(arity_id, Arc::clone(&ir_func), profile_args);
 
     Some(execute_ir(f, arity, &ir_func, args, caller_env))
+}
+
+/// Whether all IR functionality is disabled (`CLJRS_NO_IR`).  Cached: the
+/// warm path checks this on every tree-walked call.
+fn no_ir() -> bool {
+    static NO_IR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_IR.get_or_init(|| std::env::var("CLJRS_NO_IR").is_ok())
+}
+
+/// Tier-0 warm-up accounting (Phase 10.7).
+///
+/// Counts a tree-walked call to `arity_id`; when the function gets warm
+/// (`jit_state::ir_threshold`, default 50) its arity bodies are macro-expanded
+/// here on the calling thread (macros need the interpreter) and shipped to
+/// the background lowering worker.  Once the worker publishes the IR, step 2
+/// of `call_cljrs_fn` takes over and the JIT pipeline proceeds as before.
+fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
+    // Cheap gates first; all of these make the arity permanently
+    // un-lowerable (or expansion unsafe), so skip before touching counters.
+    //
+    // - Inside a lowering/expansion already: don't recurse.
+    // - Async fns: the IR interpreter refuses them (`try_ir_path`), so
+    //   lowering would be wasted work.
+    // - Capturing closures: lowering cannot see captures (every reference
+    //   would mis-resolve as a global), same restriction as eager lowering.
+    // - Bootstrap-era fns (defined before the compiler was ready): never
+    //   lowered under eager lowering either; they stay at tree-walk.
+    if IR_LOWERING_ACTIVE.get()
+        || f.is_async
+        || !f.closed_over_names.is_empty()
+        || crate::jit_state::is_bootstrap_arity(arity_id)
+        || no_ir()
+        || !caller_env
+            .globals
+            .compiler_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+
+    if !crate::jit_state::record_interp_call(arity_id) {
+        return;
+    }
+
+    // Threshold crossed.  Shipped (builtin-source) namespaces — clojure.test,
+    // clojure.string, the compiler namespaces, … — keep their historical
+    // behavior and are never background-lowered: like the bootstrap, they
+    // only ever reached the IR tiers under opt-in eager lowering, and some
+    // of their patterns are known to miscompile (TODO.md Phase 10.7 notes).
+    // Pin the queued flag so this is a one-time check per arity.
+    if caller_env.globals.builtin_source(&f.defining_ns).is_some() {
+        crate::jit_state::mark_lower_queued(arity_id);
+        return;
+    }
+
+    // A previous lowering attempt may have marked this arity Unsupported
+    // (e.g. an eager-lowering failure); pin the queued flag so the per-call
+    // gates above stay the steady-state cost.
+    if !crate::ir_cache::should_attempt(arity_id) {
+        crate::jit_state::mark_lower_queued(arity_id);
+        return;
+    }
+
+    request_background_lower(f, caller_env);
+}
+
+/// Snapshot `f` (macro-expanding every arity body on this thread) and enqueue
+/// it for background lowering.  On acceptance, marks every arity of `f` as
+/// queued; a full queue leaves the flags unset so a later call retries.
+fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
+    let arities: Vec<crate::lower_worker::LowerArityRequest> = f
+        .arities
+        .iter()
+        .map(|a| crate::lower_worker::LowerArityRequest {
+            arity_id: a.ir_arity_id,
+            params: a.params.clone(),
+            rest_param: a.rest_param.clone(),
+            destructure_params: a.destructure_params.clone(),
+            destructure_rest: a.destructure_rest.clone(),
+            expanded_body: crate::lower::macroexpand_body(&a.body, caller_env),
+        })
+        .collect();
+    let arity_ids: Vec<u64> = arities.iter().map(|a| a.arity_id).collect();
+
+    let accepted = crate::lower_worker::enqueue(crate::lower_worker::LowerRequest {
+        globals_id: crate::lower::globals_id(caller_env),
+        name: f.name.clone(),
+        ns: f.defining_ns.clone(),
+        is_async: f.is_async,
+        arities,
+    });
+    if accepted {
+        for id in arity_ids {
+            crate::jit_state::mark_lower_queued(id);
+        }
+    }
 }
 
 /// Execute an IR function with the given arguments.

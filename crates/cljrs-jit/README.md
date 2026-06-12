@@ -35,6 +35,7 @@ sites compile through per-call-site inline caches (`rt_kw_ic_fill`,
 | `src/jit_worker.rs` | Background worker thread: receives `CompileRequest::Function` and `CompileRequest::Osr` requests, registers each module in `code_cache`, publishes the function pointer + epoch (whole-function: `jit_state::store_native_fn`; OSR: `jit_state::store_osr_fn` with the live-in list). `specs_from_profile` maps the arity's Tier-1 type profile to per-parameter specializations (skipped when banned by deopts or `CLJRS_JIT_NO_SPEC=1`; OSR entries are never specialized). Each compile is wrapped in `catch_unwind` so a codegen panic on one function cannot kill the worker (the function just stays at Tier 1; failed OSR compiles are recorded via `mark_osr_failed`) |
 | `src/code_cache.rs` | Epoch-tagged registry of compiled modules; `mark_stale` on redefinition, `pin_epoch` for modules whose code leaked into a closure value, `reclaim_at_stw` frees stale, unpinned modules with no live frame via `JITModule::free_memory` |
 | `src/osr_integration.rs` | (test-only) end-to-end OSR test: lowers a real `loop*` from source, builds + compiles the OSR entry, and calls the native code with a mid-loop register snapshot |
+| `tests/versioned_jit.rs` | End-to-end versioned-symbol test: pinned references (`mylib/x@<sha>`) inside JIT-compiled functions resolve at the pinned commit through the `rt_load_global_versioned_ic` inline cache, agree with the interpreter tiers, survive a forced GC, and leave HEAD untouched |
 
 ## Public API
 
@@ -62,14 +63,30 @@ call_cljrs_fn
   1. JIT-native  — cljrs_eval::jit_state::get_native_fn()   ← fastest
   2. Tier-1 IR   — cljrs_eval::ir_cache::get_cached()
   3. Tree-walk   — cljrs_interp::apply::call_cljrs_fn()
+                   (counted: crossing CLJRS_IR_THRESHOLD requests background
+                    IR lowering — Phase 10.7, owned by cljrs-eval)
 ```
+
+`init()` no longer forces eager IR lowering: functions reach Tier 1 via the
+warm-threshold background lowering worker in `cljrs-eval` (default 50
+tree-walked calls), then proceed to JIT compilation as before once their
+Tier-1 call count crosses the JIT threshold (the Tier counter restarts when
+the IR is published).  `CLJRS_EAGER_LOWER=1` restores lowering at definition
+time.
+
+The worker validates each whole-function compile before publishing: the IR
+the request was built from must still be the arity's current cache entry
+(`Arc::ptr_eq`), otherwise the module is marked stale instead — a rebind or
+cold-IR eviction during the compile must not resurrect stale native code.
 
 ## Configuration
 
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `CLJRS_JIT_THRESHOLD` | `1000` | Calls before a function is JIT-compiled |
+| `CLJRS_JIT_THRESHOLD` | `1000` | Tier-1 calls before a function is JIT-compiled |
+| `CLJRS_IR_THRESHOLD` | `50` | Tree-walked calls before background IR lowering (Phase 10.7, owned by `cljrs-eval`) |
 | `CLJRS_OSR_THRESHOLD` | = JIT threshold | Loop back-edges (within one call) before an OSR entry is compiled |
+| `CLJRS_EAGER_LOWER` | unset | Lower every definition to IR eagerly instead of by warm threshold |
 | `CLJRS_NO_JIT` | unset | Set to any value to disable JIT init |
 | `CLJRS_NO_IR` | unset | Disables IR lowering (also disables JIT) |
 | `CLJRS_JIT_NO_SPEC` | unset | Disable type specialization (compile everything generic) |
