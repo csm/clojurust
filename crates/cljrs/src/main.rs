@@ -738,7 +738,37 @@ fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
     }
     let escaped: Vec<String> = args.iter().map(|s| escape_clojure_string(s)).collect();
     let call = format!("(-main {})", escaped.join(" "));
-    eval_in(env, &call, "<main>")?;
+    let result = eval_in(env, &call, "<main>")?;
+    // An `^:async` `-main` returns a `Future` immediately, with its body
+    // queued as a task on the shared `LocalSet`. Await that future so the body
+    // (and anything it spawns) runs to completion before the process exits;
+    // for a synchronous `-main` this is a no-op pass-through.
+    await_main_result(result)?;
+    Ok(())
+}
+
+/// Drive `value` to a settled value on the shared async `LocalSet`. If `value`
+/// is a `Future`/`Promise` (e.g. the result of an `^:async` `-main`), this
+/// yields until it resolves; any other value is returned unchanged.
+#[cfg(feature = "async")]
+fn await_main_result(value: Value) -> miette::Result<()> {
+    ASYNC_DRIVER.with(|d| {
+        let guard = d.borrow();
+        match guard.as_ref() {
+            Some(drv) => {
+                drv.local
+                    .block_on(&drv.rt, cljrs_async::eval_async::await_value(value))
+                    .map_err(format_eval_error)?;
+                Ok(())
+            }
+            // No driver installed: nothing to await against, so leave as-is.
+            None => Ok(()),
+        }
+    })
+}
+
+#[cfg(not(feature = "async"))]
+fn await_main_result(_value: Value) -> miette::Result<()> {
     Ok(())
 }
 
