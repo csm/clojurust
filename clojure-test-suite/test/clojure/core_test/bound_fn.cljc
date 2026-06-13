@@ -49,4 +49,4 @@
                      (future (bound-fn [] *x*))))]
            (binding [*x* :derefer]
              (let [derefed-f @f]
-               (is (= :callee (@derefed-f)) "Binding in futures preserved."))))))))
+               (is (= :callee (@derefed-f)) "Binding in futures preserved.")))))))))
