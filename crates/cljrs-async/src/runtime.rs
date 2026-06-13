@@ -65,20 +65,29 @@ fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
 /// Must be called from within a Tokio `LocalSet` context (e.g., from `init`).
 /// On `wasm32` this is a no-op — see below.
 pub(crate) fn spawn_gc_service() {
-    // On native, `spawn_local` panics when called outside a `LocalSet` context
-    // (e.g. in unit tests that call `init()` before `block_on_local`).
-    // `catch_unwind` silences that panic; the service simply won't run, which is
-    // fine — safepoints inside `await_value` still fire whenever code runs in a
-    // LocalSet.
+    // On native, `spawn_local` panics unless it is called inside a Tokio
+    // runtime *and* a `LocalSet`.  Several callers invoke `init()` with no
+    // runtime at all — notably the AOT compiler, which registers
+    // `clojure.core.async` only so `require`/`go`/`await` resolve during
+    // macro-expansion, and unit tests that call `init()` before
+    // `block_on_local`.  Probe for a runtime first and skip the GC service when
+    // there is none: a missing service outside a LocalSet is expected and
+    // harmless — safepoints inside `await_value` still fire whenever code runs
+    // in a LocalSet.  Probing (rather than provoke-and-`catch_unwind`) avoids
+    // emitting a scary—but-caught—panic message to stderr during compilation.
+    // The `catch_unwind` remains as a guard for the pathological case of a
+    // runtime present without a LocalSet, which none of our call paths hit.
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = std::panic::catch_unwind(|| {
-        tokio::task::spawn_local(async {
-            loop {
-                tokio::task::yield_now().await;
-                cljrs_env::gc_roots::async_gc_collect();
-            }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let _ = std::panic::catch_unwind(|| {
+            tokio::task::spawn_local(async {
+                loop {
+                    tokio::task::yield_now().await;
+                    cljrs_env::gc_roots::async_gc_collect();
+                }
+            });
         });
-    });
+    }
 
     // On wasm32, tokio's yield_now() only cooperates with the LocalSet scheduler
     // — it does NOT yield back to the browser event loop.  A `loop { yield_now();
