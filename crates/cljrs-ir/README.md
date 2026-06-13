@@ -60,8 +60,10 @@ pub struct BlockId(pub u32);
 
 /// Machine representation of an IR var (lives here so IrFunction can carry
 /// static seeds from `^long`/`^double` type hints; re-exported by
-/// cljrs_compiler::typeinfer).
-pub enum Repr { Boxed, Long, Double, Bool }
+/// cljrs_compiler::typeinfer).  `LongArray`/`DoubleArray` are boxed array
+/// pointers with a known element type (from `^longs`/`^doubles`), enabling
+/// unboxed `aget`/`aset`.
+pub enum Repr { Boxed, Long, Double, Bool, LongArray, DoubleArray }
 
 pub struct IrFunction {
     pub name: Option<Arc<str>>,
@@ -137,6 +139,11 @@ and compiled tiers (Clojure primitive-long semantics); `UncheckedAdd`/
 `UncheckedSub`/`UncheckedMul` are the wrapping counterparts (the `unchecked-*`
 family, plus `unchecked-inc`/`-dec`/`-negate` which lower to them).  `inc`/`dec`
 lower to checked `Add`/`Sub`.
+
+`Aget`/`Aset`/`Alength` are primitive array access.  On a `^longs`/`^doubles`
+operand (`Repr::LongArray`/`DoubleArray`) with an unboxed index, codegen loads/
+stores unboxed `i64`/`f64` elements; otherwise it uses a boxed bridge.  All
+paths bounds-check and throw on out-of-range access.
 
 Some `KnownFn` variants exist purely for analysis precision — the
 codegen and IR interpreter dispatch them through the dynamic builtin

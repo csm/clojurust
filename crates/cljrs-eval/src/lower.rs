@@ -28,6 +28,8 @@ pub fn seed_reprs_from_hints(param_hints: &[Option<TypeHint>]) -> Vec<Repr> {
                     | TypeHint::Double
                     | TypeHint::Float
                     | TypeHint::Bool
+                    | TypeHint::LongArray
+                    | TypeHint::DoubleArray
             )
         )
     }) {
@@ -39,8 +41,11 @@ pub fn seed_reprs_from_hints(param_hints: &[Option<TypeHint>]) -> Vec<Repr> {
             Some(TypeHint::Long | TypeHint::Int) => Repr::Long,
             Some(TypeHint::Double | TypeHint::Float) => Repr::Double,
             Some(TypeHint::Bool) => Repr::Bool,
-            // Array hints get unboxed array reprs in a later phase; for now they
-            // (and absent/non-primitive hints) stay boxed.
+            // `^longs`/`^doubles` enable unboxed element access via aget/aset.
+            Some(TypeHint::LongArray) => Repr::LongArray,
+            Some(TypeHint::DoubleArray) => Repr::DoubleArray,
+            // Other array hints / absent / non-primitive hints stay boxed (they
+            // still work through the boxed array bridge).
             _ => Repr::Boxed,
         })
         .collect()

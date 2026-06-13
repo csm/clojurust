@@ -61,6 +61,13 @@ struct RuntimeFuncs {
     rt_unchecked_sub: FuncId,
     rt_unchecked_mul: FuncId,
     rt_overflow_error: FuncId,
+    rt_alength: FuncId,
+    rt_aget_long: FuncId,
+    rt_aget_double: FuncId,
+    rt_aset_long: FuncId,
+    rt_aset_double: FuncId,
+    rt_aget: FuncId,
+    rt_aset: FuncId,
     rt_div: FuncId,
     rt_rem: FuncId,
     rt_eq: FuncId,
@@ -1016,8 +1023,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                             .ins()
                             .brif(raw, then_b, &then_args, else_b, &else_args);
                     }
-                    // Numbers are always truthy in Clojure.
-                    Repr::Long | Repr::Double => {
+                    // Numbers are always truthy in Clojure; a typed-array repr is
+                    // a live object pointer, hence also always truthy.
+                    Repr::Long | Repr::Double | Repr::LongArray | Repr::DoubleArray => {
                         self.builder.ins().jump(then_b, &then_args);
                     }
                     Repr::Boxed => {
@@ -1113,7 +1121,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     /// CLIF type backing a [`Repr`].
     fn clif_ty(&self, repr: Repr) -> types::Type {
         match repr {
-            Repr::Boxed => self.ptr_type,
+            // Array reprs are boxed `*const Value` pointers; only their elements
+            // are unboxed (at `aget`/`aset`).
+            Repr::Boxed | Repr::LongArray | Repr::DoubleArray => self.ptr_type,
             Repr::Long => types::I64,
             Repr::Double => types::F64,
             Repr::Bool => types::I8,
@@ -1144,7 +1154,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn use_var_boxed(&mut self, var_id: VarId) -> CodegenResult<cranelift_codegen::ir::Value> {
         let raw = self.use_var(var_id);
         match self.repr_of(var_id) {
-            Repr::Boxed => Ok(raw),
+            // Array reprs are already boxed pointers — no boxing needed.
+            Repr::Boxed | Repr::LongArray | Repr::DoubleArray => Ok(raw),
             Repr::Long => self.call_rt_1(self.rt.rt_const_long, raw),
             Repr::Double => self.call_rt_1(self.rt.rt_const_double, raw),
             Repr::Bool => self.call_rt_1(self.rt.rt_box_bool, raw),
@@ -1734,6 +1745,70 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         Ok(())
     }
 
+    /// Emit primitive array access (`aget`/`aset`/`alength`).  When the array
+    /// operand's repr is a known `LongArray`/`DoubleArray` (and the index/value
+    /// are unboxed), emit a typed bridge that loads/stores unboxed elements;
+    /// otherwise fall back to the boxed bridge.  All bridges bounds-check and
+    /// throw on out-of-range / type mismatch.
+    fn emit_array_op(
+        &mut self,
+        known_fn: &KnownFn,
+        args: &[VarId],
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        match known_fn {
+            KnownFn::Alength => {
+                let arr = self.use_var_boxed(args[0])?;
+                self.call_rt_1(self.rt.rt_alength, arr)
+            }
+            KnownFn::Aget => {
+                let arr_repr = self.repr_of(args[0]);
+                let idx_repr = self.repr_of(args[1]);
+                let arr = self.use_var_boxed(args[0])?;
+                match (arr_repr, idx_repr) {
+                    (Repr::LongArray, Repr::Long) => {
+                        let idx = self.use_var(args[1]);
+                        self.call_rt_2(self.rt.rt_aget_long, arr, idx)
+                    }
+                    (Repr::DoubleArray, Repr::Long) => {
+                        let idx = self.use_var(args[1]);
+                        self.call_rt_2(self.rt.rt_aget_double, arr, idx)
+                    }
+                    _ => {
+                        let idx = self.use_var_boxed(args[1])?;
+                        self.call_rt_2(self.rt.rt_aget, arr, idx)
+                    }
+                }
+            }
+            KnownFn::Aset => {
+                let arr_repr = self.repr_of(args[0]);
+                let idx_repr = self.repr_of(args[1]);
+                let val_repr = self.repr_of(args[2]);
+                let arr = self.use_var_boxed(args[0])?;
+                match arr_repr {
+                    Repr::LongArray if idx_repr == Repr::Long && val_repr == Repr::Long => {
+                        let idx = self.use_var(args[1]);
+                        let val = self.use_var(args[2]);
+                        self.call_rt_3(self.rt.rt_aset_long, arr, idx, val)
+                    }
+                    Repr::DoubleArray
+                        if idx_repr == Repr::Long
+                            && matches!(val_repr, Repr::Double | Repr::Long) =>
+                    {
+                        let idx = self.use_var(args[1]);
+                        let val = self.use_var_f64(args[2])?;
+                        self.call_rt_3(self.rt.rt_aset_double, arr, idx, val)
+                    }
+                    _ => {
+                        let idx = self.use_var_boxed(args[1])?;
+                        let val = self.use_var_boxed(args[2])?;
+                        self.call_rt_3(self.rt.rt_aset, arr, idx, val)
+                    }
+                }
+            }
+            _ => unreachable!("emit_array_op called with non-array KnownFn"),
+        }
+    }
+
     /// Emit a call to a known function.
     fn emit_known_call(
         &mut self,
@@ -1741,6 +1816,11 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         known_fn: &KnownFn,
         args: &[VarId],
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        // Primitive array access has dedicated unboxed/boxed paths.
+        if matches!(known_fn, KnownFn::Aget | KnownFn::Aset | KnownFn::Alength) {
+            return self.emit_array_op(known_fn, args);
+        }
+
         // Unboxed arithmetic/comparisons compile to native instructions —
         // no bridge call, no boxing, no GC allocation.
         let dst_repr = self.repr_of(dst);
@@ -2123,6 +2203,18 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let call = self.builder.ins().call(func_ref, &[a, b]);
         Ok(self.builder.inst_results(call)[0])
     }
+
+    fn call_rt_3(
+        &mut self,
+        func_id: FuncId,
+        a: cranelift_codegen::ir::Value,
+        b: cranelift_codegen::ir::Value,
+        c: cranelift_codegen::ir::Value,
+    ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        let func_ref = self.import_func(func_id);
+        let call = self.builder.ins().call(func_ref, &[a, b, c]);
+        Ok(self.builder.inst_results(call)[0])
+    }
 }
 
 // ── Runtime function declaration ────────────────────────────────────────────
@@ -2178,6 +2270,18 @@ fn declare_runtime_funcs<M: Module>(
         rt_unchecked_sub: declare_rt(module, "rt_unchecked_sub", &[ptr, ptr], ptr)?,
         rt_unchecked_mul: declare_rt(module, "rt_unchecked_mul", &[ptr, ptr], ptr)?,
         rt_overflow_error: declare_rt(module, "rt_overflow_error", &[], ptr)?,
+        rt_alength: declare_rt(module, "rt_alength", &[ptr], types::I64)?,
+        rt_aget_long: declare_rt(module, "rt_aget_long", &[ptr, types::I64], types::I64)?,
+        rt_aget_double: declare_rt(module, "rt_aget_double", &[ptr, types::I64], types::F64)?,
+        rt_aset_long: declare_rt(module, "rt_aset_long", &[ptr, types::I64, types::I64], ptr)?,
+        rt_aset_double: declare_rt(
+            module,
+            "rt_aset_double",
+            &[ptr, types::I64, types::F64],
+            ptr,
+        )?,
+        rt_aget: declare_rt(module, "rt_aget", &[ptr, ptr], ptr)?,
+        rt_aset: declare_rt(module, "rt_aset", &[ptr, ptr, ptr], ptr)?,
         rt_div: declare_rt(module, "rt_div", &[ptr, ptr], ptr)?,
         rt_rem: declare_rt(module, "rt_rem", &[ptr, ptr], ptr)?,
         rt_eq: declare_rt(module, "rt_eq", &[ptr, ptr], ptr)?,

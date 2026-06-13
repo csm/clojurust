@@ -512,6 +512,8 @@ fn meta_tag_repr(meta: &Form) -> Option<crate::Repr> {
         "long" | "int" => Some(crate::Repr::Long),
         "double" | "float" => Some(crate::Repr::Double),
         "boolean" => Some(crate::Repr::Bool),
+        "longs" => Some(crate::Repr::LongArray),
+        "doubles" => Some(crate::Repr::DoubleArray),
         _ => None,
     }
 }
@@ -2558,6 +2560,9 @@ fn known_fn_arity(kf: &KnownFn) -> Option<usize> {
         KnownFn::Dissoc => Some(2),
         KnownFn::Disj => Some(2),
         KnownFn::Nth => Some(2),
+        KnownFn::Aget => Some(2),
+        KnownFn::Aset => Some(3),
+        KnownFn::Alength => Some(1),
         KnownFn::Contains => Some(2),
         KnownFn::Cons => Some(2),
         KnownFn::Seq => Some(1),

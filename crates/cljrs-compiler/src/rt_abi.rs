@@ -372,6 +372,243 @@ pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Valu
     }
 }
 
+/// Raise an exception carrying `msg` via the pending-exception slot and return
+/// nil (used by the array bridges for type and bounds errors).
+fn throw_str(msg: String) -> *const Value {
+    let exc = box_val(Value::Error(GcPtr::new(
+        cljrs_value::error::ExceptionInfo::new(
+            cljrs_value::ValueError::Other(msg.clone()),
+            msg,
+            None,
+            None,
+        ),
+    )));
+    unsafe { rt_throw(exc) }
+}
+
+fn array_index_error(idx: i64, len: usize) -> String {
+    format!("array index out of bounds: {idx} (length {len})")
+}
+
+// ── Primitive array access ──────────────────────────────────────────────────
+
+/// `(alength arr)` — element count of any primitive/object array, unboxed.
+/// Throws on a non-array argument.
+///
+/// # Safety
+/// `arr` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_alength(arr: *const Value) -> i64 {
+    let arr = unsafe { val_ref(arr) };
+    let len = match arr {
+        Value::ObjectArray(a) => a.get().0.lock().unwrap().len(),
+        Value::IntArray(a) => a.get().lock().unwrap().len(),
+        Value::LongArray(a) => a.get().lock().unwrap().len(),
+        Value::ShortArray(a) => a.get().lock().unwrap().len(),
+        Value::ByteArray(a) => a.get().lock().unwrap().len(),
+        Value::FloatArray(a) => a.get().lock().unwrap().len(),
+        Value::DoubleArray(a) => a.get().lock().unwrap().len(),
+        Value::BooleanArray(a) => a.get().lock().unwrap().len(),
+        Value::CharArray(a) => a.get().lock().unwrap().len(),
+        _ => {
+            throw_str(format!("alength: not an array: {}", arr.type_name()));
+            return 0;
+        }
+    };
+    len as i64
+}
+
+/// `(aget longs i)` — unboxed `i64` element load from a `LongArray`.
+///
+/// # Safety
+/// `arr` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aget_long(arr: *const Value, i: i64) -> i64 {
+    let arr = unsafe { val_ref(arr) };
+    match arr {
+        Value::LongArray(a) => {
+            let v = a.get().lock().unwrap();
+            if i < 0 || i as usize >= v.len() {
+                throw_str(array_index_error(i, v.len()));
+                return 0;
+            }
+            v[i as usize]
+        }
+        _ => {
+            throw_str(format!("aget: not a long array: {}", arr.type_name()));
+            0
+        }
+    }
+}
+
+/// `(aget doubles i)` — unboxed `f64` element load from a `DoubleArray`.
+///
+/// # Safety
+/// `arr` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aget_double(arr: *const Value, i: i64) -> f64 {
+    let arr = unsafe { val_ref(arr) };
+    match arr {
+        Value::DoubleArray(a) => {
+            let v = a.get().lock().unwrap();
+            if i < 0 || i as usize >= v.len() {
+                throw_str(array_index_error(i, v.len()));
+                return 0.0;
+            }
+            v[i as usize]
+        }
+        _ => {
+            throw_str(format!("aget: not a double array: {}", arr.type_name()));
+            0.0
+        }
+    }
+}
+
+/// `(aset longs i v)` — unboxed `i64` element store into a `LongArray`,
+/// returning the boxed stored value.
+///
+/// # Safety
+/// `arr` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aset_long(arr: *const Value, i: i64, v: i64) -> *const Value {
+    let arr = unsafe { val_ref(arr) };
+    match arr {
+        Value::LongArray(a) => {
+            let mut g = a.get().lock().unwrap();
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            g[i as usize] = v;
+            intern_long(v)
+        }
+        _ => throw_str(format!("aset: not a long array: {}", arr.type_name())),
+    }
+}
+
+/// `(aset doubles i v)` — unboxed `f64` element store into a `DoubleArray`.
+///
+/// # Safety
+/// `arr` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aset_double(arr: *const Value, i: i64, v: f64) -> *const Value {
+    let arr = unsafe { val_ref(arr) };
+    match arr {
+        Value::DoubleArray(a) => {
+            let mut g = a.get().lock().unwrap();
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            g[i as usize] = v;
+            box_val(Value::Double(v))
+        }
+        _ => throw_str(format!("aset: not a double array: {}", arr.type_name())),
+    }
+}
+
+/// `(aget arr i)` — boxed single-dimension element load for any array type
+/// (used when the array's element type is not statically known).
+///
+/// # Safety
+/// Both pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const Value {
+    let arr = unsafe { val_ref(arr) };
+    let idx = unsafe { val_ref(idx) };
+    let i = match idx {
+        Value::Long(n) => *n,
+        _ => return throw_str("aget: index must be an integer".to_string()),
+    };
+    macro_rules! load {
+        ($a:expr, $map:expr) => {{
+            let g = $a.get().lock().unwrap();
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            #[allow(clippy::redundant_closure_call)]
+            box_val($map(&g[i as usize]))
+        }};
+    }
+    match arr {
+        Value::ObjectArray(a) => {
+            let g = a.get().0.lock().unwrap();
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            box_val(g[i as usize].clone())
+        }
+        Value::LongArray(a) => load!(a, |v: &i64| Value::Long(*v)),
+        Value::IntArray(a) => load!(a, |v: &i32| Value::Long(*v as i64)),
+        Value::ShortArray(a) => load!(a, |v: &i16| Value::Long(*v as i64)),
+        Value::ByteArray(a) => load!(a, |v: &i8| Value::Long(*v as i64)),
+        Value::DoubleArray(a) => load!(a, |v: &f64| Value::Double(*v)),
+        Value::FloatArray(a) => load!(a, |v: &f32| Value::Double(*v as f64)),
+        Value::BooleanArray(a) => load!(a, |v: &bool| Value::Bool(*v)),
+        Value::CharArray(a) => load!(a, |v: &char| Value::Char(*v)),
+        _ => throw_str(format!("aget: not an array: {}", arr.type_name())),
+    }
+}
+
+/// `(aset arr i v)` — boxed element store for any array type.
+///
+/// # Safety
+/// All pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_aset(
+    arr: *const Value,
+    idx: *const Value,
+    val: *const Value,
+) -> *const Value {
+    let arr_v = unsafe { val_ref(arr) };
+    let idx_v = unsafe { val_ref(idx) };
+    let val_v = unsafe { val_ref(val) };
+    let i = match idx_v {
+        Value::Long(n) => *n,
+        _ => return throw_str("aset: index must be an integer".to_string()),
+    };
+    macro_rules! store {
+        ($lock:expr, $conv:expr) => {{
+            let mut g = $lock;
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            match $conv(val_v) {
+                Some(c) => {
+                    g[i as usize] = c;
+                    return val;
+                }
+                None => return throw_str("aset: value type does not match array".to_string()),
+            }
+        }};
+    }
+    match arr_v {
+        Value::ObjectArray(a) => {
+            let mut g = a.get().0.lock().unwrap();
+            if i < 0 || i as usize >= g.len() {
+                return throw_str(array_index_error(i, g.len()));
+            }
+            g[i as usize] = val_v.clone();
+            val
+        }
+        Value::LongArray(a) => store!(a.get().lock().unwrap(), |v: &Value| match v {
+            Value::Long(n) => Some(*n),
+            _ => None,
+        }),
+        Value::DoubleArray(a) => store!(a.get().lock().unwrap(), |v: &Value| match v {
+            Value::Double(f) => Some(*f),
+            Value::Long(n) => Some(*n as f64),
+            _ => None,
+        }),
+        Value::IntArray(a) => store!(a.get().lock().unwrap(), |v: &Value| match v {
+            Value::Long(n) => Some(*n as i32),
+            _ => None,
+        }),
+        _ => throw_str(format!(
+            "aset: unsupported array type: {}",
+            arr_v.type_name()
+        )),
+    }
+}
+
 /// Unchecked (wrapping) boxed long arithmetic — the `unchecked-*` family.
 /// Never throws or promotes; wraps on overflow.
 ///
@@ -3745,6 +3982,13 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_unchecked_sub as *const () as usize);
     std::hint::black_box(rt_unchecked_mul as *const () as usize);
     std::hint::black_box(rt_overflow_error as *const () as usize);
+    std::hint::black_box(rt_alength as *const () as usize);
+    std::hint::black_box(rt_aget_long as *const () as usize);
+    std::hint::black_box(rt_aget_double as *const () as usize);
+    std::hint::black_box(rt_aset_long as *const () as usize);
+    std::hint::black_box(rt_aset_double as *const () as usize);
+    std::hint::black_box(rt_aget as *const () as usize);
+    std::hint::black_box(rt_aset as *const () as usize);
     std::hint::black_box(rt_div as *const () as usize);
     std::hint::black_box(rt_rem as *const () as usize);
     std::hint::black_box(rt_eq as *const () as usize);

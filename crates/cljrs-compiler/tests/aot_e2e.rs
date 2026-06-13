@@ -108,6 +108,42 @@ fn test_arithmetic() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_unchecked_arithmetic_wraps() {
+    assert_output(
+        "unchecked_arith",
+        r#"
+(println (unchecked-add 9223372036854775807 1))
+(println (unchecked-multiply 9223372036854775807 2))
+"#,
+        "-9223372036854775808\n-2",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_primitive_array_dot_product() {
+    // ^longs/^long hints drive unboxed array loads + unboxed arithmetic.
+    assert_output(
+        "prim_array_dot",
+        r#"
+(defn dot [^longs a ^longs b ^long n]
+  (loop [^long i 0 ^long s 0]
+    (if (< i n)
+      (recur (unchecked-inc i)
+             (unchecked-add s (unchecked-multiply (aget a i) (aget b i))))
+      s)))
+(def a (long-array 4))
+(def b (long-array 4))
+(dotimes [i 4] (aset a i (inc i)) (aset b i (inc i)))
+(println (dot a b 4))
+(println (alength a))
+"#,
+        "30\n4",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_comparison() {
     assert_output(
         "comparison",

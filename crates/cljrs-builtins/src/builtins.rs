@@ -3947,71 +3947,64 @@ fn builtin_alength(args: &[Value]) -> ValueResult<Value> {
 }
 
 /// `(aget arr idx & idxs)` — get element from an array, supports nested access.
+///
+/// An out-of-bounds index throws `IndexOutOfBounds` (Clojure semantics, and
+/// consistent with `aset` and the compiled `rt_aget_*` bridges).
 fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
+    /// Map an `Option<T>` element to a converted `Value`, or an OOB error.
+    fn at<T>(
+        elem: Option<T>,
+        idx: usize,
+        len: usize,
+        f: impl FnOnce(T) -> Value,
+    ) -> ValueResult<Value> {
+        match elem {
+            Some(v) => Ok(f(v)),
+            None => Err(ValueError::IndexOutOfBounds { idx, count: len }),
+        }
+    }
     let mut current = args[0].clone();
     for idx_val in &args[1..] {
         let idx = numeric_as_i64(idx_val)? as usize;
         current = match &current {
             Value::ObjectArray(a) => {
-                let guard = a.get().0.lock().unwrap();
-                guard.get(idx).cloned().unwrap_or(Value::Nil)
+                let g = a.get().0.lock().unwrap();
+                at(g.get(idx).cloned(), idx, g.len(), |v| v)?
             }
-            Value::IntArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Long(*v as i64))
-                .unwrap_or(Value::Nil),
-            Value::LongArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Long(*v))
-                .unwrap_or(Value::Nil),
-            Value::ShortArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Long(*v as i64))
-                .unwrap_or(Value::Nil),
-            Value::ByteArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Long(*v as i64))
-                .unwrap_or(Value::Nil),
-            Value::FloatArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Double(*v as f64))
-                .unwrap_or(Value::Nil),
-            Value::DoubleArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Double(*v))
-                .unwrap_or(Value::Nil),
-            Value::BooleanArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Bool(*v))
-                .unwrap_or(Value::Nil),
-            Value::CharArray(a) => a
-                .get()
-                .lock()
-                .unwrap()
-                .get(idx)
-                .map(|v| Value::Char(*v))
-                .unwrap_or(Value::Nil),
+            Value::IntArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), |v| Value::Long(v as i64))?
+            }
+            Value::LongArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), Value::Long)?
+            }
+            Value::ShortArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), |v| Value::Long(v as i64))?
+            }
+            Value::ByteArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), |v| Value::Long(v as i64))?
+            }
+            Value::FloatArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), |v| {
+                    Value::Double(v as f64)
+                })?
+            }
+            Value::DoubleArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), Value::Double)?
+            }
+            Value::BooleanArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), Value::Bool)?
+            }
+            Value::CharArray(a) => {
+                let g = a.get().lock().unwrap();
+                at(g.get(idx).copied(), idx, g.len(), Value::Char)?
+            }
             _ => {
                 return Err(ValueError::WrongType {
                     expected: "array",

@@ -158,10 +158,22 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
                                 (None, _) | (_, None) => None,
                                 _ => Some(Repr::Boxed),
                             },
+                            // `(aget arr i)` on a typed array with an unboxed
+                            // index yields its unboxed element; `a`/`b` are the
+                            // array/index reprs.  A boxed index falls back to
+                            // the boxed bridge (result stays boxed).
+                            KnownFn::Aget => match (a, b) {
+                                (Some(Repr::LongArray), Some(Repr::Long)) => Some(Repr::Long),
+                                (Some(Repr::DoubleArray), Some(Repr::Long)) => Some(Repr::Double),
+                                (None, _) | (_, None) => None,
+                                _ => Some(Repr::Boxed),
+                            },
                             _ => Some(Repr::Boxed),
                         };
                         Some((*dst, r))
                     }
+                    // `(alength arr)` always yields an unboxed long count.
+                    Inst::CallKnown(dst, KnownFn::Alength, _) => Some((*dst, Some(Repr::Long))),
                     other => other.dst().map(|d| (d, Some(Repr::Boxed))),
                 };
                 if let Some((dst, r)) = new {

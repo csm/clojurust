@@ -70,6 +70,24 @@ pub enum Repr {
     Double,
     /// Raw `i8` (0 or 1, a `Value::Bool` payload).
     Bool,
+    /// A `Value::LongArray` (`^longs`).  The array value itself is still a boxed
+    /// `*const Value`; this repr records the element type so `aget`/`aset` on it
+    /// load/store unboxed `i64` elements.
+    LongArray,
+    /// A `Value::DoubleArray` (`^doubles`); unboxed `f64` elements.
+    DoubleArray,
+}
+
+impl Repr {
+    /// For an array repr, the element scalar repr (`LongArray` → `Long`,
+    /// `DoubleArray` → `Double`); `None` for scalar/boxed reprs.
+    pub fn array_element(self) -> Option<Repr> {
+        match self {
+            Repr::LongArray => Some(Repr::Long),
+            Repr::DoubleArray => Some(Repr::Double),
+            _ => None,
+        }
+    }
 }
 
 /// A basic block identifier within an IR function.
@@ -136,6 +154,13 @@ pub enum KnownFn {
     UncheckedAdd,
     UncheckedSub,
     UncheckedMul,
+
+    // Primitive array access: `(aget arr i)`, `(aset arr i v)`, `(alength arr)`.
+    // On a known `LongArray`/`DoubleArray` repr, codegen loads/stores unboxed
+    // elements; otherwise it falls back to a boxed runtime bridge.
+    Aget,
+    Aset,
+    Alength,
 
     // Comparison (pure)
     Eq,
@@ -911,6 +936,10 @@ impl KnownFn {
 
             // Deref reads from heap
             KnownFn::Deref | KnownFn::AtomDeref => Effect::HeapRead,
+
+            // Primitive array access
+            KnownFn::Aget | KnownFn::Alength => Effect::HeapRead,
+            KnownFn::Aset => Effect::HeapWrite,
 
             // Atom mutation
             KnownFn::AtomReset | KnownFn::AtomSwap => Effect::HeapWrite,
