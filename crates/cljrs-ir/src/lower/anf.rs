@@ -2052,6 +2052,9 @@ fn is_binary_foldable(kf: &KnownFn) -> bool {
             | KnownFn::Gt
             | KnownFn::Lte
             | KnownFn::Gte
+            | KnownFn::UncheckedAdd
+            | KnownFn::UncheckedSub
+            | KnownFn::UncheckedMul
     )
 }
 
@@ -2179,6 +2182,39 @@ fn try_inline_expansion(
             let one = ctx.emit_const(Const::Long(1));
             let dst = ctx.fresh_var();
             ctx.emit(Inst::CallKnown(dst, KnownFn::Sub, vec![x, one]));
+            Ok(Some(dst))
+        }
+        "unchecked-inc" | "unchecked-inc-int" => {
+            let x = lower_form(
+                ctx,
+                args.first()
+                    .ok_or_else(|| malformed("unchecked-inc needs 1 arg"))?,
+            )?;
+            let one = ctx.emit_const(Const::Long(1));
+            let dst = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(dst, KnownFn::UncheckedAdd, vec![x, one]));
+            Ok(Some(dst))
+        }
+        "unchecked-dec" | "unchecked-dec-int" => {
+            let x = lower_form(
+                ctx,
+                args.first()
+                    .ok_or_else(|| malformed("unchecked-dec needs 1 arg"))?,
+            )?;
+            let one = ctx.emit_const(Const::Long(1));
+            let dst = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(dst, KnownFn::UncheckedSub, vec![x, one]));
+            Ok(Some(dst))
+        }
+        "unchecked-negate" | "unchecked-negate-int" => {
+            let x = lower_form(
+                ctx,
+                args.first()
+                    .ok_or_else(|| malformed("unchecked-negate needs 1 arg"))?,
+            )?;
+            let zero = ctx.emit_const(Const::Long(0));
+            let dst = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(dst, KnownFn::UncheckedSub, vec![zero, x]));
             Ok(Some(dst))
         }
         "not" => {

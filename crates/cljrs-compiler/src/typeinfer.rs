@@ -14,9 +14,13 @@
 //! A var is given an unboxed repr only when the *exact* runtime semantics of
 //! the boxed bridge are expressible on the raw representation:
 //!
-//! - `rt_add`/`rt_sub`/`rt_mul` on `(Long, Long)` use `wrapping_*` — identical
-//!   to Cranelift `iadd`/`isub`/`imul`.  Mixed `Long`/`Double` operands
-//!   promote to `f64`, identical to `fcvt_from_sint` + `fadd`/….
+//! - `rt_add`/`rt_sub`/`rt_mul` on `(Long, Long)` are *checked* and throw on
+//!   overflow (Clojure primitive-long semantics); the unboxed codegen path
+//!   emits `iadd`/`isub`/`imul` followed by a signed-overflow branch that
+//!   raises the same exception, so the two agree.  The `unchecked-*` family
+//!   (`rt_unchecked_*` / plain `iadd`) wraps, also consistently across tiers.
+//!   Mixed `Long`/`Double` operands promote to `f64`, identical to
+//!   `fcvt_from_sint` + `fadd`/….
 //! - `rt_lt`/`rt_gt`/`rt_lte`/`rt_gte` compare `(Long, Long)` as `i64` and
 //!   promote mixed operands to `f64` — identical to `icmp`/`fcmp`.
 //! - `rt_eq` on `(Long, Long)` is `i64` equality.  Other operand types keep
@@ -133,7 +137,12 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
                         let a = get(&lat, args[0]);
                         let b = get(&lat, args[1]);
                         let r = match kf {
-                            KnownFn::Add | KnownFn::Sub | KnownFn::Mul => arith_result(a, b),
+                            KnownFn::Add
+                            | KnownFn::Sub
+                            | KnownFn::Mul
+                            | KnownFn::UncheckedAdd
+                            | KnownFn::UncheckedSub
+                            | KnownFn::UncheckedMul => arith_result(a, b),
                             // Long/Long division truncates and nil-guards; only
                             // the all-double case is expressible unboxed.
                             KnownFn::Div => match (a, b) {

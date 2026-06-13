@@ -57,6 +57,10 @@ struct RuntimeFuncs {
     rt_add: FuncId,
     rt_sub: FuncId,
     rt_mul: FuncId,
+    rt_unchecked_add: FuncId,
+    rt_unchecked_sub: FuncId,
+    rt_unchecked_mul: FuncId,
+    rt_overflow_error: FuncId,
     rt_div: FuncId,
     rt_rem: FuncId,
     rt_eq: FuncId,
@@ -1593,22 +1597,44 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
         let (a, b) = (args[0], args[1]);
         match (known_fn, dst_repr) {
+            // Checked unboxed integer arithmetic — throws on overflow.
             (KnownFn::Add | KnownFn::Sub | KnownFn::Mul, Repr::Long) => {
                 let av = self.use_var(a);
                 let bv = self.use_var(b);
-                Ok(match known_fn {
+                let sum = match known_fn {
                     KnownFn::Add => self.builder.ins().iadd(av, bv),
                     KnownFn::Sub => self.builder.ins().isub(av, bv),
                     _ => self.builder.ins().imul(av, bv),
+                };
+                self.emit_long_overflow_check(known_fn, av, bv, sum)?;
+                Ok(sum)
+            }
+            // Unchecked unboxed integer arithmetic — wraps on overflow.
+            (KnownFn::UncheckedAdd | KnownFn::UncheckedSub | KnownFn::UncheckedMul, Repr::Long) => {
+                let av = self.use_var(a);
+                let bv = self.use_var(b);
+                Ok(match known_fn {
+                    KnownFn::UncheckedAdd => self.builder.ins().iadd(av, bv),
+                    KnownFn::UncheckedSub => self.builder.ins().isub(av, bv),
+                    _ => self.builder.ins().imul(av, bv),
                 })
             }
-            (KnownFn::Add | KnownFn::Sub | KnownFn::Mul | KnownFn::Div, Repr::Double) => {
+            (
+                KnownFn::Add
+                | KnownFn::Sub
+                | KnownFn::Mul
+                | KnownFn::Div
+                | KnownFn::UncheckedAdd
+                | KnownFn::UncheckedSub
+                | KnownFn::UncheckedMul,
+                Repr::Double,
+            ) => {
                 let av = self.use_var_f64(a)?;
                 let bv = self.use_var_f64(b)?;
                 Ok(match known_fn {
-                    KnownFn::Add => self.builder.ins().fadd(av, bv),
-                    KnownFn::Sub => self.builder.ins().fsub(av, bv),
-                    KnownFn::Mul => self.builder.ins().fmul(av, bv),
+                    KnownFn::Add | KnownFn::UncheckedAdd => self.builder.ins().fadd(av, bv),
+                    KnownFn::Sub | KnownFn::UncheckedSub => self.builder.ins().fsub(av, bv),
+                    KnownFn::Mul | KnownFn::UncheckedMul => self.builder.ins().fmul(av, bv),
                     _ => self.builder.ins().fdiv(av, bv),
                 })
             }
@@ -1647,6 +1673,65 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 "unboxed known-call combination not supported: {other:?}"
             ))),
         }
+    }
+
+    /// After an unboxed `iadd`/`isub`/`imul`, branch to a throw block if the
+    /// operation signed-overflowed, raising the integer-overflow exception
+    /// (Clojure semantics for primitive long arithmetic).  On no overflow,
+    /// execution continues in a fresh block; `seal_all_blocks` (end of
+    /// `translate`) seals both.
+    ///
+    /// Signed-overflow predicates (no dedicated CLIF flag instruction needed):
+    /// - add: `((a ^ s) & (b ^ s)) < 0`
+    /// - sub: `((a ^ b) & (a ^ s)) < 0`
+    /// - mul: `s / a != b` (when `a != 0`), guarded so `a == 0` never overflows
+    fn emit_long_overflow_check(
+        &mut self,
+        known_fn: &KnownFn,
+        av: cranelift_codegen::ir::Value,
+        bv: cranelift_codegen::ir::Value,
+        sum: cranelift_codegen::ir::Value,
+    ) -> CodegenResult<()> {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let ovf = match known_fn {
+            KnownFn::Add => {
+                let t1 = self.builder.ins().bxor(av, sum);
+                let t2 = self.builder.ins().bxor(bv, sum);
+                let t3 = self.builder.ins().band(t1, t2);
+                self.builder.ins().icmp_imm(IntCC::SignedLessThan, t3, 0)
+            }
+            KnownFn::Sub => {
+                let t1 = self.builder.ins().bxor(av, bv);
+                let t2 = self.builder.ins().bxor(av, sum);
+                let t3 = self.builder.ins().band(t1, t2);
+                self.builder.ins().icmp_imm(IntCC::SignedLessThan, t3, 0)
+            }
+            _ => {
+                // mul: the full 128-bit product is (hi:lo); it fits in i64 iff
+                // the high half equals the sign-extension of the low half, i.e.
+                // `smulhi(a, b) == (lo >> 63)`.  No division, so no zero-trap.
+                let hi = self.builder.ins().smulhi(av, bv);
+                let expected = self.builder.ins().sshr_imm(sum, 63);
+                self.builder.ins().icmp(IntCC::NotEqual, hi, expected)
+            }
+        };
+
+        let throw_block = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(ovf, throw_block, &[], cont_block, &[]);
+
+        // Throw block: raise the integer-overflow exception and return nil.
+        self.builder.switch_to_block(throw_block);
+        let exc = self.call_rt_0(self.rt.rt_overflow_error)?;
+        let throw_ref = self.import_func(self.rt.rt_throw);
+        self.builder.ins().call(throw_ref, &[exc]);
+        let nil = self.call_rt_0(self.rt.rt_const_nil)?;
+        self.builder.ins().return_(&[nil]);
+
+        self.builder.switch_to_block(cont_block);
+        Ok(())
     }
 
     /// Emit a call to a known function.
@@ -1689,6 +1774,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             KnownFn::Add => self.rt.rt_add,
             KnownFn::Sub => self.rt.rt_sub,
             KnownFn::Mul => self.rt.rt_mul,
+            KnownFn::UncheckedAdd => self.rt.rt_unchecked_add,
+            KnownFn::UncheckedSub => self.rt.rt_unchecked_sub,
+            KnownFn::UncheckedMul => self.rt.rt_unchecked_mul,
             KnownFn::Div => self.rt.rt_div,
             KnownFn::Rem => self.rt.rt_rem,
             KnownFn::Eq => self.rt.rt_eq,
@@ -2086,6 +2174,10 @@ fn declare_runtime_funcs<M: Module>(
         rt_add: declare_rt(module, "rt_add", &[ptr, ptr], ptr)?,
         rt_sub: declare_rt(module, "rt_sub", &[ptr, ptr], ptr)?,
         rt_mul: declare_rt(module, "rt_mul", &[ptr, ptr], ptr)?,
+        rt_unchecked_add: declare_rt(module, "rt_unchecked_add", &[ptr, ptr], ptr)?,
+        rt_unchecked_sub: declare_rt(module, "rt_unchecked_sub", &[ptr, ptr], ptr)?,
+        rt_unchecked_mul: declare_rt(module, "rt_unchecked_mul", &[ptr, ptr], ptr)?,
+        rt_overflow_error: declare_rt(module, "rt_overflow_error", &[], ptr)?,
         rt_div: declare_rt(module, "rt_div", &[ptr, ptr], ptr)?,
         rt_rem: declare_rt(module, "rt_rem", &[ptr, ptr], ptr)?,
         rt_eq: declare_rt(module, "rt_eq", &[ptr, ptr], ptr)?,

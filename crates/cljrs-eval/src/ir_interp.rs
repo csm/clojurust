@@ -1089,6 +1089,9 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         KnownFn::Mul => builtin_arith(&args, "*"),
         KnownFn::Div => builtin_arith(&args, "/"),
         KnownFn::Rem => builtin_arith(&args, "rem"),
+        KnownFn::UncheckedAdd => builtin_arith(&args, "unchecked-add"),
+        KnownFn::UncheckedSub => builtin_arith(&args, "unchecked-subtract"),
+        KnownFn::UncheckedMul => builtin_arith(&args, "unchecked-multiply"),
 
         // ── Comparison ──────────────────────────────────────────────────
         KnownFn::Eq => Ok(Value::Bool(args.len() == 2 && args[0] == args[1])),
@@ -1412,9 +1415,23 @@ fn builtin_arith(args: &[Value], op: &str) -> EvalResult {
     let (a, b) = (&args[0], &args[1]);
     match (a, b) {
         (Value::Long(x), Value::Long(y)) => match op {
-            "+" => Ok(Value::Long(x.wrapping_add(*y))),
-            "-" => Ok(Value::Long(x.wrapping_sub(*y))),
-            "*" => Ok(Value::Long(x.wrapping_mul(*y))),
+            // Checked: primitive long arithmetic throws on overflow (matches
+            // the compiled tier).  The wrapping variants are `unchecked-*`.
+            "+" => x
+                .checked_add(*y)
+                .map(Value::Long)
+                .ok_or_else(|| EvalError::Runtime("integer overflow".to_string())),
+            "-" => x
+                .checked_sub(*y)
+                .map(Value::Long)
+                .ok_or_else(|| EvalError::Runtime("integer overflow".to_string())),
+            "*" => x
+                .checked_mul(*y)
+                .map(Value::Long)
+                .ok_or_else(|| EvalError::Runtime("integer overflow".to_string())),
+            "unchecked-add" => Ok(Value::Long(x.wrapping_add(*y))),
+            "unchecked-subtract" => Ok(Value::Long(x.wrapping_sub(*y))),
+            "unchecked-multiply" => Ok(Value::Long(x.wrapping_mul(*y))),
             "/" => {
                 if *y == 0 {
                     Err(EvalError::Runtime("Divide by zero".to_string()))
@@ -1432,9 +1449,9 @@ fn builtin_arith(args: &[Value], op: &str) -> EvalResult {
             _ => builtin_call_native(op, args),
         },
         (Value::Double(x), Value::Double(y)) => match op {
-            "+" => Ok(Value::Double(x + y)),
-            "-" => Ok(Value::Double(x - y)),
-            "*" => Ok(Value::Double(x * y)),
+            "+" | "unchecked-add" => Ok(Value::Double(x + y)),
+            "-" | "unchecked-subtract" => Ok(Value::Double(x - y)),
+            "*" | "unchecked-multiply" => Ok(Value::Double(x * y)),
             "/" => Ok(Value::Double(x / y)),
             "rem" => Ok(Value::Double(x % y)),
             _ => builtin_call_native(op, args),
@@ -1442,9 +1459,9 @@ fn builtin_arith(args: &[Value], op: &str) -> EvalResult {
         (Value::Long(x), Value::Double(y)) => {
             let x = *x as f64;
             match op {
-                "+" => Ok(Value::Double(x + y)),
-                "-" => Ok(Value::Double(x - y)),
-                "*" => Ok(Value::Double(x * y)),
+                "+" | "unchecked-add" => Ok(Value::Double(x + y)),
+                "-" | "unchecked-subtract" => Ok(Value::Double(x - y)),
+                "*" | "unchecked-multiply" => Ok(Value::Double(x * y)),
                 "/" => Ok(Value::Double(x / y)),
                 "rem" => Ok(Value::Double(x % y)),
                 _ => builtin_call_native(op, args),
@@ -1453,9 +1470,9 @@ fn builtin_arith(args: &[Value], op: &str) -> EvalResult {
         (Value::Double(x), Value::Long(y)) => {
             let y = *y as f64;
             match op {
-                "+" => Ok(Value::Double(*x + y)),
-                "-" => Ok(Value::Double(*x - y)),
-                "*" => Ok(Value::Double(*x * y)),
+                "+" | "unchecked-add" => Ok(Value::Double(*x + y)),
+                "-" | "unchecked-subtract" => Ok(Value::Double(*x - y)),
+                "*" | "unchecked-multiply" => Ok(Value::Double(*x * y)),
                 "/" => Ok(Value::Double(*x / y)),
                 "rem" => Ok(Value::Double(*x % y)),
                 _ => builtin_call_native(op, args),
@@ -1652,4 +1669,44 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     );
 
     IR_LOWERING_ACTIVE.set(false);
+}
+
+#[cfg(test)]
+mod arith_tests {
+    use super::builtin_arith;
+    use cljrs_value::Value;
+
+    #[test]
+    fn checked_add_overflow_throws() {
+        let r = builtin_arith(&[Value::Long(i64::MAX), Value::Long(1)], "+");
+        assert!(r.is_err(), "checked + overflow must throw");
+    }
+
+    #[test]
+    fn checked_mul_overflow_throws() {
+        let r = builtin_arith(&[Value::Long(i64::MAX), Value::Long(2)], "*");
+        assert!(r.is_err(), "checked * overflow must throw");
+    }
+
+    #[test]
+    fn checked_add_normal_ok() {
+        let r = builtin_arith(&[Value::Long(3), Value::Long(4)], "+").unwrap();
+        assert_eq!(r, Value::Long(7));
+    }
+
+    #[test]
+    fn unchecked_add_wraps() {
+        let r = builtin_arith(&[Value::Long(i64::MAX), Value::Long(1)], "unchecked-add").unwrap();
+        assert_eq!(r, Value::Long(i64::MIN));
+    }
+
+    #[test]
+    fn unchecked_multiply_wraps() {
+        let r = builtin_arith(
+            &[Value::Long(i64::MAX), Value::Long(2)],
+            "unchecked-multiply",
+        )
+        .unwrap();
+        assert_eq!(r, Value::Long(-2));
+    }
 }

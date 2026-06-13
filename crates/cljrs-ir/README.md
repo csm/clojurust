@@ -132,6 +132,12 @@ versioned namespace (see `split_sym` in `lower/anf.rs`).
 160+ built-in function identifiers with effect classification (`Effect`):
 `Pure`, `Alloc`, `HeapRead`, `HeapWrite`, `IO`, `UnknownCall`.
 
+The checked integer arithmetic `Add`/`Sub`/`Mul` throw on overflow at the IR
+and compiled tiers (Clojure primitive-long semantics); `UncheckedAdd`/
+`UncheckedSub`/`UncheckedMul` are the wrapping counterparts (the `unchecked-*`
+family, plus `unchecked-inc`/`-dec`/`-negate` which lower to them).  `inc`/`dec`
+lower to checked `Add`/`Sub`.
+
 Some `KnownFn` variants exist purely for analysis precision — the
 codegen and IR interpreter dispatch them through the dynamic builtin
 lookup like a regular `Call`, but the analyzer can use them to tighten

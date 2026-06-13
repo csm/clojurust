@@ -141,6 +141,42 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("inc", Arity::Fixed(1), builtin_inc),
         ("dec", Arity::Fixed(1), builtin_dec),
         ("abs", Arity::Fixed(1), builtin_abs),
+        ("unchecked-add", Arity::Fixed(2), builtin_unchecked_add),
+        ("unchecked-add-int", Arity::Fixed(2), builtin_unchecked_add),
+        (
+            "unchecked-subtract",
+            Arity::Fixed(2),
+            builtin_unchecked_subtract,
+        ),
+        (
+            "unchecked-subtract-int",
+            Arity::Fixed(2),
+            builtin_unchecked_subtract,
+        ),
+        (
+            "unchecked-multiply",
+            Arity::Fixed(2),
+            builtin_unchecked_multiply,
+        ),
+        (
+            "unchecked-multiply-int",
+            Arity::Fixed(2),
+            builtin_unchecked_multiply,
+        ),
+        ("unchecked-inc", Arity::Fixed(1), builtin_unchecked_inc),
+        ("unchecked-inc-int", Arity::Fixed(1), builtin_unchecked_inc),
+        ("unchecked-dec", Arity::Fixed(1), builtin_unchecked_dec),
+        ("unchecked-dec-int", Arity::Fixed(1), builtin_unchecked_dec),
+        (
+            "unchecked-negate",
+            Arity::Fixed(1),
+            builtin_unchecked_negate,
+        ),
+        (
+            "unchecked-negate-int",
+            Arity::Fixed(1),
+            builtin_unchecked_negate,
+        ),
         (
             "push-precision!",
             Arity::Variadic { min: 1 },
@@ -1620,6 +1656,74 @@ fn builtin_dec(args: &[Value]) -> ValueResult<Value> {
         ))),
         Value::BigInt(i) => Ok(Value::BigInt(GcPtr::new(i.get().sub(1)))),
         Value::BigDecimal(d) => Ok(Value::BigDecimal(GcPtr::new(d.get().sub(1)))),
+        v => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+/// `unchecked-add` — wrapping long addition (no overflow check, no promotion).
+/// Doubles add normally.  Mirrors Clojure's `unchecked-*` family.
+fn builtin_unchecked_add(args: &[Value]) -> ValueResult<Value> {
+    match (&args[0], &args[1]) {
+        (Value::Long(x), Value::Long(y)) => Ok(Value::Long(x.wrapping_add(*y))),
+        _ => {
+            let x = numeric_as_f64(&args[0])?;
+            let y = numeric_as_f64(&args[1])?;
+            Ok(Value::Double(x + y))
+        }
+    }
+}
+
+fn builtin_unchecked_subtract(args: &[Value]) -> ValueResult<Value> {
+    match (&args[0], &args[1]) {
+        (Value::Long(x), Value::Long(y)) => Ok(Value::Long(x.wrapping_sub(*y))),
+        _ => {
+            let x = numeric_as_f64(&args[0])?;
+            let y = numeric_as_f64(&args[1])?;
+            Ok(Value::Double(x - y))
+        }
+    }
+}
+
+fn builtin_unchecked_multiply(args: &[Value]) -> ValueResult<Value> {
+    match (&args[0], &args[1]) {
+        (Value::Long(x), Value::Long(y)) => Ok(Value::Long(x.wrapping_mul(*y))),
+        _ => {
+            let x = numeric_as_f64(&args[0])?;
+            let y = numeric_as_f64(&args[1])?;
+            Ok(Value::Double(x * y))
+        }
+    }
+}
+
+fn builtin_unchecked_inc(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(n) => Ok(Value::Long(n.wrapping_add(1))),
+        Value::Double(f) => Ok(Value::Double(f + 1.0)),
+        v => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_unchecked_dec(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(n) => Ok(Value::Long(n.wrapping_sub(1))),
+        Value::Double(f) => Ok(Value::Double(f - 1.0)),
+        v => Err(ValueError::WrongType {
+            expected: "number",
+            got: v.type_name().to_string(),
+        }),
+    }
+}
+
+fn builtin_unchecked_negate(args: &[Value]) -> ValueResult<Value> {
+    match &args[0] {
+        Value::Long(n) => Ok(Value::Long(n.wrapping_neg())),
+        Value::Double(f) => Ok(Value::Double(-f)),
         v => Err(ValueError::WrongType {
             expected: "number",
             got: v.type_name().to_string(),

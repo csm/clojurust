@@ -283,6 +283,37 @@ pub unsafe extern "C" fn rt_truthiness(v: *const Value) -> u8 {
 
 // ── Arithmetic ──────────────────────────────────────────────────────────────
 
+/// Build a boxed "integer overflow" exception `Value` (mirrors what the
+/// interpreter's `throw` wraps non-error values into).
+fn make_overflow_exc() -> *const Value {
+    let msg = "integer overflow".to_string();
+    box_val(Value::Error(GcPtr::new(
+        cljrs_value::error::ExceptionInfo::new(
+            cljrs_value::ValueError::Other(msg.clone()),
+            msg,
+            None,
+            None,
+        ),
+    )))
+}
+
+/// Construct (but do not throw) the integer-overflow exception value.  The
+/// unboxed checked-arithmetic codegen path calls this and feeds it to
+/// `rt_throw` on its overflow branch.
+///
+/// # Safety
+/// Trivially safe (no pointer arguments); `extern "C"` for codegen linkage.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_overflow_error() -> *const Value {
+    make_overflow_exc()
+}
+
+/// Raise the integer-overflow exception via the pending-exception slot and
+/// return nil, exactly as `(throw …)` does in compiled code.
+fn throw_overflow() -> *const Value {
+    unsafe { rt_throw(make_overflow_exc()) }
+}
+
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
@@ -291,7 +322,11 @@ pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_add(*y)),
+        // Checked: primitive long `+` throws on overflow (Clojure semantics).
+        (Value::Long(x), Value::Long(y)) => match x.checked_add(*y) {
+            Some(s) => intern_long(s),
+            None => throw_overflow(),
+        },
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x + y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 + y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x + *y as f64)),
@@ -307,7 +342,10 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
-        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_sub(*y)),
+        (Value::Long(x), Value::Long(y)) => match x.checked_sub(*y) {
+            Some(s) => intern_long(s),
+            None => throw_overflow(),
+        },
         (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x - y)),
         (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 - y)),
         (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x - *y as f64)),
@@ -319,6 +357,60 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
+    let a = unsafe { val_ref(a) };
+    let b = unsafe { val_ref(b) };
+    match (a, b) {
+        (Value::Long(x), Value::Long(y)) => match x.checked_mul(*y) {
+            Some(s) => intern_long(s),
+            None => throw_overflow(),
+        },
+        (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x * y)),
+        (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 * y)),
+        (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x * *y as f64)),
+        _ => rt_const_nil(),
+    }
+}
+
+/// Unchecked (wrapping) boxed long arithmetic — the `unchecked-*` family.
+/// Never throws or promotes; wraps on overflow.
+///
+/// # Safety
+/// Both pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unchecked_add(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
+    let a = unsafe { val_ref(a) };
+    let b = unsafe { val_ref(b) };
+    match (a, b) {
+        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_add(*y)),
+        (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x + y)),
+        (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 + y)),
+        (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x + *y as f64)),
+        _ => rt_const_nil(),
+    }
+}
+
+/// # Safety
+/// Both pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unchecked_sub(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
+    let a = unsafe { val_ref(a) };
+    let b = unsafe { val_ref(b) };
+    match (a, b) {
+        (Value::Long(x), Value::Long(y)) => intern_long(x.wrapping_sub(*y)),
+        (Value::Double(x), Value::Double(y)) => box_val(Value::Double(x - y)),
+        (Value::Long(x), Value::Double(y)) => box_val(Value::Double(*x as f64 - y)),
+        (Value::Double(x), Value::Long(y)) => box_val(Value::Double(x - *y as f64)),
+        _ => rt_const_nil(),
+    }
+}
+
+/// # Safety
+/// Both pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unchecked_mul(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
@@ -3649,6 +3741,10 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_add as *const () as usize);
     std::hint::black_box(rt_sub as *const () as usize);
     std::hint::black_box(rt_mul as *const () as usize);
+    std::hint::black_box(rt_unchecked_add as *const () as usize);
+    std::hint::black_box(rt_unchecked_sub as *const () as usize);
+    std::hint::black_box(rt_unchecked_mul as *const () as usize);
+    std::hint::black_box(rt_overflow_error as *const () as usize);
     std::hint::black_box(rt_div as *const () as usize);
     std::hint::black_box(rt_rem as *const () as usize);
     std::hint::black_box(rt_eq as *const () as usize);

@@ -51,7 +51,7 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 
 - **Constants:** `rt_const_nil`, `rt_const_true`, `rt_const_false`, `rt_const_long(i64)`, `rt_const_double(f64)`, `rt_const_char(u32)`, `rt_const_string(ptr, len)`, `rt_const_keyword(ptr, len)`, `rt_const_symbol(ptr, len)`.  nil, true/false, and longs in `0..1024` are interned once per process via `cljrs_gc::static_alloc` (program-lifetime, **not** GC-heap allocations — nothing traces the intern caches, so GC-managed entries would be swept after two collections and every compiled use would read freed memory; see `tests/interned_scalars.rs`)
 - **Truthiness:** `rt_truthiness(v) -> u8`
-- **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul`, `rt_div`, `rt_rem`
+- **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul` (checked — throw on long overflow), `rt_div`, `rt_rem`, `rt_unchecked_add`, `rt_unchecked_sub`, `rt_unchecked_mul` (wrapping), `rt_overflow_error` (builds the integer-overflow exception for the unboxed checked-arithmetic codegen path)
 - **Comparison:** `rt_eq`, `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
@@ -175,9 +175,10 @@ Forward fixpoint dataflow over the CFG (including `RecurJump` back-edges into
 loop-header phis).  Parameters are seeded from `specs`; constants and the
 arithmetic/comparison `KnownFn`s propagate; phis meet (mixed reprs fall back to
 `Boxed`).  A var gets an unboxed repr only where codegen can emit semantics
-bit-identical to the boxed rt_abi bridge (`wrapping` long arithmetic, f64
-promotion for mixed operands, ordered float compares); `Div`/`Rem` and
-cross-type `Eq` always stay boxed.
+matching the boxed rt_abi bridge: checked long `+`/`-`/`*` (overflow throws,
+via an inline signed-overflow branch matching `rt_add`/etc.), wrapping
+`unchecked-*`, f64 promotion for mixed operands, ordered float compares;
+`Div`/`Rem` and cross-type `Eq` always stay boxed.
 
 ### AOT driver (`aot.rs`)
 

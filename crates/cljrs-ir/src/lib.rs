@@ -131,6 +131,12 @@ pub enum KnownFn {
     Div,
     Rem,
 
+    // Unchecked integer arithmetic — wraps on overflow (never promotes/throws).
+    // The checked `Add`/`Sub`/`Mul` throw on unboxed-Long overflow; these do not.
+    UncheckedAdd,
+    UncheckedSub,
+    UncheckedMul,
+
     // Comparison (pure)
     Eq,
     Lt,
@@ -864,6 +870,9 @@ impl KnownFn {
             | KnownFn::Mul
             | KnownFn::Div
             | KnownFn::Rem
+            | KnownFn::UncheckedAdd
+            | KnownFn::UncheckedSub
+            | KnownFn::UncheckedMul
             | KnownFn::Eq
             | KnownFn::Lt
             | KnownFn::Gt
