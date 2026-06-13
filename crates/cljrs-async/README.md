@@ -292,9 +292,13 @@ rt.block_on(local.run_until(async {
 }));
 ```
 
-**WASM (browser REPL):** `init` may be called before a `LocalSet` context exists
-(e.g. in `Repl::new()`); `spawn_gc_service` silently no-ops via `catch_unwind` in that
-case. Re-call `init` from inside a `LocalSet::run_until` block to start the GC service.
+**Calling `init` outside a `LocalSet`:** `init` is also called with no Tokio runtime
+at all — by the AOT compiler (which registers `clojure.core.async` only so that
+`require`/`go`/`await` resolve during macro-expansion) and by unit tests, as well as
+before a `LocalSet` context exists on WASM (e.g. in `Repl::new()`). `spawn_gc_service`
+probes `tokio::runtime::Handle::try_current()` and silently no-ops when there is no
+runtime, so these callers see no spurious panic. Re-call `init` from inside a
+`LocalSet::run_until` block to start the GC service.
 `timeout` uses `gloo_timers::future::sleep` on `wasm32` instead of `tokio::time::sleep`.
 
 **Timer portability:** On `wasm32` the `time` feature of tokio is present but
