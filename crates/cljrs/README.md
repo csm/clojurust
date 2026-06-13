@@ -47,6 +47,11 @@ compiled binary calls `-main` after `__cljrs_main` finishes, passing all
 
 If `-main` is not defined the program exits normally without error.
 
+An `^:async` `-main` is supported: calling it returns a `Future` immediately,
+so `cljrs run` awaits that future on the shared async `LocalSet` (see
+implementation notes) before exiting, ensuring the body and anything it spawns
+run to completion. A synchronous `-main` is awaited as a no-op pass-through.
+
 ### Per-subcommand flags
 
 `run`, `repl`, `compile`, `test` accept:
