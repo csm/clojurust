@@ -210,6 +210,11 @@ total throughput scales ~linearly with isolate count (no shared alloc lock, no g
 **Done when:** a value sent over a cross-isolate channel arrives as an independent copy in the
 receiver's heap, verified independently collectable on both sides.
 
+The **programming model around this boundary** — keeping the crossing visible in source (distinct
+cross-isolate target, no polymorphic `future`), metered in telemetry, and locating its own
+can't-cross failures — plus the deferred zero-copy `shared-vec` fast path, is specified in
+`isolate-boundary-plan.md`.
+
 ### B3 — Shared immortal arena for code, keywords, blobs
 
 - Interned **keywords/symbols** live in the static arena behind a global `Mutex` intern table, so
