@@ -546,6 +546,19 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         #[cfg(feature = "no-gc")]
         let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
 
+        // Under GC: scope this iteration's heap allocations in a fresh alloc
+        // frame.  Every value the body allocates is rooted (via ALLOC_ROOTS)
+        // only until this frame drops at the end of the iteration; the
+        // intermediates — and the previous iteration's now-dead recur values —
+        // then become collectable, instead of being pinned for the lifetime of
+        // the enclosing top-level form.  `result` (the return value or recur
+        // values) is moved out before the frame drops and is re-rooted at the
+        // top of the next iteration (`root_values`) or by the caller during
+        // return unwinding; no GC safepoint runs in the interval, exactly as
+        // the IR/JIT dispatch seam relies on (see cljrs-eval `apply.rs`).
+        #[cfg(not(feature = "no-gc"))]
+        let _iter_frame = cljrs_gc::push_alloc_frame();
+
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
             if let Err(e) = bind_pattern(pat, val.clone(), env) {
@@ -562,7 +575,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         let result = eval_body_with_scratch_loop(body, &mut scratch, env);
 
         env.pop_frame();
-        // scratch drops here, resetting the region (freeing intermediates).
+        // scratch / _iter_frame drop at the end of the iteration (after the
+        // match below), freeing this iteration's intermediates.
 
         match result {
             Ok(v) => return Ok(v),

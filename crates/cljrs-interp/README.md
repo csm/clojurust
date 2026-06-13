@@ -10,9 +10,18 @@ Self-contained tree-walking interpreter for Clojure.
 
 Evaluates Clojure `Form` ASTs produced by `cljrs-reader`, managing lexical
 environments, special forms, function application, and the recur trampoline.
-Under the `no-gc` Cargo feature, applies the allocation-context stack protocol
-(scratch regions for function/loop scopes; `StaticArena` for static-sink
-expressions).
+
+Allocations are scoped per function call and per loop iteration: under GC, each
+trampoline iteration (`call_cljrs_fn`, `eval_loop`) runs inside its own
+`cljrs_gc::push_alloc_frame()`, so that iteration's intermediates — and a
+`recur`'s now-dead values — become collectable when the frame drops, instead of
+being pinned in `ALLOC_ROOTS` for the lifetime of the enclosing top-level form.
+The return value / recur args are moved out before the frame drops and re-rooted
+at the next iteration (or by the caller on return); no GC safepoint runs in the
+interval (GC fires only at explicit safepoints, with a one-cycle grace period —
+see `cljrs-gc`). Under the `no-gc` Cargo feature the same scoping is achieved
+with the allocation-context stack protocol (scratch regions for function/loop
+scopes; `StaticArena` for static-sink expressions).
 
 ---
 
@@ -69,9 +78,11 @@ Evaluate a sequence of forms, returning the value of the last one.
 
 ### `eval_loop(args, env) -> EvalResult`
 
-Evaluate a `loop*` form.  Under `no-gc`, pushes a `ScratchGuard` on each
-iteration and pops it before the tail expression (recur args or return value)
-so intermediate allocations are freed per iteration.
+Evaluate a `loop*` form.  Each iteration is scoped in its own allocation frame
+so intermediate allocations are freed per iteration: under GC a
+`cljrs_gc::push_alloc_frame()` that drops at the end of the iteration; under
+`no-gc` a `ScratchGuard` popped before the tail expression (recur args or return
+value).
 
 ### `eval_defn(args, env) -> EvalResult`
 
