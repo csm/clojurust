@@ -500,6 +500,18 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 
         env.push_frame();
 
+        // Under GC: scope this call's heap allocations in a fresh alloc frame.
+        // Everything the body (and parameter binding) allocates is rooted only
+        // until the frame drops at the end of this trampoline iteration, so a
+        // deep call's locals and a `recur`'s dead intermediates become
+        // collectable instead of being pinned for the lifetime of the enclosing
+        // top-level form.  `result` is moved out before the frame drops and is
+        // re-rooted at the top of the next iteration (`root_values`) or by the
+        // caller during return unwinding — no GC safepoint runs in the
+        // interval, exactly as the IR/JIT dispatch seam relies on (below).
+        #[cfg(not(feature = "no-gc"))]
+        let _call_frame = cljrs_gc::push_alloc_frame();
+
         // Bind params.
         bind_fn_params(arity, &current_args, &mut env)?;
 
@@ -522,6 +534,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
             eval_body_with_scratch(&arity.body, &mut scratch, &mut env)
         };
         env.pop_frame();
+        // _call_frame drops at the end of this iteration (after the match
+        // below), freeing this call's intermediates.
 
         match result {
             Ok(v) => return Ok(v),

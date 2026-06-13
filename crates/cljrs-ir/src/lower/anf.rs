@@ -1,7 +1,7 @@
 //! ANF lowering: `Form` AST → `IrFunction`.
 //!
-//! Mirrors `cljrs.compiler.anf`. Receives fully macro-expanded `Form` nodes
-//! and produces a well-formed SSA IR in A-normal form.
+//! Receives fully macro-expanded `Form` nodes and produces a well-formed
+//! SSA IR in A-normal form.
 
 use std::collections::HashSet;
 use std::sync::Arc;

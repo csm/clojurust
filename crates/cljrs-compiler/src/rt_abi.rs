@@ -96,12 +96,27 @@ fn alloc_inner_coll<T: cljrs_gc::Trace + 'static>(val: T) -> GcPtr<T> {
 // nil, true, false, and integers in 0..INTERN_LONG_MAX are allocated once and
 // reused for the lifetime of the process, eliminating the dominant source of
 // GC heap allocation in tight loops.
+//
+// The cache entries are handed to compiled code as raw `*const Value`s and
+// nothing ever traces them, so they must NOT live on the GC heap: a heap box
+// becomes unreachable the moment its allocation frame pops, survives only the
+// lives grace period (one collection), and is then swept — after which every
+// compiled use of the cached pointer reads freed memory.  `static_alloc`
+// (StaticArena under no-gc, `Box::leak` under GC) gives exactly the
+// program-lifetime allocation these caches need; scalars hold no `GcPtr`
+// children, so opting out of tracing is sound.
+
+/// Leak a scalar `Value` as program-lifetime memory for an intern cache.
+#[inline]
+fn intern_static_val(v: Value) -> *const Value {
+    cljrs_gc::static_alloc(v).get() as *const Value
+}
 
 /// Cached nil pointer (allocated once, reused forever).
 #[inline]
 fn intern_nil() -> *const Value {
     static PTR: OnceLock<usize> = OnceLock::new();
-    *PTR.get_or_init(|| box_val(Value::Nil) as usize) as *const Value
+    *PTR.get_or_init(|| intern_static_val(Value::Nil) as usize) as *const Value
 }
 
 /// Cached true/false pointers (allocated once each, reused forever).
@@ -110,9 +125,9 @@ fn intern_bool(b: bool) -> *const Value {
     static TRUE_PTR: OnceLock<usize> = OnceLock::new();
     static FALSE_PTR: OnceLock<usize> = OnceLock::new();
     if b {
-        *TRUE_PTR.get_or_init(|| box_val(Value::Bool(true)) as usize) as *const Value
+        *TRUE_PTR.get_or_init(|| intern_static_val(Value::Bool(true)) as usize) as *const Value
     } else {
-        *FALSE_PTR.get_or_init(|| box_val(Value::Bool(false)) as usize) as *const Value
+        *FALSE_PTR.get_or_init(|| intern_static_val(Value::Bool(false)) as usize) as *const Value
     }
 }
 
@@ -160,7 +175,7 @@ fn intern_long(n: i64) -> *const Value {
     if (0..INTERN_LONG_MAX).contains(&n) {
         let cache = CACHE.get_or_init(|| {
             (0..INTERN_LONG_MAX)
-                .map(|i| box_val(Value::Long(i)) as usize)
+                .map(|i| intern_static_val(Value::Long(i)) as usize)
                 .collect()
         });
         cache[n as usize] as *const Value

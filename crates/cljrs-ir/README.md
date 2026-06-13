@@ -43,33 +43,10 @@ src/
                      `neighbours`), guarded by a caller-side check that the
                      result is never element-extracted (first/nth/get/peek) or
                      passed to an opaque call
-  cljrs/compiler/
-    ir.cljrs       — IR data constructors + mutable builder context (atom-based)
-    known.cljrs    — symbol-name → KnownFn keyword resolution
-    anf.cljrs      — ANF lowering: Form values → IR data maps
-    escape.cljrs   — escape analysis on plain IR data maps
-    optimize.cljrs — region-allocation optimization (escape → region rewriting)
-
-test/cljrs/compiler/
-  ir_test.cljrs       — clojure.test cases for `cljrs.compiler.ir`
-  known_test.cljrs    — clojure.test cases for `cljrs.compiler.known`
-  escape_test.cljrs   — clojure.test cases for `cljrs.compiler.escape`
-  optimize_test.cljrs — clojure.test cases for `cljrs.compiler.optimize`
 tests/
-  clojure_tests.rs    — Rust integration test that boots a standard env,
-                        requires each `*_test` namespace, runs
-                        `clojure.test/run-tests`, and fails if any Clojure
-                        assertion failed or errored.
+  capture_minimization.rs — closure-capture set regression tests
+  escape_regression.rs    — escape-analysis regression tests
 ```
-
----
-
-## Running the Clojure-side tests
-
-`cargo test -p cljrs-ir --test clojure_tests` runs the embedded
-`clojure.test` suites against the compiler namespaces.  Add a new
-`*_test.cljrs` file under `test/cljrs/compiler/` and append its namespace
-to the `TEST_NSES` list in `tests/clojure_tests.rs` to extend coverage.
 
 ---
 

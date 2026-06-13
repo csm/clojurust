@@ -1,7 +1,7 @@
 //! Region escape analysis.
 //!
 //! Classifies allocations as `:no-escape`, `:arg-escape`, `:returns`, or
-//! `:escapes`.  Mirrors `cljrs.compiler.escape`.
+//! `:escapes`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};

@@ -1057,23 +1057,6 @@ impl fmt::Display for Terminator {
     }
 }
 
-// ── Embedded Clojure compiler sources ───────────────────────────────────────
-
-/// Clojure source for the IR builder namespace.
-pub const COMPILER_IR_SOURCE: &str = include_str!("cljrs/compiler/ir.cljrs");
-
-/// Clojure source for the known function resolution namespace.
-pub const COMPILER_KNOWN_SOURCE: &str = include_str!("cljrs/compiler/known.cljrs");
-
-/// Clojure source for the ANF lowering namespace.
-pub const COMPILER_ANF_SOURCE: &str = include_str!("cljrs/compiler/anf.cljrs");
-
-/// Clojure source for the escape analysis namespace.
-pub const COMPILER_ESCAPE_SOURCE: &str = include_str!("cljrs/compiler/escape.cljrs");
-
-/// Clojure source for the optimization pass namespace.
-pub const COMPILER_OPTIMIZE_SOURCE: &str = include_str!("cljrs/compiler/optimize.cljrs");
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

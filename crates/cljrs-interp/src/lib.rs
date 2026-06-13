@@ -108,10 +108,8 @@ pub fn standard_env(
         globals.mark_loaded("clojure.test");
     }
 
-    // Compiler namespaces are NOT loaded here — the Clojure compiler's deep
-    // recursion can overflow the default 8MB test thread stack.  Instead,
-    // callers that need IR lowering should call `ensure_compiler_loaded()`
-    // on a thread with sufficient stack (see cljrs-stdlib / cljrs binary).
+    // IR lowering is NOT enabled here — callers that need it should call
+    // `cljrs_eval::mark_compiler_ready()` (see cljrs-stdlib / cljrs binary).
 
     // Restore *ns* to "user" — loading above may change it.
     {

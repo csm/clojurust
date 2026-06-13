@@ -17,19 +17,12 @@ use cljrs_env::env::Env;
 pub enum LowerError {
     /// The Rust lowering function failed.
     LowerFailed(String),
-    /// IR conversion failed (kept for compatibility; no longer used internally).
-    ConvertFailed(String),
-    /// The compiler namespaces are not loaded yet (no longer used with Rust lowering,
-    /// kept for callers that may still pattern-match on this variant).
-    NotReady,
 }
 
 impl std::fmt::Display for LowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LowerError::NotReady => write!(f, "compiler not ready"),
             LowerError::LowerFailed(msg) => write!(f, "lowering failed: {msg}"),
-            LowerError::ConvertFailed(msg) => write!(f, "IR conversion failed: {msg}"),
         }
     }
 }

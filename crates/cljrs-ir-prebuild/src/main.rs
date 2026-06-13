@@ -107,7 +107,7 @@ fn run_prebuild(
     src_paths: &[PathBuf],
     verbose: bool,
 ) -> Result<PrebuildStats, String> {
-    // 1. Boot the environment with compiler sources.
+    // 1. Boot the environment.
     let globals = if src_paths.is_empty() {
         cljrs_eval::standard_env()
     } else {
@@ -116,15 +116,9 @@ fn run_prebuild(
 
     let mut env = Env::new(globals.clone(), "user");
 
-    // 2. Load the Clojure compiler.
-    if verbose {
-        eprintln!("Loading compiler...");
-    }
-    if !cljrs_eval::ensure_compiler_loaded(&globals, &mut env) {
-        return Err("Failed to load compiler namespaces".to_string());
-    }
-    if verbose {
-        eprintln!("Compiler loaded.");
+    // 2. Enable IR lowering.
+    if !cljrs_eval::mark_compiler_ready(&globals) {
+        return Err("IR lowering is disabled (CLJRS_NO_IR is set)".to_string());
     }
 
     // 3. Load any non-core namespaces that were requested.

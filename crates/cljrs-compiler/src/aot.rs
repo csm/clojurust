@@ -75,10 +75,8 @@ pub type AotResult<T> = Result<T, AotError>;
 
 // ── Rust-native lowering ────────────────────────────────────────────────────
 
-/// Lower forms directly via the native Rust compiler pipeline.
-///
-/// Replaces the old `lower_via_clojure` path: no interpreter round-trip,
-/// no `callback::invoke`, no `ir_convert`.
+/// Lower forms directly via the native Rust compiler pipeline
+/// (no interpreter round-trip).
 pub fn lower_via_rust(
     name: Option<&str>,
     ns: &str,
@@ -777,10 +775,6 @@ fn discover_bundled_sources(
         if globals.builtin_source(ns).is_some() {
             continue;
         }
-        // Skip compiler-internal namespaces.
-        if ns.starts_with("cljrs.compiler.") {
-            continue;
-        }
         // Resolve the source file from src_dirs.
         let rel_path = ns.replace('.', "/").replace('-', "_");
         if let Some(src) = find_user_source(&rel_path, src_dirs) {
@@ -1358,7 +1352,6 @@ fn run() {
     // The test harness interprets Clojure at runtime; there is no benefit to
     // eagerly compiling test functions to IR, and doing so fills IR_CACHE with
     // entries that are never evicted (non-GC memory, leaks across all 233 namespaces).
-    // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
     let globals = cljrs_stdlib::standard_env_no_ir();
 
     // Override GC soft limit to a small value so the collector fires during

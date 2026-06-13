@@ -16,9 +16,8 @@ time via the `on_fn_defined` hook (`CLJRS_EAGER_LOWER=1`), or from a pre-built
 cache — calls are dispatched to the tier-1 IR interpreter. Otherwise they fall
 back to the tree-walking interpreter in `cljrs-interp`.
 
-The crate also manages the Clojure compiler namespaces (`cljrs.compiler.anf`,
-`cljrs.compiler.ir`, `cljrs.compiler.known`) that perform ANF lowering of
-Clojure source to the IR representation defined in `cljrs-ir`.
+Lowering itself is pure Rust (`cljrs_ir::lower`); the `lower` module here
+orchestrates macro expansion (interpreter) and the Env-free lowering half.
 
 ---
 
@@ -27,7 +26,7 @@ Clojure source to the IR representation defined in `cljrs-ir`.
 ```
 src/
   lib.rs          — module declarations, re-exports, standard_env_minimal/standard_env/standard_env_with_paths,
-                    register_compiler_sources, ensure_compiler_loaded
+                    mark_compiler_ready
   apply.rs        — IR-aware function dispatch: tries IR cache, falls back to cljrs_interp::apply
   ir_interp.rs    — tier-1 IR interpreter: executes IrFunction over a VarId→Value register file;
                     counts loop back-edges and transfers into compiled OSR entries (Phase 10.4);
@@ -42,8 +41,7 @@ src/
                     macro-expanded LowerRequests from the dispatch seam, runs the Env-free half of
                     lowering (ANF + optimize), publishes to ir_cache, and registers defns; sole
                     consumer of relower marks (publish-validate-retry against concurrent rebinds)
-  ir_convert.rs   — converts Clojure Value data structures (maps/vectors/keywords) → Rust IR types
-  lower.rs        — bridges the Clojure compiler front-end (cljrs.compiler.anf/lower-fn-body) to produce IrFunction;
+  lower.rs        — orchestrates the pure-Rust cljrs_ir::lower pipeline to produce IrFunction;
                     threads cross-defn externals into cljrs_ir::lower::optimize_with_externals (Phase 10.5)
   defn_registry.rs— (Phase 10.5) cross-defn IR registry: registers each eagerly-lowered top-level defn
                     (keyed by GlobalEnv identity + ns + name), supplies ExternalDefns to later lowerings
@@ -79,12 +77,9 @@ pub fn standard_env() -> Arc<GlobalEnv>;
 /// Like standard_env() but also sets user source paths.
 pub fn standard_env_with_paths(source_paths: Vec<PathBuf>) -> Arc<GlobalEnv>;
 
-/// Register the Clojure compiler namespace sources into the GlobalEnv.
-pub fn register_compiler_sources(globals: &Arc<GlobalEnv>);
-
-/// Load the Clojure compiler namespaces and mark the compiler as ready
-/// for IR lowering. Thread-safe; idempotent.
-pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool;
+/// Mark the IR compiler ready (lowering is pure Rust — nothing to load),
+/// snapshotting the bootstrap arity watermark. Honors CLJRS_NO_IR. Idempotent.
+pub fn mark_compiler_ready(globals: &Arc<GlobalEnv>) -> bool;
 
 /// Load pre-built IR from a serialized bundle into the IR cache.
 /// Walks all namespaces, matches bundle keys to runtime arity IDs.
@@ -195,9 +190,8 @@ Tier 1 IR ──(jit_threshold, 1000 calls; counter restarts at IR publish)─�
   ships a `LowerRequest` (plain `Form` data) to the `cljrs-ir-lower` worker.
   The worker is not a GC mutator: it only runs the Env-free half of lowering.
 - Skipped: macros, async fns, capturing closures, bootstrap-era definitions
-  (arity id below the watermark snapshotted by `ensure_compiler_loaded`), and
-  fns defined in builtin-source namespaces (clojure.test, clojure.string, the
-  compiler namespaces, …).  Background lowering targets **user code only**:
+  (arity id below the watermark snapshotted by `mark_compiler_ready`), and
+  fns defined in builtin-source namespaces (clojure.test, clojure.string, …).  Background lowering targets **user code only**:
   shipped namespaces only ever reached the IR tiers under opt-in eager
   lowering, and some of their patterns are known to miscompile (see TODO.md
   Phase 10.7 notes).
@@ -235,7 +229,7 @@ pub fn on_ir_published(arity_id);                 // worker: restart counter at 
 pub fn evict_entry_if_cold(arity_id) -> bool;     // TTL sweep: drop entry unless native/queued
 pub fn stale_osr_code(arity_id);                  // TTL sweep: stale published OSR entries
 pub fn compile_queued(arity_id) -> bool;          // TTL sweep: in-flight JIT needs the IR
-pub fn set_bootstrap_arity_watermark(w: u64);     // ensure_compiler_loaded snapshots the boundary
+pub fn set_bootstrap_arity_watermark(w: u64);     // mark_compiler_ready snapshots the boundary
 pub fn is_bootstrap_arity(arity_id) -> bool;      // bootstrap fns excluded from background lowering
 pub fn record_call(arity_id, ir_func, profile_args);  // bump counter + arg-type profile; enqueue when hot
 pub fn arg_type_profile(arity_id) -> Option<Vec<u8>>; // per-param type bitmasks (PROFILE_LONG/_DOUBLE/_OTHER)
