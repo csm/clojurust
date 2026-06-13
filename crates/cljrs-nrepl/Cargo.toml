@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-nrepl"
-version = "0.1.0"
+version = "0.1.141"
 edition = "2024"
 description = "nREPL server for clojurust — bencode wire protocol for editor integration"
 license.workspace = true
