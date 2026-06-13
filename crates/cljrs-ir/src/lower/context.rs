@@ -55,6 +55,15 @@ pub struct LowerCtx {
     /// Whether this function body was declared `^:async`.
     /// Set by `lower_fn_arity` and propagated to `IrFunction::is_async`.
     pub(crate) is_async: bool,
+
+    /// Static parameter representation seeds (from `^long`/`^double` hints),
+    /// positional with the function's params.  Propagated to
+    /// `IrFunction::seed_reprs`.
+    pub(crate) seed_reprs: Vec<crate::Repr>,
+
+    /// Static representation seeds for `let`/`loop`-bound locals, keyed by the
+    /// local's `VarId`.  Propagated to `IrFunction::local_seed_reprs`.
+    pub(crate) local_seed_reprs: Vec<(VarId, crate::Repr)>,
 }
 
 impl LowerCtx {
@@ -75,6 +84,8 @@ impl LowerCtx {
             subfunctions: Vec::new(),
             last_source_loc: None,
             is_async: false,
+            seed_reprs: Vec::new(),
+            local_seed_reprs: Vec::new(),
         }
     }
 
@@ -242,6 +253,8 @@ impl LowerCtx {
             span: None,
             subfunctions: self.subfunctions,
             is_async: self.is_async,
+            seed_reprs: self.seed_reprs,
+            local_seed_reprs: self.local_seed_reprs,
         }
     }
 }

@@ -54,6 +54,24 @@ impl Display for VarId {
     }
 }
 
+/// Machine representation of an IR variable in compiled code.
+///
+/// Lives here (rather than in `cljrs-compiler`) so the IR layer can carry
+/// static representation seeds (`IrFunction::seed_reprs`, from `^long`/`^double`
+/// type hints) that both the type-inference pass and codegen consume.
+/// `cljrs_compiler::typeinfer` re-exports this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repr {
+    /// `*const Value` — the default, universal representation.
+    Boxed,
+    /// Raw `i64` (a `Value::Long` payload).
+    Long,
+    /// Raw `f64` (a `Value::Double` payload).
+    Double,
+    /// Raw `i8` (0 or 1, a `Value::Bool` payload).
+    Bool,
+}
+
 /// A basic block identifier within an IR function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
@@ -527,6 +545,19 @@ pub struct IrFunction {
     /// Async IR functions fall back to tree-walking (`eval_async`) at runtime;
     /// a future JIT pass will emit proper Cranelift state machines.
     pub is_async: bool,
+    /// Static representation seeds for the parameters, positional with `params`,
+    /// derived from `^long`/`^double`/… type hints (see `cljrs-value`'s
+    /// `TypeHint`).  Empty means "no hints"; a `Repr::Boxed` entry means a param
+    /// with no usable hint.  The type-inference pass (`cljrs_compiler::typeinfer`)
+    /// prefers these over runtime-profiled specs and the JIT can skip its warmup
+    /// when an arity is fully hinted.
+    #[serde(default)]
+    pub seed_reprs: Vec<Repr>,
+    /// Static representation seeds for `let`/`loop`-bound locals, keyed by the
+    /// local's `VarId` (assigned during lowering).  Seeded into type inference
+    /// alongside `seed_reprs`.
+    #[serde(default)]
+    pub local_seed_reprs: Vec<(VarId, Repr)>,
 }
 
 impl IrFunction {
@@ -541,6 +572,8 @@ impl IrFunction {
             span,
             subfunctions: Vec::new(),
             is_async: false,
+            seed_reprs: Vec::new(),
+            local_seed_reprs: Vec::new(),
         }
     }
 

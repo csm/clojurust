@@ -44,6 +44,8 @@ pub(crate) struct LowerArityRequest {
     pub destructure_params: Vec<(usize, Form)>,
     pub destructure_rest: Option<Form>,
     pub expanded_body: Vec<Form>,
+    /// Per-parameter primitive type hints, parallel to `params`.
+    pub param_hints: Vec<Option<cljrs_value::TypeHint>>,
 }
 
 /// A whole function's lowering job.  All arities travel together so the
@@ -145,7 +147,8 @@ fn process_request(req: &LowerRequest) {
                 true,
                 req.is_async,
             ) {
-                Ok((ir, _used)) => {
+                Ok((mut ir, _used)) => {
+                    ir.seed_reprs = crate::lower::seed_reprs_from_hints(&arity.param_hints);
                     let ir = Arc::new(ir);
                     crate::ir_cache::store_cached(id, ir.clone());
                     if crate::defn_registry::relower_marked(id) {
@@ -233,6 +236,7 @@ mod tests {
                 destructure_params: Vec::new(),
                 destructure_rest: None,
                 expanded_body: vec![sym("x")],
+                param_hints: Vec::new(),
             }],
         }
     }

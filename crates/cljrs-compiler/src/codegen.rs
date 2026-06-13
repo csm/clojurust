@@ -268,6 +268,29 @@ impl<M: Module> Compiler<M> {
             .clone();
         self.ctx.func.name = cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32());
 
+        // Merge static `^long`/`^double` parameter hints (`ir_func.seed_reprs`)
+        // with the caller-supplied (profile-derived) `specs`.  A static hint is
+        // authoritative — the user declared the type — so it wins when present;
+        // otherwise the profile spec stands.  The merged array drives BOTH the
+        // prologue guards (`self.specs`) and type inference, keeping them
+        // consistent.
+        let merged_specs: Vec<Repr> = if ir_func.seed_reprs.is_empty() {
+            specs.to_vec()
+        } else {
+            let n = ir_func.params.len();
+            (0..n)
+                .map(|i| {
+                    let hint = ir_func.seed_reprs.get(i).copied().unwrap_or(Repr::Boxed);
+                    if hint != Repr::Boxed {
+                        hint
+                    } else {
+                        specs.get(i).copied().unwrap_or(Repr::Boxed)
+                    }
+                })
+                .collect()
+        };
+        let specs: &[Repr] = &merged_specs;
+
         let reprs = typeinfer::infer(ir_func, specs);
 
         {

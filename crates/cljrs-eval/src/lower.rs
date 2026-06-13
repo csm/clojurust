@@ -6,10 +6,45 @@
 
 use std::sync::Arc;
 
-use cljrs_ir::IrFunction;
+use cljrs_ir::{IrFunction, Repr};
 use cljrs_reader::Form;
+use cljrs_value::TypeHint;
 
 use cljrs_env::env::Env;
+
+/// Map per-parameter primitive type hints onto representation seeds for type
+/// inference, positional with the function's fixed parameters.  `^long`/`^int`
+/// → [`Repr::Long`], `^double`/`^float` → [`Repr::Double`], `^boolean` →
+/// [`Repr::Bool`].  Array hints and unrecognized/absent hints seed [`Repr::Boxed`]
+/// (no scalar unboxing).  Returns an empty vec when no hint is usable, so the
+/// caller leaves `IrFunction::seed_reprs` empty.
+pub fn seed_reprs_from_hints(param_hints: &[Option<TypeHint>]) -> Vec<Repr> {
+    if !param_hints.iter().any(|h| {
+        matches!(
+            h,
+            Some(
+                TypeHint::Long
+                    | TypeHint::Int
+                    | TypeHint::Double
+                    | TypeHint::Float
+                    | TypeHint::Bool
+            )
+        )
+    }) {
+        return Vec::new();
+    }
+    param_hints
+        .iter()
+        .map(|h| match h {
+            Some(TypeHint::Long | TypeHint::Int) => Repr::Long,
+            Some(TypeHint::Double | TypeHint::Float) => Repr::Double,
+            Some(TypeHint::Bool) => Repr::Bool,
+            // Array hints get unboxed array reprs in a later phase; for now they
+            // (and absent/non-primitive hints) stay boxed.
+            _ => Repr::Boxed,
+        })
+        .collect()
+}
 
 // ── Error type ──────────────────────────────────────────────────────────────
 

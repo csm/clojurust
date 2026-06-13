@@ -131,6 +131,26 @@ pub fn lower_fn_body(
     lower_fn_body_destructured(name, ns, params, &[], body, is_async)
 }
 
+/// Like [`lower_fn_body_destructured`] but also records static parameter
+/// representation seeds (from `^long`/`^double` type hints) on the resulting
+/// `IrFunction::seed_reprs`.  `seed_reprs` is positional with `params`.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_fn_body_seeded(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
+    body: &[Form],
+    is_async: bool,
+    seed_reprs: &[crate::Repr],
+) -> Result<IrFunction, LowerError> {
+    let mut ir = lower_fn_body_destructured(name, ns, params, destructures, body, is_async)?;
+    if seed_reprs.iter().any(|r| *r != crate::Repr::Boxed) {
+        ir.seed_reprs = seed_reprs.to_vec();
+    }
+    Ok(ir)
+}
+
 /// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
 /// into explicit bindings at the top of the body.
 ///
@@ -452,10 +472,47 @@ fn lower_destructure_binding(
         }
         FormKind::Vector(pats) => lower_destructure_sequential(ctx, pats, val),
         FormKind::Map(pairs) => lower_destructure_associative(ctx, pairs, val),
+        // `^long x` (etc.): a primitive type hint on a `let`/`loop` binding.
+        // Record a representation seed for the bound local (folded soundly
+        // through `meet` in type inference) and bind the inner pattern.
+        FormKind::Meta(meta, inner) => {
+            if let FormKind::Symbol(_) = &inner.kind
+                && let Some(repr) = meta_tag_repr(meta)
+            {
+                ctx.local_seed_reprs.push((val, repr));
+            }
+            lower_destructure_binding(ctx, inner, val)
+        }
         _ => Err(LowerError::UnsupportedForm(format!(
             "unsupported binding pattern: {:?}",
             pattern.kind
         ))),
+    }
+}
+
+/// Resolve a `^meta` tag form to a scalar [`Repr`] seed, or `None` for tags
+/// with no unboxed scalar representation (arrays, unknown/non-primitive tags).
+/// Handles the `^sym` shorthand and the `^{:tag sym}` map form.
+fn meta_tag_repr(meta: &Form) -> Option<crate::Repr> {
+    let tag = match &meta.kind {
+        FormKind::Symbol(s) => s.as_str(),
+        FormKind::Map(entries) => entries.chunks(2).find_map(|kv| {
+            let is_tag = matches!(&kv[0].kind, FormKind::Keyword(k) if k == "tag");
+            match (is_tag, kv.get(1).map(|f| &f.kind)) {
+                (true, Some(FormKind::Symbol(s))) => Some(s.as_str()),
+                (true, Some(FormKind::Str(s))) => Some(s.as_str()),
+                _ => None,
+            }
+        })?,
+        _ => return None,
+    };
+    // Strip any namespace (`clojure.core/long` → `long`).
+    let tag = tag.rsplit('/').next().unwrap_or(tag);
+    match tag {
+        "long" | "int" => Some(crate::Repr::Long),
+        "double" | "float" => Some(crate::Repr::Double),
+        "boolean" => Some(crate::Repr::Bool),
+        _ => None,
     }
 }
 
@@ -1105,35 +1162,55 @@ fn lower_fn_arity(
     struct ParamInfo {
         name: Arc<str>,
         pattern: Option<Form>,
+        /// Scalar repr seed from a `^long`/`^double` hint, if any.
+        repr: Option<crate::Repr>,
     }
 
     let param_infos: Vec<ParamInfo> = fixed_params
         .iter()
         .map(|p| {
+            // Peel a `^hint` wrapper, recording the scalar repr seed; the inner
+            // form is then handled as a plain symbol or destructuring pattern.
+            let (repr, p) = if let FormKind::Meta(meta, inner) = &p.kind {
+                (meta_tag_repr(meta), inner.as_ref())
+            } else {
+                (None, p)
+            };
             if let FormKind::Symbol(s) = &p.kind {
                 ParamInfo {
                     name: Arc::from(s.as_str()),
                     pattern: None,
+                    repr,
                 }
             } else {
                 ParamInfo {
                     name: Arc::from(format!("__destructure_{}", fresh_global_name_id()).as_str()),
                     pattern: Some(p.clone()),
+                    repr: None,
                 }
             }
         })
         .collect();
 
     let rest_info: Option<ParamInfo> = rest_param.map(|p| {
+        // A rest param binds a seq, so any hint carries no scalar repr; just
+        // peel it so the inner symbol/pattern is handled correctly.
+        let p = if let FormKind::Meta(_, inner) = &p.kind {
+            inner.as_ref()
+        } else {
+            p
+        };
         if let FormKind::Symbol(s) = &p.kind {
             ParamInfo {
                 name: Arc::from(s.as_str()),
                 pattern: None,
+                repr: None,
             }
         } else {
             ParamInfo {
                 name: Arc::from(format!("__destructure_rest_{}", fresh_global_name_id()).as_str()),
                 pattern: Some(p.clone()),
+                repr: None,
             }
         }
     });
@@ -1222,6 +1299,20 @@ fn lower_fn_arity(
     let exit_result = sub.fresh_var();
     sub.emit_phi(exit_result, vec![(body_exit, body_result)]);
     sub.finish_block(Terminator::Return(exit_result));
+
+    // Static repr seeds, positional with `bound_params` (captures first, then
+    // fixed params, then rest).  Captures and the rest param carry no scalar
+    // hint, so they seed Boxed.
+    if param_infos.iter().any(|pi| pi.repr.is_some()) {
+        let mut seeds: Vec<crate::Repr> = vec![crate::Repr::Boxed; capture_names.len()];
+        for pi in &param_infos {
+            seeds.push(pi.repr.unwrap_or(crate::Repr::Boxed));
+        }
+        if rest_info.is_some() {
+            seeds.push(crate::Repr::Boxed);
+        }
+        sub.seed_reprs = seeds;
+    }
 
     // Propagate any subfunctions from the nested context to the parent.
     // (fn* inside fn* produces sub-subfunctions that belong to the tree.)

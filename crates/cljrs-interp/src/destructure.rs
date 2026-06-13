@@ -24,6 +24,9 @@ pub fn bind_pattern(pattern: &Form, val: Value, env: &mut Env) -> EvalResult<()>
         }
         FormKind::Vector(forms) => bind_sequential(forms, &val, env),
         FormKind::Map(forms) => bind_associative(forms, &val, env),
+        // A `^long x` (etc.) binding carries a primitive type hint that the
+        // tree-walk interpreter ignores; bind the underlying pattern.
+        FormKind::Meta(_, inner) => bind_pattern(inner, val, env),
         _ => Err(EvalError::Runtime(format!(
             "unsupported binding pattern: {:?}",
             pattern.kind

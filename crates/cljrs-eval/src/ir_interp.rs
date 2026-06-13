@@ -997,6 +997,8 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
         span: f.span.clone(),
         subfunctions: f.subfunctions.iter().map(clone_ir_function).collect(),
         is_async: f.is_async,
+        seed_reprs: f.seed_reprs.clone(),
+        local_seed_reprs: f.local_seed_reprs.clone(),
     }
 }
 
@@ -1605,7 +1607,10 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             env,
             f.is_async,
         ) {
-            Ok((ir_func, used_externals)) => {
+            Ok((mut ir_func, used_externals)) => {
+                // Attach static primitive type-hint seeds so the JIT can skip
+                // its profiling warmup and guard/unbox these params directly.
+                ir_func.seed_reprs = crate::lower::seed_reprs_from_hints(&arity.param_hints);
                 let ir_func = Arc::new(ir_func);
                 crate::ir_cache::store_cached(arity_id, ir_func.clone());
                 // The lowering specialized against these defns — invalidate

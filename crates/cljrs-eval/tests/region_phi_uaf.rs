@@ -139,6 +139,8 @@ fn build_phi_over_regions_ir() -> IrFunction {
         span: None,
         subfunctions: vec![],
         is_async: false,
+        seed_reprs: vec![],
+        local_seed_reprs: vec![],
     }
 }
 

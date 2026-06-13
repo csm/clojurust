@@ -23,8 +23,8 @@ src/
              function so its entry jumps straight to a hot loop header, with
              live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
-    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured, analyze,
-                  inline, optimize, EscapeContext …
+    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured,
+                  lower_fn_body_seeded, analyze, inline, optimize, EscapeContext …
     anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
                   capture only the enclosing locals their (fully macro-expanded)
                   body references (`collect_symbol_names`, a conservative
@@ -58,6 +58,11 @@ tests/
 pub struct VarId(pub u32);
 pub struct BlockId(pub u32);
 
+/// Machine representation of an IR var (lives here so IrFunction can carry
+/// static seeds from `^long`/`^double` type hints; re-exported by
+/// cljrs_compiler::typeinfer).
+pub enum Repr { Boxed, Long, Double, Bool }
+
 pub struct IrFunction {
     pub name: Option<Arc<str>>,
     pub params: Vec<(Arc<str>, VarId)>,
@@ -70,6 +75,11 @@ pub struct IrFunction {
     /// Async IR functions fall back to tree-walking `eval_async`; Phase H JIT
     /// will emit Cranelift state machines with explicit resume points.
     pub is_async: bool,
+    /// Static per-parameter repr seeds from `^long`/`^double` hints (positional
+    /// with `params`).  Empty ⇒ no hints.  Preferred over profiled specs.
+    pub seed_reprs: Vec<Repr>,
+    /// Static repr seeds for `let`/`loop`-bound locals, keyed by VarId.
+    pub local_seed_reprs: Vec<(VarId, Repr)>,
 }
 
 impl IrFunction {

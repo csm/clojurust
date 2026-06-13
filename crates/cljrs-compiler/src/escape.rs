@@ -447,6 +447,8 @@ mod tests {
             span: None,
             subfunctions: vec![],
             is_async: false,
+            seed_reprs: vec![],
+            local_seed_reprs: vec![],
         }
     }
 

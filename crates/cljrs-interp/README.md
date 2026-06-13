@@ -34,7 +34,10 @@ src/
   special.rs     — special form evaluators: def, defn, defmacro, fn*, if, let*,
                    loop*, recur, quote, var, set!, throw, try, do, ns, require,
                    letfn, in-ns, alias, defprotocol, extend-type, extend-protocol,
-                   defmulti, defmethod, defrecord, reify, binding, with-out-str
+                   defmulti, defmethod, defrecord, reify, binding, with-out-str.
+                   parse_arity peels primitive type hints (`^long x`, `^doubles a`)
+                   off params into CljxFnArity::param_hints; let*/loop* binding
+                   hints are stripped via bind_pattern's Meta arm (destructure.rs)
   apply.rs       — eval_call: macro expansion, native-fn dispatch, CljxFn
                    application, recur trampoline; special env-needing handlers
                    (apply, atom, reset!, swap!, volatile!, vreset!, vswap!,

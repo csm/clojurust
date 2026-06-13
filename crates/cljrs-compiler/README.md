@@ -157,9 +157,19 @@ pub fn new_compiler_from_module<M: Module>(module: M, ptr_type: types::Type) -> 
 ### Type inference (`typeinfer.rs`, Phase 10.6)
 
 ```rust
-pub enum Repr { Boxed, Long, Double, Bool }
+pub use cljrs_ir::Repr; // { Boxed, Long, Double, Bool } — moved to cljrs-ir, re-exported here
 pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr>;
 ```
+
+`Repr` now lives in `cljrs-ir` so `IrFunction` can carry static representation
+seeds from `^long`/`^double` type hints; `typeinfer` re-exports it unchanged.
+`infer` seeds parameters from `specs` and `let`/`loop` locals from
+`func.local_seed_reprs` (folded through `meet`, so a hint never unsoundly
+forces a boxed-producing binding into an unboxed register).
+`compile_function_with_specs` merges `func.seed_reprs` (static hints, which win)
+with the caller's profiled `specs` before driving both the prologue guards and
+inference, so a `^long`-hinted parameter is guarded/unboxed without waiting for
+the Tier-1 profiling warmup.
 
 Forward fixpoint dataflow over the CFG (including `RecurJump` back-edges into
 loop-header phis).  Parameters are seeded from `specs`; constants and the

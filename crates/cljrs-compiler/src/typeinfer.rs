@@ -37,17 +37,11 @@ use std::collections::HashMap;
 use crate::ir::{Const, Inst, IrFunction, KnownFn, Terminator, VarId};
 
 /// Machine representation of an IR variable in compiled code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Repr {
-    /// `*const Value` — the default, universal representation.
-    Boxed,
-    /// Raw `i64` (a `Value::Long` payload).
-    Long,
-    /// Raw `f64` (a `Value::Double` payload).
-    Double,
-    /// Raw `i8` (0 or 1, a `Value::Bool` payload).
-    Bool,
-}
+///
+/// Defined in `cljrs-ir` (so `IrFunction` can carry static `seed_reprs` from
+/// `^long`/`^double` type hints) and re-exported here for backwards
+/// compatibility — existing `cljrs_compiler::typeinfer::Repr` paths still work.
+pub use crate::ir::Repr;
 
 /// Lattice element during inference: `None` = ⊥ (not yet computed).
 type Lat = Option<Repr>;
@@ -88,6 +82,15 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
     for (i, (_name, var)) in func.params.iter().enumerate() {
         let r = specs.get(i).copied().unwrap_or(Repr::Boxed);
         lat.insert(*var, Some(r));
+    }
+
+    // Seed `let`/`loop`-bound locals from static type hints.  These are folded
+    // through the same monotonic `meet` as everything else, so a hint can only
+    // confirm an unboxed repr the body's dataflow agrees with — it never
+    // unsoundly forces a boxed-producing binding into an unboxed register.
+    for (var, r) in &func.local_seed_reprs {
+        let merged = meet(lat.get(var).copied().flatten(), Some(*r));
+        lat.insert(*var, merged);
     }
 
     let get = |lat: &HashMap<VarId, Lat>, v: VarId| -> Lat { lat.get(&v).copied().flatten() };
@@ -268,6 +271,32 @@ mod tests {
         assert_eq!(reprs.get(&n), None, "unspecialized param must be boxed");
         assert_eq!(reprs.get(&cond), None, "cmp with boxed operand stays boxed");
         assert_eq!(reprs.get(&i), Some(&Repr::Long));
+    }
+
+    /// A `let`-bound local seeded with a scalar hint is inferred unboxed when
+    /// the dataflow agrees, and the hint is folded soundly through `meet`.
+    #[test]
+    fn local_seed_repr_is_honored() {
+        let mut f = IrFunction::new(None, None);
+        let x = f.fresh_var();
+        let one = f.fresh_var();
+        let y = f.fresh_var();
+        let entry = f.fresh_block();
+        f.blocks.push(Block {
+            id: entry,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(x, Const::Long(5)),
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(y, KnownFn::Add, vec![x, one]),
+            ],
+            terminator: Terminator::Return(y),
+        });
+        // Seed `x` as Long (as a `^long` let-binding would).
+        f.local_seed_reprs = vec![(x, Repr::Long)];
+        let reprs = infer(&f, &[]);
+        assert_eq!(reprs.get(&x), Some(&Repr::Long));
+        assert_eq!(reprs.get(&y), Some(&Repr::Long));
     }
 
     /// A phi joining a Long with a Boxed value must come out Boxed.
