@@ -11,6 +11,12 @@
 //! 3. **Stop-the-world collections** — every completed `GcHeap::collect`
 //!    bumps `gc_collections` and accumulates pause time, freed object count,
 //!    and freed bytes.
+//! 4. **Isolate boundary crossings** — every value deep-copied across an
+//!    isolate boundary (the Phase B2 structured-clone seam) bumps
+//!    `boundary_crossings`, accumulates the estimated bytes copied, and the
+//!    time spent serializing. This is the metering the isolate-boundary plan
+//!    requires so a silent fan-out copy shows up as a number, not mystery
+//!    latency.
 //!
 //! Counters are process-global ([`GC_STATS`]) and thread-safe via atomics.
 //! Reset is not supported — the counters live for the lifetime of the process.
@@ -30,6 +36,9 @@ pub struct GcStats {
     gc_pause_total_nanos: AtomicU64,
     gc_objects_freed: AtomicU64,
     gc_bytes_freed: AtomicU64,
+    boundary_crossings: AtomicU64,
+    boundary_bytes_copied: AtomicU64,
+    boundary_copy_total_nanos: AtomicU64,
 }
 
 impl GcStats {
@@ -44,6 +53,9 @@ impl GcStats {
             gc_pause_total_nanos: AtomicU64::new(0),
             gc_objects_freed: AtomicU64::new(0),
             gc_bytes_freed: AtomicU64::new(0),
+            boundary_crossings: AtomicU64::new(0),
+            boundary_bytes_copied: AtomicU64::new(0),
+            boundary_copy_total_nanos: AtomicU64::new(0),
         }
     }
 
@@ -84,6 +96,18 @@ impl GcStats {
             .fetch_add(freed_bytes, Ordering::Relaxed);
     }
 
+    /// Record one value crossing an isolate boundary (the Phase B2
+    /// structured-clone seam). `bytes` is the estimated heap footprint of the
+    /// deep copy; `copy_time` is the time spent serializing it.
+    #[inline]
+    pub fn record_boundary_crossing(&self, bytes: u64, copy_time: Duration) {
+        self.boundary_crossings.fetch_add(1, Ordering::Relaxed);
+        self.boundary_bytes_copied
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.boundary_copy_total_nanos
+            .fetch_add(copy_time.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     /// Take a point-in-time snapshot of all counters.
     pub fn snapshot(&self) -> GcStatsSnapshot {
         GcStatsSnapshot {
@@ -96,6 +120,9 @@ impl GcStats {
             gc_pause_total_nanos: self.gc_pause_total_nanos.load(Ordering::Relaxed),
             gc_objects_freed: self.gc_objects_freed.load(Ordering::Relaxed),
             gc_bytes_freed: self.gc_bytes_freed.load(Ordering::Relaxed),
+            boundary_crossings: self.boundary_crossings.load(Ordering::Relaxed),
+            boundary_bytes_copied: self.boundary_bytes_copied.load(Ordering::Relaxed),
+            boundary_copy_total_nanos: self.boundary_copy_total_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -118,12 +145,20 @@ pub struct GcStatsSnapshot {
     pub gc_pause_total_nanos: u64,
     pub gc_objects_freed: u64,
     pub gc_bytes_freed: u64,
+    pub boundary_crossings: u64,
+    pub boundary_bytes_copied: u64,
+    pub boundary_copy_total_nanos: u64,
 }
 
 impl GcStatsSnapshot {
     /// Total cumulative GC pause time.
     pub fn total_pause(&self) -> Duration {
         Duration::from_nanos(self.gc_pause_total_nanos)
+    }
+
+    /// Total cumulative time spent serializing values across isolate boundaries.
+    pub fn total_boundary_copy(&self) -> Duration {
+        Duration::from_nanos(self.boundary_copy_total_nanos)
     }
 }
 
@@ -144,7 +179,17 @@ impl fmt::Display for GcStatsSnapshot {
         writeln!(f, "  GC collections:        {}", self.gc_collections)?;
         writeln!(f, "  Total GC pause time:   {:.3?}", self.total_pause())?;
         writeln!(f, "  Objects freed by GC:   {}", self.gc_objects_freed)?;
-        write!(f, "  Bytes freed by GC:     {}", self.gc_bytes_freed)
+        writeln!(f, "  Bytes freed by GC:     {}", self.gc_bytes_freed)?;
+        writeln!(
+            f,
+            "  Boundary crossings:    {} ({} bytes copied)",
+            self.boundary_crossings, self.boundary_bytes_copied
+        )?;
+        write!(
+            f,
+            "  Boundary copy time:    {:.3?}",
+            self.total_boundary_copy()
+        )
     }
 }
 
@@ -231,6 +276,17 @@ mod tests {
     }
 
     #[test]
+    fn record_boundary_crossing_updates_counters() {
+        let stats = GcStats::new();
+        stats.record_boundary_crossing(2048, Duration::from_micros(40));
+        stats.record_boundary_crossing(1024, Duration::from_micros(10));
+        let snap = stats.snapshot();
+        assert_eq!(snap.boundary_crossings, 2);
+        assert_eq!(snap.boundary_bytes_copied, 3072);
+        assert_eq!(snap.total_boundary_copy(), Duration::from_micros(50));
+    }
+
+    #[test]
     fn display_renders_all_fields() {
         let snap = GcStatsSnapshot {
             gc_allocations: 5,
@@ -242,6 +298,9 @@ mod tests {
             gc_pause_total_nanos: 1_000_000,
             gc_objects_freed: 2,
             gc_bytes_freed: 96,
+            boundary_crossings: 4,
+            boundary_bytes_copied: 8192,
+            boundary_copy_total_nanos: 2_000_000,
         };
         let s = format!("{snap}");
         assert!(s.contains("GC allocations:"));
@@ -251,5 +310,7 @@ mod tests {
         assert!(s.contains("Total GC pause time:"));
         assert!(s.contains("Objects freed by GC:"));
         assert!(s.contains("Bytes freed by GC:"));
+        assert!(s.contains("Boundary crossings:"));
+        assert!(s.contains("Boundary copy time:"));
     }
 }

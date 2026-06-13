@@ -68,7 +68,13 @@ impl IsolateSender {
     /// non-shareable type (mutable state, closures, native resources).
     /// Returns `Err(CloneError::Disconnected)` if the receiver has been dropped.
     pub fn send(&self, v: &Value) -> Result<(), CloneError> {
+        let start = std::time::Instant::now();
         let sv = serialize(v)?;
+        // Meter the crossing (bytes copied + serialize time) into the shared
+        // GC stats so a silent fan-out copy is observable rather than mystery
+        // latency. The error path above is intentionally *not* metered — a
+        // rejected value never crosses, so it copies nothing.
+        cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
         self.tx.send(sv).map_err(|_| CloneError::Disconnected)
     }
 }
@@ -272,6 +278,26 @@ mod tests {
         let h = Isolate::new("atom-sender").spawn(move || async move {
             let a = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
             assert!(matches!(tx.send(&a), Err(CloneError::NotShareable { .. })));
+        });
+        h.join().unwrap();
+    }
+
+    /// Sending a value across the boundary meters bytes + crossings into the
+    /// shared GC stats. Other tests may also increment the global counters
+    /// concurrently, so we assert monotonic *increase*, not exact totals.
+    #[test]
+    fn send_meters_the_crossing() {
+        let (tx, _rx) = isolate_channel();
+        let h = Isolate::new("meter-sender").spawn(move || async move {
+            let before = cljrs_gc::GC_STATS.snapshot();
+            let v = Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                Value::string("a metered payload"),
+                Value::Long(7),
+            ])));
+            tx.send(&v).unwrap();
+            let after = cljrs_gc::GC_STATS.snapshot();
+            assert!(after.boundary_crossings >= before.boundary_crossings + 1);
+            assert!(after.boundary_bytes_copied > before.boundary_bytes_copied);
         });
         h.join().unwrap();
     }

@@ -20,7 +20,7 @@ standard library on top of them.
 ```
 src/
   lib.rs                         — module declarations and re-exports
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); handles SharedAtom/ByteBlob pass-through (B3)
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; handles SharedAtom/ByteBlob pass-through (B3)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
@@ -401,6 +401,13 @@ pub fn bump_protocol_generation();
 /// A Send + Sync intermediate representation for cross-isolate transfer.
 /// All heap data is owned (no GcPtr); safe to move across thread boundaries.
 pub enum SerializedValue { Nil, Bool(bool), Long(i64), /* … */ }
+
+impl SerializedValue {
+    /// Estimated heap bytes a deep copy of this value materializes on the
+    /// receiver. Telemetry approximation for the metered boundary seam
+    /// (`docs/isolate-boundary-plan.md`); Arc-shared payloads count as zero.
+    pub fn byte_size(&self) -> usize;
+}
 
 /// Reason a value cannot cross an isolate boundary.
 pub enum CloneError {

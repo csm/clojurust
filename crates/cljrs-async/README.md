@@ -50,7 +50,13 @@ Done (Phases A–H, A2, B1):
   values (mutable state, closures, native resources) are rejected at send time with a typed
   `CloneError`. The sender may be cloned (multi-producer); the receiver must stay on its isolate
   thread (single-consumer). `GcPtr`'s `!Send` bound makes pointer-sharing a compile error —
-  the channel is the only sanctioned crossing point.
+  the channel is the only sanctioned crossing point. Each accepted send is
+  **metered** into the process-global `cljrs_gc::GC_STATS` via
+  `record_boundary_crossing` (estimated bytes copied + serialize time), so a
+  silent fan-out deep-copy is observable in `--gc-stats` rather than mystery
+  latency — one of the four visibility guarantees in
+  `docs/isolate-boundary-plan.md`. Rejected (non-shareable) sends copy nothing
+  and are not metered.
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
   contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
   remain non-deadlocking when called from the LocalSet executor thread). Errors with a
@@ -201,8 +207,9 @@ pub mod isolate_channel {
     #[derive(Clone)]
     pub struct IsolateSender;
     impl IsolateSender {
-        /// Serialize `v` and enqueue it. Returns CloneError for non-shareable values
-        /// or if the receiver has been dropped.
+        /// Serialize `v`, meter the crossing (bytes + time into GC_STATS), and
+        /// enqueue it. Returns CloneError for non-shareable values (located at
+        /// the send site) or if the receiver has been dropped.
         pub fn send(&self, v: &Value) -> Result<(), CloneError>;
     }
 
