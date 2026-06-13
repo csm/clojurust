@@ -9,8 +9,7 @@
 //! Key components:
 //! - `ir_interp` — tier-1 IR interpreter (register-file execution of `IrFunction`)
 //! - `ir_cache` — thread-safe cache of lowered IR keyed by arity ID
-//! - `ir_convert` — converts Clojure Value data → Rust `IrFunction`
-//! - `lower` — bridges the Clojure compiler front-end to produce IR
+//! - `lower` — orchestrates the pure-Rust `cljrs_ir::lower` pipeline to produce IR
 //! - `apply` — IR-aware function dispatch with tree-walk fallback
 
 // EvalError::Thrown wraps a full Value; boxing would require pervasive changes.
@@ -21,7 +20,6 @@
 pub mod apply;
 pub mod defn_registry;
 pub mod ir_cache;
-pub mod ir_convert;
 pub mod ir_interp;
 pub mod jit_state;
 pub mod lower;
@@ -42,21 +40,16 @@ pub use jit_state::{
 use crate::ir_interp::eager_lower_fn;
 use std::sync::Arc;
 
-pub fn register_compiler_sources(globals: &Arc<GlobalEnv>) {
-    globals.register_builtin_source("cljrs.compiler.ir", cljrs_ir::COMPILER_IR_SOURCE);
-    globals.register_builtin_source("cljrs.compiler.known", cljrs_ir::COMPILER_KNOWN_SOURCE);
-    globals.register_builtin_source("cljrs.compiler.anf", cljrs_ir::COMPILER_ANF_SOURCE);
-    globals.register_builtin_source("cljrs.compiler.escape", cljrs_ir::COMPILER_ESCAPE_SOURCE);
-    globals.register_builtin_source(
-        "cljrs.compiler.optimize",
-        cljrs_ir::COMPILER_OPTIMIZE_SOURCE,
-    );
-}
-
-/// Load the Clojure compiler namespaces and mark the compiler as ready
-/// for IR lowering.  Called lazily on first lowering attempt.
-pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
-    // Already loaded?
+/// Mark the IR compiler as ready and snapshot the bootstrap arity watermark.
+///
+/// IR lowering is pure Rust (`cljrs_ir::lower`, orchestrated by the `lower`
+/// module) — there is nothing to load.  This flips `compiler_ready`, the gate
+/// for eager and background lowering, and records the bootstrap watermark so
+/// functions defined before this point (the clojure.core bootstrap) stay
+/// excluded from background lowering (Phase 10.7).
+///
+/// Returns `false` (leaving lowering disabled) when `CLJRS_NO_IR` is set.
+pub fn mark_compiler_ready(globals: &Arc<GlobalEnv>) -> bool {
     if globals
         .compiler_ready
         .load(std::sync::atomic::Ordering::Acquire)
@@ -64,57 +57,14 @@ pub fn ensure_compiler_loaded(globals: &Arc<GlobalEnv>, env: &mut Env) -> bool {
         return true;
     }
 
-    // Don't load if CLJRS_NO_IR is set.
     if std::env::var("CLJRS_NO_IR").is_ok() {
         return false;
-    }
-
-    // Prevent concurrent loading attempts.
-    static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if LOADING.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return false; // Another thread is loading.
-    }
-
-    let span = || cljrs_types::span::Span::new(Arc::new("<compiler-load>".to_string()), 0, 0, 1, 1);
-    for ns_name in &[
-        "cljrs.compiler.ir",
-        "cljrs.compiler.known",
-        "cljrs.compiler.anf",
-        "cljrs.compiler.escape",
-        "cljrs.compiler.optimize",
-    ] {
-        let require_form = cljrs_reader::Form::new(
-            cljrs_reader::form::FormKind::List(vec![
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Symbol("require".into()),
-                    span(),
-                ),
-                cljrs_reader::Form::new(
-                    cljrs_reader::form::FormKind::Quote(Box::new(cljrs_reader::Form::new(
-                        cljrs_reader::form::FormKind::Symbol((*ns_name).into()),
-                        span(),
-                    ))),
-                    span(),
-                ),
-            ]),
-            span(),
-        );
-        if let Err(e) = eval(&require_form, env) {
-            eprintln!("[compiler-load warning] failed to load {ns_name}: {e:?}");
-            LOADING.store(false, std::sync::atomic::Ordering::Release);
-            return false;
-        }
     }
 
     globals
         .compiler_ready
         .store(true, std::sync::atomic::Ordering::Release);
-    // Everything defined up to this point (the clojure.core bootstrap, the
-    // compiler namespaces) is bootstrap-era: excluded from background
-    // lowering (Phase 10.7), exactly as the compiler_ready gate excluded it
-    // from eager lowering at definition time.
     jit_state::set_bootstrap_arity_watermark(cljrs_interp::arity::next_arity_id());
-    LOADING.store(false, std::sync::atomic::Ordering::Release);
     true
 }
 
@@ -130,9 +80,7 @@ pub fn standard_env_minimal_no_ir() -> Arc<GlobalEnv> {
 }
 
 pub fn standard_env() -> Arc<GlobalEnv> {
-    let globals = standard_env_minimal();
-    register_compiler_sources(&globals);
-    globals
+    standard_env_minimal()
 }
 
 pub fn standard_env_with_paths(source_paths: Vec<std::path::PathBuf>) -> Arc<GlobalEnv> {

@@ -4,10 +4,9 @@ Program analysis, optimization, and AOT compilation for clojurust. Provides an
 intermediate representation (IR) in A-normal form with SSA, escape analysis,
 Cranelift-based native code generation, and a C-ABI runtime bridge.
 
-ANF lowering and escape analysis are written in Clojure (`cljrs.compiler.anf`,
-`cljrs.compiler.escape`), producing IR as plain data maps. A thin Rust conversion
-layer (`ir_convert.rs`) translates these back to the `IrFunction` structs that the
-Cranelift codegen backend consumes.
+ANF lowering and escape analysis run in pure Rust (`cljrs_ir::lower`, in the
+`cljrs-ir` crate); the Cranelift codegen backend here consumes the resulting
+`IrFunction` structs directly.
 
 **Phase:** 8.1 (optimization) + 10.0 (backend refactor) + 11 (AOT compilation) + no-gc phases 6–7 — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs, sequence/collection ops, type predicates, atom constructor, and inline expansions.  Under the `no-gc` feature the AOT driver also runs the **blacklist analysis** (`escape.rs`) which rejects programs that cannot be safely compiled without a GC.
 
@@ -21,20 +20,13 @@ Cranelift codegen backend consumes.
 
 ```
 src/
-  lib.rs        — module declarations, embedded Clojure sources, register_compiler_sources()
+  lib.rs        — module declarations
   ir.rs         — re-exports all types from cljrs-ir crate
-  ir_convert.rs — Value → IrFunction conversion (Clojure data → Rust IR types)
   rt_abi.rs     — C-ABI runtime bridge: ~40 extern "C" functions called by compiled code
   codegen.rs    — Cranelift code generator: IrFunction → native object code
   typeinfer.rs  — Phase 10.6 scalar representation inference (Repr lattice, fixpoint dataflow)
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
-  cljrs/compiler/
-    ir.cljrs      — IR data constructors + mutable builder context (atom-based)
-    known.cljrs   — Known function symbol → keyword resolution table
-    anf.cljrs     — ANF lowering (Clojure): Form values → IR data maps
-    escape.cljrs  — Escape analysis (Clojure): operates on plain IR data
-    optimize.cljrs — Optimization passes (Clojure): escape analysis → region allocation rewriting
 ```
 
 ---
@@ -52,23 +44,6 @@ pub enum Terminator { Jump, Branch, Return, RecurJump, Unreachable }
 pub enum KnownFn { Vector, HashMap, Assoc, Conj, Get, Count, Add, Sub, Apply, Reduce2, Map, Filter, Mapv, Range1, Take, Drop, Concat, Sort, Keys, Vals, Merge, Update, Atom, ... }
 pub enum Effect { Pure, Alloc, HeapRead, HeapWrite, IO, UnknownCall }
 ```
-
-### IR conversion (`ir_convert.rs`)
-
-```rust
-pub fn value_to_ir_function(val: &Value) -> ConvertResult<IrFunction>;
-pub fn keyword_to_known_fn(kw: &str) -> Option<KnownFn>;
-```
-
-Converts Clojure data maps (produced by the Clojure front-end) back to Rust IR types.
-
-### Compiler source registration (`lib.rs`)
-
-```rust
-pub fn register_compiler_sources(globals: &Arc<GlobalEnv>);
-```
-
-Registers embedded Clojure compiler namespaces as builtin sources so `require` can load them.
 
 ### Runtime bridge (`rt_abi.rs`)
 
@@ -203,7 +178,7 @@ pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], form
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Clojure) → optimize (escape analysis + region alloc) → IR convert → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
 
 **Versioned namespaces are snapshotted at compile time.** Versioned requires
 execute during expansion (fetching the pinned source from git); a discovery
@@ -265,25 +240,6 @@ Detects four classes of no-gc memory-safety violations in IR functions:
 4. **EscapingClosure** — `AllocClosure` stored in a static container.
 
 Multi-file support: when the source file uses `(ns ... (:require [...]))`, the required namespaces are loaded during compilation. Their source files are discovered from `src_dirs`, bundled into the harness as builtin sources, and made available at runtime so the binary is self-contained.
-
----
-
-## Clojure front-end namespaces
-
-### `cljrs.compiler.ir`
-Mutable builder context (atom-based) for constructing IR data maps. Provides constructors for all instruction/terminator types and scope management.
-
-### `cljrs.compiler.known`
-Maps symbol names (e.g. `"+"`, `"assoc"`, `"println"`) to IR keyword tags (e.g. `:+`, `:assoc`, `:println`).
-
-### `cljrs.compiler.anf`
-ANF lowering: converts Clojure form values (from `form_to_value`) into IR data maps. Supports the same special forms as the Rust front-end.
-
-### `cljrs.compiler.escape`
-Escape analysis on IR data maps. Determines allocation escape states and detects collection operation chains.
-
-### `cljrs.compiler.optimize`
-Optimization passes on IR data maps. Currently implements region allocation: rewrites non-escaping allocations (identified by escape analysis) into `region-start`/`region-alloc`/`region-end` instructions. Recursively optimizes subfunctions.
 
 ---
 

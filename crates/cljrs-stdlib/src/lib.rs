@@ -103,14 +103,12 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 }
 
 /// Create a `GlobalEnv` with all built-ins and stdlib registered, **without**
-/// the IR lowering hook or compiler loading.
+/// the IR lowering hook.
 ///
 /// Use this in the AOT test harness and any other execution context where
 /// IR generation is not needed.  It avoids populating the global `IR_CACHE`
 /// with entries for test-namespace functions (entries that would never be
 /// evicted and would accumulate to hundreds of MB over 233 namespaces).
-/// It also skips loading the cljrs.compiler.* namespaces, saving additional
-/// startup time and memory.
 ///
 /// GC config and root tracer are still registered identically to `standard_env`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -154,14 +152,8 @@ pub fn standard_env() -> Arc<GlobalEnv> {
         }
     });
 
-    // Register and load compiler namespaces so IR lowering is available at
-    // runtime.  The main thread already has a large stack (set in main.rs),
-    // so we run this synchronously rather than on a background thread.
-    cljrs_eval::register_compiler_sources(&globals);
-    {
-        let mut env = cljrs_eval::Env::new(globals.clone(), "user");
-        cljrs_eval::ensure_compiler_loaded(&globals, &mut env);
-    }
+    // Enable IR lowering (pure Rust — nothing to load; honors CLJRS_NO_IR).
+    cljrs_eval::mark_compiler_ready(&globals);
 
     globals
 }

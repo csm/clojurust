@@ -1,7 +1,7 @@
 //! Known-function name → KnownFn dispatch table.
 //!
-//! Mirrors `cljrs.compiler.known`. Maps Clojure symbol names (possibly
-//! namespace-qualified) to `KnownFn` variants.
+//! Maps Clojure symbol names (possibly namespace-qualified) to `KnownFn`
+//! variants.
 
 use crate::KnownFn;
 

@@ -2,7 +2,6 @@
 //!
 //! Rewrites non-escaping allocations to region-backed allocations scoped
 //! over the minimal CFG subgraph that covers the allocation and all its uses.
-//! Mirrors `cljrs.compiler.optimize`.
 
 use std::collections::{HashMap, HashSet};
 

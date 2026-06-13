@@ -315,8 +315,7 @@ pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>, profile_args: &[Valu
 //
 // Arity ids are minted from a monotonic counter, so a single snapshot taken
 // when the compiler becomes ready separates bootstrap-era definitions
-// (the clojure.core bootstrap and the cljrs.compiler.* namespaces) from
-// everything defined afterwards (user code).  Background lowering excludes
+// (the clojure.core bootstrap) from everything defined afterwards (user code).  Background lowering excludes
 // bootstrap arities: they were never lowered under eager lowering either
 // (the compiler was not ready when they were defined), and some bootstrap
 // patterns are known to miscompile under the JIT (see TODO.md Phase 10.7
@@ -327,7 +326,7 @@ static BOOTSTRAP_ARITY_WATERMARK: AtomicU64 = AtomicU64::new(0);
 
 /// Record the bootstrap/user boundary: every arity id strictly below `w` was
 /// defined before the compiler became ready.  Called by
-/// `ensure_compiler_loaded` with `cljrs_interp::arity::next_arity_id()`.
+/// `mark_compiler_ready` with `cljrs_interp::arity::next_arity_id()`.
 pub fn set_bootstrap_arity_watermark(w: u64) {
     BOOTSTRAP_ARITY_WATERMARK.store(w, Ordering::Relaxed);
 }
