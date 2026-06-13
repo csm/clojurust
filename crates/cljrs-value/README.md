@@ -2,7 +2,7 @@
 
 Core runtime values and persistent collections for clojurust.
 
-**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) — implemented.
+**Phase:** 3 (collections/Value) + 4 (CljxFn, Namespace) + 5 (LazySeq, CljxCons) + 6 (Protocol, ProtocolFn, MultiFn) + 7 (Volatile, Delay, CljxPromise, CljxFuture, Agent) + 6-ext (TypeInstance for defrecord/reify) + B2 (structured-clone boundary) + B3 (shared static arena: intern tables, SharedValue, SharedAtom, ByteBlob) — implemented.
 
 ---
 
@@ -20,13 +20,18 @@ standard library on top of them.
 ```
 src/
   lib.rs                         — module declarations and re-exports
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); handles SharedAtom/ByteBlob pass-through (B3)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
+  intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
+  jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the JIT stales superseded native code; cljrs-eval invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
+  publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
+  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
   symbol.rs                      — Symbol { namespace, name }
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
-  value.rs                       — Value enum (incl. NativeObject variant), MapValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
+  value.rs                       — Value enum (incl. SharedAtom, ByteBlob variants), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
     array_map.rs                 — PersistentArrayMap (≤8 entries, linear scan)
@@ -74,6 +79,8 @@ pub enum Value {
     // Runtime objects
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
+    SharedAtom(Arc<SharedAtom>),       // cross-isolate mutable ref (Phase B3)
+    ByteBlob(Arc<[u8]>),               // refcounted immutable byte buffer (Phase B3)
     Namespace(GcPtr<Namespace>),
     NativeFn(GcPtr<NativeFn>),
     CljxFn(GcPtr<CljxFn>),
@@ -106,12 +113,63 @@ and sequential collection equality between `List` and `Vector`.
 ### `Symbol` / `Keyword`
 
 ```rust
-pub struct Symbol   { namespace: Option<Arc<str>>, name: Arc<str> }
+pub struct Symbol   { namespace: Option<Arc<str>>, name: Arc<str>, version: Option<Arc<str>> }
 pub struct Keyword  { namespace: Option<Arc<str>>, name: Arc<str> }
 ```
 
 Both support `simple(name)`, `qualified(ns, name)`, `parse(str)`, and
-`full_name() -> String`.
+`full_name() -> String`. `Symbol` additionally carries an optional git-commit
+`version` (the `@<hash>` suffix) with `versioned_name() -> String`. Free
+helpers used by all execution tiers to detect versioned names:
+`symbol::is_commit_hash(s) -> bool` and
+`symbol::split_version(name) -> (&str, Option<&str>)`.
+
+### Phase B3 — Shared static arena
+
+#### Intern tables (`intern` module)
+
+```rust
+pub fn intern_keyword(namespace: Option<&str>, name: &str)
+    -> StaticGcPtr<Keyword>;
+pub fn intern_symbol(namespace: Option<&str>, name: &str, version: Option<&str>)
+    -> StaticGcPtr<Symbol>;
+```
+
+Global `OnceLock<Mutex<HashMap<…>>>` tables.  First call allocates the
+`Keyword`/`Symbol` into program-lifetime memory via `static_alloc`; subsequent
+calls return a clone of the same `StaticGcPtr` (pointer-stable identity across
+all isolates).
+
+#### `SharedValue` and `SharedAtom` (`shared` module)
+
+```rust
+pub enum SharedValue {
+    Nil, Bool(bool), Long(i64), Double(f64), Char(char), Uuid(u128),
+    Str(Arc<str>),
+    Keyword(StaticGcPtr<Keyword>),
+    Symbol(StaticGcPtr<Symbol>),
+    ByteBlob(Arc<[u8]>),              // BEAM off-heap-binary trick
+}
+
+pub struct SharedAtom {
+    pub cell: Arc<ArcSwap<SharedValue>>,
+    pub meta: Mutex<Option<SharedValue>>,
+}
+
+impl SharedAtom {
+    pub fn new(val: SharedValue) -> Self
+    pub fn deref_val(&self) -> Arc<SharedValue>     // atomic load
+    pub fn reset(&self, val: SharedValue) -> Arc<SharedValue>
+    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry
+}
+
+pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
+pub fn demote (sv:    &SharedValue) -> Value;
+```
+
+`promote` converts an isolate-local `Value` to `SharedValue` (fails for
+closures, resources, atoms, …).  `demote` converts back into a fresh
+isolate-local `Value`.
 
 ### `ClojureHash`
 
@@ -187,6 +245,40 @@ pub struct CljxFn {
 `is_async` is set by the interpreter when a `fn`/`defn` carries `^:async` (or an
 `{:async true}` attr-map). `CljxFn::new` defaults it to `false`; `cljrs-env`'s
 `dispatch_if_async` checks it at call time.
+
+### Var-rebind hooks (`jit_hooks`, Phases 10.2/10.5)
+
+```rust
+/// Register a rebind hook. Multiple hooks may be registered; each is called
+/// with (old_value, new_value) in registration order.
+pub fn set_var_rebind_hook(f: impl Fn(&Value, &Value) + Send + Sync + 'static);
+```
+
+`Var::bind` invokes every registered hook (via `notify_var_rebind`) whenever
+it overwrites an existing binding.  Two consumers exist: the JIT stales and
+reclaims native code compiled for the superseded definition (10.2), and
+`cljrs-eval`'s defn registry invalidates lowerings of *other* functions that
+specialized against it (10.5).  When no hook is registered the cost is a
+single atomic flag load.
+
+### Heap-promotion publish barrier (`publish`, Phase 10.5 — GC builds)
+
+```rust
+/// Prepare a value for publication into a program-lifetime cell (or another
+/// thread): returns the value to store — the original when no region-
+/// allocated box is reachable, or a heap deep-copy when one is.  Values
+/// opaque to the scan (closures, unrealized lazy seqs, native objects)
+/// poison the thread's active regions instead
+/// (cljrs_gc::region::poison_active_regions), retiring them at scope close.
+/// One thread-local depth check when no region is open.
+pub fn publish_value(v: Value) -> Value;
+```
+
+The runtime safety net for bump regions coexisting with the tracing GC:
+correctness never depends on escape analysis being perfect.  Invoked by
+`Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
+`CljxPromise::deliver`, and `cljrs-async`'s channel puts.  Under `no-gc` the
+module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
 
 ### `Namespace` (Phase 4)
 
@@ -293,7 +385,47 @@ pub struct MultiFn {
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
     pub default_dispatch: String,  // normally ":default"
 }
+
+/// Phase 10.6 — protocol-dispatch inline-cache invalidation.
+/// `bump_protocol_generation()` must follow every mutation of any
+/// `Protocol::impls` map (extend-type / extend-protocol / inline impls);
+/// `rt_call_ic` (cljrs-compiler) tags each cached dispatch with the
+/// generation observed at fill time and re-resolves on mismatch.
+pub fn protocol_generation() -> u64;
+pub fn bump_protocol_generation();
 ```
+
+### `clone` — isolate copy boundary (Phase B2)
+
+```rust
+/// A Send + Sync intermediate representation for cross-isolate transfer.
+/// All heap data is owned (no GcPtr); safe to move across thread boundaries.
+pub enum SerializedValue { Nil, Bool(bool), Long(i64), /* … */ }
+
+/// Reason a value cannot cross an isolate boundary.
+pub enum CloneError {
+    NotShareable { type_name: &'static str },
+    Disconnected,
+}
+
+/// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
+/// closures, native resources, and other non-shareable types.
+pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError>;
+
+/// Allocate a fresh Value in the *current* GC heap from a SerializedValue.
+/// Infallible — non-shareable types are rejected at serialize time.
+pub fn deserialize(sv: SerializedValue) -> Value;
+```
+
+Shareable types: all scalars, strings, BigInt/BigDecimal/Ratio, Symbol/Keyword,
+all persistent collections, TypeInstance records, Error chains, primitive and
+object arrays, lazy sequences (realized first), WithMeta/Reduced wrappers.
+
+Non-shareable (returns `CloneError`): Atom, Var, Volatile, Promise, Future,
+Agent (mutable state); Fn, BoundFn, NativeFn, Macro, ProtocolFn, MultiFn
+(closures with isolate-local captures); Namespace, Protocol (global singletons);
+Resource, NativeObject (isolate-bound handles); TransientMap/Set/Vector;
+unforced Delay; Matcher.
 
 ### Dependencies
 

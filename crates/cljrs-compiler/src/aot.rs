@@ -75,10 +75,8 @@ pub type AotResult<T> = Result<T, AotError>;
 
 // ── Rust-native lowering ────────────────────────────────────────────────────
 
-/// Lower forms directly via the native Rust compiler pipeline.
-///
-/// Replaces the old `lower_via_clojure` path: no interpreter round-trip,
-/// no `callback::invoke`, no `ir_convert`.
+/// Lower forms directly via the native Rust compiler pipeline
+/// (no interpreter round-trip).
 pub fn lower_via_rust(
     name: Option<&str>,
     ns: &str,
@@ -385,12 +383,16 @@ pub fn lower_file_to_ir(
 /// binary.  `src_dirs` are additional directories for `require` resolution
 /// during macro expansion.  `rust_config`, when present, causes the generated
 /// harness to depend on the user's Rust crate and call its `cljrs_init` hook
-/// before loading any Clojure code.
+/// before loading any Clojure code.  `verify_commit_signatures` enables
+/// `git verify-commit` on every versioned pin resolved during compilation
+/// (the produced binary trusts its embedded sources, so verification happens
+/// here, at compile time).
 pub fn compile_file(
     src_path: &Path,
     out_path: &Path,
     src_dirs: &[PathBuf],
     rust_config: Option<&cljrs_deps::RustConfig>,
+    verify_commit_signatures: bool,
 ) -> AotResult<()> {
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
@@ -408,10 +410,20 @@ pub fn compile_file(
     } else {
         cljrs_stdlib::standard_env_with_paths(src_dirs.to_vec())
     };
+    if verify_commit_signatures {
+        globals
+            .verify_commit_signatures
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Register clojure.core.async so that (require '[clojure.core.async ...])
     // and the `go`/`alt` macros resolve during macro-expansion. The GC
     // service is silently skipped when there is no LocalSet context.
     cljrs_async::init(&globals);
+    // Register I/O, networking, and charset namespaces so that require forms
+    // in source files resolve correctly during macro expansion.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -437,8 +449,22 @@ pub fn compile_file(
     }
     eprintln!("[aot] macro-expanded {} form(s)", expanded.len());
 
-    // Discover user namespaces loaded during expansion (transitive deps).
-    let bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    // ── 2a. Pin versioned references ──────────────────────────────────
+    // Versioned requires already executed (and were fetched) during
+    // expansion.  This pass additionally catches bare versioned symbols
+    // (`mylib/foo@<sha>`) anywhere in the program, force-loading each pin
+    // now so the binary is self-contained: every pinned source is recorded
+    // in `versioned_sources` for embedding, and a bad pin (missing commit,
+    // failed signature) fails the compile instead of the deployed binary.
+    pin_versioned_references(&expanded, &mut env)?;
+
+    // Discover user namespaces loaded during expansion (transitive deps),
+    // plus every pinned source fetched from git (embedded under the
+    // versioned namespace name, e.g. "mylib@abc1234").
+    let mut bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    for (ns, src) in env.globals.versioned_sources_snapshot() {
+        bundled_sources.push((ns, src.to_string()));
+    }
     if !bundled_sources.is_empty() {
         eprintln!(
             "[aot] bundling {} required namespace(s): {}",
@@ -532,14 +558,14 @@ pub fn compile_file(
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
 
     // ── 5. Generate harness project & build ─────────────────────────────
-    let harness_dir = build_harness(
+    let (harness_dir, offline) = build_harness(
         out_path,
         &obj_bytes,
         &interpreted_source,
         &bundled_sources,
         rust_config,
     )?;
-    link_with_cargo(&harness_dir, out_path)?;
+    link_with_cargo(&harness_dir, out_path, offline)?;
 
     eprintln!("[aot] wrote {}", out_path.display());
     Ok(())
@@ -621,7 +647,9 @@ fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
 fn declare_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotResult<()> {
     for sub in &ir_func.subfunctions {
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
-        compiler.declare_function(name, sub.params.len())?;
+        // `abi_param_count` adds the hidden trailing region parameter for
+        // region-parameterised (`__rg`) variants.
+        compiler.declare_function(name, sub.abi_param_count())?;
         declare_subfunctions(sub, compiler)?;
     }
     Ok(())
@@ -632,10 +660,98 @@ fn compile_subfunctions(ir_func: &IrFunction, compiler: &mut Compiler) -> AotRes
     for sub in &ir_func.subfunctions {
         compile_subfunctions(sub, compiler)?;
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
-        let func_id = compiler.declare_function(name, sub.params.len())?;
+        let func_id = compiler.declare_function(name, sub.abi_param_count())?;
         compiler.compile_function(sub, func_id)?;
     }
     Ok(())
+}
+
+// ── Versioned pin discovery ──────────────────────────────────────────────────
+
+/// Walk the macro-expanded program for versioned symbols (`name@<sha>`,
+/// `ns/name@<sha>`) and force-load each pin at compile time.
+///
+/// Loading records the pinned source in `GlobalEnv::versioned_sources` for
+/// embedding.  Pins whose namespace has no locatable Clojure source are
+/// skipped (pure-Rust packages resolve through the native HEAD fallback at
+/// runtime; quoted symbols that merely look versioned stay inert).  Genuine
+/// load failures abort the compile.
+fn pin_versioned_references(
+    forms: &[cljrs_reader::Form],
+    env: &mut cljrs_eval::Env,
+) -> AotResult<()> {
+    let mut pins: Vec<(Option<String>, String)> = Vec::new();
+    for form in forms {
+        collect_versioned_syms(form, &mut pins);
+    }
+    pins.sort();
+    pins.dedup();
+
+    for (ns_part, commit) in pins {
+        let base: Arc<str> = match &ns_part {
+            Some(p) => {
+                let resolved = env
+                    .globals
+                    .resolve_alias(&env.current_ns, p)
+                    .unwrap_or_else(|| Arc::from(p.as_str()));
+                Arc::from(cljrs_env::versioned::base_ns_name(&resolved))
+            }
+            None => Arc::from(cljrs_env::versioned::base_ns_name(&env.current_ns)),
+        };
+        match cljrs_env::versioned::pin_if_available(&env.globals, &base, &commit) {
+            Ok(true) => eprintln!("[aot] pinned {base}@{commit}"),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(AotError::Eval(format!(
+                    "failed to pin {base}@{commit}: {e:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect `(namespace-part, commit)` for every versioned symbol in the form
+/// tree (including quoted/metadata-wrapped positions).
+fn collect_versioned_syms(form: &cljrs_reader::Form, out: &mut Vec<(Option<String>, String)>) {
+    use cljrs_reader::form::FormKind;
+    match &form.kind {
+        FormKind::Symbol(s) => {
+            let sym = cljrs_value::Symbol::parse(s);
+            if let Some(v) = sym.version {
+                out.push((
+                    sym.namespace.as_deref().map(str::to_string),
+                    v.as_ref().to_string(),
+                ));
+            }
+        }
+        FormKind::List(items)
+        | FormKind::Vector(items)
+        | FormKind::Map(items)
+        | FormKind::Set(items)
+        | FormKind::AnonFn(items) => {
+            for item in items {
+                collect_versioned_syms(item, out);
+            }
+        }
+        FormKind::Quote(inner)
+        | FormKind::SyntaxQuote(inner)
+        | FormKind::Unquote(inner)
+        | FormKind::UnquoteSplice(inner)
+        | FormKind::Deref(inner)
+        | FormKind::Var(inner)
+        | FormKind::TaggedLiteral(_, inner) => collect_versioned_syms(inner, out),
+        FormKind::Meta(meta, inner) => {
+            collect_versioned_syms(meta, out);
+            collect_versioned_syms(inner, out);
+        }
+        FormKind::ReaderCond { clauses, .. } => {
+            for clause in clauses {
+                collect_versioned_syms(clause, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── Bundled source discovery ─────────────────────────────────────────────────
@@ -657,10 +773,6 @@ fn discover_bundled_sources(
     for ns in post_loaded.difference(pre_loaded) {
         // Skip namespaces that are already available as builtins at runtime.
         if globals.builtin_source(ns).is_some() {
-            continue;
-        }
-        // Skip compiler-internal namespaces.
-        if ns.starts_with("cljrs.compiler.") {
             continue;
         }
         // Resolve the source file from src_dirs.
@@ -696,7 +808,7 @@ fn build_harness(
     interpreted_source: &str,
     bundled_sources: &[(Arc<str>, String)],
     rust_config: Option<&cljrs_deps::RustConfig>,
-) -> AotResult<PathBuf> {
+) -> AotResult<(PathBuf, bool)> {
     // Place the harness in a temp dir next to the output.
     let harness_dir = out_path
         .parent()
@@ -713,23 +825,26 @@ fn build_harness(
     let obj_path = harness_dir.join("__cljrs_main.o");
     std::fs::write(&obj_path, obj_bytes)?;
 
-    // Find the workspace root (where the top-level Cargo.toml lives).
-    let workspace_root = find_workspace_root()?;
+    // Resolve how to depend on the runtime crates: a local checkout (path
+    // deps) when one is found, otherwise the published versions (so an
+    // installed `cargo install cljrs` binary can still compile).
+    let deps = resolve_harness_deps()?;
 
     // Write Cargo.toml.
     // The empty [workspace] table prevents Cargo from thinking this is
     // part of a parent workspace.
-    let ws = workspace_root.display();
     let mut native_deps = String::new();
     if let Some(rc) = rust_config {
-        native_deps.push_str(&format!(
-            "cljrs-interop  = {{ path = \"{ws}/crates/cljrs-interop\" }}\n"
-        ));
+        native_deps.push_str(&deps.dep_line("cljrs-interop"));
         if let Some(crate_name) = rc.crate_name() {
             let crate_dir = rc.crate_dir.display();
             native_deps.push_str(&format!("{crate_name} = {{ path = \"{crate_dir}\" }}\n"));
         }
     }
+    let runtime_deps: String = HARNESS_RUNTIME_CRATES
+        .iter()
+        .map(|c| deps.dep_line(c))
+        .collect();
     let cargo_toml = format!(
         r#"[package]
 name = "cljrs-aot-harness"
@@ -739,17 +854,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
-cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
-cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
-cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
-cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
-cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
-cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
-cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
-cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
-cljrs-async    = {{ path = "{ws}/crates/cljrs-async" }}
-tokio          = {{ version = "1", features = ["rt", "time"] }}
+{runtime_deps}tokio = {{ version = "1", features = ["rt", "time", "net", "io-util"] }}
 {native_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
@@ -900,8 +1005,17 @@ async fn run() {{
     // runtime bridge functions can look up builtins.
     let globals = cljrs_stdlib::standard_env();
 
+    // Versioned namespaces resolve only from sources embedded at compile
+    // time — an AOT binary never fetches from git at runtime.
+    globals.set_versioned_offline(true);
+
     // Register the async runtime (clojure.core.async, ^:async dispatch, await).
     cljrs_async::init(&globals);
+
+    // Register I/O, networking, and charset namespaces.
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -932,7 +1046,7 @@ fn main() {{
             // single-threaded Tokio LocalSet so GcPtr<!Send> values stay on
             // one OS thread throughout execution.
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();
@@ -951,19 +1065,55 @@ fn main() {{
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
 
-    Ok(harness_dir)
+    Ok((harness_dir, deps.offline()))
 }
 
+/// Runtime crates the AOT harness `main()` links against, in dependency order.
+const HARNESS_RUNTIME_CRATES: &[&str] = &[
+    "cljrs-logging",
+    "cljrs-types",
+    "cljrs-gc",
+    "cljrs-value",
+    "cljrs-reader",
+    "cljrs-env",
+    "cljrs-eval",
+    "cljrs-stdlib",
+    "cljrs-compiler",
+    "cljrs-async",
+    "cljrs-io",
+    "cljrs-net",
+    "cljrs-charset",
+];
+
+/// Runtime crates the AOT *test* harness links against.  The test runner
+/// interprets Clojure at runtime, so it needs neither the async/IO/net/charset
+/// stacks nor object-file linking.
+const TEST_HARNESS_RUNTIME_CRATES: &[&str] = &[
+    "cljrs-logging",
+    "cljrs-types",
+    "cljrs-gc",
+    "cljrs-value",
+    "cljrs-reader",
+    "cljrs-env",
+    "cljrs-eval",
+    "cljrs-stdlib",
+    "cljrs-compiler",
+];
+
 /// Build the harness with Cargo and copy the resulting binary to `out_path`.
-fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
+///
+/// `offline` passes `--offline`; it is set only for path-dep (local checkout)
+/// harnesses.  Versioned (published) deps may need to be fetched from
+/// crates.io, so the build must be allowed network access.
+fn link_with_cargo(harness_dir: &Path, out_path: &Path, offline: bool) -> AotResult<()> {
     eprintln!("[aot] building harness with cargo...");
 
-    let output = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("--offline")
-        .current_dir(harness_dir)
-        .output()?;
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build").arg("--release");
+    if offline {
+        cmd.arg("--offline");
+    }
+    let output = cmd.current_dir(harness_dir).output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -987,15 +1137,19 @@ fn link_with_cargo(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
 
 /// Build the harness with Cargo and copy the resulting binary to `out_path`.
 /// Keeps the harness directory for debugging test harnesses.
-fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResult<()> {
+fn link_with_cargo_test_harness(
+    harness_dir: &Path,
+    out_path: &Path,
+    offline: bool,
+) -> AotResult<()> {
     eprintln!("[aot] building harness with cargo...");
 
-    let output = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("--offline")
-        .current_dir(harness_dir)
-        .output()?;
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build").arg("--release");
+    if offline {
+        cmd.arg("--offline");
+    }
+    let output = cmd.current_dir(harness_dir).output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1017,24 +1171,109 @@ fn link_with_cargo_test_harness(harness_dir: &Path, out_path: &Path) -> AotResul
     Ok(())
 }
 
-/// Walk up from the current directory to find the workspace root
-/// (the directory containing Cargo.toml with [workspace]).
-fn find_workspace_root() -> AotResult<PathBuf> {
-    let mut dir = std::env::current_dir()?;
-    loop {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            let contents = std::fs::read_to_string(&cargo_toml)?;
-            if contents.contains("[workspace") {
-                return Ok(dir);
+/// How the generated harness depends on the clojurust runtime crates.
+enum HarnessDeps {
+    /// A local clojurust checkout was found — depend on the crates by path.
+    Workspace(PathBuf),
+    /// No checkout is available (e.g. a `cargo install cljrs` binary) — depend
+    /// on the published crates from crates.io by exact version.
+    Published(String),
+}
+
+impl HarnessDeps {
+    /// Whether the harness build may pass `--offline`.  Path deps resolve
+    /// against the local checkout (already built/cached), so offline is safe;
+    /// versioned deps may still need to be fetched from crates.io.
+    fn offline(&self) -> bool {
+        matches!(self, HarnessDeps::Workspace(_))
+    }
+
+    /// Emit a `[dependencies]` line for one runtime crate.
+    fn dep_line(&self, name: &str) -> String {
+        match self {
+            HarnessDeps::Workspace(root) => {
+                format!(
+                    "{name} = {{ path = \"{}/crates/{name}\" }}\n",
+                    root.display()
+                )
             }
-        }
-        if !dir.pop() {
-            return Err(AotError::Link(
-                "could not find workspace root (no Cargo.toml with [workspace])".to_string(),
-            ));
+            // `=` pins the exact version this `cljrs` was built against, so the
+            // harness can never silently link a mismatched runtime.
+            HarnessDeps::Published(version) => format!("{name} = \"={version}\"\n"),
         }
     }
+}
+
+/// Decide how the harness should depend on the runtime crates: against a local
+/// checkout when one is found, otherwise against the published versions.
+fn resolve_harness_deps() -> AotResult<HarnessDeps> {
+    match find_workspace_root()? {
+        Some(root) => Ok(HarnessDeps::Workspace(root)),
+        // The runtime crates share the workspace version, which is this crate's
+        // `CARGO_PKG_VERSION`, so they are all published in lock-step.
+        None => Ok(HarnessDeps::Published(
+            env!("CARGO_PKG_VERSION").to_string(),
+        )),
+    }
+}
+
+/// Locate the clojurust workspace root — the directory whose `Cargo.toml`
+/// declares the `[workspace]` that owns the `cljrs-*` crates the generated
+/// harness depends on.
+///
+/// Returns `Ok(None)` when no checkout is found (the caller then falls back to
+/// versioned crates.io deps).  Only errors when `CLJRS_WORKSPACE_ROOT` is set
+/// but invalid — an explicit override that doesn't resolve is a user mistake,
+/// not a cue to silently switch to published deps.  Resolution order:
+///
+/// 1. `CLJRS_WORKSPACE_ROOT` env var — an explicit override for unusual
+///    layouts (e.g. an installed `cljrs` pointed at a relocated source tree).
+/// 2. The compiler crate's own compile-time location.  `cljrs-compiler` lives
+///    at `<workspace>/crates/cljrs-compiler`, so its `CARGO_MANIFEST_DIR` is
+///    two levels below the root.  This works no matter the current directory,
+///    which is what lets `cljrs compile` run on a *bare* `.cljrs` file with no
+///    surrounding Cargo workspace.
+/// 3. As a last resort, walk up from the current directory.  This keeps
+///    working in exotic setups where the source tree was moved after build
+///    but the user runs `cljrs` from inside the checkout.
+fn find_workspace_root() -> AotResult<Option<PathBuf>> {
+    // 1. Explicit override.
+    if let Some(root) = std::env::var_os("CLJRS_WORKSPACE_ROOT") {
+        let dir = PathBuf::from(root);
+        if is_workspace_manifest(&dir.join("Cargo.toml")) {
+            return Ok(Some(dir));
+        }
+        return Err(AotError::Link(format!(
+            "CLJRS_WORKSPACE_ROOT={} does not contain a Cargo.toml with [workspace]",
+            dir.display()
+        )));
+    }
+
+    // 2. Compile-time location of this crate: <workspace>/crates/cljrs-compiler.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(root) = manifest_dir.parent().and_then(Path::parent)
+        && is_workspace_manifest(&root.join("Cargo.toml"))
+    {
+        return Ok(Some(root.to_path_buf()));
+    }
+
+    // 3. Walk up from the current directory.
+    let mut dir = std::env::current_dir()?;
+    loop {
+        if is_workspace_manifest(&dir.join("Cargo.toml")) {
+            return Ok(Some(dir));
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+/// Returns true when `cargo_toml` exists and declares a `[workspace]` table.
+fn is_workspace_manifest(cargo_toml: &Path) -> bool {
+    std::fs::read_to_string(cargo_toml)
+        .map(|contents| contents.contains("[workspace"))
+        .unwrap_or(false)
 }
 
 // ── Test harness generation ─────────────────────────────────────────────────
@@ -1113,7 +1352,6 @@ fn run() {
     // The test harness interprets Clojure at runtime; there is no benefit to
     // eagerly compiling test functions to IR, and doing so fills IR_CACHE with
     // entries that are never evicted (non-GC memory, leaks across all 233 namespaces).
-    // standard_env_no_ir() also skips loading the cljrs.compiler.* namespaces.
     let globals = cljrs_stdlib::standard_env_no_ir();
 
     // Override GC soft limit to a small value so the collector fires during
@@ -1376,8 +1614,13 @@ pub fn compile_test_harness(
         }
     }
 
-    // Write Cargo.toml
-    let workspace_root = find_workspace_root()?;
+    // Write Cargo.toml.  Resolve deps the same way as the run harness: a local
+    // checkout (path deps) when found, otherwise the published versions.
+    let deps = resolve_harness_deps()?;
+    let runtime_deps: String = TEST_HARNESS_RUNTIME_CRATES
+        .iter()
+        .map(|c| deps.dep_line(c))
+        .collect();
     let cargo_toml = format!(
         r#"[package]
 name = "cljrs-aot-harness"
@@ -1387,17 +1630,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-cljrs-logging  = {{ path = "{ws}/crates/cljrs-logging" }}
-cljrs-types    = {{ path = "{ws}/crates/cljrs-types" }}
-cljrs-gc       = {{ path = "{ws}/crates/cljrs-gc" }}
-cljrs-value    = {{ path = "{ws}/crates/cljrs-value" }}
-cljrs-reader   = {{ path = "{ws}/crates/cljrs-reader" }}
-cljrs-env      = {{ path = "{ws}/crates/cljrs-env" }}
-cljrs-eval     = {{ path = "{ws}/crates/cljrs-eval" }}
-cljrs-stdlib   = {{ path = "{ws}/crates/cljrs-stdlib" }}
-cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
-"#,
-        ws = workspace_root.display()
+{runtime_deps}"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -1408,8 +1641,45 @@ cljrs-compiler = {{ path = "{ws}/crates/cljrs-compiler" }}
     std::fs::write(harness_dir.join("build.rs"), build_rs)?;
 
     // Build with cargo
-    link_with_cargo_test_harness(&harness_dir, out_path)?;
+    link_with_cargo_test_harness(&harness_dir, out_path, deps.offline())?;
 
     eprintln!("[aot] wrote {}", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_deps_use_path() {
+        let deps = HarnessDeps::Workspace(PathBuf::from("/checkout/clojurust"));
+        assert_eq!(
+            deps.dep_line("cljrs-stdlib"),
+            "cljrs-stdlib = { path = \"/checkout/clojurust/crates/cljrs-stdlib\" }\n"
+        );
+        // Path deps come from a built checkout, so the build may stay offline.
+        assert!(deps.offline());
+    }
+
+    #[test]
+    fn published_deps_pin_exact_version() {
+        let deps = HarnessDeps::Published("0.1.0".to_string());
+        // `=` pins the exact version this cljrs was built against so the
+        // harness can never link a mismatched runtime.
+        assert_eq!(deps.dep_line("cljrs-stdlib"), "cljrs-stdlib = \"=0.1.0\"\n");
+        // Published deps may need fetching, so the build must allow network.
+        assert!(!deps.offline());
+    }
+
+    #[test]
+    fn published_version_matches_this_crate() {
+        // resolve_harness_deps() falls back to this crate's version, which the
+        // workspace shares across every runtime crate, so they publish in
+        // lock-step.
+        if let HarnessDeps::Published(v) = HarnessDeps::Published(env!("CARGO_PKG_VERSION").into())
+        {
+            assert_eq!(v, env!("CARGO_PKG_VERSION"));
+        }
+    }
 }

@@ -42,6 +42,18 @@ pub type DepsResult<T> = Result<T, DepsError>;
 pub struct GitDep {
     pub url: Arc<str>,
     pub sha: Arc<str>,
+    /// `:rust/init` — fully-qualified path to the dep's native init function
+    /// (e.g. `"my_crate::cljrs_init"`), when the dep ships Rust code.
+    pub rust_init: Option<Arc<str>>,
+    /// `:rust/crate` — directory of the dep's Cargo.toml relative to its
+    /// repository root (defaults to the root).
+    pub rust_crate_dir: Option<Arc<str>>,
+    /// `:rust/load :dylib` — opt in to **pinned native code**: when a
+    /// versioned symbol resolves into this dep's namespace and falls back to
+    /// a native function, build the dep's crate at the pinned commit as a
+    /// cdylib and load it instead of using the current binary's
+    /// implementation.
+    pub rust_load_dylib: bool,
 }
 
 /// A dependency declared in `:deps` or `:extra-deps`.
@@ -111,6 +123,11 @@ pub struct DepsConfig {
     /// must pass `git verify-commit` before historical code is executed.
     /// Equivalent to the `--verify-commit-signatures` CLI flag.
     pub verify_commit_signatures: bool,
+    /// When true, a pinned lookup of a native (Rust-backed) function whose
+    /// recorded provenance does not match the requested commit is an error
+    /// instead of a warning.  Equivalent to the `--enforce-native-versions`
+    /// CLI flag.
+    pub enforce_native_versions: bool,
     /// Optional Rust-crate configuration for mixed Rust/Clojure projects.
     pub rust: Option<RustConfig>,
 }

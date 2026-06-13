@@ -1,0 +1,14 @@
+[package]
+name = "cljrs-charset"
+version = "0.1.0"
+edition = "2024"
+description = "Charset encoding and decoding with stream support — clojure.rust.charset"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-gc    = { workspace = true }
+cljrs-value = { workspace = true }
+cljrs-env   = { workspace = true }
+cljrs-async = { workspace = true }
+encoding_rs = { workspace = true }

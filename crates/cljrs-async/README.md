@@ -44,6 +44,13 @@ Done (Phases A–H, A2, B1):
 - Phase B1: `Isolate` type — per-isolate OS thread with independent GC heap (`ISOLATE_HEAP`
   thread-local), `current_thread` Tokio runtime, and `LocalSet`. GC collections are fully
   parallel and independent; no cross-isolate STW coordination.
+- Phase B2: `isolate_channel` — cross-isolate copy boundary. `IsolateSender::send` serializes
+  a `Value` to a `Send + Sync` wire form (`SerializedValue`, defined in `cljrs-value::clone`);
+  `IsolateReceiver::recv`/`try_recv` deserializes it into the receiver's GC heap. Non-shareable
+  values (mutable state, closures, native resources) are rejected at send time with a typed
+  `CloneError`. The sender may be cloned (multi-producer); the receiver must stay on its isolate
+  thread (single-consumer). `GcPtr`'s `!Send` bound makes pointer-sharing a compile error —
+  the channel is the only sanctioned crossing point.
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
   contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
   remain non-deadlocking when called from the LocalSet executor thread). Errors with a
@@ -129,6 +136,7 @@ blocking bridge is a later phase.
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
 | `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
+| `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a tokio unbounded MPSC channel |
 | `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
@@ -188,6 +196,31 @@ pub mod worker_pool {
     }
 }
 
+pub mod isolate_channel {
+    /// Sending end of a cross-isolate channel (cloneable, Send).
+    #[derive(Clone)]
+    pub struct IsolateSender;
+    impl IsolateSender {
+        /// Serialize `v` and enqueue it. Returns CloneError for non-shareable values
+        /// or if the receiver has been dropped.
+        pub fn send(&self, v: &Value) -> Result<(), CloneError>;
+    }
+
+    /// Receiving end of a cross-isolate channel. Must remain on the destination
+    /// isolate thread so `deserialize` allocates into the correct GC heap.
+    pub struct IsolateReceiver;
+    impl IsolateReceiver {
+        /// Async receive: deserialize the next value into the current isolate's heap.
+        /// Returns `None` when all senders have been dropped.
+        pub async fn recv(&mut self) -> Option<Value>;
+        /// Non-blocking receive attempt. Returns `None` if the channel is empty.
+        pub fn try_recv(&mut self) -> Option<Value>;
+    }
+
+    /// Create a linked `(IsolateSender, IsolateReceiver)` pair.
+    pub fn isolate_channel() -> (IsolateSender, IsolateReceiver);
+}
+
 pub mod eval_async {
     /// Spawn `task` on the current LocalSet and return a `Value::Future` that
     /// settles when it completes. The shared delivery point for async primitives;
@@ -221,6 +254,9 @@ pub mod channel {
         /// Async put: yield to the LocalSet until the value is accepted (buffered
         /// or handed off). `true` on success, `false` if the channel is closed.
         /// The building block other crates use to stream produced values.
+        /// Enqueued values pass through the Phase 10.5 publish barrier
+        /// (cljrs_value::publish::publish_value): the taker may outlive any
+        /// bump-region scope active on the putting side.
         pub async fn put(&self, v: Value) -> bool;
         /// Close the channel (idempotent). Buffered values still drain to takers.
         pub fn close(&self);

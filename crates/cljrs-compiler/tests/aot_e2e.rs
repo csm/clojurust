@@ -37,7 +37,7 @@ fn compile_and_run(name: &str, source: &str) -> String {
         .spawn({
             let src = src_path.clone();
             let bin = bin_path.clone();
-            move || cljrs_compiler::aot::compile_file(&src, &bin, &[], None)
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[], None, false)
         })
         .unwrap()
         .join()
@@ -1038,7 +1038,7 @@ fn compile_and_run_multi(name: &str, main_source: &str, deps: &[(&str, &str)]) -
             let src = src_path.clone();
             let bin = bin_path.clone();
             let src_dir = src_dir.clone();
-            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir], None)
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir], None, false)
         })
         .unwrap()
         .join()
@@ -1289,6 +1289,102 @@ fn test_into_basic() {
         "into_basic",
         r#"(println (into [] (list 1 2 3)))"#,
         "[1 2 3]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_high_arity_closure_call() {
+    // Regression: a closure passed to a HOF (reduce) inside a loop over a
+    // let-bound collection over-captures enclosing locals, so its compiled
+    // arity (captures + params) exceeded the call trampoline's old 8-arg
+    // ceiling, which silently returned nil.  All of these must compute the
+    // real result, not nil.
+    assert_output(
+        "high_arity_closure_call",
+        r#"
+(let [v [10 20 30]]
+  (println (loop [i 0 r 0]
+             (if (= i 2) r (recur (inc i) (reduce (fn [a x] x) 0 v))))))
+(let [v (vec (range 100))]
+  (println (loop [i 0 r 0]
+             (if (= i 3) r (recur (inc i) (reduce (fn [a x] (+ a x)) 0 v))))))
+"#,
+        "30\n4950",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_set() {
+    // Exercises the hash-set target fast path in `rt_into`.
+    assert_output(
+        "into_set",
+        r#"
+(println (sort (into #{} [1 2 3 2 1])))
+(println (sort (into #{1 2} [2 3 4])))
+(println (sort (into #{} (list 5 6 5))))
+(println (into #{} nil))
+"#,
+        "(1 2 3)\n(1 2 3 4)\n(5 6)\n#{}",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_map() {
+    // Exercises the map target fast path in `rt_into`: eager pair sources and
+    // a source map, with last-wins on conflicting keys.
+    assert_output(
+        "into_map",
+        r#"
+(println (into {} [[:a 1] [:b 2]]))
+(println (into {:a 1 :b 2} [[:b 9] [:c 3]]))
+(println (into {} (list [:p 1] [:q 2])))
+(println (into {} {:x 1 :y 2}))
+(println (into {} nil))
+(println (get (into {} (mapv (fn [i] [i (* i i)]) (range 4))) 3))
+"#,
+        "{:a 1, :b 2}\n{:a 1, :b 9, :c 3}\n{:p 1, :q 2}\n{:x 1, :y 2}\n{}\n9",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_for_comprehension_fusion() {
+    // `for` expands to `map`, so these exercise the `(into to (map f coll))`
+    // IntoMap fusion — including a lazy `range` source and a map target.
+    assert_output(
+        "for_comprehension_fusion",
+        r#"
+(println (into {} (for [i (range 5)] [i (* i i)])))
+(println (into [] (for [x [1 2 3]] (* x 10))))
+(println (sort (into #{} (for [x [1 1 2 3 3]] x))))
+(println (into {} (map (fn [i] [i (+ i 1)]) [10 20])))
+(let [c (atom 0)]
+  (into [] (for [x (range 6)] (swap! c inc)))
+  (println @c))
+"#,
+        "{0 0, 1 1, 2 4, 3 9, 4 16}\n[10 20 30]\n(1 2 3)\n{10 11, 20 21}\n6",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_repeatedly_count() {
+    // Exercises the finite-count fast path in `rt_repeatedly`: the result is
+    // realized eagerly into a vector and `f` runs exactly n times.
+    assert_output(
+        "repeatedly_count",
+        r#"
+(println (into [] (repeatedly 3 (fn [] :x))))
+(println (count (repeatedly 0 (fn [] 1))))
+(println (sort (into #{} (repeatedly 5 (fn [] 7)))))
+(let [a (atom 0)]
+  (dorun (repeatedly 4 (fn [] (swap! a inc))))
+  (println @a))
+"#,
+        "[:x :x :x]\n0\n(7)\n4",
     );
 }
 
@@ -2042,5 +2138,179 @@ fn test_clojure_test_with_failure() {
     assert!(
         output.contains("FAIL in"),
         "expected FAIL message, got: {output}"
+    );
+}
+
+// ── Versioned namespaces (compile-time snapshot) ────────────────────────────
+
+/// Build a two-commit git fixture and return `(dir, src_dir, sha_v1)`.
+/// `src/mylib.cljrs` — v1: `the-answer` = 1; v2 (HEAD): `the-answer` = 2.
+#[cfg(feature = "aot_full_test")]
+fn make_versioned_lib_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    use std::path::Path;
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git command failed to start");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    git_ok(&root, &["init", "-q", "-b", "main"]);
+    // Override any global commit.gpgsign so test commits don't invoke a
+    // signing server.
+    git_ok(&root, &["config", "commit.gpgsign", "false"]);
+
+    let lib_file = src_dir.join("mylib.cljrs");
+    std::fs::write(
+        &lib_file,
+        "(def the-answer 1)\n(defn describe [] (str \"v\" the-answer))\n",
+    )
+    .unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-q", "-m", "v1"]);
+    let sha_out = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let sha_v1 = String::from_utf8(sha_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    std::fs::write(
+        &lib_file,
+        "(def the-answer 2)\n(defn describe [] (str \"v\" the-answer))\n",
+    )
+    .unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-q", "-m", "v2"]);
+
+    (dir, src_dir, sha_v1)
+}
+
+/// An AOT binary that pins a library namespace runs without the git repo,
+/// without source files, and without a cljrs cache (`HOME` redirected): the
+/// pinned source is fetched at compile time and embedded in the binary.
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_versioned_snapshot_is_self_contained() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (repo_dir, src_dir, sha_v1) = make_versioned_lib_repo();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let src_path = out_dir.path().join("versioned_app.cljrs");
+    let bin_path = out_dir.path().join("versioned_app_bin");
+
+    // Both pin styles: a versioned require and a bare versioned symbol; plus
+    // the HEAD require to prove the live binding coexists untouched.
+    let app_source = format!(
+        r#"
+(require '[mylib@{sha} :as v1])
+(require '[mylib])
+(println (v1/describe))
+(println mylib/the-answer@{sha})
+(println mylib/the-answer)
+"#,
+        sha = sha_v1
+    );
+    std::fs::write(&src_path, app_source).unwrap();
+
+    let result = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn({
+            let src = src_path.clone();
+            let bin = bin_path.clone();
+            let src_dir = src_dir.clone();
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir], None, false)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    result.unwrap_or_else(|e| panic!("versioned AOT compilation failed: {e:?}"));
+
+    // Delete the library repo (source files AND git history) and run the
+    // binary from an empty cwd with HOME pointing at an empty dir (defeats
+    // ~/.cljrs caches).  The pinned values must come from embedded sources.
+    drop(repo_dir);
+    let empty_home = tempfile::tempdir().unwrap();
+    let empty_cwd = tempfile::tempdir().unwrap();
+
+    let output = Command::new(&bin_path)
+        .current_dir(empty_cwd.path())
+        .env("HOME", empty_home.path())
+        .output()
+        .expect("failed to run versioned binary");
+    assert!(
+        output.status.success(),
+        "versioned binary exited with {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.trim(),
+        "v1\n1\n2",
+        "pinned values must be v1 and HEAD must stay v2; got:\n{stdout}"
+    );
+}
+
+/// A pin pointing at a commit that does not exist fails the *compile*, not
+/// the deployed binary.
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_versioned_bad_commit_fails_at_compile_time() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (_repo_dir, src_dir, _sha_v1) = make_versioned_lib_repo();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let src_path = out_dir.path().join("bad_pin_app.cljrs");
+    let bin_path = out_dir.path().join("bad_pin_app_bin");
+
+    // Valid hash format, nonexistent commit.
+    std::fs::write(
+        &src_path,
+        "(println mylib/the-answer@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
+    )
+    .unwrap();
+
+    let result = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn({
+            let src = src_path.clone();
+            let bin = bin_path.clone();
+            let src_dir = src_dir.clone();
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &[src_dir], None, false)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let err = result.expect_err("compile must fail for a nonexistent pinned commit");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("aaaaaaa"),
+        "error should mention the bad commit: {msg}"
     );
 }

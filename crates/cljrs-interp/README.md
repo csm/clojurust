@@ -10,9 +10,18 @@ Self-contained tree-walking interpreter for Clojure.
 
 Evaluates Clojure `Form` ASTs produced by `cljrs-reader`, managing lexical
 environments, special forms, function application, and the recur trampoline.
-Under the `no-gc` Cargo feature, applies the allocation-context stack protocol
-(scratch regions for function/loop scopes; `StaticArena` for static-sink
-expressions).
+
+Allocations are scoped per function call and per loop iteration: under GC, each
+trampoline iteration (`call_cljrs_fn`, `eval_loop`) runs inside its own
+`cljrs_gc::push_alloc_frame()`, so that iteration's intermediates — and a
+`recur`'s now-dead values — become collectable when the frame drops, instead of
+being pinned in `ALLOC_ROOTS` for the lifetime of the enclosing top-level form.
+The return value / recur args are moved out before the frame drops and re-rooted
+at the next iteration (or by the caller on return); no GC safepoint runs in the
+interval (GC fires only at explicit safepoints, with a one-cycle grace period —
+see `cljrs-gc`). Under the `no-gc` Cargo feature the same scoping is achieved
+with the allocation-context stack protocol (scratch regions for function/loop
+scopes; `StaticArena` for static-sink expressions).
 
 ---
 
@@ -32,17 +41,22 @@ src/
                    agent, send/send-off, with-bindings*, alter-var-root,
                    vary-meta, find-ns, all-ns, create-ns, ns-aliases, remove-ns,
                    alter-meta!, ns-resolve, resolve, intern, bound-fn*)
-  arity.rs       — fresh arity ID generator
+  arity.rs       — fresh arity ID generator (pub; `fresh_arity_id`, plus `next_arity_id`
+                   for the Phase 10.7 bootstrap watermark snapshot)
   destructure.rs — pattern destructuring (vector, map, & rest)
   macros.rs      — macro expansion helpers
   syntax_quote.rs — syntax-quote (backtick) expansion
   virtualize.rs  — let-chain virtualization: assoc/conj chains → transients
-  versioned.rs   — versioned symbol resolution: git-source fetch, native version
-                   registry lookup, HEAD fallback for stable native functions
+  versioned.rs   — tree-walker entry point for versioned symbol resolution;
+                   thin shim over the shared resolver in `cljrs_env::versioned`
+                   (whole-namespace `ns@commit` loading, native HEAD fallback)
 tests/
   no_gc_eval.rs  — (no-gc mode) integration tests: arithmetic, def/defn provenance,
                    function-call region stack, loop/recur accumulation,
                    atom/reset!/swap! static-sink correctness
+  versioned_resolution.rs — end-to-end versioned resolution against a real git
+                   fixture: pinned symbols, HEAD-clobber regression, versioned
+                   require, GC survival of versioned values
 ```
 
 ---
@@ -64,9 +78,11 @@ Evaluate a sequence of forms, returning the value of the last one.
 
 ### `eval_loop(args, env) -> EvalResult`
 
-Evaluate a `loop*` form.  Under `no-gc`, pushes a `ScratchGuard` on each
-iteration and pops it before the tail expression (recur args or return value)
-so intermediate allocations are freed per iteration.
+Evaluate a `loop*` form.  Each iteration is scoped in its own allocation frame
+so intermediate allocations are freed per iteration: under GC a
+`cljrs_gc::push_alloc_frame()` that drops at the end of the iteration; under
+`no-gc` a `ScratchGuard` popped before the tail expression (recur args or return
+value).
 
 ### `eval_defn(args, env) -> EvalResult`
 

@@ -20,6 +20,7 @@ mod builtins;
 pub mod channel;
 pub mod eval_async;
 pub mod isolate;
+pub mod isolate_channel;
 mod runtime;
 pub mod worker_pool;
 use runtime::AsyncRuntimeImpl;

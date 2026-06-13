@@ -1,0 +1,35 @@
+[package]
+name = "cljrs-jit"
+version = "0.1.0"
+edition = "2024"
+description = "In-process JIT compiler (Cranelift) for clojurust — Phase 10.1"
+license.workspace = true
+repository.workspace = true
+
+[features]
+no-gc = [
+    "cljrs-gc/no-gc",
+    "cljrs-value/no-gc",
+    "cljrs-eval/no-gc",
+    "cljrs-compiler/no-gc",
+]
+
+[dependencies]
+cljrs-eval     = { workspace = true }
+cljrs-compiler = { workspace = true }
+cljrs-ir       = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-logging  = { workspace = true }
+
+cranelift-codegen  = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module   = { workspace = true }
+cranelift-jit      = { workspace = true }
+cranelift-native   = { workspace = true }
+
+[dev-dependencies]
+cljrs-stdlib = { workspace = true }
+cljrs-reader = { workspace = true }
+cljrs-env    = { workspace = true }
+tempfile     = "3"

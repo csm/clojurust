@@ -1,8 +1,9 @@
 //! ANF lowering: `Form` AST → `IrFunction`.
 //!
-//! Mirrors `cljrs.compiler.anf`. Receives fully macro-expanded `Form` nodes
-//! and produces a well-formed SSA IR in A-normal form.
+//! Receives fully macro-expanded `Form` nodes and produces a well-formed
+//! SSA IR in A-normal form.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cljrs_reader::form::{Form, FormKind};
@@ -11,6 +12,52 @@ use crate::{BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, Terminat
 
 use super::context::{LowerCtx, fresh_global_name_id};
 use super::known::{resolve_known_fn, strip_ns_prefix};
+
+// ── Free-variable approximation for closure captures ─────────────────────────
+
+/// Collect every symbol name that appears anywhere in `forms`, recursing into
+/// all nested forms — including quoted forms and nested `fn` bodies, whose free
+/// variables a closure must capture transitively.
+///
+/// This is a deliberate *over*-approximation of a closure's free variables.
+/// Lowering only ever uses it to *remove* locals that provably cannot be
+/// referenced (their name never appears) from a closure's capture list:
+/// capturing a local whose name merely appears textually is wasteful but safe,
+/// whereas missing a genuine reference would leave the variable unbound at
+/// runtime.  Relies on the module invariant that bodies are fully
+/// macro-expanded, so every real reference is an explicit symbol.
+fn collect_symbol_names<'a>(forms: &'a [Form], out: &mut HashSet<&'a str>) {
+    for form in forms {
+        collect_symbol_names_form(form, out);
+    }
+}
+
+fn collect_symbol_names_form<'a>(form: &'a Form, out: &mut HashSet<&'a str>) {
+    match &form.kind {
+        FormKind::Symbol(s) => {
+            out.insert(s.as_str());
+        }
+        FormKind::List(v)
+        | FormKind::Vector(v)
+        | FormKind::Map(v)
+        | FormKind::Set(v)
+        | FormKind::AnonFn(v) => collect_symbol_names(v, out),
+        FormKind::Quote(b)
+        | FormKind::SyntaxQuote(b)
+        | FormKind::Unquote(b)
+        | FormKind::UnquoteSplice(b)
+        | FormKind::Deref(b)
+        | FormKind::Var(b)
+        | FormKind::TaggedLiteral(_, b) => collect_symbol_names_form(b, out),
+        FormKind::Meta(m, f) => {
+            collect_symbol_names_form(m, out);
+            collect_symbol_names_form(f, out);
+        }
+        FormKind::ReaderCond { clauses, .. } => collect_symbol_names(clauses, out),
+        // Atoms (Nil, Bool, Int, …, Keyword, …) contain no symbol references.
+        _ => {}
+    }
+}
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
@@ -68,13 +115,38 @@ fn is_meta_async(meta: &Form) -> bool {
 /// `name`     — function name (for diagnostics), or `None` for anonymous.
 /// `ns`       — current Clojure namespace name.
 /// `params`   — flat parameter name list, including the rest param if variadic
-///              (the rest param is the last element).
+///              (the rest param is the last element).  When a parameter is a
+///              destructuring pattern, the interpreter has already replaced it
+///              with a gensym placeholder name here and recorded the original
+///              pattern in `destructures` (see below).
 /// `body`     — sequence of already macro-expanded body forms (implicit `do`).
 /// `is_async` — whether the function was declared `^:async`.
 pub fn lower_fn_body(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
+    body: &[Form],
+    is_async: bool,
+) -> Result<IrFunction, LowerError> {
+    lower_fn_body_destructured(name, ns, params, &[], body, is_async)
+}
+
+/// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
+/// into explicit bindings at the top of the body.
+///
+/// `destructures` pairs a parameter index (into `params`) with the original
+/// destructuring pattern form.  The interpreter splits a destructured parameter
+/// such as `[a b]` into a gensym placeholder name (stored in `params`) plus the
+/// pattern (passed here); this prologue binds the gensym to the incoming
+/// argument and then expands the pattern against it, exactly as
+/// `lower_fn_arity` does for inner `fn*` forms.  The result is that the body's
+/// references to the destructured names (`a`, `b`, …) resolve to real IR locals
+/// instead of being emitted as `LoadGlobal` for non-existent vars.
+pub fn lower_fn_body_destructured(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
     body: &[Form],
     is_async: bool,
 ) -> Result<IrFunction, LowerError> {
@@ -87,6 +159,13 @@ pub fn lower_fn_body(
         let id = ctx.fresh_var();
         ctx.bind_local(pname.clone(), id);
         bound_params.push((pname.clone(), id));
+    }
+
+    // Expand any destructuring patterns into explicit bindings in the prologue,
+    // before the body is lowered, so the body sees the pattern's names.
+    for (idx, pattern) in destructures {
+        let var = bound_params[*idx].1;
+        lower_destructure_binding(&mut ctx, pattern, var)?;
     }
 
     // Lower the body; emit a Return terminator.
@@ -744,12 +823,23 @@ fn lower_def(ctx: &mut LowerCtx, args: &[Form]) -> R {
             "def requires a name".into(),
         ));
     }
-    let FormKind::Symbol(name_sym) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm(
-            "def name must be a symbol".into(),
-        ));
+    // Name may carry metadata: `(def ^:private x 1)`.
+    let name_str: Arc<str> = match &args[0].kind {
+        FormKind::Symbol(s) => Arc::from(s.as_str()),
+        FormKind::Meta(_, inner) => {
+            let FormKind::Symbol(s) = &inner.kind else {
+                return Err(LowerError::MalformedSpecialForm(
+                    "def name must be a symbol".into(),
+                ));
+            };
+            Arc::from(s.as_str())
+        }
+        _ => {
+            return Err(LowerError::MalformedSpecialForm(
+                "def name must be a symbol".into(),
+            ));
+        }
     };
-    let name_str: Arc<str> = Arc::from(name_sym.as_str());
     let ns = ctx.ns().clone();
 
     let val = if args.len() >= 2 {
@@ -878,10 +968,20 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
         None
     };
 
-    // Capture all locals (after self-ref scope is pushed).
+    // Capture only the enclosing locals the body actually references (after the
+    // self-ref scope is pushed).  `collect_symbol_names` over-approximates the
+    // free variables, so this only ever *removes* provably-unreferenced locals
+    // — never a real capture.  Capturing every in-scope local (the previous
+    // behaviour) inflates the compiled arity (captures + params), wasting
+    // allocations and, past 16, exceeding the call trampoline's maximum.
     let all_locals = ctx.get_all_locals();
-    let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
-    let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
+    let mut referenced: HashSet<&str> = HashSet::new();
+    collect_symbol_names(&args[body_start..], &mut referenced);
+    let (capture_names, capture_vars): (Vec<Arc<str>>, Vec<VarId>) = all_locals
+        .iter()
+        .filter(|(n, _)| referenced.contains(n.as_ref()))
+        .map(|(n, v)| (n.clone(), *v))
+        .unzip();
 
     // Pop self-ref scope now that captures are computed.
     if self_var_reg.is_some() {
@@ -2275,8 +2375,33 @@ fn split_sym(s: &str, current_ns: &Arc<str>) -> (Arc<str>, Arc<str>) {
         return (current_ns.clone(), Arc::from("/"));
     }
     match s.find('/') {
-        Some(pos) => (Arc::from(&s[..pos]), Arc::from(&s[pos + 1..])),
+        Some(pos) => {
+            let ns_part = &s[..pos];
+            // Inside a versioned namespace ("base@hash"), a qualified
+            // self-reference written with the base name ("base/x") must
+            // resolve at the pinned commit, i.e. inside the versioned
+            // namespace itself — mirroring the tree-walker's eval_symbol.
+            if let Some(base) = versioned_ns_base(current_ns)
+                && ns_part == base
+            {
+                return (current_ns.clone(), Arc::from(&s[pos + 1..]));
+            }
+            (Arc::from(ns_part), Arc::from(&s[pos + 1..]))
+        }
         None => (current_ns.clone(), Arc::from(s)),
+    }
+}
+
+/// If `ns` is a versioned namespace name (`"base@<7-40 hex>"`), return the
+/// base part.  Mirrors `cljrs_value::symbol::split_version` (cljrs-ir cannot
+/// depend on cljrs-value).
+fn versioned_ns_base(ns: &str) -> Option<&str> {
+    let pos = ns.rfind('@')?;
+    let hash = &ns[pos + 1..];
+    if (7..=40).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(&ns[..pos])
+    } else {
+        None
     }
 }
 

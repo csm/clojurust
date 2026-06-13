@@ -40,6 +40,35 @@ struct Cli {
     #[arg(long, global = true)]
     verify_commit_signatures: bool,
 
+    /// Make pinned lookups of native (Rust-backed) functions an error when
+    /// the package's recorded provenance does not match the requested
+    /// commit (default: warn once per pin).  Can also be enabled
+    /// per-project via `:enforce-native-versions true` in `cljrs.edn`.
+    #[arg(long, global = true)]
+    enforce_native_versions: bool,
+
+    /// JIT compilation invocation threshold (default 1000; 0 = disable JIT).
+    /// Also read from CLJRS_JIT_THRESHOLD env var.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "JIT invocation threshold (0 to disable, default 1000)"
+    )]
+    jit_threshold: Option<u32>,
+
+    /// Warm threshold: tree-walked calls before a function is lowered to IR
+    /// in the background (default 50; 0 disables background lowering).
+    /// Also read from CLJRS_IR_THRESHOLD env var.  Applies even when the
+    /// JIT is disabled.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "Background IR lowering threshold (0 to disable, default 50)"
+    )]
+    ir_threshold: Option<u32>,
+
     /// Feature-level logging flags: -X debug:gc,jit or -X trace:reader
     ///
     /// Format: <level>:<feature1>,<feature2>,...
@@ -58,6 +87,19 @@ struct Cli {
         default_missing_value = "",
     )]
     gc_stats: Option<String>,
+
+    /// Print JIT specialization / inline-cache statistics on exit (Phase
+    /// 10.6).  Pass a path to write them to a file; pass the flag without a
+    /// value to write them to stdout.  Only the `run`, `eval`, and `test`
+    /// subcommands honour this flag.
+    #[arg(
+        long = "jit-stats",
+        global = true,
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "",
+    )]
+    jit_stats: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -183,6 +225,34 @@ enum Commands {
         #[arg(long)]
         release: bool,
     },
+    /// Run the clojurust language server (LSP) over stdio.
+    ///
+    /// Speaks the Language Server Protocol on stdin/stdout for editor
+    /// integration, providing parse diagnostics and a document-symbol outline
+    /// for `.cljrs` / `.cljc` files. Editors normally launch this for you.
+    Lsp,
+    /// Start an nREPL server for editor integration (CIDER, Calva, Conjure).
+    ///
+    /// Listens for bencode-encoded nREPL messages over TCP and writes the
+    /// bound port to `.nrepl-port` in the current directory so clients can
+    /// auto-connect. Runs until interrupted.
+    Nrepl {
+        /// Port to listen on (0 = let the OS pick a free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Source directories to search when resolving `require`.
+        #[arg(long = "src-path", value_name = "DIR")]
+        src_paths: Vec<PathBuf>,
+        /// GC soft memory limit in MB (triggers collection when exceeded).
+        #[arg(long)]
+        gc_soft_limit_mb: Option<usize>,
+        /// GC hard memory limit in MB (forces collection when exceeded).
+        #[arg(long)]
+        gc_hard_limit_mb: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -290,14 +360,30 @@ fn run(cli: Cli) -> miette::Result<i32> {
     // how many threads to wait for during stop-the-world collection.
     let _mutator = cljrs_gc::register_mutator();
 
+    // Initialise the JIT tier (unless explicitly disabled).
+    init_jit(cli.jit_threshold.as_ref().copied());
+
+    // Configure background IR lowering (Phase 10.7); independent of the JIT.
+    match cli.ir_threshold {
+        // 0 disables background lowering entirely (functions stay at
+        // tree-walk unless eagerly lowered or pre-built).
+        Some(0) => cljrs_eval::set_ir_threshold(u32::MAX),
+        Some(t) => cljrs_eval::set_ir_threshold(t),
+        None => {}
+    }
+
     let gc_stats_target = cli.gc_stats.clone();
-    let verify_commit_signatures = cli.verify_commit_signatures;
+    let jit_stats_target = cli.jit_stats.clone();
+    let versioning = VersioningFlags {
+        verify_commit_signatures: cli.verify_commit_signatures,
+        enforce_native_versions: cli.enforce_native_versions,
+    };
     let supports_gc_stats = matches!(
         &cli.command,
         Commands::Run { .. } | Commands::Eval { .. } | Commands::Test { .. },
     );
 
-    let result = run_command(cli.command, verify_commit_signatures);
+    let result = run_command(cli.command, versioning);
 
     if supports_gc_stats
         && let Some(target) = gc_stats_target.as_deref()
@@ -305,11 +391,57 @@ fn run(cli: Cli) -> miette::Result<i32> {
     {
         eprintln!("cljrs: failed to write GC stats: {e}");
     }
+    if supports_gc_stats
+        && let Some(target) = jit_stats_target.as_deref()
+        && let Err(e) = write_jit_stats(target)
+    {
+        eprintln!("cljrs: failed to write JIT stats: {e}");
+    }
 
     result
 }
 
-fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Result<i32> {
+/// Write a snapshot of the JIT specialization / inline-cache counters
+/// (`cljrs_compiler::rt_abi::jit_stats`) to `target`.
+///
+/// An empty target (the flag was passed without a value) writes to stdout;
+/// any other value is treated as a filesystem path.
+fn write_jit_stats(target: &str) -> std::io::Result<()> {
+    let snapshot = cljrs_compiler::rt_abi::jit_stats::snapshot();
+    if target.is_empty() {
+        println!("{snapshot}");
+        Ok(())
+    } else {
+        std::fs::write(target, snapshot)
+    }
+}
+
+/// Initialise the JIT tier based on CLI flags and env vars.
+///
+/// JIT is enabled by default; disable with `CLJRS_NO_JIT=1` or `--jit-threshold 0`.
+fn init_jit(threshold: Option<u32>) {
+    if std::env::var("CLJRS_NO_JIT").is_ok() {
+        return;
+    }
+    if let Some(0) = threshold {
+        return; // Explicitly disabled via --jit-threshold 0.
+    }
+    if let Some(t) = threshold {
+        cljrs_eval::jit_state::set_jit_threshold(t);
+    }
+    cljrs_jit::init();
+}
+
+/// CLI-level versioned-symbol policy flags, threaded into `setup_globals`.
+#[derive(Clone, Copy, Default)]
+struct VersioningFlags {
+    /// `--verify-commit-signatures` / `:verify-commit-signatures`.
+    verify_commit_signatures: bool,
+    /// `--enforce-native-versions` / `:enforce-native-versions`.
+    enforce_native_versions: bool,
+}
+
+fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result<i32> {
     match command {
         Commands::Run {
             file,
@@ -322,7 +454,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
                 .map_err(|e| miette::miette!("{}: {}", file.display(), e))?;
             let filename = file.display().to_string();
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+            let globals = setup_globals(src_paths, gc_config, versioning);
             run_source(&src, &filename, globals, &args)?;
             Ok(0)
         }
@@ -332,7 +464,7 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             gc_hard_limit_mb,
         } => {
             let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+            let globals = setup_globals(src_paths, gc_config, versioning);
             run_repl(globals);
             Ok(0)
         }
@@ -357,14 +489,20 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
                 cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             } else {
-                cljrs_compiler::aot::compile_file(&file, &out, &src_paths, rust_config.as_ref())
-                    .map_err(|e| miette::miette!("{e}"))?;
+                cljrs_compiler::aot::compile_file(
+                    &file,
+                    &out,
+                    &src_paths,
+                    rust_config.as_ref(),
+                    versioning.verify_commit_signatures,
+                )
+                .map_err(|e| miette::miette!("{e}"))?;
             }
             Ok(0)
         }
         Commands::Eval { expr } => {
             let gc_config = Arc::new(GcConfig::new());
-            let globals = setup_globals(Vec::new(), gc_config, verify_commit_signatures);
+            let globals = setup_globals(Vec::new(), gc_config, versioning);
             let result = eval_source(&expr, "<eval>", globals)?;
             if result != Value::Nil {
                 println!("{}", result);
@@ -389,13 +527,47 @@ fn run_command(command: Commands, verify_commit_signatures: bool) -> miette::Res
             verbose,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
-            verify_commit_signatures,
+            versioning,
         ),
         Commands::Deps { command } => match command {
             DepsCommands::Fetch { name } => run_deps_fetch(name),
             DepsCommands::Status => run_deps_status(),
         },
         Commands::BuildNative { release } => run_build_native(release),
+        Commands::Lsp => {
+            // cljrs-lsp owns its own runtime; this is safe because `run` never
+            // enters the interpreter's async driver runtime.
+            cljrs_lsp::run_stdio_blocking()
+                .map_err(|e| miette::miette!("lsp server error: {e}"))?;
+            Ok(0)
+        }
+        Commands::Nrepl {
+            port,
+            bind,
+            src_paths,
+            gc_soft_limit_mb,
+            gc_hard_limit_mb,
+        } => {
+            let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
+            let globals = setup_globals(src_paths, gc_config, versioning);
+            let addr: std::net::SocketAddr = format!("{bind}:{port}")
+                .parse()
+                .map_err(|e| miette::miette!("invalid bind address {bind}:{port}: {e}"))?;
+            let config = cljrs_nrepl::Config {
+                addr,
+                port_file: Some(PathBuf::from(".nrepl-port")),
+            };
+            let server = cljrs_nrepl::start(config, globals)?;
+            // Editors (CIDER, Calva) parse this exact line to auto-connect.
+            println!(
+                "nREPL server started on port {0} on host {bind} - nrepl://{bind}:{0}",
+                server.port()
+            );
+            // Evaluate forms through the CLI's async driver so core.async /
+            // ^:async code makes progress, exactly like `cljrs repl`.
+            server.serve_with(eval_form)?;
+            Ok(0)
+        }
     }
 }
 
@@ -460,14 +632,19 @@ fn write_gc_stats(target: &str) -> std::io::Result<()> {
 fn setup_globals(
     src_paths: Vec<PathBuf>,
     gc_config: Arc<GcConfig>,
-    verify_commit_signatures: bool,
+    versioning: VersioningFlags,
 ) -> Arc<GlobalEnv> {
     let globals = cljrs_stdlib::standard_env_with_paths_and_config(src_paths, gc_config);
-    if verify_commit_signatures {
+    if versioning.verify_commit_signatures {
         globals
             .verify_commit_signatures
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    if versioning.enforce_native_versions {
+        globals.set_enforce_native_versions(true);
+    }
+    // Opt-in pinned native packages (:rust/load :dylib in cljrs.edn).
+    cljrs_dylib::install(&globals);
     if let Ok(cwd) = std::env::current_dir() {
         apply_deps_config(&globals, &cwd);
     }
@@ -483,6 +660,8 @@ fn setup_globals(
             cljrs_io::init(g);
             #[cfg(feature = "net")]
             cljrs_net::init(g);
+            #[cfg(feature = "charset")]
+            cljrs_charset::init(g);
         };
         match guard.as_ref() {
             Some(drv) => drv.local.block_on(&drv.rt, async { init(&globals) }),
@@ -512,6 +691,9 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                 globals
                     .verify_commit_signatures
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if config.enforce_native_versions {
+                globals.set_enforce_native_versions(true);
             }
             // Load the native shared library (if :rust is configured) so that
             // native functions are registered before any Clojure code runs.
@@ -982,10 +1164,10 @@ fn run_tests_command(
     verbose: bool,
     gc_soft_limit_mb: Option<usize>,
     gc_hard_limit_mb: Option<usize>,
-    verify_commit_signatures: bool,
+    versioning: VersioningFlags,
 ) -> miette::Result<i32> {
     let gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-    let globals = setup_globals(src_paths, gc_config, verify_commit_signatures);
+    let globals = setup_globals(src_paths, gc_config, versioning);
 
     let namespaces = if namespaces.is_empty() {
         // Read the final source paths (which may include cljrs.edn :paths).

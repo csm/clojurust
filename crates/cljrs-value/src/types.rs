@@ -37,8 +37,8 @@ pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
         | Value::Double(_)
         | Value::Char(_)
         | Value::Uuid(_) => true,
-        // Arc-managed — not GcPtr.
-        Value::Resource(_) => true,
+        // Arc-managed — not GcPtr; always considered static.
+        Value::Resource(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
         // GcPtr variants.
         Value::BigInt(p) => p.is_static_alloc(),
         Value::BigDecimal(p) => p.is_static_alloc(),
@@ -121,6 +121,27 @@ impl Protocol {
             impls: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// Global protocol-extension generation, bumped on every `impls` mutation
+/// (`extend-type`, `extend-protocol`, `defrecord`/`reify` inline impls).
+///
+/// Inline caches for protocol dispatch (Phase 10.6, `rt_call_ic` in
+/// `cljrs-compiler`'s rt_abi) tag each cached `(dispatch type → impl fn)`
+/// entry with the generation observed at fill time; a later bump invalidates
+/// every cache entry at once, so re-extending a protocol mid-session is
+/// picked up on the next dispatch through any call site.
+static PROTOCOL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current protocol-extension generation (see [`bump_protocol_generation`]).
+pub fn protocol_generation() -> u64 {
+    PROTOCOL_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Invalidate all protocol-dispatch inline caches.  Must be called after
+/// every mutation of any [`Protocol::impls`] map.
+pub fn bump_protocol_generation() {
+    PROTOCOL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 impl cljrs_gc::Trace for Protocol {
@@ -251,7 +272,23 @@ impl Var {
             self.namespace,
             self.name
         );
-        *self.value.lock().unwrap() = Some(v);
+        // GC builds: heap-promotion fallback — a region-allocated value bound
+        // to a program-lifetime var is deep-copied to the heap (or the active
+        // regions are retired when it cannot be).  One depth check when no
+        // region is open.
+        let v = crate::publish::publish_value(v);
+        // Replace the binding, holding the lock only across the swap.  The
+        // previous value (if any) is handed to the JIT rebind hook so it can
+        // reclaim native code compiled for a now-superseded definition
+        // (Phase 10.2 — code unloading).  `v.clone()` is O(1) for the only
+        // values that carry compiled code (`Value::Fn`, a `GcPtr` clone).
+        let prev = {
+            let mut slot = self.value.lock().unwrap();
+            slot.replace(v.clone())
+        };
+        if let Some(prev) = prev {
+            crate::jit_hooks::notify_var_rebind(&prev, &v);
+        }
     }
 
     pub fn get_meta(&self) -> Option<Value> {
@@ -304,6 +341,9 @@ pub struct Atom {
 
 impl Atom {
     pub fn new(v: Value) -> Self {
+        // Heap-promotion fallback (GC builds): an atom is program-lifetime
+        // shared state, so its initial value must not be region-allocated.
+        let v = crate::publish::publish_value(v);
         Self {
             value: Mutex::new(v),
             meta: Mutex::new(None),
@@ -325,6 +365,8 @@ impl Atom {
              expression must be computed inside a StaticCtxGuard (i.e. inside \
              the swap! / reset! call) so it is allocated in the static arena"
         );
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         let mut guard = self.value.lock().unwrap();
         *guard = v.clone();
         v
@@ -754,6 +796,8 @@ pub struct Volatile {
 
 impl Volatile {
     pub fn new(v: Value) -> Self {
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         Self {
             value: Mutex::new(v),
         }
@@ -771,6 +815,8 @@ impl Volatile {
             "no-gc: Volatile::reset() received a region-local value — ensure the \
              new-value expression is inside a StaticCtxGuard (vreset! handles this)"
         );
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_value(v);
         *self.value.lock().unwrap() = v.clone();
         v
     }
@@ -877,6 +923,9 @@ impl CljxPromise {
 
     /// Deliver a value (no-op if already delivered).
     pub fn deliver(&self, v: Value) {
+        // GC builds: heap-promotion fallback — the promise may outlive (and be
+        // read from outside) any region scope active at delivery time.
+        let v = crate::publish::publish_value(v);
         let mut guard = self.value.lock().unwrap();
         if guard.is_none() {
             *guard = Some(v);

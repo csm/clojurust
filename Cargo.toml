@@ -25,7 +25,13 @@ members = [
     "crates/cljrs-wasm",
     "crates/cljrs-async",
     "crates/cljrs-io",
-    "crates/cljrs-net"]
+    "crates/cljrs-net",
+    "crates/cljrs-charset",
+    "crates/cljrs-lsp",
+    "crates/cljrs-nrepl",
+    "crates/cljrs-base64",
+    "crates/cljrs-jit",
+    "crates/cljrs-dylib"]
 resolver = "2"
 
 [workspace.package]
@@ -55,6 +61,11 @@ cljrs-vcs          = { path = "crates/cljrs-vcs",          version = "0.1.0" }
 cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0" }
 cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0" }
 cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
+cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
+cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
+cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0" }
+cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.0" }
+cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
@@ -75,11 +86,15 @@ serde        = "1.0.228"
 postcard     = "1.1.3"
 rustyline    = "18.0.0"
 libloading   = "0.8"
+arc-swap     = "1"
+tower-lsp     = "0.20"
+dashmap       = "6"
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"
 cranelift-frontend = "0.129.1"
 cranelift-module   = "0.129.1"
 cranelift-object   = "0.129.1"
+cranelift-jit      = "0.129.1"
 cranelift-native   = "0.129.1"
 target-lexicon     = "0.13"

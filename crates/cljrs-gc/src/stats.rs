@@ -25,6 +25,7 @@ pub struct GcStats {
     gc_alloc_bytes: AtomicU64,
     region_allocations: AtomicU64,
     region_alloc_bytes: AtomicU64,
+    region_poisons: AtomicU64,
     gc_collections: AtomicU64,
     gc_pause_total_nanos: AtomicU64,
     gc_objects_freed: AtomicU64,
@@ -38,6 +39,7 @@ impl GcStats {
             gc_alloc_bytes: AtomicU64::new(0),
             region_allocations: AtomicU64::new(0),
             region_alloc_bytes: AtomicU64::new(0),
+            region_poisons: AtomicU64::new(0),
             gc_collections: AtomicU64::new(0),
             gc_pause_total_nanos: AtomicU64::new(0),
             gc_objects_freed: AtomicU64::new(0),
@@ -62,6 +64,14 @@ impl GcStats {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Record one poisoning of the active regions (a publish-barrier hit on
+    /// a value that was opaque to heap promotion; the affected regions are
+    /// retired instead of reset).
+    #[inline]
+    pub fn record_region_poison(&self) {
+        self.region_poisons.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a completed stop-the-world collection.
     #[inline]
     pub fn record_gc_pause(&self, pause: Duration, freed_objects: u64, freed_bytes: u64) {
@@ -81,6 +91,7 @@ impl GcStats {
             gc_alloc_bytes: self.gc_alloc_bytes.load(Ordering::Relaxed),
             region_allocations: self.region_allocations.load(Ordering::Relaxed),
             region_alloc_bytes: self.region_alloc_bytes.load(Ordering::Relaxed),
+            region_poisons: self.region_poisons.load(Ordering::Relaxed),
             gc_collections: self.gc_collections.load(Ordering::Relaxed),
             gc_pause_total_nanos: self.gc_pause_total_nanos.load(Ordering::Relaxed),
             gc_objects_freed: self.gc_objects_freed.load(Ordering::Relaxed),
@@ -102,6 +113,7 @@ pub struct GcStatsSnapshot {
     pub gc_alloc_bytes: u64,
     pub region_allocations: u64,
     pub region_alloc_bytes: u64,
+    pub region_poisons: u64,
     pub gc_collections: u64,
     pub gc_pause_total_nanos: u64,
     pub gc_objects_freed: u64,
@@ -128,6 +140,7 @@ impl fmt::Display for GcStatsSnapshot {
             "  Region (bump) allocs:  {} ({} bytes)",
             self.region_allocations, self.region_alloc_bytes
         )?;
+        writeln!(f, "  Region poisons:        {}", self.region_poisons)?;
         writeln!(f, "  GC collections:        {}", self.gc_collections)?;
         writeln!(f, "  Total GC pause time:   {:.3?}", self.total_pause())?;
         writeln!(f, "  Objects freed by GC:   {}", self.gc_objects_freed)?;
@@ -224,6 +237,7 @@ mod tests {
             gc_alloc_bytes: 240,
             region_allocations: 3,
             region_alloc_bytes: 96,
+            region_poisons: 0,
             gc_collections: 1,
             gc_pause_total_nanos: 1_000_000,
             gc_objects_freed: 2,
@@ -232,6 +246,7 @@ mod tests {
         let s = format!("{snap}");
         assert!(s.contains("GC allocations:"));
         assert!(s.contains("Region (bump) allocs:"));
+        assert!(s.contains("Region poisons:"));
         assert!(s.contains("GC collections:"));
         assert!(s.contains("Total GC pause time:"));
         assert!(s.contains("Objects freed by GC:"));

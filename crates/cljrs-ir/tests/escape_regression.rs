@@ -313,6 +313,54 @@ fn stage4_promotes_non_inlineable_callee() {
 }
 
 #[test]
+fn stage4_call_with_region_threads_the_region_start_handle() {
+    // The rewritten `CallWithRegion` must carry the handle of the
+    // `RegionStart` the rewrite inserted, and the cloned variant must report
+    // a hidden region parameter — compiled code threads the handle as a
+    // trailing argument bound to the variant's `RegionParam`.
+    let ir = lower(
+        "(do
+           (defn make-pair [a b]
+             (let [f (fn [x] x)]
+               [a b]))
+           (defn use-pair [x] (count (make-pair x x))))",
+    );
+    let optimized = optimize(ir);
+
+    fn check(ir: &IrFunction) -> bool {
+        for block in &ir.blocks {
+            for inst in &block.insts {
+                if let Inst::CallWithRegion(_, name, _, region) = inst {
+                    // The region operand must be defined by a RegionStart in
+                    // the same function…
+                    let started = ir.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i, Inst::RegionStart(h) if h == region))
+                    });
+                    // …and the target variant must take the hidden parameter.
+                    let target_takes_param = ir
+                        .subfunctions
+                        .iter()
+                        .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
+                        .map(|sf| sf.takes_region_param())
+                        .unwrap_or(false);
+                    if started && target_takes_param {
+                        return true;
+                    }
+                }
+            }
+        }
+        ir.subfunctions.iter().any(check)
+    }
+    assert!(
+        check(&optimized),
+        "CallWithRegion must thread its RegionStart handle into a \
+         region-parameterised target; IR:\n{optimized}"
+    );
+}
+
+#[test]
 fn stage4_skipped_when_callee_result_escapes() {
     // The caller returns make-pair's result directly — call_dst is `Returns`,
     // not `NoEscape`.  Stage 4 must NOT rewrite the call site.
@@ -413,17 +461,16 @@ fn stage4_handles_callee_with_self_capture() {
 
     // Find the rewritten CallWithRegion and verify its arg count matches the
     // target subfunction's params count.
-    fn find_target_and_call<'a>(ir: &'a IrFunction) -> Option<(&'a Arc<str>, usize, usize)> {
+    fn find_target_and_call(ir: &IrFunction) -> Option<(&Arc<str>, usize, usize)> {
         for block in &ir.blocks {
             for inst in &block.insts {
-                if let Inst::CallWithRegion(_, name, args) = inst {
-                    if let Some(target) = ir
+                if let Inst::CallWithRegion(_, name, args, _) = inst
+                    && let Some(target) = ir
                         .subfunctions
                         .iter()
                         .find(|sf| sf.name.as_deref() == Some(name.as_ref()))
-                    {
-                        return Some((name, args.len(), target.params.len()));
-                    }
+                {
+                    return Some((name, args.len(), target.params.len()));
                 }
             }
         }
@@ -440,6 +487,125 @@ fn stage4_handles_callee_with_self_capture() {
     assert_eq!(
         arg_count, param_count,
         "CallWithRegion to {name} passes {arg_count} args but the target expects {param_count}",
+    );
+}
+
+#[test]
+fn stage4_co_promotes_container_contained_allocs() {
+    // `make-grid` returns a vector of three inner coordinate vectors.  The
+    // inner vectors are stored only into the returned outer vector, so they
+    // are reachable solely through it.  When the call result feeds `count`
+    // (a structural, non-extracting consumer) stage 4 should co-promote the
+    // whole nest: the outer vector AND all three inner vectors.  This is the
+    // `neighbours` showcase pattern in miniature.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn use-grid [a] (count (make-grid a))))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        call_with_region_count(&optimized) >= 1,
+        "stage 4 should rewrite the call to CallWithRegion; IR:\n{optimized}"
+    );
+    assert!(
+        region_alloc_count(&optimized) >= 4,
+        "outer vector + three inner vectors should all be region-promoted \
+         (expected >= 4 RegionAllocs); IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn stage4_deep_promotion_skipped_when_result_is_extracted() {
+    // Same nest, but the call result is element-*extracted* via `first` before
+    // being consumed.  The extracted inner vector could outlive the caller's
+    // region, so deep co-promotion must be skipped: only the outer container
+    // (the shallow `Returns` alloc) is region-promoted, leaving exactly one
+    // RegionAlloc.
+    let ir = lower(
+        "(do
+           (defn make-grid [a]
+             (let [f (fn [x] x)]
+               [[a a] [a a] [a a]]))
+           (defn pick [a] (count (first (make-grid a)))))",
+    );
+    let optimized = optimize(ir);
+    assert_eq!(
+        region_alloc_count(&optimized),
+        1,
+        "only the outer container should be promoted when the result is \
+         element-extracted; IR:\n{optimized}"
+    );
+}
+
+// ── Eager HOF fusion tests ───────────────────────────────────────────────────
+
+/// Count `CallKnown` insts whose known fn debug-prints as `name`, across tree.
+fn known_call_count(ir: &IrFunction, name: &str) -> usize {
+    let mut n = 0;
+    for block in &ir.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(_, kfn, _) = inst
+                && format!("{kfn:?}") == name
+            {
+                n += 1;
+            }
+        }
+    }
+    for sub in &ir.subfunctions {
+        n += known_call_count(sub, name);
+    }
+    n
+}
+
+#[test]
+fn count_filter_is_fused_to_count_filter() {
+    // `count` is the sole consumer of `filter`, so the pair fuses into the
+    // allocation-free `CountFilter` and the dead `filter` is removed.
+    let ir = lower("(count (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "Filter"),
+        0,
+        "the fused filter should be removed; IR:\n{optimized}"
+    );
+    assert_eq!(
+        known_call_count(&optimized, "Count"),
+        0,
+        "the count should become CountFilter; IR:\n{optimized}"
+    );
+    assert_eq!(known_call_count(&optimized, "CountFilter"), 1);
+}
+
+#[test]
+fn into_filter_is_fused() {
+    let ir = lower("(into [] (filter (fn [x] x) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Filter"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoFilter"), 1);
+}
+
+#[test]
+fn into_mapcat_is_fused() {
+    let ir = lower("(into #{} (mapcat (fn [x] [x x]) [1 2 3]))");
+    let optimized = optimize(ir);
+    assert_eq!(known_call_count(&optimized, "Mapcat"), 0);
+    assert_eq!(known_call_count(&optimized, "Into"), 0);
+    assert_eq!(known_call_count(&optimized, "IntoMapcat"), 1);
+}
+
+#[test]
+fn count_filter_not_fused_when_filter_escapes() {
+    // The filter result is used twice (count + returned), so it must not fuse.
+    let ir = lower("(let [s (filter (fn [x] x) [1 2 3])] [(count s) s])");
+    let optimized = optimize(ir);
+    assert_eq!(
+        known_call_count(&optimized, "CountFilter"),
+        0,
+        "filter with a non-count use must not fuse; IR:\n{optimized}"
     );
 }
 

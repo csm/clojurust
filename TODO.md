@@ -362,7 +362,7 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 - [x] Calling Rust trait methods on `NativeObject` values via protocol dispatch
 - [ ] Safety restrictions: document which Rust APIs are safe to call from GC-managed code
 - [ ] `cljx.rust` namespace with intrinsics (`rust/cast`, `rust/ptr`, `rust/unsafe`, etc.)
-- [ ] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime
+- [x] Dynamic linking: load compiled Rust `.so`/`.dylib` at runtime — project-local lib via `cljrs build-native` + `load_native_lib`; **pinned native packages** (`:rust/load :dylib`) via `cljrs-dylib` (build the dep's crate at a pinned commit, ABI-fingerprint handshake, register into the `ns@<commit>` namespace). Deferred: statically linking pinned native crates into AOT harnesses (`#[export]` inventory collision between two versions of one crate), and a C-ABI vtable to replace the Rust-ABI `&mut Registry` boundary
 - [x] RAII resource management: `with-open` macro + `close` builtin for deterministic cleanup of `Resource` values
 - [ ] (Stretch) `#rust` typed sublanguage: functions annotated `#rust` receive Rust-typed arguments with lifetime bounds enforced at the interop boundary, bypassing `Value` boxing entirely for those call sites
 
@@ -370,25 +370,84 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 
 ## Phase 10 — JIT Compiler
 
-- [x] Choose JIT backend (Cranelift recommended; LLVM as alternative)
-- [x] Define intermediate representation (IR) for clojurust forms
+A fourth execution tier that compiles hot functions and hot loops to native
+code in-process, so ad-hoc code (`cljrs run`, the REPL, `eval`) reaches
+AOT-class speed with no explicit compile step. Full architecture and rationale:
+[`docs/jit-plan.md`](docs/jit-plan.md). Milestones below map 1:1 to that
+document's layers.
+
+Foundations already in place:
+
+- [x] Choose JIT backend (Cranelift)
+- [x] Define intermediate representation (IR) for clojurust forms (ANF + SSA + CFG, `cljrs-ir`)
 - [x] Emit IR for core special forms and function calls
-- [ ] Type inference / specialization for numeric code paths
-- [ ] Inline caches for protocol dispatch and keyword lookup
-- [ ] OSR (on-stack replacement) to transition from interpreter to JIT mid-execution
-- [ ] Deoptimization path back to interpreter when assumptions are violated
-- [ ] JIT compilation threshold (invocation count trigger)
-- [ ] Integration with GC: patch compiled code roots, handle safepoints in native frames
-- [ ] Primitive unboxing: where type feedback confirms a value is always `i64` or `f64`, emit raw arithmetic on machine registers — no `Value` boxing, no GC allocation
-- [ ] Escape analysis: values that do not escape their defining scope (not returned, not captured, not stored) may be stack-allocated rather than heap-allocated through the GC
-- [ ] Call-site monomorphization: generate type-specialized copies of hot functions when call-site type profiles are stable (e.g. `(map inc xs)` where `xs` is always `Vec<i64>`)
 
-### Phase 10.1 — JIT Optimization
+### Phase 10.0 — Backend refactor
 
-- [ ] Profile allocation escape rates.
-- [ ] Speculate region allocation.
-- [ ] Guard and promote to heap if needed.
-- [ ] Specialize hot lookup sites further.
+- [x] Make `codegen.rs` generic over `cranelift_module::Module` (drives both `ObjectModule` for AOT and `JITModule` for JIT); AOT behavior unchanged
+
+### Phase 10.1 — Minimal JIT tier (first working JIT)
+
+- [x] New `cljrs-jit` crate (`cranelift-jit` + shared codegen); register `rt_abi` `extern "C"` symbols with `JITBuilder`; materialize constants via runtime calls (no `GcPtr`s in code)
+- [x] Per-arity invocation counter + threshold (`CLJRS_JIT_THRESHOLD`, CLI flag) in a `JitState` keyed by `ir_arity_id`
+- [x] Background-thread compilation with atomic code-pointer swap (never stall a hot call)
+- [x] Dispatch order JIT-native → Tier-1 IR → tree-walk at the `call_cljrs_fn` seam
+- [x] Conservative stack scanning of JIT frames for GC roots (sound under the non-moving collector); safepoint polls at loop back-edges and function entry
+- [x] Compile the set Tier-1 already handles (non-capturing, no destructuring/rest)
+
+### Phase 10.2 — Code unloading
+
+- [x] Per-version code tagged with `ir_arity_id` + epoch; mark prior arity stale on redefinition (var-rebind hook in `cljrs-value` `Var::bind` → `cljrs-jit` `on_var_rebind` → `code_cache::mark_stale`; dispatch pointer nulled so future calls fall back to the interpreter)
+- [x] Reclaim stale epochs at the existing STW safepoint, freeing only epochs with no live JIT frame (resolves the unload-vs-execute race) — per-thread active-frame tracking (`jit_state::push_jit_frame`/`live_epochs`) + `code_cache::reclaim_at_stw` (calls `JITModule::free_memory`), installed via `set_stw_reclaim_hook`
+
+### Phase 10.3 — Shrink the interpreter seam (ROI order)
+
+- [x] Destructured params: expand destructuring to explicit let-bindings in the IR prologue (lowering-only) — `lower_fn_body_destructured` runs the same prologue as inner `fn*` forms (`lower_destructure_binding`), driven by `CljxFnArity.destructure_params`/`destructure_rest` threaded through `lower_arity`; gate in `eager_lower_fn` removed
+- [x] Closures with captured bindings: capture lowering + closure-alloc codegen through the JIT — `compile_jit` now recursively declares + compiles closure subfunctions into the same `JITModule` (mirroring `aot.rs`), so `AllocClosure` resolves them. The "closure built by `rt_make_fn` then invoked via `rt_call` returns nil" symptom that blocked this was not a codegen bug — it was the missing-eval-context dispatch-seam bug below. Escaped-closure safety vs. code unloading: a closure value materialized by `rt_make_fn*` captures a raw pointer into the module and lives on the GC heap, invisible to the active-frame scan, so `rt_make_fn*` fires a closure-escape hook that **pins** the executing epoch (`code_cache::pin_epoch`); pinned modules are never freed (a deliberate bounded leak — precise reclamation needs a GC death notification for the closure value). Graceful decline (`lookup_user_func` → clean error) and the panic-resilient worker (`catch_unwind`) remain as the safety net for anything codegen still can't express.
+- [x] Variadic / rest params through codegen — codegen already compiles the `(fixed…, rest_list)` signature; the JIT-native dispatch path (`call_jit_native`) now packs the trailing call args into the rest list before invoking native code (mirroring `execute_ir`), fixing silently-dropped rest args (`(mixed 10 20 30 40 50)` → `[10 20 3 30]`, not `[10 20 0 nil]`)
+- [~] Promote special-cased ops to first-class `KnownFn`/IR instructions — `apply`, `atom`, `reset!`, `swap!`, `deref` are already `KnownFn`s with rt_abi bridges (mapped in `cljrs-ir/src/lower/known.rs`); `volatile!`/`vswap!`/`vreset!` remain. No longer blocked: the `rt_call`/HOF correctness bugs that made more rt_abi surface net-negative are fixed (below).
+
+  **Resolved: the pre-existing JIT-native correctness bugs.** Both "returns nil under JIT-native dispatch" symptoms — higher-order calls taking a function value (`reduce`/`map`/`filter` with `+`, `inc`, `even?`, or a lambda; any `(f x)` call of a function-valued argument) and in-place calls of a JIT-constructed closure — had a single root cause: **the JIT-native dispatch seam never pushed an eval context.** Every rt_abi bridge that re-enters Clojure (`rt_call`, `rt_load_global`, `call_global_fn`, the HOF bridges) dispatches via `cljrs_env::callback`'s thread-local context; Tier-1 (`execute_ir`) and the AOT preamble push one, `call_jit_native` did not — so `callback::invoke` failed and the bridges swallowed the error into nil. Fixed by installing a guarded eval context (callee's `defining_ns`) around the native call. A second silent-nil hole fixed at the same seam: an *uncaught* `(throw …)` inside native code stashes the value in rt_abi's thread-local and returns the nil sentinel; only an `rt_try` inside compiled code checked it, so the throw vanished (and the stale slot could misfire a later `rt_try`). The seam (and the OSR entry) now takes the pending exception via a hook and re-raises it as `EvalError::Thrown`. Regression-tested end-to-end in `crates/cljrs/tests/jit_seam_correctness.rs`.
+
+### Phase 10.4 — OSR (on-stack replacement)
+
+- [x] Loop back-edge counters at loop headers — `interpret_ir_with_osr` counts `RecurJump`s per header within one execution (lazily allocated; straight-line code pays nothing); crossing `osr_threshold()` (override → `CLJRS_OSR_THRESHOLD` → JIT threshold) issues an idempotent `jit_state::osr_request` to the background worker. Per-execution counting is deliberate: hot-within-one-call is exactly the case invocation tiering misses; loops spread over many short calls are already covered by the invocation counter
+- [x] OSR-entry compilation (entry block = loop header; live-ins as params) and mid-loop transfer of the interpreter register file into the native frame — `cljrs_ir::osr::build_osr_function` keeps the blocks reachable from the header, rewires header φs to take an extra edge from a fresh entry block (loop variables arrive as fresh params), passes other pre-loop values as params bound to their original `VarId`s, and drops `RegionEnd`s whose `RegionStart` ran in the interpreter (the interpreter frame closes those regions after the transfer). The worker compiles the variant through the ordinary backend, registers it under its own reclamation epoch (rebind staling covers OSR epochs via `take_osr_epochs`), and publishes `(fn_ptr, epoch, live_ins)`; the interpreter polls at loop-header entry (after φ resolution) and, on `Ready`, snapshots the live-in registers and calls native code with the same rooting + frame-epoch protocol as ordinary JIT-native calls. *Milestone holds:* a single-call 2M-iteration `loop`/`recur` script promotes to native mid-run (`crates/cljrs/tests/osr_promotion.rs`); any transform/compile failure marks the slot failed and the loop finishes at Tier 1
+
+### Phase 10.5 — Context-driven bump allocation
+
+- [x] Thread the active region pointer as a hidden parameter into JIT'd calls — `rt_region_start` returns the real `*mut Region`; `CallWithRegion` carries the caller's handle and codegen passes it as a hidden trailing argument bound to the callee's `RegionParam` (`IrFunction::abi_param_count`); `rt_region_alloc_*` bump directly into the passed region instead of a per-alloc thread-local lookup. The "call-site context" half is the new cross-defn registry (`cljrs-eval/src/defn_registry.rs`): each eagerly-lowered top-level defn is registered, later lowerings consume referenced defns as `ExternalDefn`s, and stage-4 promotion fires in the script/REPL flow (previously whole-program-AOT-only). Redefining a consumed defn invalidates its dependents (cached IR dropped, native code staled via the stale-epoch hook, lazy re-lower on next dispatch) — load-bearing because stage 4 clones the callee body into the caller. End-to-end: `crates/cljrs/tests/region_threading.rs`
+- [~] Call-site monomorphization of allocation strategy — the caller-region vs GC-heap choice is made per call site (stage-4 clones a region-parameterised `__rg` variant when the result is `NoEscape`; the heap path is the default `Call`). A distinct static-arena variant is not implemented: in GC builds "static arena" coincides with the GC heap (program-lifetime is the collector's default), and in no-gc builds the interpreter's `StaticCtxGuard` discipline already routes program-lifetime sinks (`def`/atom/`reset!`) to the static arena
+- [~] Treat each REPL form / script run as an arena scope; promote the result out before reset — the *promotion* half ships as the publish barriers below, which run while scopes are still live (a form-boundary copy would be too late). The form-wide arena itself is deliberately not adopted: with an always-open region, `box_coll_val`'s opportunistic regioning captures *unproven* allocations, and soundness would then require barriers on every mutation channel (transients, `aset!`, watches, metadata), not just the program-lifetime cells. Revisit if/when allocation sites are classified at codegen time instead of opportunistically
+- [x] Extend profile-driven scratch regions to the default GC build — analysis-driven regions now demonstrably run under the tracing collector on the JIT/script path (bit-0-tagged pointers skipped by the marker, live regions traced as roots, `GC_STATS` region counters as the milestone evidence), with a **heap-promotion fallback for escapers**: publish barriers at `Var::bind`, `Atom::new/reset`, `Volatile::new/reset`, `Promise::deliver`, and channel puts (`cljrs-value/src/publish.rs`) scan stored values for region-tagged boxes and deep-copy them to the heap (via the structured-clone machinery); values opaque to the scan (closures, unrealized lazy seqs, native objects) — and task spawns — instead *poison* the active regions, which are then retired (kept alive forever, traced as GC roots) rather than reset (`cljrs_gc::region::{poison_active_regions, close_region}`) — the bounded-leak escape hatch that keeps correctness independent of analysis perfection
+
+*Milestone evidence:* `region_threading.rs` runs an allocation-heavy hot cross-defn call 20k times under the JIT in the default GC build and asserts ≥10k region (bump) allocations in `GC_STATS` — allocations that previously all hit the GC heap.
+
+### Phase 10.6 — Specialization & inline caches
+
+- [x] Type inference / primitive unboxing (`i64`/`f64` in registers, no boxing, no GC alloc) — `cljrs-compiler/src/typeinfer.rs` assigns every IR var a `Repr` (`Boxed`/`Long`/`Double`/`Bool`) by forward dataflow (params seeded from type profiles; constants; arithmetic/comparison closure; phi meets, including recur back-edges); codegen keeps unboxed vars in registers — `iadd`/`fadd`/`icmp`/`fcmp` instead of `rt_add`/`rt_lt` bridge calls (each of which boxed a result on the GC heap) — and boxes only where a value flows into a boxed context (call arg, collection element, return, boxed phi edge). Sound by construction: unboxed ops are emitted only where the bridge semantics are bit-identical (`rt_add` on Long+Long is `wrapping_add` = `iadd`; mixed long/double promotes to f64 exactly as the bridges do; `Div`/`Rem`/cross-type `Eq` stay boxed). Unboxed booleans also skip `rt_truthiness` at branches
+- [x] Inline caches for protocol dispatch and keyword lookup — keyword constants compile to a per-call-site writable data slot (fast path: inline load + branch; the first execution interns via `rt_kw_ic_fill` into a permanently rooted global table — previously *every* execution of a keyword literal heap-allocated a fresh keyword, and `rt_const_keyword` now interns too); `Inst::Call` compiles to `rt_call_ic`, which caches `(ProtocolFn identity, dispatch type-tag, generation) → impl fn` per call site, skipping the per-dispatch `Arc<str>` tag allocation + protocol mutex + double hash lookup; the global protocol generation (`cljrs_value::protocol_generation`, bumped on every `extend-type`/`extend-protocol`/inline impl) invalidates every entry on re-extension. IC slots hold only table indices / interned pointers, so compiled modules stay free of GC roots; cached impl fns and interned keywords are kept alive by an IC root tracer registered on each allocating thread's heap
+- [x] Call-site monomorphization on stable type profiles — Tier-1 dispatch (`jit_state::record_call`) accumulates a per-parameter type bitmask (Long/Double/other; variadic rest params are never profiled) until the compile is queued; the JIT worker turns a monomorphic profile into per-parameter specs (`specs_from_profile`) and compiles a specialized entry: a prologue that guards each specialized parameter's runtime tag (`rt_value_tag`) and unboxes it into a register — which is what lets the inference above unbox whole loop bodies. Closures/region subfunction variants and OSR entries always compile generic. Disable with `CLJRS_JIT_NO_SPEC=1`; observability via `--jit-stats` (boxed-arith / deopt / IC counters)
+- [x] Deoptimization path back to Tier 1 when assumptions are violated — entry guards run before any side effect, so a failure returns a unique sentinel (`rt_deopt`; a `Box::leak`ed non-GC address no real result can alias) and the dispatch seam (`call_jit_native`) re-executes the call at Tier 1 — exact interpreter semantics for the violating call. Failures are counted per arity; crossing `CLJRS_JIT_DEOPT_LIMIT` (default 10) unpublishes the specialized code (module reclaimed through the existing stale-epoch path), bans the arity from re-specialization, and resets its counters so the ordinary hot path recompiles it generically
+
+*Milestone evidence:* `crates/cljrs/tests/jit_specialization.rs` — a hot monomorphic 20k-call loop's boxed-arithmetic bridge calls drop >5× vs the same run under `CLJRS_JIT_NO_SPEC=1`; Double calls against a Long-specialized function deopt with exact Tier-1 results and discard the specialization past the limit; keyword ICs fill once per call site across 20k iterations; protocol dispatch hits the IC and a mid-run `extend-type` is picked up at the same (already compiled) call site.
+
+### Phase 10.7 — Background IR lowering (warm tier) + cold IR eviction
+
+- [x] Warm threshold (Tier 0 → Tier 1) — tree-walked calls bump the per-arity counter (`jit_state::record_interp_call`); crossing `CLJRS_IR_THRESHOLD` (default 50; `--ir-threshold`; 0 disables) macro-expands the fn's arity bodies on the calling thread (macros need the interpreter — the runtime is single-mutator, so expansion cannot move off-thread) and enqueues the expanded `Form`s to the background `cljrs-ir-lower` worker (`cljrs-eval/src/lower_worker.rs`), which runs the Env-free half of lowering (ANF + inlining + escape analysis + region promotion, split out as `lower::lower_expanded_arity`) and publishes via `ir_cache::store_cached`. `cljrs_jit::init` no longer forces eager lowering; `CLJRS_EAGER_LOWER=1` restores it. The Tier-1 counter restarts at IR publish, so `CLJRS_JIT_THRESHOLD` measures pure Tier-1 calls with a full arg-type-profile window
+- [x] Scope: **user code only** — background lowering skips macros, async fns, capturing closures, bootstrap-era definitions (arity-id watermark snapshotted by `mark_compiler_ready`), and fns from builtin-source namespaces (clojure.test, clojure.string, …). Shipped namespaces keep their historical behavior (no IR unless opted in): they were never lowered by default before, and several of their patterns trip latent bugs (below)
+- [x] Rebind races — `defn_registry::snapshot_externals` records dependent edges atomically with reading the registry (REGISTRY read lock held across the DEPENDENTS write, serializing against `on_redefined`), and the lowering worker is the **only consumer** of relower marks: after `store_cached` it re-peeks `relower_marked` and re-lowers with fresh externals (≤3 attempts) if a rebind landed mid-flight. The dispatch seam only peeks (`relower_marked` + `lower_queued` dedup) — this also fixes the previously-broken relower path, which consumed the mark and then silently skipped re-lowering whenever eager lowering was off
+- [x] JIT publish guard — the worker publishes a whole-function compile only if the request's IR is still the arity's current cache entry (`Arc::ptr_eq`); otherwise the module is marked stale (fixes a pre-existing race where a compile from since-invalidated IR could resurrect stale native code)
+- [x] Cold IR eviction — `Cached` entries track coarse last-access; `ir_cache::sweep_idle` runs at the stop-the-world reclaim pass (`set_stw_reclaim_hook` is now a multi-hook registry) and evicts entries idle past `CLJRS_IR_CACHE_TTL` (default 600 s) — deliberately *colder* than native code. Arities with published native code or an in-flight compile are skipped (deopt fallback); `Unsupported` markers are kept; eviction drops the `JitEntry` (the fn re-warms from zero) and stales any OSR code
+- [x] Pre-existing bug fixed en route: `rt_alloc_vector`/`rt_alloc_map`/`rt_alloc_set`/`rt_alloc_list` formed `slice::from_raw_parts(null, 0)` for empty collection literals (codegen passes null for `n == 0`) — UB that aborts debug builds the moment any JIT-compiled fn builds an empty literal (e.g. a hot `(conj [] x)`)
+- [ ] Known pre-existing bugs surfaced (reproduce under `CLJRS_EAGER_LOWER=1` on older trees too; the reason builtin namespaces are excluded above): (1) JIT codegen of a seq-driven `loop*` (e.g. `(loop [s (seq coll) acc []] (if s (recur (next s) …) acc))`) compiles to an infinite loop — Tier-1 executes the same IR correctly; (2) Tier-1 IR closures in clojure.test patterns fail with `Arity { name: "<ir-closure>", expected: 2, got: 0 }` (`cargo test -p cljrs-stdlib --test compiler_clojure_tests` with `CLJRS_EAGER_LOWER=1`)
+- [ ] Known limitation: a long-running loop entered at Tier 0 cannot tier up mid-call (the tree-walker has no OSR); `CLJRS_EAGER_LOWER=1` is the escape hatch
+
+*Milestone evidence:* `crates/cljrs/tests/background_lowering.rs` — without `CLJRS_EAGER_LOWER`, a hot fn tiers tree-walk → background-lowered IR → JIT-native mid-run with per-iteration correctness; the debug log shows `background lower published`; rebinding a dependency mid-warm takes effect immediately; the worker runs without `cljrs_jit::init` (`CLJRS_NO_JIT=1`); `--ir-threshold 0` produces no lowering.
+
+### Phase H (deferred) — Async JIT
+
+- [ ] Emit Cranelift state machines with explicit resume points for `^:async` functions, integrating with the Tokio executor
 
 ---
 
@@ -409,7 +468,7 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 ## Phase 12 — REPL & Tooling
 
 - [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)
-- [ ] nREPL-compatible server for editor integration
+- [x] nREPL-compatible server for editor integration (`cljrs nrepl`, `cljrs-nrepl` crate)
 - [x] `cljx run <file>` — execute a `.cljrs` or `.cljc` source file
 - [x] `cljx eval '<expr>'` — evaluate expression from command line
 - [ ] Project / build system (`cljx.edn` project descriptor, dependency resolution)
@@ -459,5 +518,11 @@ Pattern: `(map f (map g xs))`, lower to single loop.
 - [ ] ClojureScript-style source-to-source compiler targeting WebAssembly
 - [ ] `clojure.core.async` compatible CSP channels (`go`, `chan`, `<!`, `>!`, `alts!`)
 - [ ] Native image / musl-linked static binaries for minimal deployment
-- [ ] Language Server Protocol (LSP) implementation for editor support
+- [~] Language Server Protocol (LSP) implementation for editor support
+  - [x] v1 (`cljrs-lsp` crate + `cljrs lsp` subcommand, syntactic/reader-based): parse
+        diagnostics (with per-top-level-form error recovery) and document-symbol outline;
+        UTF-8/UTF-16 position-encoding negotiation; FULL text sync
+  - [ ] v2 (semantic, evaluator-backed via `cljrs-eval` `GlobalEnv`): hover, completion,
+        go-to-definition, find-references
+  - [ ] INCREMENTAL text sync, semantic tokens
 - [ ] Transducers in core collection ops

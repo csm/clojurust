@@ -65,17 +65,194 @@ impl Registers {
 
 /// A region entry in the interpreter's local region stack.
 struct RegionEntry {
-    _region: Box<cljrs_gc::region::Region>,
-    // The region is also pushed onto the cljrs_gc thread-local REGION_STACK
-    // via push_region_raw.  We track it here for cleanup.
+    /// `Some` until closed; taken by `Drop`.  The region is also pushed onto
+    /// the cljrs_gc thread-local REGION_STACK via `push_region_raw`.
+    region: Option<Box<cljrs_gc::region::Region>>,
 }
 
 impl Drop for RegionEntry {
     fn drop(&mut self) {
-        // Pop from cljrs_gc's thread-local stack.
-        cljrs_gc::region::pop_region_guard();
-        // Box<Region> drop handles destructor execution and chunk freeing.
+        if let Some(region) = self.region.take() {
+            // Pops the thread-local stack entry, then resets the region — or
+            // retires it if a publish barrier poisoned it (Phase 10.5
+            // heap-promotion fallback).
+            cljrs_gc::region::close_region(region);
+        }
     }
+}
+
+/// Per-execution region state: the owned scope stack plus the handle map
+/// binding region `VarId`s to their concrete regions.
+///
+/// The handle map is what makes `RegionAlloc(dst, region, …)` allocate into
+/// the *named* region rather than blindly into the innermost open scope —
+/// essential once a region-parameterised callee opens scopes of its own: an
+/// alloc naming the inherited `RegionParam` must go into the caller's region
+/// even while an inner scope is on top of the stack.  (Compiled code gets the
+/// same semantics by passing the `*mut Region` handle to `rt_region_alloc_*`.)
+#[derive(Default)]
+struct RegionFrame {
+    stack: Vec<RegionEntry>,
+    /// `region VarId → live region` for every `RegionStart`/`RegionParam` in
+    /// this frame.  Functions have at most a handful of region vars.
+    handles: Vec<(VarId, *mut cljrs_gc::region::Region)>,
+    /// The caller's region, when this frame is a region-parameterised callee
+    /// entered via `CallWithRegion`.
+    inherited: Option<*mut cljrs_gc::region::Region>,
+}
+
+impl RegionFrame {
+    fn bind(&mut self, var: VarId, region: *mut cljrs_gc::region::Region) {
+        self.handles.push((var, region));
+    }
+
+    fn lookup(&self, var: VarId) -> Option<*mut cljrs_gc::region::Region> {
+        self.handles
+            .iter()
+            .rev()
+            .find(|(v, _)| *v == var)
+            .map(|&(_, r)| r)
+    }
+}
+
+/// Allocate `val` into `target` when given, falling back to the innermost
+/// thread-local region (then the GC heap).
+fn region_alloc_val<T: cljrs_gc::Trace + 'static>(
+    target: Option<*mut cljrs_gc::region::Region>,
+    val: T,
+) -> cljrs_gc::GcPtr<T> {
+    match target {
+        // SAFETY: handles are only bound to regions owned by a live
+        // `RegionEntry` of this or a caller's frame.
+        Some(region) => unsafe { (*region).alloc(val) },
+        None => {
+            if cljrs_gc::region::region_is_active() {
+                unsafe { cljrs_gc::region::try_alloc_in_region(val).unwrap() }
+            } else {
+                GcPtr::new(val)
+            }
+        }
+    }
+}
+
+// ── OSR (on-stack replacement) bookkeeping ──────────────────────────────────
+
+/// Per-execution OSR state — Phase 10.4.
+///
+/// Allocated lazily on the first loop back-edge of an OSR-eligible execution
+/// (a top-level arity dispatched through `execute_ir`), so straight-line
+/// functions pay nothing.  Back-edge counts are local to one execution on
+/// purpose: a loop that is hot *within a single call* is exactly the case
+/// invocation-count tiering cannot promote; loops spread over many short
+/// calls are already covered by the invocation counter.
+struct OsrLocal {
+    arity_id: u64,
+    threshold: u32,
+    /// Back-edge count per loop header (`BlockId.0`).
+    counts: std::collections::HashMap<u32, u32>,
+    /// Header we are waiting on: compilation requested (or already published),
+    /// checked at each loop-header entry.
+    polling: Option<BlockId>,
+    /// Headers that must not be polled or re-requested in this execution
+    /// (compilation failed, or a transfer was declined).
+    dead: std::collections::HashSet<u32>,
+}
+
+/// Record one loop back-edge to `target`.  Crossing the threshold requests OSR
+/// compilation (idempotent across executions via the global table).
+fn record_back_edge(
+    osr: &mut Option<Box<OsrLocal>>,
+    arity_id: u64,
+    target: BlockId,
+    ir_func: &IrFunction,
+) {
+    let ol = osr.get_or_insert_with(|| {
+        Box::new(OsrLocal {
+            arity_id,
+            threshold: crate::jit_state::osr_threshold().max(1),
+            counts: std::collections::HashMap::new(),
+            polling: None,
+            dead: std::collections::HashSet::new(),
+        })
+    });
+    if ol.polling == Some(target) || ol.dead.contains(&target.0) {
+        return;
+    }
+    let count = {
+        let c = ol.counts.entry(target.0).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if count == 1 {
+        // A previous execution may already have requested (or finished)
+        // compilation of this loop — start polling right away.
+        match crate::jit_state::osr_poll(arity_id, target.0) {
+            crate::jit_state::OsrPoll::Ready(_) | crate::jit_state::OsrPoll::Pending => {
+                ol.polling = Some(target);
+                return;
+            }
+            crate::jit_state::OsrPoll::Failed => {
+                ol.dead.insert(target.0);
+                return;
+            }
+            crate::jit_state::OsrPoll::NotRequested => {}
+        }
+    }
+    if count >= ol.threshold {
+        crate::jit_state::osr_request(arity_id, target.0, ir_func);
+        ol.polling = Some(target);
+    }
+}
+
+/// Transfer this execution into compiled OSR-entry code: snapshot the live-in
+/// registers, call the native entry, and hand back its result as the result of
+/// the whole call.
+///
+/// Returns `None` (caller keeps interpreting) if any live-in register is not
+/// yet initialized — a conservatively declined transfer, not an error.
+fn try_osr_enter(
+    slot: &crate::jit_state::OsrSlot,
+    regs: &Registers,
+    env: &mut Env,
+) -> Option<EvalResult> {
+    let mut call_args: Vec<Value> = Vec::with_capacity(slot.live_ins.len());
+    for var in slot.live_ins.iter() {
+        match regs.values.get(var.0 as usize).and_then(|v| v.as_ref()) {
+            Some(v) => call_args.push(v.clone()),
+            None => return None,
+        }
+    }
+    cljrs_logging::feat_debug!(
+        "jit",
+        "osr entering native code ({} live-ins, epoch={})",
+        call_args.len(),
+        slot.epoch
+    );
+
+    // Same protocol as `call_jit_native` (apply.rs): keep the backing module
+    // alive for the duration of the frame, root the caller env and the
+    // snapshot, and track allocations made inside the native frame.
+    let _jit_frame = crate::jit_state::push_jit_frame(slot.epoch);
+    let _caller_root = cljrs_env::gc_roots::push_env_root(env);
+    let _arg_roots = cljrs_env::gc_roots::root_values(&call_args);
+    let _alloc_frame = cljrs_gc::push_alloc_frame();
+
+    let arg_ptrs: Vec<*const Value> = call_args.iter().map(|v| v as *const Value).collect();
+    // SAFETY: fn_ptr was produced by Cranelift JIT with the C ABI and exactly
+    // `live_ins.len()` `*const Value` params (`build_osr_function` caps this at
+    // the dispatch limit); all arg pointers are live for the call.
+    let result_ptr = unsafe { crate::jit_state::dispatch_jit_call(slot.fn_ptr, &arg_ptrs) };
+    // SAFETY: result_ptr points to a live Value in ALLOC_ROOTS; clone it
+    // before the alloc frame drops.
+    let result = unsafe { (*result_ptr).clone() };
+
+    // Same as `call_jit_native`: an uncaught `(throw …)` inside native code
+    // stashes the thrown value and returns the nil sentinel — surface it as an
+    // error while the alloc frame still roots it.
+    if let Some(thrown) = crate::jit_state::take_pending_exception() {
+        return Some(Err(cljrs_env::error::EvalError::Thrown(thrown)));
+    }
+    Some(Ok(result))
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -98,6 +275,36 @@ pub fn interpret_ir(
     ns: &Arc<str>,
     env: &mut Env,
 ) -> EvalResult {
+    interpret_ir_with_osr(ir_func, args, globals, ns, env, None)
+}
+
+/// Like [`interpret_ir`], with OSR enabled when `osr_arity_id` is given.
+///
+/// `osr_arity_id` is the `ir_arity_id` under which loop back-edges are counted
+/// and OSR-compiled entries are published.  Pass `None` (or use
+/// [`interpret_ir`]) for executions that have no stable arity identity, e.g.
+/// IR closures and region-parameterised subfunction calls.
+pub fn interpret_ir_with_osr(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
+) -> EvalResult {
+    interpret_ir_inner(ir_func, args, globals, ns, env, osr_arity_id, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpret_ir_inner(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
+    inherited_region: Option<*mut cljrs_gc::region::Region>,
+) -> EvalResult {
     // GC safepoint at function entry.
     cljrs_env::gc_roots::gc_safepoint(env);
 
@@ -106,7 +313,10 @@ pub fn interpret_ir(
     // The Box<[Option<Value>]> slice address is stable; this guard pops the
     // root entry when interpret_ir returns (or unwinds).
     let _regs_root = cljrs_env::gc_roots::root_option_values(&regs.values);
-    let mut region_stack: Vec<RegionEntry> = Vec::new();
+    let mut region_frame = RegionFrame {
+        inherited: inherited_region,
+        ..RegionFrame::default()
+    };
 
     // Bind parameters to registers.
     for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
@@ -134,6 +344,10 @@ pub fn interpret_ir(
     let mut current_block_idx: usize = 0;
     let mut prev_block_id = BlockId(u32::MAX); // sentinel
 
+    // Lazily allocated OSR back-edge state (only for OSR-eligible executions
+    // that actually take a loop back-edge).
+    let mut osr: Option<Box<OsrLocal>> = None;
+
     loop {
         let block = &ir_func.blocks[current_block_idx];
 
@@ -149,12 +363,38 @@ pub fn interpret_ir(
             }
         }
 
+        // OSR transfer: once a hot loop header's compilation has been
+        // requested, check for published native code each time we re-enter the
+        // header (i.e. after its phis — the loop variables — are resolved).
+        if let Some(ol) = osr.as_deref_mut()
+            && ol.polling == Some(block.id)
+        {
+            match crate::jit_state::osr_poll(ol.arity_id, block.id.0) {
+                crate::jit_state::OsrPoll::Ready(slot) => {
+                    // Regions opened before the loop stay open across the
+                    // transfer (the OSR variant drops their RegionEnds) and
+                    // are closed as usual when `region_stack` unwinds after
+                    // the native call returns.
+                    if let Some(result) = try_osr_enter(&slot, &regs, env) {
+                        return result;
+                    }
+                    ol.polling = None;
+                    ol.dead.insert(block.id.0);
+                }
+                crate::jit_state::OsrPoll::Failed => {
+                    ol.polling = None;
+                    ol.dead.insert(block.id.0);
+                }
+                _ => {}
+            }
+        }
+
         // Execute instructions.
         for inst in &block.insts {
             execute_inst(
                 inst,
                 &mut regs,
-                &mut region_stack,
+                &mut region_frame,
                 ir_func,
                 globals,
                 ns,
@@ -186,6 +426,12 @@ pub fn interpret_ir(
                 // GC safepoint at loop back-edge.
                 cljrs_env::gc_roots::gc_safepoint(env);
 
+                // Loop back-edge counter: a hot header triggers background OSR
+                // compilation; the transfer happens at the header entry above.
+                if let Some(arity_id) = osr_arity_id {
+                    record_back_edge(&mut osr, arity_id, *target, ir_func);
+                }
+
                 // Jump to the target (loop header) block.
                 // Phi nodes at the target block entry will resolve the new
                 // loop variable values based on this block as predecessor.
@@ -213,7 +459,7 @@ fn is_truthy(val: &Value) -> bool {
 fn execute_inst(
     inst: &Inst,
     regs: &mut Registers,
-    region_stack: &mut Vec<RegionEntry>,
+    regions: &mut RegionFrame,
     ir_func: &IrFunction,
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
@@ -370,30 +616,35 @@ fn execute_inst(
             let mut region = Box::new(cljrs_gc::region::Region::new());
             let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
             unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
-            region_stack.push(RegionEntry { _region: region });
+            regions.stack.push(RegionEntry {
+                region: Some(region),
+            });
+            regions.bind(*dst, region_ptr);
             regs.set(*dst, Value::Nil);
         }
 
-        Inst::RegionAlloc(dst, _region, kind, operands) => {
-            let val = alloc_in_region(*kind, operands, regs)?;
+        Inst::RegionAlloc(dst, region, kind, operands) => {
+            let val = alloc_in_region(*kind, operands, regs, regions.lookup(*region))?;
             regs.set(*dst, val);
         }
 
         Inst::RegionEnd(_region) => {
             // Pop and drop the region entry (Drop impl handles cleanup).
-            region_stack.pop();
+            regions.stack.pop();
         }
 
         Inst::RegionParam(dst) => {
-            // Marker bound at the entry of a region-parameterised callee
-            // variant.  The actual region is inherited via the thread-local
-            // region stack; the VarId is referenced as the (ignored) `region`
-            // operand of subsequent `RegionAlloc` instructions, so we just
-            // bind it to nil.
+            // Bind the caller's region (threaded through `CallWithRegion`) so
+            // `RegionAlloc`s naming this handle allocate into it even when
+            // this frame opens scopes of its own.  The register itself holds
+            // nil — region handles are not first-class values here.
+            if let Some(region) = regions.inherited {
+                regions.bind(*dst, region);
+            }
             regs.set(*dst, Value::Nil);
         }
 
-        Inst::CallWithRegion(dst, name, args) => {
+        Inst::CallWithRegion(dst, name, args, region) => {
             cljrs_env::gc_roots::gc_safepoint(env);
             let target = ir_func
                 .subfunctions
@@ -405,10 +656,18 @@ fn execute_inst(
                     ))
                 })?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
-            // The caller's RegionStart has already pushed a region onto the
-            // thread-local stack, so the callee's `RegionAlloc`s will pick it
-            // up via `try_alloc_in_region`.
-            let result = interpret_ir(target, arg_vals, globals, ns, env)?;
+            // Thread our region handle into the callee so its inherited
+            // `RegionParam` allocations land in *this* region — by name, not
+            // by stack position (the callee may open scopes of its own).
+            let result = interpret_ir_inner(
+                target,
+                arg_vals,
+                globals,
+                ns,
+                env,
+                None,
+                regions.lookup(*region),
+            )?;
             regs.set(*dst, result);
         }
 
@@ -487,7 +746,26 @@ fn const_to_value(c: &Const) -> Value {
 
 // ── Global value lookup ─────────────────────────────────────────────────────
 
-fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &str) -> EvalResult {
+fn load_global_value(
+    globals: &Arc<GlobalEnv>,
+    ns: &str,
+    name: &str,
+    defining_ns: &str,
+) -> EvalResult {
+    // Versioned reference (`name@hash`): resolve through the shared service,
+    // which lazily loads the immutable `ns@hash` namespace and looks up the
+    // base name in it (with the native HEAD fallback).
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (base_name, Some(commit)) = cljrs_value::symbol::split_version(name) {
+        return cljrs_env::versioned::resolve_versioned_value(
+            globals,
+            defining_ns,
+            Some(ns),
+            base_name,
+            commit,
+        );
+    }
+
     // Try direct namespace lookup first, then resolve as alias.
     let resolved_ns = globals
         .resolve_alias(defining_ns, ns)
@@ -501,6 +779,21 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
             "IR interpreter: unbound var {resolved_ns}/{name}"
         )));
     }
+
+    // Reference into a versioned namespace (`lib@hash`/name) that has not
+    // been loaded this session: load it lazily and retry the lookup.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (base, Some(commit)) = cljrs_value::symbol::split_version(&resolved_ns)
+        && !globals.is_loaded(&resolved_ns)
+    {
+        cljrs_env::versioned::ensure_versioned_ns_loaded(globals, base, commit)?;
+        if let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name)
+            && let Some(val) = cljrs_env::dynamics::deref_var(&var)
+        {
+            return Ok(val);
+        }
+    }
+
     // JVM class names resolve to themselves as symbols, mirroring eval_symbol.
     if cljrs_interp::eval::is_jvm_class_name(name) {
         return Ok(Value::symbol(cljrs_value::Symbol::simple(name)));
@@ -512,17 +805,17 @@ fn load_global_value(globals: &GlobalEnv, ns: &str, name: &str, defining_ns: &st
 
 // ── Region-aware allocation ─────────────────────────────────────────────────
 
-fn alloc_in_region(kind: RegionAllocKind, operands: &[VarId], regs: &Registers) -> EvalResult {
+fn alloc_in_region(
+    kind: RegionAllocKind,
+    operands: &[VarId],
+    regs: &Registers,
+    target: Option<*mut cljrs_gc::region::Region>,
+) -> EvalResult {
     match kind {
         RegionAllocKind::Vector => {
             let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
             let pv = PersistentVector::from_iter(items);
-            let ptr = if cljrs_gc::region::region_is_active() {
-                unsafe { cljrs_gc::region::try_alloc_in_region(pv).unwrap() }
-            } else {
-                GcPtr::new(pv)
-            };
-            Ok(Value::Vector(ptr))
+            Ok(Value::Vector(region_alloc_val(target, pv)))
         }
         RegionAllocKind::Map => {
             // Operands are flattened [k, v, k, v, ...].
@@ -540,24 +833,14 @@ fn alloc_in_region(kind: RegionAllocKind, operands: &[VarId], regs: &Registers) 
         RegionAllocKind::List => {
             let items: Vec<Value> = operands.iter().map(|v| regs.get_cloned(*v)).collect();
             let list = PersistentList::from_iter(items);
-            let ptr = if cljrs_gc::region::region_is_active() {
-                unsafe { cljrs_gc::region::try_alloc_in_region(list).unwrap() }
-            } else {
-                GcPtr::new(list)
-            };
-            Ok(Value::List(ptr))
+            Ok(Value::List(region_alloc_val(target, list)))
         }
         RegionAllocKind::Cons => {
             if operands.len() == 2 {
                 let h = regs.get_cloned(operands[0]);
                 let t = regs.get_cloned(operands[1]);
                 let cons = CljxCons { head: h, tail: t };
-                let ptr = if cljrs_gc::region::region_is_active() {
-                    unsafe { cljrs_gc::region::try_alloc_in_region(cons).unwrap() }
-                } else {
-                    GcPtr::new(cons)
-                };
-                Ok(Value::Cons(ptr))
+                Ok(Value::Cons(region_alloc_val(target, cons)))
             } else {
                 Ok(Value::Nil)
             }
@@ -866,6 +1149,26 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
         KnownFn::Count => builtin_call_native("count", &args),
+        KnownFn::CountFilter => {
+            // Synthesized fused op == (count (filter pred coll)).
+            let filter_fn = load_builtin(env, "filter")?;
+            let seq = apply_value(&filter_fn, args, env)?;
+            builtin_call_native("count", &[seq])
+        }
+        KnownFn::IntoFilter | KnownFn::IntoMapcat | KnownFn::IntoMap => {
+            // Synthesized fused ops == (into to (filter|mapcat|map f coll)).
+            let hof = match known_fn {
+                KnownFn::IntoFilter => "filter",
+                KnownFn::IntoMapcat => "mapcat",
+                _ => "map",
+            };
+            let mut args = args;
+            let to = args.remove(0);
+            let hof_fn = load_builtin(env, hof)?;
+            let seq = apply_value(&hof_fn, args, env)?;
+            let into_fn = load_builtin(env, "into")?;
+            apply_value(&into_fn, vec![to, seq], env)
+        }
         KnownFn::Contains => builtin_call_native("contains?", &args),
         KnownFn::Assoc => builtin_call_native("assoc", &args),
         KnownFn::Dissoc => builtin_call_native("dissoc", &args),
@@ -1271,35 +1574,44 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
 
     IR_LOWERING_ACTIVE.set(true);
 
+    // Arities lowered in this call, collected for the cross-defn registry
+    // (param_count, is_variadic, ir).
+    let mut registered: Vec<(usize, bool, Arc<IrFunction>)> = Vec::new();
+
     for arity in &f.arities {
         let arity_id = arity.ir_arity_id;
         if !crate::ir_cache::should_attempt(arity_id) {
             cached += 1;
+            // Keep already-cached arities in the registration so a partial
+            // re-lower doesn't drop them from the cross-defn registry.
+            if let Some(ir) = crate::ir_cache::get_cached(arity_id) {
+                registered.push((arity.params.len(), arity.rest_param.is_some(), ir));
+            }
             continue;
         }
 
-        // Don't lower arities with destructured params or rest params.
-        // lower-fn-body only binds the gensym'd placeholder names from
-        // arity.params; the body uses the original symbolic names (a, b, k, v,
-        // ...) that bind_fn_params would normally introduce.  Those names are
-        // absent from the IR context and would be emitted as LoadGlobal
-        // instructions referencing non-existent vars.
-        if !arity.destructure_params.is_empty() || arity.destructure_rest.is_some() {
-            crate::ir_cache::store_unsupported(arity_id);
-            continue;
-        }
+        // Destructured params are expanded into explicit IR-prologue bindings by
+        // lower_and_optimize_arity (passing the patterns below), so they no
+        // longer force a tree-walk fallback.
 
-        match crate::lower::lower_and_optimize_arity(
+        match crate::lower::lower_and_optimize_arity_tracked(
             f.name.as_deref(),
             &arity.params,
             arity.rest_param.as_ref(),
+            &arity.destructure_params,
+            arity.destructure_rest.as_ref(),
             &arity.body,
             &f.defining_ns,
             env,
             f.is_async,
         ) {
-            Ok(ir_func) => {
-                crate::ir_cache::store_cached(arity_id, Arc::new(ir_func));
+            Ok((ir_func, used_externals)) => {
+                let ir_func = Arc::new(ir_func);
+                crate::ir_cache::store_cached(arity_id, ir_func.clone());
+                // The lowering specialized against these defns — invalidate
+                // it (and re-lower lazily) if any of them is rebound.
+                crate::defn_registry::record_dependents(arity_id, used_externals);
+                registered.push((arity.params.len(), arity.rest_param.is_some(), ir_func));
                 lowered += 1;
             }
             Err(_) => {
@@ -1307,6 +1619,22 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
                 failed += 1;
             }
         }
+    }
+
+    // Publish this defn so later lowerings of *other* functions can
+    // region-promote calls into it (stage 4).  Anonymous, async, or capturing
+    // fns are not callable cross-defn by name, so skip them.
+    if !f.is_async
+        && !registered.is_empty()
+        && let Some(name) = f.name.as_deref()
+    {
+        crate::defn_registry::install_invalidation_hook();
+        crate::defn_registry::register_defn(
+            crate::lower::globals_id(env),
+            &f.defining_ns,
+            &Arc::from(name),
+            registered,
+        );
     }
 
     cljrs_logging::feat_debug!(

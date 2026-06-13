@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cljrs REPL</title>
+  <link rel="icon" href="/favicon.ico" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inconsolata:wght@200..900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Iosevka+Extended:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Gruvbox palette ────────────────────────────────────── */
+    :root {
+      color-scheme: light dark;
+
+      /* dark mode (default) */
+      --bg0-h:   #1d2021;
+      --bg0:     #282828;
+      --bg1:     #3c3836;
+      --bg2:     #504945;
+      --fg:      #ebdbb2;
+      --fg2:     #d5c4a1;
+      --fg3:     #bdae93;
+      --gray:    #928374;
+      --red:     #cc241d;
+      --red-b:   #fb4934;
+      --green:   #98971a;
+      --green-b: #b8bb26;
+      --yellow:  #d79921;
+      --yellow-b:#fabd2f;
+      --blue:    #458588;
+      --blue-b:  #83a598;
+      --purple:  #b16286;
+      --purple-b:#d3869b;
+      --aqua:    #689d6a;
+      --aqua-b:  #8ec07c;
+      --orange:  #d65d0e;
+      --orange-b:#fe8019;
+
+      --surface:   var(--bg0);
+      --surface1:  var(--bg1);
+      --surface2:  var(--bg2);
+      --text:      var(--fg);
+      --text-dim:  var(--fg3);
+      --text-faint:var(--gray);
+      --accent:    var(--yellow-b);
+      --accent2:   var(--aqua-b);
+      --accent3:   var(--orange-b);
+      --accent4:   var(--red-b);
+      --link:      var(--blue-b);
+      --link-hover:var(--aqua-b);
+      --rule:      var(--bg2);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --surface:   #f9f5d7;   /* gruvbox light bg0_h */
+        --surface1:  #f2e5bc;   /* bg0 */
+        --surface2:  #ebdbb2;   /* bg1 */
+        --text:      #3c3836;
+        --text-dim:  #504945;
+        --text-faint:#7c6f64;
+        --accent:    #b57614;   /* yellow dark */
+        --accent2:   #427b58;   /* aqua dark */
+        --accent3:   #af3a03;   /* orange dark */
+        --accent4:   #cc0303;   /* red dark */
+        --link:      #076678;   /* blue dark */
+        --link-hover:#427b58;
+        --rule:      #d5c4a1;
+      }
+    }
+
+    /* ── Reset & base ───────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      font-size: 16px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    body {
+      font-family: 'Inconsolata', 'Iosevka Extended', 'Fira Code', 'Source Code Pro',
+                   'JetBrains Mono', 'Cascadia Code', ui-monospace,
+                   'Menlo', 'Consolas', monospace;
+      line-height: 1.65;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────── */
+    .wrapper {
+      max-width: 740px;
+      margin: 0 auto;
+      padding: 3.5rem 1.5rem 5rem;
+    }
+
+    @media (min-width: 900px) {
+      .wrapper {
+        padding: 5rem 0 6rem;
+      }
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      margin-bottom: 3rem;
+      border-bottom: 1px solid var(--rule);
+      padding-bottom: 1.5rem;
+    }
+
+    .site-title {
+      font-size: clamp(1.8rem, 5vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--accent);
+      line-height: 1.1;
+    }
+
+    .site-title span { color: var(--text-dim); }
+
+    .tagline {
+      margin-top: 0.6rem;
+      font-size: 0.9rem;
+      color: var(--text-faint);
+    }
+
+    /* ── Sections ───────────────────────────────────────────── */
+    section {
+      margin-bottom: 2.8rem;
+    }
+
+    .section-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      margin-bottom: 0.75rem;
+    }
+
+    .section-label::before {
+      content: '## ';
+      color: var(--accent2);
+    }
+
+    p {
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      max-width: 62ch;
+    }
+
+    p + p { margin-top: 0.75rem; }
+
+    /* ── Code / inline ───────────────────────────────────────── */
+    code {
+      background: var(--surface2);
+      color: var(--accent3);
+      padding: 0.1em 0.35em;
+      border-radius: 2px;
+      font-size: 0.88em;
+    }
+
+    /* ── Link list ──────────────────────────────────────────── */
+    .link-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+    }
+
+    .link-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+    }
+
+    .link-list li::before {
+      content: '->';
+      color: var(--accent2);
+      flex-shrink: 0;
+      font-size: 0.85rem;
+    }
+
+    .link-list a {
+      color: var(--link);
+      text-decoration: none;
+      font-size: 0.92rem;
+      transition: color 0.12s;
+    }
+
+    .link-list a:hover,
+    .link-list a:focus-visible {
+      color: var(--link-hover);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .link-list .desc {
+      color: var(--text-faint);
+      font-size: 0.82rem;
+    }
+
+    .link-list .desc::before { content: ';; '; }
+
+    /* ── Inline badge ────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      padding: 0.1em 0.45em;
+      border-radius: 2px;
+      vertical-align: middle;
+      font-weight: 700;
+    }
+
+    .badge-alpha {
+      background: var(--surface2);
+      color: var(--orange-b, #fe8019);
+    }
+
+    /* ── Divider ─────────────────────────────────────────────── */
+    hr {
+      border: none;
+      border-top: 1px solid var(--rule);
+      margin: 2.5rem 0;
+    }
+
+    /* ── Footer ─────────────────────────────────────────────── */
+    footer {
+      margin-top: 4rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--rule);
+      font-size: 0.78rem;
+      color: var(--text-faint);
+    }
+
+    footer a {
+      color: var(--text-faint);
+      text-decoration: none;
+    }
+
+    footer a:hover { color: var(--link-hover); }
+
+    /* ── Focus outline ──────────────────────────────────────── */
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    /* ── REPL result entries ─────────────────────────────────── */
+    .repl-divider {
+      border: none;
+      border-top: 1px solid var(--rule);
+      margin: 2.5rem 0 1.5rem;
+      display: flex;
+      align-items: center;
+    }
+
+    .repl-divider::after {
+      content: ';; REPL — compiled to WASM · clojure.core.async supported';
+      margin-left: 0.75rem;
+      font-size: 0.72rem;
+      color: var(--text-faint);
+      white-space: nowrap;
+    }
+
+    .repl-entry {
+      margin: 0.6rem 0;
+      padding-left: 1rem;
+      border-left: 2px solid var(--accent2);
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }
+
+    .repl-in { color: var(--accent2); white-space: pre-wrap; word-break: break-word; }
+    .repl-in::before { content: 'user=> '; opacity: 0.5; }
+
+    .repl-print { color: var(--text-dim);  white-space: pre-wrap; word-break: break-word; }
+    .repl-val   { color: var(--accent);  white-space: pre-wrap; word-break: break-word; }
+    .repl-err   { color: var(--accent4);     white-space: pre-wrap; word-break: break-word; }
+
+    /* ── Inline REPL input area ──────────────────────────────── */
+    #repl-input-area {
+      margin-top: 1.5rem;
+      background: var(--surface1);
+      border-top: 1px solid var(--rule);
+    }
+
+    #repl-bar-inner {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 7px 0;
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+
+    #repl-prompt {
+      color: var(--accent2);
+      padding-top: 3px;
+      flex-shrink: 0;
+      user-select: none;
+      opacity: 0.7;
+    }
+
+    #repl-input-wrap {
+      flex: 1;
+      position: relative;
+      min-height: 26px;
+    }
+
+    /* Backdrop that mirrors the textarea's text so we can paint a
+       background behind matching brackets. The textarea sits on top with a
+       transparent background; this layer shows through behind it. All
+       text-layout properties here MUST match #repl-input exactly or the
+       marks will drift out of alignment. */
+    #repl-highlights {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      margin: 0;
+      padding: 1px 0;
+      border: none;
+      overflow: hidden;
+      pointer-events: none;
+      color: transparent;
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #repl-highlights mark {
+      background: var(--accent2);
+      color: transparent;
+      border-radius: 2px;
+      opacity: 0.4;
+    }
+
+    #repl-highlights mark.unmatched {
+      background: var(--accent4);
+      opacity: 0.5;
+    }
+
+    #repl-input {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      min-height: 26px;
+      max-height: 200px;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.65;
+      resize: none;
+      padding: 1px 0;
+      caret-color: var(--accent);
+    }
+
+    #repl-input:disabled { opacity: 0.35; cursor: not-allowed; }
+    #repl-input::placeholder { color: var(--text-faint); }
+
+    #repl-status {
+      padding-top: 4px;
+      font-size: 0.72rem;
+      color: var(--text-faint);
+      flex-shrink: 0;
+      opacity: 0.55;
+      white-space: nowrap;
+      transition: color 0.2s, opacity 0.2s;
+    }
+
+    #repl-status.ready { color: var(--accent2); opacity: 1; }
+    #repl-status.busy  { color: var(--accent);  opacity: 1; }
+    #repl-status.err   { color: var(--accent4);   opacity: 1; }
+
+    #repl-eval {
+      flex-shrink: 0;
+      padding: 2px 10px;
+      background: var(--surface2);
+      color: var(--accent2);
+      border: 1px solid var(--rule);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      line-height: 1.65;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+      white-space: nowrap;
+    }
+
+    #repl-eval:hover:not(:disabled) {
+      background: var(--rule);
+      color: var(--text);
+    }
+
+    #repl-eval:disabled { opacity: 0.3; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+
+    <header>
+      <div class="site-title">cljrs <span>repl</span> <span class="badge badge-alpha">alpha</span></div>
+      <div class="tagline">interactive Clojure dialect in your browser — compiled to WASM</div>
+    </header>
+
+    <section>
+      <div class="section-label">about</div>
+      <p>
+        This REPL runs the cljrs interpreter compiled to WebAssembly entirely in
+        your browser — no server, no installation. Type any Clojure expression and
+        press <code>Shift+Enter</code> or the <code>eval</code> button to run it.
+        Persistent data structures, <code>clojure.core.async</code>, and the full
+        cljrs standard library are available.
+      </p>
+      <p>
+        Use <code>Tab</code> to indent, <code>↑</code>/<code>↓</code> to navigate
+        history. Matching brackets are highlighted as you type.
+      </p>
+    </section>
+
+    <section>
+      <div class="section-label">links</div>
+      <ul class="link-list">
+        <li>
+          <a href="https://crates.io/crates/cljrs" target="_blank" rel="noopener">crates.io/crates/cljrs</a>
+          <span class="desc">published crate</span>
+        </li>
+        <li>
+          <a href="/">clj.rs</a>
+          <span class="desc">project home</span>
+        </li>
+      </ul>
+    </section>
+
+    <div id="repl-out"></div>
+
+    <div id="repl-input-area">
+      <div id="repl-bar-inner">
+        <span id="repl-prompt">user=>&nbsp;</span>
+        <div id="repl-input-wrap">
+          <div id="repl-highlights" aria-hidden="true"></div>
+          <textarea id="repl-input"
+            rows="1"
+            disabled
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Loading REPL…"
+            aria-label="Clojure REPL input"
+          ></textarea>
+        </div>
+        <button id="repl-eval" disabled aria-label="Evaluate">eval</button>
+        <span id="repl-status">loading…</span>
+      </div>
+    </div>
+
+    <footer>
+      <span>clj.rs &mdash; open source &mdash; </span>
+      <a href="https://github.com/csm/clojurust/blob/main/COPYING.md" target="_blank" rel="noopener">license</a>
+    </footer>
+
+  </div><!-- /.wrapper -->
+
+  <script>
+  (function () {
+    'use strict';
+
+    var WASM_JS  = 'https://docs.clj.rs/wasm/cljrs_wasm.js';
+    var WASM_BIN = 'https://docs.clj.rs/wasm/cljrs_wasm_bg.wasm';
+
+    var repl = null;
+    var history = [];
+    var historyIdx = -1;
+    var liveDraft = '';
+    var dividerInserted = false;
+
+    var input  = document.getElementById('repl-input');
+    var status = document.getElementById('repl-status');
+    var btn    = document.getElementById('repl-eval');
+    var out    = document.getElementById('repl-out');
+    var hl     = document.getElementById('repl-highlights');
+
+    // ── Auto-resize textarea ──────────────────────────────────
+    function resize() {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+    }
+
+    // ── Cursor-position helpers ───────────────────────────────
+    function onFirstLine() {
+      return input.value.lastIndexOf('\n', input.selectionStart - 1) === -1;
+    }
+    function onLastLine() {
+      return input.value.indexOf('\n', input.selectionStart) === -1;
+    }
+
+    // ── Bracket pairing & match highlight ─────────────────────
+    var OPEN  = { '(': ')', '[': ']', '{': '}' };
+    var CLOSE = { ')': '(', ']': '[', '}': '{' };
+
+    function escHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Classify each char as "code" (1) or not (0). Brackets inside string
+    // literals, line comments, or char literals (\() must be ignored so a
+    // "(" in a string can't pair with a real paren.
+    function scanCode(text) {
+      var n = text.length, code = new Uint8Array(n), i = 0;
+      while (i < n) {
+        var c = text[i];
+        if (c === ';') {                       // line comment to EOL
+          while (i < n && text[i] !== '\n') { i++; }
+          continue;
+        }
+        if (c === '"') {                       // string literal
+          i++;
+          while (i < n) {
+            if (text[i] === '\\') { i += 2; continue; }
+            if (text[i] === '"')  { i++; break; }
+            i++;
+          }
+          continue;
+        }
+        if (c === '\\') { i += 2; continue; }  // char literal (\( \space …)
+        code[i] = 1; i++;
+      }
+      return code;
+    }
+
+    // Is the caret position inside an (unterminated-so-far) string literal?
+    // Scans from the start, respecting escapes, char literals, and comments.
+    function inString(text, pos) {
+      var inStr = false, i = 0;
+      while (i < pos) {
+        var c = text[i];
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === '"')  { inStr = false; i++; continue; }
+          i++;
+        } else {
+          if (c === ';')  { while (i < pos && text[i] !== '\n') i++; continue; }
+          if (c === '"')  { inStr = true; i++; continue; }
+          if (c === '\\') { i += 2; continue; }
+          i++;
+        }
+      }
+      return inStr;
+    }
+
+    // From a bracket at `idx`, find its partner's index, or -1 if none /
+    // mismatched type. Scans only over code chars.
+    function matchFrom(text, code, idx) {
+      var c = text[idx], depth = 0, i;
+      if (OPEN[c]) {
+        for (i = idx; i < text.length; i++) {
+          if (!code[i]) continue;
+          var ch = text[i];
+          if (OPEN[ch]) depth++;
+          else if (CLOSE[ch]) { if (--depth === 0) return ch === OPEN[c] ? i : -1; }
+        }
+      } else if (CLOSE[c]) {
+        for (i = idx; i >= 0; i--) {
+          if (!code[i]) continue;
+          var ch2 = text[i];
+          if (CLOSE[ch2]) depth++;
+          else if (OPEN[ch2]) { if (--depth === 0) return ch2 === CLOSE[c] ? i : -1; }
+        }
+      }
+      return -1;
+    }
+
+    // Pick the bracket adjacent to the caret (preferring the one just to its
+    // left, i.e. the one you just typed) and resolve its match.
+    function bracketInfo() {
+      if (input.selectionStart !== input.selectionEnd) return null;
+      var text = input.value, pos = input.selectionStart;
+      var code = scanCode(text);
+      var cands = [pos - 1, pos], k;
+      for (k = 0; k < cands.length; k++) {
+        var idx = cands[k];
+        if (idx < 0 || idx >= text.length || !code[idx]) continue;
+        var c = text[idx];
+        if (OPEN[c] || CLOSE[c]) {
+          var m = matchFrom(text, code, idx);
+          return { a: idx, b: m, err: m === -1 };
+        }
+      }
+      return null;
+    }
+
+    function renderHighlights() {
+      if (!hl) return;
+      var text = input.value, info = bracketInfo();
+      if (!info) { hl.textContent = text; syncScroll(); return; }
+      var marks = [{ i: info.a, cls: info.err ? 'unmatched' : '' }];
+      if (info.b !== -1) marks.push({ i: info.b, cls: '' });
+      marks.sort(function (x, y) { return x.i - y.i; });
+      var html = '', last = 0, j;
+      for (j = 0; j < marks.length; j++) {
+        var mi = marks[j].i;
+        html += escHtml(text.slice(last, mi));
+        html += '<mark' + (marks[j].cls ? ' class="' + marks[j].cls + '"' : '') +
+                '>' + escHtml(text[mi]) + '</mark>';
+        last = mi + 1;
+      }
+      html += escHtml(text.slice(last));
+      hl.innerHTML = html;
+      syncScroll();
+    }
+
+    function syncScroll() {
+      if (!hl) return;
+      hl.scrollTop = input.scrollTop;
+      hl.scrollLeft = input.scrollLeft;
+    }
+
+    // ── Append a REPL entry ───────────────────────────────────
+    function appendEntry(code, printOut, result, isError) {
+      if (!dividerInserted) {
+        dividerInserted = true;
+        var hr = document.createElement('div');
+        hr.className = 'repl-divider';
+        out.appendChild(hr);
+      }
+
+      var entry = document.createElement('div');
+      entry.className = 'repl-entry';
+
+      var inDiv = document.createElement('div');
+      inDiv.className = 'repl-in';
+      inDiv.textContent = code;
+      entry.appendChild(inDiv);
+
+      if (printOut) {
+        var p = document.createElement('div');
+        p.className = 'repl-print';
+        p.textContent = printOut;
+        entry.appendChild(p);
+      }
+      if (result !== '') {
+        var r = document.createElement('div');
+        r.className = isError ? 'repl-err' : 'repl-val';
+        r.textContent = result;
+        entry.appendChild(r);
+      }
+
+      out.appendChild(entry);
+      scrollToInput();
+    }
+
+    // ── Scroll so the REPL input area stays visible ───────────
+    function scrollToInput() {
+      requestAnimationFrame(function () {
+        document.getElementById('repl-input-area').scrollIntoView(
+          { behavior: 'smooth', block: 'nearest' }
+        );
+      });
+    }
+
+    // ── Evaluate current input ────────────────────────────────
+    // repl.eval() is async (returns a Promise); disable controls while
+    // in-flight to prevent concurrent submissions racing on the LocalSet.
+    async function evalInput() {
+      var code = input.value;
+      if (!code.trim() || !repl) return;
+      if (history[history.length - 1] !== code) history.push(code);
+      historyIdx = -1;
+      liveDraft = '';
+
+      // Clear immediately so the user sees the form was accepted.
+      input.value = '';
+      resize();
+      renderHighlights();
+
+      input.disabled = true;
+      btn.disabled   = true;
+      status.textContent = '● eval…';
+      status.className   = 'busy';
+
+      try {
+        var res = await repl.eval(code);
+        appendEntry(code, res.output, res.result, res.is_error);
+      } catch (err) {
+        appendEntry(code, '', String(err), true);
+      } finally {
+        input.disabled = false;
+        btn.disabled   = false;
+        status.textContent = '● ready';
+        status.className   = 'ready';
+        input.focus();
+      }
+    }
+
+    btn.addEventListener('click', evalInput);
+
+    // ── Keyboard handling ─────────────────────────────────────
+    input.addEventListener('input', function () { resize(); renderHighlights(); });
+    input.addEventListener('keyup', renderHighlights);
+    input.addEventListener('click', renderHighlights);
+    input.addEventListener('scroll', syncScroll);
+    input.addEventListener('keydown', function (e) {
+
+      var s = input.selectionStart, t = input.selectionEnd, v = input.value;
+
+      // Auto-close: typing an opener inserts its matching closer and puts
+      // the caret between them; a selection gets wrapped instead.
+      if (OPEN[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        var open = e.key, close = OPEN[open], sel = v.slice(s, t);
+        input.value = v.slice(0, s) + open + sel + close + v.slice(t);
+        if (sel) {
+          input.selectionStart = s + 1;
+          input.selectionEnd = s + 1 + sel.length;
+        } else {
+          input.selectionStart = input.selectionEnd = s + 1;
+        }
+        resize();
+        renderHighlights();
+        return;
+      }
+
+      // Type-over: pressing a closer when it's already the next char just
+      // steps past it, so the auto-inserted closer isn't doubled.
+      if (CLOSE[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey &&
+          s === t && v[s] === e.key) {
+        e.preventDefault();
+        input.selectionStart = input.selectionEnd = s + 1;
+        renderHighlights();
+        return;
+      }
+
+      // Auto-pair string quotes. The same char opens and closes, so the
+      // rules differ from brackets: type over a closing quote, wrap a
+      // selection, insert a lone quote when escaping or already inside a
+      // string, otherwise insert an empty pair.
+      if (e.key === '"' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (s === t && v[s] === '"') {
+          input.selectionStart = input.selectionEnd = s + 1;
+        } else if (s !== t) {
+          input.value = v.slice(0, s) + '"' + v.slice(s, t) + '"' + v.slice(t);
+          input.selectionStart = s + 1;
+          input.selectionEnd = t + 1;
+        } else if (v[s - 1] === '\\' || inString(v, s)) {
+          input.value = v.slice(0, s) + '"' + v.slice(s);
+          input.selectionStart = input.selectionEnd = s + 1;
+        } else {
+          input.value = v.slice(0, s) + '""' + v.slice(s);
+          input.selectionStart = input.selectionEnd = s + 1;
+        }
+        resize();
+        renderHighlights();
+        return;
+      }
+
+      // Backspace over an empty pair "(|)" or ""|"" deletes both delimiters.
+      if (e.key === 'Backspace' && s === t && s > 0 &&
+          ((OPEN[v[s - 1]] && OPEN[v[s - 1]] === v[s]) ||
+           (v[s - 1] === '"' && v[s] === '"'))) {
+        e.preventDefault();
+        input.value = v.slice(0, s - 1) + v.slice(s + 1);
+        input.selectionStart = input.selectionEnd = s - 1;
+        resize();
+        renderHighlights();
+        return;
+      }
+
+      // Tab → two-space indent
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        var s = input.selectionStart;
+        input.value = input.value.slice(0, s) + '  ' + input.value.slice(s);
+        input.selectionStart = input.selectionEnd = s + 2;
+        resize();
+        return;
+      }
+
+      // Shift+Enter → evaluate
+      if (e.key === 'Enter' && e.shiftKey) {
+        e.preventDefault();
+        evalInput();
+        return;
+      }
+
+      // ↑ — history back (only on first line)
+      if (e.key === 'ArrowUp' && onFirstLine()) {
+        if (!history.length) return;
+        e.preventDefault();
+        if (historyIdx === -1) { liveDraft = input.value; historyIdx = history.length - 1; }
+        else if (historyIdx > 0) { historyIdx--; }
+        input.value = history[historyIdx];
+        resize();
+        input.selectionStart = input.selectionEnd = input.value.length;
+        return;
+      }
+
+      // ↓ — history forward (only on last line)
+      if (e.key === 'ArrowDown' && onLastLine()) {
+        if (historyIdx === -1) return;
+        e.preventDefault();
+        if (historyIdx < history.length - 1) {
+          historyIdx++;
+          input.value = history[historyIdx];
+        } else {
+          historyIdx = -1;
+          input.value = liveDraft;
+        }
+        resize();
+        input.selectionStart = input.selectionEnd = input.value.length;
+        return;
+      }
+    });
+
+    // ── Lazy WASM load ────────────────────────────────────────
+    function loadWasm() {
+      import(WASM_JS).then(function (mod) {
+        return mod.default(WASM_BIN).then(function () { return mod; });
+      }).then(function (mod) {
+        repl = new mod.Repl();
+        input.disabled = false;
+        btn.disabled = false;
+        input.placeholder = '(+ 1 2)  —  eval button or Shift+Enter  ·  Tab to indent  ·  ↑↓ history';
+        status.textContent = '● ready';
+        status.className = 'ready';
+        input.focus();
+      }).catch(function (err) {
+        status.textContent = '✕ failed';
+        status.className = 'err';
+        status.title = String(err);
+        console.error('[cljrs-wasm]', err);
+      });
+    }
+
+    if (typeof requestIdleCallback !== 'undefined') {
+      requestIdleCallback(loadWasm, { timeout: 4000 });
+    } else {
+      setTimeout(loadWasm, 250);
+    }
+  }());
+  </script>
+</body>
+</html>

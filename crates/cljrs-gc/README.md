@@ -9,7 +9,8 @@ fixed **64 MB** soft limit instead of consulting total system RAM.
 
 **Phase:** 8.1 (GcVisitor + Trace infrastructure) + 8.2 (GcBox/GcHeap
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
-`docs/no-gc-plan.md`) — implemented.
+`docs/no-gc-plan.md`) — implemented.  B3 (`StaticGcPtr`, `static_alloc`) —
+implemented.
 
 ---
 
@@ -19,6 +20,17 @@ Manages all Clojure runtime values.  `GcPtr<T>` is a raw pointer into either
 the GC heap or a bump-allocated region; `clone` is O(1); `drop` is a no-op.
 
 **Default build (GC mode):** memory is freed only during `GcHeap::collect`.
+
+**Region provenance tagging (GC mode):** region-allocated `GcPtr`s carry a
+low-bit tag (`REGION_PTR_TAG`; `GcBox<T>` is ≥8-aligned so bit 0 is free).
+`MarkVisitor::visit` checks the tag *without dereferencing* and **skips**
+region objects — a region whose scope has ended leaves dangling pointers whose
+headers are freed/reused memory, so tracing them would follow a garbage
+`trace_fn`.  Because the mark phase no longer traces *into* region objects,
+`GcHeap::collect` instead treats every live region on the thread's region
+stack as a root (`region::trace_active_regions`), so heap objects reachable
+only through a live region are still kept alive.  `GcPtr::raw()` masks the tag
+on every dereference; `GcPtr::is_region_alloc()` exposes it.
 
 **`no-gc` build:** every function call and every `loop` iteration pushes a
 scratch `Region`; intermediates are freed when the scope exits.  Return values
@@ -51,7 +63,11 @@ src/
                     in debug builds, tracks chunk ranges for is_static_addr()
   alloc_ctx.rs    — (no-gc mode) thread-local allocation context stack;
                     ScratchGuard, StaticCtxGuard
-  region.rs       — Region bump allocator, RegionGuard, thread-local region stack
+  region.rs       — Region bump allocator, RegionGuard, thread-local region
+                    stack; trace_active_regions() (GC-root scan of live regions);
+                    poison/retire protocol (Phase 10.5 heap-promotion fallback):
+                    poison_active_regions(), close_region(), retired-region
+                    root tracing
   cancellation.rs — (GC mode) STW coordination, MutatorGuard, safepoints
   config.rs       — (GC mode) GcConfig, GcCancellation (zero-sized proxy),
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
@@ -113,6 +129,9 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn get(&self) -> &T             // borrow; invalid after collect frees it
     pub fn ptr_eq(a: &Self, b: &Self) -> bool
 
+    // GC mode only:
+    pub fn is_region_alloc(&self) -> bool  // true if bump-allocated in a Region
+
     // no-gc + debug_assertions only:
     pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena
 }
@@ -120,10 +139,37 @@ impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
 ```
 
-### Free functions (no-gc only)
+### `StaticGcPtr<T: 'static>` (always available — Phase B3)
+
+Program-lifetime pointer safe to share across isolate threads.  Backed by the
+global `StaticArena` (in `no-gc` builds) or `Box::leak` (in GC builds).
+Unlike `GcPtr`, it wraps `*const T` directly (no `GcBox` header) and is
+`Send + Sync`.
 
 ```rust
-// debug_assertions only:
+pub struct StaticGcPtr<T: 'static>(NonNull<T>);
+
+impl<T: 'static> StaticGcPtr<T> {
+    pub fn get(&self) -> &T
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool
+}
+impl<T: 'static> Clone for StaticGcPtr<T> { /* O(1) NonNull copy */ }
+
+/// Allocate `value` as program-lifetime memory.
+/// no-gc: StaticArena bump-alloc; GC: Box::leak.
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+```
+
+### Free functions
+
+```rust
+// always:
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+
+// no-gc only:
+pub fn static_arena() -> &'static StaticArena;
+
+// no-gc + debug_assertions only:
 pub fn is_static_addr(addr: usize) -> bool;  // checks the StaticArena chunk registry
 ```
 
@@ -207,6 +253,26 @@ Destructors run on `reset()` or `drop`.
 RAII guard that pushes a `Region` onto the thread-local stack. Use with
 `try_alloc_in_region()` for opportunistic region allocation.
 
+### Region poisoning / retirement (Phase 10.5)
+
+```rust
+/// Mark every region currently active on this thread: each will be *retired*
+/// (kept alive forever and traced as a GC root) instead of reset when its
+/// scope closes.  No-op when no region is active.
+pub fn poison_active_regions();
+
+/// Close a region whose scope ended: pop the thread-local stack entry, then
+/// reset/drop the region — or retire it if poisoned.  All owners of
+/// stack-registered regions (rt_abi, the IR interpreter) close through here.
+pub fn close_region(region: Box<Region>);
+```
+
+The heap-promotion fallback: when a publish barrier
+(`cljrs_value::publish::publish_value`) meets a value it can neither verify
+nor deep-copy while regions are open, it poisons them.  Retired regions are a
+deliberate bounded leak (mirroring the JIT's pinned epochs) that can never
+dangle; `GcHeap::collect` traces them as roots alongside the active stack.
+
 ### `stats::GcStats` and `GC_STATS`
 
 ```rust
@@ -216,6 +282,7 @@ impl GcStats {
     pub const fn new() -> Self
     pub fn record_gc_alloc(&self, bytes: usize)
     pub fn record_region_alloc(&self, bytes: usize)
+    pub fn record_region_poison(&self)
     pub fn record_gc_pause(&self, pause: Duration, freed_objects: u64, freed_bytes: u64)
     pub fn snapshot(&self) -> GcStatsSnapshot
 }

@@ -1,0 +1,23 @@
+[package]
+name = "cljrs-nrepl"
+version = "0.1.0"
+edition = "2024"
+description = "nREPL server for clojurust — bencode wire protocol for editor integration"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-gc       = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-eval     = { workspace = true }
+cljrs-builtins = { workspace = true }
+miette    = { workspace = true }
+thiserror = { workspace = true }
+# The server needs async TCP plus a runtime; pin a richer tokio feature set
+# than the workspace default (which omits net/io-util), same as cljrs-lsp.
+tokio = { version = "1.50.0", features = ["rt", "net", "io-util", "sync", "macros", "time"] }
+
+[dev-dependencies]
+cljrs-stdlib = { workspace = true }

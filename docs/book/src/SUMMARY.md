@@ -27,6 +27,8 @@
 - [Overview](async-io/index.md)
 - [core.async](async-io/async.md)
 - [Asynchronous I/O](async-io/io.md)
+- [Charset encoding](async-io/charset.md)
+- [Networking](async-io/net.md)
 
 # Rust Interop
 
@@ -36,3 +38,9 @@
 - [The `#[export]` macro](rust-interop/export-macro.md)
 - [Interpreter mode](rust-interop/interpreter.md)
 - [AOT mode](rust-interop/aot.md)
+
+# Memory Management
+
+- [Overview](memory/index.md)
+- [The bump allocator](memory/bump-allocator.md)
+- [JIT & tiered execution](memory/jit.md)

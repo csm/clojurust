@@ -2,11 +2,14 @@
 //!
 //! Rewrites non-escaping allocations to region-backed allocations scoped
 //! over the minimal CFG subgraph that covers the allocation and all its uses.
-//! Mirrors `cljrs.compiler.optimize`.
 
 use std::collections::{HashMap, HashSet};
 
-use super::escape::{EscapeContext, EscapeState, analyze, make_context};
+use std::sync::Arc;
+
+use super::escape::{
+    EscapeContext, EscapeState, analyze, build_use_chains, make_context_with_externals,
+};
 use super::inline::inline as inline_pass;
 use super::regionalize::promote_cross_fn_allocs;
 use crate::{Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Terminator, VarId};
@@ -407,9 +410,9 @@ fn emit_region_for_alloc(
     }
 
     let region_var = VarId(*next_var);
-    *next_var += 1;
 
     // Rewrite the alloc instruction in alloc_block → RegionAlloc
+    let mut rewrote = false;
     for block in &mut ir_func.blocks {
         if block.id == alloc_block {
             for inst in &mut block.insts {
@@ -418,10 +421,18 @@ fn emit_region_for_alloc(
                 {
                     let operands = alloc_operands(inst);
                     *inst = Inst::RegionAlloc(alloc_var, region_var, kind, operands);
+                    rewrote = true;
                 }
             }
         }
     }
+    // A non-promotable alloc (e.g. a closure) must not leave an *empty*
+    // scope behind: in compiled code any escaping collection boxed while the
+    // scope is active (`box_coll_val`) would die at its RegionEnd.
+    if !rewrote {
+        return ir_func;
+    }
+    *next_var += 1;
 
     // Insert RegionStart at head of `start` block
     for block in &mut ir_func.blocks {
@@ -509,6 +520,7 @@ fn is_scalar_knownfn(kfn: &KnownFn) -> bool {
             | KnownFn::Lte
             | KnownFn::Gte
             | KnownFn::Count
+            | KnownFn::CountFilter
             | KnownFn::IsNil
             | KnownFn::IsSeq
             | KnownFn::IsVector
@@ -567,7 +579,7 @@ fn inst_dst(inst: &Inst) -> Option<VarId> {
         | Inst::RegionStart(d)
         | Inst::RegionAlloc(d, _, _, _)
         | Inst::RegionParam(d)
-        | Inst::CallWithRegion(d, _, _) => Some(*d),
+        | Inst::CallWithRegion(d, _, _, _) => Some(*d),
         Inst::Await { dst, .. } => Some(*dst),
         Inst::Spawn { dst, .. } => Some(*dst),
         Inst::ChanTake { dst, .. } => Some(*dst),
@@ -642,11 +654,126 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
     }
 }
 
+// ── Eager HOF fusion ─────────────────────────────────────────────────────────
+
+/// Fuse lazy HOFs into their eager, compiled consumers:
+///
+/// * `(count  (filter pred coll))` → `CountFilter(pred, coll)`
+/// * `(into to (filter pred coll))` → `IntoFilter(to, pred, coll)`
+/// * `(into to (mapcat f  coll))`   → `IntoMapcat(to, f, coll)`
+/// * `(into to (map f  coll))`      → `IntoMap(to, f, coll)`  — also fuses
+///   `(into to (for [x coll] body))`, since the minimal `for` macro expands
+///   to `map`.
+///
+/// fired only when the lazy producer's result is consumed *exactly once*, by
+/// the consumer it fuses with — so no laziness or seq identity is relied upon.
+/// The consumers (`count`/`into`) fully realize their source, so the eager
+/// fusion is observationally identical while skipping the interpreted lazy-seq
+/// realization (Form re-walking, symbol re-parsing) and the per-element cons
+/// allocations that dominate `samples/life.cljrs`'s `step`.
+///
+/// The dead producer instruction is removed once its consumer is rewritten.
+fn fuse_eager_hofs(mut ir_func: IrFunction) -> IrFunction {
+    ir_func.subfunctions = ir_func
+        .subfunctions
+        .into_iter()
+        .map(fuse_eager_hofs)
+        .collect();
+
+    let uses = build_use_chains(&ir_func);
+
+    // seq_var → (producer_fn, arg0, arg1) for every `filter`/`mapcat` whose
+    // result is used exactly once.
+    let mut producers: HashMap<VarId, (KnownFn, VarId, VarId)> = HashMap::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            if let Inst::CallKnown(
+                dst,
+                kfn @ (KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map),
+                args,
+            ) = inst
+                && args.len() == 2
+                && uses.get(dst).map(|u| u.len() == 1).unwrap_or(false)
+            {
+                producers.insert(*dst, (kfn.clone(), args[0], args[1]));
+            }
+        }
+    }
+    if producers.is_empty() {
+        return ir_func;
+    }
+
+    // Decide fusions by inspecting consumers.  consumer_dst → (fused_fn, args);
+    // remove_seqs → producer instructions made dead.
+    let mut rewrites: HashMap<VarId, (KnownFn, Vec<VarId>)> = HashMap::new();
+    let mut remove_seqs: HashSet<VarId> = HashSet::new();
+    for block in &ir_func.blocks {
+        for inst in &block.insts {
+            let Inst::CallKnown(cdst, cfn, cargs) = inst else {
+                continue;
+            };
+            match cfn {
+                // (count seq) where seq = (filter pred coll)
+                KnownFn::Count if cargs.len() == 1 => {
+                    if let Some((KnownFn::Filter, pred, coll)) = producers.get(&cargs[0]) {
+                        rewrites.insert(*cdst, (KnownFn::CountFilter, vec![*pred, *coll]));
+                        remove_seqs.insert(cargs[0]);
+                    }
+                }
+                // (into to seq) where seq = (filter pred coll) | (mapcat f coll)
+                KnownFn::Into if cargs.len() == 2 => {
+                    let to = cargs[0];
+                    if let Some((prod, a0, a1)) = producers.get(&cargs[1]) {
+                        let fused = match prod {
+                            KnownFn::Filter => KnownFn::IntoFilter,
+                            KnownFn::Mapcat => KnownFn::IntoMapcat,
+                            KnownFn::Map => KnownFn::IntoMap,
+                            _ => continue,
+                        };
+                        rewrites.insert(*cdst, (fused, vec![to, *a0, *a1]));
+                        remove_seqs.insert(cargs[1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return ir_func;
+    }
+
+    for block in &mut ir_func.blocks {
+        // Drop the now-dead producer instructions.
+        block.insts.retain(|inst| match inst {
+            Inst::CallKnown(dst, KnownFn::Filter | KnownFn::Mapcat | KnownFn::Map, _) => {
+                !remove_seqs.contains(dst)
+            }
+            _ => true,
+        });
+        // Rewrite each fused consumer in place.
+        for inst in &mut block.insts {
+            if let Inst::CallKnown(dst, cfn, cargs) = inst
+                && let Some((fused_fn, fused_args)) = rewrites.get(dst)
+            {
+                *cfn = fused_fn.clone();
+                *cargs = fused_args.clone();
+            }
+        }
+    }
+
+    ir_func
+}
+
 // ── Top-level pass ───────────────────────────────────────────────────────────
+
+/// The `(ns, name)` set of cross-defn externals an optimization run consulted.
+pub type UsedExternals = HashSet<(Arc<str>, Arc<str>)>;
 
 /// Run all optimization passes on an IR function tree.
 ///
 /// Order:
+///   0. Eager HOF fusion (`fuse_eager_hofs`) — fuse count(filter),
+///      `count(filter …)` into the allocation-free `CountFilter`.
 ///   1. Inlining — splice eligible callees into call sites so their
 ///      allocations are visible as local to the caller.
 ///   2. Local region promotion (`optimize_tree`) — turn `NoEscape`
@@ -658,16 +785,36 @@ fn wrap_scalar_returning(ir_func: IrFunction) -> IrFunction {
 ///      bodies of provably scalar-returning functions so their intermediate
 ///      collection allocations are freed at function return.
 pub fn optimize(ir_func: IrFunction) -> IrFunction {
+    optimize_with_externals(ir_func, &[]).0
+}
+
+/// Like [`optimize`], but makes previously-lowered defns from *other* lowering
+/// units visible to escape analysis and stage-4 cross-function promotion.
+///
+/// Returns the optimized tree plus the `(ns, name)` set of externals the
+/// passes actually consulted — the caller must invalidate this lowering when
+/// any of them is redefined, because stage 4 clones the external's body into
+/// the tree (and escape summaries derived from it shaped the optimization).
+pub fn optimize_with_externals(
+    ir_func: IrFunction,
+    externals: &[super::escape::ExternalDefn],
+) -> (IrFunction, UsedExternals) {
+    let ir_func = fuse_eager_hofs(ir_func);
+    // Inlining is deliberately unit-local (it builds its own registry):
+    // splicing an external body into the caller would carry the same
+    // staleness obligations for a much larger set of call shapes.
     let ir_func = inline_pass(ir_func);
-    let ctx = make_context(&ir_func);
+    let ctx = make_context_with_externals(&ir_func, externals);
     let ir_func = optimize_tree(ir_func, &ctx);
+    let mut used = ctx.take_used_externals();
 
     // Stage 4 needs a fresh analysis context because the local pass may have
     // rewritten allocations (and added blocks), invalidating the cached
     // per-function summaries the original `ctx` carries.
-    let ctx2 = make_context(&ir_func);
+    let ctx2 = make_context_with_externals(&ir_func, externals);
     let ir_func = promote_cross_fn_allocs(ir_func, &ctx2);
+    used.extend(ctx2.take_used_externals());
 
     // Stage 5: function-scope regions for scalar-returning functions.
-    wrap_scalar_returning(ir_func)
+    (wrap_scalar_returning(ir_func), used)
 }

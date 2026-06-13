@@ -128,7 +128,7 @@ cljrs test --src-path test/ <ns>  # run clojure.test namespaces
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLJRS_NO_IR` | unset | Disable all IR functionality. When set, the IR cache is not consulted and prebuilt IR is not loaded. All evaluation falls back to the tree-walking interpreter. Useful for debugging semantic differences between the IR interpreter and the tree-walker. |
-| `CLJRS_EAGER_LOWER` | unset | Enable eager IR lowering at function definition time. Every `fn*` form triggers the Clojure compiler to lower the function body to IR immediately. This is expensive and primarily useful for testing the IR pipeline. Requires the compiler namespaces to be loaded. Has no effect when `CLJRS_NO_IR` is set. |
+| `CLJRS_EAGER_LOWER` | unset | Enable eager IR lowering at function definition time. Every `fn*` form lowers the function body to IR immediately (via the pure-Rust `cljrs_ir::lower` pipeline). This is expensive and primarily useful for testing the IR pipeline. Has no effect when `CLJRS_NO_IR` is set. |
 
 ### Debug logging
 

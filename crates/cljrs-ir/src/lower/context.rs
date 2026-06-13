@@ -1,7 +1,4 @@
 //! Lowering context — mutable builder state for ANF IR construction.
-//!
-//! Mirrors `cljrs.compiler.ir` (the Clojure atom-based builder context).
-//! All methods take `&mut self` instead of a Clojure atom.
 
 use std::collections::HashMap;
 use std::sync::Arc;

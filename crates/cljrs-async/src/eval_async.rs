@@ -41,6 +41,12 @@ pub fn spawn_future<F>(task: F) -> Value
 where
     F: Future<Output = EvalResult> + 'static,
 {
+    // GC builds: heap-promotion fallback — the task's captured environment is
+    // opaque to the publish-barrier scan, and the task may run after any
+    // bump-region scope active right now has closed.  Poison the active
+    // regions so they are retired (kept alive) instead of reset; a no-op (one
+    // thread-local read) when no region is open, which is the common case.
+    cljrs_gc::region::poison_active_regions();
     let future = GcPtr::new(CljxFuture::new());
     let task_future = future.clone();
     tokio::task::spawn_local(async move {

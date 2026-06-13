@@ -19,9 +19,16 @@ can depend on the same types without a circular dependency.
 src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
              KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
+  osr.rs  — OSR-entry transform (Phase 10.4): build_osr_function rewrites a
+             function so its entry jumps straight to a hot loop header, with
+             live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
-    mod.rs      — re-exports: lower_fn_body, analyze, inline, optimize, EscapeContext …
-    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust)
+    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured, analyze,
+                  inline, optimize, EscapeContext …
+    anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
+                  capture only the enclosing locals their (fully macro-expanded)
+                  body references (`collect_symbol_names`, a conservative
+                  free-variable over-approximation), not every local in scope.
     context.rs  — LowerCtx builder state used by anf.rs
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites
@@ -30,34 +37,16 @@ src/
     regionalize.rs — stage-4 cross-function region promotion: clones callees
                      whose `Returns` allocs are NoEscape at a call site, wraps
                      the call site in RegionStart/RegionEnd, rewrites Call →
-                     CallWithRegion targeting the cloned variant by name
-  cljrs/compiler/
-    ir.cljrs       — IR data constructors + mutable builder context (atom-based)
-    known.cljrs    — symbol-name → KnownFn keyword resolution
-    anf.cljrs      — ANF lowering: Form values → IR data maps
-    escape.cljrs   — escape analysis on plain IR data maps
-    optimize.cljrs — region-allocation optimization (escape → region rewriting)
-
-test/cljrs/compiler/
-  ir_test.cljrs       — clojure.test cases for `cljrs.compiler.ir`
-  known_test.cljrs    — clojure.test cases for `cljrs.compiler.known`
-  escape_test.cljrs   — clojure.test cases for `cljrs.compiler.escape`
-  optimize_test.cljrs — clojure.test cases for `cljrs.compiler.optimize`
+                     CallWithRegion targeting the cloned variant by name.
+                     Also co-promotes allocations reachable only through the
+                     returned container (e.g. the inner coordinate vectors of
+                     `neighbours`), guarded by a caller-side check that the
+                     result is never element-extracted (first/nth/get/peek) or
+                     passed to an opaque call
 tests/
-  clojure_tests.rs    — Rust integration test that boots a standard env,
-                        requires each `*_test` namespace, runs
-                        `clojure.test/run-tests`, and fails if any Clojure
-                        assertion failed or errored.
+  capture_minimization.rs — closure-capture set regression tests
+  escape_regression.rs    — escape-analysis regression tests
 ```
-
----
-
-## Running the Clojure-side tests
-
-`cargo test -p cljrs-ir --test clojure_tests` runs the embedded
-`clojure.test` suites against the compiler namespaces.  Add a new
-`*_test.cljrs` file under `test/cljrs/compiler/` and append its namespace
-to the `TEST_NSES` list in `tests/clojure_tests.rs` to extend coverage.
 
 ---
 
@@ -83,6 +72,14 @@ pub struct IrFunction {
     pub is_async: bool,
 }
 
+impl IrFunction {
+    /// True for region-parameterised variants (entry block binds RegionParam):
+    /// compiled code receives the caller's region as a hidden trailing param.
+    pub fn takes_region_param(&self) -> bool;
+    /// Compiled-signature param count: params.len() + the hidden region param.
+    pub fn abi_param_count(&self) -> usize;
+}
+
 pub struct Block {
     pub id: BlockId,
     pub phis: Vec<Inst>,
@@ -92,6 +89,11 @@ pub struct Block {
 ```
 
 ### Instructions (`Inst`)
+
+Versioned symbols need no dedicated instruction: the `@<sha>` suffix rides in
+the `LoadGlobal` name string, and lowering inside a versioned namespace
+(`"base@sha"`) rewrites base-qualified self-references (`base/x`) to the
+versioned namespace (see `split_sym` in `lower/anf.rs`).
 
 `Const`, `LoadLocal`, `LoadGlobal`, `LoadVar`, `AllocVector`, `AllocMap`,
 `AllocSet`, `AllocList`, `AllocCons`, `AllocClosure`, `CallKnown`, `Call`,
@@ -153,9 +155,29 @@ to reach `NoEscape` and get promoted to a region.
 /// non-escaping allocations to region (bump) allocation.
 pub fn optimize(ir: IrFunction) -> IrFunction;
 
+/// Like `optimize`, but makes previously-lowered defns from other lowering
+/// units visible to escape analysis and stage-4 promotion (the script/REPL
+/// counterpart of AOT's whole-program tree; supplied by cljrs-eval's defn
+/// registry).  Returns the (ns, name) set of externals actually consulted —
+/// the caller must invalidate this lowering when any of them is redefined.
+pub fn optimize_with_externals(
+    ir: IrFunction,
+    externals: &[ExternalDefn],
+) -> (IrFunction, HashSet<(Arc<str>, Arc<str>)>);
+
+/// One registered cross-unit defn: per-arity registry names (process-unique,
+/// never emitted as symbols), callable param counts, variadic flags, and the
+/// lowered IR.
+pub struct ExternalDefn { pub ns, pub name, pub arity_fn_names,
+                          pub param_counts, pub is_variadic, pub arity_irs }
+
 /// Run only the inlining pass (before escape analysis).
 pub fn inline(ir: IrFunction) -> IrFunction;
 ```
+
+Inlining is deliberately *not* externals-aware: splicing another unit's body
+into the caller would carry the same redefinition-staleness obligations for a
+much larger set of call shapes.
 
 **Pipeline order** inside `optimize`:
 1. **Inlining** (`lower::inline`) — resolves `Call` sites whose callee is a
@@ -175,13 +197,28 @@ pub fn inline(ir: IrFunction) -> IrFunction;
    sites whose result is `NoEscape` and whose callee has `Returns`-tagged
    allocations, clones a region-parameterised variant of the callee
    (`<orig>__rgN`) where those allocations become `RegionAlloc` and the entry
-   block carries a `RegionParam` marker.  The call site is rewritten to
-   `CallWithRegion(dst, target_name, args)` and bracketed by
+   block carries a `RegionParam` binding.  The call site is rewritten to
+   `CallWithRegion(dst, target_name, args, region)` — carrying the handle of
+   the `RegionStart` the rewrite inserts — and bracketed by
    `RegionStart`/`RegionEnd` over the dom/postdom-LCA scope of `dst`'s uses.
-   At runtime the callee inherits the caller's region via the thread-local
-   region stack, so its `RegionAlloc` instructions bump-allocate into the
-   caller's region.  Variants are attached as subfunctions of the calling
-   function so both the IR interpreter and codegen can resolve them by name.
+   In compiled code the region travels as a **hidden trailing argument**
+   (`IrFunction::abi_param_count` = `params.len() + 1` for such variants;
+   `takes_region_param()` detects them), so the callee bump-allocates
+   directly into the caller's region without a thread-local lookup; the IR
+   interpreter threads the same handle through its per-frame handle map.
+   Variants are attached as subfunctions of the calling function so both the
+   IR interpreter and codegen can resolve them by name.
+   The clone also co-promotes allocations reachable *only* through the
+   returned container (e.g. the eight inner `[r c]` vectors stored inside
+   `neighbours`' result vector): their lifetime is bounded by the returned
+   value, so they live in the same region.  This is gated by a caller-side
+   check that the call result is never element-extracted (`first`/`nth`/
+   `get`/`peek`) or passed to an opaque call, either of which could keep an
+   inner pointer alive past `RegionEnd`.  Note: this sharpens the IR (and
+   benefits the tree-walking interpreter, where `AllocVector` is not
+   region-aware); the AOT backend already bump-allocates any collection
+   built while a region scope is active, so the win there comes from region
+   *scope* coverage rather than the per-allocation kind.
 
 ### Analysis (re-exported from `lower::`)
 
@@ -207,6 +244,31 @@ pub struct AnalysisResult {
 These are the same types the optimizer uses internally; they are exposed
 publicly so downstream tooling (e.g. `cljrs-ir-viz`) can present
 escape-analysis results without re-implementing the use-chain walk.
+
+### OSR-entry construction (`osr` module, Phase 10.4)
+
+```rust
+/// Cap on OSR parameters (the JIT dispatch shim supports 8 native args).
+pub const MAX_OSR_PARAMS: usize = 8;
+
+pub struct OsrFunction {
+    /// Entry block jumps to the loop header; loop state arrives as params.
+    pub func: IrFunction,
+    /// For each param (in order), the original VarId whose current value the
+    /// interpreter must pass when transferring into the native frame.
+    pub live_ins: Vec<VarId>,
+}
+
+/// Build the OSR-entry variant of `orig` for the loop header `header`
+/// (a `RecurJump` target).  Keeps only blocks reachable from the header;
+/// header φs get a new incoming edge from the fresh entry block fed by fresh
+/// parameters (loop variables), other live-ins become parameters bound to
+/// their original VarIds.  `RegionEnd`s whose `RegionStart` executed before
+/// the loop (i.e. in the interpreter) are dropped — the interpreter frame
+/// closes those regions after the transfer returns.  Errs (caller stays at
+/// Tier 1) if the header is unknown or live-ins exceed MAX_OSR_PARAMS.
+pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunction, String>;
+```
 
 ### Source mapping
 

@@ -274,10 +274,21 @@ impl MarkVisitor {
 impl GcVisitor for MarkVisitor {
     fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
         use gc_header::GC_INITIAL_LIVES;
-        let header = unsafe { &(*ptr.0.as_ptr()).header };
+        // Region-allocated objects are not on the GC heap; their lifetime is
+        // bounded by the enclosing `Region`, not the collector.  Never
+        // dereference one here: once the region's scope ends its memory is
+        // freed/reused, so the header would be garbage and we'd follow a
+        // dangling `trace_fn`.  Live regions are traced as roots separately
+        // (see `region::trace_active_regions`), so a region's heap-allocated
+        // children are still kept alive.
+        if ptr.is_region_alloc() {
+            return;
+        }
+        let raw = ptr.raw();
+        let header = unsafe { &(*raw).header };
         if header.lives.get() < GC_INITIAL_LIVES {
             header.lives.set(GC_INITIAL_LIVES);
-            self.grey.push(ptr.0.as_ptr() as *mut GcBoxHeader);
+            self.grey.push(raw as *mut GcBoxHeader);
         }
     }
 }
@@ -301,6 +312,17 @@ impl GcVisitor for MarkVisitor {
 
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
+/// Low pointer bit reserved to mark region-allocated `GcPtr`s in GC builds.
+///
+/// `GcBox<T>` (a `GcBoxHeader` followed by the value) is always ≥8-byte
+/// aligned in GC builds, so bit 0 is free.  Region-allocated pointers set it;
+/// GC-heap pointers leave it clear.  This lets the mark phase distinguish a
+/// region object from a heap object **without dereferencing it** — essential,
+/// because a region whose scope has ended leaves dangling pointers whose
+/// headers point at freed (or reused) memory.
+#[cfg(not(feature = "no-gc"))]
+pub(crate) const REGION_PTR_TAG: usize = 1;
+
 impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(not(feature = "no-gc"))]
     pub fn new(value: T) -> Self {
@@ -312,11 +334,45 @@ impl<T: Trace + 'static> GcPtr<T> {
         alloc_ctx::alloc_in_ctx(value)
     }
 
+    /// The untagged `GcBox<T>` address.  In GC builds this masks off the
+    /// region-provenance tag bit; in no-gc builds pointers are never tagged.
+    #[inline]
+    fn raw(&self) -> *mut GcBox<T> {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            (self.0.as_ptr() as usize & !REGION_PTR_TAG) as *mut GcBox<T>
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            self.0.as_ptr()
+        }
+    }
+
+    /// `true` if this pointer was bump-allocated in a [`region::Region`]
+    /// rather than the GC heap.  Region objects are not GC-managed.
+    #[cfg(not(feature = "no-gc"))]
+    #[inline]
+    pub fn is_region_alloc(&self) -> bool {
+        (self.0.as_ptr() as usize & REGION_PTR_TAG) != 0
+    }
+
+    /// Construct a region-tagged pointer from a raw `GcBox<T>` allocated in a
+    /// bump region.
+    ///
+    /// # Safety
+    /// `raw` must be a valid, non-null, ≥8-aligned `GcBox<T>` whose header was
+    /// initialised by [`region::Region::alloc`].
+    #[cfg(not(feature = "no-gc"))]
+    #[inline]
+    pub(crate) unsafe fn from_region_raw(raw: *mut GcBox<T>) -> Self {
+        GcPtr(unsafe { NonNull::new_unchecked((raw as usize | REGION_PTR_TAG) as *mut GcBox<T>) })
+    }
+
     pub fn get(&self) -> &T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
             use gc_header::GC_MAGIC_ALIVE;
-            let header = unsafe { &(*self.0.as_ptr()).header };
+            let header = unsafe { &(*self.raw()).header };
             assert_eq!(
                 header.magic.get(),
                 GC_MAGIC_ALIVE,
@@ -324,14 +380,14 @@ impl<T: Trace + 'static> GcPtr<T> {
                 header.magic.get(),
             );
         }
-        unsafe { &(*self.0.as_ptr()).value }
+        unsafe { &(*self.raw()).value }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
             use gc_header::GC_MAGIC_ALIVE;
-            let header = unsafe { &(*self.0.as_ptr()).header };
+            let header = unsafe { &(*self.raw()).header };
             assert_eq!(
                 header.magic.get(),
                 GC_MAGIC_ALIVE,
@@ -339,7 +395,7 @@ impl<T: Trace + 'static> GcPtr<T> {
                 header.magic.get(),
             );
         }
-        unsafe { &mut (*self.0.as_ptr()).value }
+        unsafe { &mut (*self.raw()).value }
     }
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
@@ -365,12 +421,75 @@ impl<T: Trace + 'static> Clone for GcPtr<T> {
 
 impl<T: Trace + 'static + std::fmt::Debug> std::fmt::Debug for GcPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe { (*self.0.as_ptr()).value.fmt(f) }
+        unsafe { (*self.raw()).value.fmt(f) }
     }
 }
 
 impl<T: Trace + 'static> Drop for GcPtr<T> {
     fn drop(&mut self) {}
+}
+
+// =============================================================================
+// StaticGcPtr — Send+Sync pointer to program-lifetime data
+// =============================================================================
+
+/// A raw pointer to a value that lives for the entire program lifetime.
+///
+/// Backed by the global `StaticArena` (in `no-gc` builds) or by `Box::leak`
+/// (in GC builds).  Either way the pointee is never freed and never moved, so
+/// it is safe to share across isolate threads.
+///
+/// `StaticGcPtr<T>` wraps `*const T` — it does **not** involve a `GcBox`
+/// header — so it is independent of the GC build mode and carries no GC
+/// overhead.
+pub struct StaticGcPtr<T: 'static>(NonNull<T>);
+
+// SAFETY: program-lifetime allocations are never moved, freed, or mutated
+// after the initial write.  The stored types (Keyword, Symbol, …) are
+// themselves `Sync` (no unsynchronised interior mutability).
+unsafe impl<T: 'static> Send for StaticGcPtr<T> {}
+unsafe impl<T: 'static> Sync for StaticGcPtr<T> {}
+
+impl<T: 'static> StaticGcPtr<T> {
+    /// Borrow the contained value.
+    pub fn get(&self) -> &T {
+        // SAFETY: pointer is program-lifetime, always valid.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Pointer equality: `true` iff both `StaticGcPtr`s point to the exact
+    /// same allocation (i.e. the same interned entry).
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.0 == b.0
+    }
+}
+
+impl<T: 'static> Clone for StaticGcPtr<T> {
+    fn clone(&self) -> Self {
+        StaticGcPtr(self.0)
+    }
+}
+
+impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { self.0.as_ref().fmt(f) }
+    }
+}
+
+/// Allocate `value` as program-lifetime memory and return a [`StaticGcPtr`].
+///
+/// In `no-gc` builds the allocation comes from the global bump-allocated
+/// `StaticArena` (never freed, no GC header overhead).  In GC builds
+/// `Box::leak` is used instead — the memory lives until the process exits.
+pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        static_arena::static_alloc_val(value)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))
+    }
 }
 
 // =============================================================================
@@ -551,6 +670,15 @@ mod gc_full {
             let mark_start = std::time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
+            // Active bump regions are additional roots: a live region object
+            // may hold `GcPtr`s into the heap, and those heap objects must not
+            // be collected while the region can still reach them.  The mark
+            // phase skips region objects themselves (they are not heap-managed),
+            // so we trace their children here instead.
+            crate::region::trace_active_regions(&mut visitor);
+            // Retired (poisoned) regions are immortal roots: their objects may
+            // still be referenced and may hold `GcPtr`s into the heap.
+            crate::region::trace_retired_regions(&mut visitor);
             cljrs_logging::feat_debug!(
                 "gc",
                 "starting drain with {} grey objects",

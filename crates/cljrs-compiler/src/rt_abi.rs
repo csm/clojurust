@@ -96,12 +96,27 @@ fn alloc_inner_coll<T: cljrs_gc::Trace + 'static>(val: T) -> GcPtr<T> {
 // nil, true, false, and integers in 0..INTERN_LONG_MAX are allocated once and
 // reused for the lifetime of the process, eliminating the dominant source of
 // GC heap allocation in tight loops.
+//
+// The cache entries are handed to compiled code as raw `*const Value`s and
+// nothing ever traces them, so they must NOT live on the GC heap: a heap box
+// becomes unreachable the moment its allocation frame pops, survives only the
+// lives grace period (one collection), and is then swept — after which every
+// compiled use of the cached pointer reads freed memory.  `static_alloc`
+// (StaticArena under no-gc, `Box::leak` under GC) gives exactly the
+// program-lifetime allocation these caches need; scalars hold no `GcPtr`
+// children, so opting out of tracing is sound.
+
+/// Leak a scalar `Value` as program-lifetime memory for an intern cache.
+#[inline]
+fn intern_static_val(v: Value) -> *const Value {
+    cljrs_gc::static_alloc(v).get() as *const Value
+}
 
 /// Cached nil pointer (allocated once, reused forever).
 #[inline]
 fn intern_nil() -> *const Value {
     static PTR: OnceLock<usize> = OnceLock::new();
-    *PTR.get_or_init(|| box_val(Value::Nil) as usize) as *const Value
+    *PTR.get_or_init(|| intern_static_val(Value::Nil) as usize) as *const Value
 }
 
 /// Cached true/false pointers (allocated once each, reused forever).
@@ -110,9 +125,9 @@ fn intern_bool(b: bool) -> *const Value {
     static TRUE_PTR: OnceLock<usize> = OnceLock::new();
     static FALSE_PTR: OnceLock<usize> = OnceLock::new();
     if b {
-        *TRUE_PTR.get_or_init(|| box_val(Value::Bool(true)) as usize) as *const Value
+        *TRUE_PTR.get_or_init(|| intern_static_val(Value::Bool(true)) as usize) as *const Value
     } else {
-        *FALSE_PTR.get_or_init(|| box_val(Value::Bool(false)) as usize) as *const Value
+        *FALSE_PTR.get_or_init(|| intern_static_val(Value::Bool(false)) as usize) as *const Value
     }
 }
 
@@ -160,7 +175,7 @@ fn intern_long(n: i64) -> *const Value {
     if (0..INTERN_LONG_MAX).contains(&n) {
         let cache = CACHE.get_or_init(|| {
             (0..INTERN_LONG_MAX)
-                .map(|i| box_val(Value::Long(i)) as usize)
+                .map(|i| intern_static_val(Value::Long(i)) as usize)
                 .collect()
         });
         cache[n as usize] as *const Value
@@ -225,13 +240,19 @@ pub unsafe extern "C" fn rt_const_string(ptr: *const u8, len: u64) -> *const Val
 
 /// Create a keyword.  `ptr`/`len` is the simple name (no colon prefix).
 ///
+/// Interned globally (Phase 10.6): every distinct keyword literal is boxed
+/// once per process and permanently rooted, instead of allocating a fresh
+/// `Value::Keyword` on every execution of the constant.  This is also what
+/// makes the keyword-constant inline cache sound — the cached pointer can
+/// never be swept.
+///
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
-    box_val(Value::Keyword(GcPtr::new(Keyword::simple(name))))
+    intern_keyword(name)
 }
 
 /// Create a symbol.  `ptr`/`len` is the simple name.
@@ -266,6 +287,7 @@ pub unsafe extern "C" fn rt_truthiness(v: *const Value) -> u8 {
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -281,6 +303,7 @@ pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -296,6 +319,7 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -311,6 +335,7 @@ pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -326,6 +351,7 @@ pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     match (a, b) {
@@ -341,6 +367,7 @@ pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     intern_bool(a == b)
@@ -350,6 +377,7 @@ pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -366,6 +394,7 @@ pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -382,6 +411,7 @@ pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -398,6 +428,7 @@ pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Valu
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Value {
+    bump_boxed_arith();
     let a = unsafe { val_ref(a) };
     let b = unsafe { val_ref(b) };
     let result = match (a, b) {
@@ -412,6 +443,7 @@ pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Valu
 
 // ── Region allocation ───────────────────────────────────────────────────────
 
+use cljrs_gc::region::Region;
 use std::cell::RefCell;
 
 thread_local! {
@@ -420,22 +452,58 @@ thread_local! {
     /// Box is intentional: we hand out raw pointers via `push_region_raw`,
     /// so the Region must not move if the Vec grows.
     #[allow(clippy::vec_box)]
-    static RT_REGION_STACK: RefCell<Vec<Box<cljrs_gc::region::Region>>> =
+    static RT_REGION_STACK: RefCell<Vec<Box<Region>>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// Allocate `val` directly into the region named by `handle`, falling back to
+/// the active thread-local region (then the GC heap) when `handle` is null.
+///
+/// A null handle is never produced by compiled `RegionStart`/`RegionParam`
+/// code today; the fallback keeps the bridge total should a future caller
+/// pass one.
+#[inline]
+fn region_alloc_box<T: cljrs_gc::Trace + 'static>(handle: *mut Region, val: T) -> GcPtr<T> {
+    if handle.is_null() {
+        alloc_inner_coll(val)
+    } else {
+        // SAFETY: `handle` was produced by `rt_region_start` (or arrived as
+        // the hidden region parameter of a region-parameterised variant) and
+        // stays alive until the matching `rt_region_end`.
+        unsafe { (*handle).alloc(val) }
+    }
+}
+
+/// Box a collection `Value` into the region named by `handle` (same fallback
+/// rules as [`region_alloc_box`]).
+#[inline]
+fn region_box_val(handle: *mut Region, v: Value) -> *const Value {
+    if handle.is_null() {
+        box_coll_val(v)
+    } else {
+        // SAFETY: see `region_alloc_box`.
+        let ptr: GcPtr<Value> = unsafe { (*handle).alloc(v) };
+        ptr.get() as *const Value
+    }
 }
 
 /// Begin a region scope — allocates a new bump region and activates it.
 ///
-/// Returns nil (the region handle is implicit via the thread-local stack).
+/// Returns the region pointer.  Compiled code passes it back to
+/// `rt_region_alloc_*` / `rt_region_end`, and threads it into
+/// region-parameterised callees as a hidden trailing argument
+/// (`CallWithRegion`).  The region is *also* pushed onto the thread-local
+/// region stack so opportunistic rt_abi allocation (`box_coll_val`) and GC
+/// root tracing see it.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_region_start() -> *const Value {
-    let mut region = Box::new(cljrs_gc::region::Region::new());
+pub extern "C" fn rt_region_start() -> *mut Region {
+    let mut region = Box::new(Region::new());
     // SAFETY: the Region lives in the Box on RT_REGION_STACK until
     // rt_region_end pops it.
-    let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
+    let region_ptr: *mut Region = &mut *region;
     unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
     RT_REGION_STACK.with(|s| s.borrow_mut().push(region));
-    rt_const_nil()
+    region_ptr
 }
 
 /// End a region scope — pops the region, runs destructors, frees memory.
@@ -443,25 +511,35 @@ pub extern "C" fn rt_region_start() -> *const Value {
 /// Returns nil.
 ///
 /// # Safety
-/// Must be paired with a prior `rt_region_start` call.
+/// Must be paired with a prior `rt_region_start` call; `handle` must be that
+/// call's return value.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_region_end(_handle: *const Value) -> *const Value {
-    cljrs_gc::region::pop_region_guard();
-    RT_REGION_STACK.with(|s| {
-        // Dropping the Box<Region> runs Region::drop which runs
-        // destructors and frees chunks.
-        s.borrow_mut().pop();
-    });
+pub extern "C" fn rt_region_end(handle: *mut Region) -> *const Value {
+    let popped = RT_REGION_STACK.with(|s| s.borrow_mut().pop());
+    debug_assert!(
+        popped
+            .as_ref()
+            .map(|r| std::ptr::eq(r.as_ref(), handle.cast_const()))
+            .unwrap_or(false),
+        "rt_region_end: handle does not match the innermost open region"
+    );
+    if let Some(region) = popped {
+        // Pops the thread-local stack entry, then resets the region — or
+        // retires it if a publish barrier poisoned it (Phase 10.5
+        // heap-promotion fallback).
+        cljrs_gc::region::close_region(region);
+    }
     rt_const_nil()
 }
 
-/// Allocate a vector in the active region (falling back to GC heap).
+/// Allocate a vector directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_vector(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -476,17 +554,18 @@ pub unsafe extern "C" fn rt_region_alloc_vector(
         Vec::new()
     };
     let pv = PersistentVector::from_iter(items);
-    let ptr = alloc_inner_coll(pv);
-    box_coll_val(Value::Vector(ptr))
+    let ptr = region_alloc_box(handle, pv);
+    region_box_val(handle, Value::Vector(ptr))
 }
 
-/// Allocate a map in the active region (falling back to GC heap).
+/// Allocate a map directly into the region named by `handle`.
 ///
 /// # Safety
-/// `pairs` must point to `2*n` valid `*const Value` pointers.
+/// `pairs` must point to `2*n` valid `*const Value` pointers; `handle` must
+/// be a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_map(
-    _handle: *const Value,
+    handle: *mut Region,
     pairs: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -503,16 +582,17 @@ pub unsafe extern "C" fn rt_region_alloc_map(
     } else {
         Vec::new()
     };
-    box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
+    region_box_val(handle, Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
-/// Allocate a set in the active region (falling back to GC heap).
+/// Allocate a set directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_set(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -527,17 +607,18 @@ pub unsafe extern "C" fn rt_region_alloc_set(
         Vec::new()
     };
     let set = PersistentHashSet::from_iter(items);
-    let ptr = alloc_inner_coll(set);
-    box_coll_val(Value::Set(SetValue::Hash(ptr)))
+    let ptr = region_alloc_box(handle, set);
+    region_box_val(handle, Value::Set(SetValue::Hash(ptr)))
 }
 
-/// Allocate a list in the active region (falling back to GC heap).
+/// Allocate a list directly into the region named by `handle`.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
+/// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_list(
-    _handle: *const Value,
+    handle: *mut Region,
     elems: *const *const Value,
     n: u64,
 ) -> *const Value {
@@ -552,39 +633,56 @@ pub unsafe extern "C" fn rt_region_alloc_list(
         Vec::new()
     };
     let list = PersistentList::from_iter(items);
-    let ptr = alloc_inner_coll(list);
-    box_coll_val(Value::List(ptr))
+    let ptr = region_alloc_box(handle, list);
+    region_box_val(handle, Value::List(ptr))
 }
 
-/// Allocate a cons cell in the active region (falling back to GC heap).
+/// Allocate a cons cell directly into the region named by `handle`.
 ///
 /// # Safety
-/// Both pointers must be valid.
+/// Both value pointers must be valid; `handle` must be a live region (see
+/// [`region_alloc_box`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_region_alloc_cons(
-    _handle: *const Value,
+    handle: *mut Region,
     head: *const Value,
     tail: *const Value,
 ) -> *const Value {
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
     let cons = CljxCons { head: h, tail: t };
-    let ptr = alloc_inner_coll(cons);
-    box_coll_val(Value::Cons(ptr))
+    let ptr = region_alloc_box(handle, cons);
+    region_box_val(handle, Value::Cons(ptr))
 }
 
-/// Unwind the region stack to the given depth on exception.
+/// Unwind both region stacks to the given depths on exception.
 ///
-/// Called by `rt_try` to clean up regions that were opened inside a
-/// try body that threw.
-fn unwind_regions_to(depth: usize) {
-    cljrs_gc::region::unwind_region_stack_to(depth);
-    RT_REGION_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        while stack.len() > depth {
-            stack.pop(); // Drop<Region> handles cleanup
+/// Called by `rt_try` to clean up regions that were opened inside a try body
+/// that threw.  The two depths are saved (and restored) independently: the
+/// gc-side stack can also hold regions pushed by the IR interpreter or the
+/// top-level form scope, so its depth is not in general equal to the rt_abi
+/// stack's depth.
+fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
+    loop {
+        let popped = RT_REGION_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            if stack.len() > rt_depth {
+                stack.pop()
+            } else {
+                None
+            }
+        });
+        match popped {
+            // Honours the poison protocol (reset vs retire) and pops the
+            // matching gc-side stack entry.
+            Some(region) => cljrs_gc::region::close_region(region),
+            None => break,
         }
-    });
+    }
+    // Belt-and-braces: drop any non-rt entries left above the saved gc depth
+    // (interpreter frames clean their own regions on unwind, so this is
+    // normally a no-op).
+    cljrs_gc::region::unwind_region_stack_to(gc_depth);
 }
 
 // ── Collection construction ─────────────────────────────────────────────────
@@ -592,15 +690,20 @@ fn unwind_regions_to(depth: usize) {
 /// Allocate a vector from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let pv = PersistentVector::from_iter(items);
     box_coll_val(Value::Vector(alloc_inner_coll(pv)))
 }
@@ -608,33 +711,43 @@ pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> 
 /// Allocate a map from `n` key-value pairs (2*n pointers: k0, v0, k1, v1, ...).
 ///
 /// # Safety
-/// `pairs` must point to `2*n` valid `*const Value` pointers.
+/// `pairs` must point to `2*n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(pairs, n * 2) };
-    let kv_pairs: Vec<(Value, Value)> = (0..n)
-        .map(|i| {
-            let k = unsafe { val_ref(slice[i * 2]) }.clone();
-            let v = unsafe { val_ref(slice[i * 2 + 1]) }.clone();
-            (k, v)
-        })
-        .collect();
+    let kv_pairs: Vec<(Value, Value)> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(pairs, n * 2) };
+        (0..n)
+            .map(|i| {
+                let k = unsafe { val_ref(slice[i * 2]) }.clone();
+                let v = unsafe { val_ref(slice[i * 2 + 1]) }.clone();
+                (k, v)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     box_coll_val(Value::Map(MapValue::from_pairs(kv_pairs)))
 }
 
 /// Allocate a set from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let set = PersistentHashSet::from_iter(items);
     box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(set))))
 }
@@ -642,15 +755,20 @@ pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *co
 /// Allocate a list from `n` element pointers.
 ///
 /// # Safety
-/// `elems` must point to `n` valid `*const Value` pointers.
+/// `elems` must point to `n` valid `*const Value` pointers, or may be null
+/// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
-    let slice = unsafe { std::slice::from_raw_parts(elems, n) };
-    let items: Vec<Value> = slice
-        .iter()
-        .map(|p| unsafe { val_ref(*p) }.clone())
-        .collect();
+    let items: Vec<Value> = if n > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(elems, n) };
+        slice
+            .iter()
+            .map(|p| unsafe { val_ref(*p) }.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let list = PersistentList::from_iter(items);
     box_coll_val(Value::List(alloc_inner_coll(list)))
 }
@@ -705,9 +823,402 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::List(l) => l.get().count(),
         Value::Str(s) => s.get().len(),
         Value::Nil => 0,
+        // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
+        // be walked and realized to be counted.  Without this arm `count`
+        // returns 0 for every lazy seq, silently corrupting any
+        // `(count (filter …))` computation.
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut count = 0usize;
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        count += 1;
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        count += l.get().count();
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        count += v.get().count();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            count
+        }
         _ => 0,
     };
     intern_long(n as i64)
+}
+
+/// `(count (filter pred coll))` fused — count matching elements without
+/// materializing the intermediate sequence.
+///
+/// `Set`/`Map` predicates are tested directly; other predicates are `invoke`d
+/// per element.  Iterates concrete collections in compiled Rust; falls back to
+/// the interpreted lazy `filter` + `count` for inputs `eager_seq_elems` can't
+/// walk directly.  Allocates nothing in the common path — the key win over the
+/// lazy path, whose per-element cons cells dominate `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value) -> *const Value {
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        // Fall back to the interpreter for lazy/cons inputs, then count.
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        return unsafe { rt_count(seq) };
+    };
+    let mut n: usize = 0;
+    for elem in elems {
+        let keep = match pred_ref {
+            Value::Set(s) => s.contains(&elem),
+            Value::Map(m) => m
+                .get(&elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+            _ => match cljrs_env::callback::invoke(pred_ref, vec![elem]) {
+                Ok(r) => !matches!(r, Value::Nil | Value::Bool(false)),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            },
+        };
+        if keep {
+            n += 1;
+        }
+    }
+    intern_long(n as i64)
+}
+
+/// Eagerly collect the elements of a directly-iterable collection, or `None`
+/// for inputs that need the interpreter's full `seq` machinery.
+fn eager_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Store a thrown value in the pending-exception slot (mirrors `rt_call`).
+#[inline]
+fn stash_pending_exception(val: Value) {
+    PENDING_EXCEPTION.with(|cell| {
+        *cell.borrow_mut() = Some(box_val(val));
+    });
+}
+
+/// Apply a filter predicate to `elem`.  Returns `Some(keep)`, or `None` if the
+/// predicate threw (exception already stashed).  `Set`/`Map` predicates are
+/// tested directly; others are `invoke`d.
+#[inline]
+fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
+    match pred {
+        Value::Set(s) => Some(s.contains(elem)),
+        Value::Map(m) => Some(
+            m.get(elem)
+                .map(|v| !matches!(v, Value::Nil | Value::Bool(false)))
+                .unwrap_or(false),
+        ),
+        _ => match cljrs_env::callback::invoke(pred, vec![elem.clone()]) {
+            Ok(r) => Some(!matches!(r, Value::Nil | Value::Bool(false))),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                None
+            }
+            Err(_) => None,
+        },
+    }
+}
+
+/// `(into to (filter pred coll))` fused — eager, no intermediate lazy seq.
+///
+/// Iterates `coll`, conj-ing matching elements straight into `to`.  Set and
+/// Vector targets are built natively; other targets fall back to interpreted
+/// `into` over an eagerly-filtered vector.  Avoids the interpreted lazy
+/// `filter` + `into` realization that dominates `samples/life.cljrs`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_filter(
+    to: *const Value,
+    pred: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let pred_ref = unsafe { val_ref(pred) };
+    let coll_ref = unsafe { val_ref(coll) };
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let pred_val = pred_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => {
+                        s.conj_mut(elem);
+                    }
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => r = r.conj(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let mut kept = Vec::new();
+            for elem in elems {
+                match pred_truthy(pred_ref, &elem) {
+                    Some(true) => kept.push(elem),
+                    Some(false) => {}
+                    None => return rt_const_nil(),
+                }
+            }
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(kept)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// `(into to (mapcat f coll))` fused — eager, no intermediate lazy seq.
+///
+/// For each element of `coll`, calls `f` (which must return a collection) and
+/// conj-es its elements into `to`.  Set and Vector targets are built natively.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_mapcat(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    // Fall back to interpreted `mapcat` + `into` if any input isn't directly
+    // iterable.
+    let fallback = || {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+    };
+
+    let Some(elems) = eager_seq_elems(coll_ref) else {
+        return fallback();
+    };
+    let mut elements: Vec<Value> = Vec::new();
+    for elem in elems {
+        let r = match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => v,
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        };
+        match eager_seq_elems(&r) {
+            Some(inner) => elements.extend(inner),
+            // `f` returned a non-directly-iterable collection: bail out.  (`f`
+            // is pure in the fused patterns we target, so re-running it in the
+            // fallback is safe.)
+            None => return fallback(),
+        }
+    }
+
+    match to_ref {
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for x in elements {
+                s.conj_mut(x);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for x in elements {
+                r = r.conj(x);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(elements)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
+}
+
+/// Eagerly realize the elements of any seqable `coll` — including lazy
+/// `Cons`/`LazySeq` chains such as `range`/`map` results — into a `Vec`.
+/// Returns `None` for genuinely non-seqable values so the caller can fall
+/// back to the interpreter.  Unlike [`eager_seq_elems`], this forces lazy
+/// thunks; it is used where the caller is an eager consumer that would fully
+/// realize the source anyway.
+fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
+    match coll {
+        Value::Vector(v) => Some(v.get().iter().cloned().collect()),
+        Value::Set(s) => Some(s.iter().cloned().collect()),
+        Value::List(l) => Some(l.get().iter().cloned().collect()),
+        Value::Nil => Some(Vec::new()),
+        Value::Cons(_) | Value::LazySeq(_) => {
+            let mut out = Vec::new();
+            let mut current = coll.clone();
+            loop {
+                match current {
+                    Value::Nil => break,
+                    Value::Cons(c) => {
+                        out.push(c.get().head.clone());
+                        current = c.get().tail.clone();
+                    }
+                    Value::LazySeq(ls) => {
+                        current = ls.get().realize();
+                    }
+                    Value::List(l) => {
+                        out.extend(l.get().iter().cloned());
+                        break;
+                    }
+                    Value::Vector(v) => {
+                        out.extend(v.get().iter().cloned());
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// `(into to (map f coll))` fused — eager, region-aware, and realizes lazy
+/// `coll` sources (e.g. `range`) natively.  Because the minimal `for` macro
+/// expands to `map`, this is the fused form of the `(into {} (for [x coll]
+/// [k v]))` map-comprehension idiom that dominates `samples/graph.cljrs`.
+///
+/// Applies `f` to each element and builds the target directly: map targets via
+/// `MapValue::from_pairs` (last-wins, size-optimal), set/vector targets via
+/// `conj`.  Falls back to interpreted `map` + `into` for inputs it can't walk
+/// (non-seqable `coll`) or targets it doesn't build natively.  `f` is invoked
+/// at most once per element; the map-target "not a pair" case routes the
+/// already-mapped values through interpreted `into` rather than re-running `f`.
+///
+/// # Safety
+/// All pointers must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_into_map(
+    to: *const Value,
+    f: *const Value,
+    coll: *const Value,
+) -> *const Value {
+    let to_ref = unsafe { val_ref(to) };
+    let f_ref = unsafe { val_ref(f) };
+    let coll_ref = unsafe { val_ref(coll) };
+
+    let Some(elems) = realize_seq_elems(coll_ref) else {
+        let to_val = to_ref.clone();
+        let f_val = f_ref.clone();
+        let coll_val = coll_ref.clone();
+        let seq = call_global_fn("clojure.core", "map", vec![f_val, coll_val]);
+        let seq_val = unsafe { val_ref(seq) }.clone();
+        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+    };
+
+    let mut mapped: Vec<Value> = Vec::with_capacity(elems.len());
+    for elem in elems {
+        match cljrs_env::callback::invoke(f_ref, vec![elem]) {
+            Ok(v) => mapped.push(v),
+            Err(cljrs_value::ValueError::Thrown(val)) => {
+                stash_pending_exception(val);
+                return rt_const_nil();
+            }
+            Err(_) => return rt_const_nil(),
+        }
+    }
+
+    match to_ref {
+        Value::Map(to_map) => {
+            // Existing entries first so the mapped pairs win on key conflict.
+            let mut pairs: Vec<(Value, Value)> =
+                to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut all_pairs = true;
+            for m in &mapped {
+                match as_pair(m) {
+                    Some(p) => pairs.push(p),
+                    None => {
+                        all_pairs = false;
+                        break;
+                    }
+                }
+            }
+            if all_pairs {
+                box_coll_val(Value::Map(MapValue::from_pairs(pairs)))
+            } else {
+                // Mapped values aren't all key/value pairs — let interpreted
+                // `into` handle map-entries/merging, without re-invoking `f`.
+                let to_val = to_ref.clone();
+                let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+                call_global_fn("clojure.core", "into", vec![to_val, src])
+            }
+        }
+        Value::Set(SetValue::Hash(set_ptr)) => {
+            let mut s = (*set_ptr.get()).clone();
+            for m in mapped {
+                s.conj_mut(m);
+            }
+            box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(s))))
+        }
+        Value::Vector(v) => {
+            let mut r = v.get().clone();
+            for m in mapped {
+                r = r.conj(m);
+            }
+            box_coll_val(Value::Vector(alloc_inner_coll(r)))
+        }
+        _ => {
+            let to_val = to_ref.clone();
+            let src = Value::Vector(alloc_inner_coll(PersistentVector::from_iter(mapped)));
+            call_global_fn("clojure.core", "into", vec![to_val, src])
+        }
+    }
 }
 
 /// `(empty? coll)` — returns Bool without converting to a seq.
@@ -841,6 +1352,27 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
 
 // ── Function/closure construction ───────────────────────────────────────────
 
+/// Hook invoked whenever `rt_make_fn*` wraps a compiled function pointer into
+/// a closure value.
+///
+/// Installed by `cljrs_jit::init`: the resulting `Value::NativeFunction` lives
+/// on the GC heap and captures a raw pointer into the executing JIT module, so
+/// the JIT pins that module's reclamation epoch.  Unset under AOT, where code
+/// is never unloaded.
+static CLOSURE_ESCAPE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the closure-escape hook (installed once by `cljrs_jit::init`).
+pub fn set_closure_escape_hook(f: fn()) {
+    let _ = CLOSURE_ESCAPE_HOOK.set(f);
+}
+
+#[inline]
+fn notify_closure_escape() {
+    if let Some(hook) = CLOSURE_ESCAPE_HOOK.get() {
+        hook();
+    }
+}
+
 /// Create a `Value::NativeFunction` wrapping a compiled function pointer.
 ///
 /// `fn_ptr` is a pointer to a compiled Cranelift function with signature:
@@ -865,6 +1397,7 @@ pub unsafe extern "C" fn rt_make_fn(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -941,6 +1474,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -1024,6 +1558,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     captures: *const *const Value,
     ncaptures: u64,
 ) -> *const Value {
+    notify_closure_escape();
     let name_str = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
@@ -1227,10 +1762,184 @@ unsafe fn rt_call_compiled(
                 args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
             )
         }
+        9 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+            )
+        }
+        10 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9],
+            )
+        }
+        11 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10],
+            )
+        }
+        12 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11],
+            )
+        }
+        13 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12],
+            )
+        }
+        14 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13],
+            )
+        }
+        15 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13], args[14],
+            )
+        }
+        16 => {
+            let f: extern "C" fn(
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+                *const Value,
+            ) -> *const Value = unsafe { std::mem::transmute(fn_addr) };
+            f(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10], args[11], args[12], args[13], args[14], args[15],
+            )
+        }
         _ => {
-            // For functions with more than 8 params, fall back to rt_call style.
-            // This shouldn't happen in practice for most Clojure code.
-            eprintln!("[rt] warning: compiled function with {nargs} args, falling back");
+            // The compiled-function trampoline supports up to a fixed maximum
+            // arity (captures + params).  Exceeding it is rare but must never
+            // silently corrupt results (the previous behaviour returned nil,
+            // which produced wrong answers, e.g. a reduce over a let-bound
+            // collection whose closure over-captures enclosing locals).  Log
+            // loudly and surface a thrown error.  `total_params = ncaptures +
+            // param_count`, so this only triggers for closures that capture an
+            // unusually large number of enclosing locals.
+            eprintln!(
+                "[rt] error: compiled function arity {nargs} exceeds trampoline maximum (16)"
+            );
+            stash_pending_exception(Value::Str(GcPtr::new(format!(
+                "compiled function arity {nargs} exceeds trampoline maximum (16)"
+            ))));
             rt_const_nil()
         }
     }
@@ -1256,6 +1965,13 @@ pub unsafe extern "C" fn rt_load_global(
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
     };
 
+    // Versioned reference (`name@<sha>`): resolve through the shared
+    // versioned-namespace service.  (The IC bridge below is the fast path
+    // for these; this covers any non-IC caller.)
+    if let (base_name, Some(commit)) = cljrs_value::symbol::split_version(name) {
+        return resolve_versioned_boxed(ns, base_name, commit);
+    }
+
     // Look up in the global environment via the thread-local eval context.
     if let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() {
         // Try the specified namespace first.
@@ -1274,8 +1990,48 @@ pub unsafe extern "C" fn rt_load_global(
         {
             return box_or_intern_val(val);
         }
+        // Reference into a versioned namespace (`lib@sha`/name) that has not
+        // been loaded this session: load it lazily and retry.
+        if let (base, Some(commit)) = cljrs_value::symbol::split_version(ns)
+            && !globals.is_loaded(ns)
+        {
+            match cljrs_env::versioned::ensure_versioned_ns_loaded(&globals, base, commit) {
+                Ok(_) => {
+                    if let Some(val) = globals.lookup_in_ns(ns, name) {
+                        return box_or_intern_val(val);
+                    }
+                }
+                Err(e) => {
+                    stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+                    return rt_const_nil();
+                }
+            }
+        }
     }
     rt_const_nil()
+}
+
+/// Resolve `ns/name@commit` through the shared versioned resolver, boxing the
+/// result.  Resolution failures surface as a pending exception (versioned
+/// bindings are pinned by the programmer; silently yielding nil would mask
+/// typos and missing commits).
+fn resolve_versioned_boxed(ns_part: &str, name: &str, commit: &str) -> *const Value {
+    let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() else {
+        return rt_const_nil();
+    };
+    match cljrs_env::versioned::resolve_versioned_value(
+        &globals,
+        &current_ns,
+        Some(ns_part),
+        name,
+        commit,
+    ) {
+        Ok(val) => box_or_intern_val(val),
+        Err(e) => {
+            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            rt_const_nil()
+        }
+    }
 }
 
 /// Define (intern) a global var.  Returns a pointer to the Var value.
@@ -1358,7 +2114,13 @@ pub unsafe extern "C" fn rt_call(
 ) -> *const Value {
     let callee = unsafe { val_ref(callee) };
     let nargs = nargs as usize;
-    let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs) };
+    // Zero-arg call sites pass a null args pointer (see emit_unknown_call);
+    // from_raw_parts requires non-null even for empty slices.
+    let arg_slice: &[*const Value] = if nargs == 0 || args.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, nargs) }
+    };
 
     // Fast paths for map/set callables — avoid interpreter + GC heap allocation.
     match callee {
@@ -2090,9 +2852,74 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
         }
         return box_coll_val(Value::Vector(alloc_inner_coll(result)));
     }
+    // Fast path: hash-set target.  `into` always fully realizes its source, so
+    // there is no laziness to preserve; iterating an eagerly-walkable source
+    // and conj-ing straight into the set avoids the interpreted `into` +
+    // lazy-`seq` realization that otherwise allocates every intermediate cons
+    // cell on the GC heap (the dominant cost of `(into #{} (repeatedly …))` in
+    // `samples/graph.cljrs`).  All allocations land in the active region.
+    if let Value::Set(SetValue::Hash(h)) = to_ref
+        && let Some(elems) = eager_seq_elems(from_ref)
+    {
+        let mut result = h.get().clone();
+        for elem in elems {
+            result.conj_mut(elem);
+        }
+        return box_coll_val(Value::Set(SetValue::Hash(alloc_inner_coll(result))));
+    }
+    // Fast path: map target.  `(into {} pairs)` — the very common idiom behind
+    // `(into {} (for …))` map comprehensions — otherwise falls through to the
+    // interpreted `into`, whose lazy realization allocates on the GC heap.  We
+    // build the result in one shot via `MapValue::from_pairs` (last-wins, like
+    // `assoc`, and size-optimal) rather than per-element `assoc` so there are
+    // no intermediate map boxes; the result is region-boxed when a region is
+    // open.  Only taken when every source element is a clean key/value pair
+    // (a 2-element vector/list) or the source is itself a map.
+    if let Value::Map(to_map) = to_ref
+        && let Some(new_pairs) = into_map_pairs(from_ref)
+    {
+        // Existing entries first, then the new pairs so they win on conflict.
+        let mut pairs: Vec<(Value, Value)> =
+            to_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.extend(new_pairs);
+        return box_coll_val(Value::Map(MapValue::from_pairs(pairs)));
+    }
     let to_val = to_ref.clone();
     let from_val = from_ref.clone();
     call_global_fn("clojure.core", "into", vec![to_val, from_val])
+}
+
+/// Collect a sequence of key/value pairs from `from` for the map-target `into`
+/// fast path, or `None` if `from` isn't eagerly walkable or any element isn't a
+/// clean 2-element pair (in which case the caller falls back to the
+/// interpreter, which handles map-entries, map merging, and lazy sources).
+fn into_map_pairs(from: &Value) -> Option<Vec<(Value, Value)>> {
+    // A source map contributes its entries directly.
+    if let Value::Map(m) = from {
+        return Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+    let elems = eager_seq_elems(from)?;
+    let mut pairs = Vec::with_capacity(elems.len());
+    for elem in elems {
+        pairs.push(as_pair(&elem)?);
+    }
+    Some(pairs)
+}
+
+/// Extract a `(key, value)` pair from a 2-element vector or list, else `None`.
+fn as_pair(v: &Value) -> Option<(Value, Value)> {
+    match v {
+        Value::Vector(vec) if vec.get().count() == 2 => {
+            Some((vec.get().nth(0)?.clone(), vec.get().nth(1)?.clone()))
+        }
+        Value::List(l) if l.get().count() == 2 => {
+            let mut it = l.get().iter();
+            let k = it.next()?.clone();
+            let val = it.next()?.clone();
+            Some((k, val))
+        }
+        _ => None,
+    }
 }
 
 /// `(into to xform from)`.
@@ -2207,8 +3034,34 @@ pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *cons
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
-    let n = unsafe { val_ref(n) }.clone();
-    let f = unsafe { val_ref(f) }.clone();
+    let n_ref = unsafe { val_ref(n) };
+    let f_ref = unsafe { val_ref(f) };
+    // Fast path: explicit count.  `(repeatedly n f)` with a fixed count is a
+    // finite sequence, so realizing it eagerly into a region-allocated vector
+    // is observationally compatible with the lazy seq for the eager consumers
+    // it is used with (`into`, `count`, `reduce`, `vec`, …) — the same liberty
+    // the eager `mapcat`/`map` fast paths already take.  This keeps the per-
+    // element results in the active region instead of allocating interpreted
+    // lazy-seq cons cells on the GC heap.
+    if let Value::Long(k) = n_ref
+        && *k >= 0
+    {
+        let mut items: Vec<Value> = Vec::with_capacity(*k as usize);
+        for _ in 0..*k {
+            match cljrs_env::callback::invoke(f_ref, vec![]) {
+                Ok(v) => items.push(v),
+                Err(cljrs_value::ValueError::Thrown(val)) => {
+                    stash_pending_exception(val);
+                    return rt_const_nil();
+                }
+                Err(_) => return rt_const_nil(),
+            }
+        }
+        let pv = PersistentVector::from_iter(items);
+        return box_coll_val(Value::Vector(alloc_inner_coll(pv)));
+    }
+    let n = n_ref.clone();
+    let f = f_ref.clone();
     call_global_fn("clojure.core", "repeatedly", vec![n, f])
 }
 
@@ -2315,6 +3168,17 @@ fn take_pending_exception() -> Option<*const Value> {
     PENDING_EXCEPTION.with(|cell| cell.borrow_mut().take())
 }
 
+/// Take (and clear) the thread's pending exception as an owned `Value`.
+///
+/// Called by the JIT-native dispatch seam (via the hook installed by
+/// `cljrs_jit::init`) right after native code returns, so an uncaught throw
+/// propagates to the interpreter caller instead of being swallowed as nil.
+/// The caller must invoke this while the JIT frame's alloc roots are still
+/// live (the pending pointer targets a Value boxed inside the native frame).
+pub fn take_pending_exception_value() -> Option<Value> {
+    take_pending_exception().map(|ptr| unsafe { val_ref(ptr) }.clone())
+}
+
 /// `(try body (catch Ex e handler) (finally cleanup))` — exception handling.
 ///
 /// `body_fn`: a zero-arg Clojure function for the try body.
@@ -2335,8 +3199,9 @@ pub unsafe extern "C" fn rt_try(
     let catch = unsafe { val_ref(catch_fn) }.clone();
     let finally = unsafe { val_ref(finally_fn) }.clone();
 
-    // Save region stack depth so we can unwind on exception.
+    // Save both region-stack depths so we can unwind on exception.
     let region_depth = cljrs_gc::region::region_stack_depth();
+    let rt_region_depth = RT_REGION_STACK.with(|s| s.borrow().len());
 
     // Call the body.
     let body_result = cljrs_env::callback::invoke(&body, vec![]);
@@ -2344,7 +3209,7 @@ pub unsafe extern "C" fn rt_try(
     // Check for thrown exception (set by rt_throw in compiled code).
     let ret = if let Some(thrown_ptr) = take_pending_exception() {
         // Unwind any regions opened inside the try body.
-        unwind_regions_to(region_depth);
+        unwind_regions_to(region_depth, rt_region_depth);
         // Exception was thrown from compiled code.
         if !matches!(catch, Value::Nil) {
             let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
@@ -2360,7 +3225,7 @@ pub unsafe extern "C" fn rt_try(
             Ok(val) => box_val(val),
             Err(val_err) => {
                 // Unwind any regions opened inside the try body.
-                unwind_regions_to(region_depth);
+                unwind_regions_to(region_depth, rt_region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
                 if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {
@@ -2890,6 +3755,464 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_vec as *const () as usize);
     std::hint::black_box(rt_mapcat as *const () as usize);
     std::hint::black_box(rt_repeatedly as *const () as usize);
+    std::hint::black_box(rt_value_tag as *const () as usize);
+    std::hint::black_box(rt_unbox_long as *const () as usize);
+    std::hint::black_box(rt_unbox_double as *const () as usize);
+    std::hint::black_box(rt_box_bool as *const () as usize);
+    std::hint::black_box(rt_deopt as *const () as usize);
+    std::hint::black_box(rt_kw_ic_fill as *const () as usize);
+    std::hint::black_box(rt_load_global_versioned_ic as *const () as usize);
+    std::hint::black_box(rt_call_ic as *const () as usize);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 10.6 — specialization & inline caches
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Runtime-type tag classes used by specialization entry guards
+/// (`rt_value_tag` result; must match `codegen.rs`'s guard constants).
+pub const TAG_OTHER: i64 = 0;
+pub const TAG_LONG: i64 = 1;
+pub const TAG_DOUBLE: i64 = 2;
+pub const TAG_BOOL: i64 = 3;
+pub const TAG_NIL: i64 = 4;
+
+/// Classify a value's runtime type for specialization guards.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_value_tag(v: *const Value) -> i64 {
+    match unsafe { val_ref(v) } {
+        Value::Long(_) => TAG_LONG,
+        Value::Double(_) => TAG_DOUBLE,
+        Value::Bool(_) => TAG_BOOL,
+        Value::Nil => TAG_NIL,
+        _ => TAG_OTHER,
+    }
+}
+
+/// Extract the raw `i64` payload of a `Value::Long`.
+///
+/// Only emitted after a successful `rt_value_tag(v) == TAG_LONG` guard.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_long(v: *const Value) -> i64 {
+    match unsafe { val_ref(v) } {
+        Value::Long(n) => *n,
+        _ => 0,
+    }
+}
+
+/// Extract the raw `f64` payload of a `Value::Double`.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_double(v: *const Value) -> f64 {
+    match unsafe { val_ref(v) } {
+        Value::Double(n) => *n,
+        _ => 0.0,
+    }
+}
+
+/// Box a raw boolean (0/1) as an interned `Value::Bool`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
+    intern_bool(b != 0)
+}
+
+/// The deoptimization sentinel: a unique, process-lifetime `Value` address
+/// that compiled code can never produce as an ordinary result.
+///
+/// A specialized function whose entry type guard fails returns this pointer;
+/// the dispatch seam (`call_jit_native`, cljrs-eval/src/apply.rs) compares
+/// the raw result address against it and, on a match, re-executes the call at
+/// Tier 1.  The sentinel is `Box::leak`ed — deliberately **not** a GC heap
+/// object — so it can never be swept, reused, or aliased by a real result.
+fn deopt_sentinel() -> *const Value {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    *PTR.get_or_init(|| Box::leak(Box::new(Value::Nil)) as *const Value as usize) as *const Value
+}
+
+/// Address of the deopt sentinel, for the dispatch seam's pointer compare
+/// (installed into `cljrs_eval::jit_state` as a hook by `cljrs_jit::init`).
+pub fn deopt_sentinel_addr() -> usize {
+    deopt_sentinel() as usize
+}
+
+/// Entry-guard failure: count it and return the deopt sentinel.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_deopt() -> *const Value {
+    jit_stats::GUARD_DEOPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    deopt_sentinel()
+}
+
+// ── Specialization / IC statistics ───────────────────────────────────────────
+
+/// Counters behind `--jit-stats` and the Phase 10.6 milestone tests.  All
+/// relaxed: they are diagnostics, never control flow.
+pub mod jit_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Boxed arithmetic/comparison bridge calls (`rt_add`, `rt_lt`, …).
+    /// Unboxed compiled code stops bumping this — the unboxing evidence.
+    pub static BOXED_ARITH_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Specialization entry-guard failures (deopts to Tier 1).
+    pub static GUARD_DEOPTS: AtomicU64 = AtomicU64::new(0);
+    /// Keyword-constant inline-cache fills (slow path; once per call site).
+    pub static KW_IC_FILLS: AtomicU64 = AtomicU64::new(0);
+    /// Protocol-dispatch inline-cache hits / misses in `rt_call_ic`.
+    pub static PROTO_IC_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static PROTO_IC_MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// Human-readable snapshot (written by `cljrs --jit-stats`).
+    pub fn snapshot() -> String {
+        format!(
+            "JIT specialization stats:\n  Boxed arith calls:    {}\n  Guard deopts:         {}\n  Keyword IC fills:     {}\n  Protocol IC hits:     {}\n  Protocol IC misses:   {}\n",
+            BOXED_ARITH_CALLS.load(Ordering::Relaxed),
+            GUARD_DEOPTS.load(Ordering::Relaxed),
+            KW_IC_FILLS.load(Ordering::Relaxed),
+            PROTO_IC_HITS.load(Ordering::Relaxed),
+            PROTO_IC_MISSES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[inline]
+fn bump_boxed_arith() {
+    jit_stats::BOXED_ARITH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── IC value registry (GC rooting for cached values) ─────────────────────────
+//
+// Inline-cache slots live in compiled-module data sections, invisible to the
+// collector.  Every Value an IC hands back to compiled code (interned keyword
+// constants) or holds for later dispatch (cached protocol impl fns) is
+// therefore *also* owned by the global tables below, and a root tracer
+// registered on each allocating thread's heap keeps those objects alive
+// permanently.  Both tables are bounded: keyword constants by the program's
+// distinct keyword literals, protocol IC entries by compiled call sites.
+
+/// A `GcPtr<Value>` shared through a global table.
+///
+/// SAFETY: the pointee is immutable after construction and kept alive by the
+/// table's root tracer; collections are stop-the-world, so cross-thread reads
+/// of the pointer never race a sweep.
+struct SharedVal(GcPtr<Value>);
+unsafe impl Send for SharedVal {}
+unsafe impl Sync for SharedVal {}
+
+/// One protocol-dispatch inline-cache entry (per compiled call site).
+struct ProtoIcEntry {
+    /// Identity of the `ProtocolFn` this site last dispatched (the
+    /// `GcPtr<ProtocolFn>` target address).
+    callee: usize,
+    /// `cljrs_value::protocol_generation()` at fill time.
+    generation: u64,
+    /// Dispatch type tag of the cached impl.
+    tag: Arc<str>,
+    /// The resolved impl fn.  Rooted by the IC root tracer.
+    impl_fn: Value,
+}
+
+/// SAFETY: same argument as [`SharedVal`]; the entry is only read/replaced
+/// under its `Mutex`.
+struct ProtoIcCell(std::sync::Mutex<Option<ProtoIcEntry>>);
+unsafe impl Send for ProtoIcCell {}
+unsafe impl Sync for ProtoIcCell {}
+
+use std::sync::RwLock;
+
+static KW_INTERN: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> = OnceLock::new();
+static PROTO_ICS: OnceLock<RwLock<Vec<Arc<ProtoIcCell>>>> = OnceLock::new();
+/// Resolved versioned values cached by compiled call sites, keyed by
+/// `"<ns>/<name@commit>"`.  Versioned bindings are immutable, so entries are
+/// never invalidated; the table permanently roots each boxed value.
+static VERSIONED_IC: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> =
+    OnceLock::new();
+
+fn kw_intern_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
+    KW_INTERN.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn versioned_ic_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
+    VERSIONED_IC.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn proto_ic_table() -> &'static RwLock<Vec<Arc<ProtoIcCell>>> {
+    PROTO_ICS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+thread_local! {
+    static IC_TRACER_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Register the IC root tracer on the current thread's heap (once per
+/// thread).  Must be called by any thread that *allocates* into the IC
+/// tables — only the owning thread's collector can free its objects, so the
+/// tracer has to run there.
+fn ensure_ic_tracer_registered() {
+    IC_TRACER_REGISTERED.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        flag.set(true);
+        cljrs_gc::HEAP.register_root_tracer(|visitor| {
+            use cljrs_gc::{GcVisitor as _, Trace as _};
+            if let Some(table) = KW_INTERN.get() {
+                for v in table.read().unwrap().values() {
+                    visitor.visit(&v.0);
+                }
+            }
+            if let Some(table) = VERSIONED_IC.get() {
+                for v in table.read().unwrap().values() {
+                    visitor.visit(&v.0);
+                }
+            }
+            if let Some(ics) = PROTO_ICS.get() {
+                for cell in ics.read().unwrap().iter() {
+                    if let Some(entry) = cell.0.lock().unwrap().as_ref() {
+                        entry.impl_fn.trace(visitor);
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// Intern a keyword `Value` by name, returning a stable, permanently rooted
+/// pointer.  Every call site (and `rt_const_keyword` itself) shares one
+/// allocation per distinct keyword instead of boxing a fresh
+/// `Value::Keyword` per execution.
+fn intern_keyword(name: &str) -> *const Value {
+    if let Some(v) = kw_intern_table().read().unwrap().get(name) {
+        return v.0.get() as *const Value;
+    }
+    ensure_ic_tracer_registered();
+    let mut table = kw_intern_table().write().unwrap();
+    // Re-check under the write lock so a racing intern of the same name
+    // cannot replace (and un-root) a pointer already handed out.
+    if let Some(v) = table.get(name) {
+        return v.0.get() as *const Value;
+    }
+    let ptr = GcPtr::new(Value::Keyword(GcPtr::new(Keyword::simple(name))));
+    let raw = ptr.get() as *const Value;
+    table.insert(name.to_string(), SharedVal(ptr));
+    raw
+}
+
+/// Keyword-constant inline-cache fill (slow path, once per call site).
+///
+/// Compiled code keeps an 8-byte writable slot per `Const::Keyword` site:
+/// the fast path is an inline load + branch on the slot; on the first
+/// execution the slot is zero and this fill interns the keyword, stores the
+/// stable pointer into the slot, and returns it.
+///
+/// # Safety
+/// `ptr`/`len` must describe valid UTF-8; `slot` must point to the call
+/// site's 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usize) -> *const Value {
+    jit_stats::KW_IC_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let name = std::str::from_utf8(bytes).unwrap_or("??");
+    let interned = intern_keyword(name);
+    // Plain (possibly racy) store: every filler stores the same interned
+    // pointer, and aligned 8-byte stores cannot tear.
+    unsafe { *slot = interned as usize };
+    interned
+}
+
+/// Versioned-load inline-cache fill (slow path, once per call site).
+///
+/// Compiled code keeps an 8-byte writable slot per versioned `LoadGlobal`
+/// site (`ns/name@sha`).  Versioned bindings are immutable for the lifetime
+/// of the process, so the slot is filled once and never invalidated — no
+/// epoch or rebind machinery is needed.  On the first execution this bridge
+/// resolves the symbol through the shared versioned resolver (which may
+/// lazily load the `ns@sha` namespace from embedded source or git), interns
+/// the boxed value in a permanently rooted table, and stores the stable
+/// pointer into the slot.
+///
+/// Resolution failure leaves the slot empty (so a later execution retries)
+/// and surfaces a pending exception.
+///
+/// # Safety
+/// `ns_ptr`/`name_ptr` must describe valid UTF-8; `slot` must point to the
+/// call site's 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_load_global_versioned_ic(
+    ns_ptr: *const u8,
+    ns_len: u64,
+    name_ptr: *const u8,
+    name_len: u64,
+    slot: *mut usize,
+) -> *const Value {
+    let ns = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
+    };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+
+    let (base_name, version) = cljrs_value::symbol::split_version(name);
+    let Some(commit) = version else {
+        // Codegen only emits this bridge for versioned names; tolerate a
+        // stray unversioned call by deferring to the generic path (uncached).
+        return unsafe { rt_load_global(ns_ptr, ns_len, name_ptr, name_len) };
+    };
+
+    let key = format!("{ns}/{name}");
+    if let Some(v) = versioned_ic_table().read().unwrap().get(&key) {
+        let raw = v.0.get() as *const Value;
+        unsafe { *slot = raw as usize };
+        return raw;
+    }
+
+    let Some((globals, current_ns)) = cljrs_env::callback::capture_eval_context() else {
+        return rt_const_nil();
+    };
+    match cljrs_env::versioned::resolve_versioned_value(
+        &globals,
+        &current_ns,
+        Some(ns),
+        base_name,
+        commit,
+    ) {
+        Ok(val) => {
+            ensure_ic_tracer_registered();
+            let mut table = versioned_ic_table().write().unwrap();
+            // Re-check under the write lock so a racing resolution of the
+            // same symbol cannot replace (and un-root) a pointer already
+            // handed out.
+            if let Some(v) = table.get(&key) {
+                let raw = v.0.get() as *const Value;
+                unsafe { *slot = raw as usize };
+                return raw;
+            }
+            let ptr = GcPtr::new(val);
+            let raw = ptr.get() as *const Value;
+            table.insert(key, SharedVal(ptr));
+            unsafe { *slot = raw as usize };
+            raw
+        }
+        Err(e) => {
+            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            rt_const_nil()
+        }
+    }
+}
+
+/// Invoke `callee` with already-cloned args, boxing the result and stashing a
+/// thrown value exactly like `rt_call` (shared tail of the call bridges).
+fn invoke_boxed(callee: &Value, args: Vec<Value>) -> *const Value {
+    match cljrs_env::callback::invoke(callee, args) {
+        Ok(result) => box_invoke_result(result),
+        Err(cljrs_value::ValueError::Thrown(val)) => {
+            stash_pending_exception(val);
+            rt_const_nil()
+        }
+        Err(_e) => rt_const_nil(),
+    }
+}
+
+/// `rt_call` with a per-call-site inline cache for protocol dispatch.
+///
+/// For a `Value::ProtocolFn` callee, the uncached path computes the dispatch
+/// type tag (allocating an `Arc<str>`), locks the protocol's impl map, and
+/// performs two hash lookups — on *every* call.  This bridge caches the
+/// resolved `(callee, dispatch tag) → impl fn` per call site, validated by
+/// the global protocol generation (bumped on every `extend-type` /
+/// `extend-protocol` / inline impl), and on a hit invokes the impl directly.
+/// Non-protocol callees fall through to `rt_call` unchanged.
+///
+/// `slot` holds `0` (empty) or `index + 1` into the global IC entry table —
+/// never a GC pointer, so compiled modules stay free of GC roots.
+///
+/// # Safety
+/// Same contract as `rt_call`, plus `slot` must point to the call site's
+/// 8-byte data slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_call_ic(
+    callee: *const Value,
+    args: *const *const Value,
+    nargs: u64,
+    slot: *mut usize,
+) -> *const Value {
+    let callee_ref = unsafe { val_ref(callee) };
+    if let Value::ProtocolFn(pf) = callee_ref
+        && nargs >= 1
+    {
+        let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs as usize) };
+        let dispatch_val = unsafe { val_ref(arg_slice[0]) };
+        let generation = cljrs_value::protocol_generation();
+        let callee_id = pf.get() as *const _ as usize;
+
+        // Fast path: validate the cached entry.
+        let idx = unsafe { *slot };
+        if idx != 0 {
+            let cell = {
+                let table = proto_ic_table().read().unwrap();
+                table.get(idx - 1).cloned()
+            };
+            if let Some(cell) = cell {
+                let guard = cell.0.lock().unwrap();
+                if let Some(entry) = guard.as_ref()
+                    && entry.callee == callee_id
+                    && entry.generation == generation
+                    && cljrs_env::apply::type_tag_matches(dispatch_val, &entry.tag)
+                {
+                    let impl_fn = entry.impl_fn.clone();
+                    drop(guard);
+                    jit_stats::PROTO_IC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
+                }
+            }
+        }
+
+        // Miss: resolve the impl the same way `apply_value` does, refill the
+        // cache, and invoke directly.  An unimplemented type falls through to
+        // `rt_call` for the canonical error path.
+        jit_stats::PROTO_IC_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tag = cljrs_env::apply::type_tag_of(dispatch_val);
+        let pf_ref = pf.get();
+        let impl_fn = {
+            let impls = pf_ref.protocol.get().impls.lock().unwrap();
+            impls
+                .get(tag.as_ref())
+                .and_then(|m| m.get(pf_ref.method_name.as_ref()))
+                .cloned()
+        };
+        if let Some(impl_fn) = impl_fn {
+            ensure_ic_tracer_registered();
+            let entry = ProtoIcEntry {
+                callee: callee_id,
+                generation,
+                tag,
+                impl_fn: impl_fn.clone(),
+            };
+            if idx != 0 {
+                let cell = {
+                    let table = proto_ic_table().read().unwrap();
+                    table.get(idx - 1).cloned()
+                };
+                if let Some(cell) = cell {
+                    *cell.0.lock().unwrap() = Some(entry);
+                }
+            } else {
+                let mut table = proto_ic_table().write().unwrap();
+                table.push(Arc::new(ProtoIcCell(std::sync::Mutex::new(Some(entry)))));
+                let new_idx = table.len(); // index + 1
+                drop(table);
+                unsafe { *slot = new_idx };
+            }
+            return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
+        }
+    }
+    unsafe { rt_call(callee, args, nargs) }
 }
 
 #[cfg(test)]
@@ -2955,5 +4278,21 @@ mod tests {
         let v = unsafe { rt_alloc_vector(elems.as_ptr(), 2) };
         let n = unsafe { rt_count(v) };
         assert!(matches!(unsafe { &*n }, Value::Long(2)));
+    }
+
+    #[test]
+    fn test_count_cons_chain() {
+        // Regression: `count` over a cons/seq chain (e.g. the result of
+        // `filter`/`map`) must walk the chain, not return 0.
+        let nil = rt_const_nil();
+        let c1 = unsafe { rt_alloc_cons(rt_const_long(3), nil) };
+        let c2 = unsafe { rt_alloc_cons(rt_const_long(2), c1) };
+        let c3 = unsafe { rt_alloc_cons(rt_const_long(1), c2) };
+        let n = unsafe { rt_count(c3) };
+        assert!(
+            matches!(unsafe { &*n }, Value::Long(3)),
+            "count of a 3-element cons chain must be 3, got {:?}",
+            unsafe { &*n }
+        );
     }
 }
