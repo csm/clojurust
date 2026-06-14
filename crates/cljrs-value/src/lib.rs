@@ -13,6 +13,7 @@ pub mod regex;
 pub mod resource;
 pub mod shared;
 pub mod symbol;
+pub mod type_hint;
 pub mod types;
 pub mod value;
 
@@ -38,6 +39,7 @@ pub use native_object::{NativeObject, NativeObjectBox, gc_native_object};
 pub use resource::{Resource, ResourceHandle};
 pub use shared::{PromoteError, SharedAtom, SharedValue, demote, promote};
 pub use symbol::Symbol;
+pub use type_hint::TypeHint;
 pub use types::{
     Agent, Arity, Atom, BoundFn, CljxCons, CljxFn, CljxFnArity, CljxFuture, CljxPromise, Delay,
     DelayState, FutureState, LazySeq, MultiFn, Namespace, NativeFn, NativeFnFunc, NativeFnPtr,

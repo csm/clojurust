@@ -1,0 +1,73 @@
+;; Mandelbrot set — primitive type tagging showcase.
+;;
+;; The escape-time inner loop (`escape-count`) is the hot path: it runs up to
+;; `max-iter` times for every pixel, doing nothing but complex-number
+;; arithmetic.  With the ^double / ^long hints the compiler keeps zr, zi and
+;; the iteration counter unboxed in registers and emits raw fadd/fmul/fcmp and
+;; iadd/icmp instead of the boxed rt_add/rt_lt bridge calls — no per-operation
+;; allocation.  `unchecked-inc` bumps the counter with a plain wrapping add
+;; (it can never exceed max-iter, so the overflow check is pure overhead).
+;;
+;; The ASCII rendering around it (str/subs/println) stays boxed; that's fine —
+;; it is O(width*height) while the unboxed kernel is O(width*height*max-iter).
+
+(ns mandelbrot)
+
+(defn escape-count
+  "Iterations before (cr,ci) escapes |z| >= 2, capped at max-iter.
+   Pure unboxed f64/i64 arithmetic."
+  [^double cr ^double ci ^long max-iter]
+  (loop [^long iter 0
+         ^double zr 0.0
+         ^double zi 0.0]
+    (let [zr2 (* zr zr)
+          zi2 (* zi zi)]
+      (if (or (>= iter max-iter)
+              (>= (+ zr2 zi2) 4.0))
+        iter
+        (recur (unchecked-inc iter)
+               (+ (- zr2 zi2) cr)            ; zr' = zr^2 - zi^2 + cr
+               (+ (* 2.0 (* zr zi)) ci)))))) ; zi' = 2*zr*zi + ci
+
+(defn render
+  "Print an ASCII Mandelbrot of the given size and return a checksum (the sum
+   of every pixel's escape count, to prevent the work being optimised away)."
+  [^long width ^long height ^long max-iter]
+  (let [xmin -2.5 xmax 1.0
+        ymin -1.25 ymax 1.25
+        dx (/ (- xmax xmin) width)
+        dy (/ (- ymax ymin) height)
+        shades " .:-=+*#%@"
+        nshades (count shades)]
+    (loop [^long py 0
+           ^long checksum 0]
+      (if (>= py height)
+        checksum
+        (let [ci (+ ymin (* py dy))
+              row-checksum
+              (loop [^long px 0
+                     ^long acc checksum
+                     line ""]
+                (if (>= px width)
+                  (do (println line) acc)
+                  (let [cr (+ xmin (* px dx))
+                        n  (escape-count cr ci max-iter)
+                        idx (if (>= n max-iter)
+                              (dec nshades)        ; inside the set
+                              (mod n nshades))
+                        ch (subs shades idx (inc idx))]
+                    (recur (unchecked-inc px)
+                           (unchecked-add acc n)
+                           (str line ch)))))]
+          (recur (unchecked-inc py) row-checksum))))))
+
+(defn -main [& args]
+  (let [width    (int (or (first args)     "80"))
+        height   (int (or (second args)    "30"))
+        max-iter (int (or (nth args 2 nil) "100"))]
+    (println "Mandelbrot" width "x" height "max-iter" max-iter)
+    (let [start    (nanotime)
+          checksum (render width height max-iter)
+          end      (nanotime)]
+      (println "Checksum:" checksum)
+      (println "Time (ms):" (/ (- end start) 1e6)))))

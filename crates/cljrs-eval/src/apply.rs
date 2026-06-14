@@ -195,6 +195,7 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
             destructure_params: a.destructure_params.clone(),
             destructure_rest: a.destructure_rest.clone(),
             expanded_body: crate::lower::macroexpand_body(&a.body, caller_env),
+            param_hints: a.param_hints.clone(),
         })
         .collect();
     let arity_ids: Vec<u64> = arities.iter().map(|a| a.arity_id).collect();
