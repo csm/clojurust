@@ -36,15 +36,26 @@ use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
 /// Sending end of a cross-isolate channel. Cloneable — multiple senders are
 /// allowed. All methods are synchronous and cheap (just serialization + channel
 /// push).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IsolateSender {
     tx: tokio::sync::mpsc::UnboundedSender<SerializedValue>,
 }
 
 /// Receiving end of a cross-isolate channel. Must live on the destination
 /// isolate's thread so that `deserialize` allocates into the right GC heap.
+#[derive(Debug)]
 pub struct IsolateReceiver {
     rx: tokio::sync::mpsc::UnboundedReceiver<SerializedValue>,
+}
+
+/// Outcome of a non-blocking [`IsolateReceiver::try_recv_status`].
+pub enum IsolateRecv {
+    /// A value was dequeued and deserialized into the current isolate's heap.
+    Value(Value),
+    /// The channel is currently empty but at least one sender is still alive.
+    Empty,
+    /// All senders have been dropped and the queue is drained.
+    Disconnected,
 }
 
 // IsolateSender is Send because SerializedValue: Send.
@@ -68,7 +79,13 @@ impl IsolateSender {
     /// non-shareable type (mutable state, closures, native resources).
     /// Returns `Err(CloneError::Disconnected)` if the receiver has been dropped.
     pub fn send(&self, v: &Value) -> Result<(), CloneError> {
+        let start = std::time::Instant::now();
         let sv = serialize(v)?;
+        // Meter the crossing (bytes copied + serialize time) into the shared
+        // GC stats so a silent fan-out copy is observable rather than mystery
+        // latency. The error path above is intentionally *not* metered — a
+        // rejected value never crosses, so it copies nothing.
+        cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
         self.tx.send(sv).map_err(|_| CloneError::Disconnected)
     }
 }
@@ -84,6 +101,18 @@ impl IsolateReceiver {
     /// empty or all senders have been dropped.
     pub fn try_recv(&mut self) -> Option<Value> {
         self.rx.try_recv().ok().map(deserialize)
+    }
+
+    /// Non-blocking receive that distinguishes "empty" from "disconnected" —
+    /// the Clojure-level `isolate-take!`/`isolate-poll!` builtins need to tell a
+    /// transient empty queue (keep waiting) from a closed channel (yield `nil`).
+    pub fn try_recv_status(&mut self) -> IsolateRecv {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(sv) => IsolateRecv::Value(deserialize(sv)),
+            Err(TryRecvError::Empty) => IsolateRecv::Empty,
+            Err(TryRecvError::Disconnected) => IsolateRecv::Disconnected,
+        }
     }
 }
 
@@ -272,6 +301,26 @@ mod tests {
         let h = Isolate::new("atom-sender").spawn(move || async move {
             let a = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
             assert!(matches!(tx.send(&a), Err(CloneError::NotShareable { .. })));
+        });
+        h.join().unwrap();
+    }
+
+    /// Sending a value across the boundary meters bytes + crossings into the
+    /// shared GC stats. Other tests may also increment the global counters
+    /// concurrently, so we assert monotonic *increase*, not exact totals.
+    #[test]
+    fn send_meters_the_crossing() {
+        let (tx, _rx) = isolate_channel();
+        let h = Isolate::new("meter-sender").spawn(move || async move {
+            let before = cljrs_gc::GC_STATS.snapshot();
+            let v = Value::Vector(GcPtr::new(PersistentVector::from_iter([
+                Value::string("a metered payload"),
+                Value::Long(7),
+            ])));
+            tx.send(&v).unwrap();
+            let after = cljrs_gc::GC_STATS.snapshot();
+            assert!(after.boundary_crossings > before.boundary_crossings);
+            assert!(after.boundary_bytes_copied > before.boundary_bytes_copied);
         });
         h.join().unwrap();
     }

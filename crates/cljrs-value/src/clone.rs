@@ -167,6 +167,102 @@ const _: () = {
     let _ = _assert_send::<SerializedValue>;
 };
 
+impl SerializedValue {
+    /// Estimated heap bytes materialized by deep-copying this value into the
+    /// receiving isolate's heap. This is an approximation for **telemetry**
+    /// (the metered clone seam the isolate-boundary plan requires), not an
+    /// exact allocation count: each node contributes a fixed per-node cost plus
+    /// the size of any owned payload (string bytes, array elements, big-number
+    /// magnitude). `Arc`-shared payloads (`SharedAtom`, `ByteBlob`) count as
+    /// zero structural bytes because they cross by refcount, not by copy.
+    pub fn byte_size(&self) -> usize {
+        // Per-node base cost: one `SerializedValue` slot plus the GcPtr/box the
+        // deserialized form allocates on the receiver side.
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+
+        let payload = match self {
+            SerializedValue::Nil
+            | SerializedValue::Bool(_)
+            | SerializedValue::Long(_)
+            | SerializedValue::Double(_)
+            | SerializedValue::Char(_)
+            | SerializedValue::Uuid(_) => 0,
+
+            SerializedValue::BigInt(b) => (b.bits() as usize / 8) + 1,
+            SerializedValue::Ratio(r) => {
+                (r.numer().bits() as usize + r.denom().bits() as usize) / 8 + 2
+            }
+            SerializedValue::BigDecimal(_) => 16,
+
+            SerializedValue::Str(s) => s.len(),
+            SerializedValue::Pattern(s) => s.len(),
+
+            SerializedValue::Symbol {
+                namespace, name, ..
+            } => namespace.as_ref().map_or(0, |n| n.len()) + name.len(),
+            SerializedValue::Keyword { namespace, name } => {
+                namespace.as_ref().map_or(0, |n| n.len()) + name.len()
+            }
+
+            SerializedValue::List(items)
+            | SerializedValue::Vector(items)
+            | SerializedValue::HashSet(items)
+            | SerializedValue::SortedSet(items)
+            | SerializedValue::Queue(items)
+            | SerializedValue::ObjectArray(items) => {
+                items.iter().map(SerializedValue::byte_size).sum()
+            }
+
+            SerializedValue::ArrayMap(pairs)
+            | SerializedValue::HashMap(pairs)
+            | SerializedValue::SortedMap(pairs) => pairs
+                .iter()
+                .map(|(k, v)| k.byte_size() + v.byte_size())
+                .sum(),
+
+            SerializedValue::TypeInstance { fields, .. } => fields
+                .iter()
+                .map(|(k, v)| k.byte_size() + v.byte_size())
+                .sum(),
+
+            SerializedValue::Cons { head, tail } => head.byte_size() + tail.byte_size(),
+
+            SerializedValue::Error(e) => e.byte_size(),
+
+            SerializedValue::BooleanArray(v) => v.len(),
+            SerializedValue::ByteArray(v) => v.len(),
+            SerializedValue::ShortArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::IntArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::LongArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::FloatArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::DoubleArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::CharArray(v) => std::mem::size_of_val(v.as_slice()),
+
+            SerializedValue::WithMeta { value, meta } => value.byte_size() + meta.byte_size(),
+            SerializedValue::Reduced(inner) => inner.byte_size(),
+
+            // Arc-shared: crosses by refcount bump, no structural copy.
+            SerializedValue::SharedAtom(_) | SerializedValue::ByteBlob(_) => 0,
+        };
+
+        NODE + payload
+    }
+}
+
+impl SerializedError {
+    fn byte_size(&self) -> usize {
+        std::mem::size_of::<SerializedError>()
+            + self.message.len()
+            + self.data.as_ref().map_or(0, |pairs| {
+                pairs
+                    .iter()
+                    .map(|(k, v)| k.byte_size() + v.byte_size())
+                    .sum()
+            })
+            + self.cause.as_ref().map_or(0, |c| c.byte_size())
+    }
+}
+
 /// Serialized form of [`crate::error::ExceptionInfo`].
 #[derive(Clone, Debug)]
 pub struct SerializedError {
@@ -756,5 +852,34 @@ mod tests {
     fn reduced_roundtrip() {
         let v = Value::Reduced(Box::new(Value::Long(55)));
         assert_eq!(roundtrip(&v), Value::Reduced(Box::new(Value::Long(55))));
+    }
+
+    #[test]
+    fn byte_size_counts_string_payload() {
+        let small = serialize(&Value::string("hi")).unwrap();
+        let large = serialize(&Value::string(&"x".repeat(1000))).unwrap();
+        // Same variant, so the difference is the string payload (~998 bytes).
+        assert!(large.byte_size() > small.byte_size() + 900);
+    }
+
+    #[test]
+    fn byte_size_grows_with_collection() {
+        let small = serialize(&Value::Vector(GcPtr::new(PersistentVector::from_iter([
+            Value::Long(1),
+        ]))))
+        .unwrap();
+        let large = serialize(&Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            (0..100).map(Value::Long),
+        ))))
+        .unwrap();
+        assert!(large.byte_size() > small.byte_size());
+    }
+
+    #[test]
+    fn byte_size_scalar_is_node_sized() {
+        // A scalar has no owned payload, so it costs exactly one node.
+        let node = std::mem::size_of::<SerializedValue>();
+        assert_eq!(serialize(&Value::Long(7)).unwrap().byte_size(), node);
+        assert_eq!(serialize(&Value::Nil).unwrap().byte_size(), node);
     }
 }

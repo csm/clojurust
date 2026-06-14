@@ -72,7 +72,8 @@ src/
   config.rs       — (GC mode) GcConfig, GcCancellation (zero-sized proxy),
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
   stats.rs        — process-global GcStats counters: GC allocations,
-                    region (bump) allocations, GC pauses + freed bytes/objects
+                    region (bump) allocations, GC pauses + freed bytes/objects,
+                    isolate-boundary crossings (bytes copied + serialize time)
 tests/
   no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
                     ScratchGuard, StaticCtxGuard, pop_for_return protocol,
@@ -284,11 +285,15 @@ impl GcStats {
     pub fn record_region_alloc(&self, bytes: usize)
     pub fn record_region_poison(&self)
     pub fn record_gc_pause(&self, pause: Duration, freed_objects: u64, freed_bytes: u64)
+    pub fn record_boundary_crossing(&self, bytes: u64, copy_time: Duration)
     pub fn snapshot(&self) -> GcStatsSnapshot
 }
 
 pub struct GcStatsSnapshot { /* immutable view of counters */ }
-impl GcStatsSnapshot { pub fn total_pause(&self) -> Duration }
+impl GcStatsSnapshot {
+    pub fn total_pause(&self) -> Duration
+    pub fn total_boundary_copy(&self) -> Duration
+}
 impl std::fmt::Display for GcStatsSnapshot { /* multi-line summary */ }
 
 pub static GC_STATS: GcStats;
@@ -300,6 +305,13 @@ pub fn dump_stats_from_env();
 Process-global counters updated automatically by `GcHeap::alloc`,
 `GcHeap::collect`, and `Region::alloc`.  The `cljrs --gc-stats [FILE]` CLI
 flag prints a snapshot of these counters at program exit.
+
+`record_boundary_crossing` is the **metered isolate-boundary seam** required by
+`docs/isolate-boundary-plan.md`: every value deep-copied across an isolate
+boundary (the Phase B2 structured-clone in `cljrs-async`'s `IsolateSender::send`)
+records its estimated bytes copied and serialize time here, so a silent fan-out
+copy shows up in `--gc-stats` as `Boundary crossings: N (B bytes copied)` rather
+than as mystery latency.
 
 `dump_stats_from_env()` is the AOT-binary equivalent: it reads the
 `CLJRS_GC_STATS` environment variable and, if set, writes a snapshot to
