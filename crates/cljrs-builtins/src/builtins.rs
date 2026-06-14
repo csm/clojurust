@@ -24,8 +24,8 @@ use cljrs_value::value::SetValue;
 use cljrs_value::{
     Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue,
     Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
-    PersistentQueue, PersistentVector, SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError,
-    ValueResult, Volatile,
+    PersistentQueue, PersistentVector, SharedAtom, SortedSet, Symbol, Thunk, TypeInstance, Value,
+    ValueError, ValueResult, Volatile, demote, promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -357,6 +357,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("queue", Arity::Variadic { min: 0 }, builtin_queue),
         // Atoms
         ("atom", Arity::Variadic { min: 1 }, builtin_atom),
+        // Phase B3 — cross-isolate shared-atom (two-tier ADR)
+        ("shared-atom", Arity::Fixed(1), builtin_shared_atom),
+        ("shared-atom?", Arity::Fixed(1), builtin_shared_atom_q),
         ("deref", Arity::Variadic { min: 1 }, builtin_deref),
         ("reset!", Arity::Fixed(2), builtin_reset_bang),
         ("get-validator", Arity::Fixed(1), builtin_get_validator),
@@ -4890,6 +4893,25 @@ fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Atom(GcPtr::new(Atom::new(args[0].clone()))))
 }
 
+// ── shared-atom (Phase B3, two-tier ADR) ──────────────────────────────────────
+
+/// `(shared-atom x)` — create a cross-isolate atom holding `x`.
+///
+/// Unlike `atom` (isolate-local, GC-backed), a `shared-atom` stores its contents
+/// as a `SharedValue` behind a lock-free `ArcSwap`, so the same reference can be
+/// handed to another isolate and mutated concurrently.  The initial value is
+/// promoted immediately; non-promotable values (closures, native resources,
+/// isolate-bound collections) are rejected here rather than at first write.
+fn builtin_shared_atom(args: &[Value]) -> ValueResult<Value> {
+    let sv = promote(&args[0]).map_err(|e| ValueError::Other(e.to_string()))?;
+    Ok(Value::SharedAtom(std::sync::Arc::new(SharedAtom::new(sv))))
+}
+
+/// `(shared-atom? x)` — true iff `x` is a `shared-atom`.
+fn builtin_shared_atom_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args[0], Value::SharedAtom(_))))
+}
+
 fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().get_validator().unwrap_or(Value::Nil)),
@@ -4950,6 +4972,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
     let with_timeout = args.len() == 3;
     match &args[0] {
         Value::Atom(a) => Ok(a.get().deref()),
+        Value::SharedAtom(sa) => Ok(demote(&sa.deref_val())),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
         Value::Delay(d) => d.get().force().map_err(ValueError::Other),
         Value::Agent(a) => Ok(a.get().get_state()),
@@ -5065,6 +5088,11 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
 fn builtin_reset_bang(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().reset(args[1].clone())),
+        Value::SharedAtom(sa) => {
+            let sv = promote(&args[1]).map_err(|e| ValueError::Other(e.to_string()))?;
+            sa.reset(sv);
+            Ok(args[1].clone())
+        }
         v => Err(ValueError::WrongType {
             expected: "atom",
             got: v.type_name().to_string(),
@@ -6431,6 +6459,16 @@ fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
             } else {
                 Ok(Value::Bool(false))
             }
+        }
+        Value::SharedAtom(sa) => {
+            // Lock-free CAS: succeed only if the live value still equals the
+            // expected one, by content, at the moment of the atomic store.
+            let cur = sa.deref_val();
+            if demote(&cur) != args[1] {
+                return Ok(Value::Bool(false));
+            }
+            let sv = promote(&args[2]).map_err(|e| ValueError::Other(e.to_string()))?;
+            Ok(Value::Bool(sa.compare_and_set(&cur, sv)))
         }
         v => Err(ValueError::WrongType {
             expected: "atom",

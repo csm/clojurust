@@ -161,7 +161,8 @@ impl SharedAtom {
     pub fn new(val: SharedValue) -> Self
     pub fn deref_val(&self) -> Arc<SharedValue>     // atomic load
     pub fn reset(&self, val: SharedValue) -> Arc<SharedValue>
-    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry
+    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry (closure form)
+    pub fn compare_and_set(&self, current: &Arc<SharedValue>, new: SharedValue) -> bool
 }
 
 pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
@@ -170,7 +171,10 @@ pub fn demote (sv:    &SharedValue) -> Value;
 
 `promote` converts an isolate-local `Value` to `SharedValue` (fails for
 closures, resources, atoms, …).  `demote` converts back into a fresh
-isolate-local `Value`.
+isolate-local `Value`.  `compare_and_set` is the single lock-free CAS that
+backs the Clojure-level `compare-and-set!` and the `swap!` retry loop (callers
+that must run interpreter code between load and store use it instead of the
+closure-based `swap`).
 
 ### `ClojureHash`
 

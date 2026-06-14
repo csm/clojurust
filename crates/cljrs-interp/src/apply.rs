@@ -968,6 +968,49 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     Ok(Value::Atom(atom))
 }
 
+// ── shared-atom (Phase B3, two-tier ADR) ──────────────────────────────────────
+//
+// `shared-atom` is the cross-isolate tier of the two-tier atom design: its
+// contents live in `SharedValue` (Send + Sync, refcounted) behind a lock-free
+// `ArcSwap`, so the same atom can be observed and mutated from any isolate.
+// `deref`/`reset!`/`swap!`/`compare-and-set!` all route through these helpers
+// when handed a `Value::SharedAtom`, so the surface mirrors a local `atom`
+// except that values are promoted on write and demoted on read.
+
+/// `reset!` on a shared-atom: promote the new value and store it atomically.
+/// Returns the (isolate-local) value that was written.
+fn shared_atom_reset(sa: &Arc<cljrs_value::SharedAtom>, new_val: Value) -> EvalResult {
+    let promoted = cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
+    sa.reset(promoted);
+    Ok(new_val)
+}
+
+/// `swap!` on a shared-atom: CAS-retry loop.  Loads the current value, demotes
+/// it into an isolate-local `Value`, applies `f` (plus any extra args), promotes
+/// the result, and commits with a single compare-and-set — retrying from the
+/// fresh value if another isolate raced us in between.
+fn shared_atom_swap(
+    sa: &Arc<cljrs_value::SharedAtom>,
+    f: &Value,
+    extra: Vec<Value>,
+    env: &mut Env,
+) -> EvalResult {
+    loop {
+        let cur = sa.deref_val();
+        let old_val = cljrs_value::demote(&cur);
+        let mut call_args = Vec::with_capacity(1 + extra.len());
+        call_args.push(old_val);
+        call_args.extend(extra.iter().cloned());
+        let new_val = cljrs_env::apply::apply_value(f, call_args, env)?;
+        let promoted =
+            cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
+        if sa.compare_and_set(&cur, promoted) {
+            return Ok(new_val);
+        }
+        // Lost the race; another writer committed first. Re-read and retry.
+    }
+}
+
 // ── reset! ────────────────────────────────────────────────────────────────────
 
 fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
@@ -987,6 +1030,7 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     let atom = match &atom_val {
         Value::Atom(a) => a.clone(),
+        Value::SharedAtom(sa) => return shared_atom_reset(sa, new_val),
         v => {
             return Err(EvalError::Runtime(format!(
                 "reset! requires an atom, got {}",
@@ -1037,6 +1081,7 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     let atom = match &atom_val {
         Value::Atom(a) => a.clone(),
+        Value::SharedAtom(sa) => return shared_atom_swap(sa, &f, evaled, env),
         v => {
             return Err(EvalError::Runtime(format!(
                 "swap! requires an atom, got {}",
@@ -1184,6 +1229,7 @@ pub fn eval_reset_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
     let new_val = args[1].clone();
     let atom = match &atom_val {
         Value::Atom(a) => a.clone(),
+        Value::SharedAtom(sa) => return shared_atom_reset(sa, new_val),
         v => {
             return Err(EvalError::Runtime(format!(
                 "reset! requires an atom, got {}",
@@ -1214,6 +1260,7 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     let f = args.remove(0);
     let atom = match &atom_val {
         Value::Atom(a) => a.clone(),
+        Value::SharedAtom(sa) => return shared_atom_swap(sa, &f, args, env),
         v => {
             return Err(EvalError::Runtime(format!(
                 "swap! requires an atom, got {}",
