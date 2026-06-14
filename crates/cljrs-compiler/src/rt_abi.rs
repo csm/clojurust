@@ -2935,6 +2935,13 @@ pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) ->
     let val = unsafe { val_ref(val) }.clone();
     match atom {
         Value::Atom(a) => box_val(a.get().reset(val)),
+        Value::SharedAtom(sa) => match cljrs_value::promote(&val) {
+            Ok(sv) => {
+                sa.reset(sv);
+                box_val(val)
+            }
+            Err(_) => rt_const_nil(),
+        },
         _ => rt_const_nil(),
     }
 }
@@ -2981,6 +2988,26 @@ pub unsafe extern "C" fn rt_atom_swap(
                         }
                         // CAS failed, retry
                     }
+                    Err(_) => return rt_const_nil(),
+                }
+            }
+        }
+        Value::SharedAtom(sa) => {
+            // Cross-isolate swap!: load → demote → apply f → promote → CAS-retry.
+            loop {
+                let cur = sa.deref_val();
+                let mut args = vec![cljrs_value::demote(&cur)];
+                args.extend(extra.iter().cloned());
+                match cljrs_env::callback::invoke(&f, args) {
+                    Ok(new_val) => match cljrs_value::promote(&new_val) {
+                        Ok(sv) => {
+                            if sa.compare_and_set(&cur, sv) {
+                                return box_val(new_val);
+                            }
+                            // CAS failed, retry
+                        }
+                        Err(_) => return rt_const_nil(),
+                    },
                     Err(_) => return rt_const_nil(),
                 }
             }

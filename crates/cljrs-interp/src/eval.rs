@@ -297,6 +297,7 @@ pub fn is_special_form(s: &str) -> bool {
 pub fn deref_value(v: Value) -> EvalResult {
     match v {
         Value::Atom(a) => Ok(a.get().deref()),
+        Value::SharedAtom(sa) => Ok(cljrs_value::demote(&sa.deref_val())),
         Value::Var(var) => cljrs_env::dynamics::deref_var(&var)
             .ok_or_else(|| EvalError::Runtime("unbound var".into())),
         Value::Volatile(vol) => Ok(vol.get().deref()),

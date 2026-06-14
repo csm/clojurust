@@ -221,6 +221,20 @@ impl SharedAtom {
     {
         self.cell.rcu(|old| Arc::new(f(old)))
     }
+
+    /// Single lock-free compare-and-set.  Atomically stores `new` iff the cell
+    /// still holds `current` (by `Arc` identity).  Returns `true` on success.
+    ///
+    /// This is the primitive used by Clojure-level `compare-and-set!` and by the
+    /// retry loop behind `swap!`: a caller that needs to run arbitrary
+    /// (interpreter) code between the load and the store cannot use the closure
+    /// form of [`swap`], so it loads via [`deref_val`](Self::deref_val), computes
+    /// the next value, then commits with this method, retrying on contention.
+    pub fn compare_and_set(&self, current: &Arc<SharedValue>, new: SharedValue) -> bool {
+        let prev = self.cell.compare_and_swap(current, Arc::new(new));
+        // The swap committed iff the value we replaced is the one we expected.
+        std::ptr::eq(Arc::as_ptr(current), Arc::as_ptr(&prev))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -318,6 +332,18 @@ mod tests {
         });
         let val = atom.deref_val();
         assert!(matches!(val.as_ref(), SharedValue::Long(2)));
+    }
+
+    #[test]
+    fn shared_atom_compare_and_set() {
+        let atom = SharedAtom::new(SharedValue::Long(1));
+        let cur = atom.deref_val();
+        // Stale expectation succeeds while no one races us.
+        assert!(atom.compare_and_set(&cur, SharedValue::Long(2)));
+        assert!(matches!(atom.deref_val().as_ref(), SharedValue::Long(2)));
+        // `cur` is now stale: a second CAS against it must fail and not write.
+        assert!(!atom.compare_and_set(&cur, SharedValue::Long(99)));
+        assert!(matches!(atom.deref_val().as_ref(), SharedValue::Long(2)));
     }
 
     #[test]
