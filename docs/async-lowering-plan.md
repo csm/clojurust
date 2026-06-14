@@ -66,13 +66,31 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
   AOT limitation — sync await deadlocks the LocalSet; async `-main` is the entry.)
 
 **The async-lowering pipeline is complete and live in both `cljrs run`/REPL
-(JIT) and `cljrs compile` (AOT).** Remaining follow-ups (not blocking):
+(JIT) and `cljrs compile` (AOT).** Scope of what compiles natively:
+
+- **Supported now:** `await` of plain values / futures (incl. nested `^:async`
+  calls), across straight-line, `if`/`let`, and `loop`/`recur`.
+- **Kept on the interpreter (Phase H4):** fns whose body uses channel /
+  concurrency ops (`go`, `chan`, `take!`/`put!`, `<!`/`>!`, `alt`, `timeout`,
+  `mult`, `async-pmap`, …) are detected by `body_uses_unsupported_async` and
+  skipped by both activation drivers, so e.g. `samples/core_async.cljrs` runs
+  fully interpreted (and correctly) under both `cljrs run` and `cljrs compile`.
+
+Two bugs fixed while bringing the core.async sample green:
+- **Slot aliasing:** `rt_state_load` / `rt_async_take_result` returned a pointer
+  into the mutable slot (`pending`); a loop-carried value reloaded then read the
+  *new* slot contents after a later `state_store` (e.g. `(await i)` saw
+  `(inc i)`). Both now return a fresh GC-boxed copy.
+- **Channel-fn miscompile / null-deref:** channel-using `^:async` fns were being
+  compiled and crashed; now skipped (above).
+
+Remaining follow-ups (not blocking):
 
 - **Region-aware suspends**: let region scopes close before / reopen after a
   suspend so async bodies regain bump-allocation (currently GC-heap only).
-- **Channels / spawn (H4)** and **try-catch across suspend (H5)**; poll-fn code
-  unloading on redefinition; inner-closure (subfunction) support in AOT async;
-  GC-stress coverage of the activated path.
+- **Channels / spawn (H4)** (native, not just fallback) and **try-catch across
+  suspend (H5)**; poll-fn code unloading on redefinition; inner-closure
+  (subfunction) support in AOT async; GC-stress coverage of the activated path.
 
 ## Context
 

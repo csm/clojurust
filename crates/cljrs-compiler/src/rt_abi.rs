@@ -4624,15 +4624,17 @@ pub extern "C" fn rt_state_store(sm: *mut CljxStateMachine, slot: u32, val: *con
 }
 
 /// Restore a live value from a state-machine slot after a resume.  Returns a
-/// pointer into the slot array, valid until the slot is next overwritten (the
-/// array's backing storage is stable for the task's lifetime).
+/// *fresh* GC-boxed copy, decoupled from the slot: a loaded value can flow
+/// through a `recur` phi and outlive a later `rt_state_store` to the same slot
+/// (e.g. a loop counter reloaded, then the slot overwritten with `(inc i)`
+/// before the old value is used), so it must not alias the mutable slot.
 ///
 /// # Safety
 /// `sm` must be live and `slot` in range.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_state_load(sm: *mut CljxStateMachine, slot: u32) -> *const Value {
     let sm = unsafe { &*sm };
-    &sm.slots[slot as usize] as *const Value
+    box_val(sm.slots[slot as usize].clone())
 }
 
 /// Register the value being awaited at a suspend point.
@@ -4668,14 +4670,16 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
     }
 }
 
-/// Return the resolved/thrown value stashed by [`rt_async_poll_ready`].
+/// Return the resolved value stashed by [`rt_async_poll_ready`], as a *fresh*
+/// GC-boxed copy decoupled from `pending` (which the next suspend overwrites) —
+/// the awaited value may flow through a `recur` phi past that point.
 ///
 /// # Safety
 /// `sm` must point to a live `CljxStateMachine`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_async_take_result(sm: *mut CljxStateMachine) -> *const Value {
     let sm = unsafe { &*sm };
-    &sm.pending as *const Value
+    box_val(sm.pending.clone())
 }
 
 /// Store the poll function's final result into the state machine (used by

@@ -49,6 +49,66 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{Block, BlockId, Inst, IrFunction, SuspendKind, Terminator, VarId};
 
+/// Channel / concurrency operations whose presence in an `^:async` body marks
+/// it as out of scope for native lowering (Phase H4): they return futures the
+/// poll machine doesn't yet model, spawn `go` tasks, or drive the executor in
+/// ways the state machine can't reproduce.  Such fns keep the `eval_async`
+/// tree-walker.  The names are matched after stripping any namespace qualifier.
+const UNSUPPORTED_ASYNC_OPS: &[&str] = &[
+    "go",
+    "chan",
+    "take!",
+    "put!",
+    "<!",
+    ">!",
+    "<!!",
+    ">!!",
+    "close!",
+    "alt",
+    "alts",
+    "alts!",
+    "timeout",
+    "join-all",
+    "async-pmap",
+    "async-spawn",
+    "mult",
+    "tap!",
+    "untap!",
+    "untap-all!",
+    "poll!",
+    "offer!",
+    "thread",
+    "thread-call",
+    "onto-chan!",
+    "to-chan!",
+    "pipe",
+    "go-try",
+    "<?",
+    "<??",
+];
+
+/// Whether an `^:async` body (its top-level forms) references any channel /
+/// concurrency operation that native lowering does not yet support (Phase H4).
+/// Drivers call this to keep such fns on the interpreter.
+pub fn body_uses_unsupported_async(body: &[cljrs_reader::Form]) -> bool {
+    body.iter().any(form_uses_unsupported_async)
+}
+
+fn form_uses_unsupported_async(form: &cljrs_reader::Form) -> bool {
+    use cljrs_reader::form::FormKind;
+    match &form.kind {
+        FormKind::Symbol(s) => {
+            let base = s.rsplit('/').next().unwrap_or(s);
+            UNSUPPORTED_ASYNC_OPS.contains(&base)
+        }
+        FormKind::List(parts) | FormKind::Vector(parts) | FormKind::Set(parts) => {
+            parts.iter().any(form_uses_unsupported_async)
+        }
+        FormKind::Map(elems) => elems.iter().any(form_uses_unsupported_async),
+        _ => false,
+    }
+}
+
 /// Reason a function could not be lowered to a state machine; the caller keeps
 /// the interpreter (`eval_async`) fallback for it.
 #[derive(Debug, Clone, PartialEq, Eq)]

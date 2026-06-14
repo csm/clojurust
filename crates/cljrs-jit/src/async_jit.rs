@@ -60,6 +60,12 @@ pub(crate) fn compile_async_arity(callee: &Value, nargs: usize, env: &mut Env) {
     let (arity_id, name, ns, params, rest_param, destructure_params, destructure_rest, body) =
         lowered;
 
+    // Channel / concurrency ops (Phase H4) aren't modeled by the poll machine;
+    // keep such fns on the tree-walker.
+    if cljrs_ir::lower::async_lower::body_uses_unsupported_async(&body) {
+        return;
+    }
+
     // Form AST → IR with `is_async = true`.  We deliberately skip the
     // region-optimization pass: a bump-region scope (`RegionStart`/`RegionEnd`)
     // must not span a suspend, since the poll function returns to the executor

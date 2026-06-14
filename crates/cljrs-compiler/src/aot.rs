@@ -917,6 +917,11 @@ fn compile_async_poll_fns(
     let mut entries = Vec::new();
     for fnsnap in &snaps {
         for arity in &fnsnap.arities {
+            // Channel / concurrency ops (Phase H4) aren't modeled by the poll
+            // machine; keep such fns on the tree-walker.
+            if cljrs_ir::lower::async_lower::body_uses_unsupported_async(&arity.body) {
+                continue;
+            }
             let ir = match cljrs_eval::lower::lower_arity(
                 Some(&fnsnap.name),
                 &arity.params,
