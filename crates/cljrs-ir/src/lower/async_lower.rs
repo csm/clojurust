@@ -283,6 +283,11 @@ fn reject_unsupported(f: &IrFunction) -> Result<(), AsyncLowerError> {
                 Inst::ChanPut { .. } => {
                     return Err(AsyncLowerError::Unsupported("channel put (>!)".into()));
                 }
+                // `throw` across a suspend needs the poll-fn exception path
+                // (deferred with try/catch, H5); keep such fns interpreted.
+                Inst::Throw(_) => {
+                    return Err(AsyncLowerError::Unsupported("throw".into()));
+                }
                 _ => {}
             }
         }

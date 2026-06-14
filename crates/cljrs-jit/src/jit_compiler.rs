@@ -91,6 +91,49 @@ pub(crate) fn compile_jit(
     })
 }
 
+/// Compile an async *poll function* (`ir_func.is_async_poll_fn`, produced by
+/// `cljrs_ir::lower::async_lower`) to native code, returning a pointer with the
+/// state-machine ABI `extern "C" fn(*mut CljxStateMachine, *mut *const Value)
+/// -> i32`.  Mirrors [`compile_jit`] but declares the fixed poll-fn signature.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compile_jit_poll(
+    func_name: &str,
+    ir_func: &IrFunction,
+) -> Result<CompiledFn, String> {
+    let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
+        .map_err(|e| format!("JITBuilder::new: {e}"))?;
+    register_rt_abi_symbols(&mut builder);
+
+    let jit_module = JITModule::new(builder);
+    let ptr_type = jit_module.isa().pointer_type();
+    let mut compiler = new_compiler_from_module(jit_module, ptr_type)
+        .map_err(|e| format!("new_compiler_from_module: {e:?}"))?;
+
+    let func_id: FuncId = compiler
+        .declare_poll_function(func_name)
+        .map_err(|e| format!("declare_poll_function: {e:?}"))?;
+
+    declare_subfunctions(ir_func, &mut compiler)?;
+    compile_subfunctions(ir_func, &mut compiler)?;
+
+    compiler
+        .compile_function(ir_func, func_id)
+        .map_err(|e| format!("compile_function: {e:?}"))?;
+
+    let code_size = compiler.last_code_size();
+    let mut jit_module = compiler.into_inner_module();
+    jit_module
+        .finalize_definitions()
+        .map_err(|e| format!("finalize_definitions: {e}"))?;
+    let fn_ptr = jit_module.get_finalized_function(func_id) as *const ();
+
+    Ok(CompiledFn {
+        fn_ptr,
+        module: jit_module,
+        code_size,
+    })
+}
+
 /// Recursively declare all closure subfunctions so they can reference each
 /// other (mirrors `aot.rs::declare_subfunctions`).
 fn declare_subfunctions<M: cranelift_module::Module>(
@@ -295,7 +338,92 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_kw_ic_fill),
         sym!(rt_call_ic),
         sym!(rt_load_global_versioned_ic),
+        // Async state machine (Phase H)
+        sym!(rt_sm_state),
+        sym!(rt_sm_set_state),
+        sym!(rt_state_store),
+        sym!(rt_state_load),
+        sym!(rt_async_register),
+        sym!(rt_async_poll_ready),
+        sym!(rt_async_take_result),
     ];
 
     builder.symbols(symbols.iter().map(|&(n, p)| (n, p)));
+}
+
+#[cfg(test)]
+mod async_poll_tests {
+    use super::*;
+    use cljrs_async::state_machine::{CljxStateMachine, POLL_PENDING, POLL_READY};
+    use cljrs_ir::{Block, Const, Inst, KnownFn, Terminator};
+    use cljrs_value::Value;
+    use std::sync::Arc;
+
+    /// Build the IR for `(defn ^:async f [x] (+ (await x) 1))`.
+    fn build_async_ir() -> IrFunction {
+        let mut f = IrFunction::new(Some(Arc::from("await_plus_one")), None);
+        f.is_async = true;
+        let v_x = f.fresh_var();
+        f.params.push((Arc::from("x"), v_x));
+        let v_one = f.fresh_var();
+        let v_res = f.fresh_var();
+        let v_sum = f.fresh_var();
+        let entry = f.fresh_block();
+        f.blocks.push(Block {
+            id: entry,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(v_one, Const::Long(1)),
+                Inst::Await {
+                    src: v_x,
+                    dst: v_res,
+                },
+                // v_one is defined before the await and used after it, so it
+                // must be spilled across the suspend.
+                Inst::CallKnown(v_sum, KnownFn::Add, vec![v_res, v_one]),
+            ],
+            terminator: Terminator::Return(v_sum),
+        });
+        f
+    }
+
+    /// End-to-end: lower an async fn, JIT-compile its poll function, and drive
+    /// the native state machine directly through one suspend/resume cycle.
+    #[test]
+    fn compiled_poll_fn_awaits_and_returns() {
+        let _mutator = cljrs_gc::register_mutator();
+
+        let ir = build_async_ir();
+        let low = cljrs_ir::lower::lower_async(&ir).expect("async lowering");
+        let cf = compile_jit_poll("await_plus_one__poll", &low.poll_fn).expect("compile poll fn");
+
+        // SAFETY: `compile_jit_poll` declared the poll-fn ABI for this symbol.
+        let poll: extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32 =
+            unsafe { std::mem::transmute(cf.fn_ptr) };
+
+        // Awaiting a plain Long is the identity (ready on first resume).
+        let mut sm = CljxStateMachine::new(poll, low.n_slots, vec![Value::Long(41)]);
+        let smp: *mut CljxStateMachine = &mut sm;
+        let mut out: *const Value = std::ptr::null();
+
+        // First poll: state 0 runs the prologue, registers the await, suspends.
+        let c0 = poll(smp, &mut out);
+        assert_eq!(
+            c0, POLL_PENDING,
+            "first poll registers the await and suspends"
+        );
+
+        // Second poll: state 1 resolves the (immediately-ready) value, computes
+        // (+ 41 1), and completes.
+        let c1 = poll(smp, &mut out);
+        assert_eq!(c1, POLL_READY, "second poll resolves and completes");
+        let result = unsafe { &*out };
+        assert!(
+            matches!(result, Value::Long(42)),
+            "expected 42, got {result:?}"
+        );
+
+        // Keep the module (and its executable memory) alive until here.
+        drop(cf);
+    }
 }

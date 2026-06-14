@@ -32,4 +32,5 @@ cranelift-native   = { workspace = true }
 cljrs-stdlib = { workspace = true }
 cljrs-reader = { workspace = true }
 cljrs-env    = { workspace = true }
+cljrs-async  = { workspace = true }
 tempfile     = "3"

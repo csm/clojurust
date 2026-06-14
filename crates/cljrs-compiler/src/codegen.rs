@@ -196,6 +196,14 @@ struct RuntimeFuncs {
     rt_deopt: FuncId,
     rt_kw_ic_fill: FuncId,
     rt_call_ic: FuncId,
+    // Async state machine (Phase H)
+    rt_sm_state: FuncId,
+    rt_sm_set_state: FuncId,
+    rt_state_store: FuncId,
+    rt_state_load: FuncId,
+    rt_async_register: FuncId,
+    rt_async_poll_ready: FuncId,
+    rt_async_take_result: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -230,6 +238,25 @@ impl<M: Module> Compiler<M> {
             sig.params.push(AbiParam::new(self.ptr_type));
         }
         sig.returns.push(AbiParam::new(self.ptr_type));
+        let func_id = self.module.declare_function(name, Linkage::Export, &sig)?;
+        self.user_funcs.insert(Arc::from(name), func_id);
+        Ok(func_id)
+    }
+
+    /// Declare a compiled async *poll function* with the state-machine ABI
+    /// `extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32`.
+    ///
+    /// Used instead of [`declare_function`](Self::declare_function) for an
+    /// `IrFunction` produced by `cljrs_ir::lower::async_lower` (its
+    /// `is_async_poll_fn` is set): the original Clojure parameters arrive in the
+    /// state machine's slots, so the compiled signature is fixed at two pointers
+    /// plus an `i32` poll code, independent of the function's arity.
+    pub fn declare_poll_function(&mut self, name: &str) -> CodegenResult<FuncId> {
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        sig.params.push(AbiParam::new(self.ptr_type)); // *mut CljxStateMachine
+        sig.params.push(AbiParam::new(self.ptr_type)); // *mut *const Value (out)
+        sig.returns.push(AbiParam::new(types::I32)); // poll code
         let func_id = self.module.declare_function(name, Linkage::Export, &sig)?;
         self.user_funcs.insert(Arc::from(name), func_id);
         Ok(func_id)
@@ -302,7 +329,15 @@ impl<M: Module> Compiler<M> {
         };
         let specs: &[Repr] = &merged_specs;
 
-        let reprs = typeinfer::infer(ir_func, specs);
+        // A poll function threads every cross-suspend value through the
+        // state-machine's boxed `Value` slots, so it runs fully boxed: clearing
+        // the inferred reprs keeps `StateLoad`/`AsyncResume` results (always
+        // boxed `*const Value`) consistent with every other var.
+        let reprs = if ir_func.is_async_poll_fn {
+            HashMap::new()
+        } else {
+            typeinfer::infer(ir_func, specs)
+        };
 
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.fb_ctx);
@@ -318,6 +353,9 @@ impl<M: Module> Compiler<M> {
                     region_param: None,
                     reprs,
                     specs,
+                    is_poll_fn: ir_func.is_async_poll_fn,
+                    sm_param: None,
+                    out_param: None,
                 };
                 translator.translate(ir_func)?;
             }
@@ -426,10 +464,21 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// Per-parameter specializations driving the entry guards (positional;
     /// missing entries are boxed).
     specs: &'b [Repr],
+    /// Whether this function is a compiled async poll function: changes the
+    /// signature/prologue and the meaning of `Return` (write `*out`, return
+    /// `POLL_READY`).  When set, [`Self::sm_param`]/[`Self::out_param`] are bound.
+    is_poll_fn: bool,
+    /// The poll function's `*mut CljxStateMachine` parameter (state-machine ABI).
+    sm_param: Option<cranelift_codegen::ir::Value>,
+    /// The poll function's `*mut *const Value` out-parameter.
+    out_param: Option<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn translate(&mut self, ir_func: &IrFunction) -> CodegenResult<()> {
+        if ir_func.is_async_poll_fn {
+            return self.translate_poll_fn(ir_func);
+        }
         let n_params = ir_func.params.len();
         let specialized = self.specs[..self.specs.len().min(n_params)]
             .iter()
@@ -505,6 +554,82 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
 
             // Translate terminator.
             self.translate_terminator(&ir_block.terminator, ir_block.id, ir_func)?;
+        }
+
+        self.builder.seal_all_blocks();
+        Ok(())
+    }
+
+    /// Translate a compiled async poll function (`is_async_poll_fn`).
+    ///
+    /// Emits the state-machine ABI: a dispatch entry block that reads the resume
+    /// state (`rt_sm_state`) and jumps to the matching block via
+    /// [`IrFunction::async_resume_blocks`] (`switch(state)`), then the function's
+    /// own blocks.  `AsyncSuspend` returns `POLL_PENDING`; `Return` writes `*out`
+    /// and returns `POLL_READY`; `AsyncResume` checks readiness and re-suspends
+    /// or binds the awaited value (see `translate_inst`).
+    fn translate_poll_fn(&mut self, ir_func: &IrFunction) -> CodegenResult<()> {
+        // Create CLIF blocks for every IR block.
+        for block in &ir_func.blocks {
+            let clif_block = self.builder.create_block();
+            self.block_map.insert(block.id, clif_block);
+        }
+
+        // Dispatch entry block carries the two function parameters.
+        let dispatch = self.builder.create_block();
+        self.builder
+            .append_block_params_for_function_params(dispatch);
+        self.builder.switch_to_block(dispatch);
+        let params = self.builder.block_params(dispatch).to_vec();
+        self.sm_param = Some(params[0]);
+        self.out_param = Some(params[1]);
+
+        self.emit_safepoint();
+
+        // switch(state): brif chain over the resume-block table.  Entry (state
+        // 0) is the default.  All targets are phi-free, so jumps carry no args.
+        let sm = self.sm_param.unwrap();
+        let state = self.call_rt_1(self.rt.rt_sm_state, sm)?;
+        for (k, resume_id) in ir_func.async_resume_blocks.iter().enumerate().skip(1) {
+            let target = self.block_map[resume_id];
+            let eq = self.builder.ins().icmp_imm(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                state,
+                k as i64,
+            );
+            let next = self.builder.create_block();
+            self.builder.ins().brif(eq, target, &[], next, &[]);
+            self.builder.switch_to_block(next);
+        }
+        let entry0 = self.block_map[&ir_func.async_resume_blocks[0]];
+        self.builder.ins().jump(entry0, &[]);
+
+        // Translate each block.  Resume/entry blocks are phi-free; other blocks
+        // (e.g. a split loop header) keep their phis as normal block params.
+        for ir_block in &ir_func.blocks {
+            let clif_block = self.block_map[&ir_block.id];
+            self.builder.switch_to_block(clif_block);
+
+            for inst in &ir_block.phis {
+                if let Inst::Phi(dst, _) = inst {
+                    let ty = self.clif_ty(self.repr_of(*dst));
+                    let var = self.ensure_var(*dst);
+                    let param = self.builder.append_block_param(clif_block, ty);
+                    self.builder.def_var(var, param);
+                }
+            }
+
+            for inst in &ir_block.insts {
+                self.translate_inst(inst)?;
+            }
+
+            // `AsyncSuspend` is always the last instruction of its block and
+            // emits a `return POLL_PENDING`, so the block is already terminated
+            // — don't emit its (placeholder `Unreachable`) terminator.
+            let ends_in_suspend = matches!(ir_block.insts.last(), Some(Inst::AsyncSuspend { .. }));
+            if !ends_in_suspend {
+                self.translate_terminator(&ir_block.terminator, ir_block.id, ir_func)?;
+            }
         }
 
         self.builder.seal_all_blocks();
@@ -985,15 +1110,118 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 ));
             }
 
-            // State-machine instructions appear in a poll function. Real codegen
-            // is wired in once the rt_abi async bridges land (next step).
-            Inst::StateStore { .. }
-            | Inst::StateLoad { .. }
-            | Inst::AsyncSuspend { .. }
-            | Inst::AsyncResume { .. } => {
-                return Err(CodegenError::UnsupportedInst(
-                    "async state-machine codegen not yet implemented".into(),
-                ));
+            // ── Async state machine (poll function only) ────────────────────
+            Inst::StateStore { slot, val } => {
+                let sm = self.sm_param.ok_or_else(|| {
+                    CodegenError::Codegen("StateStore outside a poll function".into())
+                })?;
+                let v = self.use_var_boxed(*val)?;
+                let slot_val = self.builder.ins().iconst(types::I32, *slot as i64);
+                let fref = self.import_func(self.rt.rt_state_store);
+                self.builder.ins().call(fref, &[sm, slot_val, v]);
+            }
+
+            Inst::StateLoad { dst, slot } => {
+                let sm = self.sm_param.ok_or_else(|| {
+                    CodegenError::Codegen("StateLoad outside a poll function".into())
+                })?;
+                let slot_val = self.builder.ins().iconst(types::I32, *slot as i64);
+                let loaded = self.call_rt_2(self.rt.rt_state_load, sm, slot_val)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, loaded);
+            }
+
+            Inst::AsyncSuspend {
+                kind,
+                operands,
+                next_state,
+            } => {
+                if *kind != cljrs_ir::SuspendKind::Await {
+                    return Err(CodegenError::UnsupportedInst(
+                        "only `await` suspends are compiled (channels/spawn stay interpreted)"
+                            .into(),
+                    ));
+                }
+                let sm = self.sm_param.ok_or_else(|| {
+                    CodegenError::Codegen("AsyncSuspend outside a poll function".into())
+                })?;
+                // Register the awaited value, record the resume state, return
+                // POLL_PENDING.  This terminates the block.
+                let op = self.use_var_boxed(operands[0])?;
+                let reg = self.import_func(self.rt.rt_async_register);
+                self.builder.ins().call(reg, &[sm, op]);
+                let state_val = self.builder.ins().iconst(types::I32, *next_state as i64);
+                let set = self.import_func(self.rt.rt_sm_set_state);
+                self.builder.ins().call(set, &[sm, state_val]);
+                let pending = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, cljrs_async::state_machine::POLL_PENDING as i64);
+                self.builder.ins().return_(&[pending]);
+            }
+
+            Inst::AsyncResume { dst, kind } => {
+                if *kind != cljrs_ir::SuspendKind::Await {
+                    return Err(CodegenError::UnsupportedInst(
+                        "only `await` resumes are compiled".into(),
+                    ));
+                }
+                let sm = self.sm_param.ok_or_else(|| {
+                    CodegenError::Codegen("AsyncResume outside a poll function".into())
+                })?;
+                let out = self.out_param.unwrap();
+                let code = self.call_rt_1(self.rt.rt_async_poll_ready, sm)?;
+
+                // Not ready yet → return POLL_PENDING; the executor re-polls and
+                // re-enters this resume block (state is unchanged).
+                let pend_block = self.builder.create_block();
+                let cont1 = self.builder.create_block();
+                let is_pending = self.builder.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    code,
+                    cljrs_async::state_machine::POLL_PENDING as i64,
+                );
+                self.builder
+                    .ins()
+                    .brif(is_pending, pend_block, &[], cont1, &[]);
+                self.builder.switch_to_block(pend_block);
+                let pending = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, cljrs_async::state_machine::POLL_PENDING as i64);
+                self.builder.ins().return_(&[pending]);
+
+                // Failed → *out = thrown value; return POLL_THREW.
+                self.builder.switch_to_block(cont1);
+                let threw_block = self.builder.create_block();
+                let cont2 = self.builder.create_block();
+                let is_threw = self.builder.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    code,
+                    cljrs_async::state_machine::POLL_THREW as i64,
+                );
+                self.builder
+                    .ins()
+                    .brif(is_threw, threw_block, &[], cont2, &[]);
+                self.builder.switch_to_block(threw_block);
+                let thrown = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
+                self.builder.ins().store(
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    thrown,
+                    out,
+                    0,
+                );
+                let threw = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, cljrs_async::state_machine::POLL_THREW as i64);
+                self.builder.ins().return_(&[threw]);
+
+                // Ready → bind the resolved value; the continuation emits here.
+                self.builder.switch_to_block(cont2);
+                let result = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
+                let var = self.ensure_var(*dst);
+                self.builder.def_var(var, result);
             }
         }
         Ok(())
@@ -1008,7 +1236,24 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         match term {
             Terminator::Return(var_id) => {
                 let val = self.use_var_boxed(*var_id)?;
-                self.builder.ins().return_(&[val]);
+                if self.is_poll_fn {
+                    // Poll-fn ABI: write the result through `out` and return
+                    // POLL_READY.
+                    let out = self.out_param.unwrap();
+                    self.builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        val,
+                        out,
+                        0,
+                    );
+                    let ready = self
+                        .builder
+                        .ins()
+                        .iconst(types::I32, cljrs_async::state_machine::POLL_READY as i64);
+                    self.builder.ins().return_(&[ready]);
+                } else {
+                    self.builder.ins().return_(&[val]);
+                }
             }
 
             Terminator::Jump(target) => {
@@ -1079,12 +1324,22 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             Terminator::Unreachable => {
-                // Return nil as a safe fallback. In practice, throw paths
-                // return before reaching here (see Inst::Throw above).
-                let nil_ref = self.import_func(self.rt.rt_const_nil);
-                let nil_call = self.builder.ins().call(nil_ref, &[]);
-                let nil_val = self.builder.inst_results(nil_call)[0];
-                self.builder.ins().return_(&[nil_val]);
+                if self.is_poll_fn {
+                    // Poll fns return an i32 code; a truly-unreachable block
+                    // returns POLL_PENDING as a type-correct fallback.
+                    let pending = self
+                        .builder
+                        .ins()
+                        .iconst(types::I32, cljrs_async::state_machine::POLL_PENDING as i64);
+                    self.builder.ins().return_(&[pending]);
+                } else {
+                    // Return nil as a safe fallback. In practice, throw paths
+                    // return before reaching here (see Inst::Throw above).
+                    let nil_ref = self.import_func(self.rt.rt_const_nil);
+                    let nil_call = self.builder.ins().call(nil_ref, &[]);
+                    let nil_val = self.builder.inst_results(nil_call)[0];
+                    self.builder.ins().return_(&[nil_val]);
+                }
             }
         }
         Ok(())
@@ -2248,6 +2503,21 @@ fn declare_rt<M: Module>(
     Ok(module.declare_function(name, Linkage::Import, &sig)?)
 }
 
+/// Declare a void-returning runtime bridge (no return value), matching an
+/// `extern "C" fn(..)` Rust signature.
+fn declare_rt_void<M: Module>(
+    module: &mut M,
+    name: &str,
+    params: &[types::Type],
+) -> CodegenResult<FuncId> {
+    let mut sig = module.make_signature();
+    sig.call_conv = CallConv::SystemV;
+    for &t in params {
+        sig.params.push(AbiParam::new(t));
+    }
+    Ok(module.declare_function(name, Linkage::Import, &sig)?)
+}
+
 /// Declare all runtime bridge functions and return cached FuncIds.  Generic
 /// over `M: Module` so the same set of ~80 `rt_*` symbols is declared for
 /// both the AOT and JIT backends.
@@ -2479,6 +2749,15 @@ fn declare_runtime_funcs<M: Module>(
         rt_deopt: declare_rt(module, "rt_deopt", &[], ptr)?,
         rt_kw_ic_fill: declare_rt(module, "rt_kw_ic_fill", &[ptr, types::I64, ptr], ptr)?,
         rt_call_ic: declare_rt(module, "rt_call_ic", &[ptr, ptr, types::I64, ptr], ptr)?,
+        // Async state machine (Phase H).  Void-returning bridges are declared
+        // with no return value to match their `extern "C" fn(..)` signatures.
+        rt_sm_state: declare_rt(module, "rt_sm_state", &[ptr], types::I32)?,
+        rt_sm_set_state: declare_rt_void(module, "rt_sm_set_state", &[ptr, types::I32])?,
+        rt_state_store: declare_rt_void(module, "rt_state_store", &[ptr, types::I32, ptr])?,
+        rt_state_load: declare_rt(module, "rt_state_load", &[ptr, types::I32], ptr)?,
+        rt_async_register: declare_rt_void(module, "rt_async_register", &[ptr, ptr])?,
+        rt_async_poll_ready: declare_rt(module, "rt_async_poll_ready", &[ptr], types::I32)?,
+        rt_async_take_result: declare_rt(module, "rt_async_take_result", &[ptr], ptr)?,
     })
 }
 

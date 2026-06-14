@@ -629,6 +629,7 @@ dependencies = [
 name = "cljrs-jit"
 version = "0.1.0"
 dependencies = [
+ "cljrs-async",
  "cljrs-compiler",
  "cljrs-env",
  "cljrs-eval",
