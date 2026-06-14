@@ -971,16 +971,28 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 self.builder.def_var(var, val);
             }
 
-            // Async instructions are not compiled to native code in Phase H.
-            // Async IrFunctions are excluded from AOT by the caller (any function
-            // with `is_async = true` should not reach the codegen pipeline yet).
+            // Raw async instructions must be rewritten into a poll function by
+            // `lower::async_lower` before reaching codegen; if one survives, the
+            // enclosing fn should have stayed interpreted.
             Inst::Await { .. }
             | Inst::Spawn { .. }
             | Inst::ChanTake { .. }
             | Inst::ChanPut { .. } => {
                 return Err(CodegenError::UnsupportedInst(
-                    "async instructions (Await/Spawn/ChanTake/ChanPut) require JIT compilation"
+                    "raw async instructions (Await/Spawn/ChanTake/ChanPut) must be \
+                     lowered to a state machine before codegen"
                         .into(),
+                ));
+            }
+
+            // State-machine instructions appear in a poll function. Real codegen
+            // is wired in once the rt_abi async bridges land (next step).
+            Inst::StateStore { .. }
+            | Inst::StateLoad { .. }
+            | Inst::AsyncSuspend { .. }
+            | Inst::AsyncResume { .. } => {
+                return Err(CodegenError::UnsupportedInst(
+                    "async state-machine codegen not yet implemented".into(),
                 ));
             }
         }

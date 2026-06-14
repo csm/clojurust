@@ -165,6 +165,30 @@ fn clone_inst(
             chan: rv(var_map, *chan),
             val: rv(var_map, *val),
         },
+        // Async state-machine instructions are produced after inlining (by
+        // `async_lower`), so these arms are not exercised in practice; remap for
+        // completeness.
+        Inst::StateStore { slot, val } => Inst::StateStore {
+            slot: *slot,
+            val: rv(var_map, *val),
+        },
+        Inst::StateLoad { dst, slot } => Inst::StateLoad {
+            dst: rv(var_map, *dst),
+            slot: *slot,
+        },
+        Inst::AsyncSuspend {
+            kind,
+            operands,
+            next_state,
+        } => Inst::AsyncSuspend {
+            kind: *kind,
+            operands: operands.iter().map(|&v| rv(var_map, v)).collect(),
+            next_state: *next_state,
+        },
+        Inst::AsyncResume { dst, kind } => Inst::AsyncResume {
+            dst: rv(var_map, *dst),
+            kind: *kind,
+        },
     }
 }
 

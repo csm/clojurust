@@ -586,7 +586,14 @@ fn inst_dst(inst: &Inst) -> Option<VarId> {
         Inst::Await { dst, .. } => Some(*dst),
         Inst::Spawn { dst, .. } => Some(*dst),
         Inst::ChanTake { dst, .. } => Some(*dst),
-        Inst::RegionEnd(_) | Inst::SourceLoc(_) | Inst::Recur(_) | Inst::ChanPut { .. } => None,
+        Inst::StateLoad { dst, .. } => Some(*dst),
+        Inst::AsyncResume { dst, .. } => Some(*dst),
+        Inst::RegionEnd(_)
+        | Inst::SourceLoc(_)
+        | Inst::Recur(_)
+        | Inst::ChanPut { .. }
+        | Inst::StateStore { .. }
+        | Inst::AsyncSuspend { .. } => None,
     }
 }
 

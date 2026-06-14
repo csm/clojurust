@@ -724,6 +724,19 @@ fn execute_inst(
                 ));
             }
         }
+
+        // State-machine instructions only ever appear in a compiled poll
+        // function (`is_async_poll_fn`); the Tier-1 interpreter never runs one
+        // (async arities are dispatched through `eval_async` or the compiled
+        // state machine, never lowered to a poll-fn for interpretation).
+        Inst::StateStore { .. }
+        | Inst::StateLoad { .. }
+        | Inst::AsyncSuspend { .. }
+        | Inst::AsyncResume { .. } => {
+            return Err(EvalError::Runtime(
+                "IR interpreter: async state-machine instructions are compile-only".into(),
+            ));
+        }
     }
 
     Ok(())
@@ -997,6 +1010,8 @@ fn clone_ir_function(f: &IrFunction) -> IrFunction {
         span: f.span.clone(),
         subfunctions: f.subfunctions.iter().map(clone_ir_function).collect(),
         is_async: f.is_async,
+        is_async_poll_fn: f.is_async_poll_fn,
+        async_resume_blocks: f.async_resume_blocks.clone(),
         seed_reprs: f.seed_reprs.clone(),
         local_seed_reprs: f.local_seed_reprs.clone(),
     }
