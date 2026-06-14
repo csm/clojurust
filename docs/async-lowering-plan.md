@@ -29,16 +29,29 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
   `cljrs-jit` registers the bridge symbols and `compile_jit_poll` compiles a poll
   fn; a test drives `(+ (await x) 1)` through a native suspend/resume cycle.
 
-**Remaining (next session):**
+- **Dispatch routing — `cljrs-async`** ✅ A poll-fn registry
+  (`register_poll_fn`/`lookup_poll_fn`, keyed by ns/name/arity) that
+  `AsyncRuntimeImpl::spawn_async_call` consults: a registered arity runs the
+  native state machine via `spawn_state_machine`; otherwise it falls back to
+  `run_async_fn`. `dispatch_if_async` in `cljrs-env` is unchanged. Integration
+  test: a real `(defn ^:async foo [x] (await x))` runs its registered compiled
+  poll fn instead of the interpreter.
 
-- **Dispatch + AOT wiring** (`aot.rs`, `cljrs-env::apply::dispatch_if_async`):
-  run `lower_async` for `^:async` arities, compile the poll fn as a symbol,
-  register `arity-id → (poll_fn, n_slots)`, and have `dispatch_if_async` build a
-  `CljxStateMachine` and call `spawn_state_machine` when a compiled poll fn
-  exists (falling back to `eval_async` otherwise). Stop excluding async fns in
-  `expanded_needs_interpreter` once lowering succeeds.
-- **End-to-end parity test**: `cljrs compile` an async program and assert the
-  native binary matches `cljrs run`, plus a GC-stress variant.
+**The pipeline is complete and tested end-to-end** (IR transform → runtime →
+ABI → codegen → dispatch). What remains is *driver activation* — making a
+compiler automatically lower/compile/register `^:async` arities instead of the
+manual `register_poll_fn` the tests use:
+
+- **AOT activation** (`aot.rs`): for each `^:async` defn, run `lower_async`,
+  compile the poll fn as a module symbol, and emit harness code that calls
+  `register_poll_fn(ns, name, arity, <symbol>, n_slots)` before `-main`; relax
+  `expanded_needs_interpreter` once a poll fn exists. Verify by `cljrs compile`
+  of an async program matching `cljrs run`.
+- **JIT activation** (`cljrs-jit`): when a hot `^:async` arity crosses the
+  threshold, `lower_async` + `compile_jit_poll` + `register_poll_fn`, tracking
+  the module in the code cache. This is the lighter path (no cargo build) and
+  makes `cljrs run`/REPL use native async without an explicit compile.
+- **GC-stress + parity tests** over the activated path.
 
 ## Context
 
