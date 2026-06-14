@@ -4,6 +4,7 @@
 //! produces `IrFunction` structs.
 
 pub mod anf;
+pub mod async_lower;
 pub mod context;
 pub mod escape;
 pub mod inline;
@@ -12,6 +13,7 @@ pub mod optimize;
 pub mod regionalize;
 
 pub use anf::{LowerError, lower_fn_body, lower_fn_body_destructured, lower_fn_body_seeded};
+pub use async_lower::{AsyncLowerError, AsyncLowering, lower_async};
 pub use escape::{
     AnalysisResult, EscapeContext, EscapeState, ExternalDefn, UseInfo, UseKind, analyze,
 };

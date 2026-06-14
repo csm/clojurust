@@ -23,6 +23,7 @@ pub mod isolate;
 mod isolate_builtins;
 pub mod isolate_channel;
 mod runtime;
+pub mod state_machine;
 pub mod worker_pool;
 use runtime::AsyncRuntimeImpl;
 

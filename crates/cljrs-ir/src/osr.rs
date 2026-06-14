@@ -298,6 +298,8 @@ pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunct
             span: orig.span.clone(),
             subfunctions: orig.subfunctions.clone(),
             is_async: orig.is_async,
+            is_async_poll_fn: orig.is_async_poll_fn,
+            async_resume_blocks: orig.async_resume_blocks.clone(),
             // The OSR variant rebinds live-ins as params, so the original
             // positional seeds no longer align; leave it unseeded.
             seed_reprs: Vec::new(),

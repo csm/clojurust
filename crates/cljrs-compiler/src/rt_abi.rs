@@ -4582,6 +4582,164 @@ pub unsafe extern "C" fn rt_call_ic(
     unsafe { rt_call(callee, args, nargs) }
 }
 
+// ── Async state machine (Phase H) ────────────────────────────────────────────
+//
+// A compiled `^:async` poll function receives a `*mut CljxStateMachine` as its
+// hidden leading parameter and drives the state machine through these bridges.
+// They mirror `cljrs_async::state_machine`'s native helpers but with the
+// `extern "C"` / `*const Value` ABI compiled code speaks.
+
+use cljrs_async::state_machine::{CljxStateMachine, Readiness, check_ready};
+
+/// Read the current resume state (for the poll function's `switch(state)`
+/// prologue).
+///
+/// # Safety
+/// `sm` must point to a live `CljxStateMachine`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_sm_state(sm: *mut CljxStateMachine) -> i32 {
+    let sm = unsafe { &*sm };
+    sm.state
+}
+
+/// Set the resume state before suspending.
+///
+/// # Safety
+/// `sm` must point to a live `CljxStateMachine`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_sm_set_state(sm: *mut CljxStateMachine, state: i32) {
+    let sm = unsafe { &mut *sm };
+    sm.state = state;
+}
+
+/// Save a live value into a state-machine slot before suspending.
+///
+/// # Safety
+/// `sm` must be live, `slot` in range, and `val` a valid `Value` pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_state_store(sm: *mut CljxStateMachine, slot: u32, val: *const Value) {
+    let v = unsafe { val_ref(val) }.clone();
+    let sm = unsafe { &mut *sm };
+    sm.slots[slot as usize] = v;
+}
+
+/// Restore a live value from a state-machine slot after a resume.  Returns a
+/// *fresh* GC-boxed copy, decoupled from the slot: a loaded value can flow
+/// through a `recur` phi and outlive a later `rt_state_store` to the same slot
+/// (e.g. a loop counter reloaded, then the slot overwritten with `(inc i)`
+/// before the old value is used), so it must not alias the mutable slot.
+///
+/// # Safety
+/// `sm` must be live and `slot` in range.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_state_load(sm: *mut CljxStateMachine, slot: u32) -> *const Value {
+    let sm = unsafe { &*sm };
+    box_val(sm.slots[slot as usize].clone())
+}
+
+/// Register the value being awaited at a suspend point.
+///
+/// # Safety
+/// `sm` must be live and `val` a valid `Value` pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_register(sm: *mut CljxStateMachine, val: *const Value) {
+    let v = unsafe { val_ref(val) }.clone();
+    let sm = unsafe { &mut *sm };
+    sm.pending = v;
+}
+
+/// Check whether the registered (`pending`) value has resolved.  Returns the
+/// poll code: `0` pending, `1` ready, `2` failed.  On ready/failed the resolved
+/// (or thrown) value replaces `pending`, so [`rt_async_take_result`] returns it.
+///
+/// # Safety
+/// `sm` must point to a live `CljxStateMachine`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
+    let sm = unsafe { &mut *sm };
+    match check_ready(&sm.pending) {
+        Readiness::Pending => 0,
+        Readiness::Ready(v) => {
+            sm.pending = v;
+            1
+        }
+        Readiness::Failed(e) => {
+            sm.pending = e;
+            2
+        }
+    }
+}
+
+/// Return the resolved value stashed by [`rt_async_poll_ready`], as a *fresh*
+/// GC-boxed copy decoupled from `pending` (which the next suspend overwrites) —
+/// the awaited value may flow through a `recur` phi past that point.
+///
+/// # Safety
+/// `sm` must point to a live `CljxStateMachine`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_take_result(sm: *mut CljxStateMachine) -> *const Value {
+    let sm = unsafe { &*sm };
+    box_val(sm.pending.clone())
+}
+
+/// Store the poll function's final result into the state machine (used by
+/// `Return` in a poll fn).  The result lands in `pending` — the GC-rooted slot
+/// the `CompiledAsyncTask` adapter reads on completion — so the result never
+/// crosses the FFI boundary as a raw pointer.
+///
+/// # Safety
+/// `sm` must be live and `val` a valid `Value` pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_set_result(sm: *mut CljxStateMachine, val: *const Value) {
+    let v = unsafe { val_ref(val) }.clone();
+    let sm = unsafe { &mut *sm };
+    sm.pending = v;
+}
+
+#[cfg(test)]
+mod async_sm_tests {
+    use super::*;
+    use cljrs_async::state_machine::CljxStateMachine;
+
+    extern "C" fn dummy_poll(_sm: *mut CljxStateMachine) -> i32 {
+        0
+    }
+
+    fn machine(n_slots: usize) -> Box<CljxStateMachine> {
+        Box::new(CljxStateMachine::new(dummy_poll, n_slots, vec![]))
+    }
+
+    #[test]
+    fn state_roundtrips() {
+        let mut sm = machine(0);
+        let p: *mut CljxStateMachine = &mut *sm;
+        assert_eq!(rt_sm_state(p), 0);
+        rt_sm_set_state(p, 3);
+        assert_eq!(rt_sm_state(p), 3);
+    }
+
+    #[test]
+    fn slot_store_and_load_roundtrip() {
+        let mut sm = machine(2);
+        let p: *mut CljxStateMachine = &mut *sm;
+        let v = rt_const_long(99);
+        rt_state_store(p, 1, v);
+        let loaded = rt_state_load(p, 1);
+        assert!(matches!(unsafe { &*loaded }, Value::Long(99)));
+    }
+
+    #[test]
+    fn register_and_poll_ready_on_plain_value() {
+        let mut sm = machine(1);
+        let p: *mut CljxStateMachine = &mut *sm;
+        // Awaiting a non-future value is immediately ready (identity).
+        rt_async_register(p, rt_const_long(7));
+        assert_eq!(rt_async_poll_ready(p), 1);
+        let r = rt_async_take_result(p);
+        assert!(matches!(unsafe { &*r }, Value::Long(7)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

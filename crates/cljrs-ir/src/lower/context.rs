@@ -253,6 +253,8 @@ impl LowerCtx {
             span: None,
             subfunctions: self.subfunctions,
             is_async: self.is_async,
+            is_async_poll_fn: false,
+            async_resume_blocks: Vec::new(),
             seed_reprs: self.seed_reprs,
             local_seed_reprs: self.local_seed_reprs,
         }

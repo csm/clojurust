@@ -190,7 +190,18 @@ pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], form
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
+
+**Async activation (Phase H):** `compile_async_poll_fns` introspects the
+`^:async` fns the program defined (their `def` forms are evaluated into the
+compile-time env first), lowers each arity to a state machine (`is_async`, no
+region pass — a region scope can't span a suspend), compiles a poll function
+(`declare_poll_function`) into the same object module, and records
+`(ns, name, arity, symbol, n_slots)`. The harness declares each symbol `extern
+"C"` and calls `cljrs_async::state_machine::register_poll_fn_named` after
+`cljrs_async::init`, so `^:async` dispatch runs native. Unsupported bodies
+(channels/spawn/`throw`/regions), capturing closures, and fns with inner
+closures fall back to the `eval_async` tree-walker.
 
 **Versioned namespaces are snapshotted at compile time.** Versioned requires
 execute during expansion (fetching the pinned source from git); a discovery

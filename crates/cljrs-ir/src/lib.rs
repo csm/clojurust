@@ -470,6 +470,72 @@ pub enum Inst {
     /// `(chan, val)` — parks if the buffer is full; returns when accepted.
     /// No result value.
     ChanPut { chan: VarId, val: VarId },
+
+    // ── Async state-machine instructions (produced by `lower::async_lower`) ──
+    //
+    // These appear only in a *poll function* — the non-async `IrFunction`
+    // (`is_async_poll_fn = true`) that `lower_async` produces from an `^:async`
+    // body.  They reference the heap-allocated `CljxStateMachine` via the poll
+    // function's hidden leading parameter (threaded like `RegionParam`), and
+    // codegen lowers them to the `rt_state_*` / `rt_async_*` bridge calls.
+    /// Save a live value into the state machine's slot array before suspending.
+    ///
+    /// `(slot, val)` — `slots[slot] = val`.  No result value.
+    StateStore { slot: u32, val: VarId },
+
+    /// Restore a live value from the state machine's slot array after a resume.
+    ///
+    /// `(dst, slot)` — `dst = slots[slot]`.
+    StateLoad { dst: VarId, slot: u32 },
+
+    /// Suspend the async task at a yield point (tail of a pre-suspend segment).
+    ///
+    /// `(kind, operands, next_state)` — registers `operands` with the state
+    /// machine (an awaited future/promise for [`SuspendKind::Await`]; `[chan]`
+    /// for [`SuspendKind::ChanTake`]; `[chan, val]` for
+    /// [`SuspendKind::ChanPut`]; `[fn_reg, args…]` for
+    /// [`SuspendKind::Spawn`]), records `next_state` as the resume point, and
+    /// returns `Poll::Pending` to the executor.  This instruction returns from
+    /// the poll function, so it is always the last instruction in its block.
+    AsyncSuspend {
+        kind: SuspendKind,
+        operands: Vec<VarId>,
+        next_state: u32,
+    },
+
+    /// Resume after a suspend (head of a resume block).
+    ///
+    /// `(dst, kind)` — checks the readiness of the value registered by the
+    /// matching [`Inst::AsyncSuspend`]: if not ready, returns `Poll::Pending`
+    /// (the executor re-polls, re-entering this block); if ready, `dst`
+    /// receives the resolved value.  For [`SuspendKind::ChanPut`] there is no
+    /// resolved value and `dst` receives `nil`.
+    AsyncResume { dst: VarId, kind: SuspendKind },
+}
+
+/// The kind of yield point an [`Inst::AsyncSuspend`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SuspendKind {
+    /// `(await x)` — suspend until a future/promise resolves.
+    Await,
+    /// Async take from a channel.
+    ChanTake,
+    /// Async put into a channel (the put value is `operand`'s companion; see
+    /// lowering).  No resolved value.
+    ChanPut,
+    /// `(spawn ...)` immediately awaited — suspend on the spawned task.
+    Spawn,
+}
+
+impl fmt::Display for SuspendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Await => write!(f, "await"),
+            Self::ChanTake => write!(f, "chan_take"),
+            Self::ChanPut => write!(f, "chan_put"),
+            Self::Spawn => write!(f, "spawn"),
+        }
+    }
 }
 
 /// The kind of object allocated in a region.
@@ -574,8 +640,22 @@ pub struct IrFunction {
     pub subfunctions: Vec<IrFunction>,
     /// Whether this function is `^:async` — contains yield points (`Await` instructions).
     /// Async IR functions fall back to tree-walking (`eval_async`) at runtime;
-    /// a future JIT pass will emit proper Cranelift state machines.
+    /// the `lower::async_lower` pass rewrites them into a poll function (below).
     pub is_async: bool,
+    /// Whether this function is a *poll function* produced by `lower::async_lower`
+    /// — a non-async `IrFunction` whose entry block dispatches on a resume state
+    /// and which references the `CljxStateMachine` via a hidden leading
+    /// parameter.  Codegen emits the extra parameter and the state prologue when
+    /// this is set, and dispatch drives it through the compiled state-machine
+    /// path instead of `eval_async`.
+    #[serde(default)]
+    pub is_async_poll_fn: bool,
+    /// State → resume-block map for a poll function (`is_async_poll_fn`).
+    /// `async_resume_blocks[k]` is the block where the poll function resumes for
+    /// state `k`; index 0 is the original entry block (state 0).  Codegen emits
+    /// a `switch(state)` prologue over this table.  Empty for non-poll functions.
+    #[serde(default)]
+    pub async_resume_blocks: Vec<BlockId>,
     /// Static representation seeds for the parameters, positional with `params`,
     /// derived from `^long`/`^double`/… type hints (see `cljrs-value`'s
     /// `TypeHint`).  Empty means "no hints"; a `Repr::Boxed` entry means a param
@@ -603,6 +683,8 @@ impl IrFunction {
             span,
             subfunctions: Vec::new(),
             is_async: false,
+            is_async_poll_fn: false,
+            async_resume_blocks: Vec::new(),
             seed_reprs: Vec::new(),
             local_seed_reprs: Vec::new(),
         }
@@ -632,9 +714,22 @@ impl IrFunction {
 
     /// Number of parameters in the compiled (AOT/JIT) signature: the visible
     /// `params` plus the hidden region parameter for region-parameterised
-    /// variants.
+    /// variants plus the hidden state-machine parameter for poll functions.
+    ///
+    /// Note: a poll function's *visible* params are not part of its compiled
+    /// signature — they arrive materialised in `CljxStateMachine.slots` — so a
+    /// poll function's ABI is `(state_ptr, out_ptr) -> i32` regardless of
+    /// `params.len()`.  Callers that build the poll-function signature use the
+    /// fixed `(state, out)` shape directly; this helper covers only the ordinary
+    /// (non-poll) case.
     pub fn abi_param_count(&self) -> usize {
         self.params.len() + usize::from(self.takes_region_param())
+    }
+
+    /// Whether this function compiles to the state-machine poll ABI
+    /// (`extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32`).
+    pub fn takes_state_param(&self) -> bool {
+        self.is_async_poll_fn
     }
 
     /// Allocate a fresh block ID.
@@ -782,6 +877,9 @@ impl Inst {
             Inst::Spawn { .. } => Effect::UnknownCall,
             Inst::ChanTake { .. } => Effect::UnknownCall,
             Inst::ChanPut { .. } => Effect::HeapWrite,
+            Inst::StateStore { .. } => Effect::HeapWrite,
+            Inst::StateLoad { .. } => Effect::HeapRead,
+            Inst::AsyncSuspend { .. } | Inst::AsyncResume { .. } => Effect::UnknownCall,
             Inst::DefVar(..) => Effect::HeapWrite,
             Inst::SetBang(..) => Effect::HeapWrite,
             Inst::Throw(..) => Effect::UnknownCall, // conservative
@@ -819,12 +917,16 @@ impl Inst {
             Inst::Await { dst, .. } => Some(*dst),
             Inst::Spawn { dst, .. } => Some(*dst),
             Inst::ChanTake { dst, .. } => Some(*dst),
+            Inst::StateLoad { dst, .. } => Some(*dst),
+            Inst::AsyncResume { dst, .. } => Some(*dst),
             Inst::SetBang(..)
             | Inst::Throw(..)
             | Inst::Recur(..)
             | Inst::SourceLoc(..)
             | Inst::RegionEnd(..)
-            | Inst::ChanPut { .. } => None,
+            | Inst::ChanPut { .. }
+            | Inst::StateStore { .. }
+            | Inst::AsyncSuspend { .. } => None,
         }
     }
 
@@ -876,6 +978,10 @@ impl Inst {
             }
             Inst::ChanTake { chan, .. } => vec![*chan],
             Inst::ChanPut { chan, val } => vec![*chan, *val],
+            Inst::StateStore { val, .. } => vec![*val],
+            Inst::StateLoad { .. } => vec![],
+            Inst::AsyncSuspend { operands, .. } => operands.clone(),
+            Inst::AsyncResume { .. } => vec![],
         }
     }
 }
@@ -1106,6 +1212,14 @@ impl Display for Inst {
             }
             Inst::ChanTake { chan, dst } => write!(f, "{dst} = chan_take {chan}"),
             Inst::ChanPut { chan, val } => write!(f, "chan_put {chan} {val}"),
+            Inst::StateStore { slot, val } => write!(f, "state_store [{slot}] {val}"),
+            Inst::StateLoad { dst, slot } => write!(f, "{dst} = state_load [{slot}]"),
+            Inst::AsyncSuspend {
+                kind,
+                operands,
+                next_state,
+            } => write!(f, "suspend.{kind} {operands:?} -> state {next_state}"),
+            Inst::AsyncResume { dst, kind } => write!(f, "{dst} = resume.{kind}"),
         }
     }
 }

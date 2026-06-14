@@ -20,6 +20,9 @@ cljrs-compiler = { workspace = true }
 cljrs-ir       = { workspace = true }
 cljrs-gc       = { workspace = true }
 cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-interp   = { workspace = true }
+cljrs-async    = { workspace = true }
 cljrs-logging  = { workspace = true }
 
 cranelift-codegen  = { workspace = true }
@@ -31,5 +34,5 @@ cranelift-native   = { workspace = true }
 [dev-dependencies]
 cljrs-stdlib = { workspace = true }
 cljrs-reader = { workspace = true }
-cljrs-env    = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tempfile     = "3"

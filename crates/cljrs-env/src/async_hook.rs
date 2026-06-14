@@ -34,3 +34,26 @@ pub trait AsyncRuntime: Send + Sync {
     /// Used by the IR interpreter's sync-context fallback for `ChanPut`.
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()>;
 }
+
+// ── Async JIT compile hook ──────────────────────────────────────────────────
+//
+// `cljrs-async` drives `^:async` dispatch but cannot compile (it sits below
+// `cljrs-jit`).  `cljrs-jit::init` installs this hook; the async dispatcher
+// invokes it (once per arity) to lower + compile + register a native poll
+// function for the called `^:async` arity.  A no-op when the JIT is absent, so
+// dispatch keeps tree-walking via `eval_async`.
+
+/// Signature of the async-JIT compile hook: `(callee_fn, nargs, env)`.
+pub type AsyncCompileHook = fn(&Value, usize, &mut Env);
+
+static ASYNC_COMPILE_HOOK: std::sync::OnceLock<AsyncCompileHook> = std::sync::OnceLock::new();
+
+/// Install the async-JIT compile hook (called once by `cljrs-jit::init`).
+pub fn set_async_compile_hook(hook: AsyncCompileHook) {
+    let _ = ASYNC_COMPILE_HOOK.set(hook);
+}
+
+/// The installed async-JIT compile hook, if any.
+pub fn async_compile_hook() -> Option<AsyncCompileHook> {
+    ASYNC_COMPILE_HOOK.get().copied()
+}

@@ -629,10 +629,12 @@ dependencies = [
 name = "cljrs-jit"
 version = "0.1.0"
 dependencies = [
+ "cljrs-async",
  "cljrs-compiler",
  "cljrs-env",
  "cljrs-eval",
  "cljrs-gc",
+ "cljrs-interp",
  "cljrs-ir",
  "cljrs-logging",
  "cljrs-reader",
@@ -644,6 +646,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
