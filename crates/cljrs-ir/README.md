@@ -18,13 +18,26 @@ can depend on the same types without a circular dependency.
 ```
 src/
   lib.rs  — all IR types: IrFunction, Block, Inst, Terminator, VarId, BlockId,
-             KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind
+             KnownFn, Effect, Const, ClosureTemplate, RegionAllocKind,
+             SuspendKind.  Async-state-machine instructions (StateStore,
+             StateLoad, AsyncSuspend, AsyncResume) and the poll-function markers
+             on IrFunction (is_async_poll_fn, async_resume_blocks) live here.
   osr.rs  — OSR-entry transform (Phase 10.4): build_osr_function rewrites a
              function so its entry jumps straight to a hot loop header, with
              live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
     mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured,
                   lower_fn_body_seeded, analyze, inline, optimize, EscapeContext …
+    async_lower.rs — async state-machine lowering (Phase H): rewrites an
+                  `^:async` IrFunction into a non-async poll function
+                  (is_async_poll_fn) whose control flow is an explicit resumable
+                  state machine.  Splits blocks at each `await`, threads values
+                  live across a suspend through the CljxStateMachine's slot array
+                  (StateStore/StateLoad), and emits AsyncSuspend/AsyncResume.
+                  SSA phi-edge liveness keeps loop-init values out of save sets;
+                  resume blocks are phi-free so the codegen dispatch jump needs
+                  no phi args.  Lowers `await` only; channels/spawn return
+                  AsyncLowerError::Unsupported (interpreter fallback kept)
     anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
                   capture only the enclosing locals their (fully macro-expanded)
                   body references (`collect_symbol_names`, a conservative
