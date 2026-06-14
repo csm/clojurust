@@ -153,7 +153,14 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     // Unwrap metadata so a WithMeta-wrapped fn is callable.
     let f = f.unwrap_meta();
     let result = if let Value::Fn(cljx_fn) = f {
-        env.call_cljrs_fn(cljx_fn.get(), &args)
+        // Honor `^:async` dispatch (spawn the body, return a Future) just like
+        // `apply_value` — otherwise a compiled/native caller invoking an async
+        // fn would run its body synchronously and never get a Future.
+        if let Some(fut) = crate::apply::dispatch_if_async(f, &args, &env) {
+            Ok(fut)
+        } else {
+            env.call_cljrs_fn(cljx_fn.get(), &args)
+        }
     } else {
         crate::apply::apply_value(f, args, &mut env)
     };

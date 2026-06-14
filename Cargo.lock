@@ -634,6 +634,7 @@ dependencies = [
  "cljrs-env",
  "cljrs-eval",
  "cljrs-gc",
+ "cljrs-interp",
  "cljrs-ir",
  "cljrs-logging",
  "cljrs-reader",
@@ -645,6 +646,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

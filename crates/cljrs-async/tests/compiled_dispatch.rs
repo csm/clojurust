@@ -53,8 +53,14 @@ fn registered_poll_fn_takes_over_dispatch() {
             cljrs_interp::eval::eval(&form, &mut env).unwrap();
         }
 
-        // Register a compiled poll function for user/foo at arity 1.
-        register_poll_fn("user", "foo", 1, sentinel_poll, 2);
+        // Register a sentinel poll function for foo's arity, keyed by its
+        // canonical ir_arity_id.
+        let foo = cljrs_interp::eval::eval(&parse_one("foo"), &mut env).unwrap();
+        let arity_id = match &foo {
+            Value::Fn(f) => f.get().arities[0].ir_arity_id,
+            other => panic!("expected foo to be a fn, got {other:?}"),
+        };
+        register_poll_fn(arity_id, sentinel_poll, 2);
 
         // Calling foo now spawns the native state machine, not the interpreter:
         // the result is the sentinel 999, not the awaited 5.

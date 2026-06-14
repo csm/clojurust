@@ -288,6 +288,17 @@ fn reject_unsupported(f: &IrFunction) -> Result<(), AsyncLowerError> {
                 Inst::Throw(_) => {
                     return Err(AsyncLowerError::Unsupported("throw".into()));
                 }
+                // A bump-region scope must not span a suspend (the poll fn
+                // returns mid-scope, unbalancing the region stack).  Callers
+                // should lower async bodies without the region pass; reject
+                // defensively if region IR slips through.
+                Inst::RegionStart(_)
+                | Inst::RegionEnd(_)
+                | Inst::RegionAlloc(..)
+                | Inst::RegionParam(_)
+                | Inst::CallWithRegion(..) => {
+                    return Err(AsyncLowerError::Unsupported("region allocation".into()));
+                }
                 _ => {}
             }
         }

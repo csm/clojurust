@@ -38,13 +38,20 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use cljrs_env::env::GlobalEnv;
 use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_env::gc_roots::{ValueRootGuard, root_value, root_values};
 use cljrs_value::{FutureState, Value};
 
 use crate::eval_async::spawn_future;
+
+/// The eval context (globals + namespace) a compiled poll function runs under,
+/// so its `rt_*` global-lookup / call bridges work while the task runs detached
+/// on the executor.
+pub type EvalCtx = (Arc<GlobalEnv>, Arc<str>);
 
 /// Poll-function return code: the task suspended; re-poll later.
 pub const POLL_PENDING: i32 = 0;
@@ -75,6 +82,10 @@ pub struct CljxStateMachine {
     pub pending: Value,
     /// The compiled poll function.
     pub poll_fn: PollFn,
+    /// Eval context installed on the executor thread around each poll, so the
+    /// poll function's global-lookup / call bridges resolve correctly.  `None`
+    /// for hand-written poll functions in tests that need no global resolution.
+    pub eval_ctx: Option<EvalCtx>,
 }
 
 impl CljxStateMachine {
@@ -90,6 +101,7 @@ impl CljxStateMachine {
             slots,
             pending: Value::Nil,
             poll_fn,
+            eval_ctx: None,
         }
     }
 }
@@ -167,6 +179,11 @@ impl Future for CompiledAsyncTask {
         // `CompiledAsyncTask` is `Unpin` (Box + guards), so `get_mut` is sound.
         let this = self.get_mut();
         let sm_ptr: *mut CljxStateMachine = &mut *this.sm;
+        // Install the eval context so the poll function's `rt_*` global-lookup /
+        // call bridges work while running detached on the executor thread.
+        let _ctx_guard = this.sm.eval_ctx.as_ref().map(|(globals, ns)| {
+            cljrs_env::callback::install_eval_context_guard(globals.clone(), ns.clone())
+        });
         let code = (this.sm.poll_fn)(sm_ptr);
         // The poll function reports its result in-band via `pending` (a plain,
         // GC-rooted `Value`), so completion is a safe field read — no raw
@@ -194,21 +211,28 @@ impl Future for CompiledAsyncTask {
 /// [`crate::runtime::AsyncRuntimeImpl::spawn_async_call`]'s `spawn_future`
 /// path: the dispatcher calls it when the callee arity has a compiled poll
 /// function.
-pub fn spawn_state_machine(poll_fn: PollFn, n_slots: usize, args: Vec<Value>) -> Value {
-    let sm = CljxStateMachine::new(poll_fn, n_slots, args);
+pub fn spawn_state_machine(
+    poll_fn: PollFn,
+    n_slots: usize,
+    args: Vec<Value>,
+    eval_ctx: Option<EvalCtx>,
+) -> Value {
+    let mut sm = CljxStateMachine::new(poll_fn, n_slots, args);
+    sm.eval_ctx = eval_ctx;
     spawn_future(CompiledAsyncTask::new(sm))
 }
 
 // ── Compiled poll-function registry ──────────────────────────────────────────
 //
 // AOT/JIT compilation of an `^:async` function emits a poll function and
-// registers it here, keyed by the defining namespace, name, and fixed arity.
-// `AsyncRuntimeImpl::spawn_async_call` consults the registry: a hit runs the
-// native state machine via `spawn_state_machine`, a miss falls back to the
-// tree-walking `run_async_fn`.  Function pointers are `Send + Sync`, so the
-// registry is a simple global map.
+// registers it here, keyed by the arity's `ir_arity_id` (the canonical
+// per-arity id used throughout the JIT).  `AsyncRuntimeImpl::spawn_async_call`
+// consults the registry: a hit runs the native state machine via
+// `spawn_state_machine`, a miss falls back to the tree-walking `run_async_fn`
+// (after a one-shot compile attempt, when an async-compile hook is installed).
+// Function pointers are `Send + Sync`, so the registry is a simple global map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 #[derive(Clone, Copy)]
@@ -217,27 +241,44 @@ struct PollEntry {
     n_slots: usize,
 }
 
-static POLL_REGISTRY: RwLock<Option<HashMap<(String, String, usize), PollEntry>>> =
-    RwLock::new(None);
-
-/// Register a compiled poll function for `ns/name` at a fixed `arity` (number of
-/// positional parameters).  Called by the AOT harness / JIT once per compiled
-/// `^:async` arity.
-pub fn register_poll_fn(ns: &str, name: &str, arity: usize, poll_fn: PollFn, n_slots: usize) {
-    let mut guard = POLL_REGISTRY.write().unwrap();
-    guard.get_or_insert_with(HashMap::new).insert(
-        (ns.to_string(), name.to_string(), arity),
-        PollEntry { poll_fn, n_slots },
-    );
+#[derive(Default)]
+struct Registry {
+    compiled: HashMap<u64, PollEntry>,
+    attempted: HashSet<u64>,
 }
 
-/// Look up a compiled poll function for `ns/name` at the given `arity`.
-pub fn lookup_poll_fn(ns: &str, name: &str, arity: usize) -> Option<(PollFn, usize)> {
+static POLL_REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
+
+/// Register a compiled poll function for an arity (`ir_arity_id`) with the
+/// number of state-machine slots it needs.  Called by the AOT harness / JIT
+/// once per compiled `^:async` arity.
+pub fn register_poll_fn(arity_id: u64, poll_fn: PollFn, n_slots: usize) {
+    let mut guard = POLL_REGISTRY.write().unwrap();
+    guard
+        .get_or_insert_with(Registry::default)
+        .compiled
+        .insert(arity_id, PollEntry { poll_fn, n_slots });
+}
+
+/// Look up a compiled poll function for an arity (`ir_arity_id`).
+pub fn lookup_poll_fn(arity_id: u64) -> Option<(PollFn, usize)> {
     let guard = POLL_REGISTRY.read().unwrap();
     guard
         .as_ref()?
-        .get(&(ns.to_string(), name.to_string(), arity))
+        .compiled
+        .get(&arity_id)
         .map(|e| (e.poll_fn, e.n_slots))
+}
+
+/// Mark `arity_id` as having had a compile attempt.  Returns `true` on the
+/// first call (the caller should run the compile), `false` thereafter — so a
+/// failed or unsupported lowering is attempted only once per arity.
+pub fn mark_compile_attempted(arity_id: u64) -> bool {
+    let mut guard = POLL_REGISTRY.write().unwrap();
+    guard
+        .get_or_insert_with(Registry::default)
+        .attempted
+        .insert(arity_id)
 }
 
 #[cfg(test)]
@@ -290,7 +331,7 @@ mod tests {
         block_on_local(async {
             // The awaited value: a future that resolves to 21.
             let arg = spawn_future(async { Ok(Value::Long(21)) });
-            let result = spawn_state_machine(double_poll, 2, vec![arg]);
+            let result = spawn_state_machine(double_poll, 2, vec![arg], None);
             let v = await_value(result).await.expect("resolves");
             assert!(matches!(v, Value::Long(42)), "got {v:?}");
         });
@@ -300,7 +341,7 @@ mod tests {
     fn state_machine_awaiting_plain_value_is_identity() {
         block_on_local(async {
             // Awaiting a non-future value resolves immediately on first resume.
-            let result = spawn_state_machine(double_poll, 2, vec![Value::Long(5)]);
+            let result = spawn_state_machine(double_poll, 2, vec![Value::Long(5)], None);
             let v = await_value(result).await.expect("resolves");
             assert!(matches!(v, Value::Long(10)), "got {v:?}");
         });
@@ -316,7 +357,7 @@ mod tests {
     #[test]
     fn state_machine_throw_propagates() {
         block_on_local(async {
-            let result = spawn_state_machine(throw_poll, 1, vec![]);
+            let result = spawn_state_machine(throw_poll, 1, vec![], None);
             let err = await_value(result).await;
             assert!(err.is_err(), "expected thrown error, got {err:?}");
         });

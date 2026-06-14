@@ -31,28 +31,38 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
   fn; a test drives `(+ (await x) 1)` through a native suspend/resume cycle.
 
 - **Dispatch routing — `cljrs-async`** ✅ A poll-fn registry
-  (`register_poll_fn`/`lookup_poll_fn`, keyed by ns/name/arity) that
-  `AsyncRuntimeImpl::spawn_async_call` consults: a registered arity runs the
-  native state machine via `spawn_state_machine`; otherwise it falls back to
-  `run_async_fn`. `dispatch_if_async` in `cljrs-env` is unchanged. Integration
-  test: a real `(defn ^:async foo [x] (await x))` runs its registered compiled
-  poll fn instead of the interpreter.
+  (`register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted`, keyed by the
+  arity's `ir_arity_id`) that `AsyncRuntimeImpl::spawn_async_call` consults: a
+  registered arity runs the native state machine via `spawn_state_machine`;
+  otherwise it falls back to `run_async_fn`. `dispatch_if_async` in `cljrs-env`
+  is unchanged.
 
-**The pipeline is complete and tested end-to-end** (IR transform → runtime →
-ABI → codegen → dispatch). What remains is *driver activation* — making a
-compiler automatically lower/compile/register `^:async` arities instead of the
-manual `register_poll_fn` the tests use:
+- **JIT activation — `cljrs-jit` + `cljrs-env`** ✅ `cljrs-jit::init` installs an
+  async-compile hook (`cljrs_env::async_hook::set_async_compile_hook`); on the
+  first dispatch of an `^:async` arity, `async_jit::compile_async_arity` lowers
+  it (`lower_arity` with `is_async`, **no region pass**), runs `lower_async`,
+  JIT-compiles the poll fn, keeps the module alive, and registers it — so
+  subsequent calls run native. The poll fn carries its `eval_ctx` (globals +
+  defining ns), installed around each poll, so its global-lookup / call bridges
+  resolve while running detached on the executor. Disable with
+  `CLJRS_NO_ASYNC_JIT`. Surfaced and fixed a latent bug: `cljrs_env::callback::
+  invoke` (the compiled `rt_call` path) bypassed `dispatch_if_async`, so a
+  compiled caller of an `^:async` fn ran its body synchronously instead of
+  getting a Future. End-to-end verified: `cljrs run` of nested-async programs
+  (`(+ (await (f …)) …)`) JIT-compiles every arity on first call and matches the
+  interpreter (`CLJRS_NO_ASYNC_JIT=1`); a `cljrs-jit` integration test confirms
+  `lookup_poll_fn` is populated after the first call.
 
-- **AOT activation** (`aot.rs`): for each `^:async` defn, run `lower_async`,
-  compile the poll fn as a module symbol, and emit harness code that calls
-  `register_poll_fn(ns, name, arity, <symbol>, n_slots)` before `-main`; relax
-  `expanded_needs_interpreter` once a poll fn exists. Verify by `cljrs compile`
-  of an async program matching `cljrs run`.
-- **JIT activation** (`cljrs-jit`): when a hot `^:async` arity crosses the
-  threshold, `lower_async` + `compile_jit_poll` + `register_poll_fn`, tracking
-  the module in the code cache. This is the lighter path (no cargo build) and
-  makes `cljrs run`/REPL use native async without an explicit compile.
-- **GC-stress + parity tests** over the activated path.
+**The async-lowering pipeline is complete and live in `cljrs run`/REPL.**
+Remaining follow-ups (not blocking):
+
+- **AOT activation** (`aot.rs`): emit poll-fn symbols + harness `register_poll_fn`
+  calls so `cljrs compile`d binaries also run native async (the JIT path already
+  proves the machinery).
+- **Region-aware suspends**: let region scopes close before / reopen after a
+  suspend so async bodies regain bump-allocation (currently GC-heap only).
+- **Channels / spawn (H4)** and **try-catch across suspend (H5)**; poll-fn code
+  unloading on redefinition; GC-stress coverage of the activated path.
 
 ## Context
 

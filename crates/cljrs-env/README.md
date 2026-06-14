@@ -81,5 +81,9 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 - `install_eval_context(globals, ns)` — push a previously captured context (spawned threads)
 - `install_eval_context_guard(globals, ns) -> EvalContextGuard` — like `install_eval_context`, but pops on drop (including unwind); used by the JIT-native dispatch seam
 - `current_is_async() -> bool` — whether the innermost context is inside an `^:async` body
-- `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context
+- `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context. Honors `^:async` dispatch (via `apply::dispatch_if_async`) so a native/compiled caller of an `^:async` fn gets a `Value::Future`, not a synchronously-run body
 - `with_eval_context(f)` — run a closure with a temporary `Env` built from the innermost context
+
+## async_hook module
+
+The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`). Also hosts the async-JIT compile hook: `set_async_compile_hook` / `async_compile_hook` (`fn(&Value, usize, &mut Env)`), installed by `cljrs-jit::init` and called by the async dispatcher to lower + compile + register a native poll function for a called `^:async` arity (a no-op when the JIT is absent).

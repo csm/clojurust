@@ -3,11 +3,19 @@
 use cljrs_env::async_hook::AsyncRuntime;
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_interp::apply::select_arity;
 use cljrs_value::{NativeObjectBox, Value};
 
 use crate::channel::CljChannel;
 use crate::eval_async::{run_async_fn, spawn_future};
-use crate::state_machine::{lookup_poll_fn, spawn_state_machine};
+use crate::state_machine::{lookup_poll_fn, mark_compile_attempted, spawn_state_machine};
+
+/// Whether async-JIT activation is enabled (default on; disable with
+/// `CLJRS_NO_ASYNC_JIT`).
+fn async_jit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CLJRS_NO_ASYNC_JIT").is_err())
+}
 
 pub(crate) struct AsyncRuntimeImpl;
 
@@ -18,15 +26,36 @@ impl AsyncRuntimeImpl {
 }
 
 impl AsyncRuntime for AsyncRuntimeImpl {
-    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value {
-        // If this arity has a compiled poll function (registered by AOT/JIT),
-        // run the native state machine; otherwise fall back to the tree-walker.
+    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, mut env: Env) -> Value {
+        // Native fast path: if this arity has a compiled poll function (or one
+        // can be compiled now via the JIT hook), run the native state machine;
+        // otherwise fall back to the tree-walker.  The compiled poll function
+        // runs detached on the executor, so it carries the eval context
+        // (globals + defining ns) it needs to resolve globals / call other fns.
         if let Value::Fn(f) = &callee {
-            let fr = f.get();
-            if let Some(name) = fr.name.as_deref()
-                && let Some((poll_fn, n_slots)) = lookup_poll_fn(&fr.defining_ns, name, args.len())
-            {
-                return spawn_state_machine(poll_fn, n_slots, args);
+            // Scope the GcPtr borrow so `callee`/`env` can move into the
+            // fallback below; only Copy/cloned data escapes.
+            let info = {
+                let fr = f.get();
+                select_arity(fr, args.len())
+                    .ok()
+                    .map(|a| (a.ir_arity_id, fr.defining_ns.clone()))
+            };
+            if let Some((id, ns)) = info {
+                let ctx = (env.globals.clone(), ns);
+                if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
+                    return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                }
+                // One-shot compile attempt (when the JIT installed a hook).
+                if async_jit_enabled()
+                    && mark_compile_attempted(id)
+                    && let Some(hook) = cljrs_env::async_hook::async_compile_hook()
+                {
+                    hook(&callee, args.len(), &mut env);
+                    if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
+                        return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                    }
+                }
             }
         }
         // `spawn_future` keeps the task on the current LocalSet thread, so the

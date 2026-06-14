@@ -37,6 +37,7 @@ use std::sync::{Arc, mpsc};
 use cljrs_ir::IrFunction;
 use cljrs_value::Value;
 
+mod async_jit;
 pub mod code_cache;
 mod jit_compiler;
 mod jit_worker;
@@ -118,6 +119,11 @@ pub fn init() {
     cljrs_eval::set_stw_reclaim_hook(|| {
         code_cache::reclaim_at_stw();
     });
+
+    // Async-JIT activation (Phase H): compile `^:async` arities to native poll
+    // functions on first dispatch.  The async dispatcher (cljrs-async) calls
+    // this hook because it cannot reach the compiler itself.
+    cljrs_env::async_hook::set_async_compile_hook(async_jit::compile_async_arity);
 
     // Spawn the background compilation thread.
     jit_worker::start_worker(rx);
