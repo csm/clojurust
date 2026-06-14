@@ -54,6 +54,42 @@ impl Display for VarId {
     }
 }
 
+/// Machine representation of an IR variable in compiled code.
+///
+/// Lives here (rather than in `cljrs-compiler`) so the IR layer can carry
+/// static representation seeds (`IrFunction::seed_reprs`, from `^long`/`^double`
+/// type hints) that both the type-inference pass and codegen consume.
+/// `cljrs_compiler::typeinfer` re-exports this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Repr {
+    /// `*const Value` — the default, universal representation.
+    Boxed,
+    /// Raw `i64` (a `Value::Long` payload).
+    Long,
+    /// Raw `f64` (a `Value::Double` payload).
+    Double,
+    /// Raw `i8` (0 or 1, a `Value::Bool` payload).
+    Bool,
+    /// A `Value::LongArray` (`^longs`).  The array value itself is still a boxed
+    /// `*const Value`; this repr records the element type so `aget`/`aset` on it
+    /// load/store unboxed `i64` elements.
+    LongArray,
+    /// A `Value::DoubleArray` (`^doubles`); unboxed `f64` elements.
+    DoubleArray,
+}
+
+impl Repr {
+    /// For an array repr, the element scalar repr (`LongArray` → `Long`,
+    /// `DoubleArray` → `Double`); `None` for scalar/boxed reprs.
+    pub fn array_element(self) -> Option<Repr> {
+        match self {
+            Repr::LongArray => Some(Repr::Long),
+            Repr::DoubleArray => Some(Repr::Double),
+            _ => None,
+        }
+    }
+}
+
 /// A basic block identifier within an IR function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
@@ -112,6 +148,19 @@ pub enum KnownFn {
     Mul,
     Div,
     Rem,
+
+    // Unchecked integer arithmetic — wraps on overflow (never promotes/throws).
+    // The checked `Add`/`Sub`/`Mul` throw on unboxed-Long overflow; these do not.
+    UncheckedAdd,
+    UncheckedSub,
+    UncheckedMul,
+
+    // Primitive array access: `(aget arr i)`, `(aset arr i v)`, `(alength arr)`.
+    // On a known `LongArray`/`DoubleArray` repr, codegen loads/stores unboxed
+    // elements; otherwise it falls back to a boxed runtime bridge.
+    Aget,
+    Aset,
+    Alength,
 
     // Comparison (pure)
     Eq,
@@ -527,6 +576,19 @@ pub struct IrFunction {
     /// Async IR functions fall back to tree-walking (`eval_async`) at runtime;
     /// a future JIT pass will emit proper Cranelift state machines.
     pub is_async: bool,
+    /// Static representation seeds for the parameters, positional with `params`,
+    /// derived from `^long`/`^double`/… type hints (see `cljrs-value`'s
+    /// `TypeHint`).  Empty means "no hints"; a `Repr::Boxed` entry means a param
+    /// with no usable hint.  The type-inference pass (`cljrs_compiler::typeinfer`)
+    /// prefers these over runtime-profiled specs and the JIT can skip its warmup
+    /// when an arity is fully hinted.
+    #[serde(default)]
+    pub seed_reprs: Vec<Repr>,
+    /// Static representation seeds for `let`/`loop`-bound locals, keyed by the
+    /// local's `VarId` (assigned during lowering).  Seeded into type inference
+    /// alongside `seed_reprs`.
+    #[serde(default)]
+    pub local_seed_reprs: Vec<(VarId, Repr)>,
 }
 
 impl IrFunction {
@@ -541,6 +603,8 @@ impl IrFunction {
             span,
             subfunctions: Vec::new(),
             is_async: false,
+            seed_reprs: Vec::new(),
+            local_seed_reprs: Vec::new(),
         }
     }
 
@@ -831,6 +895,9 @@ impl KnownFn {
             | KnownFn::Mul
             | KnownFn::Div
             | KnownFn::Rem
+            | KnownFn::UncheckedAdd
+            | KnownFn::UncheckedSub
+            | KnownFn::UncheckedMul
             | KnownFn::Eq
             | KnownFn::Lt
             | KnownFn::Gt
@@ -869,6 +936,10 @@ impl KnownFn {
 
             // Deref reads from heap
             KnownFn::Deref | KnownFn::AtomDeref => Effect::HeapRead,
+
+            // Primitive array access
+            KnownFn::Aget | KnownFn::Alength => Effect::HeapRead,
+            KnownFn::Aset => Effect::HeapWrite,
 
             // Atom mutation
             KnownFn::AtomReset | KnownFn::AtomSwap => Effect::HeapWrite,

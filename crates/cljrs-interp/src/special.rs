@@ -15,7 +15,7 @@ use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
     CljxFn, CljxFnArity, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
-    ProtocolMethod, TypeInstance, Value, ValueError,
+    ProtocolMethod, TypeHint, TypeInstance, Value, ValueError,
 };
 
 /// Dispatch to the right special-form handler.
@@ -240,12 +240,20 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
     };
 
     let mut params: Vec<Arc<str>> = Vec::new();
+    let mut param_hints: Vec<Option<TypeHint>> = Vec::new();
     let mut rest_param: Option<Arc<str>> = None;
+    let mut rest_hint: Option<TypeHint> = None;
     let mut destructure_params: Vec<(usize, Form)> = Vec::new();
     let mut destructure_rest: Option<Form> = None;
     let mut saw_amp = false;
 
     for p in param_forms {
+        // Peel a leading `^hint` (e.g. `^long x`, `^doubles a`) from the param,
+        // resolving the `:tag` to a primitive `TypeHint`.  Unknown / non-primitive
+        // tags resolve to `None` and are simply ignored (Clojure treats them as
+        // advisory).  The unwrapped form keeps the existing symbol/destructure
+        // handling unchanged.
+        let (hint, p) = peel_param_hint(p);
         match &p.kind {
             FormKind::Symbol(s) if s == "&" => {
                 saw_amp = true;
@@ -253,9 +261,11 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
             FormKind::Symbol(s) => {
                 if saw_amp {
                     rest_param = Some(Arc::from(s.as_str()));
+                    rest_hint = hint;
                     break;
                 } else {
                     params.push(Arc::from(s.as_str()));
+                    param_hints.push(hint);
                 }
             }
             // Destructuring patterns: vectors and maps
@@ -269,6 +279,8 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
                     let idx = params.len();
                     let gensym = format!("__destructure_{idx}");
                     params.push(Arc::from(gensym.as_str()));
+                    // Destructured params can't be primitive-tagged.
+                    param_hints.push(None);
                     destructure_params.push((idx, p.clone()));
                 }
             }
@@ -287,7 +299,53 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::arity::fresh_arity_id(),
+        param_hints,
+        rest_hint,
     })
+}
+
+/// Peel a `^hint` wrapper off a parameter form, returning the resolved
+/// primitive [`TypeHint`] (if the tag is a recognized primitive) together with
+/// the unwrapped inner form.  A param with no metadata returns `(None, form)`.
+fn peel_param_hint(p: &Form) -> (Option<TypeHint>, &Form) {
+    if let FormKind::Meta(meta, inner) = &p.kind {
+        let hint = tag_name_of_meta(meta).and_then(|n| TypeHint::from_tag(&n));
+        // Recurse in case of stacked metadata; the innermost form is the param.
+        let (inner_hint, inner_form) = peel_param_hint(inner);
+        (hint.or(inner_hint), inner_form)
+    } else {
+        (None, p)
+    }
+}
+
+/// Extract the bare tag name from a `^meta` form: `^long` (symbol shorthand) or
+/// `^{:tag long}` (explicit map).  Strips any namespace from the tag symbol.
+fn tag_name_of_meta(meta: &Form) -> Option<Arc<str>> {
+    match &meta.kind {
+        // `^long x` — the metadata is a bare symbol naming the tag.
+        FormKind::Symbol(s) => Some(strip_tag_ns(s)),
+        // `^{:tag long} x` — pull the `:tag` entry out of the map literal.
+        FormKind::Map(entries) => entries.chunks(2).find_map(|kv| {
+            let is_tag = matches!(&kv[0].kind, FormKind::Keyword(k) if k == "tag");
+            if !is_tag {
+                return None;
+            }
+            match kv.get(1).map(|f| &f.kind) {
+                Some(FormKind::Symbol(s)) => Some(strip_tag_ns(s)),
+                Some(FormKind::Str(s)) => Some(strip_tag_ns(s)),
+                _ => None,
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Strip a namespace prefix from a tag name (`clojure.core/long` → `long`).
+fn strip_tag_ns(s: &str) -> Arc<str> {
+    match s.rfind('/') {
+        Some(pos) if pos + 1 < s.len() => Arc::from(&s[pos + 1..]),
+        _ => Arc::from(s),
+    }
 }
 
 // ── if ────────────────────────────────────────────────────────────────────────
@@ -1782,6 +1840,8 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             destructure_params: vec![],
             destructure_rest: None,
             ir_arity_id: crate::arity::fresh_arity_id(),
+            param_hints: vec![],
+            rest_hint: None,
         };
         let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
         let ctor = CljxFn::new(
@@ -1817,6 +1877,8 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             destructure_params: vec![],
             destructure_rest: None,
             ir_arity_id: crate::arity::fresh_arity_id(),
+            param_hints: vec![],
+            rest_hint: None,
         };
         let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
         let ctor = CljxFn::new(

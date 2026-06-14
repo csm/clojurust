@@ -29,6 +29,7 @@ src/
   publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
   symbol.rs                      — Symbol { namespace, name }
+  type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
   types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
   value.rs                       — Value enum (incl. SharedAtom, ByteBlob variants), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
@@ -229,6 +230,9 @@ pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,        // positional param names
     pub rest_param: Option<Arc<str>>, // name after & (if any)
     pub body: Vec<Form>,              // forms in this arity's body
+    pub param_hints: Vec<Option<TypeHint>>, // primitive type hint per param (^long, …)
+    pub rest_hint: Option<TypeHint>,         // hint on the rest param (rarely used)
+    // (also: destructure_params, destructure_rest, ir_arity_id)
 }
 
 pub struct CljxFn {

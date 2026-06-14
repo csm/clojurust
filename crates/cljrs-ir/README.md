@@ -23,8 +23,8 @@ src/
              function so its entry jumps straight to a hot loop header, with
              live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
-    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured, analyze,
-                  inline, optimize, EscapeContext …
+    mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured,
+                  lower_fn_body_seeded, analyze, inline, optimize, EscapeContext …
     anf.rs      — ANF lowering: Form AST → IrFunction (pure Rust).  Closures
                   capture only the enclosing locals their (fully macro-expanded)
                   body references (`collect_symbol_names`, a conservative
@@ -58,6 +58,13 @@ tests/
 pub struct VarId(pub u32);
 pub struct BlockId(pub u32);
 
+/// Machine representation of an IR var (lives here so IrFunction can carry
+/// static seeds from `^long`/`^double` type hints; re-exported by
+/// cljrs_compiler::typeinfer).  `LongArray`/`DoubleArray` are boxed array
+/// pointers with a known element type (from `^longs`/`^doubles`), enabling
+/// unboxed `aget`/`aset`.
+pub enum Repr { Boxed, Long, Double, Bool, LongArray, DoubleArray }
+
 pub struct IrFunction {
     pub name: Option<Arc<str>>,
     pub params: Vec<(Arc<str>, VarId)>,
@@ -70,6 +77,11 @@ pub struct IrFunction {
     /// Async IR functions fall back to tree-walking `eval_async`; Phase H JIT
     /// will emit Cranelift state machines with explicit resume points.
     pub is_async: bool,
+    /// Static per-parameter repr seeds from `^long`/`^double` hints (positional
+    /// with `params`).  Empty ⇒ no hints.  Preferred over profiled specs.
+    pub seed_reprs: Vec<Repr>,
+    /// Static repr seeds for `let`/`loop`-bound locals, keyed by VarId.
+    pub local_seed_reprs: Vec<(VarId, Repr)>,
 }
 
 impl IrFunction {
@@ -121,6 +133,17 @@ versioned namespace (see `split_sym` in `lower/anf.rs`).
 
 160+ built-in function identifiers with effect classification (`Effect`):
 `Pure`, `Alloc`, `HeapRead`, `HeapWrite`, `IO`, `UnknownCall`.
+
+The checked integer arithmetic `Add`/`Sub`/`Mul` throw on overflow at the IR
+and compiled tiers (Clojure primitive-long semantics); `UncheckedAdd`/
+`UncheckedSub`/`UncheckedMul` are the wrapping counterparts (the `unchecked-*`
+family, plus `unchecked-inc`/`-dec`/`-negate` which lower to them).  `inc`/`dec`
+lower to checked `Add`/`Sub`.
+
+`Aget`/`Aset`/`Alength` are primitive array access.  On a `^longs`/`^doubles`
+operand (`Repr::LongArray`/`DoubleArray`) with an unboxed index, codegen loads/
+stores unboxed `i64`/`f64` elements; otherwise it uses a boxed bridge.  All
+paths bounds-check and throw on out-of-range access.
 
 Some `KnownFn` variants exist purely for analysis precision — the
 codegen and IR interpreter dispatch them through the dynamic builtin

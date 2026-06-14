@@ -14,9 +14,13 @@
 //! A var is given an unboxed repr only when the *exact* runtime semantics of
 //! the boxed bridge are expressible on the raw representation:
 //!
-//! - `rt_add`/`rt_sub`/`rt_mul` on `(Long, Long)` use `wrapping_*` — identical
-//!   to Cranelift `iadd`/`isub`/`imul`.  Mixed `Long`/`Double` operands
-//!   promote to `f64`, identical to `fcvt_from_sint` + `fadd`/….
+//! - `rt_add`/`rt_sub`/`rt_mul` on `(Long, Long)` are *checked* and throw on
+//!   overflow (Clojure primitive-long semantics); the unboxed codegen path
+//!   emits `iadd`/`isub`/`imul` followed by a signed-overflow branch that
+//!   raises the same exception, so the two agree.  The `unchecked-*` family
+//!   (`rt_unchecked_*` / plain `iadd`) wraps, also consistently across tiers.
+//!   Mixed `Long`/`Double` operands promote to `f64`, identical to
+//!   `fcvt_from_sint` + `fadd`/….
 //! - `rt_lt`/`rt_gt`/`rt_lte`/`rt_gte` compare `(Long, Long)` as `i64` and
 //!   promote mixed operands to `f64` — identical to `icmp`/`fcmp`.
 //! - `rt_eq` on `(Long, Long)` is `i64` equality.  Other operand types keep
@@ -37,17 +41,11 @@ use std::collections::HashMap;
 use crate::ir::{Const, Inst, IrFunction, KnownFn, Terminator, VarId};
 
 /// Machine representation of an IR variable in compiled code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Repr {
-    /// `*const Value` — the default, universal representation.
-    Boxed,
-    /// Raw `i64` (a `Value::Long` payload).
-    Long,
-    /// Raw `f64` (a `Value::Double` payload).
-    Double,
-    /// Raw `i8` (0 or 1, a `Value::Bool` payload).
-    Bool,
-}
+///
+/// Defined in `cljrs-ir` (so `IrFunction` can carry static `seed_reprs` from
+/// `^long`/`^double` type hints) and re-exported here for backwards
+/// compatibility — existing `cljrs_compiler::typeinfer::Repr` paths still work.
+pub use crate::ir::Repr;
 
 /// Lattice element during inference: `None` = ⊥ (not yet computed).
 type Lat = Option<Repr>;
@@ -90,6 +88,15 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
         lat.insert(*var, Some(r));
     }
 
+    // Seed `let`/`loop`-bound locals from static type hints.  These are folded
+    // through the same monotonic `meet` as everything else, so a hint can only
+    // confirm an unboxed repr the body's dataflow agrees with — it never
+    // unsoundly forces a boxed-producing binding into an unboxed register.
+    for (var, r) in &func.local_seed_reprs {
+        let merged = meet(lat.get(var).copied().flatten(), Some(*r));
+        lat.insert(*var, merged);
+    }
+
     let get = |lat: &HashMap<VarId, Lat>, v: VarId| -> Lat { lat.get(&v).copied().flatten() };
 
     // Fixpoint: reprs move monotonically ⊥ → unboxed → Boxed, so this
@@ -130,7 +137,12 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
                         let a = get(&lat, args[0]);
                         let b = get(&lat, args[1]);
                         let r = match kf {
-                            KnownFn::Add | KnownFn::Sub | KnownFn::Mul => arith_result(a, b),
+                            KnownFn::Add
+                            | KnownFn::Sub
+                            | KnownFn::Mul
+                            | KnownFn::UncheckedAdd
+                            | KnownFn::UncheckedSub
+                            | KnownFn::UncheckedMul => arith_result(a, b),
                             // Long/Long division truncates and nil-guards; only
                             // the all-double case is expressible unboxed.
                             KnownFn::Div => match (a, b) {
@@ -146,10 +158,22 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
                                 (None, _) | (_, None) => None,
                                 _ => Some(Repr::Boxed),
                             },
+                            // `(aget arr i)` on a typed array with an unboxed
+                            // index yields its unboxed element; `a`/`b` are the
+                            // array/index reprs.  A boxed index falls back to
+                            // the boxed bridge (result stays boxed).
+                            KnownFn::Aget => match (a, b) {
+                                (Some(Repr::LongArray), Some(Repr::Long)) => Some(Repr::Long),
+                                (Some(Repr::DoubleArray), Some(Repr::Long)) => Some(Repr::Double),
+                                (None, _) | (_, None) => None,
+                                _ => Some(Repr::Boxed),
+                            },
                             _ => Some(Repr::Boxed),
                         };
                         Some((*dst, r))
                     }
+                    // `(alength arr)` always yields an unboxed long count.
+                    Inst::CallKnown(dst, KnownFn::Alength, _) => Some((*dst, Some(Repr::Long))),
                     other => other.dst().map(|d| (d, Some(Repr::Boxed))),
                 };
                 if let Some((dst, r)) = new {
@@ -268,6 +292,32 @@ mod tests {
         assert_eq!(reprs.get(&n), None, "unspecialized param must be boxed");
         assert_eq!(reprs.get(&cond), None, "cmp with boxed operand stays boxed");
         assert_eq!(reprs.get(&i), Some(&Repr::Long));
+    }
+
+    /// A `let`-bound local seeded with a scalar hint is inferred unboxed when
+    /// the dataflow agrees, and the hint is folded soundly through `meet`.
+    #[test]
+    fn local_seed_repr_is_honored() {
+        let mut f = IrFunction::new(None, None);
+        let x = f.fresh_var();
+        let one = f.fresh_var();
+        let y = f.fresh_var();
+        let entry = f.fresh_block();
+        f.blocks.push(Block {
+            id: entry,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(x, Const::Long(5)),
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(y, KnownFn::Add, vec![x, one]),
+            ],
+            terminator: Terminator::Return(y),
+        });
+        // Seed `x` as Long (as a `^long` let-binding would).
+        f.local_seed_reprs = vec![(x, Repr::Long)];
+        let reprs = infer(&f, &[]);
+        assert_eq!(reprs.get(&x), Some(&Repr::Long));
+        assert_eq!(reprs.get(&y), Some(&Repr::Long));
     }
 
     /// A phi joining a Long with a Boxed value must come out Boxed.

@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 
+use crate::TypeHint;
 use crate::Value;
 
 // ── No-GC debug provenance helper ────────────────────────────────────────────
@@ -567,6 +568,13 @@ pub struct CljxFnArity {
     pub destructure_rest: Option<Form>,
     /// Unique ID for IR cache lookup (assigned by the evaluator).
     pub ir_arity_id: u64,
+    /// Optional primitive type hint per positional parameter (parallel to
+    /// `params`).  `^long x` → `Some(TypeHint::Long)`; an un-hinted or
+    /// non-primitive-tagged param → `None`.  Drives unboxed codegen.
+    pub param_hints: Vec<Option<TypeHint>>,
+    /// Primitive type hint on the rest param, if any (rarely useful, but parsed
+    /// for symmetry).
+    pub rest_hint: Option<TypeHint>,
 }
 
 impl CljxFnArity {
@@ -583,6 +591,8 @@ impl CljxFnArity {
         // destructure_rest
         + self.destructure_rest.as_ref()
             .map_or(0, |f| mem::size_of::<Form>() + f.heap_size())
+        // param_hints (Copy elements, no nested heap)
+        + self.param_hints.capacity() * mem::size_of::<Option<TypeHint>>()
     }
 }
 

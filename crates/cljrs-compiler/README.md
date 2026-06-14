@@ -51,8 +51,9 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 
 - **Constants:** `rt_const_nil`, `rt_const_true`, `rt_const_false`, `rt_const_long(i64)`, `rt_const_double(f64)`, `rt_const_char(u32)`, `rt_const_string(ptr, len)`, `rt_const_keyword(ptr, len)`, `rt_const_symbol(ptr, len)`.  nil, true/false, and longs in `0..1024` are interned once per process via `cljrs_gc::static_alloc` (program-lifetime, **not** GC-heap allocations — nothing traces the intern caches, so GC-managed entries would be swept after two collections and every compiled use would read freed memory; see `tests/interned_scalars.rs`)
 - **Truthiness:** `rt_truthiness(v) -> u8`
-- **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul`, `rt_div`, `rt_rem`
+- **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul` (checked — throw on long overflow), `rt_div`, `rt_rem`, `rt_unchecked_add`, `rt_unchecked_sub`, `rt_unchecked_mul` (wrapping), `rt_overflow_error` (builds the integer-overflow exception for the unboxed checked-arithmetic codegen path)
 - **Comparison:** `rt_eq`, `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
+- **Primitive arrays:** `rt_alength(arr) -> i64`, `rt_aget_long(arr, i) -> i64`, `rt_aget_double(arr, i) -> f64` (unboxed element loads), `rt_aset_long`/`rt_aset_double` (unboxed stores), `rt_aget`/`rt_aset` (boxed fallback for unknown element types) — all bounds-checked, throwing on out-of-range / type mismatch
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
 - **Dispatch:** `rt_call(callee, args, nargs)`, `rt_deref(v)`, `rt_load_global(ns, ns_len, name, name_len)`
@@ -157,17 +158,28 @@ pub fn new_compiler_from_module<M: Module>(module: M, ptr_type: types::Type) -> 
 ### Type inference (`typeinfer.rs`, Phase 10.6)
 
 ```rust
-pub enum Repr { Boxed, Long, Double, Bool }
+pub use cljrs_ir::Repr; // { Boxed, Long, Double, Bool } — moved to cljrs-ir, re-exported here
 pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr>;
 ```
+
+`Repr` now lives in `cljrs-ir` so `IrFunction` can carry static representation
+seeds from `^long`/`^double` type hints; `typeinfer` re-exports it unchanged.
+`infer` seeds parameters from `specs` and `let`/`loop` locals from
+`func.local_seed_reprs` (folded through `meet`, so a hint never unsoundly
+forces a boxed-producing binding into an unboxed register).
+`compile_function_with_specs` merges `func.seed_reprs` (static hints, which win)
+with the caller's profiled `specs` before driving both the prologue guards and
+inference, so a `^long`-hinted parameter is guarded/unboxed without waiting for
+the Tier-1 profiling warmup.
 
 Forward fixpoint dataflow over the CFG (including `RecurJump` back-edges into
 loop-header phis).  Parameters are seeded from `specs`; constants and the
 arithmetic/comparison `KnownFn`s propagate; phis meet (mixed reprs fall back to
 `Boxed`).  A var gets an unboxed repr only where codegen can emit semantics
-bit-identical to the boxed rt_abi bridge (`wrapping` long arithmetic, f64
-promotion for mixed operands, ordered float compares); `Div`/`Rem` and
-cross-type `Eq` always stay boxed.
+matching the boxed rt_abi bridge: checked long `+`/`-`/`*` (overflow throws,
+via an inline signed-overflow branch matching `rt_add`/etc.), wrapping
+`unchecked-*`, f64 promotion for mixed operands, ordered float compares;
+`Div`/`Rem` and cross-type `Eq` always stay boxed.
 
 ### AOT driver (`aot.rs`)
 
