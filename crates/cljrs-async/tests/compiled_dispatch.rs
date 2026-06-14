@@ -25,12 +25,11 @@ fn parse_one(src: &str) -> cljrs_reader::Form {
 }
 
 /// A stand-in for compiled output: ignores its inputs and completes
-/// immediately with a sentinel `999`, distinguishable from what the
-/// interpreter would compute (`(await 5)` = 5).
-extern "C" fn sentinel_poll(sm: *mut CljxStateMachine, out: *mut *const Value) -> i32 {
+/// immediately with a sentinel `999` (returned in-band via `pending`),
+/// distinguishable from what the interpreter would compute (`(await 5)` = 5).
+extern "C" fn sentinel_poll(sm: *mut CljxStateMachine) -> i32 {
     let sm = unsafe { &mut *sm };
-    sm.slots[0] = Value::Long(999);
-    unsafe { *out = &sm.slots[0] as *const Value };
+    sm.pending = Value::Long(999);
     POLL_READY
 }
 

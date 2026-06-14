@@ -346,6 +346,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_async_register),
         sym!(rt_async_poll_ready),
         sym!(rt_async_take_result),
+        sym!(rt_async_set_result),
     ];
 
     builder.symbols(symbols.iter().map(|&(n, p)| (n, p)));
@@ -398,29 +399,28 @@ mod async_poll_tests {
         let cf = compile_jit_poll("await_plus_one__poll", &low.poll_fn).expect("compile poll fn");
 
         // SAFETY: `compile_jit_poll` declared the poll-fn ABI for this symbol.
-        let poll: extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32 =
+        let poll: extern "C" fn(*mut CljxStateMachine) -> i32 =
             unsafe { std::mem::transmute(cf.fn_ptr) };
 
         // Awaiting a plain Long is the identity (ready on first resume).
         let mut sm = CljxStateMachine::new(poll, low.n_slots, vec![Value::Long(41)]);
         let smp: *mut CljxStateMachine = &mut sm;
-        let mut out: *const Value = std::ptr::null();
 
         // First poll: state 0 runs the prologue, registers the await, suspends.
-        let c0 = poll(smp, &mut out);
+        let c0 = poll(smp);
         assert_eq!(
             c0, POLL_PENDING,
             "first poll registers the await and suspends"
         );
 
         // Second poll: state 1 resolves the (immediately-ready) value, computes
-        // (+ 41 1), and completes.
-        let c1 = poll(smp, &mut out);
+        // (+ 41 1), and completes.  The result is returned in-band via `pending`.
+        let c1 = poll(smp);
         assert_eq!(c1, POLL_READY, "second poll resolves and completes");
-        let result = unsafe { &*out };
         assert!(
-            matches!(result, Value::Long(42)),
-            "expected 42, got {result:?}"
+            matches!(sm.pending, Value::Long(42)),
+            "expected 42, got {:?}",
+            sm.pending
         );
 
         // Keep the module (and its executable memory) alive until here.

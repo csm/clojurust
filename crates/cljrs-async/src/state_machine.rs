@@ -15,6 +15,13 @@
 //! and the readiness helpers the poll function calls at a suspend's resume
 //! point.
 //!
+//! A completed poll function stores its result (or thrown value) into the
+//! machine's GC-rooted [`CljxStateMachine::pending`] slot — via
+//! `rt_async_set_result` on `Return`, or left there by the readiness check on a
+//! failed await — rather than handing back a raw pointer through an
+//! out-parameter.  The adapter then reads it as a plain owned `Value`, so no
+//! externally-written raw pointer is ever dereferenced on the Rust side.
+//!
 //! ## GC safety
 //!
 //! The values that cross a suspend live in [`CljxStateMachine::slots`] (a
@@ -41,13 +48,14 @@ use crate::eval_async::spawn_future;
 
 /// Poll-function return code: the task suspended; re-poll later.
 pub const POLL_PENDING: i32 = 0;
-/// Poll-function return code: the task finished; `out` holds the result.
+/// Poll-function return code: the task finished; the result is in `pending`.
 pub const POLL_READY: i32 = 1;
-/// Poll-function return code: the task threw; `out` holds the thrown value.
+/// Poll-function return code: the task threw; the thrown value is in `pending`.
 pub const POLL_THREW: i32 = 2;
 
-/// The C-ABI signature of a compiled poll function.
-pub type PollFn = extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32;
+/// The C-ABI signature of a compiled poll function.  The result/thrown value is
+/// returned in-band (`CljxStateMachine::pending`), not through an out-pointer.
+pub type PollFn = extern "C" fn(*mut CljxStateMachine) -> i32;
 
 /// Runtime state of one compiled `^:async` invocation.
 ///
@@ -159,18 +167,10 @@ impl Future for CompiledAsyncTask {
         // `CompiledAsyncTask` is `Unpin` (Box + guards), so `get_mut` is sound.
         let this = self.get_mut();
         let sm_ptr: *mut CljxStateMachine = &mut *this.sm;
-        let mut out: *const Value = std::ptr::null();
-        let code = (this.sm.poll_fn)(sm_ptr, &mut out as *mut *const Value);
-        let read_out = || {
-            if out.is_null() {
-                Value::Nil
-            } else {
-                // SAFETY: a poll function that returns READY/THREW writes a
-                // pointer to a live Value (GC-heap-boxed in compiled code, or a
-                // stable state-machine slot) that is valid until the next poll.
-                unsafe { (*out).clone() }
-            }
-        };
+        let code = (this.sm.poll_fn)(sm_ptr);
+        // The poll function reports its result in-band via `pending` (a plain,
+        // GC-rooted `Value`), so completion is a safe field read — no raw
+        // FFI-provenance pointer is dereferenced here.
         match code {
             POLL_PENDING => {
                 // Cooperative re-poll, mirroring the tree-walker's `yield_now`:
@@ -178,8 +178,8 @@ impl Future for CompiledAsyncTask {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            POLL_READY => Poll::Ready(Ok(read_out())),
-            POLL_THREW => Poll::Ready(Err(EvalError::Thrown(read_out()))),
+            POLL_READY => Poll::Ready(Ok(this.sm.pending.clone())),
+            POLL_THREW => Poll::Ready(Err(EvalError::Thrown(this.sm.pending.clone()))),
             other => Poll::Ready(Err(EvalError::Runtime(format!(
                 "compiled async poll returned invalid code {other}"
             )))),
@@ -256,8 +256,8 @@ mod tests {
 
     /// A hand-written two-state poll function standing in for compiled output:
     /// `state 0` registers the awaited value (slot 0) and suspends; `state 1`
-    /// resumes, doubles the resolved Long, and returns it.
-    extern "C" fn double_poll(sm: *mut CljxStateMachine, out: *mut *const Value) -> i32 {
+    /// resumes, doubles the resolved Long, and stores it in `pending`.
+    extern "C" fn double_poll(sm: *mut CljxStateMachine) -> i32 {
         // SAFETY: the adapter passes a valid, exclusively-borrowed machine.
         let sm = unsafe { &mut *sm };
         match sm.state {
@@ -273,13 +273,11 @@ mod tests {
                         Value::Long(n) => n,
                         _ => 0,
                     };
-                    sm.slots[1] = Value::Long(n * 2);
-                    unsafe { *out = &sm.slots[1] as *const Value };
+                    sm.pending = Value::Long(n * 2);
                     POLL_READY
                 }
                 Readiness::Failed(e) => {
-                    sm.slots[1] = e;
-                    unsafe { *out = &sm.slots[1] as *const Value };
+                    sm.pending = e;
                     POLL_THREW
                 }
             },
@@ -309,10 +307,9 @@ mod tests {
     }
 
     /// A poll function that fails surfaces as a thrown error.
-    extern "C" fn throw_poll(sm: *mut CljxStateMachine, out: *mut *const Value) -> i32 {
+    extern "C" fn throw_poll(sm: *mut CljxStateMachine) -> i32 {
         let sm = unsafe { &mut *sm };
-        sm.slots[0] = Value::Str(cljrs_gc::GcPtr::new("boom".into()));
-        unsafe { *out = &sm.slots[0] as *const Value };
+        sm.pending = Value::Str(cljrs_gc::GcPtr::new("boom".into()));
         POLL_THREW
     }
 

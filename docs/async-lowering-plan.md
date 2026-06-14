@@ -22,7 +22,8 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
   `rt_state_store`/`rt_state_load`/`rt_async_register`/`rt_async_poll_ready`/
   `rt_async_take_result`. 3 unit tests.
 - **Codegen — `cljrs-compiler::codegen`** ✅ `declare_poll_function` (the
-  `(state_ptr, out_ptr) -> i32` ABI), `translate_poll_fn` (the `switch(state)`
+  `(state_ptr) -> i32` ABI, result returned in-band via `pending`),
+  `translate_poll_fn` (the `switch(state)`
   dispatch prologue over `async_resume_blocks`), and lowering of all four
   state-machine instructions to the bridges; `Return` writes `*out` + returns
   `POLL_READY`. Poll fns compile fully boxed. Verified **end-to-end via the JIT**:
@@ -186,11 +187,15 @@ prologue.
 
 **Poll-function ABI** (emitted by codegen):
 ```rust
-extern "C" fn <name>__poll(state: *mut CljxStateMachine, out: *mut *const Value) -> i32
-// 0 = Pending, 1 = Ready (out written), 2 = Threw (out holds the thrown Value)
+extern "C" fn <name>__poll(state: *mut CljxStateMachine) -> i32
+// 0 = Pending, 1 = Ready, 2 = Threw
 ```
-The `out`-param + `i32` keeps the thrown-vs-resolved distinction unambiguous and
-integrates with the existing `PENDING_EXCEPTION` slot in `rt_abi`.
+The result (or thrown value) is returned **in-band** via `CljxStateMachine.pending`
+(written by `rt_async_set_result` on `Return`, or left there by the readiness
+check on a failed await), so the Rust adapter reads it as a safe owned `Value`
+field rather than dereferencing an externally-written raw pointer. (The original
+design used a `*mut *const Value` out-parameter; that was replaced after CodeQL
+flagged the raw out-pointer deref — see PR #173.)
 
 **State object** — new `crates/cljrs-async/src/state_machine.rs`:
 ```rust
@@ -198,7 +203,7 @@ pub struct CljxStateMachine {
     pub state: i32,
     pub slots: Vec<Value>,        // contiguous; GC-traced via VALUE_ROOTS slice
     pub pending: Option<Value>,   // the Future/Promise/Channel currently awaited
-    poll_fn: extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32,
+    poll_fn: extern "C" fn(*mut CljxStateMachine) -> i32,
 }
 ```
 - Allocated on the **GC heap** (`GcPtr::new`). `slots`' backing pointer is stable

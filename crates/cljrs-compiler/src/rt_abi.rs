@@ -4678,12 +4678,26 @@ pub extern "C" fn rt_async_take_result(sm: *mut CljxStateMachine) -> *const Valu
     &sm.pending as *const Value
 }
 
+/// Store the poll function's final result into the state machine (used by
+/// `Return` in a poll fn).  The result lands in `pending` — the GC-rooted slot
+/// the `CompiledAsyncTask` adapter reads on completion — so the result never
+/// crosses the FFI boundary as a raw pointer.
+///
+/// # Safety
+/// `sm` must be live and `val` a valid `Value` pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_set_result(sm: *mut CljxStateMachine, val: *const Value) {
+    let v = unsafe { val_ref(val) }.clone();
+    let sm = unsafe { &mut *sm };
+    sm.pending = v;
+}
+
 #[cfg(test)]
 mod async_sm_tests {
     use super::*;
     use cljrs_async::state_machine::CljxStateMachine;
 
-    extern "C" fn dummy_poll(_sm: *mut CljxStateMachine, _out: *mut *const Value) -> i32 {
+    extern "C" fn dummy_poll(_sm: *mut CljxStateMachine) -> i32 {
         0
     }
 

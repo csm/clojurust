@@ -204,6 +204,7 @@ struct RuntimeFuncs {
     rt_async_register: FuncId,
     rt_async_poll_ready: FuncId,
     rt_async_take_result: FuncId,
+    rt_async_set_result: FuncId,
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────
@@ -244,18 +245,18 @@ impl<M: Module> Compiler<M> {
     }
 
     /// Declare a compiled async *poll function* with the state-machine ABI
-    /// `extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32`.
+    /// `extern "C" fn(*mut CljxStateMachine) -> i32`.
     ///
     /// Used instead of [`declare_function`](Self::declare_function) for an
     /// `IrFunction` produced by `cljrs_ir::lower::async_lower` (its
     /// `is_async_poll_fn` is set): the original Clojure parameters arrive in the
-    /// state machine's slots, so the compiled signature is fixed at two pointers
+    /// state machine's slots, and the result/thrown value is returned in-band via
+    /// `CljxStateMachine::pending`, so the compiled signature is a single pointer
     /// plus an `i32` poll code, independent of the function's arity.
     pub fn declare_poll_function(&mut self, name: &str) -> CodegenResult<FuncId> {
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         sig.params.push(AbiParam::new(self.ptr_type)); // *mut CljxStateMachine
-        sig.params.push(AbiParam::new(self.ptr_type)); // *mut *const Value (out)
         sig.returns.push(AbiParam::new(types::I32)); // poll code
         let func_id = self.module.declare_function(name, Linkage::Export, &sig)?;
         self.user_funcs.insert(Arc::from(name), func_id);
@@ -355,7 +356,6 @@ impl<M: Module> Compiler<M> {
                     specs,
                     is_poll_fn: ir_func.is_async_poll_fn,
                     sm_param: None,
-                    out_param: None,
                 };
                 translator.translate(ir_func)?;
             }
@@ -465,13 +465,12 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// missing entries are boxed).
     specs: &'b [Repr],
     /// Whether this function is a compiled async poll function: changes the
-    /// signature/prologue and the meaning of `Return` (write `*out`, return
-    /// `POLL_READY`).  When set, [`Self::sm_param`]/[`Self::out_param`] are bound.
+    /// signature/prologue and the meaning of `Return` (stash the result in the
+    /// state machine via `rt_async_set_result`, return `POLL_READY`).  When set,
+    /// [`Self::sm_param`] is bound.
     is_poll_fn: bool,
     /// The poll function's `*mut CljxStateMachine` parameter (state-machine ABI).
     sm_param: Option<cranelift_codegen::ir::Value>,
-    /// The poll function's `*mut *const Value` out-parameter.
-    out_param: Option<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
@@ -582,7 +581,6 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         self.builder.switch_to_block(dispatch);
         let params = self.builder.block_params(dispatch).to_vec();
         self.sm_param = Some(params[0]);
-        self.out_param = Some(params[1]);
 
         self.emit_safepoint();
 
@@ -1169,7 +1167,6 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 let sm = self.sm_param.ok_or_else(|| {
                     CodegenError::Codegen("AsyncResume outside a poll function".into())
                 })?;
-                let out = self.out_param.unwrap();
                 let code = self.call_rt_1(self.rt.rt_async_poll_ready, sm)?;
 
                 // Not ready yet → return POLL_PENDING; the executor re-polls and
@@ -1191,7 +1188,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .iconst(types::I32, cljrs_async::state_machine::POLL_PENDING as i64);
                 self.builder.ins().return_(&[pending]);
 
-                // Failed → *out = thrown value; return POLL_THREW.
+                // Failed → the thrown value is already in `pending` (stashed by
+                // rt_async_poll_ready); just return POLL_THREW.
                 self.builder.switch_to_block(cont1);
                 let threw_block = self.builder.create_block();
                 let cont2 = self.builder.create_block();
@@ -1204,13 +1202,6 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .ins()
                     .brif(is_threw, threw_block, &[], cont2, &[]);
                 self.builder.switch_to_block(threw_block);
-                let thrown = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
-                self.builder.ins().store(
-                    cranelift_codegen::ir::MemFlags::trusted(),
-                    thrown,
-                    out,
-                    0,
-                );
                 let threw = self
                     .builder
                     .ins()
@@ -1237,15 +1228,13 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             Terminator::Return(var_id) => {
                 let val = self.use_var_boxed(*var_id)?;
                 if self.is_poll_fn {
-                    // Poll-fn ABI: write the result through `out` and return
-                    // POLL_READY.
-                    let out = self.out_param.unwrap();
-                    self.builder.ins().store(
-                        cranelift_codegen::ir::MemFlags::trusted(),
-                        val,
-                        out,
-                        0,
-                    );
+                    // Poll-fn ABI: stash the result in the state machine
+                    // (`pending`) and return POLL_READY — no raw out-pointer.
+                    let sm = self.sm_param.ok_or_else(|| {
+                        CodegenError::Codegen("Return outside a poll function".into())
+                    })?;
+                    let set = self.import_func(self.rt.rt_async_set_result);
+                    self.builder.ins().call(set, &[sm, val]);
                     let ready = self
                         .builder
                         .ins()
@@ -2758,6 +2747,7 @@ fn declare_runtime_funcs<M: Module>(
         rt_async_register: declare_rt_void(module, "rt_async_register", &[ptr, ptr])?,
         rt_async_poll_ready: declare_rt(module, "rt_async_poll_ready", &[ptr], types::I32)?,
         rt_async_take_result: declare_rt(module, "rt_async_take_result", &[ptr], ptr)?,
+        rt_async_set_result: declare_rt_void(module, "rt_async_set_result", &[ptr, ptr])?,
     })
 }
 
