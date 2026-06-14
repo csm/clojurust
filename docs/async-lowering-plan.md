@@ -21,15 +21,16 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
 - **rt_abi bridges — `cljrs-compiler::rt_abi`** ✅ `rt_sm_state`/`rt_sm_set_state`/
   `rt_state_store`/`rt_state_load`/`rt_async_register`/`rt_async_poll_ready`/
   `rt_async_take_result`. 3 unit tests.
+- **Codegen — `cljrs-compiler::codegen`** ✅ `declare_poll_function` (the
+  `(state_ptr, out_ptr) -> i32` ABI), `translate_poll_fn` (the `switch(state)`
+  dispatch prologue over `async_resume_blocks`), and lowering of all four
+  state-machine instructions to the bridges; `Return` writes `*out` + returns
+  `POLL_READY`. Poll fns compile fully boxed. Verified **end-to-end via the JIT**:
+  `cljrs-jit` registers the bridge symbols and `compile_jit_poll` compiles a poll
+  fn; a test drives `(+ (await x) 1)` through a native suspend/resume cycle.
 
 **Remaining (next session):**
 
-- **Codegen** (`codegen.rs`): emit the poll-fn ABI `(state_ptr, out_ptr) -> i32`,
-  the `switch(state)` prologue over `async_resume_blocks` (sm pointer is the
-  hidden leading param, threaded like the region param), and lower the four
-  state-machine instructions to the rt_abi bridges (incl. `Return` → `*out =
-  box(v); return POLL_READY`, and the suspend block ending in a `return` with no
-  terminator emission). Register the new bridges in the codegen `RtFns` table.
 - **Dispatch + AOT wiring** (`aot.rs`, `cljrs-env::apply::dispatch_if_async`):
   run `lower_async` for `^:async` arities, compile the poll fn as a symbol,
   register `arity-id → (poll_fn, n_slots)`, and have `dispatch_if_async` build a
