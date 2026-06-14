@@ -26,6 +26,10 @@ Two tiers coexist:
 
 Both tiers produce `Value::Future`, so a caller can `await` or `deref` either.
 
+To run Clojure work on more than one core, the single-threaded executor is
+instantiated multiple times as independent **isolates**; see the
+[Worker isolation](isolation.md) chapter.
+
 ## `^:async` functions and `await`
 
 A function tagged `^:async` runs its body as an async task. Calling it returns
