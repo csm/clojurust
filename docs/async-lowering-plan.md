@@ -1,5 +1,44 @@
 # Plan: AOT State-Machine Lowering for `^:async` Functions (Phase H)
 
+## Implementation status
+
+Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
+`cargo test` / `cargo clippy`):
+
+- **H0 — IR vocabulary** ✅ `StateStore`/`StateLoad`/`AsyncSuspend`/`AsyncResume`
+  instructions + `SuspendKind`, the `is_async_poll_fn` flag and
+  `async_resume_blocks` state→block table on `IrFunction`, wired through
+  `Inst::{effect,dst,uses}`/`Display` and every exhaustive match. No behaviour
+  change.
+- **H1–H3 — `lower::async_lower` pass** ✅ The IR-on-IR transform: splits blocks
+  at each `await`, SSA phi-edge liveness, slot assignment, `StateStore`/
+  `StateLoad` insertion, parameter slot-loading, and loop-header phi-predecessor
+  remap. `await` only; channels/spawn return `Unsupported`. 6 unit tests.
+- **Runtime — `cljrs-async::state_machine`** ✅ `CljxStateMachine`, the poll ABI
+  + codes, `check_ready`, and the `CompiledAsyncTask` Future adapter that drives
+  a poll fn on the `LocalSet` while GC-rooting `slots`/`pending` via the existing
+  thread-local root stacks. 3 tests drive hand-written poll fns end-to-end.
+- **rt_abi bridges — `cljrs-compiler::rt_abi`** ✅ `rt_sm_state`/`rt_sm_set_state`/
+  `rt_state_store`/`rt_state_load`/`rt_async_register`/`rt_async_poll_ready`/
+  `rt_async_take_result`. 3 unit tests.
+
+**Remaining (next session):**
+
+- **Codegen** (`codegen.rs`): emit the poll-fn ABI `(state_ptr, out_ptr) -> i32`,
+  the `switch(state)` prologue over `async_resume_blocks` (sm pointer is the
+  hidden leading param, threaded like the region param), and lower the four
+  state-machine instructions to the rt_abi bridges (incl. `Return` → `*out =
+  box(v); return POLL_READY`, and the suspend block ending in a `return` with no
+  terminator emission). Register the new bridges in the codegen `RtFns` table.
+- **Dispatch + AOT wiring** (`aot.rs`, `cljrs-env::apply::dispatch_if_async`):
+  run `lower_async` for `^:async` arities, compile the poll fn as a symbol,
+  register `arity-id → (poll_fn, n_slots)`, and have `dispatch_if_async` build a
+  `CljxStateMachine` and call `spawn_state_machine` when a compiled poll fn
+  exists (falling back to `eval_async` otherwise). Stop excluding async fns in
+  `expanded_needs_interpreter` once lowering succeeds.
+- **End-to-end parity test**: `cljrs compile` an async program and assert the
+  native binary matches `cljrs run`, plus a GC-stress variant.
+
 ## Context
 
 `clojurust` AOT-compiles Clojure to native code via Cranelift, but **`^:async`
