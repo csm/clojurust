@@ -20,6 +20,7 @@ mod builtins;
 pub mod channel;
 pub mod eval_async;
 pub mod isolate;
+mod isolate_builtins;
 pub mod isolate_channel;
 mod runtime;
 pub mod worker_pool;
@@ -66,6 +67,7 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
     globals.get_or_create_ns(ns);
     globals.refer_all(ns, "clojure.core");
     builtins::register(globals, ns);
+    isolate_builtins::register(globals, ns);
     load_source(globals, ns, CORE_ASYNC_SOURCE);
     globals.mark_loaded(ns);
 }

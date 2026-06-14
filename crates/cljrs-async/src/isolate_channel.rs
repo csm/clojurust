@@ -36,15 +36,26 @@ use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
 /// Sending end of a cross-isolate channel. Cloneable — multiple senders are
 /// allowed. All methods are synchronous and cheap (just serialization + channel
 /// push).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IsolateSender {
     tx: tokio::sync::mpsc::UnboundedSender<SerializedValue>,
 }
 
 /// Receiving end of a cross-isolate channel. Must live on the destination
 /// isolate's thread so that `deserialize` allocates into the right GC heap.
+#[derive(Debug)]
 pub struct IsolateReceiver {
     rx: tokio::sync::mpsc::UnboundedReceiver<SerializedValue>,
+}
+
+/// Outcome of a non-blocking [`IsolateReceiver::try_recv_status`].
+pub enum IsolateRecv {
+    /// A value was dequeued and deserialized into the current isolate's heap.
+    Value(Value),
+    /// The channel is currently empty but at least one sender is still alive.
+    Empty,
+    /// All senders have been dropped and the queue is drained.
+    Disconnected,
 }
 
 // IsolateSender is Send because SerializedValue: Send.
@@ -90,6 +101,18 @@ impl IsolateReceiver {
     /// empty or all senders have been dropped.
     pub fn try_recv(&mut self) -> Option<Value> {
         self.rx.try_recv().ok().map(deserialize)
+    }
+
+    /// Non-blocking receive that distinguishes "empty" from "disconnected" —
+    /// the Clojure-level `isolate-take!`/`isolate-poll!` builtins need to tell a
+    /// transient empty queue (keep waiting) from a closed channel (yield `nil`).
+    pub fn try_recv_status(&mut self) -> IsolateRecv {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(sv) => IsolateRecv::Value(deserialize(sv)),
+            Err(TryRecvError::Empty) => IsolateRecv::Empty,
+            Err(TryRecvError::Disconnected) => IsolateRecv::Disconnected,
+        }
     }
 }
 
@@ -296,7 +319,7 @@ mod tests {
             ])));
             tx.send(&v).unwrap();
             let after = cljrs_gc::GC_STATS.snapshot();
-            assert!(after.boundary_crossings >= before.boundary_crossings + 1);
+            assert!(after.boundary_crossings > before.boundary_crossings);
             assert!(after.boundary_bytes_copied > before.boundary_bytes_copied);
         });
         h.join().unwrap();

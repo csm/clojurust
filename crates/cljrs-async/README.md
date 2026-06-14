@@ -57,6 +57,17 @@ Done (Phases A–H, A2, B1):
   latency — one of the four visibility guarantees in
   `docs/isolate-boundary-plan.md`. Rejected (non-shareable) sends copy nothing
   and are not metered.
+- Phase B2 (Clojure surface): `isolate_builtins` exposes the copy boundary to
+  Clojure as a **distinct constructor** (`(isolate-chan) → [tx rx]`), honoring
+  the plan's "distinct-at-construction, not per-message" rule — you know a send
+  copies because the *target* you hold is an isolate-channel end, not an
+  in-isolate `(chan)`. `(isolate-put! tx v)` deep-copies `v` across the boundary
+  (returns `true`, or `false` if the receiver is gone) and raises a **located**
+  error at the put site if `v` cannot cross. `(isolate-poll! rx)` is a
+  non-blocking take; `(isolate-take! rx)` returns a `Future` for use with
+  `await`. The *distinct parallel primitive* (`pfuture`/`spawn`) that would run
+  Clojure on another isolate is deferred — it needs B3's shared code arena so a
+  worker can see the running program's code without copying the world.
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
   contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
   remain non-deadlocking when called from the LocalSet executor thread). Errors with a
@@ -87,6 +98,34 @@ inside an async context:
 `poll!` (non-blocking take → value or `nil`) and `offer!` (non-blocking buffered put →
 `true`/`false`) act synchronously and return immediately. `<!!` and `>!!` are the
 blocking sync-context equivalents, suitable for REPL use and tests (see Phase H above).
+
+### Isolate channels — the copy boundary in Clojure
+
+An **isolate** channel is a *distinct constructor* from `(chan)`. The point is
+source-visibility (see `docs/isolate-boundary-plan.md`): sending through an
+isolate channel deep-copies the value across an isolate boundary, and you know
+that because the thing you hold is an isolate-channel end — you do not tag each
+send.
+
+```clojure
+(require '[clojure.core.async :refer [isolate-chan isolate-put! isolate-poll! isolate-take!]])
+
+(let [[tx rx] (isolate-chan)]
+  (isolate-put! tx {:a 1 :b [2 3]})  ; deep-copies the map across the boundary → true
+  (isolate-poll! rx))                ; => {:a 1 :b [2 3]} (an independent copy), or nil if empty
+
+;; in an async body, park until a value arrives:
+(go (await (isolate-take! rx)))
+```
+
+`isolate-put!` returns `true` on success, `false` if the receiver is gone, and
+**throws at the put site** if the value holds isolate-local state (a closure,
+atom, native resource, …) that cannot cross. Every accepted send is metered
+into `--gc-stats` (bytes copied + time). The sender is multi-producer
+(value-copyable); the receiver is single-consumer and deserializes into the
+heap of whichever isolate holds it. Until the parallel primitive lands, both
+ends usually live on one isolate, so this behaves as an unbounded queue that
+still pays — and meters — the honest deep copy.
 
 ### Error propagation: the `<?` family
 
@@ -142,11 +181,13 @@ blocking bridge is a later phase.
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
 | `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
-| `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a tokio unbounded MPSC channel |
+| `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a tokio unbounded MPSC channel; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |
+| `src/isolate_builtins.rs` | Clojure-level surface for the copy boundary: `CljIsolateTx`/`CljIsolateRx` native objects and the `isolate-chan` / `isolate-put!` / `isolate-poll!` / `isolate-take!` builtins |
 | `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
+| `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!` |
 
 ## Public API
 
@@ -222,7 +263,13 @@ pub mod isolate_channel {
         pub async fn recv(&mut self) -> Option<Value>;
         /// Non-blocking receive attempt. Returns `None` if the channel is empty.
         pub fn try_recv(&mut self) -> Option<Value>;
+        /// Non-blocking receive that distinguishes `Empty` (keep waiting) from
+        /// `Disconnected` (all senders gone). Backs the Clojure builtins.
+        pub fn try_recv_status(&mut self) -> IsolateRecv;
     }
+
+    /// Outcome of `try_recv_status`: `Value(v)`, `Empty`, or `Disconnected`.
+    pub enum IsolateRecv { Value(Value), Empty, Disconnected }
 
     /// Create a linked `(IsolateSender, IsolateReceiver)` pair.
     pub fn isolate_channel() -> (IsolateSender, IsolateReceiver);
