@@ -199,6 +199,47 @@ pub fn spawn_state_machine(poll_fn: PollFn, n_slots: usize, args: Vec<Value>) ->
     spawn_future(CompiledAsyncTask::new(sm))
 }
 
+// ── Compiled poll-function registry ──────────────────────────────────────────
+//
+// AOT/JIT compilation of an `^:async` function emits a poll function and
+// registers it here, keyed by the defining namespace, name, and fixed arity.
+// `AsyncRuntimeImpl::spawn_async_call` consults the registry: a hit runs the
+// native state machine via `spawn_state_machine`, a miss falls back to the
+// tree-walking `run_async_fn`.  Function pointers are `Send + Sync`, so the
+// registry is a simple global map.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+#[derive(Clone, Copy)]
+struct PollEntry {
+    poll_fn: PollFn,
+    n_slots: usize,
+}
+
+static POLL_REGISTRY: RwLock<Option<HashMap<(String, String, usize), PollEntry>>> =
+    RwLock::new(None);
+
+/// Register a compiled poll function for `ns/name` at a fixed `arity` (number of
+/// positional parameters).  Called by the AOT harness / JIT once per compiled
+/// `^:async` arity.
+pub fn register_poll_fn(ns: &str, name: &str, arity: usize, poll_fn: PollFn, n_slots: usize) {
+    let mut guard = POLL_REGISTRY.write().unwrap();
+    guard.get_or_insert_with(HashMap::new).insert(
+        (ns.to_string(), name.to_string(), arity),
+        PollEntry { poll_fn, n_slots },
+    );
+}
+
+/// Look up a compiled poll function for `ns/name` at the given `arity`.
+pub fn lookup_poll_fn(ns: &str, name: &str, arity: usize) -> Option<(PollFn, usize)> {
+    let guard = POLL_REGISTRY.read().unwrap();
+    guard
+        .as_ref()?
+        .get(&(ns.to_string(), name.to_string(), arity))
+        .map(|e| (e.poll_fn, e.n_slots))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

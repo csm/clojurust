@@ -7,6 +7,7 @@ use cljrs_value::{NativeObjectBox, Value};
 
 use crate::channel::CljChannel;
 use crate::eval_async::{run_async_fn, spawn_future};
+use crate::state_machine::{lookup_poll_fn, spawn_state_machine};
 
 pub(crate) struct AsyncRuntimeImpl;
 
@@ -18,6 +19,16 @@ impl AsyncRuntimeImpl {
 
 impl AsyncRuntime for AsyncRuntimeImpl {
     fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value {
+        // If this arity has a compiled poll function (registered by AOT/JIT),
+        // run the native state machine; otherwise fall back to the tree-walker.
+        if let Value::Fn(f) = &callee {
+            let fr = f.get();
+            if let Some(name) = fr.name.as_deref()
+                && let Some((poll_fn, n_slots)) = lookup_poll_fn(&fr.defining_ns, name, args.len())
+            {
+                return spawn_state_machine(poll_fn, n_slots, args);
+            }
+        }
         // `spawn_future` keeps the task on the current LocalSet thread, so the
         // `!Send` Clojure values (env, args, GcPtrs) never cross threads, and
         // delivers the body's result into the returned Future.
