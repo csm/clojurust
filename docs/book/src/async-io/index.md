@@ -40,5 +40,12 @@ clojurust distinguishes async waiting from blocking waiting:
 Without `cljrs-async` loaded, `(await x)` falls back to a blocking deref, so the
 form is still meaningful in purely synchronous code.
 
-See the [core.async](async.md) chapter for the concurrency model and the
+To scale Clojure work across CPU cores, that single-threaded executor is
+instantiated multiple times as independent **isolates**, each with its own heap
+and collector. Values move between isolates by an explicit copy rather than a
+shared pointer. See the [Worker isolation](isolation.md) chapter for the model
+and its rationale.
+
+See the [core.async](async.md) chapter for the concurrency model, the
+[Worker isolation](isolation.md) chapter for scaling across cores, and the
 [Asynchronous I/O](io.md) chapter for the channel-oriented filesystem API.
