@@ -53,16 +53,26 @@ Landed and tested on `claude/async-lowering-plan-eubefa` (each item green under
   interpreter (`CLJRS_NO_ASYNC_JIT=1`); a `cljrs-jit` integration test confirms
   `lookup_poll_fn` is populated after the first call.
 
-**The async-lowering pipeline is complete and live in `cljrs run`/REPL.**
-Remaining follow-ups (not blocking):
+- **AOT activation — `aot.rs`** ✅ `cljrs compile` introspects the `^:async` fns
+  the program defined (evaluating their `def` forms into the compile-time env so
+  their bodies are available), compiles a poll fn for each into the object module
+  (`compile_async_poll_fns`), and emits harness code that declares the symbols
+  and calls `register_poll_fn_named(ns, name, arity, sym, n_slots)` after
+  `cljrs_async::init`. The runtime registry now carries a second key —
+  `(ns, name, arity)` for AOT (compile-time stable), alongside `ir_arity_id` for
+  JIT — and `spawn_async_call` consults both. End-to-end verified: `cljrs
+  compile` of a nested-async program with an async `-main` runs native and prints
+  the correct result (`32`). (Top-level `await` in the preamble is a pre-existing
+  AOT limitation — sync await deadlocks the LocalSet; async `-main` is the entry.)
 
-- **AOT activation** (`aot.rs`): emit poll-fn symbols + harness `register_poll_fn`
-  calls so `cljrs compile`d binaries also run native async (the JIT path already
-  proves the machinery).
+**The async-lowering pipeline is complete and live in both `cljrs run`/REPL
+(JIT) and `cljrs compile` (AOT).** Remaining follow-ups (not blocking):
+
 - **Region-aware suspends**: let region scopes close before / reopen after a
   suspend so async bodies regain bump-allocation (currently GC-heap only).
 - **Channels / spawn (H4)** and **try-catch across suspend (H5)**; poll-fn code
-  unloading on redefinition; GC-stress coverage of the activated path.
+  unloading on redefinition; inner-closure (subfunction) support in AOT async;
+  GC-stress coverage of the activated path.
 
 ## Context
 

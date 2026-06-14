@@ -8,7 +8,9 @@ use cljrs_value::{NativeObjectBox, Value};
 
 use crate::channel::CljChannel;
 use crate::eval_async::{run_async_fn, spawn_future};
-use crate::state_machine::{lookup_poll_fn, mark_compile_attempted, spawn_state_machine};
+use crate::state_machine::{
+    lookup_poll_fn, lookup_poll_fn_named, mark_compile_attempted, spawn_state_machine,
+};
 
 /// Whether async-JIT activation is enabled (default on; disable with
 /// `CLJRS_NO_ASYNC_JIT`).
@@ -39,11 +41,18 @@ impl AsyncRuntime for AsyncRuntimeImpl {
                 let fr = f.get();
                 select_arity(fr, args.len())
                     .ok()
-                    .map(|a| (a.ir_arity_id, fr.defining_ns.clone()))
+                    .map(|a| (a.ir_arity_id, fr.defining_ns.clone(), fr.name.clone()))
             };
-            if let Some((id, ns)) = info {
-                let ctx = (env.globals.clone(), ns);
+            if let Some((id, ns, name)) = info {
+                let ctx = (env.globals.clone(), ns.clone());
+                // JIT registry (keyed by runtime ir_arity_id).
                 if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
+                    return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                }
+                // AOT registry (keyed by ns/name/arity, registered by the harness).
+                if let Some(nm) = name.as_deref()
+                    && let Some((poll_fn, n_slots)) = lookup_poll_fn_named(&ns, nm, args.len())
+                {
                     return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
                 }
                 // One-shot compile attempt (when the JIT installed a hook).

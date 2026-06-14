@@ -243,8 +243,13 @@ struct PollEntry {
 
 #[derive(Default)]
 struct Registry {
+    /// JIT registrations, keyed by the arity's runtime `ir_arity_id`.
     compiled: HashMap<u64, PollEntry>,
+    /// Arities a JIT compile has been attempted for (one-shot).
     attempted: HashSet<u64>,
+    /// AOT registrations, keyed by `(ns, name, arity)` — the compile-time key,
+    /// since `ir_arity_id` is only assigned at runtime.
+    named: HashMap<(String, String, usize), PollEntry>,
 }
 
 static POLL_REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
@@ -279,6 +284,27 @@ pub fn mark_compile_attempted(arity_id: u64) -> bool {
         .get_or_insert_with(Registry::default)
         .attempted
         .insert(arity_id)
+}
+
+/// Register an AOT-compiled poll function by `(ns, name, arity)`.  Called by the
+/// generated AOT harness once per compiled `^:async` arity, before the program
+/// runs.
+pub fn register_poll_fn_named(ns: &str, name: &str, arity: usize, poll_fn: PollFn, n_slots: usize) {
+    let mut guard = POLL_REGISTRY.write().unwrap();
+    guard.get_or_insert_with(Registry::default).named.insert(
+        (ns.to_string(), name.to_string(), arity),
+        PollEntry { poll_fn, n_slots },
+    );
+}
+
+/// Look up an AOT-compiled poll function by `(ns, name, arity)`.
+pub fn lookup_poll_fn_named(ns: &str, name: &str, arity: usize) -> Option<(PollFn, usize)> {
+    let guard = POLL_REGISTRY.read().unwrap();
+    guard
+        .as_ref()?
+        .named
+        .get(&(ns.to_string(), name.to_string(), arity))
+        .map(|e| (e.poll_fn, e.n_slots))
 }
 
 #[cfg(test)]
