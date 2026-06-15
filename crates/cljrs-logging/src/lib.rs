@@ -128,20 +128,26 @@ pub fn set_feature_levels_from_env() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // NOTE: FEATURE_LEVELS is a process-global static and tests run in
+    // parallel within a single process, so each test must use feature names
+    // unique to that test. Reusing a name across tests races: one test's
+    // set_feature_level can clobber the state another test asserts on.
+
     #[test]
     fn test_parse_x_flag() {
-        parse_x_flag("debug:gc,jit").unwrap();
-        assert_eq!(feature_level("gc"), Level::Debug);
-        assert_eq!(feature_level("jit"), Level::Debug);
-        assert_eq!(feature_level("reader"), Level::Off);
+        parse_x_flag("debug:flag_gc,flag_jit").unwrap();
+        assert_eq!(feature_level("flag_gc"), Level::Debug);
+        assert_eq!(feature_level("flag_jit"), Level::Debug);
+        // A feature this test never configures stays Off.
+        assert_eq!(feature_level("flag_unconfigured"), Level::Off);
     }
 
     #[test]
     fn test_parse_x_flag_trace() {
-        parse_x_flag("trace:reader").unwrap();
-        assert_eq!(feature_level("reader"), Level::Trace);
-        assert!(is_enabled("reader", Level::Debug));
-        assert!(is_enabled("reader", Level::Trace));
+        parse_x_flag("trace:trace_reader").unwrap();
+        assert_eq!(feature_level("trace_reader"), Level::Trace);
+        assert!(is_enabled("trace_reader", Level::Debug));
+        assert!(is_enabled("trace_reader", Level::Trace));
     }
 
     #[test]
