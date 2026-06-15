@@ -305,6 +305,49 @@ mod tests {
         h.join().unwrap();
     }
 
+    /// A var `def`'d in one isolate is observable by value from another after
+    /// the structured-clone boundary (issue #171). Keyword identity preserved.
+    #[test]
+    fn var_with_value_root_crosses_boundary() {
+        let (tx, rx) = isolate_channel();
+        let hs = Isolate::new("var-sender").spawn(move || async move {
+            let var = cljrs_value::Var::new("user", "answer");
+            var.bind(Value::keyword(Keyword::qualified("ns", "kw")));
+            tx.send(&Value::Var(GcPtr::new(var))).unwrap();
+        });
+        let hr = Isolate::new("var-receiver").spawn(move || async move {
+            let mut rx = rx;
+            let Value::Var(p) = rx.recv().await.unwrap() else {
+                panic!("expected a Var on the receiving side");
+            };
+            assert_eq!(p.get().namespace.as_ref(), "user");
+            assert_eq!(
+                p.get().deref(),
+                Some(Value::keyword(Keyword::qualified("ns", "kw")))
+            );
+        });
+        hs.join().unwrap();
+        hr.join().unwrap();
+    }
+
+    /// A var bound to a closure / native fn is explicitly isolate-local: it is
+    /// rejected at the boundary rather than silently crossing unbound.
+    #[test]
+    fn var_with_fn_root_rejected_at_boundary() {
+        let (tx, _rx) = isolate_channel();
+        let h = Isolate::new("var-fn-sender").spawn(move || async move {
+            let var = cljrs_value::Var::new("user", "f");
+            var.bind(Value::NativeFunction(GcPtr::new(
+                cljrs_value::NativeFn::new("f", cljrs_value::Arity::Fixed(0), |_| Ok(Value::Nil)),
+            )));
+            assert!(matches!(
+                tx.send(&Value::Var(GcPtr::new(var))),
+                Err(CloneError::NotShareable { type_name: "var" })
+            ));
+        });
+        h.join().unwrap();
+    }
+
     /// Sending a value across the boundary meters bytes + crossings into the
     /// shared GC stats. Other tests may also increment the global counters
     /// concurrently, so we assert monotonic *increase*, not exact totals.

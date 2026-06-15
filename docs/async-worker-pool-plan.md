@@ -132,6 +132,20 @@ A var's root binding is the same shape as a shared mutable cell, so it uses the 
 the promotion cost is acceptable. Dynamic `binding` is already thread-local and maps directly to
 per-isolate — no change.
 
+**Implemented (issue #171), option (b) — hybrid var.** `Var` keeps its isolate-local, GC-backed
+root (`value: Mutex<Option<Value>>`) as the fast path that every deref, the IR tier, and the JIT/AOT
+`rt_*` ABI read — promotion never touches it, so inline caches stay valid and there is no JIT
+regression. Alongside it, `Var::shared_root: Arc<ArcSwap<Option<SharedValue>>>` mirrors the root:
+`Var::bind` (the single choke point for `def`/`alter-var-root`/`set!`) promotes the new value into
+the shared cell when promotable and clears it otherwise. The cell is what crosses the
+structured-clone boundary (`clone::serialize`/`deserialize`), so a var `def`'d in one isolate is
+observable by value from another with keyword/symbol identity preserved. A var whose current root is
+**non-promotable** (a closure / native resource) is explicitly isolate-local: crossing it is a
+non-silent `CloneError`. Var-root watches stay isolate-local (the shared cell carries no callbacks),
+matching `shared-atom`. Option (a) — arena-resident compiled fns addressable as a `SharedValue`
+variant — remains the more complete fix and is deferred until arena-resident code is addressable
+that way.
+
 ### Immortal shared state (orthogonal, also decided)
 
 Code (compiled fns, namespaces), interned keywords/symbols, and large `byte-array` blobs live in the

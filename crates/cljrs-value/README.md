@@ -20,14 +20,14 @@ standard library on top of them.
 ```
 src/
   lib.rs                         — module declarations and re-exports
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; handles SharedAtom/ByteBlob pass-through (B3)
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the JIT stales superseded native code; cljrs-eval invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
   publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
-  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError
+  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
   symbol.rs                      — Symbol { namespace, name }
   type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
@@ -175,6 +175,43 @@ isolate-local `Value`.  `compare_and_set` is the single lock-free CAS that
 backs the Clojure-level `compare-and-set!` and the `swap!` retry loop (callers
 that must run interpreter code between load and store use it instead of the
 closure-based `swap`).
+
+#### Var roots — two-tier, promote-on-`def` (issue #171)
+
+A var's *root* binding uses the **same** cross-isolate mechanism as
+`shared-atom`.  `Var` carries two slots:
+
+```rust
+pub struct Var {
+    pub value: Mutex<Option<Value>>,                          // isolate-local fast path
+    pub shared_root: Arc<ArcSwap<Option<SharedValue>>>,       // cross-isolate mirror (B3)
+    // …namespace, name, is_macro, meta, watches
+}
+
+impl Var {
+    pub fn deref(&self) -> Option<Value>          // reads the local fast path
+    pub fn deref_shared(&self) -> Option<Value>   // demotes the shared cell
+    pub fn bind(&self, v: Value)                  // promote-on-def: updates both slots
+    pub fn from_shared_root(ns, name, is_macro, shared_root) -> Self  // receiver side
+}
+```
+
+- **Reads stay local.** Every var deref, the IR tier, and the JIT/AOT `rt_*`
+  ABI read `value` — promotion never touches it, so inline caches and
+  pointer-identity assumptions in compiled code remain valid (no JIT
+  regression).
+- **`bind` promotes-on-write.** `def` / `alter-var-root` / `set!` all funnel
+  through `Var::bind`, which mirrors the new root into `shared_root` when it is
+  promotable, and clears it to `None` otherwise.  `def` is rare, so this
+  write-path cost is acceptable.
+- **Crossing isolates.** `clone::serialize` passes the `shared_root` `Arc`
+  through (both isolates share the same cell); the receiver rebuilds the var
+  with `from_shared_root`, seeding its local slot from the demoted snapshot.
+  A var bound to a **non-promotable** root (closure / native resource) is
+  *explicitly isolate-local* (ADR option (b)): `serialize` returns
+  `CloneError::NotShareable { type_name: "var" }` — a non-silent boundary
+  error.  Var-root watches stay isolate-local (the shared cell carries no
+  watch callbacks), matching `shared-atom`.
 
 ### `ClojureHash`
 
@@ -436,11 +473,17 @@ Shareable types: all scalars, strings, BigInt/BigDecimal/Ratio, Symbol/Keyword,
 all persistent collections, TypeInstance records, Error chains, primitive and
 object arrays, lazy sequences (realized first), WithMeta/Reduced wrappers.
 
-Non-shareable (returns `CloneError`): Atom, Var, Volatile, Promise, Future,
-Agent (mutable state); Fn, BoundFn, NativeFn, Macro, ProtocolFn, MultiFn
-(closures with isolate-local captures); Namespace, Protocol (global singletons);
-Resource, NativeObject (isolate-bound handles); TransientMap/Set/Vector;
-unforced Delay; Matcher.
+Cross-isolate shared references (Arc passed through, not deep-copied): SharedAtom,
+ByteBlob, and Var — a var crosses by sharing its `shared_root` cell, so a value
+`def`'d in one isolate is observable by value in another (issue #171). A var
+whose current root is non-promotable (closure/resource) is the exception and
+returns `CloneError`.
+
+Non-shareable (returns `CloneError`): Atom, Volatile, Promise, Future, Agent
+(mutable state); Fn, BoundFn, NativeFn, Macro, ProtocolFn, MultiFn (closures
+with isolate-local captures); Namespace, Protocol (global singletons); Resource,
+NativeObject (isolate-bound handles); TransientMap/Set/Vector; unforced Delay;
+Matcher; Var whose root holds a non-promotable value.
 
 ### Dependencies
 
