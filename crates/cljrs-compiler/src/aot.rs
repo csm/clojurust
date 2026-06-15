@@ -414,6 +414,14 @@ pub fn compile_file(
         globals
             .verify_commit_signatures
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Load `:trusted-signers` from cljrs.edn so compile-time signature
+        // verification has keys to check pinned commits against.
+        if let Some(config) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cljrs_deps::load_config(&cwd).ok().flatten())
+        {
+            globals.load_trusted_signers(&config);
+        }
     }
     // Register clojure.core.async so that (require '[clojure.core.async ...])
     // and the `go`/`alt` macros resolve during macro-expansion. The GC

@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+gix       = { workspace = true }
+pgp       = { workspace = true }
+ssh-key   = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

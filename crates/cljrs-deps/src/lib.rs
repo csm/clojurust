@@ -66,6 +66,20 @@ pub enum Dependency {
     },
 }
 
+/// A trusted commit signer declared in `:trusted-signers`.
+///
+/// Used (with `:verify-commit-signatures true`) to decide which keys are
+/// allowed to sign versioned dependency commits. Each entry is either an
+/// inline public key or a path to a key file resolved relative to the
+/// `cljrs.edn` directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustedSigner {
+    /// An inline public key: an armored PGP block or an OpenSSH public key line.
+    Inline(String),
+    /// A path to a public-key file (PGP `.asc` or OpenSSH `.pub`).
+    File(PathBuf),
+}
+
 /// A single alias entry from the `:aliases` map.
 #[derive(Debug, Clone, Default)]
 pub struct Alias {
@@ -120,9 +134,14 @@ pub struct DepsConfig {
     /// Named aliases (e.g. `:dev`, `:test`).
     pub aliases: Vec<(Arc<str>, Alias)>,
     /// When true, every versioned-symbol or versioned-namespace resolution
-    /// must pass `git verify-commit` before historical code is executed.
-    /// Equivalent to the `--verify-commit-signatures` CLI flag.
+    /// must carry a valid commit signature (verified natively against
+    /// `trusted_signers`) before historical code is executed.  Equivalent to
+    /// the `--verify-commit-signatures` CLI flag.
     pub verify_commit_signatures: bool,
+    /// Public keys trusted to sign versioned dependency commits, from
+    /// `:trusted-signers`.  Consulted only when `verify_commit_signatures` is
+    /// on; an empty set means no commit can be verified.
+    pub trusted_signers: Vec<TrustedSigner>,
     /// When true, a pinned lookup of a native (Rust-backed) function whose
     /// recorded provenance does not match the requested commit is an error
     /// instead of a warning.  Equivalent to the `--enforce-native-versions`
