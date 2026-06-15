@@ -11,6 +11,19 @@ thiserror = { workspace = true }
 gix       = { workspace = true }
 pgp       = { workspace = true }
 ssh-key   = { workspace = true }
+# Optional native SSH transport (enabled by the `ssh` feature).
+russh      = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+] }
+tokio-util = { workspace = true, optional = true }
+
+[features]
+# Native pure-Rust SSH transport for ssh:// remotes (host keys verified
+# against ~/.ssh/known_hosts; ssh-agent authentication). Off by default.
+ssh = ["dep:russh", "dep:tokio", "dep:tokio-util"]
 
 [dev-dependencies]
 tempfile = "3"

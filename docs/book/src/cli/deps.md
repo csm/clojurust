@@ -108,6 +108,15 @@ valid clojurust EDN:
 | `:trusted-signers` | vector of strings | Public keys allowed to sign versioned commits. Each entry is an inline key (armored PGP or OpenSSH) or a path to a key file relative to `cljrs.edn`. |
 | `:rust` | map | Embedded Rust crate for native interop. See [Rust Interop](../rust-interop/index.md). |
 
+#### Git dependency URLs
+
+`:git/url` accepts `https://` URLs and local paths (and `file://`), all fetched
+in-process with pure-Rust gitoxide — no `git` binary required. The `cljrs`
+binary additionally fetches `ssh://` and scp-like `git@host:path` URLs natively
+over SSH: host keys are verified against `~/.ssh/known_hosts`, and authentication
+uses a running ssh-agent (`$SSH_AUTH_SOCK`). Other schemes (`git://`, `http://`)
+are rejected.
+
 #### `:rust` key
 
 ```clojure
