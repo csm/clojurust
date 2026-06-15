@@ -208,7 +208,7 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Block, BlockId};
+    use crate::ir::Block;
     use std::sync::Arc;
 
     /// (fn [n] (loop [i 0 acc 0] (if (< i n) (recur (+ i 1) (+ acc i)) acc)))

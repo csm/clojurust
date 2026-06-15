@@ -217,17 +217,24 @@ fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
         FormKind::Bool(b) => Ok(ctx.emit_const(Const::Bool(*b))),
         FormKind::Int(n) => Ok(ctx.emit_const(Const::Long(*n))),
         FormKind::BigInt(s) => {
-            // Parse as i64 if possible, otherwise error.
-            let n: i64 = s.parse().unwrap_or(0);
-            Ok(ctx.emit_const(Const::Long(n)))
+            // No bignum Const exists yet: represent as i64 when it fits, but
+            // surface an error rather than silently truncating an out-of-range
+            // literal to 0 (which would corrupt results).
+            match s.parse::<i64>() {
+                Ok(n) => Ok(ctx.emit_const(Const::Long(n))),
+                Err(_) => Err(LowerError::UnsupportedForm(format!(
+                    "integer literal out of i64 range (bignums are not yet supported): {s}"
+                ))),
+            }
         }
         FormKind::Float(f) => Ok(ctx.emit_const(Const::Double(*f))),
         FormKind::BigDecimal(s) => {
+            // Lossy: no BigDecimal Const exists yet, so approximate as f64.
             let f: f64 = s.parse().unwrap_or(0.0);
             Ok(ctx.emit_const(Const::Double(f)))
         }
         FormKind::Ratio(s) => {
-            // Evaluate a/b ratio as f64.
+            // Lossy: no Ratio Const exists yet, so evaluate a/b as f64.
             if let Some(pos) = s.find('/') {
                 let num: f64 = s[..pos].parse().unwrap_or(0.0);
                 let den: f64 = s[pos + 1..].parse().unwrap_or(1.0);

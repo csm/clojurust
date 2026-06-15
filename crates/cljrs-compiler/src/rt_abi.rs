@@ -1128,7 +1128,7 @@ pub unsafe extern "C" fn rt_get(coll: *const Value, key: *const Value) -> *const
         Value::TypeInstance(ti) => ti.get().fields.get(key),
         Value::Vector(v) => {
             if let Value::Long(i) = key {
-                v.get().nth(*i as *const () as usize).cloned()
+                v.get().nth(*i as usize).cloned()
             } else {
                 None
             }
