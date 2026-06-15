@@ -660,12 +660,21 @@ mod tests {
     #[test]
     fn test_nth_negative_index() {
         // Negative index returns the not-found default, or throws without one.
-        assert_eq!(eval_str("(= (nth [10 20 30] -1 :nf) :nf)").unwrap(), bool_v(true));
+        assert_eq!(
+            eval_str("(= (nth [10 20 30] -1 :nf) :nf)").unwrap(),
+            bool_v(true)
+        );
         assert!(eval_str("(nth [10 20 30] -1)").is_err());
         assert!(eval_str("(nth '(1 2 3) -1)").is_err());
         // Crucially, must NOT hang walking an infinite lazy seq to usize::MAX.
-        assert_eq!(eval_str("(= (nth (range) -1 :nf) :nf)").unwrap(), bool_v(true));
-        assert_eq!(eval_str("(= (nth '(1 2 3) -1 :nf) :nf)").unwrap(), bool_v(true));
+        assert_eq!(
+            eval_str("(= (nth (range) -1 :nf) :nf)").unwrap(),
+            bool_v(true)
+        );
+        assert_eq!(
+            eval_str("(= (nth '(1 2 3) -1 :nf) :nf)").unwrap(),
+            bool_v(true)
+        );
     }
 
     // ── destructuring ─────────────────────────────────────────────────────

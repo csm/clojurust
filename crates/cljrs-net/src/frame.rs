@@ -685,7 +685,10 @@ mod tests {
         let mut f = LengthPrefixedFramer::new(4, true, 16);
         let frames = f.feed(&[0, 0, 1, 0]); // 0x00000100 = 256 > 16
         assert_eq!(frames.len(), 1);
-        assert!(matches!(frames[0], Value::Error(_)), "expected an error frame");
+        assert!(
+            matches!(frames[0], Value::Error(_)),
+            "expected an error frame"
+        );
         // The framer is poisoned: further bytes are dropped, buffer never grows.
         assert!(f.feed(&[0u8; 4096]).is_empty());
         assert!(f.buf.is_empty(), "errored framer must not accumulate input");
