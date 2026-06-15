@@ -230,11 +230,37 @@ impl cljrs_gc::Trace for MultiFn {
 // ── Var ───────────────────────────────────────────────────────────────────────
 
 /// A Clojure var — a namespace-interned mutable root binding.
+///
+/// ## Two-tier root (Phase B3, issue #171)
+///
+/// A var's *root* binding uses the same two-tier mechanism as `shared-atom`:
+///
+/// - **`value`** — the isolate-local, GC-backed fast path.  Every var deref,
+///   the IR tier, and the JIT/AOT `rt_*` ABI read this slot; promotion never
+///   touches it, so compiled inline caches and pointer-identity assumptions
+///   baked into native code stay valid.
+/// - **`shared_root`** — a `Send + Sync` cross-isolate mirror,
+///   `Arc<ArcSwap<Option<SharedValue>>>`, reusing
+///   [`crate::shared::SharedValue`].  `bind` (i.e. `def` / `alter-var-root` /
+///   `set!`) *promotes-on-write*: if the new root value is promotable the cell
+///   holds `Some(SharedValue)`, otherwise it is cleared to `None` (option (b)
+///   of the ADR — non-promotable roots, e.g. closures, stay isolate-local).
+///
+/// The shared cell is what crosses the structured-clone boundary: a var
+/// `def`'d in one isolate is observable *by value* from another, with keyword
+/// /symbol identity preserved through the intern table.  See
+/// `crate::clone` for the serialize/deserialize seam.
+///
+/// Dynamic `binding` is unchanged — it is already thread-local / per-isolate
+/// and lives on the binding stack, not in the var root.
 #[derive(Debug)]
 pub struct Var {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
     pub value: Mutex<Option<Value>>,
+    /// Cross-isolate mirror of the root binding (Phase B3).  `None` when the
+    /// var is unbound or its current root is not promotable.
+    pub shared_root: Arc<arc_swap::ArcSwap<Option<crate::shared::SharedValue>>>,
     pub is_macro: bool,
     /// Metadata map (e.g. `{:dynamic true}`).
     pub meta: Mutex<Option<Value>>,
@@ -247,7 +273,36 @@ impl Var {
             namespace: namespace.into(),
             name: name.into(),
             value: Mutex::new(None),
+            shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             is_macro: false,
+            meta: Mutex::new(None),
+            watches: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reconstruct a var on the receiving side of an isolate boundary.
+    ///
+    /// The `shared_root` cell is the *same* `Arc` as the sending isolate's, so
+    /// both isolates share the cross-isolate root cell.  The local `value`
+    /// fast-path slot is seeded by demoting the current shared snapshot, so an
+    /// immediate `deref` observes the value the var carried at crossing time.
+    pub fn from_shared_root(
+        namespace: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
+        is_macro: bool,
+        shared_root: Arc<arc_swap::ArcSwap<Option<crate::shared::SharedValue>>>,
+    ) -> Self {
+        let local = shared_root
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(crate::shared::demote);
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            value: Mutex::new(local),
+            shared_root,
+            is_macro,
             meta: Mutex::new(None),
             watches: Mutex::new(Vec::new()),
         }
@@ -259,6 +314,18 @@ impl Var {
 
     pub fn deref(&self) -> Option<Value> {
         self.value.lock().unwrap().clone()
+    }
+
+    /// Read the cross-isolate root by demoting the shared cell, ignoring the
+    /// isolate-local fast path.  Returns `None` when the shared root is empty
+    /// (unbound or non-promotable).  Used to observe writes another isolate
+    /// made through the shared cell.
+    pub fn deref_shared(&self) -> Option<Value> {
+        self.shared_root
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(crate::shared::demote)
     }
 
     pub fn bind(&self, v: Value) {
@@ -287,6 +354,13 @@ impl Var {
             let mut slot = self.value.lock().unwrap();
             slot.replace(v.clone())
         };
+        // Promote-on-`def` (Phase B3): mirror the new root into the
+        // cross-isolate cell when it is promotable, else clear the cell so it
+        // never advertises a stale or non-shareable root.  `def` is rare and
+        // global by nature, so this write-path cost is acceptable; the read
+        // path (and the JIT) never touch the shared cell.
+        let shared = crate::shared::promote(&v).ok();
+        self.shared_root.store(Arc::new(shared));
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
         }
@@ -1131,5 +1205,53 @@ impl cljrs_gc::Trace for Agent {
                 f.trace(visitor);
             }
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod var_tests {
+    use super::*;
+    use crate::shared::SharedValue;
+
+    #[test]
+    fn bind_promotable_mirrors_shared_root() {
+        let var = Var::new("user", "x");
+        assert!(var.shared_root.load().is_none());
+        var.bind(Value::Long(7));
+        assert!(matches!(
+            var.shared_root.load().as_ref().as_ref(),
+            Some(SharedValue::Long(7))
+        ));
+        assert_eq!(var.deref(), Some(Value::Long(7)));
+        assert_eq!(var.deref_shared(), Some(Value::Long(7)));
+    }
+
+    #[test]
+    fn bind_nonpromotable_clears_shared_root() {
+        let var = Var::new("user", "f");
+        var.bind(Value::Long(1));
+        assert!(var.shared_root.load().is_some());
+        // Rebinding to a non-promotable value clears the mirror, but the
+        // isolate-local fast path still holds it.
+        let f = Value::NativeFunction(GcPtr::new(NativeFn::new("f", Arity::Fixed(0), |_| {
+            Ok(Value::Nil)
+        })));
+        var.bind(f);
+        assert!(var.shared_root.load().is_none());
+        assert!(var.is_bound());
+        assert_eq!(var.deref_shared(), None);
+    }
+
+    #[test]
+    fn from_shared_root_seeds_local_slot() {
+        let src = Var::new("user", "y");
+        src.bind(Value::Long(99));
+        let recv = Var::from_shared_root("user", "y", false, src.shared_root.clone());
+        assert_eq!(recv.deref(), Some(Value::Long(99)));
+        // Same underlying cell.
+        src.bind(Value::Long(100));
+        assert_eq!(recv.deref_shared(), Some(Value::Long(100)));
     }
 }

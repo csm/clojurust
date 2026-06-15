@@ -48,7 +48,10 @@ Done (Phases A–H, A2, B1):
   a `Value` to a `Send + Sync` wire form (`SerializedValue`, defined in `cljrs-value::clone`);
   `IsolateReceiver::recv`/`try_recv` deserializes it into the receiver's GC heap. Non-shareable
   values (mutable state, closures, native resources) are rejected at send time with a typed
-  `CloneError`. The sender may be cloned (multi-producer); the receiver must stay on its isolate
+  `CloneError`. Phase B3 (issue #171): a `Var` with a *promotable* (or unbound) root crosses by
+  sharing its `shared_root` cell, so a value `def`'d in one isolate is observable by value in
+  another; a var bound to a non-promotable root (closure/resource) stays isolate-local and is
+  rejected like any other closure. The sender may be cloned (multi-producer); the receiver must stay on its isolate
   thread (single-consumer). `GcPtr`'s `!Send` bound makes pointer-sharing a compile error —
   the channel is the only sanctioned crossing point. Each accepted send is
   **metered** into the process-global `cljrs_gc::GC_STATS` via

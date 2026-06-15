@@ -24,9 +24,20 @@
 //! - Lazy sequences: **realized** first; the realized value is then cloned
 //! - `WithMeta`, `Reduced` wrappers (inner value + meta cloned recursively)
 //!
+//! ## Cross-isolate shared references (Phase B3)
+//!
+//! - `SharedAtom`, `ByteBlob`  — `Arc`-cloned, not deep-copied; both isolates
+//!   share the same underlying cell/buffer.
+//! - `Var`  — the var's *root* binding crosses through its shared cell
+//!   (`Arc<ArcSwap<Option<SharedValue>>>`), so a var `def`'d in one isolate is
+//!   observable by value from another, keyword/symbol identity preserved.  A
+//!   var whose current root holds a non-promotable value (a closure / native
+//!   resource) is **not** shareable and returns `CloneError` — such vars are
+//!   explicitly isolate-local (option (b) of the ADR).
+//!
 //! ## What is *not* shareable (returns `CloneError`)
 //!
-//! - `Atom`, `Var`, `Volatile`, `Promise`, `Future`, `Agent`  (mutable state)
+//! - `Atom`, `Volatile`, `Promise`, `Future`, `Agent`  (mutable state)
 //! - `Fn`, `BoundFn`, `Macro`, `NativeFunction`, `ProtocolFn`, `MultiFn`
 //!   (closures capture isolate-local `GcPtr`s)
 //! - `Namespace`, `Protocol`  (global singletons managed elsewhere)
@@ -37,11 +48,12 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use num_bigint::BigInt;
 
 use crate::collections::{PersistentHashSet, PersistentVector, SortedMap, SortedSet};
 use crate::error::ValueError;
-use crate::shared::SharedAtom;
+use crate::shared::{SharedAtom, SharedValue};
 use crate::types::DelayState;
 use crate::{Keyword, MapValue, PersistentList, PersistentQueue, SetValue, Symbol, Value};
 use cljrs_gc::GcPtr;
@@ -159,6 +171,17 @@ pub enum SerializedValue {
     SharedAtom(Arc<SharedAtom>),
     /// `ByteBlob` is an immutable refcounted buffer; clone the `Arc`.
     ByteBlob(Arc<[u8]>),
+    /// A var crosses by sharing its cross-isolate root cell (the `Arc` is
+    /// cloned, so both isolates point at the same `ArcSwap`).  The receiving
+    /// isolate rebuilds a `Var` whose local fast-path slot is the demoted
+    /// current snapshot.  Only vars with a promotable (or unbound) root reach
+    /// here — a non-promotable root is rejected at `serialize` time.
+    Var {
+        namespace: Arc<str>,
+        name: Arc<str>,
+        is_macro: bool,
+        shared_root: Arc<ArcSwap<Option<SharedValue>>>,
+    },
 }
 
 // Compile-time Send + Sync assertions.
@@ -243,6 +266,11 @@ impl SerializedValue {
 
             // Arc-shared: crosses by refcount bump, no structural copy.
             SerializedValue::SharedAtom(_) | SerializedValue::ByteBlob(_) => 0,
+
+            // The var's root cell is Arc-shared; only the ns/name strings copy.
+            SerializedValue::Var {
+                namespace, name, ..
+            } => namespace.len() + name.len(),
         };
 
         NODE + payload
@@ -425,7 +453,26 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         Value::ProtocolFn(_) => Err(not_shareable("fn")),
         Value::MultiFn(_) => Err(not_shareable("fn")),
 
-        Value::Var(_) => Err(not_shareable("var")),
+        // ── Phase B3: vars cross by sharing their root cell ──
+        Value::Var(p) => {
+            let var = p.get();
+            // The shared cell is kept in sync by `Var::bind` (promote-on-def).
+            // It is empty when the var is unbound *or* its current root is not
+            // promotable.  Distinguish the two: an unbound var may cross (it
+            // arrives unbound), but a var bound to a non-promotable value
+            // (closure / native resource) is explicitly isolate-local and is
+            // rejected here — a non-silent boundary error, not a silent drop.
+            let shared_empty = var.shared_root.load().is_none();
+            if shared_empty && var.is_bound() {
+                return Err(not_shareable("var"));
+            }
+            Ok(SerializedValue::Var {
+                namespace: var.namespace.clone(),
+                name: var.name.clone(),
+                is_macro: var.is_macro,
+                shared_root: var.shared_root.clone(),
+            })
+        }
         Value::Atom(_) => Err(not_shareable("atom")),
         Value::Volatile(_) => Err(not_shareable("volatile")),
         Value::Promise(_) => Err(not_shareable("promise")),
@@ -656,6 +703,17 @@ pub fn deserialize(sv: SerializedValue) -> Value {
         // Phase B3: cross-isolate shared references — clone the Arc.
         SerializedValue::SharedAtom(a) => Value::SharedAtom(a),
         SerializedValue::ByteBlob(b) => Value::ByteBlob(b),
+        SerializedValue::Var {
+            namespace,
+            name,
+            is_macro,
+            shared_root,
+        } => Value::Var(GcPtr::new(crate::types::Var::from_shared_root(
+            namespace,
+            name,
+            is_macro,
+            shared_root,
+        ))),
     }
 }
 
@@ -873,6 +931,90 @@ mod tests {
         ))))
         .unwrap();
         assert!(large.byte_size() > small.byte_size());
+    }
+
+    #[test]
+    fn var_with_promotable_root_roundtrips() {
+        use crate::types::Var;
+        // A var def'd with a promotable value crosses by value.
+        let var = Var::new("user", "answer");
+        var.bind(Value::Long(42));
+        let v = Value::Var(GcPtr::new(var));
+
+        let crossed = roundtrip(&v);
+        if let Value::Var(p) = crossed {
+            let got = p.get();
+            assert_eq!(got.namespace.as_ref(), "user");
+            assert_eq!(got.name.as_ref(), "answer");
+            // Observable by value on the receiving side.
+            assert_eq!(got.deref(), Some(Value::Long(42)));
+        } else {
+            panic!("expected a Var on the receiving side");
+        }
+    }
+
+    #[test]
+    fn var_keyword_root_preserves_identity() {
+        use crate::types::Var;
+        let var = Var::new("user", "k");
+        var.bind(Value::keyword(Keyword::qualified("ns", "kw")));
+        let v = Value::Var(GcPtr::new(var));
+
+        let crossed = roundtrip(&v);
+        let Value::Var(p) = crossed else {
+            panic!("expected Var")
+        };
+        // Keyword identity preserved through the intern table on demote.
+        assert_eq!(
+            p.get().deref(),
+            Some(Value::keyword(Keyword::qualified("ns", "kw")))
+        );
+    }
+
+    #[test]
+    fn var_shares_root_cell_across_boundary() {
+        use crate::types::Var;
+        // Both isolates point at the *same* shared root cell, so a write on the
+        // sending side is observable through the receiver's shared view.
+        let var = GcPtr::new(Var::new("user", "shared"));
+        var.get().bind(Value::Long(1));
+        let v = Value::Var(var.clone());
+
+        let Value::Var(recv) = roundtrip(&v) else {
+            panic!("expected Var")
+        };
+        assert_eq!(recv.get().deref_shared(), Some(Value::Long(1)));
+
+        // Sender re-defs through the same cell; receiver observes via the cell.
+        var.get().bind(Value::Long(2));
+        assert_eq!(recv.get().deref_shared(), Some(Value::Long(2)));
+    }
+
+    #[test]
+    fn var_with_nonpromotable_root_is_not_shareable() {
+        use crate::types::{Arity, NativeFn, Var};
+        // A var bound to a closure / native fn is explicitly isolate-local.
+        let var = Var::new("user", "f");
+        var.bind(Value::NativeFunction(GcPtr::new(NativeFn::new(
+            "f",
+            Arity::Fixed(0),
+            |_| Ok(Value::Nil),
+        ))));
+        let v = Value::Var(GcPtr::new(var));
+        assert!(matches!(
+            serialize(&v),
+            Err(CloneError::NotShareable { type_name: "var" })
+        ));
+    }
+
+    #[test]
+    fn unbound_var_crosses_as_unbound() {
+        use crate::types::Var;
+        let v = Value::Var(GcPtr::new(Var::new("user", "later")));
+        let Value::Var(p) = roundtrip(&v) else {
+            panic!("expected Var")
+        };
+        assert!(!p.get().is_bound());
     }
 
     #[test]
