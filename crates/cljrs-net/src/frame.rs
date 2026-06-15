@@ -65,7 +65,11 @@ const FRAMER_TAG: &str = "FramerSpec";
 pub enum FramerKind {
     Lines,
     Delimiter(u8),
-    LengthPrefixed { prefix_len: usize, big_endian: bool },
+    LengthPrefixed {
+        prefix_len: usize,
+        big_endian: bool,
+        max_frame: usize,
+    },
 }
 
 /// Native object that describes a framing algorithm. Created by `(lines)`,
@@ -187,6 +191,9 @@ impl Framer for DelimiterFramer {
 enum LpState {
     Header,
     Body(usize),
+    /// A frame exceeded `max_frame`; the stream is poisoned and further input
+    /// is discarded so the buffer cannot keep growing.
+    Errored,
 }
 
 /// Reads an N-byte big- or little-endian length header, then reads that many body
@@ -195,15 +202,17 @@ enum LpState {
 struct LengthPrefixedFramer {
     prefix_len: usize,
     big_endian: bool,
+    max_frame: usize,
     buf: Vec<u8>,
     state: LpState,
 }
 
 impl LengthPrefixedFramer {
-    fn new(prefix_len: usize, big_endian: bool) -> Self {
+    fn new(prefix_len: usize, big_endian: bool, max_frame: usize) -> Self {
         Self {
             prefix_len,
             big_endian,
+            max_frame,
             buf: Vec::new(),
             state: LpState::Header,
         }
@@ -227,6 +236,10 @@ impl LengthPrefixedFramer {
 impl Framer for LengthPrefixedFramer {
     fn feed(&mut self, bytes: &[u8]) -> Vec<Value> {
         let mut frames = Vec::new();
+        if self.state == LpState::Errored {
+            // Already past a protocol violation — drop input, don't buffer.
+            return frames;
+        }
         self.buf.extend_from_slice(bytes);
         loop {
             match self.state {
@@ -236,6 +249,16 @@ impl Framer for LengthPrefixedFramer {
                     }
                     let header: Vec<u8> = self.buf.drain(..self.prefix_len).collect();
                     let body_len = self.parse_length(&header);
+                    if body_len > self.max_frame {
+                        // Reject before allocating/accumulating the body.
+                        frames.push(frame_error(format!(
+                            "length-prefixed frame of {body_len} bytes exceeds max-frame limit ({} bytes)",
+                            self.max_frame
+                        )));
+                        self.buf = Vec::new();
+                        self.state = LpState::Errored;
+                        break;
+                    }
                     self.state = LpState::Body(body_len);
                 }
                 LpState::Body(body_len) => {
@@ -246,6 +269,7 @@ impl Framer for LengthPrefixedFramer {
                     frames.push(bytes_value(&body));
                     self.state = LpState::Header;
                 }
+                LpState::Errored => break,
             }
         }
         frames
@@ -285,7 +309,14 @@ fn get_bytes(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-fn parse_prefix_opts(opts: &MapValue) -> (usize, bool) {
+/// Default cap on a single length-prefixed frame body (16 MiB).  A length
+/// header declaring more than this is treated as a protocol violation rather
+/// than allocated, so a malicious peer cannot exhaust memory by sending a huge
+/// length prefix (and then dribbling or withholding the body).  Override per
+/// framer with the `:max-frame` option.
+const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
+
+fn parse_prefix_opts(opts: &MapValue) -> (usize, bool, usize) {
     let prefix_len = match opts.get(&kw("bytes")) {
         Some(Value::Long(n)) if n > 0 && n <= 8 => n as usize,
         _ => 4,
@@ -294,7 +325,11 @@ fn parse_prefix_opts(opts: &MapValue) -> (usize, bool) {
         .get(&kw("endian"))
         .map(|v| v != kw("little"))
         .unwrap_or(true);
-    (prefix_len, big_endian)
+    let max_frame = match opts.get(&kw("max-frame")) {
+        Some(Value::Long(n)) if n > 0 => n as usize,
+        _ => DEFAULT_MAX_FRAME,
+    };
+    (prefix_len, big_endian, max_frame)
 }
 
 // ── Framer async pipe task ─────────────────────────────────────────────────────
@@ -383,8 +418,10 @@ fn builtin_by_delimiter(args: &[Value]) -> ValueResult<Value> {
 /// `byte-array` of exactly that many bytes. Pass to `frame`.
 ///
 /// Options:
-///   `:bytes`  — prefix width in bytes: 1, 2, 4 (default), or 8
-///   `:endian` — `:big` (default) or `:little`
+///   `:bytes`     — prefix width in bytes: 1, 2, 4 (default), or 8
+///   `:endian`    — `:big` (default) or `:little`
+///   `:max-frame` — max body size in bytes (default 16 MiB); a header declaring
+///                  more is rejected as a protocol error instead of buffered
 fn builtin_length_prefixed(args: &[Value]) -> ValueResult<Value> {
     let opts = match args.first() {
         Some(Value::Map(m)) => m.clone(),
@@ -395,11 +432,12 @@ fn builtin_length_prefixed(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let (prefix_len, big_endian) = parse_prefix_opts(&opts);
+    let (prefix_len, big_endian, max_frame) = parse_prefix_opts(&opts);
     let spec = FramerSpec {
         kind: FramerKind::LengthPrefixed {
             prefix_len,
             big_endian,
+            max_frame,
         },
         out_buf: 8,
     };
@@ -492,7 +530,8 @@ fn builtin_frame(args: &[Value]) -> ValueResult<Value> {
                 FramerKind::LengthPrefixed {
                     prefix_len,
                     big_endian,
-                } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian)),
+                    max_frame,
+                } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian, max_frame)),
             };
 
             tokio::task::spawn_local(framer_task(in_chan, out_chan, framer));
@@ -539,9 +578,9 @@ fn builtin_length_prefixed_encode(args: &[Value]) -> ValueResult<Value> {
         }
     };
 
-    let (prefix_len, big_endian) = match args.get(1) {
+    let (prefix_len, big_endian, _max_frame) = match args.get(1) {
         Some(Value::Map(m)) => parse_prefix_opts(m),
-        None | Some(Value::Nil) => (4, true),
+        None | Some(Value::Nil) => (4, true, DEFAULT_MAX_FRAME),
         Some(other) => {
             return Err(ValueError::WrongType {
                 expected: "map {:bytes n :endian :big/:little}",
@@ -583,7 +622,8 @@ pub fn frame_channel(
         FramerKind::LengthPrefixed {
             prefix_len,
             big_endian,
-        } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian)),
+            max_frame,
+        } => Box::new(LengthPrefixedFramer::new(prefix_len, big_endian, max_frame)),
     };
     tokio::task::spawn_local(framer_task(in_chan, out_chan.clone(), framer));
     out_chan
@@ -612,4 +652,43 @@ pub fn encode_length_prefixed(data: &[u8], prefix_len: usize, big_endian: bool) 
     let mut result = header;
     result.extend_from_slice(data);
     bytes_value(&result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_of(frame: &Value) -> Vec<u8> {
+        match frame {
+            Value::ByteArray(arr) => arr.get().lock().unwrap().iter().map(|&b| b as u8).collect(),
+            other => panic!("expected byte-array frame, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn length_prefixed_decodes_frames() {
+        // 4-byte big-endian header of length 3, then the 3 body bytes.
+        let mut f = LengthPrefixedFramer::new(4, true, DEFAULT_MAX_FRAME);
+        let frames = f.feed(&[0, 0, 0, 3, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(body_of(&frames[0]), vec![0xAA, 0xBB, 0xCC]);
+        // Header and body split across two feeds still decodes once complete.
+        let mut g = LengthPrefixedFramer::new(4, true, DEFAULT_MAX_FRAME);
+        assert!(g.feed(&[0, 0, 0, 2, 0x01]).is_empty());
+        let frames = g.feed(&[0x02]);
+        assert_eq!(body_of(&frames[0]), vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn length_prefixed_rejects_oversized_frame_without_buffering() {
+        // max_frame = 16, but the header declares 256 bytes.
+        let mut f = LengthPrefixedFramer::new(4, true, 16);
+        let frames = f.feed(&[0, 0, 1, 0]); // 0x00000100 = 256 > 16
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0], Value::Error(_)), "expected an error frame");
+        // The framer is poisoned: further bytes are dropped, buffer never grows.
+        assert!(f.feed(&[0u8; 4096]).is_empty());
+        assert!(f.buf.is_empty(), "errored framer must not accumulate input");
+        assert!(f.state == LpState::Errored);
+    }
 }

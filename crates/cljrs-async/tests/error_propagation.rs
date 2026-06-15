@@ -37,10 +37,6 @@ fn eval_sync(src: &str, env: &mut Env) -> Value {
     result
 }
 
-fn pr(v: &Value) -> String {
-    format!("{v}")
-}
-
 fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()

@@ -84,7 +84,7 @@ mod tests {
         let b1 = barrier.clone();
         let h1 = Isolate::new("iso-a").spawn(move || async move {
             // Allocate some GC values
-            let _vals: Vec<_> = (0_i64..50).map(|i| cljrs_gc::GcPtr::new(i)).collect();
+            let _vals: Vec<_> = (0_i64..50).map(cljrs_gc::GcPtr::new).collect();
             b1.wait();
             // Isolate A's heap has exactly 50 objects
             assert_eq!(cljrs_gc::HEAP.count(), 50);
@@ -92,7 +92,7 @@ mod tests {
 
         let b2 = barrier.clone();
         let h2 = Isolate::new("iso-b").spawn(move || async move {
-            let _vals: Vec<_> = (0_i64..75).map(|i| cljrs_gc::GcPtr::new(i)).collect();
+            let _vals: Vec<_> = (0_i64..75).map(cljrs_gc::GcPtr::new).collect();
             b2.wait();
             // Isolate B's heap has exactly 75 objects — unaffected by A
             assert_eq!(cljrs_gc::HEAP.count(), 75);
