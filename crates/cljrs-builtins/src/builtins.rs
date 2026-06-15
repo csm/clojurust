@@ -3195,8 +3195,21 @@ fn builtin_cons(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
-    let idx = numeric_as_i64(&args[1])? as usize;
+    let raw = numeric_as_i64(&args[1])?;
     let default = args.get(2).cloned();
+    // A negative index is always out of range.  Handle it before the `as usize`
+    // cast so the seq paths below don't walk a (possibly infinite) lazy seq up
+    // to usize::MAX.  Matches Clojure: throw, or return the not-found default.
+    if raw < 0 {
+        return match default {
+            Some(d) => Ok(d),
+            None => Err(ValueError::IndexOutOfBounds {
+                idx: raw as usize,
+                count: 0,
+            }),
+        };
+    }
+    let idx = raw as usize;
     match &args[0].unwrap_meta() {
         Value::LazySeq(_) | Value::Cons(_) => {
             let mut iter = ValueIter::new(args[0].clone());

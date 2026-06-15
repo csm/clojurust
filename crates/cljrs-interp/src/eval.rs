@@ -631,6 +631,43 @@ mod tests {
         assert_eq!(eval_str("(try 42)").unwrap(), long(42));
     }
 
+    #[test]
+    fn test_finally_runs_and_value_is_discarded() {
+        // finally executes for its side effect, but the `try` value is the body's.
+        let v = eval_str("(let [a (atom 0)] (try 1 (finally (reset! a 5))) @a)").unwrap();
+        assert_eq!(v, long(5));
+        assert_eq!(eval_str("(try 1 (finally 2))").unwrap(), long(1));
+    }
+
+    #[test]
+    fn test_finally_runs_after_catch() {
+        let v = eval_str(
+            "(let [a (atom 0)]
+               (try (throw (ex-info \"x\" {})) (catch Exception e :caught)
+                 (finally (reset! a 9)))
+               @a)",
+        )
+        .unwrap();
+        assert_eq!(v, long(9));
+    }
+
+    #[test]
+    fn test_finally_exception_propagates() {
+        // An exception thrown from `finally` supersedes the body's result.
+        assert!(eval_str("(try 1 (finally (throw (ex-info \"boom\" {}))))").is_err());
+    }
+
+    #[test]
+    fn test_nth_negative_index() {
+        // Negative index returns the not-found default, or throws without one.
+        assert_eq!(eval_str("(= (nth [10 20 30] -1 :nf) :nf)").unwrap(), bool_v(true));
+        assert!(eval_str("(nth [10 20 30] -1)").is_err());
+        assert!(eval_str("(nth '(1 2 3) -1)").is_err());
+        // Crucially, must NOT hang walking an infinite lazy seq to usize::MAX.
+        assert_eq!(eval_str("(= (nth (range) -1 :nf) :nf)").unwrap(), bool_v(true));
+        assert_eq!(eval_str("(= (nth '(1 2 3) -1 :nf) :nf)").unwrap(), bool_v(true));
+    }
+
     // ── destructuring ─────────────────────────────────────────────────────
 
     #[test]

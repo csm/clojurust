@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn byte_size_counts_string_payload() {
         let small = serialize(&Value::string("hi")).unwrap();
-        let large = serialize(&Value::string(&"x".repeat(1000))).unwrap();
+        let large = serialize(&Value::string("x".repeat(1000))).unwrap();
         // Same variant, so the difference is the string payload (~998 bytes).
         assert!(large.byte_size() > small.byte_size() + 900);
     }
