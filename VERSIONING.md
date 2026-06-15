@@ -168,7 +168,7 @@ inventory entries under the same unversioned names).
 | Crate        | Responsibility |
 |--------------|----------------|
 | `cljrs-deps` | Parse `cljrs.edn`, `DepsConfig` / `Dependency` types, config discovery |
-| `cljrs-vcs`  | Pure-Rust (gitoxide) git helpers: `find_repo_root`, `get_file_at_commit`, `fetch_remote`, commit-hash validation, cache layout, native PGP/SSH commit-signature verification |
+| `cljrs-vcs`  | Pure-Rust (gitoxide) git helpers: `find_repo_root`, `get_file_at_commit`, `fetch_remote` (https/local; ssh via the optional `ssh` feature using `russh`), commit-hash validation, cache layout, native PGP/SSH commit-signature verification |
 
 ### Modified crates
 

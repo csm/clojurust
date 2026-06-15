@@ -105,6 +105,10 @@ ssh-key  = { version = "0.6", default-features = false, features = [
     "p256",
     "rsa",
 ] }
+# Native (pure-Rust) SSH transport for ssh:// git remotes (opt-in via the
+# `ssh` feature of cljrs-vcs).
+russh      = "0.61"
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"

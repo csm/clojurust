@@ -7,14 +7,18 @@
 //!
 //! Remote fetch/clone over the network is HTTPS-only and fully pure-Rust
 //! (rustls). Local filesystem paths and `file://` URLs are also supported
-//! (handled in-process). `ssh://`/scp-like remotes are rejected with a clear
-//! error; pure-Rust SSH transport is planned for a later phase.
+//! (handled in-process). `ssh://`/scp-like remotes are fetched natively (no
+//! `ssh` binary) when the optional `ssh` feature is enabled (see the `ssh`
+//! module); without it they are rejected with a clear error. Other schemes
+//! (`git://`, `http://`) are unsupported.
 
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 mod signature;
+#[cfg(feature = "ssh")]
+mod ssh;
 pub use signature::{TrustedKeyError, TrustedKeys};
 
 #[derive(Debug, Error)]
@@ -32,7 +36,7 @@ pub enum VcsError {
     #[error("no git repository found at or above {0:?}")]
     NoRepo(PathBuf),
     #[error(
-        "unsupported remote {0:?}: only https:// URLs and local paths are supported (ssh remotes are not yet supported)"
+        "unsupported remote {0:?}: supported are https:// URLs, local paths, and (with the `ssh` feature) ssh:// remotes"
     )]
     UnsupportedRemote(String),
     #[error("git error: {0}")]
@@ -125,8 +129,8 @@ fn url_slug(url: &str) -> String {
 
 /// Clone or fetch a git repository into the local cache.
 ///
-/// `url`  — an `https://` URL, a local filesystem path, or a `file://` URL
-///          (ssh remotes are not yet supported)
+/// `url`  — an `https://` URL, a local filesystem path, a `file://` URL, or
+///          (with the `ssh` feature) an `ssh://`/scp-like remote
 /// `sha`  — the commit SHA that must be reachable after the operation
 ///
 /// Returns the path to the bare repository in the cache.
@@ -134,18 +138,32 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
     if !is_valid_commit_hash(sha) {
         return Err(VcsError::InvalidCommit(sha.to_string()));
     }
-    if matches!(classify_remote(url), RemoteKind::Unsupported) {
+    let kind = classify_remote(url);
+    if matches!(kind, RemoteKind::Unsupported) {
+        return Err(VcsError::UnsupportedRemote(url.to_string()));
+    }
+    // ssh requires the optional `ssh` feature; without it, reject clearly.
+    #[cfg(not(feature = "ssh"))]
+    if matches!(kind, RemoteKind::Ssh) {
         return Err(VcsError::UnsupportedRemote(url.to_string()));
     }
 
     let repo_dir = cache_root().join(url_slug(url));
 
-    if repo_dir.exists() {
-        // Already cloned — fetch to make sure we have the requested commit.
-        fetch_existing(&repo_dir)?;
-    } else {
-        std::fs::create_dir_all(&repo_dir).map_err(VcsError::Io)?;
-        clone_bare(url, &repo_dir)?;
+    match kind {
+        #[cfg(feature = "ssh")]
+        RemoteKind::Ssh => ssh::fetch_into_cache(url, &repo_dir)?,
+        // https / local / file (and, without the `ssh` feature, nothing else
+        // reaches here).
+        _ => {
+            if repo_dir.exists() {
+                // Already cloned — fetch to make sure we have the requested commit.
+                fetch_existing(&repo_dir)?;
+            } else {
+                std::fs::create_dir_all(&repo_dir).map_err(VcsError::Io)?;
+                clone_bare(url, &repo_dir)?;
+            }
+        }
     }
 
     // Verify that the requested commit is now present locally.
@@ -161,24 +179,31 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
 enum RemoteKind {
     /// `https://` (pure-Rust network) or a local filesystem path / `file://`.
     Supported,
-    /// `ssh://`, scp-like `git@host:path`, `git://`, `http://`, etc.
+    /// `ssh://` or scp-like `git@host:path`. Fetched natively only with the
+    /// `ssh` feature; otherwise rejected.
+    Ssh,
+    /// `git://`, `http://`, or any other unsupported scheme.
     Unsupported,
 }
 
-/// Classify a remote URL. Network transport is HTTPS-only; local paths and
-/// `file://` are also supported (gitoxide handles them in-process). SSH and
-/// other network transports are rejected.
+/// Classify a remote URL. `https://` (network) plus local paths and `file://`
+/// are always supported (gitoxide handles them in-process). `ssh://` and
+/// scp-like `git@host:path` map to [`RemoteKind::Ssh`]. Other network schemes
+/// (`http://`, `git://`, …) are unsupported.
 fn classify_remote(url: &str) -> RemoteKind {
     if url.starts_with("https://") || url.starts_with("file://") {
         return RemoteKind::Supported;
     }
+    if url.starts_with("ssh://") {
+        return RemoteKind::Ssh;
+    }
     if url.contains("://") {
-        // An explicit non-https/file scheme (ssh://, git://, http://, …).
+        // An explicit non-https/file/ssh scheme (git://, http://, …).
         return RemoteKind::Unsupported;
     }
     // No scheme: an scp-like `user@host:path` is SSH; otherwise a local path.
     match url.split_once(':') {
-        Some((host, _)) if !host.is_empty() && !host.contains('/') => RemoteKind::Unsupported,
+        Some((host, _)) if !host.is_empty() && !host.contains('/') => RemoteKind::Ssh,
         _ => RemoteKind::Supported,
     }
 }
@@ -258,14 +283,23 @@ mod tests {
 
     #[test]
     fn remote_classification() {
-        let supported = |u| matches!(classify_remote(u), RemoteKind::Supported);
-        assert!(supported("https://github.com/u/r"));
-        assert!(supported("file:///tmp/repo"));
-        assert!(supported("/tmp/local/repo")); // absolute local path
-        assert!(supported("../relative/repo")); // relative local path
-        assert!(!supported("ssh://git@github.com/u/r"));
-        assert!(!supported("git@github.com:u/r.git")); // scp-like
-        assert!(!supported("git://github.com/u/r"));
-        assert!(!supported("http://github.com/u/r")); // insecure
+        use RemoteKind::*;
+        assert!(matches!(
+            classify_remote("https://github.com/u/r"),
+            Supported
+        ));
+        assert!(matches!(classify_remote("file:///tmp/repo"), Supported));
+        assert!(matches!(classify_remote("/tmp/local/repo"), Supported)); // absolute local path
+        assert!(matches!(classify_remote("../relative/repo"), Supported)); // relative local path
+        assert!(matches!(classify_remote("ssh://git@github.com/u/r"), Ssh));
+        assert!(matches!(classify_remote("git@github.com:u/r.git"), Ssh)); // scp-like
+        assert!(matches!(
+            classify_remote("git://github.com/u/r"),
+            Unsupported
+        ));
+        assert!(matches!(
+            classify_remote("http://github.com/u/r"),
+            Unsupported
+        )); // insecure
     }
 }

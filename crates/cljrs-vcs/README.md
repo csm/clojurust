@@ -17,10 +17,16 @@ is no fallback to the user's GPG keyring or SSH `allowed_signers`).
 
 Remote fetch/clone over the network is HTTPS-only and fully pure-Rust (rustls);
 local filesystem paths and `file://` URLs are also supported. `ssh://`/scp-like
-remotes are rejected with a clear error — pure-Rust SSH transport is planned for
-a later phase. `fetch_remote` is called by `cljrs deps fetch`;
-`cache_path_for_url` is used by `cljrs deps status` to check cache presence
-without network access.
+remotes are supported natively when the optional **`ssh` feature** is enabled
+(see below); without it they are rejected with a clear error. `fetch_remote` is
+called by `cljrs deps fetch`; `cache_path_for_url` is used by `cljrs deps
+status` to check cache presence without network access.
+
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `ssh`   | off     | Native pure-Rust SSH transport (`russh`) for `ssh://`/scp-like remotes. Host keys are verified against `~/.ssh/known_hosts`; authentication is via a running ssh-agent (`$SSH_AUTH_SOCK`). The `cljrs` binary enables this. |
 
 [`gix`]: https://docs.rs/gix
 [`TrustedKeys`]: src/signature.rs
@@ -31,6 +37,7 @@ without network access.
 |------|-------------|
 | `src/lib.rs` | Public functions, `VcsError`, and the `gix`-backed git operations |
 | `src/signature.rs` | Native PGP/SSH commit-signature verification and the `TrustedKeys` set |
+| `src/ssh.rs` | Native SSH transport (`ssh` feature): `russh` + gitoxide's `git::Connection`, known_hosts host-key checks, ssh-agent auth |
 | `tests/versioning_harness.rs` | Integration test harness — two-repo fixture (library + app) plus a natively SSH-signed commit, covering all versioned-symbol resolution cases |
 
 ## Public API
