@@ -6,38 +6,6 @@
 
 use crate::config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcParked};
 
-/// A guard that marks the current thread as cancellable.
-///
-/// When dropped, the thread is marked as no longer cancellable.
-/// This allows the GC to know which threads are safe to interrupt.
-#[derive(Default)]
-pub struct CancellableGuard {
-    cancelled: bool,
-}
-
-impl CancellableGuard {
-    /// Create a new cancellable guard.
-    pub fn new() -> Self {
-        Self { cancelled: false }
-    }
-
-    /// Check if this guard has been cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-    }
-
-    /// Mark this guard as cancelled.
-    pub fn set_cancelled(&mut self) {
-        self.cancelled = true;
-    }
-}
-
-impl Drop for CancellableGuard {
-    fn drop(&mut self) {
-        // Guard is automatically removed from the cancellable set
-    }
-}
-
 /// Check if the current operation should be cancelled due to GC.
 ///
 /// This function checks the global GC cancellation flag. If a GC is in
@@ -145,14 +113,6 @@ impl Drop for StwGuard {
     fn drop(&mut self) {
         CONFIG_CANCELLATION.set_in_progress(false);
     }
-}
-
-/// A helper that wraps a function with cancellation checking.
-pub fn with_cancellation_check<T, E: std::fmt::Debug>(
-    f: impl FnOnce() -> Result<T, E>,
-) -> Result<T, GcParked> {
-    check_cancellation()?;
-    f().map_err(|_| GcParked)
 }
 
 /// Mark the current thread as parked during GC.

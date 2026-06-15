@@ -24,9 +24,9 @@ pub use stats::{CLJRS_GC_STATS_ENV, GC_STATS, GcStats, GcStatsSnapshot, dump_sta
 
 #[cfg(not(feature = "no-gc"))]
 pub use cancellation::{
-    CancellableGuard, MutatorGuard, StwGuard, begin_stw, check_cancellation, gc_requested,
-    park_thread, register_mutator, registered_threads, request_gc, safepoint, take_gc_request,
-    unpark_thread, wait_for_threads_to_park,
+    MutatorGuard, StwGuard, begin_stw, check_cancellation, gc_requested, park_thread,
+    register_mutator, registered_threads, request_gc, safepoint, take_gc_request, unpark_thread,
+    wait_for_threads_to_park,
 };
 #[cfg(not(feature = "no-gc"))]
 pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
@@ -37,10 +37,10 @@ pub use gc_full::{
 };
 #[cfg(feature = "no-gc")]
 pub use nogc_stubs::{
-    AllocRootGuard, CONFIG_CANCELLATION, CancellableGuard, GcConfig, GcHeap, GcParked, HEAP,
-    MutatorGuard, StwGuard, begin_stw, check_cancellation, gc_requested, park_thread,
-    push_alloc_frame, register_mutator, registered_threads, request_gc, safepoint, take_gc_request,
-    unpark_thread, wait_for_threads_to_park,
+    AllocRootGuard, CONFIG_CANCELLATION, GcConfig, GcHeap, GcParked, HEAP, MutatorGuard, StwGuard,
+    begin_stw, check_cancellation, gc_requested, park_thread, push_alloc_frame, register_mutator,
+    registered_threads, request_gc, safepoint, take_gc_request, unpark_thread,
+    wait_for_threads_to_park,
 };
 
 /// Return `true` if `addr` was allocated by the global `StaticArena`.
@@ -555,6 +555,25 @@ mod gc_full {
         }
     }
 
+    /// Parse a megabyte limit from a (raw) environment value into a byte count,
+    /// falling back to `default` (and warning) on malformed input rather than
+    /// panicking on user misconfiguration. `value` is `None` when the variable
+    /// is unset. Saturates instead of overflowing on absurdly large values.
+    pub(crate) fn parse_limit_mb(var: &str, value: Option<&str>, default: usize) -> usize {
+        match value {
+            Some(s) => match s.trim().parse::<usize>() {
+                Ok(mb) => mb.saturating_mul(1024 * 1024),
+                Err(_) => {
+                    eprintln!(
+                        "[gc] warning: ignoring invalid {var}={s:?} (expected a number of megabytes)"
+                    );
+                    default
+                }
+            },
+            None => default,
+        }
+    }
+
     impl GcHeap {
         pub const fn new() -> Self {
             Self {
@@ -579,14 +598,16 @@ mod gc_full {
             #[cfg(target_arch = "wasm32")]
             let default_soft_limit: usize = 64 * 1024 * 1024;
 
-            let soft_limit_mb: usize = match std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok() {
-                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
-                None => default_soft_limit,
-            };
-            let hard_limit_mb: usize = match std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok() {
-                Some(s) => s.parse::<usize>().unwrap() * (1024 * 1024),
-                None => soft_limit_mb,
-            };
+            let soft_limit_mb = parse_limit_mb(
+                "CLJRS_GC_SOFT_LIMIT_MB",
+                std::env::var("CLJRS_GC_SOFT_LIMIT_MB").ok().as_deref(),
+                default_soft_limit,
+            );
+            let hard_limit_mb = parse_limit_mb(
+                "CLJRS_GC_HARD_LIMIT_MB",
+                std::env::var("CLJRS_GC_HARD_LIMIT_MB").ok().as_deref(),
+                soft_limit_mb,
+            );
             self.set_config(Arc::new(GcConfig::with_limits(
                 soft_limit_mb,
                 hard_limit_mb,
@@ -978,7 +999,6 @@ mod nogc_stubs {
         fn drop(&mut self) {}
     }
     pub struct GcParked;
-    pub struct CancellableGuard;
 
     pub struct GcCancellationStub;
     impl GcCancellationStub {
@@ -1079,6 +1099,28 @@ mod tests {
         let p = heap.alloc(99i64);
         let q = p.clone();
         assert!(GcPtr::ptr_eq(&p, &q));
+    }
+
+    #[test]
+    fn parse_limit_mb_handles_valid_unset_and_malformed() {
+        // Valid: converts megabytes to bytes.
+        assert_eq!(gc_full::parse_limit_mb("X", Some("4"), 7), 4 * 1024 * 1024);
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            gc_full::parse_limit_mb("X", Some(" 4 "), 7),
+            4 * 1024 * 1024
+        );
+        // Unset: falls back to the default.
+        assert_eq!(gc_full::parse_limit_mb("X", None, 7), 7);
+        // Malformed must NOT panic — it falls back to the default.
+        assert_eq!(gc_full::parse_limit_mb("X", Some("foo"), 7), 7);
+        assert_eq!(gc_full::parse_limit_mb("X", Some(""), 7), 7);
+        assert_eq!(gc_full::parse_limit_mb("X", Some("-1"), 7), 7);
+        // Absurdly large value saturates rather than overflowing.
+        assert_eq!(
+            gc_full::parse_limit_mb("X", Some(&usize::MAX.to_string()), 7),
+            usize::MAX
+        );
     }
 
     #[test]

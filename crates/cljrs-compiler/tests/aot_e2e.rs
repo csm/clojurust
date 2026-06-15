@@ -397,6 +397,25 @@ fn test_vector_ops() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_vector_get_index() {
+    // Exercises the `rt_get` vector-indexing path: an in-range index returns
+    // the element; out-of-range (including negative) returns nil, matching
+    // Clojure's `get` semantics.
+    assert_output(
+        "vector_get_index",
+        r#"
+(let [v [10 20 30]]
+  (println (get v 0))
+  (println (get v 2))
+  (println (get v 3))
+  (println (get v -1)))
+"#,
+        "10\n30\nnil\nnil",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_map_ops() {
     assert_output(
         "map_ops",
