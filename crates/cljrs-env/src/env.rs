@@ -114,7 +114,9 @@ pub struct GlobalEnv {
     pub verify_commit_signatures: AtomicBool,
     /// Public keys trusted to sign versioned dependency commits, built from
     /// the `:trusted-signers` config.  Consulted by `check_commit_signature`
-    /// when `verify_commit_signatures` is on.
+    /// when `verify_commit_signatures` is on.  (Not built on wasm, where
+    /// `cljrs-vcs` is unavailable and signature checks are no-ops.)
+    #[cfg(not(target_arch = "wasm32"))]
     pub trusted_keys: RwLock<Arc<cljrs_vcs::TrustedKeys>>,
     /// Session-scoped cache of commits that have already passed signature
     /// verification this run, keyed by `(repo_root, commit_hash)`.
@@ -183,6 +185,7 @@ impl GlobalEnv {
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
             trusted_keys: RwLock::new(Arc::new(cljrs_vcs::TrustedKeys::new())),
             sig_verify_cache: Mutex::new(HashSet::new()),
             versioned_sources: RwLock::new(HashMap::new()),
@@ -548,7 +551,8 @@ impl GlobalEnv {
     /// install it, so subsequent `check_commit_signature` calls verify against
     /// it.  Inline keys are parsed directly; `File` entries are read from disk.
     /// Returns the number of keys loaded; warns (to stderr) on any key that
-    /// fails to load rather than aborting.
+    /// fails to load rather than aborting.  (Not available on wasm.)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_trusted_signers(&self, config: &cljrs_deps::DepsConfig) -> usize {
         let mut keys = cljrs_vcs::TrustedKeys::new();
         let mut loaded = 0usize;
