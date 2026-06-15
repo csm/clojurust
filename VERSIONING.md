@@ -108,8 +108,9 @@ name.  The produced binary is **self-contained**:
 - the harness sets `versioned_offline`, so a versioned namespace that was not
   embedded fails with a clear error instead of attempting a fetch;
 - a bad pin (missing commit, failed signature check) fails the *compile*;
-- `--verify-commit-signatures` runs `git verify-commit` at compile time — the
-  binary trusts its embedded sources.
+- `--verify-commit-signatures` verifies signatures natively (against the
+  `:trusted-signers` keys) at compile time — the binary trusts its embedded
+  sources.
 
 ---
 
@@ -167,7 +168,7 @@ inventory entries under the same unversioned names).
 | Crate        | Responsibility |
 |--------------|----------------|
 | `cljrs-deps` | Parse `cljrs.edn`, `DepsConfig` / `Dependency` types, config discovery |
-| `cljrs-vcs`  | Git subprocess helpers: `find_repo_root`, `get_file_at_commit`, commit-hash validation, cache layout |
+| `cljrs-vcs`  | Pure-Rust (gitoxide) git helpers: `find_repo_root`, `get_file_at_commit`, `fetch_remote`, commit-hash validation, cache layout, native PGP/SSH commit-signature verification |
 
 ### Modified crates
 
@@ -187,7 +188,7 @@ inventory entries under the same unversioned names).
 | # | Phase | Crate(s) touched | Status |
 |---|-------|------------------|--------|
 | 1 | `cljrs-deps` crate — config types and `cljrs.edn` parser | `cljrs-deps` (new) | ✅ Done |
-| 2 | `cljrs-vcs` crate — git subprocess helpers | `cljrs-vcs` (new) | ✅ Done |
+| 2 | `cljrs-vcs` crate — pure-Rust (gitoxide) git helpers | `cljrs-vcs` (new) | ✅ Done |
 | 3 | `Symbol.version`, `Namespace` git fields | `cljrs-value` | ✅ Done |
 | 4 | Lexer `@hash` recognition | `cljrs-reader` | ✅ Done |
 | 5 | `RequireSpec.version`, `GlobalEnv` version cache, `Env.versioned_eval_commit` | `cljrs-env` | ✅ Done |

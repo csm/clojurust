@@ -35,9 +35,19 @@ pub struct DepsConfig {
     pub deps:                     Vec<(Arc<str>, Dependency)>,
     pub aliases:                  Vec<(Arc<str>, Alias)>,
     pub verify_commit_signatures: bool,
+    pub trusted_signers:          Vec<TrustedSigner>,  // :trusted-signers — keys allowed
+                                         // to sign versioned dependency commits
     pub enforce_native_versions:  bool,  // :enforce-native-versions — pinned-native
                                          // provenance mismatches error instead of warning
     pub rust:                     Option<RustConfig>,
+}
+
+/// A trusted commit signer from `:trusted-signers`: an inline public key
+/// (armored PGP or OpenSSH) or a path to a key file resolved relative to
+/// `cljrs.edn`.
+pub enum TrustedSigner {
+    Inline(String),
+    File(PathBuf),
 }
 
 /// Rust-crate configuration for mixed Rust/Clojure projects.

@@ -90,6 +90,22 @@ arc-swap     = "1"
 tower-lsp     = "0.20"
 dashmap       = "6"
 
+# Pure-Rust git (gitoxide) + native commit-signature verification
+gix      = { version = "0.84", default-features = false, features = [
+    "sha1",
+    "max-performance-safe",
+    "blocking-http-transport-reqwest-rust-tls",
+    "revision",
+    "worktree-mutation",
+] }
+pgp      = "0.19"
+ssh-key  = { version = "0.6", default-features = false, features = [
+    "alloc",
+    "ed25519",
+    "p256",
+    "rsa",
+] }
+
 # Cranelift compiler backend (all crates must be at the same version)
 cranelift-codegen  = "0.129.1"
 cranelift-frontend = "0.129.1"

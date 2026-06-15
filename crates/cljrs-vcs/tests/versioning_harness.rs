@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cljrs_vcs::{
-    VcsError, find_repo_root, get_file_at_commit, is_valid_commit_hash, verify_commit_signature,
+    TrustedKeys, VcsError, find_repo_root, get_file_at_commit, is_valid_commit_hash,
+    verify_commit_signature,
 };
 
 // ---------------------------------------------------------------------------
@@ -170,104 +171,84 @@ fn setup_app(lib: &LibraryRepo) -> AppRepo {
 }
 
 // ---------------------------------------------------------------------------
-// GPG signing fixture
+// Native SSH signing fixture
 // ---------------------------------------------------------------------------
 
-struct GpgSetup {
-    // Keeps the temp GNUPGHOME dir alive.
-    _homedir: tempfile::TempDir,
-    pub fingerprint: String,
-    /// Shell wrapper that calls `gpg --homedir <homedir>` so any git subprocess
-    /// that invokes gpg will use our test keyring.
-    pub wrapper_path: PathBuf,
+// A static Ed25519 keypair (generated once with `ssh-key`) used to produce a
+// natively SSH-signed commit. No external `gpg`/`ssh-keygen` is involved.
+const TEST_SSH_PRIVATE: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBmFUP3SDH5k28ErT2na8g4asrcsI4STLcmDImAF0WjDwAAAIiFW+7uhVvu
+7gAAAAtzc2gtZWQyNTUxOQAAACBmFUP3SDH5k28ErT2na8g4asrcsI4STLcmDImAF0WjDw
+AAAEAgsZE1vrnYoatnjRDx6BGE9PeOViG9mgDVkCbPj8unnmYVQ/dIMfmTbwStPadryDhq
+ytywjhJMtyYMiYAXRaMPAAAAAAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+";
+const TEST_SSH_PUBLIC: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGYVQ/dIMfmTbwStPadryDhqytywjhJMtyYMiYAXRaMP cljrs-test";
+
+/// Sign `payload` with the static SSH key under git's "git" namespace, returning
+/// the armored SSHSIG block.
+fn ssh_sign(payload: &[u8]) -> String {
+    let key = ssh_key::PrivateKey::from_openssh(TEST_SSH_PRIVATE).expect("parse private key");
+    let sig = ssh_key::SshSig::sign(&key, "git", ssh_key::HashAlg::Sha512, payload).expect("sign");
+    sig.to_pem(ssh_key::LineEnding::LF)
+        .expect("pem")
+        .to_string()
 }
 
-/// Generates a temporary ed25519 GPG key in an isolated homedir and returns a
-/// wrapper script that points gpg at that homedir.
-///
-/// Returns `None` when gpg is absent or key generation fails — callers should
-/// skip the test gracefully in that case.
-fn setup_gpg() -> Option<GpgSetup> {
-    Command::new("gpg")
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+/// Build a raw commit object embedding `armored_sig` in the `gpgsig` header.
+/// `payload` is the no-signature commit text.
+fn embed_gpgsig(payload: &[u8], armored_sig: &str) -> Vec<u8> {
+    let split = payload
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .expect("payload has a header/message separator");
+    let headers = &payload[..=split];
+    let message = &payload[split + 1..];
 
-    let homedir = tempfile::TempDir::new().ok()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(homedir.path(), std::fs::Permissions::from_mode(0o700)).ok()?;
+    let mut out = Vec::new();
+    out.extend_from_slice(headers);
+    out.extend_from_slice(b"gpgsig ");
+    for (i, line) in armored_sig.lines().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+            out.push(b' ');
+        }
+        out.extend_from_slice(line.as_bytes());
     }
+    out.push(b'\n');
+    out.extend_from_slice(message);
+    out
+}
 
-    let params_file = homedir.path().join("key-params");
-    std::fs::write(
-        &params_file,
-        "%no-protection\n\
-         Key-Type: EdDSA\n\
-         Key-Curve: ed25519\n\
-         Name-Real: Test Signer\n\
-         Name-Email: test@example.com\n\
-         Expire-Date: 0\n\
-         %commit\n",
-    )
-    .ok()?;
-
-    let out = Command::new("gpg")
-        .env("GNUPGHOME", homedir.path())
-        .args(["--batch", "--gen-key"])
-        .arg(&params_file)
-        .output()
-        .ok()?;
-
-    if !out.status.success() {
-        eprintln!(
-            "gpg key generation failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
-
-    // Extract the fingerprint from `gpg --list-secret-keys --with-colons`.
-    let list_out = Command::new("gpg")
-        .env("GNUPGHOME", homedir.path())
-        .args(["--list-secret-keys", "--with-colons"])
-        .output()
-        .ok()?;
-    let list_str = String::from_utf8(list_out.stdout).ok()?;
-    let fingerprint = list_str
-        .lines()
-        .find(|l| l.starts_with("fpr:"))?
-        .split(':')
-        .nth(9)?
-        .to_string();
-
-    // A wrapper script that invokes gpg with our isolated homedir.
-    // Git's `gpg.program` config will point at this script, so both
-    // `git commit -S` and `git verify-commit` use the test keyring.
-    let wrapper_path = homedir.path().join("gpg-wrapper.sh");
-    std::fs::write(
-        &wrapper_path,
-        format!(
-            "#!/bin/sh\nexec gpg --homedir '{}' \"$@\"\n",
-            homedir.path().display()
-        ),
-    )
-    .ok()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755)).ok()?;
-    }
-
-    Some(GpgSetup {
-        _homedir: homedir,
-        fingerprint,
-        wrapper_path,
-    })
+/// Write a raw object of type `kind` into `dir`'s object store via
+/// `git hash-object -w` (used only to store the fixture; signing/verifying is
+/// native). Returns the object's SHA.
+fn git_write_object(dir: &Path, kind: &str, bytes: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "-w", "-t", kind, "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git hash-object");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bytes)
+        .expect("write object to git");
+    let out = child.wait_with_output().expect("git hash-object");
+    assert!(
+        out.status.success(),
+        "git hash-object failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 // ===========================================================================
@@ -410,90 +391,58 @@ fn test_path_not_found_at_commit() {
 fn test_signature_verification_negative() {
     let lib = setup_library();
 
-    let result = verify_commit_signature(&lib.root, &lib.commit_v2);
+    let result = verify_commit_signature(&lib.root, &lib.commit_v2, &TrustedKeys::new());
 
     assert!(result.is_err(), "unsigned commit should fail verification");
     match result {
-        Err(VcsError::SignatureVerificationFailed { commit, .. }) => {
+        Err(VcsError::SignatureVerificationFailed { commit, reason }) => {
             assert_eq!(commit, lib.commit_v2);
+            assert!(reason.contains("not signed"), "reason: {reason}");
         }
         Err(other) => panic!("expected SignatureVerificationFailed, got {other}"),
         Ok(()) => panic!("expected Err, got Ok"),
     }
 }
 
-/// Positive: `verify_commit_signature` succeeds on a commit signed with a
-/// GPG key that git can verify through its `gpg.program` configuration.
-///
-/// This test is skipped automatically when gpg is unavailable or key
-/// generation fails (e.g. restricted CI environments).
+/// Positive: `verify_commit_signature` succeeds on a commit natively signed with
+/// an SSH key, when that key is present in the trusted set. The signed commit
+/// object is constructed and signed in-process (no `gpg`/`ssh-keygen`); git is
+/// used only to store the object in the repository.
 #[test]
 fn test_signature_verification_positive() {
-    let gpg = match setup_gpg() {
-        Some(g) => g,
-        None => {
-            eprintln!("SKIP test_signature_verification_positive: gpg setup unavailable");
-            return;
-        }
-    };
-
-    // A fresh repo so we can configure gpg.program locally without touching
-    // the library or app fixtures.
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
-
     git_ok(&root, &["init", "-b", "main"]);
-    git_ok(&root, &["config", "user.email", "test@example.com"]);
-    git_ok(&root, &["config", "user.name", "Test Signer"]);
-    git_ok(&root, &["config", "commit.gpgsign", "false"]);
-    git_ok(&root, &["config", "user.signingkey", &gpg.fingerprint]);
-    // Point gpg.program at the wrapper so both `git commit -S` and
-    // `git verify-commit` use the isolated test keyring.
-    git_ok(
-        &root,
-        &["config", "gpg.program", gpg.wrapper_path.to_str().unwrap()],
+
+    // Store an empty tree so the commit object references a real object.
+    let tree = git_write_object(&root, "tree", b"");
+
+    let payload = format!(
+        "tree {tree}\n\
+         author Test <test@example.com> 0 +0000\n\
+         committer Test <test@example.com> 0 +0000\n\
+         \n\
+         signed commit\n"
     );
+    let sig = ssh_sign(payload.as_bytes());
+    let raw = embed_gpgsig(payload.as_bytes(), &sig);
+    let signed_sha = git_write_object(&root, "commit", &raw);
 
-    std::fs::write(root.join("signed.txt"), "signed content\n").unwrap();
-    git_ok(&root, &["add", "signed.txt"]);
+    let mut trusted = TrustedKeys::new();
+    trusted.add_ssh_openssh(TEST_SSH_PUBLIC).unwrap();
 
-    // Create a signed commit.  -S forces signing regardless of gpg.program config.
-    let sign_out = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args([
-            "-c",
-            "commit.gpgsign=true",
-            "commit",
-            "-S",
-            "-m",
-            "signed commit",
-        ])
-        .env("GIT_AUTHOR_NAME", "Test Signer")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test Signer")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("git commit -S failed to start");
-
-    if !sign_out.status.success() {
-        eprintln!(
-            "SKIP test_signature_verification_positive: signed commit failed: {}",
-            String::from_utf8_lossy(&sign_out.stderr)
-        );
-        return;
-    }
-
-    let signed_sha = git_sha(&root, "HEAD");
-
-    // verify_commit_signature calls `git verify-commit` which picks up
-    // gpg.program from the repo's local config and uses our test keyring.
-    let result = verify_commit_signature(&root, &signed_sha);
+    let result = verify_commit_signature(&root, &signed_sha, &trusted);
     assert!(
         result.is_ok(),
-        "GPG-signed commit should verify successfully; got: {:?}",
+        "SSH-signed commit should verify; got: {:?}",
         result.err()
+    );
+
+    // The same commit must fail when the signing key is not trusted.
+    let untrusted = verify_commit_signature(&root, &signed_sha, &TrustedKeys::new());
+    assert!(
+        matches!(untrusted, Err(VcsError::SignatureVerificationFailed { .. })),
+        "empty trust set must reject; got {untrusted:?}"
     );
 }
 

@@ -199,38 +199,49 @@ fn build_pinned_wrapper(git: &GitDep, commit: &str) -> Result<PathBuf, String> {
     Ok(artifact)
 }
 
-/// Clone the bare cache repo into a working checkout at `commit`.
+/// Materialize the pinned commit's tree into a working checkout (no `.git`).
 fn checkout_at(bare: &Path, crate_name: &str, commit: &str) -> Result<PathBuf, String> {
     let dest = dylib_cache_root()
         .join("checkouts")
         .join(format!("{crate_name}@{commit}"));
-    if dest.join(".git").exists() {
+    // Sentinel marking a previously completed checkout (the worktree has no
+    // `.git`, so we can't probe for one).
+    let sentinel = dest.join(".cljrs-checkout-complete");
+    if sentinel.exists() {
         return Ok(dest);
     }
-    std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
-    let ok = std::process::Command::new("git")
-        .arg("clone")
-        .arg("--quiet")
-        .arg(bare)
-        .arg(&dest)
-        .status()
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+    // Resolve the pinned commit to its tree and check that tree out into `dest`
+    // with gitoxide — just the files needed to build the crate.
+    let repo = gix::open(bare).map_err(|e| format!("open {}: {e}", bare.display()))?;
+    let tree = repo
+        .rev_parse_single(commit)
+        .map_err(|e| format!("resolve {commit}: {e}"))?
+        .object()
         .map_err(|e| e.to_string())?
-        .success();
-    if !ok {
-        return Err(format!("git clone of {} failed", bare.display()));
-    }
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&dest)
-        .arg("checkout")
-        .arg("--quiet")
-        .arg(commit)
-        .status()
-        .map_err(|e| e.to_string())?
-        .success();
-    if !ok {
-        return Err(format!("git checkout {commit} failed"));
-    }
+        .peel_to_tree()
+        .map_err(|e| format!("peel {commit} to tree: {e}"))?;
+    let mut index = repo
+        .index_from_tree(&tree.id)
+        .map_err(|e| format!("index from tree: {e}"))?;
+    let opts = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| e.to_string())?;
+    let odb = repo.objects.clone().into_arc().map_err(|e| e.to_string())?;
+    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+    gix::worktree::state::checkout(
+        &mut index,
+        &dest,
+        odb,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &should_interrupt,
+        opts,
+    )
+    .map_err(|e| format!("checkout {commit} into {}: {e}", dest.display()))?;
+
+    std::fs::write(&sentinel, commit.as_bytes()).map_err(|e| e.to_string())?;
     Ok(dest)
 }
 

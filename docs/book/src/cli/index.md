@@ -68,9 +68,10 @@ cljrs --gc-stats gc.log run my-program.cljrs # stats to file
 
 ### `--verify-commit-signatures`
 
-Require valid GPG or SSH signatures on every versioned commit before executing
-historical code. Off by default. Can also be enabled per-project in `cljrs.edn`
-via `:verify-commit-signatures true`.
+Require valid PGP or SSH signatures on every versioned commit before executing
+historical code. Verification is native (no `git`/`gpg` subprocess) and checks
+the signature against the keys listed in `:trusted-signers`. Off by default. Can
+also be enabled per-project in `cljrs.edn` via `:verify-commit-signatures true`.
 
 ## Project configuration: `cljrs.edn`
 

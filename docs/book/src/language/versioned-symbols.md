@@ -128,8 +128,11 @@ error: dependency 'my.lib' is not cached locally.
 
 When `--verify-commit-signatures` is passed on the CLI (or
 `:verify-commit-signatures true` is set in `cljrs.edn`), clojurust verifies
-that every accessed versioned commit carries a valid GPG or SSH signature
-before executing its code.
+that every accessed versioned commit carries a valid PGP or SSH signature
+before executing its code. Verification is native (no `git`/`gpg`/`ssh-keygen`
+subprocess): the signature must be made by a key listed in the project's
+`:trusted-signers`. With verification on but no trusted signers configured, no
+commit can be verified and resolution fails closed.
 
 ## Notes
 

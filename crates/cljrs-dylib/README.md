@@ -51,8 +51,9 @@ pub const INIT_SYMBOL: &[u8];  // b"cljrs_dylib_init\0"
    native function.
 2. The loader finds a `:rust/load :dylib` git dep covering the namespace
    (exact or dotted-prefix match) with a `:rust/init` function.
-3. `cljrs_vcs::fetch_remote` + checkout at the pinned commit
-   (`~/.cljrs/cache/dylibs/checkouts/<crate>@<commit>`).
+3. `cljrs_vcs::fetch_remote` + a gitoxide worktree checkout of the pinned
+   commit's tree (`~/.cljrs/cache/dylibs/checkouts/<crate>@<commit>`, no
+   `.git`; a `.cljrs-checkout-complete` sentinel marks a finished checkout).
 4. A wrapper cdylib crate is generated
    (`~/.cljrs/cache/dylibs/<crate>@<commit>/fp-<hash>/`), pinning the same
    `cljrs-interop` as the host (local checkout path when found —

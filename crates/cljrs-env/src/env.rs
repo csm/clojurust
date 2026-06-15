@@ -106,11 +106,16 @@ pub struct GlobalEnv {
     pub version_cache: Mutex<HashMap<Arc<str>, Value>>,
     /// Parsed `cljrs.edn` config, loaded once at startup.
     pub deps_config: RwLock<Option<Arc<cljrs_deps::DepsConfig>>>,
-    /// When true, every versioned-symbol or versioned-namespace resolution
-    /// must pass `git verify-commit` before the historical code is executed.
-    /// Off by default; enabled via `--verify-commit-signatures` CLI flag or
-    /// `:verify-commit-signatures true` in `cljrs.edn`.
+    /// When true, every versioned-symbol or versioned-namespace resolution must
+    /// carry a valid commit signature (verified natively against `trusted_keys`)
+    /// before the historical code is executed.  Off by default; enabled via
+    /// `--verify-commit-signatures` CLI flag or `:verify-commit-signatures true`
+    /// in `cljrs.edn`.
     pub verify_commit_signatures: AtomicBool,
+    /// Public keys trusted to sign versioned dependency commits, built from
+    /// the `:trusted-signers` config.  Consulted by `check_commit_signature`
+    /// when `verify_commit_signatures` is on.
+    pub trusted_keys: RwLock<Arc<cljrs_vcs::TrustedKeys>>,
     /// Session-scoped cache of commits that have already passed signature
     /// verification this run, keyed by `(repo_root, commit_hash)`.
     pub sig_verify_cache: Mutex<HashSet<(Arc<str>, Arc<str>)>>,
@@ -178,6 +183,7 @@ impl GlobalEnv {
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
+            trusted_keys: RwLock::new(Arc::new(cljrs_vcs::TrustedKeys::new())),
             sig_verify_cache: Mutex::new(HashSet::new()),
             versioned_sources: RwLock::new(HashMap::new()),
             versioned_offline: AtomicBool::new(false),
@@ -524,21 +530,49 @@ impl GlobalEnv {
             if self.sig_verify_cache.lock().unwrap().contains(&key) {
                 return Ok(());
             }
-            cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit).map_err(
-                |e| match e {
-                    cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
-                        crate::error::EvalError::CommitSignatureVerificationFailed {
-                            commit: c,
-                            reason,
-                        }
-                    }
-                    other => crate::error::EvalError::Runtime(format!("{other}")),
-                },
-            )?;
+            let trusted = self.trusted_keys.read().unwrap().clone();
+            cljrs_vcs::verify_commit_signature(std::path::Path::new(repo_root), commit, &trusted)
+                .map_err(|e| match e {
+                cljrs_vcs::VcsError::SignatureVerificationFailed { commit: c, reason } => {
+                    crate::error::EvalError::CommitSignatureVerificationFailed { commit: c, reason }
+                }
+                other => crate::error::EvalError::Runtime(format!("{other}")),
+            })?;
             self.sig_verify_cache.lock().unwrap().insert(key);
         }
         let _ = (repo_root, commit);
         Ok(())
+    }
+
+    /// Build the trusted-signer key set from a parsed `cljrs.edn` config and
+    /// install it, so subsequent `check_commit_signature` calls verify against
+    /// it.  Inline keys are parsed directly; `File` entries are read from disk.
+    /// Returns the number of keys loaded; warns (to stderr) on any key that
+    /// fails to load rather than aborting.
+    pub fn load_trusted_signers(&self, config: &cljrs_deps::DepsConfig) -> usize {
+        let mut keys = cljrs_vcs::TrustedKeys::new();
+        let mut loaded = 0usize;
+        for signer in &config.trusted_signers {
+            let result = match signer {
+                cljrs_deps::TrustedSigner::Inline(text) => keys.add_key_text(text),
+                cljrs_deps::TrustedSigner::File(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => keys.add_key_text(&text),
+                    Err(e) => {
+                        eprintln!(
+                            "cljrs: warning: could not read trusted signer key {}: {e}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                },
+            };
+            match result {
+                Ok(()) => loaded += 1,
+                Err(e) => eprintln!("cljrs: warning: invalid trusted signer key: {e}"),
+            }
+        }
+        *self.trusted_keys.write().unwrap() = Arc::new(keys);
+        loaded
     }
 }
 
