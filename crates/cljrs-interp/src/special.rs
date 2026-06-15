@@ -848,9 +848,11 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
         }
     }
 
-    // Always run finally.
+    // Always run finally.  Its normal (Ok) value is discarded — `try` returns
+    // the body/catch result — but an exception thrown from `finally` supersedes
+    // the pending result or exception (matching JVM/Clojure semantics).
     if !fin_body.is_empty() {
-        let _ = eval_body(fin_body, env);
+        eval_body(fin_body, env)?;
     }
 
     result
@@ -1807,7 +1809,6 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     // map->TypeName: map constructor
     let ns = env.current_ns.clone();
     let globals = env.globals.clone();
-    let field_names_clone = field_names.clone();
     let type_tag2 = type_tag.clone();
 
     // Build `->TypeName` as a native-Clojure fn: (fn [f1 f2 ...] (make-type-instance "T" {:f1 f1 :f2 f2 ...}))
@@ -1893,7 +1894,6 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     // Intern the type name as a Symbol value so `(instance? TypeName x)` works.
-    let _ = field_names_clone;
     let type_sym = cljrs_value::Symbol::simple(type_name);
     globals.intern(
         &ns,

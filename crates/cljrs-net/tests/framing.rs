@@ -192,6 +192,7 @@ fn test_length_prefixed_protocol_end_to_end() {
             kind: cljrs_net::frame::FramerKind::LengthPrefixed {
                 prefix_len: 4,
                 big_endian: true,
+                max_frame: 16 * 1024 * 1024,
             },
             out_buf: 8,
         };
@@ -313,6 +314,7 @@ fn test_length_prefixed_framer_coalesced_chunks() {
             kind: cljrs_net::frame::FramerKind::LengthPrefixed {
                 prefix_len: 4,
                 big_endian: true,
+                max_frame: 16 * 1024 * 1024,
             },
             out_buf: 8,
         };

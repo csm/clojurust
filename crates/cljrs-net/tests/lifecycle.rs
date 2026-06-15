@@ -440,10 +440,10 @@ fn test_connect_timeout_ms_fast_connection() {
         );
 
         // Close the connection and listener.
-        if let Value::Map(m) = conn_val {
-            if let Some(Value::Resource(h)) = m.get(&kw("resource")) {
-                let _ = h.close();
-            }
+        if let Value::Map(m) = conn_val
+            && let Some(Value::Resource(h)) = m.get(&kw("resource"))
+        {
+            let _ = h.close();
         }
         if let Value::Resource(handle) = map_get(&server_map, "resource") {
             let _ = handle.close();

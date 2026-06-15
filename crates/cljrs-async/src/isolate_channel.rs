@@ -335,7 +335,7 @@ mod tests {
         let b1 = barrier.clone();
         let hs = Isolate::new("b2-sender").spawn(move || async move {
             // Allocate 30 boxed i64s on the sender's heap.
-            let _vals: Vec<_> = (0_i64..30).map(|i| GcPtr::new(i)).collect();
+            let _vals: Vec<_> = (0_i64..30).map(GcPtr::new).collect();
             // Send a shareable value to the receiver.
             tx.send(&Value::Long(999)).unwrap();
             b1.wait();
@@ -347,7 +347,7 @@ mod tests {
         let hr = Isolate::new("b2-receiver").spawn(move || async move {
             let mut rx = rx;
             // Allocate 50 objects on the receiver's heap before receiving.
-            let _vals: Vec<_> = (0_i64..50).map(|i| GcPtr::new(i)).collect();
+            let _vals: Vec<_> = (0_i64..50).map(GcPtr::new).collect();
             let v = rx.recv().await.unwrap();
             b2.wait();
             // Long is inlined (no GcPtr), so count stays at 50.

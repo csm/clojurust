@@ -62,7 +62,7 @@
 ;; Decoder specs — pass to `frame`
 (lines)                              ; => FramerSpec — split on \n, emit strings
 (by-delimiter b)                     ; => FramerSpec — split on byte b, emit byte-arrays
-(length-prefixed {:bytes 4 :endian :big})  ; => FramerSpec — N-byte length prefix, emit byte-arrays
+(length-prefixed {:bytes 4 :endian :big :max-frame 16777216})  ; => FramerSpec — N-byte length prefix, emit byte-arrays
 
 ;; Main framing helper
 (frame in-chan spec)                 ; => out-chan of decoded messages
@@ -315,7 +315,7 @@ can be split across frame boundaries or contain multiple frames.
 |---|---|---|---|
 | `(lines)` | `byte-array` chunks | `string` per line | strips `\r`, emits partial final line at EOF |
 | `(by-delimiter b)` | `byte-array` chunks | `byte-array` per frame | `b` is excluded from frames |
-| `(length-prefixed {:bytes n})` | `byte-array` chunks | `byte-array` per frame | N-byte big-endian (default) or little-endian length header; partial frame at EOF discarded |
+| `(length-prefixed {:bytes n})` | `byte-array` chunks | `byte-array` per frame | N-byte big-endian (default) or little-endian length header; partial frame at EOF discarded. `:max-frame` (default 16 MiB) caps the declared body size — an oversized header emits an error frame instead of buffering, preventing memory exhaustion from a malicious peer |
 
 ### Encode helpers
 
