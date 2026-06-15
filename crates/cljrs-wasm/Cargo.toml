@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-wasm"
-version = "0.1.0"
+version = "0.1.150"
 edition = "2024"
 description = "WebAssembly browser REPL for clojurust"
 license.workspace = true
