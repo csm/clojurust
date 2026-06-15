@@ -214,8 +214,9 @@ self-contained — the generated harness calls
 `globals.set_versioned_offline(true)`, and a versioned namespace that was not
 embedded fails with a clear error instead of attempting a git fetch.  A bad
 pin (missing commit, failed signature check) fails the *compile*.  When
-`verify_commit_signatures` is set, `git verify-commit` runs at compile time;
-the binary trusts its embedded sources.
+`verify_commit_signatures` is set, native PGP/SSH signature verification (against
+the project's `:trusted-signers`) runs at compile time; the binary trusts its
+embedded sources.
 
 The generated harness `main()` calls `-main` (via `resolve`) after
 `__cljrs_main` returns, forwarding all command-line arguments (skipping the

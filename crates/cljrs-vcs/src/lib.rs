@@ -1,12 +1,21 @@
-//! Git subprocess helpers for versioned symbol resolution.
+//! Pure-Rust git helpers for versioned symbol resolution.
 //!
-//! All git operations are performed by shelling out to the `git` binary.
-//! No network access happens here; callers are responsible for ensuring
-//! that required commits are present locally before calling these functions.
+//! All git operations are performed in-process with [`gix`] (gitoxide); no
+//! `git` binary is required. Commit-signature verification is likewise native
+//! (see [`signature`]): PGP signatures are checked with rPGP and SSH signatures
+//! with `ssh-key`, against a caller-supplied set of [`TrustedKeys`].
+//!
+//! Remote fetch/clone over the network is HTTPS-only and fully pure-Rust
+//! (rustls). Local filesystem paths and `file://` URLs are also supported
+//! (handled in-process). `ssh://`/scp-like remotes are rejected with a clear
+//! error; pure-Rust SSH transport is planned for a later phase.
 
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+
+mod signature;
+pub use signature::{TrustedKeyError, TrustedKeys};
 
 #[derive(Debug, Error)]
 pub enum VcsError {
@@ -16,12 +25,18 @@ pub enum VcsError {
     CommitNotFound(String),
     #[error("path {0:?} not found at commit {1:?}")]
     PathNotFound(String, String),
-    #[error("git subprocess error: {0}")]
+    #[error("git error: {0}")]
     Io(#[from] std::io::Error),
     #[error("git output is not valid UTF-8")]
     Utf8,
     #[error("no git repository found at or above {0:?}")]
     NoRepo(PathBuf),
+    #[error(
+        "unsupported remote {0:?}: only https:// URLs and local paths are supported (ssh remotes are not yet supported)"
+    )]
+    UnsupportedRemote(String),
+    #[error("git error: {0}")]
+    Git(String),
     #[error("commit {commit:?} has no valid signature: {reason}")]
     SignatureVerificationFailed { commit: String, reason: String },
 }
@@ -35,7 +50,7 @@ pub fn is_valid_commit_hash(s: &str) -> bool {
 }
 
 /// Walk upward from `start` (a file or directory) to find the root of the
-/// enclosing git repository, i.e. the directory that contains `.git`.
+/// enclosing git repository, i.e. the working-tree root.
 pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     // Normalise: if `start` is a file, begin from its parent directory.
     let dir: &Path = if start.is_file() {
@@ -44,20 +59,8 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
         start
     };
 
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let s = String::from_utf8(output.stdout).ok()?;
-        Some(PathBuf::from(s.trim()))
-    } else {
-        None
-    }
+    let repo = gix::discover(dir).ok()?;
+    repo.workdir().map(|p| p.to_path_buf())
 }
 
 /// Return the contents of `rel_path` (relative to the repo root) at `commit`.
@@ -69,27 +72,25 @@ pub fn get_file_at_commit(repo_root: &Path, rel_path: &str, commit: &str) -> Vcs
         return Err(VcsError::InvalidCommit(commit.to_string()));
     }
 
-    let spec = format!("{commit}:{rel_path}");
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("show")
-        .arg(&spec)
-        .output()?;
+    let repo = gix::open(repo_root).map_err(|e| VcsError::Git(e.to_string()))?;
+    let object = repo
+        .rev_parse_single(commit)
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?
+        .object()
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?;
+    let tree = object
+        .try_into_commit()
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?
+        .tree()
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?;
 
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|_| VcsError::Utf8)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("does not exist") || stderr.contains("exists on disk") {
-            Err(VcsError::PathNotFound(
-                rel_path.to_string(),
-                commit.to_string(),
-            ))
-        } else {
-            Err(VcsError::CommitNotFound(commit.to_string()))
-        }
-    }
+    let entry = tree
+        .lookup_entry_by_path(Path::new(rel_path))
+        .map_err(|e| VcsError::Git(e.to_string()))?
+        .ok_or_else(|| VcsError::PathNotFound(rel_path.to_string(), commit.to_string()))?;
+
+    let blob = entry.object().map_err(|e| VcsError::Git(e.to_string()))?;
+    String::from_utf8(blob.data.clone()).map_err(|_| VcsError::Utf8)
 }
 
 /// Returns the path to the local git-dep cache root: `~/.cljrs/cache/git/`.
@@ -106,8 +107,12 @@ pub fn cache_root() -> PathBuf {
 /// This mirrors the slug derivation inside [`fetch_remote`] so callers can
 /// check cache existence without triggering network access.
 pub fn cache_path_for_url(url: &str) -> PathBuf {
-    let slug: String = url
-        .chars()
+    cache_root().join(url_slug(url))
+}
+
+/// Stable cache directory slug derived from a URL (non-alphanumerics → `_`).
+fn url_slug(url: &str) -> String {
+    url.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' {
                 c
@@ -115,13 +120,13 @@ pub fn cache_path_for_url(url: &str) -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    cache_root().join(slug)
+        .collect()
 }
 
-/// Clone or fetch a remote git repository into the local cache.
+/// Clone or fetch a git repository into the local cache.
 ///
-/// `url`  — remote URL (https or ssh)
+/// `url`  — an `https://` URL, a local filesystem path, or a `file://` URL
+///          (ssh remotes are not yet supported)
 /// `sha`  — the commit SHA that must be reachable after the operation
 ///
 /// Returns the path to the bare repository in the cache.
@@ -129,86 +134,111 @@ pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf> {
     if !is_valid_commit_hash(sha) {
         return Err(VcsError::InvalidCommit(sha.to_string()));
     }
+    if matches!(classify_remote(url), RemoteKind::Unsupported) {
+        return Err(VcsError::UnsupportedRemote(url.to_string()));
+    }
 
-    // Stable cache directory derived from the URL (replace non-alphanum with _).
-    let slug: String = url
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let repo_dir = cache_root().join(&slug);
+    let repo_dir = cache_root().join(url_slug(url));
 
     if repo_dir.exists() {
         // Already cloned — fetch to make sure we have the requested commit.
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .arg("fetch")
-            .arg("--quiet")
-            .arg("origin")
-            .status()?;
-        if !status.success() {
-            return Err(VcsError::Io(std::io::Error::other("git fetch failed")));
-        }
+        fetch_existing(&repo_dir)?;
     } else {
         std::fs::create_dir_all(&repo_dir).map_err(VcsError::Io)?;
-        let status = std::process::Command::new("git")
-            .arg("clone")
-            .arg("--bare")
-            .arg("--quiet")
-            .arg(url)
-            .arg(&repo_dir)
-            .status()?;
-        if !status.success() {
-            return Err(VcsError::Io(std::io::Error::other("git clone failed")));
-        }
+        clone_bare(url, &repo_dir)?;
     }
 
-    // Verify that the requested commit is now present.
-    let check = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_dir)
-        .arg("cat-file")
-        .arg("-e")
-        .arg(sha)
-        .status()?;
-    if !check.success() {
+    // Verify that the requested commit is now present locally.
+    let repo = gix::open(&repo_dir).map_err(|e| VcsError::Git(e.to_string()))?;
+    if repo.rev_parse_single(sha).is_err() {
         return Err(VcsError::CommitNotFound(sha.to_string()));
     }
 
     Ok(repo_dir)
 }
 
-/// Verify the GPG or SSH signature on `commit` inside `repo_root`.
+/// How a remote URL is transported.
+enum RemoteKind {
+    /// `https://` (pure-Rust network) or a local filesystem path / `file://`.
+    Supported,
+    /// `ssh://`, scp-like `git@host:path`, `git://`, `http://`, etc.
+    Unsupported,
+}
+
+/// Classify a remote URL. Network transport is HTTPS-only; local paths and
+/// `file://` are also supported (gitoxide handles them in-process). SSH and
+/// other network transports are rejected.
+fn classify_remote(url: &str) -> RemoteKind {
+    if url.starts_with("https://") || url.starts_with("file://") {
+        return RemoteKind::Supported;
+    }
+    if url.contains("://") {
+        // An explicit non-https/file scheme (ssh://, git://, http://, …).
+        return RemoteKind::Unsupported;
+    }
+    // No scheme: an scp-like `user@host:path` is SSH; otherwise a local path.
+    match url.split_once(':') {
+        Some((host, _)) if !host.is_empty() && !host.contains('/') => RemoteKind::Unsupported,
+        _ => RemoteKind::Supported,
+    }
+}
+
+/// Clone `url` as a bare repository into `repo_dir`.
+fn clone_bare(url: &str, repo_dir: &Path) -> VcsResult<()> {
+    let mut prepare =
+        gix::prepare_clone_bare(url, repo_dir).map_err(|e| VcsError::Git(e.to_string()))?;
+    let (_repo, _outcome) = prepare
+        .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    Ok(())
+}
+
+/// Fetch updates for an already-cloned bare repository at `repo_dir`.
+fn fetch_existing(repo_dir: &Path) -> VcsResult<()> {
+    let repo = gix::open(repo_dir).map_err(|e| VcsError::Git(e.to_string()))?;
+    let remote = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .ok_or_else(|| VcsError::Git("repository has no default remote".to_string()))?
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(|e| VcsError::Git(e.to_string()))?
+        .prepare_fetch(gix::progress::Discard, Default::default())
+        .map_err(|e| VcsError::Git(e.to_string()))?
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    Ok(())
+}
+
+/// Verify the PGP or SSH signature on `commit` inside `repo_root` against the
+/// caller-supplied set of `trusted` keys.
 ///
-/// Delegates entirely to `git verify-commit`; trust is determined by the
-/// caller's GPG keyring or `gpg.program` git config.  Returns `Ok(())` when
-/// the signature is present and valid, `Err(SignatureVerificationFailed)`
-/// otherwise (unsigned commit, expired key, key not in keyring, etc.).
-pub fn verify_commit_signature(repo_root: &Path, commit: &str) -> VcsResult<()> {
+/// Returns `Ok(())` when the commit carries a cryptographically valid signature
+/// whose signing key is present in `trusted`. Returns
+/// `Err(SignatureVerificationFailed)` for an unsigned commit, an invalid
+/// signature, or a signature made by a key that is not trusted.
+pub fn verify_commit_signature(
+    repo_root: &Path,
+    commit: &str,
+    trusted: &TrustedKeys,
+) -> VcsResult<()> {
     if !is_valid_commit_hash(commit) {
         return Err(VcsError::InvalidCommit(commit.to_string()));
     }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("verify-commit")
-        .arg(commit)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(VcsError::SignatureVerificationFailed {
+    let repo = gix::open(repo_root).map_err(|e| VcsError::Git(e.to_string()))?;
+    let object = repo
+        .rev_parse_single(commit)
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?
+        .object()
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?;
+    let raw = object.data.clone();
+
+    signature::verify_commit_object(&raw, trusted).map_err(|reason| {
+        VcsError::SignatureVerificationFailed {
             commit: commit.to_string(),
             reason,
-        })
-    }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -224,5 +254,18 @@ mod tests {
         assert!(!is_valid_commit_hash("abc123")); // too short
         assert!(!is_valid_commit_hash("xyz1234")); // non-hex
         assert!(!is_valid_commit_hash(""));
+    }
+
+    #[test]
+    fn remote_classification() {
+        let supported = |u| matches!(classify_remote(u), RemoteKind::Supported);
+        assert!(supported("https://github.com/u/r"));
+        assert!(supported("file:///tmp/repo"));
+        assert!(supported("/tmp/local/repo")); // absolute local path
+        assert!(supported("../relative/repo")); // relative local path
+        assert!(!supported("ssh://git@github.com/u/r"));
+        assert!(!supported("git@github.com:u/r.git")); // scp-like
+        assert!(!supported("git://github.com/u/r"));
+        assert!(!supported("http://github.com/u/r")); // insecure
     }
 }

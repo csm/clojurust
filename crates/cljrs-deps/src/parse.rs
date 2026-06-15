@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use cljrs_reader::{Form, FormKind, Parser};
 
-use crate::{Alias, Dependency, DepsConfig, GitDep, RustConfig};
+use crate::{Alias, Dependency, DepsConfig, GitDep, RustConfig, TrustedSigner};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -56,6 +56,9 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
                 FormKind::Bool(b) => config.verify_commit_signatures = *b,
                 _ => return Err(":verify-commit-signatures must be true or false".to_string()),
             },
+            Some("trusted-signers") => {
+                config.trusted_signers = extract_trusted_signers(val, config_dir)?;
+            }
             Some("enforce-native-versions") => match &val.kind {
                 FormKind::Bool(b) => config.enforce_native_versions = *b,
                 _ => return Err(":enforce-native-versions must be true or false".to_string()),
@@ -81,6 +84,46 @@ fn extract_path_vec(form: &Form, ctx: &str, base: &Path) -> Result<Vec<PathBuf>,
             Ok(base.join(s))
         })
         .collect()
+}
+
+// ── :trusted-signers ──────────────────────────────────────────────────────────
+
+/// Parse `:trusted-signers` — a vector of strings. Each string is either an
+/// inline public key (an armored PGP block or an OpenSSH public key line) or a
+/// path to a key file resolved relative to the config directory.
+fn extract_trusted_signers(form: &Form, base: &Path) -> Result<Vec<TrustedSigner>, String> {
+    let items = require_vec(form, ":trusted-signers")?;
+    items
+        .iter()
+        .map(|f| {
+            let s = require_str(f, ":trusted-signers")?;
+            Ok(if looks_like_inline_key(s) {
+                TrustedSigner::Inline(s.to_string())
+            } else {
+                TrustedSigner::File(base.join(s))
+            })
+        })
+        .collect()
+}
+
+/// Heuristic: an inline key is either an armored PGP block or starts with a
+/// known OpenSSH key-type prefix; anything else is treated as a file path.
+fn looks_like_inline_key(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("-----BEGIN PGP")
+        || matches!(
+            t.split_whitespace().next(),
+            Some(
+                "ssh-ed25519"
+                    | "ssh-rsa"
+                    | "ssh-dss"
+                    | "ecdsa-sha2-nistp256"
+                    | "ecdsa-sha2-nistp384"
+                    | "ecdsa-sha2-nistp521"
+                    | "sk-ssh-ed25519@openssh.com"
+                    | "sk-ecdsa-sha2-nistp256@openssh.com"
+            )
+        )
 }
 
 // ── :deps ─────────────────────────────────────────────────────────────────────
@@ -291,6 +334,24 @@ mod tests {
     fn no_rust_key_is_none() {
         let cfg = parse(r#"{:paths ["src"]}"#).unwrap();
         assert!(cfg.rust.is_none());
+    }
+
+    #[test]
+    fn trusted_signers_inline_and_file() {
+        let cfg = parse(
+            r#"{:trusted-signers ["ssh-ed25519 AAAAaaaa comment"
+                                  "keys/signer.asc"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.trusted_signers.len(), 2);
+        assert_eq!(
+            cfg.trusted_signers[0],
+            TrustedSigner::Inline("ssh-ed25519 AAAAaaaa comment".to_string())
+        );
+        assert_eq!(
+            cfg.trusted_signers[1],
+            TrustedSigner::File(Path::new("/proj/keys/signer.asc").to_path_buf())
+        );
     }
 
     #[test]

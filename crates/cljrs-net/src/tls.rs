@@ -460,7 +460,9 @@ pub fn build_client_config(opts: &MapValue) -> ValueResult<Arc<ClientConfig>> {
             }
         }
 
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ValueError::Other(format!("tls provider error: {e}")))?
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
@@ -484,10 +486,13 @@ pub fn build_server_config(opts: &MapValue) -> ValueResult<Arc<ServerConfig>> {
     let certs = load_certs(&cert_path)?;
     let key = load_private_key(&key_path)?;
 
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| ValueError::Other(format!("server cert/key error: {e}")))?;
+    let mut config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ValueError::Other(format!("tls provider error: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| ValueError::Other(format!("server cert/key error: {e}")))?;
 
     // ALPN
     if let Some(alpn) = opts_string_vec(opts, "alpn") {

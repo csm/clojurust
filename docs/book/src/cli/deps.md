@@ -88,6 +88,10 @@ valid clojurust EDN:
 
  :verify-commit-signatures true
 
+ ; Keys allowed to sign versioned commits (inline key or path to a key file).
+ :trusted-signers ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... maintainer@example.com"
+                   "keys/release-signing.asc"]
+
  ; Optional: embed a Rust crate for native interop
  :rust {:crate "."
         :init  "my_project::cljrs_init"}}
@@ -100,7 +104,8 @@ valid clojurust EDN:
 | `:paths` | vector of strings | Directories to add to the source path. Equivalent to `--src-path` on the CLI. |
 | `:deps` | map | Map from dependency name (symbol) to dependency descriptor. |
 | `:aliases` | map | Named alias maps with `:extra-paths` and `:extra-deps`. |
-| `:verify-commit-signatures` | boolean | If `true`, require GPG/SSH signatures on all versioned commits. |
+| `:verify-commit-signatures` | boolean | If `true`, require valid PGP/SSH signatures (verified natively) on all versioned commits. |
+| `:trusted-signers` | vector of strings | Public keys allowed to sign versioned commits. Each entry is an inline key (armored PGP or OpenSSH) or a path to a key file relative to `cljrs.edn`. |
 | `:rust` | map | Embedded Rust crate for native interop. See [Rust Interop](../rust-interop/index.md). |
 
 #### `:rust` key

@@ -692,6 +692,7 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                     .verify_commit_signatures
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            globals.load_trusted_signers(&config);
             if config.enforce_native_versions {
                 globals.set_enforce_native_versions(true);
             }
