@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-logging"
-version = "0.1.0"
+version = "0.1.152"
 edition = "2024"
 description = "Feature-gated debug/trace logging for clojurust"
 license.workspace = true
