@@ -139,7 +139,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             // and may trigger GC.
             let _caller_root = crate::gc_roots::push_env_root(env);
             crate::callback::push_eval_context(env);
-            let result = (nf.get().func)(&args).map_err(|e| EvalError::Runtime(e.to_string()));
+            let result = (nf.get().func)(&args).map_err(crate::error::value_error_to_eval_error);
             crate::callback::pop_eval_context();
             result
         }

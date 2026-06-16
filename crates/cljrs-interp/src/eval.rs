@@ -632,6 +632,30 @@ mod tests {
     }
 
     #[test]
+    fn test_catch_default_catches_internal_value_errors() {
+        // Regression for #168: internal `ValueError`s (IndexOutOfBounds, WrongType)
+        // raised by core ops must be caught by the ClojureScript `:default` keyword,
+        // not just by symbol catch types.
+        for src in [
+            "(try (nth [1 2 3] 10) (catch :default e \"caught\"))",
+            "(try (aget (long-array 3) 10) (catch :default e \"caught\"))",
+            "(try (aset (long-array 3) 10 5) (catch :default e \"caught\"))",
+        ] {
+            let v = eval_str(src).unwrap();
+            assert_eq!(v, Value::string("caught"), "{src}");
+        }
+    }
+
+    #[test]
+    fn test_catch_default_binds_clean_ex_message() {
+        // The caught value is a normalized exception: `ex-message` returns the
+        // plain `ValueError` text with no `runtime error:` prefix, matching how a
+        // user `throw` / `ex-info` value behaves.
+        let v = eval_str("(try (nth [1 2 3] 10) (catch :default e (ex-message e)))").unwrap();
+        assert_eq!(v, Value::string("index out of bounds: 10 >= 3"));
+    }
+
+    #[test]
     fn test_finally_runs_and_value_is_discarded() {
         // finally executes for its side effect, but the `try` value is the body's.
         let v = eval_str("(let [a (atom 0)] (try 1 (finally (reset! a 5))) @a)").unwrap();

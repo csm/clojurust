@@ -386,8 +386,24 @@ fn throw_str(msg: String) -> *const Value {
     unsafe { rt_throw(exc) }
 }
 
-fn array_index_error(idx: i64, len: usize) -> String {
-    format!("array index out of bounds: {idx} (length {len})")
+/// Raise an out-of-bounds condition carrying the structured
+/// `ValueError::IndexOutOfBounds` variant, matching the tree-walk interpreter's
+/// `aget`/`aset`/`nth` errors so a caught value has the same shape and message
+/// (`index out of bounds: {idx} >= {len}`) regardless of execution tier.
+fn throw_index_oob(idx: i64, len: usize) -> *const Value {
+    let err = if idx >= 0 {
+        cljrs_value::ValueError::IndexOutOfBounds {
+            idx: idx as usize,
+            count: len,
+        }
+    } else {
+        cljrs_value::ValueError::Other(format!("index out of bounds: {idx} >= {len}"))
+    };
+    let msg = err.to_string();
+    let exc = box_val(Value::Error(GcPtr::new(
+        cljrs_value::error::ExceptionInfo::new(err, msg, None, None),
+    )));
+    unsafe { rt_throw(exc) }
 }
 
 // ── Primitive array access ──────────────────────────────────────────────────
@@ -429,7 +445,7 @@ pub unsafe extern "C" fn rt_aget_long(arr: *const Value, i: i64) -> i64 {
         Value::LongArray(a) => {
             let v = a.get().lock().unwrap();
             if i < 0 || i as usize >= v.len() {
-                throw_str(array_index_error(i, v.len()));
+                throw_index_oob(i, v.len());
                 return 0;
             }
             v[i as usize]
@@ -452,7 +468,7 @@ pub unsafe extern "C" fn rt_aget_double(arr: *const Value, i: i64) -> f64 {
         Value::DoubleArray(a) => {
             let v = a.get().lock().unwrap();
             if i < 0 || i as usize >= v.len() {
-                throw_str(array_index_error(i, v.len()));
+                throw_index_oob(i, v.len());
                 return 0.0;
             }
             v[i as usize]
@@ -476,7 +492,7 @@ pub unsafe extern "C" fn rt_aset_long(arr: *const Value, i: i64, v: i64) -> *con
         Value::LongArray(a) => {
             let mut g = a.get().lock().unwrap();
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             g[i as usize] = v;
             intern_long(v)
@@ -496,7 +512,7 @@ pub unsafe extern "C" fn rt_aset_double(arr: *const Value, i: i64, v: f64) -> *c
         Value::DoubleArray(a) => {
             let mut g = a.get().lock().unwrap();
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             g[i as usize] = v;
             box_val(Value::Double(v))
@@ -522,7 +538,7 @@ pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const
         ($a:expr, $map:expr) => {{
             let g = $a.get().lock().unwrap();
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             #[allow(clippy::redundant_closure_call)]
             box_val($map(&g[i as usize]))
@@ -532,7 +548,7 @@ pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const
         Value::ObjectArray(a) => {
             let g = a.get().0.lock().unwrap();
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             box_val(g[i as usize].clone())
         }
@@ -569,7 +585,7 @@ pub unsafe extern "C" fn rt_aset(
         ($lock:expr, $conv:expr) => {{
             let mut g = $lock;
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             match $conv(val_v) {
                 Some(c) => {
@@ -584,7 +600,7 @@ pub unsafe extern "C" fn rt_aset(
         Value::ObjectArray(a) => {
             let mut g = a.get().0.lock().unwrap();
             if i < 0 || i as usize >= g.len() {
-                return throw_str(array_index_error(i, g.len()));
+                return throw_index_oob(i, g.len());
             }
             g[i as usize] = val_v.clone();
             val
