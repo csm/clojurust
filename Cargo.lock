@@ -1067,6 +1067,7 @@ dependencies = [
  "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
+ "quinn",
  "rcgen",
  "rustls",
  "rustls-native-certs",
