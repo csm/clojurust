@@ -72,6 +72,19 @@ helpers shared with the Phase 10.6 inline caches:
   `rt_call_ic`'s hot path in `cljrs-compiler`)
 - `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
 
+## error module
+
+`EvalError` / `EvalResult` are the evaluator's error types. Helpers:
+
+- `EvalError::to_error_value(self) -> Value` — convert an error into a Clojure
+  error *value*; `Thrown` is returned unchanged, anything else is wrapped in a
+  fresh `ExceptionInfo`
+- `value_error_to_eval_error(err: ValueError) -> EvalError` — surface a builtin's
+  `ValueError` as a *catchable* `EvalError::Thrown(Value::Error(..))`, preserving
+  the original variant and its plain message (no `runtime error:` prefix) so
+  `(catch :default e ..)` / `ex-message` / `ex-data` behave the same as for a
+  user `throw` / `ex-info`. A `ValueError::Thrown` re-surfaces the exact value.
+
 ## callback module
 
 Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_context`). The context is pushed automatically around native builtin calls and by the Tier-1 IR executor; rt_abi bridges (`rt_call`, `rt_load_global`, the HOF bridges) dispatch through it. Public API includes:

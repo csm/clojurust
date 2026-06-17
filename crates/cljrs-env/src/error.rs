@@ -1,6 +1,7 @@
 //! Evaluation-time error types.
 
 use cljrs_value::Value;
+use cljrs_value::ValueError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
@@ -60,6 +61,27 @@ impl EvalError {
                     None,
                 )))
             }
+        }
+    }
+}
+
+/// Surface a builtin's `ValueError` to the evaluator as a *catchable* condition.
+///
+/// Internal runtime errors (`IndexOutOfBounds`, `WrongType`, `ArityError`, …)
+/// are normalized into an `EvalError::Thrown(Value::Error(..))` carrying the
+/// original `ValueError` variant and its plain display message — no
+/// `runtime error:` prefix — so that `(catch :default e ..)` /
+/// `(catch Throwable e ..)` bind a value on which `ex-message` / `ex-data`
+/// behave the same as for a user `throw` / `ex-info`. A `ValueError::Thrown`
+/// (a builtin re-throwing a Clojure value) is surfaced as that exact value.
+pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
+    match err {
+        ValueError::Thrown(v) => EvalError::Thrown(v),
+        other => {
+            let msg = other.to_string();
+            EvalError::Thrown(Value::Error(cljrs_gc::GcPtr::new(
+                cljrs_value::ExceptionInfo::new(other, msg, None, None),
+            )))
         }
     }
 }

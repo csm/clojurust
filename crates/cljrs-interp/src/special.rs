@@ -801,7 +801,9 @@ pub fn catch_type_matches(type_name: &str, val: &Value) -> bool {
     let short = type_name.rsplit('.').next().unwrap_or(type_name);
     match short {
         // Catch-all (matches any value, error or not — back-compat).
-        "Object" | "Exception" | "Throwable" | "Error" => true,
+        // `:default` is the ClojureScript universal catch keyword; it arrives
+        // here as the keyword's name ("default") via `parse_try_args`.
+        "Object" | "Exception" | "Throwable" | "Error" | "default" => true,
         // ExceptionInfo only matches actual ex-info / Exception values.
         "ExceptionInfo" => matches!(val, Value::Error(_)),
         _ => false,
@@ -874,8 +876,11 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
                 if i < body_end {
                     body_end = i;
                 }
+                // The catch type may be a symbol (`Throwable`, `java.lang.Exception`)
+                // or the ClojureScript `:default` catch-all keyword.
                 let type_sym = match parts.get(1).map(|f| &f.kind) {
                     Some(FormKind::Symbol(s)) => s.as_str(),
+                    Some(FormKind::Keyword(s)) => s.as_str(),
                     _ => continue,
                 };
                 let binding = match parts.get(2).map(|f| &f.kind) {
