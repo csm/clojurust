@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-base64"
-version = "0.1.0"
+version = "0.1.155"
 edition = "2024"
 description = "Base64 library for Clojurust wrapping rust-base64"
 license.workspace = true
