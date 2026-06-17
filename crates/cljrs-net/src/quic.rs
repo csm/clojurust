@@ -56,7 +56,11 @@ type Builtin = fn(&[Value]) -> ValueResult<Value>;
 pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, Builtin)> = vec![
         ("connect", Arity::Fixed(1), builtin_connect),
-        ("open-stream", Arity::Variadic { min: 1 }, builtin_open_stream),
+        (
+            "open-stream",
+            Arity::Variadic { min: 1 },
+            builtin_open_stream,
+        ),
         ("close", Arity::Fixed(1), builtin_close),
         ("stream-close", Arity::Fixed(1), builtin_stream_close),
     ];
@@ -110,8 +114,7 @@ impl Resource for QuicConnectionResource {
         for h in g.abort_handles.drain(..) {
             h.abort();
         }
-        self.connection
-            .close(quinn::VarInt::from_u32(0), b"closed");
+        self.connection.close(quinn::VarInt::from_u32(0), b"closed");
         Ok(())
     }
 
@@ -236,15 +239,12 @@ async fn pool_stream_accept_loop(
     loop {
         match connection.accept_bi().await {
             Err(e) => {
-                let _ = stream_tx
-                    .send(Err(format!("accept_bi: {e}")))
-                    .await;
+                let _ = stream_tx.send(Err(format!("accept_bi: {e}"))).await;
                 break;
             }
             Ok((send, recv)) => {
                 let stream_id = send.id().index();
-                let (read_tx, read_rx) =
-                    mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+                let (read_tx, read_rx) = mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
                 let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
 
                 let reader_jh = tokio::spawn(pool_reader(recv, read_tx));
@@ -285,8 +285,7 @@ async fn pool_open_stream(
         }
         Ok((send, recv)) => {
             let stream_id = send.id().index();
-            let (read_tx, read_rx) =
-                mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
+            let (read_tx, read_rx) = mpsc::channel::<crate::pool_io::ReadMsg>(in_buf.max(1));
             let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(out_buf.max(1));
 
             let reader_jh = tokio::spawn(pool_reader(recv, read_tx));
@@ -387,9 +386,9 @@ fn make_quic_connection(
 
     let (stream_tx, stream_rx) = mpsc::channel::<QuicStreamResult>(streams_buf.max(1));
 
-    let pool_jh = WorkerPool::global()
-        .handle()
-        .spawn(pool_stream_accept_loop(connection, stream_tx, in_buf, out_buf));
+    let pool_jh = WorkerPool::global().handle().spawn(pool_stream_accept_loop(
+        connection, stream_tx, in_buf, out_buf,
+    ));
 
     let bridge_jh = tokio::task::spawn_local(local_stream_accept_bridge(
         stream_rx,
@@ -431,7 +430,16 @@ pub fn connect_to(
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
     spawn_future(async move {
-        do_quic_connect(host, port, quinn_config, streams_buf, in_buf, out_buf, promise).await
+        do_quic_connect(
+            host,
+            port,
+            quinn_config,
+            streams_buf,
+            in_buf,
+            out_buf,
+            promise,
+        )
+        .await
     });
     promise_val
 }
@@ -498,7 +506,10 @@ async fn do_quic_connect(
         };
 
         let remote_addr = connection.remote_address().to_string();
-        let local_addr = endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let local_addr = endpoint
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         let _ = conn_tx.send(Ok((connection, endpoint, remote_addr, local_addr)));
     });
 
@@ -506,8 +517,15 @@ async fn do_quic_connect(
         Err(_) => chan_deliver(&promise, net_error("pool task dropped")).await,
         Ok(Err(e)) => chan_deliver(&promise, net_error(e)).await,
         Ok(Ok((connection, endpoint, remote_addr, local_addr))) => {
-            let conn =
-                make_quic_connection(connection, endpoint, remote_addr, local_addr, streams_buf, in_buf, out_buf);
+            let conn = make_quic_connection(
+                connection,
+                endpoint,
+                remote_addr,
+                local_addr,
+                streams_buf,
+                in_buf,
+                out_buf,
+            );
             chan_deliver(&promise, conn).await;
         }
     }
@@ -520,16 +538,10 @@ async fn do_quic_connect(
 ///
 /// Runs `open_bi()` on the `WorkerPool` and returns a promise channel that
 /// yields a stream map on the LocalSet.
-pub fn open_stream_on(
-    connection: quinn::Connection,
-    in_buf: usize,
-    out_buf: usize,
-) -> Value {
+pub fn open_stream_on(connection: quinn::Connection, in_buf: usize, out_buf: usize) -> Value {
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move {
-        do_open_stream(connection, in_buf, out_buf, promise).await
-    });
+    spawn_future(async move { do_open_stream(connection, in_buf, out_buf, promise).await });
     promise_val
 }
 
@@ -549,8 +561,7 @@ async fn do_open_stream(
         Err(_) => chan_deliver(&promise, net_error("pool task dropped")).await,
         Ok(Err(e)) => chan_deliver(&promise, net_error(e)).await,
         Ok(Ok(msg)) => {
-            let stream_val =
-                make_quic_stream_from_setup(msg.setup, msg.stream_id, in_buf, out_buf);
+            let stream_val = make_quic_stream_from_setup(msg.setup, msg.stream_id, in_buf, out_buf);
             chan_deliver(&promise, stream_val).await;
         }
     }
@@ -580,7 +591,14 @@ fn builtin_connect(args: &[Value]) -> ValueResult<Value> {
     let out_buf = opts_usize(&opts, "out-buf").unwrap_or(8);
 
     let config = crate::quic_config::client_config(&opts)?;
-    Ok(connect_to(&host, port, config, streams_buf, in_buf, out_buf))
+    Ok(connect_to(
+        &host,
+        port,
+        config,
+        streams_buf,
+        in_buf,
+        out_buf,
+    ))
 }
 
 /// `(open-stream conn)` or `(open-stream conn {:in-buf N :out-buf N})`
@@ -607,9 +625,7 @@ fn builtin_open_stream(args: &[Value]) -> ValueResult<Value> {
     let resource_handle = match conn_map.get(&kw("resource")) {
         Some(Value::Resource(h)) => h.clone(),
         _ => {
-            return Err(ValueError::Other(
-                "connection map missing :resource".into(),
-            ));
+            return Err(ValueError::Other("connection map missing :resource".into()));
         }
     };
 

@@ -40,9 +40,8 @@ fn make_server_config() -> (quinn::ServerConfig, rcgen::CertifiedKey) {
         .expect("rcgen cert generation failed");
 
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        certified.key_pair.serialize_der().into(),
-    );
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
 
     let rustls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -63,9 +62,8 @@ fn make_server_config() -> (quinn::ServerConfig, rcgen::CertifiedKey) {
 /// Spawn a simple QUIC echo server on the WorkerPool.
 /// Returns the bound port.
 fn spawn_echo_server(server_config: quinn::ServerConfig) -> u16 {
-    let endpoint =
-        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint");
     let port = endpoint.local_addr().unwrap().port();
 
     WorkerPool::global().handle().spawn(async move {
@@ -112,16 +110,13 @@ fn test_quic_echo_round_trip() {
         let port = spawn_echo_server(server_config);
 
         // Build insecure client config (accepts self-signed cert).
-        let client_opts = MapValue::from_pairs(vec![(
-            kw("insecure-skip-verify"),
-            Value::Bool(true),
-        )]);
+        let client_opts =
+            MapValue::from_pairs(vec![(kw("insecure-skip-verify"), Value::Bool(true))]);
         let quinn_config =
             cljrs_net::quic_config::client_config(&client_opts).expect("client config");
 
         // Connect.
-        let promise =
-            cljrs_net::quic::connect_to("localhost", port, quinn_config, 8, 8, 8);
+        let promise = cljrs_net::quic::connect_to("localhost", port, quinn_config, 8, 8, 8);
         let conn_val = chan_take(&as_chan(&promise)).await;
         let conn = match conn_val {
             Value::Map(m) => m,
@@ -173,13 +168,8 @@ fn test_quic_echo_round_trip() {
             match chan_take(&in_ch).await {
                 Value::Nil => break,
                 Value::ByteArray(arr) => {
-                    let bytes: Vec<u8> = arr
-                        .get()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|&b| b as u8)
-                        .collect();
+                    let bytes: Vec<u8> =
+                        arr.get().lock().unwrap().iter().map(|&b| b as u8).collect();
                     response.extend_from_slice(&bytes);
                 }
                 Value::Error(e) => panic!("read error: {}", e.get().message()),
@@ -208,10 +198,8 @@ fn test_quic_connect_failure() {
     local.block_on(&rt, async {
         let _globals = setup_globals();
 
-        let client_opts = MapValue::from_pairs(vec![(
-            kw("insecure-skip-verify"),
-            Value::Bool(true),
-        )]);
+        let client_opts =
+            MapValue::from_pairs(vec![(kw("insecure-skip-verify"), Value::Bool(true))]);
         let quinn_config =
             cljrs_net::quic_config::client_config(&client_opts).expect("client config");
 
