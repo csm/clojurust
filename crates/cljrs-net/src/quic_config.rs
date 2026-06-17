@@ -28,18 +28,20 @@ fn transport_config(opts: &MapValue) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
 
     if let Some(ms) = opts_u64(opts, "max-idle-ms")
-        && let Ok(v) = quinn::VarInt::try_from(ms) {
-            transport.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
-        }
+        && let Ok(v) = quinn::VarInt::try_from(ms)
+    {
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
+    }
 
     if let Some(ms) = opts_u64(opts, "keep-alive-ms") {
         transport.keep_alive_interval(Some(Duration::from_millis(ms)));
     }
 
     if let Some(n) = opts_u64(opts, "max-streams")
-        && let Ok(v) = quinn::VarInt::try_from(n) {
-            transport.max_concurrent_bidi_streams(v);
-        }
+        && let Ok(v) = quinn::VarInt::try_from(n)
+    {
+        transport.max_concurrent_bidi_streams(v);
+    }
 
     Arc::new(transport)
 }
