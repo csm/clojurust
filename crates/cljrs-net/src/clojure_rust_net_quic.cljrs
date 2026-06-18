@@ -1,0 +1,49 @@
+;; clojure.rust.net.quic — QUIC multiplexed transport client.
+;;
+;; Phase Q1 (QUIC client):
+;;   connect      — (connect opts) => promise-chan -> conn-map
+;;   open-stream  — (open-stream conn) / (open-stream conn opts) => promise-chan -> stream-map
+;;   close        — (close conn) => nil
+;;   stream-close — (stream-close stream) => nil
+;;   start-server — (start-server handler opts) => reserved for Q2
+
+(defn with-stream
+  "Open a stream on `conn`, call `(f stream)`, then close the stream.
+  Returns the return value of `f`.  Use inside a `go` block; both
+  `open-stream` and the stream itself are handled asynchronously.
+
+  Example:
+    (go
+      (let [conn (<! (quic/connect {:host \"h\" :port 4433
+                                    :alpn [\"hq-interop\"]
+                                    :insecure-skip-verify true}))]
+        (quic/with-stream conn
+          (fn [s]
+            (>! (:out s) (.getBytes \"ping\"))
+            (close! (:out s))
+            (<! (:in s))))))"
+  [conn f]
+  (let [stream (await (clojure.core.async/take!
+                        (clojure.rust.net.quic/open-stream conn)))]
+    (try
+      (f stream)
+      (finally
+        (clojure.rust.net.quic/stream-close stream)))))
+
+(defn drain-stream
+  "Drain a stream's `:in` channel to a byte-array, then close the stream.
+  Returns the concatenated bytes as a `byte-array`.  Must be called inside
+  a `go` block (uses `await`)."
+  [stream]
+  (let [in-ch (:in stream)]
+    (loop [acc []]
+      (let [v (await (clojure.core.async/take! in-ch))]
+        (if (nil? v)
+          (let [total (reduce + 0 (map count acc))
+                result (byte-array total)]
+            (loop [i 0 chunks acc]
+              (when-let [chunk (first chunks)]
+                (System/arraycopy chunk 0 result i (count chunk))
+                (recur (+ i (count chunk)) (rest chunks))))
+            result)
+          (recur (conj acc v)))))))

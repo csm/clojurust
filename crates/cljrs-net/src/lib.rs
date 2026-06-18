@@ -18,6 +18,8 @@ use cljrs_async::load_source;
 
 pub mod frame;
 mod pool_io;
+pub mod quic;
+pub mod quic_config;
 pub mod tcp;
 pub mod tls;
 pub mod udp;
@@ -41,12 +43,16 @@ const NET_TLS_SOURCE: &str = include_str!("clojure_rust_net_tls.cljrs");
 /// Clojure source for `clojure.rust.net.unix`.
 const NET_UNIX_SOURCE: &str = include_str!("clojure_rust_net_unix.cljrs");
 
+/// Clojure source for `clojure.rust.net.quic`.
+const NET_QUIC_SOURCE: &str = include_str!("clojure_rust_net_quic.cljrs");
+
 pub const NS_TCP: &str = "clojure.rust.net.tcp";
 pub const NS: &str = "clojure.rust.net";
 pub const NS_FRAME: &str = "clojure.rust.net.frame";
 pub const NS_UDP: &str = "clojure.rust.net.udp";
 pub const NS_TLS: &str = "clojure.rust.net.tls";
 pub const NS_UNIX: &str = "clojure.rust.net.unix";
+pub const NS_QUIC: &str = "clojure.rust.net.quic";
 
 /// Register the networking namespaces.
 ///
@@ -93,6 +99,14 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         unix::register(globals, NS_UNIX);
         load_source(globals, NS_UNIX, NET_UNIX_SOURCE);
         globals.mark_loaded(NS_UNIX);
+    }
+
+    if !globals.is_loaded(NS_QUIC) {
+        globals.get_or_create_ns(NS_QUIC);
+        globals.refer_all(NS_QUIC, "clojure.core");
+        quic::register(globals, NS_QUIC);
+        load_source(globals, NS_QUIC, NET_QUIC_SOURCE);
+        globals.mark_loaded(NS_QUIC);
     }
 
     if !globals.is_loaded(NS) {

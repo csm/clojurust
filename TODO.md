@@ -526,3 +526,26 @@ Foundations already in place:
         go-to-definition, find-references
   - [ ] INCREMENTAL text sync, semantic tokens
 - [ ] Transducers in core collection ops
+
+---
+
+## cljrs-net — QUIC + HTTP/3 (`docs/quic-http3-integration-plan.md`)
+
+Using **quinn 0.11** (rustls-ring backend, no new native build) + `h3`/`h3-quinn`
+for HTTP/3.  Each phase ships new source files + tests in one commit.
+
+- [x] **Q1 — QUIC client transport.** `quic_config.rs` (wraps `tls::build_client_config`
+      into `quinn::ClientConfig` via `QuicClientConfig::try_from`), `quic.rs`
+      (`connect_to`, `open_stream_on`, `connect`/`open-stream`/`close` builtins,
+      pool accept/open loops, `QuicConnectionResource`/`QuicStreamResource`),
+      `clojure_rust_net_quic.cljrs` (sugar: `with-stream`, `drain-stream`).
+      Tests: echo round-trip against a quinn in-test server; connect-failure path.
+- [ ] **Q2 — QUIC server transport.** `quic.rs` `listen`/`listen-close`,
+      `endpoint.accept()` pool loop, `:conns`/`:streams` LocalSet bridges,
+      `QuicListenerResource`.
+- [ ] **Q3 — HTTP/3 client.** `h3.rs` client over `h3-quinn`: `h3/get`/`request`,
+      response-body streaming to a `:body` channel.  Depends on Q1.
+- [ ] **Q4 — HTTP/3 server.** `h3.rs` server: request map + `respond` fn,
+      `send_response`/`send_data`.  Depends on Q2+Q3.
+- [ ] **Q5 (optional) — QUIC datagrams.** `send_datagram`/`read_datagram`;
+      connection-level `:dgram-in`/`:dgram-out` channels.

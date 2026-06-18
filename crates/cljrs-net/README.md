@@ -1,8 +1,8 @@
 # cljrs-net
 
-**Purpose**: TCP/Unix/TLS networking for clojurust — channel-oriented sockets delivered as core.async channels.
+**Purpose**: TCP/Unix/TLS/QUIC networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–G + A2 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O).
+**Status**: Phases A–G + A2 + Q1 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -12,18 +12,21 @@
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, and `clojure.rust.net` |
+| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, `clojure.rust.net.quic`, and `clojure.rust.net` |
 | `src/pool_io.rs` | Shared pool tasks and bridge helpers: `ReadMsg`, `PoolStreamSetup`, `pool_reader`, `pool_writer`, `read_bridge`, `write_bridge`, `bytes_value`, `net_error` |
 | `src/tcp.rs` | `TcpStreamResource` (Vec<AbortHandle>), `TcpListenerResource` (Vec<AbortHandle>), pool-based connect/accept, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
 | `src/udp.rs` | `UdpSocketResource`, reader/writer tasks, `socket`/`close` builtins |
 | `src/tls.rs` | `TlsStreamResource` (Vec<AbortHandle>), `TlsListenerResource` (Vec<AbortHandle>), pool-based TLS connect/accept, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
 | `src/unix.rs` | `UnixStreamResource`, `UnixListenerResource` (`close` unlinks path), reader/writer loops, accept loop, `connect`/`listen`/`close` builtins; `#[cfg(unix)]` with non-Unix stubs |
+| `src/quic_config.rs` | Build `quinn::ClientConfig`/`ServerConfig` from opts maps; delegates TLS to `tls::build_client_config`/`build_server_config`, wraps via `QuicClientConfig::try_from`; applies QUIC transport params (`:max-idle-ms`, `:keep-alive-ms`, `:max-streams`) |
+| `src/quic.rs` | `QuicConnectionResource` (holds `quinn::Connection` + `Endpoint` + abort handles), `QuicStreamResource` (abort handles for pool reader/writer + LocalSet bridges), pool accept/open loops, LocalSet bridges, `connect_to`/`open_stream_on`, `connect`/`open-stream`/`close`/`stream-close` builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
 | `src/clojure_rust_net_tls.cljrs` | Clojure source for `clojure.rust.net.tls`; `start-server` sugar |
 | `src/clojure_rust_net_unix.cljrs` | Clojure source for `clojure.rust.net.unix`; `start-server` sugar |
+| `src/clojure_rust_net_quic.cljrs` | Clojure source for `clojure.rust.net.quic`; `with-stream`, `drain-stream` sugar |
 | `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` (`:tcp`, `:tls`, `:unix`) |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
@@ -32,6 +35,7 @@
 | `tests/tls.rs` | Phase E integration tests (TLS echo round-trip with rcgen self-signed cert, connect failure) |
 | `tests/unix.rs` | Phase F integration tests (Unix echo round-trip, listener unlinks path, stale socket removal) |
 | `tests/lifecycle.rs` | Phase G integration tests (split-err, drain-to, with-open, :connect-timeout-ms) |
+| `tests/quic.rs` | Phase Q1 integration tests (QUIC echo round-trip via quinn in-test server, connect-failure path) |
 
 ## Public API
 
@@ -166,6 +170,29 @@ side. `(close conn)` tears down both halves.
 (close sock)  ;; => nil — closes :in/:out and aborts reader/writer tasks
 ```
 
+### `clojure.rust.net.quic` (Phase Q1 — client)
+
+```clojure
+;; Phase Q1 — QUIC client
+(connect {:host "h" :port 4433 :alpn ["hq-interop"] :insecure-skip-verify true})
+;; => promise-chan — yields {:streams ch :remote-addr str :local-addr str :resource h}
+;;    or Value::Error on failure
+;; Optional keys: :insecure-skip-verify, :alpn, :roots (same as tls/connect)
+;;                :max-idle-ms, :keep-alive-ms, :max-streams (QUIC transport params)
+;;                :streams-buf, :in-buf, :out-buf (default 8)
+
+(open-stream conn)                    ;; => promise-chan yielding stream map
+(open-stream conn {:in-buf N :out-buf N})
+;; stream map: {:in ch :out ch :stream-id long :resource h}
+
+(close conn)                          ;; => nil — sends CONNECTION_CLOSE, aborts tasks
+(stream-close stream)                 ;; => nil — aborts stream tasks (sends RESET/FIN)
+
+;; Clojure sugar:
+(with-stream conn (fn [s] ...))       ;; open, use, close
+(drain-stream stream)                 ;; => byte-array of all :in data (^:async context)
+```
+
 ### Rust
 
 ```rust
@@ -182,9 +209,14 @@ pub fn tls::build_client_config(opts: &MapValue) -> ValueResult<Arc<rustls::Clie
 pub fn tls::build_server_config(opts: &MapValue) -> ValueResult<Arc<rustls::ServerConfig>>
 #[cfg(unix)] pub fn unix::connect_to(path: &str, in_buf: usize, out_buf: usize) -> Value
 #[cfg(unix)] pub fn unix::listen_on(path: &str, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
+pub fn quic::connect_to(host: &str, port: u16, config: quinn::ClientConfig, streams_buf: usize, in_buf: usize, out_buf: usize) -> Value
+pub fn quic::open_stream_on(connection: quinn::Connection, in_buf: usize, out_buf: usize) -> Value
+pub fn quic_config::client_config(opts: &MapValue) -> ValueResult<quinn::ClientConfig>
+pub fn quic_config::server_config(opts: &MapValue) -> ValueResult<quinn::ServerConfig>
+pub const NS_QUIC: &str  // "clojure.rust.net.quic"
 ```
 
-`init` registers all three namespaces, calling `cljrs_async::init` internally. Idempotent.
+`init` registers all namespaces including `clojure.rust.net.quic`, calling `cljrs_async::init` internally. Idempotent.
 
 ### `TcpStreamResource`
 
@@ -209,6 +241,14 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for th
 ### `UnixStreamResource` (`#[cfg(unix)]`)
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds `AbortHandle`s for the reader and writer tasks. `close()` aborts both tasks, dropping the Unix stream halves and releasing the FD.
+
+### `QuicConnectionResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds the `quinn::Connection` (for `open_bi`/`close` calls) and the `quinn::Endpoint` (kept alive so the internal UDP driver doesn't shut down while the connection is live). Also holds `Vec<AbortHandle>` for the peer-stream accept loop and LocalSet `:streams` bridge (2 total). `close()` aborts all handles and calls `connection.close(0, b"closed")`, sending a QUIC CONNECTION_CLOSE frame to the peer. `resource_type` → `"QuicConnection"`.
+
+### `QuicStreamResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool reader, pool writer, and LocalSet bridge tasks (4 total). `close()` aborts all handles; dropping the `SendStream`/`RecvStream` on the pool causes quinn to send RESET_STREAM / STOP_SENDING to the peer. `resource_type` → `"QuicStream"`.
 
 ### `UnixListenerResource` (`#[cfg(unix)]`)
 
