@@ -459,58 +459,66 @@ async fn do_quic_connect(
     WorkerPool::global().handle().spawn(async move {
         let addr_str = format!("{host}:{port}");
 
-        // Resolve host to a SocketAddr (handles both IPs and hostnames).
-        let addr = match tokio::net::lookup_host(&addr_str).await {
-            Ok(mut it) => match it.next() {
-                Some(a) => a,
-                None => {
-                    let _ = conn_tx.send(Err(format!("no address for {addr_str}")));
-                    return;
-                }
-            },
+        // Resolve host; prefer IPv4 over IPv6 so that "localhost" works on
+        // runners where /etc/hosts lists ::1 before 127.0.0.1.
+        let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
+            Ok(it) => {
+                let (v4, v6): (Vec<_>, Vec<_>) = it.partition(|a| a.is_ipv4());
+                v4.into_iter().chain(v6).collect()
+            }
             Err(e) => {
                 let _ = conn_tx.send(Err(format!("lookup {addr_str}: {e}")));
                 return;
             }
         };
 
-        let bind: std::net::SocketAddr = if addr.is_ipv6() {
-            "[::]:0".parse().unwrap()
-        } else {
-            "0.0.0.0:0".parse().unwrap()
-        };
+        if addrs.is_empty() {
+            let _ = conn_tx.send(Err(format!("no address for {addr_str}")));
+            return;
+        }
 
-        let mut endpoint = match quinn::Endpoint::client(bind) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = conn_tx.send(Err(format!("endpoint: {e}")));
-                return;
+        let mut last_err = String::new();
+        for addr in addrs {
+            let bind: std::net::SocketAddr = if addr.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            };
+
+            let mut endpoint = match quinn::Endpoint::client(bind) {
+                Ok(e) => e,
+                Err(e) => {
+                    last_err = format!("endpoint: {e}");
+                    continue;
+                }
+            };
+            endpoint.set_default_client_config(quinn_config.clone());
+
+            let connecting = match endpoint.connect(addr, &host) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("connect: {e}");
+                    continue;
+                }
+            };
+
+            match connecting.await {
+                Ok(connection) => {
+                    let remote_addr = connection.remote_address().to_string();
+                    let local_addr = endpoint
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    let _ = conn_tx.send(Ok((connection, endpoint, remote_addr, local_addr)));
+                    return;
+                }
+                Err(e) => {
+                    last_err = format!("handshake: {e}");
+                    continue;
+                }
             }
-        };
-        endpoint.set_default_client_config(quinn_config);
-
-        let connecting = match endpoint.connect(addr, &host) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = conn_tx.send(Err(format!("connect: {e}")));
-                return;
-            }
-        };
-
-        let connection = match connecting.await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = conn_tx.send(Err(format!("handshake: {e}")));
-                return;
-            }
-        };
-
-        let remote_addr = connection.remote_address().to_string();
-        let local_addr = endpoint
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        let _ = conn_tx.send(Ok((connection, endpoint, remote_addr, local_addr)));
+        }
+        let _ = conn_tx.send(Err(last_err));
     });
 
     match conn_rx.await {

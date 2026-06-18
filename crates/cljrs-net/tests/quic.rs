@@ -116,7 +116,7 @@ fn test_quic_echo_round_trip() {
             cljrs_net::quic_config::client_config(&client_opts).expect("client config");
 
         // Connect.
-        let promise = cljrs_net::quic::connect_to("localhost", port, quinn_config, 8, 8, 8);
+        let promise = cljrs_net::quic::connect_to("127.0.0.1", port, quinn_config, 8, 8, 8);
         let conn_val = chan_take(&as_chan(&promise)).await;
         let conn = match conn_val {
             Value::Map(m) => m,
