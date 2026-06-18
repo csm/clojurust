@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS/QUIC networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–G + A2 + Q1 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport).
+**Status**: Phases A–G + A2 + Q1 + Q2 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport, QUIC server transport).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -20,13 +20,13 @@
 | `src/tls.rs` | `TlsStreamResource` (Vec<AbortHandle>), `TlsListenerResource` (Vec<AbortHandle>), pool-based TLS connect/accept, `build_client_config`, `build_server_config`, `tls_connect_to`/`tls_listen_on`/`connect`/`listen`/`close` builtins |
 | `src/unix.rs` | `UnixStreamResource`, `UnixListenerResource` (`close` unlinks path), reader/writer loops, accept loop, `connect`/`listen`/`close` builtins; `#[cfg(unix)]` with non-Unix stubs |
 | `src/quic_config.rs` | Build `quinn::ClientConfig`/`ServerConfig` from opts maps; delegates TLS to `tls::build_client_config`/`build_server_config`, wraps via `QuicClientConfig::try_from`; applies QUIC transport params (`:max-idle-ms`, `:keep-alive-ms`, `:max-streams`) |
-| `src/quic.rs` | `QuicConnectionResource` (holds `quinn::Connection` + `Endpoint` + abort handles), `QuicStreamResource` (abort handles for pool reader/writer + LocalSet bridges), pool accept/open loops, LocalSet bridges, `connect_to`/`open_stream_on`, `connect`/`open-stream`/`close`/`stream-close` builtins |
+| `src/quic.rs` | `QuicConnectionResource` (holds `quinn::Connection` + `Endpoint` + abort handles), `QuicStreamResource` (abort handles for pool reader/writer + LocalSet bridges), `QuicListenerResource` (holds `Endpoint` + abort handles for pool accept loop + LocalSet bridge), pool accept/open loops, LocalSet bridges, `connect_to`/`open_stream_on`/`listen_on`, `connect`/`open-stream`/`close`/`stream-close`/`listen`/`listen-close` builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
 | `src/clojure_rust_net_tls.cljrs` | Clojure source for `clojure.rust.net.tls`; `start-server` sugar |
 | `src/clojure_rust_net_unix.cljrs` | Clojure source for `clojure.rust.net.unix`; `start-server` sugar |
-| `src/clojure_rust_net_quic.cljrs` | Clojure source for `clojure.rust.net.quic`; `with-stream`, `drain-stream` sugar |
+| `src/clojure_rust_net_quic.cljrs` | Clojure source for `clojure.rust.net.quic`; `with-stream`, `drain-stream`, `start-server` sugar |
 | `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` (`:tcp`, `:tls`, `:unix`) |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
@@ -35,7 +35,7 @@
 | `tests/tls.rs` | Phase E integration tests (TLS echo round-trip with rcgen self-signed cert, connect failure) |
 | `tests/unix.rs` | Phase F integration tests (Unix echo round-trip, listener unlinks path, stale socket removal) |
 | `tests/lifecycle.rs` | Phase G integration tests (split-err, drain-to, with-open, :connect-timeout-ms) |
-| `tests/quic.rs` | Phase Q1 integration tests (QUIC echo round-trip via quinn in-test server, connect-failure path) |
+| `tests/quic.rs` | Phases Q1+Q2 integration tests (QUIC echo round-trip via quinn in-test server, QUIC server echo via `listen_on`, listener close, connect-failure path) |
 
 ## Public API
 
@@ -170,7 +170,7 @@ side. `(close conn)` tears down both halves.
 (close sock)  ;; => nil — closes :in/:out and aborts reader/writer tasks
 ```
 
-### `clojure.rust.net.quic` (Phase Q1 — client)
+### `clojure.rust.net.quic` (Phases Q1+Q2)
 
 ```clojure
 ;; Phase Q1 — QUIC client
@@ -188,9 +188,22 @@ side. `(close conn)` tears down both halves.
 (close conn)                          ;; => nil — sends CONNECTION_CLOSE, aborts tasks
 (stream-close stream)                 ;; => nil — aborts stream tasks (sends RESET/FIN)
 
+;; Phase Q2 — QUIC server
+(listen {:port 4433 :cert "cert.pem" :key "key.pem"})
+;; => {:conns <chan> :local-addr "ip:port" :resource h}
+;;    :conns yields a connection map per accepted QUIC connection; closed when listener closes
+;;    connection map: {:streams <chan> :remote-addr str :local-addr str :resource h}
+;;    :streams yields stream maps per accepted bidi stream: {:in ch :out ch :stream-id long :resource h}
+;; Optional keys: :host (default "0.0.0.0"), :alpn [...], :max-idle-ms, :keep-alive-ms
+;;                :max-streams, :conns-buf, :streams-buf, :in-buf, :out-buf (default 8)
+
+(listen-close server)                 ;; => nil — sends CONNECTION_CLOSE, closes :conns
+
 ;; Clojure sugar:
 (with-stream conn (fn [s] ...))       ;; open, use, close
 (drain-stream stream)                 ;; => byte-array of all :in data (^:async context)
+(start-server handler {:port 4433 :cert "cert.pem" :key "key.pem"})
+;; => server-map — spawns go-loop that calls (handler conn) for each accepted QUIC conn
 ```
 
 ### Rust
@@ -211,6 +224,7 @@ pub fn tls::build_server_config(opts: &MapValue) -> ValueResult<Arc<rustls::Serv
 #[cfg(unix)] pub fn unix::listen_on(path: &str, conns_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 pub fn quic::connect_to(host: &str, port: u16, config: quinn::ClientConfig, streams_buf: usize, in_buf: usize, out_buf: usize) -> Value
 pub fn quic::open_stream_on(connection: quinn::Connection, in_buf: usize, out_buf: usize) -> Value
+pub fn quic::listen_on(host: &str, port: u16, server_config: quinn::ServerConfig, conns_buf: usize, streams_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 pub fn quic_config::client_config(opts: &MapValue) -> ValueResult<quinn::ClientConfig>
 pub fn quic_config::server_config(opts: &MapValue) -> ValueResult<quinn::ServerConfig>
 pub const NS_QUIC: &str  // "clojure.rust.net.quic"
@@ -249,6 +263,10 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds the `quinn::Connection` (
 ### `QuicStreamResource`
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the pool reader, pool writer, and LocalSet bridge tasks (4 total). `close()` aborts all handles; dropping the `SendStream`/`RecvStream` on the pool causes quinn to send RESET_STREAM / STOP_SENDING to the peer. `resource_type` → `"QuicStream"`.
+
+### `QuicListenerResource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds the `quinn::Endpoint` (keeps the UDP driver alive and provides `close()`) and `Vec<AbortHandle>` for the pool accept loop and the LocalSet connection bridge (2 total). `close()` aborts both handles and calls `endpoint.close(0, b"listener closed")`, sending QUIC CONNECTION_CLOSE to any in-flight handshakes. `resource_type` → `"QuicListener"`.
 
 ### `UnixListenerResource` (`#[cfg(unix)]`)
 
