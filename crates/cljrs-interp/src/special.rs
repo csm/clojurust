@@ -292,16 +292,132 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         }
     }
 
+    let body = desugar_pre_post_conditions(body);
+
     Ok(CljxFnArity {
         params,
         rest_param,
-        body: body.to_vec(),
+        body,
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::arity::fresh_arity_id(),
         param_hints,
         rest_hint,
     })
+}
+
+/// Desugar a `:pre`/`:post` conditions map at the head of a function body.
+///
+/// Clojure binds `%` to the return value inside `:post` conditions. This
+/// transforms the raw body forms into equivalent assertion code so the
+/// interpreter does not need to handle conditions separately at call time.
+///
+/// Input body (simplified):
+/// ```text
+/// [{:pre [(pos? x)] :post [(pos? %)]} (inc x)]
+/// ```
+/// Output body:
+/// ```text
+/// [(assert (pos? x))
+///  (let* [% (inc x)]
+///    (assert (pos? %))
+///    %)]
+/// ```
+fn desugar_pre_post_conditions(body: &[Form]) -> Vec<Form> {
+    let first = match body.first() {
+        Some(f) => f,
+        None => return body.to_vec(),
+    };
+
+    let entries = match &first.kind {
+        FormKind::Map(entries) => entries,
+        _ => return body.to_vec(),
+    };
+
+    let mut pre_conds: Vec<Form> = Vec::new();
+    let mut post_conds: Vec<Form> = Vec::new();
+    let mut has_conditions = false;
+
+    for chunk in entries.chunks(2) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let (key, val) = (&chunk[0], &chunk[1]);
+        match &key.kind {
+            FormKind::Keyword(k) if k == "pre" => {
+                if let FormKind::Vector(conds) = &val.kind {
+                    pre_conds.extend_from_slice(conds);
+                    has_conditions = true;
+                }
+            }
+            FormKind::Keyword(k) if k == "post" => {
+                if let FormKind::Vector(conds) = &val.kind {
+                    post_conds.extend_from_slice(conds);
+                    has_conditions = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_conditions {
+        return body.to_vec();
+    }
+
+    let real_body = &body[1..]; // strip the conditions map
+    let span = first.span.clone();
+    let mut new_body: Vec<Form> = Vec::new();
+
+    // Emit (assert cond) for each :pre condition.
+    for cond in &pre_conds {
+        new_body.push(make_assert_call(cond, &span));
+    }
+
+    if post_conds.is_empty() {
+        new_body.extend_from_slice(real_body);
+    } else {
+        // Wrap real body in (let* [% <body>] (assert post-cond)... %)
+        // so that % refers to the return value inside :post conditions.
+        let percent = Form::new(FormKind::Symbol("%".to_string()), span.clone());
+
+        let body_expr = if real_body.len() == 1 {
+            real_body[0].clone()
+        } else {
+            let mut do_forms =
+                vec![Form::new(FormKind::Symbol("do".to_string()), span.clone())];
+            do_forms.extend_from_slice(real_body);
+            Form::new(FormKind::List(do_forms), span.clone())
+        };
+
+        let binding_vec = Form::new(
+            FormKind::Vector(vec![percent.clone(), body_expr]),
+            span.clone(),
+        );
+
+        let mut let_forms = vec![
+            Form::new(FormKind::Symbol("let*".to_string()), span.clone()),
+            binding_vec,
+        ];
+        for cond in &post_conds {
+            let_forms.push(make_assert_call(cond, &span));
+        }
+        let_forms.push(percent);
+
+        new_body.push(Form::new(FormKind::List(let_forms), span));
+    }
+
+    new_body
+}
+
+/// Build `(assert <cond>)` as a Form node.
+fn make_assert_call(cond: &Form, span: &cljrs_types::span::Span) -> Form {
+    Form::new(
+        FormKind::List(vec![
+            Form::new(FormKind::Symbol("assert".to_string()), span.clone()),
+            cond.clone(),
+        ]),
+        span.clone(),
+    )
 }
 
 /// Peel a `^hint` wrapper off a parameter form, returning the resolved
