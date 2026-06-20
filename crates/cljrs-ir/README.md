@@ -42,6 +42,9 @@ src/
                   capture only the enclosing locals their (fully macro-expanded)
                   body references (`collect_symbol_names`, a conservative
                   free-variable over-approximation), not every local in scope.
+                  `desugar_pre_post_conditions` rewrites `{:pre [...] :post [...]}`
+                  maps at the head of a function body into `(assert ...)` forms
+                  (binds `%` to the return value in `:post` conditions).
     context.rs  — LowerCtx builder state used by anf.rs
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites

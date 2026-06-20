@@ -971,6 +971,102 @@ fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     Ok(dst)
 }
 
+// ── :pre/:post condition desugaring ──────────────────────────────────────────
+
+/// Mirror of the interpreter's `desugar_pre_post_conditions`.
+///
+/// If the body begins with a `{:pre [...] :post [...]}` map, rewrite it into
+/// explicit `(assert ...)` forms so the IR lowerer generates the same checks as
+/// the tree-walking interpreter.  `%` is bound to the return value inside
+/// `:post` conditions via `(let* [% <body>] post-asserts... %)`.
+fn desugar_pre_post_conditions(body: &[Form]) -> Vec<Form> {
+    let first = match body.first() {
+        Some(f) => f,
+        None => return body.to_vec(),
+    };
+    let entries = match &first.kind {
+        FormKind::Map(entries) => entries,
+        _ => return body.to_vec(),
+    };
+
+    let mut pre_conds: Vec<Form> = Vec::new();
+    let mut post_conds: Vec<Form> = Vec::new();
+    let mut has_conditions = false;
+
+    for chunk in entries.chunks(2) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let (key, val) = (&chunk[0], &chunk[1]);
+        match &key.kind {
+            FormKind::Keyword(k) if k == "pre" => {
+                if let FormKind::Vector(conds) = &val.kind {
+                    pre_conds.extend_from_slice(conds);
+                    has_conditions = true;
+                }
+            }
+            FormKind::Keyword(k) if k == "post" => {
+                if let FormKind::Vector(conds) = &val.kind {
+                    post_conds.extend_from_slice(conds);
+                    has_conditions = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_conditions {
+        return body.to_vec();
+    }
+
+    let real_body = &body[1..];
+    let span = first.span.clone();
+    let mut new_body: Vec<Form> = Vec::new();
+
+    for cond in &pre_conds {
+        new_body.push(make_assert_call(cond, &span));
+    }
+
+    if post_conds.is_empty() {
+        new_body.extend_from_slice(real_body);
+    } else {
+        let percent = Form::new(FormKind::Symbol("%".to_string()), span.clone());
+        let body_expr = if real_body.len() == 1 {
+            real_body[0].clone()
+        } else {
+            let mut do_forms =
+                vec![Form::new(FormKind::Symbol("do".to_string()), span.clone())];
+            do_forms.extend_from_slice(real_body);
+            Form::new(FormKind::List(do_forms), span.clone())
+        };
+        let binding_vec = Form::new(
+            FormKind::Vector(vec![percent.clone(), body_expr]),
+            span.clone(),
+        );
+        let mut let_forms = vec![
+            Form::new(FormKind::Symbol("let*".to_string()), span.clone()),
+            binding_vec,
+        ];
+        for cond in &post_conds {
+            let_forms.push(make_assert_call(cond, &span));
+        }
+        let_forms.push(percent);
+        new_body.push(Form::new(FormKind::List(let_forms), span));
+    }
+
+    new_body
+}
+
+fn make_assert_call(cond: &Form, span: &cljrs_types::span::Span) -> Form {
+    Form::new(
+        FormKind::List(vec![
+            Form::new(FormKind::Symbol("assert".to_string()), span.clone()),
+            cond.clone(),
+        ]),
+        span.clone(),
+    )
+}
+
 // ── fn / fn* ──────────────────────────────────────────────────────────────────
 
 fn parse_params(params_vec: &[Form]) -> Result<(Vec<Form>, Option<Form>), LowerError> {
@@ -1067,7 +1163,7 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
             vec![AritySpec {
                 fixed,
                 rest,
-                body: rest_args[1..].to_vec(),
+                body: desugar_pre_post_conditions(&rest_args[1..]),
             }]
         } else {
             // Multi arity: each element is a list (params body...)
@@ -1088,7 +1184,7 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
                     Ok(AritySpec {
                         fixed,
                         rest,
-                        body: arity_parts[1..].to_vec(),
+                        body: desugar_pre_post_conditions(&arity_parts[1..]),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?
