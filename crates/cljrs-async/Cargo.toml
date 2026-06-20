@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-async"
-version = "0.1.0"
+version = "0.1.157"
 edition = "2024"
 description = "Async support for clojurust — clojure.core.async via Tokio"
 license.workspace = true
