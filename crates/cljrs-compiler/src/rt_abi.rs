@@ -2432,6 +2432,12 @@ pub unsafe extern "C" fn rt_load_var(
         if let Some(var) = globals.lookup_var_in_ns(ns, name) {
             return box_val(Value::Var(var));
         }
+        // Try resolving ns as an alias in the current namespace.
+        if let Some(resolved_ns) = globals.resolve_alias(&current_ns, ns)
+            && let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name)
+        {
+            return box_val(Value::Var(var));
+        }
         // If ns is the current namespace, also check refers via current ns.
         if ns == current_ns.as_ref()
             && let Some(var) = globals.lookup_var_in_ns(&current_ns, name)
