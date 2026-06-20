@@ -1456,11 +1456,7 @@ mod tests {
         .unwrap();
         let (_, mut env) = make_env_with_paths(vec![dir]);
         // Regular call via alias must work first.
-        let call_result = eval_src(
-            "(require '[lib.core :as l]) (l/public 21)",
-            &mut env,
-        )
-        .unwrap();
+        let call_result = eval_src("(require '[lib.core :as l]) (l/public 21)", &mut env).unwrap();
         assert_eq!(call_result, Value::Long(42));
         // #'alias/sym reader form.
         let var_result = eval_src("#'l/public", &mut env).unwrap();
