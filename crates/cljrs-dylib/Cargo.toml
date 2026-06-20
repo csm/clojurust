@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-dylib"
-version = "0.1.0"
+version = "0.1.159"
 edition = "2024"
 description = "Pinned native packages for clojurust: build a dependency's Rust crate at a pinned commit as a cdylib and load it (:rust/load :dylib)"
 license.workspace = true
