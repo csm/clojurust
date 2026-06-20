@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS/QUIC networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–G + A2 + Q1 + Q2 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport, QUIC server transport).
+**Status**: Phases A–G + A2 + Q1 + Q2 + Q3 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport, QUIC server transport, HTTP/3 client).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -21,12 +21,14 @@
 | `src/unix.rs` | `UnixStreamResource`, `UnixListenerResource` (`close` unlinks path), reader/writer loops, accept loop, `connect`/`listen`/`close` builtins; `#[cfg(unix)]` with non-Unix stubs |
 | `src/quic_config.rs` | Build `quinn::ClientConfig`/`ServerConfig` from opts maps; delegates TLS to `tls::build_client_config`/`build_server_config`, wraps via `QuicClientConfig::try_from`; applies QUIC transport params (`:max-idle-ms`, `:keep-alive-ms`, `:max-streams`) |
 | `src/quic.rs` | `QuicConnectionResource` (holds `quinn::Connection` + `Endpoint` + abort handles), `QuicStreamResource` (abort handles for pool reader/writer + LocalSet bridges), `QuicListenerResource` (holds `Endpoint` + abort handles for pool accept loop + LocalSet bridge), pool accept/open loops, LocalSet bridges, `connect_to`/`open_stream_on`/`listen_on`, `connect`/`open-stream`/`close`/`stream-close`/`listen`/`listen-close` builtins |
+| `src/h3.rs` | `H3Resource` (holds `quinn::Connection` + `Endpoint` + abort handles for pool streaming task and LocalSet body-bridge), pool task for QUIC connect + h3 handshake + request send + response header recv + body streaming, LocalSet body bridge (`local_body_bridge`), `get`/`h3_request` public Rust API, `get`/`request`/`close` Clojure builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
 | `src/clojure_rust_net_tls.cljrs` | Clojure source for `clojure.rust.net.tls`; `start-server` sugar |
 | `src/clojure_rust_net_unix.cljrs` | Clojure source for `clojure.rust.net.unix`; `start-server` sugar |
 | `src/clojure_rust_net_quic.cljrs` | Clojure source for `clojure.rust.net.quic`; `with-stream`, `drain-stream`, `start-server` sugar |
+| `src/clojure_rust_net_h3.cljrs` | Clojure source for `clojure.rust.net.h3`; `drain-body`, `get-string` sugar |
 | `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` (`:tcp`, `:tls`, `:unix`) |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
