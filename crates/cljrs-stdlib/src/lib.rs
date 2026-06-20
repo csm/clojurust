@@ -279,6 +279,23 @@ mod tests {
             run("(str/replace-first \"aabbcc\" \"a\" \"X\")", &mut env).unwrap(),
             Value::string("Xabbcc")
         );
+        // regex match (issue #188)
+        assert_eq!(
+            run("(str/replace \"--host\" #\"^--\" \"\")", &mut env).unwrap(),
+            Value::string("host")
+        );
+        assert_eq!(
+            run("(str/replace \"aaa\" #\"a\" \"b\")", &mut env).unwrap(),
+            Value::string("bbb")
+        );
+        assert_eq!(
+            run("(str/replace-first \"aaa\" #\"a\" \"b\")", &mut env).unwrap(),
+            Value::string("baa")
+        );
+        assert_eq!(
+            run("(str/replace-first \"--host\" #\"^--\" \"\")", &mut env).unwrap(),
+            Value::string("host")
+        );
     }
 
     #[test]

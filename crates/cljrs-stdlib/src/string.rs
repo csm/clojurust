@@ -176,16 +176,32 @@ fn includes_q(args: &[Value]) -> ValueResult<Value> {
 
 fn replace(args: &[Value]) -> ValueResult<Value> {
     let s = get_str(&args[0])?;
-    let from = get_str(&args[1])?;
     let to = get_str(&args[2])?;
-    Ok(make_str(s.replace(from.as_ref(), to.as_ref())))
+    match &args[1] {
+        Value::Pattern(re) => {
+            let re = re.get();
+            Ok(make_str(re.replace_all(s.as_ref(), to.as_ref()).into_owned()))
+        }
+        _ => {
+            let from = get_str(&args[1])?;
+            Ok(make_str(s.replace(from.as_ref(), to.as_ref())))
+        }
+    }
 }
 
 fn replace_first(args: &[Value]) -> ValueResult<Value> {
     let s = get_str(&args[0])?;
-    let from = get_str(&args[1])?;
     let to = get_str(&args[2])?;
-    Ok(make_str(s.replacen(from.as_ref(), to.as_ref(), 1)))
+    match &args[1] {
+        Value::Pattern(re) => {
+            let re = re.get();
+            Ok(make_str(re.replace(s.as_ref(), to.as_ref()).into_owned()))
+        }
+        _ => {
+            let from = get_str(&args[1])?;
+            Ok(make_str(s.replacen(from.as_ref(), to.as_ref(), 1)))
+        }
+    }
 }
 
 /// `(split s delim)` or `(split s delim limit)`.

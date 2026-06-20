@@ -64,6 +64,10 @@ pub fn standard_env_with_paths(source_paths: Vec<PathBuf>) -> Arc<GlobalEnv>;
 `replace`, `replace-first`, `split`, `split-lines`, `join`,
 `index-of`, `last-index-of`
 
+`replace` and `replace-first` accept either a string or a regex pattern
+(`#"..."`) as the match argument. When the match is a pattern, `replace`
+replaces all occurrences and `replace-first` replaces only the first.
+
 ### clojure.set functions
 
 `union`, `intersection`, `difference`, `subset?`, `superset?`,
