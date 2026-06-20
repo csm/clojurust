@@ -180,7 +180,9 @@ fn replace(args: &[Value]) -> ValueResult<Value> {
     match &args[1] {
         Value::Pattern(re) => {
             let re = re.get();
-            Ok(make_str(re.replace_all(s.as_ref(), to.as_ref()).into_owned()))
+            Ok(make_str(
+                re.replace_all(s.as_ref(), to.as_ref()).into_owned(),
+            ))
         }
         _ => {
             let from = get_str(&args[1])?;
