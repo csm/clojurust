@@ -12,8 +12,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cljrs_async::channel::{chan_ref, chan_take};
 use cljrs_async::worker_pool::WorkerPool;
-use cljrs_value::{Keyword, MapValue, NativeObjectBox, Value};
 use cljrs_gc::GcPtr;
+use cljrs_value::{Keyword, MapValue, NativeObjectBox, Value};
 
 fn setup_globals() -> Arc<cljrs_env::env::GlobalEnv> {
     let globals = cljrs_stdlib::standard_env();
@@ -42,11 +42,9 @@ fn make_server_config() -> quinn::ServerConfig {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("rcgen cert generation failed");
 
-    let cert_der =
-        rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        certified.key_pair.serialize_der().into(),
-    );
+    let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
 
     let mut rustls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -70,9 +68,8 @@ fn make_server_config() -> quinn::ServerConfig {
 ///
 /// Responds to every request with HTTP 200 and the body `"h3 Q3 test body"`.
 fn spawn_h3_server(server_config: quinn::ServerConfig) -> u16 {
-    let endpoint =
-        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint");
     let port = endpoint.local_addr().unwrap().port();
 
     WorkerPool::global().handle().spawn(async move {
@@ -182,8 +179,7 @@ fn test_h3_get_round_trip() {
             }
         }
         assert_eq!(
-            body,
-            b"h3 Q3 test body",
+            body, b"h3 Q3 test body",
             "response body must match server payload"
         );
 
@@ -286,10 +282,7 @@ fn test_h3_close_before_drain() {
             match chan_take(&body_ch).await {
                 Value::Nil => break,
                 Value::ByteArray(_) => {} // drain buffered data
-                other => panic!(
-                    "unexpected value on closed :body: {}",
-                    other.type_name()
-                ),
+                other => panic!("unexpected value on closed :body: {}", other.type_name()),
             }
         }
     });

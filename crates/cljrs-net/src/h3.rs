@@ -34,8 +34,8 @@ use cljrs_env::env::GlobalEnv;
 use cljrs_env::error::EvalResult;
 use cljrs_gc::GcPtr;
 use cljrs_value::{
-    Arity, Keyword, MapValue, NativeFn, NativeObjectBox, PersistentVector, Resource, ResourceHandle,
-    Value, ValueError, ValueResult,
+    Arity, Keyword, MapValue, NativeFn, NativeObjectBox, PersistentVector, Resource,
+    ResourceHandle, Value, ValueError, ValueResult,
 };
 
 use crate::pool_io::{bytes_value, net_error};
@@ -337,12 +337,7 @@ async fn pool_h3_request(
     let headers: Vec<(String, String)> = response
         .headers()
         .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                v.to_str().unwrap_or("").to_string(),
-            )
-        })
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
     let partial = H3ResponsePartial {
@@ -419,13 +414,7 @@ async fn local_body_bridge(
 /// `:roots`, `:max-idle-ms`, etc.). `:alpn ["h3"]` is injected automatically
 /// when absent.
 pub fn get(url: &str, opts: &MapValue, body_buf: usize) -> ValueResult<Value> {
-    h3_request(
-        url,
-        http::Method::GET,
-        vec![],
-        opts,
-        body_buf,
-    )
+    h3_request(url, http::Method::GET, vec![], opts, body_buf)
 }
 
 /// Issue an arbitrary HTTP/3 request and return a promise channel.
@@ -440,14 +429,11 @@ pub fn h3_request(
     opts: &MapValue,
     body_buf: usize,
 ) -> ValueResult<Value> {
-    let (host, port, uri) =
-        parse_url(url).map_err(ValueError::Other)?;
+    let (host, port, uri) = parse_url(url).map_err(ValueError::Other)?;
     let quinn_config = h3_client_config(opts)?;
 
-    let (body_tx, body_rx) =
-        mpsc::channel::<Result<Vec<u8>, String>>(body_buf.max(1));
-    let (response_tx, response_rx) =
-        oneshot::channel::<Result<H3ResponsePartial, String>>();
+    let (body_tx, body_rx) = mpsc::channel::<Result<Vec<u8>, String>>(body_buf.max(1));
+    let (response_tx, response_rx) = oneshot::channel::<Result<H3ResponsePartial, String>>();
 
     let pool_jh = WorkerPool::global().handle().spawn(pool_h3_request(
         host,
@@ -492,8 +478,7 @@ async fn do_h3_response(
 
     // Build :body channel and LocalSet bridge.
     let body_chan = make_chan(body_buf);
-    let bridge_jh =
-        tokio::task::spawn_local(local_body_bridge(body_rx, body_chan.clone()));
+    let bridge_jh = tokio::task::spawn_local(local_body_bridge(body_rx, body_chan.clone()));
     let bridge_abort = bridge_jh.abort_handle();
 
     // Build H3Resource.
@@ -570,8 +555,7 @@ fn builtin_request(args: &[Value]) -> ValueResult<Value> {
         _ => MapValue::empty(),
     };
 
-    let url =
-        opts_str(&req_map, "url").ok_or_else(|| ValueError::Other(":url required".into()))?;
+    let url = opts_str(&req_map, "url").ok_or_else(|| ValueError::Other(":url required".into()))?;
     let method_str = opts_str(&req_map, "method").unwrap_or_else(|| "GET".to_string());
     let method = method_str
         .parse::<http::Method>()
