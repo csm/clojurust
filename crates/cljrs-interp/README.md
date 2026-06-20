@@ -37,7 +37,9 @@ src/
                    defmulti, defmethod, defrecord, reify, binding, with-out-str.
                    parse_arity peels primitive type hints (`^long x`, `^doubles a`)
                    off params into CljxFnArity::param_hints; let*/loop* binding
-                   hints are stripped via bind_pattern's Meta arm (destructure.rs)
+                   hints are stripped via bind_pattern's Meta arm (destructure.rs);
+                   desugar_pre_post_conditions rewrites {:pre [...] :post [...]} maps
+                   into assertion forms (binds % to return value in :post conditions)
   apply.rs       — eval_call: macro expansion, native-fn dispatch, CljxFn
                    application, recur trampoline; special env-needing handlers
                    (apply, atom, reset!, swap!, volatile!, vreset!, vswap!,

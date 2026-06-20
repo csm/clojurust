@@ -1868,4 +1868,52 @@ mod tests {
             panic!("expected map");
         }
     }
+
+    // ── :pre/:post conditions ─────────────────────────────────────────────
+
+    #[test]
+    fn test_post_condition_percent_bound() {
+        // % must resolve to the return value inside :post conditions.
+        let v = eval_str("(defn g [x] {:post [(pos? %)]} (inc x)) (g 5)").unwrap();
+        assert_eq!(v, long(6));
+    }
+
+    #[test]
+    fn test_post_condition_violation_throws() {
+        // A failing :post condition must throw.
+        let r = eval_str("(defn g [x] {:post [(neg? %)]} (inc x)) (g 5)");
+        assert!(r.is_err(), "expected error from failing :post condition");
+    }
+
+    #[test]
+    fn test_pre_condition_passes() {
+        let v = eval_str("(defn g [x] {:pre [(pos? x)]} (inc x)) (g 5)").unwrap();
+        assert_eq!(v, long(6));
+    }
+
+    #[test]
+    fn test_pre_condition_violation_throws() {
+        let r = eval_str("(defn g [x] {:pre [(pos? x)]} (inc x)) (g -1)");
+        assert!(r.is_err(), "expected error from failing :pre condition");
+    }
+
+    #[test]
+    fn test_pre_and_post_conditions() {
+        let v = eval_str("(defn g [x] {:pre [(pos? x)] :post [(> % x)]} (inc x)) (g 3)").unwrap();
+        assert_eq!(v, long(4));
+    }
+
+    #[test]
+    fn test_post_condition_no_pre() {
+        // :post only (no :pre).
+        let v = eval_str("(defn h [x] {:post [(number? %)]} (inc x)) (h 2)").unwrap();
+        assert_eq!(v, long(3));
+    }
+
+    #[test]
+    fn test_pre_condition_no_post() {
+        // :pre only (no :post); existing test variant without conditions map.
+        let v = eval_str("(defn h [x] {:pre [(number? x)]} x) (h 42)").unwrap();
+        assert_eq!(v, long(42));
+    }
 }
