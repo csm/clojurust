@@ -63,6 +63,8 @@ pub fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("close", Arity::Fixed(1), builtin_close),
         ("stream-close", Arity::Fixed(1), builtin_stream_close),
+        ("listen", Arity::Fixed(1), builtin_listen),
+        ("listen-close", Arity::Fixed(1), builtin_listen_close),
     ];
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
@@ -186,6 +188,66 @@ impl Resource for QuicStreamResource {
     }
 }
 
+// ── QuicListenerResource ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct QuicListenerInner {
+    closed: bool,
+    abort_handles: Vec<AbortHandle>,
+}
+
+/// `Resource` for a QUIC server listener.
+///
+/// Holds the `quinn::Endpoint` (to call `close()` and to keep the driver alive)
+/// and abort handles for the pool connection-accept loop and the LocalSet
+/// `:conns` bridge (2 total). `close()` aborts all handles and calls
+/// `endpoint.close(...)`, sending CONNECTION_CLOSE to all open connections.
+#[derive(Debug)]
+pub struct QuicListenerResource {
+    endpoint: quinn::Endpoint,
+    inner: Arc<Mutex<QuicListenerInner>>,
+}
+
+impl QuicListenerResource {
+    fn new(endpoint: quinn::Endpoint) -> Self {
+        Self {
+            endpoint,
+            inner: Arc::new(Mutex::new(QuicListenerInner {
+                closed: false,
+                abort_handles: Vec::new(),
+            })),
+        }
+    }
+}
+
+impl Resource for QuicListenerResource {
+    fn close(&self) -> ValueResult<()> {
+        let mut g = self.inner.lock().unwrap();
+        if g.closed {
+            return Ok(());
+        }
+        g.closed = true;
+        for h in g.abort_handles.drain(..) {
+            h.abort();
+        }
+        self.endpoint
+            .close(quinn::VarInt::from_u32(0), b"listener closed");
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+
+    fn resource_type(&self) -> &'static str {
+        "QuicListener"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 // ── Internal message types ─────────────────────────────────────────────────────
 
 /// A `PoolStreamSetup` augmented with the QUIC stream index.
@@ -195,6 +257,16 @@ struct QuicStreamSetup {
 }
 
 type QuicStreamResult = Result<QuicStreamSetup, String>;
+
+/// A completed QUIC handshake, sent from the pool accept loop to the LocalSet bridge.
+struct QuicConnectionSetup {
+    connection: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    remote_addr: String,
+    local_addr: String,
+}
+
+type QuicConnectionResult = Result<QuicConnectionSetup, String>;
 
 // ── Value helpers ──────────────────────────────────────────────────────────────
 
@@ -306,6 +378,50 @@ async fn pool_open_stream(
     }
 }
 
+/// Runs on the pool: loops on `endpoint.accept()` and, for each incoming
+/// connection, spawns a task to await the QUIC handshake and then sends the
+/// resolved `quinn::Connection` to the LocalSet bridge via `conn_tx`.
+///
+/// Handshakes run concurrently (one spawned task per `Incoming`), so a slow
+/// handshake does not block subsequent accepts.
+async fn pool_listener_accept_loop(
+    endpoint: quinn::Endpoint,
+    conn_tx: mpsc::Sender<QuicConnectionResult>,
+) {
+    let local_addr = endpoint
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            // Endpoint was closed; stop accepting.
+            break;
+        };
+
+        let conn_tx = conn_tx.clone();
+        let endpoint_clone = endpoint.clone();
+        let local_addr = local_addr.clone();
+
+        tokio::spawn(async move {
+            match incoming.await {
+                Err(_) => {} // individual handshake failure — ignore, keep accepting
+                Ok(connection) => {
+                    let remote_addr = connection.remote_address().to_string();
+                    let _ = conn_tx
+                        .send(Ok(QuicConnectionSetup {
+                            connection,
+                            endpoint: endpoint_clone,
+                            remote_addr,
+                            local_addr,
+                        }))
+                        .await;
+                }
+            }
+        });
+    }
+}
+
 // ── LocalSet bridges (touch GcPtr / Value) ────────────────────────────────────
 
 /// Runs on the LocalSet: receives `QuicStreamResult` from `pool_stream_accept_loop`,
@@ -409,6 +525,41 @@ fn make_quic_connection(
         (kw("local-addr"), Value::string(local_addr)),
         (kw("resource"), Value::Resource(resource_handle)),
     ]))
+}
+
+/// Runs on the LocalSet: receives `QuicConnectionResult` from
+/// `pool_listener_accept_loop`, builds a connection map (spawning the per-connection
+/// peer-stream accept loop and its bridge), and puts it on the `:conns` channel.
+async fn local_listener_accept_bridge(
+    mut conn_rx: mpsc::Receiver<QuicConnectionResult>,
+    conns_chan: GcPtr<NativeObjectBox>,
+    streams_buf: usize,
+    in_buf: usize,
+    out_buf: usize,
+) {
+    while let Some(result) = conn_rx.recv().await {
+        match result {
+            Err(e) => {
+                chan_put(&conns_chan, net_error(e)).await;
+                break;
+            }
+            Ok(setup) => {
+                let conn_val = make_quic_connection(
+                    setup.connection,
+                    setup.endpoint,
+                    setup.remote_addr,
+                    setup.local_addr,
+                    streams_buf,
+                    in_buf,
+                    out_buf,
+                );
+                if !chan_put(&conns_chan, conn_val).await {
+                    break;
+                }
+            }
+        }
+    }
+    chan_ref(conns_chan.get()).close();
 }
 
 // ── Connect implementation ─────────────────────────────────────────────────────
@@ -576,6 +727,73 @@ async fn do_open_stream(
     Ok(Value::Nil)
 }
 
+// ── Listen implementation ──────────────────────────────────────────────────────
+
+/// Bind a QUIC server endpoint and return a server map immediately.
+///
+/// The `quinn::Endpoint` is created synchronously (UDP bind). The pool accept
+/// loop and LocalSet `:conns` bridge are started before this function returns.
+///
+/// Server map shape:
+/// ```clojure
+/// {:conns      <chan>     ; yields a connection map per accepted QUIC connection
+///  :local-addr "ip:port"
+///  :resource   <handle>} ; QuicListenerResource
+/// ```
+pub fn listen_on(
+    host: &str,
+    port: u16,
+    server_config: quinn::ServerConfig,
+    conns_buf: usize,
+    streams_buf: usize,
+    in_buf: usize,
+    out_buf: usize,
+) -> ValueResult<Value> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|_| ValueError::Other(format!("invalid address: {host}:{port}")))?;
+
+    let endpoint = quinn::Endpoint::server(server_config, addr)
+        .map_err(|e| ValueError::Other(format!("bind: {e}")))?;
+
+    let local_addr = endpoint
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    let conns_chan = make_chan(conns_buf);
+
+    let resource = QuicListenerResource::new(endpoint.clone());
+    let shared_inner = resource.inner.clone();
+    let resource_handle = ResourceHandle::new(resource);
+
+    let (conn_tx, conn_rx) = mpsc::channel::<QuicConnectionResult>(conns_buf.max(1));
+
+    let pool_jh = WorkerPool::global()
+        .handle()
+        .spawn(pool_listener_accept_loop(endpoint, conn_tx));
+
+    let bridge_jh = tokio::task::spawn_local(local_listener_accept_bridge(
+        conn_rx,
+        conns_chan.clone(),
+        streams_buf,
+        in_buf,
+        out_buf,
+    ));
+
+    {
+        let mut g = shared_inner.lock().unwrap();
+        g.abort_handles.push(pool_jh.abort_handle());
+        g.abort_handles.push(bridge_jh.abort_handle());
+    }
+
+    Ok(Value::Map(MapValue::from_pairs(vec![
+        (kw("conns"), Value::NativeObject(conns_chan)),
+        (kw("local-addr"), Value::string(local_addr)),
+        (kw("resource"), Value::Resource(resource_handle)),
+    ])))
+}
+
 // ── Builtins ───────────────────────────────────────────────────────────────────
 
 /// `(connect {:host h :port p :alpn [...] :insecure-skip-verify bool ...})`
@@ -687,6 +905,66 @@ fn builtin_stream_close(args: &[Value]) -> ValueResult<Value> {
         chan_ref(obj.get()).close();
     }
     if let Some(Value::Resource(handle)) = stream.get(&kw("resource")) {
+        let _ = handle.close();
+    }
+
+    Ok(Value::Nil)
+}
+
+/// `(listen {:host h :port p :cert path :key path ...})` — bind a QUIC server
+/// endpoint and return a server map `{:conns chan :local-addr str :resource h}`.
+///
+/// Option keys: `:host` (default `"0.0.0.0"`), `:port` (required), `:cert`,
+/// `:key`, `:alpn`, `:max-idle-ms`, `:keep-alive-ms`, `:max-streams`,
+/// `:conns-buf`, `:streams-buf`, `:in-buf`, `:out-buf` (default 8 each).
+fn builtin_listen(args: &[Value]) -> ValueResult<Value> {
+    let opts = match args.first() {
+        Some(Value::Map(m)) => m.clone(),
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "map {:port long :cert str :key str}",
+                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
+            });
+        }
+    };
+
+    let host = opts_str(&opts, "host").unwrap_or_else(|| "0.0.0.0".to_string());
+    let port =
+        opts_port(&opts).ok_or_else(|| ValueError::Other(":port required (1-65535)".into()))?;
+    let conns_buf = opts_usize(&opts, "conns-buf").unwrap_or(8);
+    let streams_buf = opts_usize(&opts, "streams-buf").unwrap_or(8);
+    let in_buf = opts_usize(&opts, "in-buf").unwrap_or(8);
+    let out_buf = opts_usize(&opts, "out-buf").unwrap_or(8);
+
+    let server_config = crate::quic_config::server_config(&opts)?;
+    listen_on(
+        &host,
+        port,
+        server_config,
+        conns_buf,
+        streams_buf,
+        in_buf,
+        out_buf,
+    )
+}
+
+/// `(listen-close server)` — stop accepting new connections, close `:conns`,
+/// and send CONNECTION_CLOSE to all connected peers.
+fn builtin_listen_close(args: &[Value]) -> ValueResult<Value> {
+    let server = match args.first() {
+        Some(Value::Map(m)) => m.clone(),
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "server map {:conns chan :resource handle}",
+                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
+            });
+        }
+    };
+
+    if let Some(Value::NativeObject(obj)) = server.get(&kw("conns")) {
+        chan_ref(obj.get()).close();
+    }
+    if let Some(Value::Resource(handle)) = server.get(&kw("resource")) {
         let _ = handle.close();
     }
 

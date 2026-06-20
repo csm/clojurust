@@ -1,11 +1,15 @@
-;; clojure.rust.net.quic — QUIC multiplexed transport client.
+;; clojure.rust.net.quic — QUIC multiplexed transport.
 ;;
 ;; Phase Q1 (QUIC client):
 ;;   connect      — (connect opts) => promise-chan -> conn-map
 ;;   open-stream  — (open-stream conn) / (open-stream conn opts) => promise-chan -> stream-map
 ;;   close        — (close conn) => nil
 ;;   stream-close — (stream-close stream) => nil
-;;   start-server — (start-server handler opts) => reserved for Q2
+;;
+;; Phase Q2 (QUIC server):
+;;   listen       — (listen opts) => {:conns ch :local-addr str :resource h}
+;;   listen-close — (listen-close server) => nil
+;;   start-server — (start-server handler opts) => server-map
 
 (defn with-stream
   "Open a stream on `conn`, call `(f stream)`, then close the stream.
@@ -47,3 +51,35 @@
                 (recur (+ i (count chunk)) (rest chunks))))
             result)
           (recur (conj acc v)))))))
+
+(defn start-server
+  "Start a QUIC server with `handler` called for each accepted connection.
+  Returns the server map `{:conns <chan> :local-addr str :resource handle}`.
+
+  `handler` is called with a connection map for each accepted QUIC connection.
+  The connection map has `:streams`, `:remote-addr`, `:local-addr`, `:resource`.
+  Use `(go ...)` inside the handler to avoid blocking new accepts.
+
+  Opts (same as listen):
+    :port             integer (required, 1-65535)
+    :cert             path to PEM certificate file (required)
+    :key              path to PEM private-key file (required)
+    :host             string (default \"0.0.0.0\")
+    :alpn             vector of ALPN protocol strings
+    :max-idle-ms      QUIC idle timeout in milliseconds
+    :keep-alive-ms    QUIC keep-alive interval in milliseconds
+    :max-streams      max concurrent bidirectional streams per connection
+    :conns-buf        buffer depth for :conns (default 8)
+    :streams-buf      buffer depth for per-connection :streams (default 8)
+    :in-buf           per-stream :in buffer depth (default 8)
+    :out-buf          per-stream :out buffer depth (default 8)"
+  [handler opts]
+  (let [server (clojure.rust.net.quic/listen opts)
+        conns  (:conns server)]
+    (clojure.core.async/go
+      (loop []
+        (let [conn (await (clojure.core.async/take! conns))]
+          (when (some? conn)
+            (handler conn)
+            (recur)))))
+    server))

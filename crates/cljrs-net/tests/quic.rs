@@ -1,9 +1,14 @@
-//! Phase Q1 integration tests: QUIC client transport.
+//! Phase Q1 + Q2 integration tests: QUIC transport.
 //!
-//! Done criterion: client connects to a quinn echo server, opens a bidirectional
-//! stream, sends bytes, FINs the write side, drains the echoed response.
-//! Also validates the failure path (connect timeout to a dead UDP port yields
+//! Q1 done criterion: client connects to a quinn echo server, opens a
+//! bidirectional stream, sends bytes, FINs the write side, drains the echoed
+//! response.  Also validates the failure path (connect timeout yields
 //! Value::Error).
+//!
+//! Q2 done criterion: `listen_on` binds a server endpoint; a cljrs client
+//! connects, opens a stream, and the server-side channels deliver the stream
+//! map so the server can echo.  Also validates that closing the listener closes
+//! the `:conns` channel.
 
 use std::sync::Arc;
 
@@ -183,6 +188,198 @@ fn test_quic_echo_round_trip() {
         if let Value::Resource(handle) = map_get(&conn, "resource") {
             let _ = handle.close();
         }
+    });
+}
+
+// ── Q2 tests ───────────────────────────────────────────────────────────────────
+
+/// Phase Q2 done criterion: `listen_on` server accepts a client connection,
+/// the client opens a bidi stream, the server-side `:streams` channel delivers
+/// it, and both sides can exchange bytes.
+#[test]
+fn test_quic_server_echo_round_trip() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async {
+        let _globals = setup_globals();
+
+        let (server_config, _cert) = make_server_config();
+
+        // Start the cljrs QUIC server.
+        let server_val = cljrs_net::quic::listen_on("127.0.0.1", 0, server_config, 8, 8, 8, 8)
+            .expect("listen_on failed");
+        let server_map = match server_val {
+            Value::Map(m) => m,
+            other => panic!("expected server map, got {}", other.type_name()),
+        };
+
+        let local_addr_str = match map_get(&server_map, "local-addr") {
+            Value::Str(s) => s.get().clone(),
+            other => panic!("expected str :local-addr, got {}", other.type_name()),
+        };
+        let port: u16 = local_addr_str
+            .split(':')
+            .last()
+            .unwrap()
+            .parse()
+            .expect("parse port");
+
+        let conns_ch = as_chan(&map_get(&server_map, "conns"));
+
+        // Connect a cljrs client.
+        let client_opts =
+            MapValue::from_pairs(vec![(kw("insecure-skip-verify"), Value::Bool(true))]);
+        let quinn_config =
+            cljrs_net::quic_config::client_config(&client_opts).expect("client config");
+        let conn_promise = cljrs_net::quic::connect_to("127.0.0.1", port, quinn_config, 8, 8, 8);
+        let conn_val = chan_take(&as_chan(&conn_promise)).await;
+        let conn = match conn_val {
+            Value::Map(m) => m,
+            Value::Error(e) => panic!("client connect failed: {}", e.get().message()),
+            other => panic!("expected conn map, got {}", other.type_name()),
+        };
+
+        // Accept the server-side connection.
+        let server_conn_val = chan_take(&conns_ch).await;
+        let server_conn = match server_conn_val {
+            Value::Map(m) => m,
+            Value::Error(e) => panic!("server accept failed: {}", e.get().message()),
+            other => panic!("expected conn map, got {}", other.type_name()),
+        };
+        let streams_ch = as_chan(&map_get(&server_conn, "streams"));
+
+        // Client opens a bidirectional stream and waits for the stream map.
+        let resource_handle = match map_get(&conn, "resource") {
+            Value::Resource(h) => h,
+            other => panic!("expected resource, got {}", other.type_name()),
+        };
+        let conn_res = resource_handle
+            .downcast::<cljrs_net::quic::QuicConnectionResource>()
+            .expect("downcast QuicConnectionResource");
+        let stream_promise = cljrs_net::quic::open_stream_on(conn_res.connection.clone(), 8, 8);
+
+        // Await the client stream map first — this yields so that do_open_stream
+        // runs and calls connection.open_bi(), creating the stream locally.
+        let stream_val = chan_take(&as_chan(&stream_promise)).await;
+        let stream = match stream_val {
+            Value::Map(m) => m,
+            Value::Error(e) => panic!("open_stream failed: {}", e.get().message()),
+            other => panic!("expected stream map, got {}", other.type_name()),
+        };
+
+        let client_out = as_chan(&map_get(&stream, "out"));
+        let client_in = as_chan(&map_get(&stream, "in"));
+
+        // Client writes data and FINs the write half BEFORE waiting for the
+        // server stream.  In QUIC, the server's accept_bi() only fires when the
+        // peer sends the first STREAM frame, so data must be in flight first.
+        let request = b"phase Q2 QUIC server echo test";
+        let signed: Vec<i8> = request.iter().map(|&b| b as i8).collect();
+        chan_put(
+            &client_out,
+            Value::ByteArray(GcPtr::new(std::sync::Mutex::new(signed))),
+        )
+        .await;
+        chan_ref(client_out.get()).close(); // FIN — write_bridge sees EOF, pool_writer shuts down
+
+        // Now wait for the server-side stream.  The write above enqueued bytes on
+        // :out; write_bridge will drain them on the next yield, triggering STREAM
+        // frames over the wire and waking up pool_stream_accept_loop's accept_bi.
+        let server_stream_val = chan_take(&streams_ch).await;
+        let server_stream = match server_stream_val {
+            Value::Map(m) => m,
+            Value::Error(e) => panic!("stream accept failed: {}", e.get().message()),
+            other => panic!("expected stream map, got {}", other.type_name()),
+        };
+
+        let server_in = as_chan(&map_get(&server_stream, "in"));
+        let server_out = as_chan(&map_get(&server_stream, "out"));
+
+        // Server drains :in to EOF, then echoes the whole payload.
+        let mut echo_data: Vec<u8> = Vec::new();
+        loop {
+            match chan_take(&server_in).await {
+                Value::Nil => break,
+                Value::ByteArray(arr) => {
+                    echo_data.extend(arr.get().lock().unwrap().iter().map(|&b| b as u8));
+                }
+                Value::Error(e) => panic!("server read error: {}", e.get().message()),
+                other => panic!("unexpected value on server :in: {}", other.type_name()),
+            }
+        }
+        let echo_signed: Vec<i8> = echo_data.iter().map(|&b| b as i8).collect();
+        chan_put(
+            &server_out,
+            Value::ByteArray(GcPtr::new(std::sync::Mutex::new(echo_signed))),
+        )
+        .await;
+        chan_ref(server_out.get()).close();
+
+        // Client drains :in.
+        let mut response: Vec<u8> = Vec::new();
+        loop {
+            match chan_take(&client_in).await {
+                Value::Nil => break,
+                Value::ByteArray(arr) => {
+                    response.extend(arr.get().lock().unwrap().iter().map(|&b| b as u8));
+                }
+                Value::Error(e) => panic!("client read error: {}", e.get().message()),
+                other => panic!("unexpected value on client :in: {}", other.type_name()),
+            }
+        }
+
+        assert_eq!(response, request, "Q2 QUIC echo must return the same bytes");
+
+        // Clean up.
+        if let Value::Resource(h) = map_get(&server_map, "resource") {
+            let _ = h.close();
+        }
+        if let Value::Resource(h) = map_get(&conn, "resource") {
+            let _ = h.close();
+        }
+    });
+}
+
+/// Closing the listener via its `QuicListenerResource` must cause the `:conns`
+/// channel to be closed (subsequent `chan_take` yields `Value::Nil`).
+#[test]
+fn test_quic_listen_close_stops_conns() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async {
+        let _globals = setup_globals();
+
+        let (server_config, _cert) = make_server_config();
+        let server_val = cljrs_net::quic::listen_on("127.0.0.1", 0, server_config, 8, 8, 8, 8)
+            .expect("listen_on failed");
+        let server_map = match server_val {
+            Value::Map(m) => m,
+            other => panic!("expected server map, got {}", other.type_name()),
+        };
+
+        let conns_ch = as_chan(&map_get(&server_map, "conns"));
+
+        // Close the listener resource; also close the channel explicitly.
+        if let Value::Resource(h) = map_get(&server_map, "resource") {
+            h.close().expect("close");
+        }
+        chan_ref(conns_ch.get()).close();
+
+        // A take on a closed channel must yield Nil immediately.
+        let v = chan_take(&conns_ch).await;
+        assert!(
+            matches!(v, Value::Nil),
+            "expected Nil from closed :conns, got {}",
+            v.type_name()
+        );
     });
 }
 
