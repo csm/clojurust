@@ -1899,10 +1899,7 @@ mod tests {
 
     #[test]
     fn test_pre_and_post_conditions() {
-        let v = eval_str(
-            "(defn g [x] {:pre [(pos? x)] :post [(> % x)]} (inc x)) (g 3)",
-        )
-        .unwrap();
+        let v = eval_str("(defn g [x] {:pre [(pos? x)] :post [(> % x)]} (inc x)) (g 3)").unwrap();
         assert_eq!(v, long(4));
     }
 

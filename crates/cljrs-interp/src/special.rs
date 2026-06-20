@@ -383,8 +383,7 @@ fn desugar_pre_post_conditions(body: &[Form]) -> Vec<Form> {
         let body_expr = if real_body.len() == 1 {
             real_body[0].clone()
         } else {
-            let mut do_forms =
-                vec![Form::new(FormKind::Symbol("do".to_string()), span.clone())];
+            let mut do_forms = vec![Form::new(FormKind::Symbol("do".to_string()), span.clone())];
             do_forms.extend_from_slice(real_body);
             Form::new(FormKind::List(do_forms), span.clone())
         };
