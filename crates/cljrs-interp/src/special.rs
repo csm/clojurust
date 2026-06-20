@@ -826,10 +826,16 @@ fn eval_var(args: &[Form], env: &mut Env) -> EvalResult {
         _ => return Err(EvalError::Runtime("var requires a symbol".into())),
     };
     let parsed = cljrs_value::Symbol::parse(&sym);
-    let ns = parsed.namespace.as_deref().unwrap_or(&env.current_ns);
+    let ns: Arc<str> = match parsed.namespace.as_deref() {
+        Some(ns_part) => env
+            .globals
+            .resolve_alias(&env.current_ns, ns_part)
+            .unwrap_or_else(|| Arc::from(ns_part)),
+        None => env.current_ns.clone(),
+    };
     let name = parsed.name.as_ref();
     env.globals
-        .lookup_var_in_ns(ns, name)
+        .lookup_var_in_ns(&ns, name)
         .map(Value::Var)
         .ok_or_else(|| EvalError::UnboundSymbol(sym))
 }

@@ -106,9 +106,15 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         FormKind::Var(inner) => {
             if let FormKind::Symbol(s) = &inner.kind {
                 let parsed = Symbol::parse(s);
-                let ns = parsed.namespace.as_deref().unwrap_or(&env.current_ns);
+                let ns: Arc<str> = match parsed.namespace.as_deref() {
+                    Some(ns_part) => env
+                        .globals
+                        .resolve_alias(&env.current_ns, ns_part)
+                        .unwrap_or_else(|| Arc::from(ns_part)),
+                    None => env.current_ns.clone(),
+                };
                 env.globals
-                    .lookup_var_in_ns(ns, &parsed.name)
+                    .lookup_var_in_ns(&ns, &parsed.name)
                     .map(Value::Var)
                     .ok_or_else(|| EvalError::UnboundSymbol(s.clone()))
             } else {
@@ -1434,6 +1440,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.to_string(), "\"Hi Alice\"");
+    }
+
+    #[test]
+    fn test_var_quote_alias_resolution() {
+        // #'alias/sym must resolve the alias to the full namespace, just like
+        // a regular function call does (issue #187).
+        let dir = temp_ns_dir("var_quote_alias");
+        // lib.core maps to lib/core.cljrs on the source path.
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(
+            dir.join("lib/core.cljrs"),
+            "(ns lib.core) (defn public [x] (* x 2))",
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        // Regular call via alias must work first.
+        let call_result = eval_src(
+            "(require '[lib.core :as l]) (l/public 21)",
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(call_result, Value::Long(42));
+        // #'alias/sym reader form.
+        let var_result = eval_src("#'l/public", &mut env).unwrap();
+        assert!(
+            matches!(var_result, Value::Var(_)),
+            "expected Var, got {var_result:?}"
+        );
+        assert_eq!(var_result.to_string(), "#'lib.core/public");
+        // (var alias/sym) special form must also resolve the alias.
+        let var_special = eval_src("(var l/public)", &mut env).unwrap();
+        assert_eq!(var_special.to_string(), "#'lib.core/public");
     }
 
     #[test]
