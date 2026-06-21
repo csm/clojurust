@@ -223,7 +223,7 @@ fn test_quic_server_echo_round_trip() {
         };
         let port: u16 = local_addr_str
             .split(':')
-            .last()
+            .next_back()
             .unwrap()
             .parse()
             .expect("parse port");

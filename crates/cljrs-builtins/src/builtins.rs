@@ -4664,12 +4664,54 @@ fn builtin_interpose(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_partition(args: &[Value]) -> ValueResult<Value> {
     let n = numeric_as_i64(&args[0])? as usize;
-    let items = value_to_seq(&args[1])?;
-    let chunks: Vec<Value> = items
-        .chunks(n)
-        .filter(|c| c.len() == n)
-        .map(|c| Value::List(GcPtr::new(PersistentList::from_iter(c.iter().cloned()))))
-        .collect();
+
+    let (step, pad_val, items) = match args.len() {
+        2 => (n, None, value_to_seq(&args[1])?),
+        3 => {
+            let step = numeric_as_i64(&args[1])? as usize;
+            (step, None, value_to_seq(&args[2])?)
+        }
+        4 => {
+            let step = numeric_as_i64(&args[1])? as usize;
+            (step, Some(args[2].clone()), value_to_seq(&args[3])?)
+        }
+        _ => unreachable!("arity enforced by registration"),
+    };
+
+    if step == 0 {
+        return Err(ValueError::Other("partition: step cannot be zero".into()));
+    }
+
+    let mut chunks: Vec<Value> = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let end = start + n;
+        if end <= items.len() {
+            let chunk = &items[start..end];
+            chunks.push(Value::List(GcPtr::new(PersistentList::from_iter(
+                chunk.iter().cloned(),
+            ))));
+        } else if let Some(ref pad) = pad_val {
+            // Pad the incomplete last chunk from the pad sequence lazily.
+            let existing = &items[start..];
+            let need = n - existing.len();
+            let mut padded: Vec<Value> = existing.to_vec();
+            let mut pad_cursor = pad.clone();
+            for _ in 0..need {
+                match seq_first_rest(&pad_cursor)? {
+                    Some((head, tail)) => {
+                        padded.push(head);
+                        pad_cursor = tail;
+                    }
+                    None => break,
+                }
+            }
+            if padded.len() == n {
+                chunks.push(Value::List(GcPtr::new(PersistentList::from_iter(padded))));
+            }
+        }
+        start += step;
+    }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(chunks))))
 }
 
