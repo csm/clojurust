@@ -1110,6 +1110,25 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
 
         // ── Comparison ──────────────────────────────────────────────────
         KnownFn::Eq => Ok(Value::Bool(args.len() == 2 && args[0] == args[1])),
+        KnownFn::CaseEq => {
+            if args.len() != 2 {
+                return Ok(Value::Bool(false));
+            }
+            let a = args[0].unwrap_meta();
+            let b = args[1].unwrap_meta();
+            let result = match (a, b) {
+                (Value::Long(_) | Value::BigInt(_), Value::Long(_) | Value::BigInt(_)) => args[0] == args[1],
+                (Value::Double(_), Value::Double(_)) => args[0] == args[1],
+                (Value::BigDecimal(_), Value::BigDecimal(_)) => args[0] == args[1],
+                (Value::Ratio(_), Value::Ratio(_)) => args[0] == args[1],
+                (
+                    Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
+                    Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
+                ) => false,
+                _ => args[0] == args[1],
+            };
+            Ok(Value::Bool(result))
+        }
         KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte => builtin_compare(known_fn, &args),
         KnownFn::Identical => Ok(Value::Bool(
             args.len() == 2 && std::ptr::eq(&args[0] as *const _, &args[1] as *const _),
@@ -1415,6 +1434,7 @@ fn known_fn_to_name(kf: &KnownFn) -> &'static str {
         KnownFn::WithOutStr => "with-out-str",
         KnownFn::TryCatchFinally => "try",
         KnownFn::SetBangVar => "set!",
+        KnownFn::CaseEq => "case=",
         KnownFn::IsEmpty => "empty?",
         KnownFn::Peek => "peek",
         KnownFn::Pop => "pop",

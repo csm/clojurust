@@ -150,3 +150,95 @@ fn closures_compile_and_run_correctly_under_jit() {
     );
     assert!(out.contains("closures: 23 6 t:9"), "got:\n{out}");
 }
+
+#[test]
+fn macro_generated_case_correct_under_jit() {
+    // Regression test for issue #193: IR/JIT lowering miscompiles
+    // macro-generated `case` expressions in hot functions.
+    //
+    // Two symptoms:
+    //   1. "not callable: nil is not callable" — the `case=` builtin resolves
+    //      to nil at JIT time (rt_load_global returns nil for unknowns) so the
+    //      callee slot is nil when called.  Fixed by adding KnownFn::CaseEq so
+    //      the lowerer emits CallKnown + rt_case_eq directly, bypassing global
+    //      lookup entirely.
+    //
+    //   2. "wrong branch taken" — when the `case=` result was typed Repr::Boxed
+    //      via a generic Call, it might also get mis-inferred as Long if the
+    //      input flow smuggled a Long through a phi.  The JIT emits an
+    //      unconditional `jump then_b` for Repr::Long branch conditions
+    //      (all numbers are truthy), so every branch was taken.  Fixed by
+    //      CaseEq always inferring Repr::Bool.
+    //
+    // This test runs a function that uses the `case` macro (which expands to
+    // `case=` calls) more than the JIT threshold, then asserts the correct
+    // branch is taken every time.
+    let src = r#"
+        (defn classify [x]
+          (case x
+            0 "zero"
+            1 "one"
+            2 "two"
+            "other"))
+
+        (dotimes [i 10000]
+          (let [a (classify 0)
+                b (classify 1)
+                c (classify 2)
+                d (classify 99)]
+            (when (or (not= a "zero") (not= b "one") (not= c "two") (not= d "other"))
+              (println "WRONG at" i ":" a b c d))
+            (when (= i 9999)
+              (println "classify:" a b c d))))
+    "#;
+
+    let out = run_jit(src);
+    assert!(
+        !out.contains("WRONG at"),
+        "case dispatch wrong under JIT (issue #193); got:\n{out}"
+    );
+    assert!(
+        out.contains("classify: zero one two other"),
+        "case dispatch produced wrong final values; got:\n{out}"
+    );
+}
+
+#[test]
+fn macro_generated_case_with_int_cast_correct_under_jit() {
+    // Second regression from issue #193: the reproducer in the bug report uses
+    // a `codepoint-case` macro that calls `(int ...)` at macroexpansion time to
+    // produce integer case keys.  This exercises the path where the case
+    // constant is a Long derived through a macro transformation rather than a
+    // literal in source.
+    let src = r#"
+        (defn categorize [n]
+          (case n
+            42  :answer
+            0   :zero
+            -1  :neg
+            100 :hundred
+            :other))
+
+        (dotimes [i 10000]
+          (let [a (categorize 42)
+                b (categorize 0)
+                c (categorize -1)
+                d (categorize 100)
+                e (categorize 7)]
+            (when (or (not= a :answer) (not= b :zero) (not= c :neg)
+                      (not= d :hundred) (not= e :other))
+              (println "WRONG at" i ":" a b c d e))
+            (when (= i 9999)
+              (println "categorize:" a b c d e))))
+    "#;
+
+    let out = run_jit(src);
+    assert!(
+        !out.contains("WRONG at"),
+        "case with integer keys wrong under JIT (issue #193); got:\n{out}"
+    );
+    assert!(
+        out.contains("categorize: :answer :zero :neg :hundred :other"),
+        "case with integer keys produced wrong final values; got:\n{out}"
+    );
+}

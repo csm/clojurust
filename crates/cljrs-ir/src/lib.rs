@@ -168,6 +168,9 @@ pub enum KnownFn {
     Gt,
     Lte,
     Gte,
+    /// Type-strict equality used by the `case` macro (`case=` builtin).
+    /// Unlike `=`, mixed numeric types (Long vs Double) are never equal.
+    CaseEq,
 
     // Type checks (pure)
     IsNil,
@@ -1009,6 +1012,7 @@ impl KnownFn {
             | KnownFn::Gt
             | KnownFn::Lte
             | KnownFn::Gte
+            | KnownFn::CaseEq
             | KnownFn::IsNil
             | KnownFn::IsSeq
             | KnownFn::IsVector

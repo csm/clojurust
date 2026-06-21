@@ -63,6 +63,7 @@ pub fn resolve_known_fn(sym_name: &str) -> Option<KnownFn> {
         "aset" => Some(KnownFn::Aset),
         "alength" => Some(KnownFn::Alength),
         "=" => Some(KnownFn::Eq),
+        "case=" => Some(KnownFn::CaseEq),
         "<" => Some(KnownFn::Lt),
         ">" => Some(KnownFn::Gt),
         "<=" => Some(KnownFn::Lte),
