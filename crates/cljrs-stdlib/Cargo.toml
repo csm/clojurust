@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-stdlib"
-version = "0.1.0"
+version = "0.1.161"
 edition = "2024"
 description = "Built-in standard library namespaces for clojurust (clojure.string, clojure.set, clojure.test, …)"
 license.workspace = true

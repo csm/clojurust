@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-interp"
-version = "0.1.0"
+version = "0.1.161"
 edition = "2024"
 description = "Tree-walking interpreter for clojurust (special forms, macros, destructuring)"
 license.workspace = true
