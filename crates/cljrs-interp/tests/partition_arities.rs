@@ -97,10 +97,7 @@ fn partition_4arg_pads_last_chunk() {
 #[test]
 fn partition_4arg_repeat_nil_pad() {
     // The example from the issue: (partition 2 2 (repeat nil) [1 2 3])
-    assert_partition(
-        "(partition 2 2 (repeat nil) [1 2 3])",
-        "[[1 2] [3 nil]]",
-    );
+    assert_partition("(partition 2 2 (repeat nil) [1 2 3])", "[[1 2] [3 nil]]");
 }
 
 #[test]
