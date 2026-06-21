@@ -297,6 +297,10 @@
 (defmacro when-not [test & body]
   (list 'if test nil (cons 'do body)))
 
+(defmacro if-not
+  ([test then] (list 'if test nil then))
+  ([test then else] (list 'if test else then)))
+
 (defmacro if-let
   ([bindings then] (list 'if-let bindings then nil))
   ([bindings then else]
@@ -1049,4 +1053,4 @@
 (defn re-seq
   [re s]
   (let [matcher (re-matcher re s)]
-    (take-while identity (repeatedly #(re-find matcher)))))
+    (seq (take-while identity (repeatedly #(re-find matcher))))))

@@ -344,6 +344,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         ("flatten", Arity::Fixed(1), builtin_flatten),
         ("distinct", Arity::Fixed(1), builtin_distinct),
+        ("distinct?", Arity::Variadic { min: 1 }, builtin_distinct_q),
         ("frequencies", Arity::Fixed(1), builtin_frequencies),
         ("interleave", Arity::Variadic { min: 0 }, builtin_interleave),
         ("interpose", Arity::Fixed(2), builtin_interpose),
@@ -4581,6 +4582,18 @@ fn builtin_distinct(args: &[Value]) -> ValueResult<Value> {
         }
     }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(out))))
+}
+
+fn builtin_distinct_q(args: &[Value]) -> ValueResult<Value> {
+    use cljrs_value::ClojureHash;
+    let mut seen = std::collections::HashSet::new();
+    for v in args {
+        let h = v.clojure_hash();
+        if !seen.insert(h) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
 }
 
 fn builtin_frequencies(args: &[Value]) -> ValueResult<Value> {
