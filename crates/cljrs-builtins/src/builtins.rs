@@ -3547,13 +3547,8 @@ fn builtin_contains_q(args: &[Value]) -> ValueResult<Value> {
         Value::Vector(v) => {
             if let Value::Long(idx) = &args[1] {
                 *idx >= 0 && (*idx as usize) < v.get().count()
-            } else if let Value::Nil = &args[1] {
-                false
             } else {
-                return Err(ValueError::WrongType {
-                    expected: "int",
-                    got: args[1].type_name().to_string(),
-                });
+                false
             }
         }
         Value::Str(s) => {

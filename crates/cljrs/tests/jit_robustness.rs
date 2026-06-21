@@ -130,3 +130,27 @@ fn string_join_char_elements_from_jit() {
         run.stdout
     );
 }
+
+#[test]
+fn contains_q_vector_non_integer_key_returns_false_under_jit() {
+    // Regression for #206: `(contains? [1 2 3] :a)` must return false, not
+    // throw, even when the call is JIT-compiled.
+    let src = r#"
+        (defn check [v k] (contains? v k))
+        (dotimes [_ 100]
+          (check [1 2 3] :a)
+          (check [1 2 3] "x")
+          (check [1 2 3] 0))
+        (println (check [1 2 3] :a))
+        (println (check [1 2 3] "x"))
+        (println (check [1 2 3] 0))
+    "#;
+
+    let run = run_jit(src);
+
+    assert!(
+        run.stdout.contains("false\nfalse\ntrue"),
+        "unexpected output; stdout:\n{}",
+        run.stdout
+    );
+}

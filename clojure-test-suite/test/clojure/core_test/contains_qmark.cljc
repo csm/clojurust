@@ -15,6 +15,9 @@
       ;; find by index
       (is (= true (contains? ["a" "b" "c"] 0)))
       (is (= false (contains? ["a" "b" "c"] 3)))
+      ;; non-integer key on vector returns false, not an error
+      (is (= false (contains? [1 2 3] :a)))
+      (is (= false (contains? [1 2 3] "x")))
       (is (= true (contains? "abc" 0)))
       (is (= true (contains? "abc" 2)))
       (is (= false (contains? "abc" 3)))
