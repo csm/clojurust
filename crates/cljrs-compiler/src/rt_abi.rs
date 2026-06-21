@@ -738,8 +738,16 @@ pub unsafe extern "C" fn rt_case_eq(a: *const Value, b: *const Value) -> *const 
         (Value::Ratio(_), Value::Ratio(_)) => a_val == b_val,
         // Mixed numeric types are never equal in case dispatch.
         (
-            Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
-            Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
         ) => false,
         // Non-numeric types use regular equality.
         _ => a_val == b_val,

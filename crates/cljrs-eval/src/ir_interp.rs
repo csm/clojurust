@@ -1117,13 +1117,23 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let a = args[0].unwrap_meta();
             let b = args[1].unwrap_meta();
             let result = match (a, b) {
-                (Value::Long(_) | Value::BigInt(_), Value::Long(_) | Value::BigInt(_)) => args[0] == args[1],
+                (Value::Long(_) | Value::BigInt(_), Value::Long(_) | Value::BigInt(_)) => {
+                    args[0] == args[1]
+                }
                 (Value::Double(_), Value::Double(_)) => args[0] == args[1],
                 (Value::BigDecimal(_), Value::BigDecimal(_)) => args[0] == args[1],
                 (Value::Ratio(_), Value::Ratio(_)) => args[0] == args[1],
                 (
-                    Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
-                    Value::Long(_) | Value::BigInt(_) | Value::Double(_) | Value::BigDecimal(_) | Value::Ratio(_),
+                    Value::Long(_)
+                    | Value::BigInt(_)
+                    | Value::Double(_)
+                    | Value::BigDecimal(_)
+                    | Value::Ratio(_),
+                    Value::Long(_)
+                    | Value::BigInt(_)
+                    | Value::Double(_)
+                    | Value::BigDecimal(_)
+                    | Value::Ratio(_),
                 ) => false,
                 _ => args[0] == args[1],
             };
