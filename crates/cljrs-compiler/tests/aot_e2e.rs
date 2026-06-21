@@ -2330,6 +2330,22 @@ fn test_versioned_snapshot_is_self_contained() {
     );
 }
 
+// ── Regression: issue #198 — into rejects lazy-seq / cons as target ──────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_into_lazy_seq_target() {
+    assert_output(
+        "into_lazy_seq_target",
+        r#"
+(println (vec (into (map inc [1 2]) [9])))
+(println (vec (into (seq [1 2]) [9])))
+(println (count (into (map inc [1 2]) [])))
+"#,
+        "[9 2 3]\n[9 1 2]\n2",
+    );
+}
+
 /// A pin pointing at a commit that does not exist fails the *compile*, not
 /// the deployed binary.
 #[test]
