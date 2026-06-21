@@ -85,7 +85,11 @@ const FMT_SCRIPT: &str = r#"
 
 fn check_output(out: &str, label: &str) {
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 10, "{label}: expected 10 output lines, got:\n{out}");
+    assert_eq!(
+        lines.len(),
+        10,
+        "{label}: expected 10 output lines, got:\n{out}"
+    );
 
     // (format "%-5s" "ab")  → "ab   "
     assert_eq!(lines[0], "ab   ", "{label}: %-5s wrong");

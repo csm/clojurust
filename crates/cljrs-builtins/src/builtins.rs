@@ -5718,7 +5718,14 @@ fn fmt_signed(negative: bool, abs: &str, plus: bool, space: bool, paren: bool) -
 
 /// Format `f` as scientific notation matching Java's `%e` / `%E`.
 /// Exponent always has a sign and at least two digits: `1.234568e+02`.
-fn fmt_scientific(f: f64, prec: usize, upper: bool, plus: bool, space: bool, paren: bool) -> String {
+fn fmt_scientific(
+    f: f64,
+    prec: usize,
+    upper: bool,
+    plus: bool,
+    space: bool,
+    paren: bool,
+) -> String {
     if f.is_nan() {
         return "NaN".to_string();
     }
@@ -5897,11 +5904,7 @@ fn builtin_format(args: &[Value]) -> ValueResult<Value> {
                 i += 1;
             }
             if i > prec_start {
-                chars[prec_start..i]
-                    .iter()
-                    .collect::<String>()
-                    .parse()
-                    .ok()
+                chars[prec_start..i].iter().collect::<String>().parse().ok()
             } else {
                 Some(0)
             }
@@ -6002,9 +6005,7 @@ fn builtin_format(args: &[Value]) -> ValueResult<Value> {
                     None => 0.0,
                 };
                 let prec = precision.unwrap_or(6);
-                let s = fmt_scientific(
-                    f, prec, conv == 'E', flag_plus, flag_space, flag_paren,
-                );
+                let s = fmt_scientific(f, prec, conv == 'E', flag_plus, flag_space, flag_paren);
                 fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
             }
 
@@ -6021,9 +6022,7 @@ fn builtin_format(args: &[Value]) -> ValueResult<Value> {
                     Some(0) | None => 6,
                     Some(p) => p,
                 };
-                let s = fmt_general(
-                    f, prec, conv == 'G', flag_plus, flag_space, flag_paren,
-                );
+                let s = fmt_general(f, prec, conv == 'G', flag_plus, flag_space, flag_paren);
                 fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
             }
 
