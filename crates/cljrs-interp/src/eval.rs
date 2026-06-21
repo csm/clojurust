@@ -628,7 +628,10 @@ mod tests {
         // Regression for #206: non-integer key on a vector must return false,
         // not throw a WrongType error.
         assert_eq!(eval_str("(contains? [1 2 3] :a)").unwrap(), bool_v(false));
-        assert_eq!(eval_str("(contains? [1 2 3] \"x\")").unwrap(), bool_v(false));
+        assert_eq!(
+            eval_str("(contains? [1 2 3] \"x\")").unwrap(),
+            bool_v(false)
+        );
         // Integer keys still work correctly.
         assert_eq!(eval_str("(contains? [1 2 3] 0)").unwrap(), bool_v(true));
         assert_eq!(eval_str("(contains? [1 2 3] 9)").unwrap(), bool_v(false));
