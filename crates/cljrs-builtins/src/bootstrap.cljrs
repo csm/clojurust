@@ -544,14 +544,28 @@
 (defn split-with [pred coll]
   [(take-while pred coll) (drop-while pred coll)])
 
-(defn partition [n coll]
-  (loop [s (seq coll) acc []]
-    (if s
-      (let [part (take n s)]
-        (if (= (count part) n)
-          (recur (nthnext s n) (conj acc part))
-          (seq acc)))
-      (seq acc))))
+(defn partition
+  ([n coll]
+   (partition n n coll))
+  ([n step coll]
+   (loop [s (seq coll) acc []]
+     (if s
+       (let [part (take n s)]
+         (if (= (count part) n)
+           (recur (nthnext s step) (conj acc part))
+           (seq acc)))
+       (seq acc))))
+  ([n step pad coll]
+   (loop [s (seq coll) acc []]
+     (if s
+       (let [part (take n s)]
+         (if (= (count part) n)
+           (recur (nthnext s step) (conj acc part))
+           (let [padded (take n (concat part pad))]
+             (if (= (count padded) n)
+               (seq (conj acc padded))
+               (seq acc)))))
+       (seq acc)))))
 
 (defn partition-all
   ([n]

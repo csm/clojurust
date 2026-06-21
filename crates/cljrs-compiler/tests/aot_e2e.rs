@@ -1824,6 +1824,26 @@ fn test_partition() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_partition_3arg() {
+    assert_output(
+        "partition_3arg_fn",
+        r#"(println (into [] (partition 2 1 [1 2 3 4])))"#,
+        "[(1 2) (2 3) (3 4)]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_partition_4arg() {
+    assert_output(
+        "partition_4arg_fn",
+        r#"(println (into [] (partition 2 2 (repeat nil) [1 2 3])))"#,
+        "[(1 2) (3 nil)]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_zipmap() {
     assert_output(
         "zipmap_fn",
