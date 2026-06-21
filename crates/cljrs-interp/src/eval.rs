@@ -52,6 +52,16 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         // ── Collections ───────────────────────────────────────────────────
         FormKind::List(forms) => eval_list(forms, env),
         FormKind::Vector(forms) => {
+            let expanded_forms;
+            let forms: &[Form] = if forms
+                .iter()
+                .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
+            {
+                expanded_forms = expand_reader_conds(forms);
+                &expanded_forms
+            } else {
+                forms
+            };
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms {
                 let _root = cljrs_env::gc_roots::root_values(&vals);

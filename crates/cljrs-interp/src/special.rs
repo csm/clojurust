@@ -487,9 +487,17 @@ fn eval_if(args: &[Form], env: &mut Env) -> EvalResult {
 // ── let* ──────────────────────────────────────────────────────────────────────
 
 fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
-    let bindings = match args.first().map(|f| &f.kind) {
+    let raw_bindings = match args.first().map(|f| &f.kind) {
         Some(FormKind::Vector(v)) => v.clone(),
         _ => return Err(EvalError::Runtime("let* requires a binding vector".into())),
+    };
+    let bindings = if raw_bindings
+        .iter()
+        .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
+    {
+        expand_reader_conds(&raw_bindings)
+    } else {
+        raw_bindings
     };
 
     if bindings.len() % 2 != 0 {
