@@ -3645,6 +3645,11 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
                 }
                 Value::Map(m.assoc(pair[0].clone(), pair[1].clone()))
             }
+            Value::LazySeq(_) | Value::Cons(_) => Value::Cons(GcPtr::new(CljxCons {
+                head: item,
+                tail: result,
+            })),
+            Value::Queue(q) => Value::Queue(GcPtr::new(q.get().conj(item))),
             other => {
                 return Err(ValueError::WrongType {
                     expected: "collection",
