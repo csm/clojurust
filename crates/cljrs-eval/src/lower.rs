@@ -172,7 +172,11 @@ fn lower_arity_inner(
     do_optimize: bool,
     is_async: bool,
 ) -> Result<(IrFunction, Vec<(Arc<str>, Arc<str>)>), LowerError> {
+    // Temporarily set current_ns to the function's defining namespace so that
+    // ::kw resolution in macroexpand_body uses the correct namespace.
+    let prev_ns = std::mem::replace(&mut env.current_ns, ns.clone());
     let expanded_body = macroexpand_body(body, env);
+    env.current_ns = prev_ns;
     lower_expanded_arity(
         name,
         params,

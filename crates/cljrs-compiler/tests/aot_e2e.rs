@@ -2445,3 +2445,39 @@ fn test_string_join_char_elements_aot() {
         "80\n8-0",
     );
 }
+
+// ── Issue #209: ::keyword resolution through macros (AOT path) ────────────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_auto_kw_through_if_not_aot() {
+    // ::kw must resolve to the call-site namespace in AOT-compiled code, not
+    // the macro definition namespace.
+    assert_output(
+        "auto_kw_if_not",
+        r#"
+(ns my.app)
+(defn check [v]
+  (if-not (= v ::error) :WRONG :right))
+(defn -main [& _]
+  (println (check ::error))
+  (println (check ::other)))
+"#,
+        ":right\n:WRONG",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_auto_kw_qualified_keyword_aot() {
+    // Verify the keyword is fully namespace-qualified in the output.
+    assert_output(
+        "auto_kw_qualified",
+        r#"
+(ns acme.core)
+(defn -main [& _]
+  (println ::status))
+"#,
+        ":acme.core/status",
+    );
+}

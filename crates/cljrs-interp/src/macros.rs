@@ -17,8 +17,19 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
         && let Some(FormKind::Symbol(s)) = parts.first().map(|f| &f.kind)
         && let Some(macro_fn) = resolve_macro(s, env)
     {
+        // Resolve ::keywords using the caller's namespace before the macro sees
+        // them.  In Clojure, ::kw is resolved at READ time; since cljrs keeps
+        // AutoKeyword forms in the AST until eval, we resolve them here — the
+        // last point at which env.current_ns reflects the call site.
+        let resolved = resolve_auto_kws(form, &env.current_ns);
+        let parts = if let FormKind::List(p) = &resolved.kind {
+            p
+        } else {
+            unreachable!()
+        };
+
         // Build &form value (the whole call as a list).
-        let form_val = form_to_value(form);
+        let form_val = form_to_value(&resolved);
         // Build &env value (local bindings as a map — empty at top level).
         let env_val = {
             let (names, vals) = env.all_local_bindings();
@@ -35,6 +46,41 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
         return value_to_form(&expanded, dummy);
     }
     Ok(form.clone())
+}
+
+/// Walk a form tree and replace every `AutoKeyword(s)` with `Keyword("{ns}/{s}")`.
+///
+/// `::kw` must be resolved using the namespace at the call site (not the
+/// macro's definition namespace).  Clojure resolves it at read time; we do it
+/// here, just before the form is handed to the macro, so the macro always
+/// receives fully-qualified keywords.
+pub(crate) fn resolve_auto_kws(form: &Form, ns: &str) -> Form {
+    let kind = match &form.kind {
+        FormKind::AutoKeyword(s) => FormKind::Keyword(format!("{ns}/{s}")),
+        FormKind::List(items) => {
+            FormKind::List(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
+        }
+        FormKind::Vector(items) => {
+            FormKind::Vector(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
+        }
+        FormKind::Map(items) => {
+            FormKind::Map(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
+        }
+        FormKind::Set(items) => {
+            FormKind::Set(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
+        }
+        // ::kw is resolved at read time in Clojure, so resolve inside quote too.
+        FormKind::Quote(inner) => FormKind::Quote(Box::new(resolve_auto_kws(inner, ns))),
+        FormKind::SyntaxQuote(inner) => {
+            FormKind::SyntaxQuote(Box::new(resolve_auto_kws(inner, ns)))
+        }
+        FormKind::Unquote(inner) => FormKind::Unquote(Box::new(resolve_auto_kws(inner, ns))),
+        FormKind::UnquoteSplice(inner) => {
+            FormKind::UnquoteSplice(Box::new(resolve_auto_kws(inner, ns)))
+        }
+        _ => return form.clone(),
+    };
+    Form::new(kind, form.span.clone())
 }
 
 /// Fully expand a form until the head is no longer a macro.
