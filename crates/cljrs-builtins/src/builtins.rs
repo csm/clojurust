@@ -4707,9 +4707,7 @@ fn builtin_partition(args: &[Value]) -> ValueResult<Value> {
                 }
             }
             if padded.len() == n {
-                chunks.push(Value::List(GcPtr::new(PersistentList::from_iter(
-                    padded,
-                ))));
+                chunks.push(Value::List(GcPtr::new(PersistentList::from_iter(padded))));
             }
         }
         start += step;
