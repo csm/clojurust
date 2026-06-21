@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-net"
-version = "0.1.0"
+version = "0.1.167"
 edition = "2024"
 description = "TCP/Unix/TLS networking for clojurust — channel-oriented sockets over core.async"
 license.workspace = true
