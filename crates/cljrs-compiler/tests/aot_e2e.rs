@@ -2408,3 +2408,20 @@ fn test_versioned_bad_commit_fails_at_compile_time() {
         "error should mention the bad commit: {msg}"
     );
 }
+
+// ── Regression: clojure.string/join with char elements (issue #200) ─────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_string_join_char_elements_aot() {
+    assert_output(
+        "string_join_chars",
+        r#"
+(require '[clojure.string :as s])
+(defn -main [& _]
+  (println (s/join [\8 \0]))
+  (println (s/join "-" [\8 \0])))
+"#,
+        "80\n8-0",
+    );
+}

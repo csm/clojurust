@@ -20,7 +20,7 @@ use crate::util::numeric_as_i64;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
-use cljrs_value::value::SetValue;
+use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
     Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq, MapValue,
     Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
@@ -6767,16 +6767,20 @@ fn builtin_join(args: &[Value]) -> ValueResult<Value> {
     } else {
         (
             match &args[0] {
+                Value::Nil => String::new(),
                 Value::Str(s) => s.get().to_string(),
-                v => format!("{}", v),
+                Value::Char(c) => c.to_string(),
+                v => format!("{}", PrintValue(v)),
             },
             &args[1],
         )
     };
     let joined: String = ValueIter::new(coll.clone())
         .map(|v| match &v {
+            Value::Nil => String::new(),
             Value::Str(s) => s.get().to_string(),
-            other => format!("{}", other),
+            Value::Char(c) => c.to_string(),
+            other => format!("{}", PrintValue(other)),
         })
         .collect::<Vec<_>>()
         .join(&sep);
