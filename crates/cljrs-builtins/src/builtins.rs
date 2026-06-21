@@ -5624,8 +5624,183 @@ fn builtin_byte(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+// ── format helpers ────────────────────────────────────────────────────────────
+
+/// Pad `s` to at least `width` characters, space-padding only (for strings /
+/// non-numeric values).
+fn fmt_pad(out: &mut String, s: &str, width: Option<usize>, left: bool) {
+    let slen = s.chars().count();
+    match width {
+        Some(w) if w > slen => {
+            let n = w - slen;
+            if left {
+                out.push_str(s);
+                for _ in 0..n {
+                    out.push(' ');
+                }
+            } else {
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+        }
+        _ => out.push_str(s),
+    }
+}
+
+/// Pad a numeric string to `width`.  When zero-padding the sign character (if
+/// any) is emitted before the zeros.
+fn fmt_pad_num(out: &mut String, s: &str, width: Option<usize>, left: bool, zero: bool) {
+    let slen = s.chars().count();
+    match width {
+        Some(w) if w > slen => {
+            let n = w - slen;
+            if left {
+                out.push_str(s);
+                for _ in 0..n {
+                    out.push(' ');
+                }
+            } else if zero {
+                let first = s.chars().next().unwrap_or(' ');
+                if matches!(first, '-' | '+' | ' ') {
+                    out.push(first);
+                    for _ in 0..n {
+                        out.push('0');
+                    }
+                    out.push_str(&s[first.len_utf8()..]);
+                } else {
+                    for _ in 0..n {
+                        out.push('0');
+                    }
+                    out.push_str(s);
+                }
+            } else {
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+        }
+        _ => out.push_str(s),
+    }
+}
+
+/// Format `n` with comma thousands-separators.
+fn fmt_grouped(n: u64) -> String {
+    let s = n.to_string();
+    let mut buf = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            buf.push(',');
+        }
+        buf.push(c);
+    }
+    buf.chars().rev().collect()
+}
+
+/// Prepend the appropriate sign to an absolute-value digit string.
+fn fmt_signed(negative: bool, abs: &str, plus: bool, space: bool, paren: bool) -> String {
+    if negative {
+        if paren {
+            format!("({})", abs)
+        } else {
+            format!("-{}", abs)
+        }
+    } else if plus {
+        format!("+{}", abs)
+    } else if space {
+        format!(" {}", abs)
+    } else {
+        abs.to_string()
+    }
+}
+
+/// Format `f` as scientific notation matching Java's `%e` / `%E`.
+/// Exponent always has a sign and at least two digits: `1.234568e+02`.
+fn fmt_scientific(f: f64, prec: usize, upper: bool, plus: bool, space: bool, paren: bool) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        let s = if f > 0.0 { "Infinity" } else { "-Infinity" };
+        return s.to_string();
+    }
+    let negative = f.is_sign_negative();
+    let f_abs = f.abs();
+    let e_char = if upper { 'E' } else { 'e' };
+
+    let (mantissa_str, exp) = if f_abs == 0.0 {
+        let frac = if prec > 0 {
+            format!(".{}", "0".repeat(prec))
+        } else {
+            String::new()
+        };
+        (format!("0{}", frac), 0i32)
+    } else {
+        let exp = f_abs.log10().floor() as i32;
+        let mantissa = f_abs / 10f64.powi(exp);
+        let ms = format!("{:.prec$}", mantissa);
+        // Rounding can push mantissa to 10.0
+        if ms.starts_with("10") {
+            (format!("{:.prec$}", mantissa / 10.0), exp + 1)
+        } else {
+            (ms, exp)
+        }
+    };
+
+    let exp_sign = if exp >= 0 { '+' } else { '-' };
+    let exp_abs = exp.unsigned_abs();
+    let abs_str = format!("{}{}{}{:02}", mantissa_str, e_char, exp_sign, exp_abs);
+    fmt_signed(negative, &abs_str, plus, space, paren)
+}
+
+/// Format `f` using `%g` / `%G` semantics (shortest of fixed / scientific,
+/// trailing zeros stripped).
+fn fmt_general(f: f64, prec: usize, upper: bool, plus: bool, space: bool, paren: bool) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        let s = if f > 0.0 { "Infinity" } else { "-Infinity" };
+        return s.to_string();
+    }
+    let negative = f.is_sign_negative();
+    let f_abs = f.abs();
+    let exp = if f_abs == 0.0 {
+        0i32
+    } else {
+        f_abs.log10().floor() as i32
+    };
+    let e_char = if upper { 'E' } else { 'e' };
+
+    let abs_str = if exp < -4 || exp >= prec as i32 {
+        let sci_prec = prec.saturating_sub(1);
+        let mantissa = if f_abs == 0.0 {
+            0.0
+        } else {
+            f_abs / 10f64.powi(exp)
+        };
+        let ms = format!("{:.prec$}", mantissa, prec = sci_prec);
+        let ms = ms.trim_end_matches('0');
+        let ms = ms.trim_end_matches('.');
+        let exp_sign = if exp >= 0 { '+' } else { '-' };
+        format!("{}{}{}{:02}", ms, e_char, exp_sign, exp.unsigned_abs())
+    } else {
+        let decimal_places = ((prec as i32) - 1 - exp).max(0) as usize;
+        let s = format!("{:.prec$}", f_abs, prec = decimal_places);
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    };
+    fmt_signed(negative, &abs_str, plus, space, paren)
+}
+
+// ── builtin_format ────────────────────────────────────────────────────────────
+
 fn builtin_format(args: &[Value]) -> ValueResult<Value> {
-    // Minimal format: just use str for now.
     let fmt = match &args[0] {
         Value::Str(s) => s.get().clone(),
         v => {
@@ -5635,40 +5810,330 @@ fn builtin_format(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    // Simple %s substitution.
-    let result = fmt;
-    let mut arg_idx = 1;
+
+    let chars: Vec<char> = fmt.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut arg_idx = 1usize;
     let mut out = String::new();
-    let mut chars = result.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.next() {
-                Some('s') => {
-                    if let Some(v) = args.get(arg_idx) {
-                        match v {
-                            Value::Str(s) => out.push_str(s.get()),
-                            other => out.push_str(&format!("{}", other)),
-                        }
-                        arg_idx += 1;
-                    }
+
+    while i < len {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume '%'
+        if i >= len {
+            out.push('%');
+            break;
+        }
+
+        // ── Parse flags ───────────────────────────────────────────────────────
+        let mut flag_left = false;
+        let mut flag_plus = false;
+        let mut flag_space = false;
+        let mut flag_zero = false;
+        let mut flag_paren = false;
+        let mut flag_comma = false;
+        let mut flag_alt = false;
+
+        loop {
+            match chars.get(i).copied() {
+                Some('-') => {
+                    flag_left = true;
+                    i += 1;
                 }
-                Some('d') => {
-                    if let Some(v) = args.get(arg_idx) {
-                        out.push_str(&format!("{}", numeric_as_i64(v).unwrap_or(0)));
-                        arg_idx += 1;
-                    }
+                Some('+') => {
+                    flag_plus = true;
+                    i += 1;
                 }
-                Some('%') => out.push('%'),
-                Some(c2) => {
-                    out.push('%');
-                    out.push(c2);
+                Some(' ') => {
+                    flag_space = true;
+                    i += 1;
                 }
-                None => out.push('%'),
+                // '0' is the zero-pad flag only before width digits; consumed
+                // at most once — subsequent '0's become part of the width.
+                Some('0') if !flag_zero => {
+                    flag_zero = true;
+                    i += 1;
+                }
+                Some('(') => {
+                    flag_paren = true;
+                    i += 1;
+                }
+                Some(',') => {
+                    flag_comma = true;
+                    i += 1;
+                }
+                Some('#') => {
+                    flag_alt = true;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // ── Parse width ───────────────────────────────────────────────────────
+        let width_start = i;
+        while i < len && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let width: Option<usize> = if i > width_start {
+            chars[width_start..i]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .ok()
+        } else {
+            None
+        };
+
+        // ── Parse precision ───────────────────────────────────────────────────
+        let precision: Option<usize> = if i < len && chars[i] == '.' {
+            i += 1;
+            let prec_start = i;
+            while i < len && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > prec_start {
+                chars[prec_start..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            } else {
+                Some(0)
             }
         } else {
-            out.push(c);
+            None
+        };
+
+        if i >= len {
+            out.push('%');
+            break;
+        }
+
+        let conv = chars[i];
+        i += 1;
+
+        match conv {
+            // ── Literal % / newline ───────────────────────────────────────────
+            '%' => out.push('%'),
+            'n' => out.push('\n'),
+
+            // ── String ───────────────────────────────────────────────────────
+            's' | 'S' => {
+                let s = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        let raw = match v {
+                            Value::Nil => "null".to_string(),
+                            Value::Str(s) => s.get().clone(),
+                            other => format!("{}", other),
+                        };
+                        match precision {
+                            Some(p) => raw.chars().take(p).collect(),
+                            None => raw,
+                        }
+                    }
+                    None => String::new(),
+                };
+                let s = if conv == 'S' { s.to_uppercase() } else { s };
+                fmt_pad(&mut out, &s, width, flag_left);
+            }
+
+            // ── Decimal integer ───────────────────────────────────────────────
+            'd' => {
+                let n = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_i64(v).unwrap_or(0)
+                    }
+                    None => 0,
+                };
+                let abs_digits = if flag_comma {
+                    fmt_grouped(n.unsigned_abs())
+                } else {
+                    n.unsigned_abs().to_string()
+                };
+                let s = fmt_signed(n < 0, &abs_digits, flag_plus, flag_space, flag_paren);
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── Fixed-point float ─────────────────────────────────────────────
+            'f' => {
+                let f = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_f64(v).unwrap_or(0.0)
+                    }
+                    None => 0.0,
+                };
+                let prec = precision.unwrap_or(6);
+                let negative = f.is_sign_negative();
+                let f_abs = f.abs();
+                let abs_str = if flag_comma {
+                    let s = format!("{:.prec$}", f_abs);
+                    match s.find('.') {
+                        Some(idx) => {
+                            let int_n: u64 = s[..idx].parse().unwrap_or(0);
+                            format!("{}{}", fmt_grouped(int_n), &s[idx..])
+                        }
+                        None => {
+                            let int_n: u64 = s.parse().unwrap_or(0);
+                            fmt_grouped(int_n)
+                        }
+                    }
+                } else {
+                    format!("{:.prec$}", f_abs)
+                };
+                let s = fmt_signed(negative, &abs_str, flag_plus, flag_space, flag_paren);
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── Scientific notation ───────────────────────────────────────────
+            'e' | 'E' => {
+                let f = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_f64(v).unwrap_or(0.0)
+                    }
+                    None => 0.0,
+                };
+                let prec = precision.unwrap_or(6);
+                let s = fmt_scientific(
+                    f, prec, conv == 'E', flag_plus, flag_space, flag_paren,
+                );
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── General float ─────────────────────────────────────────────────
+            'g' | 'G' => {
+                let f = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_f64(v).unwrap_or(0.0)
+                    }
+                    None => 0.0,
+                };
+                let prec = match precision {
+                    Some(0) | None => 6,
+                    Some(p) => p,
+                };
+                let s = fmt_general(
+                    f, prec, conv == 'G', flag_plus, flag_space, flag_paren,
+                );
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── Hex integer ───────────────────────────────────────────────────
+            'x' | 'X' => {
+                let n = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_i64(v).unwrap_or(0) as u64
+                    }
+                    None => 0,
+                };
+                let digits = if conv == 'X' {
+                    format!("{:X}", n)
+                } else {
+                    format!("{:x}", n)
+                };
+                let s = if flag_alt {
+                    let prefix = if conv == 'X' { "0X" } else { "0x" };
+                    format!("{}{}", prefix, digits)
+                } else {
+                    digits
+                };
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── Octal integer ─────────────────────────────────────────────────
+            'o' => {
+                let n = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        numeric_as_i64(v).unwrap_or(0) as u64
+                    }
+                    None => 0,
+                };
+                let s = format!("{:o}", n);
+                fmt_pad_num(&mut out, &s, width, flag_left, flag_zero && !flag_left);
+            }
+
+            // ── Boolean ───────────────────────────────────────────────────────
+            'b' | 'B' => {
+                let s = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        match v {
+                            Value::Nil | Value::Bool(false) => "false".to_string(),
+                            _ => "true".to_string(),
+                        }
+                    }
+                    None => "false".to_string(),
+                };
+                let s = if conv == 'B' { s.to_uppercase() } else { s };
+                fmt_pad(&mut out, &s, width, flag_left);
+            }
+
+            // ── Character ─────────────────────────────────────────────────────
+            'c' | 'C' => {
+                let s = match args.get(arg_idx) {
+                    Some(v) => {
+                        arg_idx += 1;
+                        match v {
+                            Value::Char(c) => c.to_string(),
+                            Value::Long(n) => char::from_u32(*n as u32)
+                                .map(|c| c.to_string())
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        }
+                    }
+                    None => String::new(),
+                };
+                let s = if conv == 'C' { s.to_uppercase() } else { s };
+                fmt_pad(&mut out, &s, width, flag_left);
+            }
+
+            // ── Unknown conversion — emit literally ───────────────────────────
+            other => {
+                out.push('%');
+                if flag_left {
+                    out.push('-');
+                }
+                if flag_plus {
+                    out.push('+');
+                }
+                if flag_space {
+                    out.push(' ');
+                }
+                if flag_zero {
+                    out.push('0');
+                }
+                if flag_paren {
+                    out.push('(');
+                }
+                if flag_comma {
+                    out.push(',');
+                }
+                if flag_alt {
+                    out.push('#');
+                }
+                if let Some(w) = width {
+                    out.push_str(&w.to_string());
+                }
+                if let Some(p) = precision {
+                    out.push('.');
+                    out.push_str(&p.to_string());
+                }
+                out.push(other);
+            }
         }
     }
+
     Ok(Value::string(out))
 }
 

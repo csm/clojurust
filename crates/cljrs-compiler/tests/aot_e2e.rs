@@ -2330,6 +2330,29 @@ fn test_versioned_snapshot_is_self_contained() {
     );
 }
 
+// ── Regression: issue #199 — format ignores width/flag specifiers ─────────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_format_width_flags() {
+    assert_output(
+        "format_width_flags",
+        r#"
+(println (format "%-5s" "ab"))
+(println (format "%-5s|" "ab"))
+(println (format "%-15s%s" "a" "b"))
+(println (format "%s %s" "a" "b"))
+(println (format "%d" 5))
+(println (format "%5d" 42))
+(println (format "%-5d" 42))
+(println (format "%05d" 42))
+(println (format "%+d" 42))
+(println (format "%5s" "ab"))
+"#,
+        "ab   \nab   |\na              b\na b\n5\n   42\n42   \n00042\n+42\n   ab",
+    );
+}
+
 // ── Regression: issue #198 — into rejects lazy-seq / cons as target ──────────
 
 #[test]
