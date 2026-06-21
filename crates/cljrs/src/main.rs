@@ -294,6 +294,7 @@ fn main() -> miette::Result<()> {
 
     let cli = Cli::parse();
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_max_level(if cli.trace {
             tracing::Level::TRACE
         } else if cli.debug {

@@ -687,10 +687,20 @@ fn macro_apply(
     arg_forms: &[Form],
     env: &mut Env,
 ) -> EvalResult<Form> {
+    // Resolve ::kw forms using the caller's namespace before the macro sees them.
+    // In Clojure, ::kw is resolved at read time; we approximate that here so a
+    // macro splicing its arguments into a new form cannot re-resolve them against
+    // the macro's own namespace.
+    let ns = env.current_ns.clone();
+    let resolved_args: Vec<Form> = arg_forms
+        .iter()
+        .map(|f| crate::macros::resolve_auto_kws(f, &ns))
+        .collect();
+
     // &form: the whole call expression as a list value.
     let form_val = {
         let mut items = vec![form_to_value(func_form)];
-        for f in arg_forms {
+        for f in &resolved_args {
             items.push(form_to_value(f));
         }
         Value::List(GcPtr::new(PersistentList::from_iter(items)))
@@ -708,7 +718,7 @@ fn macro_apply(
 
     // Prepend &form and &env, then pass remaining arg forms as unevaluated values.
     let mut args = vec![form_val, env_val];
-    args.extend(arg_forms.iter().map(form_to_value));
+    args.extend(resolved_args.iter().map(form_to_value));
 
     let expanded_val = call_cljrs_fn(mfn, args.as_ref(), env)?;
     let dummy_span = cljrs_types::span::Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
