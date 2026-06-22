@@ -578,7 +578,15 @@ fn lower_destructure_sequential(
 fn lower_emit_nth(ctx: &mut LowerCtx, val: VarId, idx: i64) -> VarId {
     let idx_var = ctx.emit_const(Const::Long(idx));
     let dst = ctx.fresh_var();
-    ctx.emit(Inst::CallKnown(dst, KnownFn::Nth, vec![val, idx_var]));
+    // Sequential destructuring binds missing positions to nil — `(nth coll idx
+    // nil)` — so it must never throw on a short collection.  Use the lenient
+    // nth, not `KnownFn::Nth` (which throws out-of-bounds, matching user-level
+    // `(nth v i)`).
+    ctx.emit(Inst::CallKnown(
+        dst,
+        KnownFn::NthLenient,
+        vec![val, idx_var],
+    ));
     dst
 }
 

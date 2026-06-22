@@ -152,6 +152,41 @@ fn background_lowering_works_without_jit() {
     );
 }
 
+/// Regression for #211: sequential destructuring of a collection shorter than
+/// its pattern must bind the missing positions to `nil`, not throw — at every
+/// tier.  Once `parse`'s reduce closure crossed the warm threshold it was
+/// IR-lowered, and its inner `[opt-type opt optarg]` destructure of a
+/// two-element token threw "index out of bounds: 2 >= 2" (the lowerer emitted a
+/// strict `nth`; Clojure destructuring is `(nth coll idx nil)`).  Mirrors
+/// `clojure.tools.cli/parse-option-tokens`: a `reduce` returning a three-element
+/// vector whose step destructures short tokens.
+#[test]
+fn short_destructure_in_warm_reduce_yields_nil_not_oob() {
+    let src = r#"
+        (defn parse [tokens]
+          (reduce
+            (fn [[m errors args] [opt-type opt optarg]]
+              (if (= opt-type :short)
+                [(assoc m opt 1) errors args]
+                [m errors (conj args opt)]))
+            [{} [] []]
+            tokens))
+        (loop [i 0]
+          (when (< i 200)
+            (let [[opts errors args] (parse [[:short "-v"]])]
+              (when (or (not= opts {"-v" 1}) (not= errors []) (not= args []))
+                (println "WRONG at" i opts errors args)))
+            (recur (+ i 1))))
+        (println "ok")
+    "#;
+    let (stdout, stderr) = run_warm(src, &["--jit-threshold", "50"], &[]);
+    assert!(
+        !stdout.contains("WRONG"),
+        "short destructure miscompiled after warm-up:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("ok"), "program did not complete:\n{stdout}");
+}
+
 /// `--ir-threshold 0` disables background lowering: no publish may appear.
 #[test]
 fn ir_threshold_zero_disables_background_lowering() {
