@@ -259,7 +259,11 @@ fn call_result_safe_for_deep(
                     // Element extractors return an inner pointer by reference.
                     if matches!(
                         kf,
-                        KnownFn::First | KnownFn::Nth | KnownFn::Get | KnownFn::Peek
+                        KnownFn::First
+                            | KnownFn::Nth
+                            | KnownFn::NthLenient
+                            | KnownFn::Get
+                            | KnownFn::Peek
                     ) {
                         return false;
                     }

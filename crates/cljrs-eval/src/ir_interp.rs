@@ -1168,6 +1168,13 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             Ok(result)
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
+        KnownFn::NthLenient => {
+            // Destructuring nth: out-of-bounds yields nil, never throws.  The
+            // 3-arg `nth` returns its default (nil here) for a short collection.
+            let mut args = args;
+            args.push(Value::Nil);
+            builtin_call_native("nth", &args)
+        }
         KnownFn::Aget => builtin_call_native("aget", &args),
         KnownFn::Aset => builtin_call_native("aset", &args),
         KnownFn::Alength => builtin_call_native("alength", &args),
