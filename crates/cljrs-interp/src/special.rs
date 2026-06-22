@@ -1005,11 +1005,21 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
                 if i < body_end {
                     body_end = i;
                 }
-                // The catch type may be a symbol (`Throwable`, `java.lang.Exception`)
-                // or the ClojureScript `:default` catch-all keyword.
+                // The catch type may be a symbol (`Throwable`, `java.lang.Exception`),
+                // the ClojureScript `:default` catch-all keyword, or a reader
+                // conditional `#?(:rust Exception :clj ...)` whose selected branch
+                // resolves to one of those.
                 let type_sym = match parts.get(1).map(|f| &f.kind) {
                     Some(FormKind::Symbol(s)) => s.as_str(),
                     Some(FormKind::Keyword(s)) => s.as_str(),
+                    Some(FormKind::ReaderCond {
+                        splicing: false,
+                        clauses,
+                    }) => match select_reader_cond(clauses).map(|f| &f.kind) {
+                        Some(FormKind::Symbol(s)) => s.as_str(),
+                        Some(FormKind::Keyword(s)) => s.as_str(),
+                        _ => continue,
+                    },
                     _ => continue,
                 };
                 let binding = match parts.get(2).map(|f| &f.kind) {
