@@ -185,6 +185,14 @@ fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
 /// it for background lowering.  On acceptance, marks every arity of `f` as
 /// queued; a full queue leaves the flags unset so a later call retries.
 fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
+    // Macro-expand using the defining namespace so that ::kw auto-keywords
+    // inside the function body resolve relative to where the function was
+    // defined, not where it happens to be called from.  Clojure resolves ::kw
+    // at read/compile time using the definer's namespace; we do it here at the
+    // first macro-expansion triggered by background lowering.
+    let saved_ns = caller_env.current_ns.clone();
+    caller_env.current_ns = f.defining_ns.clone();
+
     let arities: Vec<crate::lower_worker::LowerArityRequest> = f
         .arities
         .iter()
@@ -198,6 +206,8 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
             param_hints: a.param_hints.clone(),
         })
         .collect();
+
+    caller_env.current_ns = saved_ns;
     let arity_ids: Vec<u64> = arities.iter().map(|a| a.arity_id).collect();
 
     let accepted = crate::lower_worker::enqueue(crate::lower_worker::LowerRequest {
