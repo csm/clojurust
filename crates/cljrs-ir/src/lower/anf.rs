@@ -1501,7 +1501,6 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     // Body closure.
     let body_name: Arc<str> =
@@ -1523,7 +1522,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names: capture_names.clone(),
         },
@@ -1570,7 +1569,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 ClosureTemplate {
                     name: None,
                     arity_fn_names: vec![catch_name],
-                    param_counts: vec![ncaptures + 1],
+                    param_counts: vec![1],
                     is_variadic: vec![false],
                     capture_names: capture_names.clone(),
                 },
@@ -1607,7 +1606,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 ClosureTemplate {
                     name: None,
                     arity_fn_names: vec![fin_name],
-                    param_counts: vec![ncaptures],
+                    param_counts: vec![0],
                     is_variadic: vec![false],
                     capture_names: capture_names.clone(),
                 },
@@ -1683,7 +1682,6 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     let body_name: Arc<str> =
         Arc::from(format!("__cljrs_binding_body_{}", fresh_global_name_id()).as_str());
@@ -1704,7 +1702,7 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names,
         },
@@ -1832,7 +1830,6 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     let body_name: Arc<str> =
         Arc::from(format!("__cljrs_with_out_str_{}", fresh_global_name_id()).as_str());
@@ -1854,7 +1851,7 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names,
         },
