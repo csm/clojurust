@@ -165,6 +165,13 @@ operand (`Repr::LongArray`/`DoubleArray`) with an unboxed index, codegen loads/
 stores unboxed `i64`/`f64` elements; otherwise it uses a boxed bridge.  All
 paths bounds-check and throw on out-of-range access.
 
+`Nth` and `NthLenient` differ only in out-of-bounds behaviour: `Nth` is
+user-level `(nth coll idx)` and throws, while `NthLenient` is the
+sequential-destructuring nth (`(nth coll idx nil)`) emitted by the lowerer
+for `[a b c]` patterns — a short collection binds the missing positions to
+`nil` rather than throwing.  Both compile to the `rt_nth` bridge (already
+nil-on-OOB); the IR interpreter appends the nil default for `NthLenient`.
+
 Some `KnownFn` variants exist purely for analysis precision — the
 codegen and IR interpreter dispatch them through the dynamic builtin
 lookup like a regular `Call`, but the analyzer can use them to tighten

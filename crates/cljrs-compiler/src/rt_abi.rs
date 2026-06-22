@@ -4425,7 +4425,7 @@ fn intern_keyword(name: &str) -> *const Value {
     if let Some(v) = table.get(name) {
         return v.0.get() as *const Value;
     }
-    let ptr = GcPtr::new(Value::Keyword(GcPtr::new(Keyword::simple(name))));
+    let ptr = GcPtr::new(Value::Keyword(GcPtr::new(Keyword::parse(name))));
     let raw = ptr.get() as *const Value;
     table.insert(name.to_string(), SharedVal(ptr));
     raw

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use cljrs_gc::GcPtr;
+use cljrs_value::value::PrintValue;
 use cljrs_value::{Arity, PersistentVector, Value, ValueError, ValueResult};
 
 use crate::register_fns;
@@ -276,8 +277,10 @@ fn join(args: &[Value]) -> ValueResult<Value> {
     let result = items
         .iter()
         .map(|v| match v {
+            Value::Nil => String::new(),
             Value::Str(s) => s.get().clone(),
-            other => format!("{other}"),
+            Value::Char(c) => c.to_string(),
+            other => format!("{}", PrintValue(other)),
         })
         .collect::<Vec<_>>()
         .join(&sep);

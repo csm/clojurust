@@ -311,6 +311,26 @@ mod tests {
     }
 
     #[test]
+    fn test_string_join_char_elements() {
+        let (_, mut env) = make_env();
+        run("(require '[clojure.string :as str])", &mut env).unwrap();
+        // Characters must render as their string value, not reader syntax.
+        assert_eq!(
+            run(r"(str/join [\8 \0])", &mut env).unwrap(),
+            Value::string("80")
+        );
+        assert_eq!(
+            run(r"(str/join \- [\8 \0])", &mut env).unwrap(),
+            Value::string("8-0")
+        );
+        // nil elements are treated as empty string (same as (str nil) = "").
+        assert_eq!(
+            run(r#"(str/join "-" [nil "a" nil])"#, &mut env).unwrap(),
+            Value::string("-a-")
+        );
+    }
+
+    #[test]
     fn test_string_capitalize() {
         let (_, mut env) = make_env();
         run("(require '[clojure.string :as str])", &mut env).unwrap();

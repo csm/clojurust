@@ -122,6 +122,11 @@ pub enum KnownFn {
     Disj,
     Get,
     Nth,
+    /// `nth` with Clojure sequential-destructuring semantics: an out-of-bounds
+    /// index yields `nil` instead of throwing (i.e. `(nth coll idx nil)`).
+    /// Emitted only by destructuring lowering; user-level `(nth v i)` stays
+    /// [`KnownFn::Nth`], which throws on out-of-bounds.
+    NthLenient,
     Count,
     Contains,
 
@@ -996,6 +1001,7 @@ impl KnownFn {
             // Pure functions — no side effects, no allocation (result is scalar or reuses input)
             KnownFn::Get
             | KnownFn::Nth
+            | KnownFn::NthLenient
             | KnownFn::Count
             | KnownFn::Contains
             | KnownFn::First

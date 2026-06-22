@@ -1824,6 +1824,26 @@ fn test_partition() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_partition_3arg() {
+    assert_output(
+        "partition_3arg_fn",
+        r#"(println (into [] (partition 2 1 [1 2 3 4])))"#,
+        "[(1 2) (2 3) (3 4)]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_partition_4arg() {
+    assert_output(
+        "partition_4arg_fn",
+        r#"(println (into [] (partition 2 2 (repeat nil) [1 2 3])))"#,
+        "[(1 2) (3 nil)]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_zipmap() {
     assert_output(
         "zipmap_fn",
@@ -2330,6 +2350,29 @@ fn test_versioned_snapshot_is_self_contained() {
     );
 }
 
+// ── Regression: issue #199 — format ignores width/flag specifiers ─────────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_format_width_flags() {
+    assert_output(
+        "format_width_flags",
+        r#"
+(println (format "%-5s" "ab"))
+(println (format "%-5s|" "ab"))
+(println (format "%-15s%s" "a" "b"))
+(println (format "%s %s" "a" "b"))
+(println (format "%d" 5))
+(println (format "%5d" 42))
+(println (format "%-5d" 42))
+(println (format "%05d" 42))
+(println (format "%+d" 42))
+(println (format "%5s" "ab"))
+"#,
+        "ab   \nab   |\na              b\na b\n5\n   42\n42   \n00042\n+42\n   ab",
+    );
+}
+
 // ── Regression: issue #198 — into rejects lazy-seq / cons as target ──────────
 
 #[test]
@@ -2383,5 +2426,58 @@ fn test_versioned_bad_commit_fails_at_compile_time() {
     assert!(
         msg.contains("aaaaaaa"),
         "error should mention the bad commit: {msg}"
+    );
+}
+
+// ── Regression: clojure.string/join with char elements (issue #200) ─────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_string_join_char_elements_aot() {
+    assert_output(
+        "string_join_chars",
+        r#"
+(require '[clojure.string :as s])
+(defn -main [& _]
+  (println (s/join [\8 \0]))
+  (println (s/join "-" [\8 \0])))
+"#,
+        "80\n8-0",
+    );
+}
+
+// ── Issue #209: ::keyword resolution through macros (AOT path) ────────────────
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_auto_kw_through_if_not_aot() {
+    // ::kw must resolve to the call-site namespace in AOT-compiled code, not
+    // the macro definition namespace.
+    assert_output(
+        "auto_kw_if_not",
+        r#"
+(ns my.app)
+(defn check [v]
+  (if-not (= v ::error) :WRONG :right))
+(defn -main [& _]
+  (println (check ::error))
+  (println (check ::other)))
+"#,
+        ":right\n:WRONG",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_auto_kw_qualified_keyword_aot() {
+    // Verify the keyword is fully namespace-qualified in the output.
+    assert_output(
+        "auto_kw_qualified",
+        r#"
+(ns acme.core)
+(defn -main [& _]
+  (println ::status))
+"#,
+        ":acme.core/status",
     );
 }

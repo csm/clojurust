@@ -248,12 +248,13 @@ fn lower_form(ctx: &mut LowerCtx, form: &Form) -> R {
         FormKind::Str(s) => Ok(ctx.emit_const(Const::Str(Arc::from(s.as_str())))),
         FormKind::Regex(s) => Ok(ctx.emit_const(Const::Str(Arc::from(s.as_str())))),
         FormKind::Symbolic(f) => Ok(ctx.emit_const(Const::Double(*f))),
-        FormKind::Keyword(s) => {
-            // Strip namespace prefix for keyword constants (mirrors `(name kw)`).
-            let local_name = kw_local_name(s);
-            Ok(ctx.emit_const(Const::Keyword(Arc::from(local_name))))
+        FormKind::Keyword(s) => Ok(ctx.emit_const(Const::Keyword(Arc::from(s.as_str())))),
+        FormKind::AutoKeyword(s) => {
+            // ::kw must resolve to the current namespace at the call site, just as
+            // the interpreter's eval.rs does at runtime.
+            let full = format!("{}/{s}", ctx.ns());
+            Ok(ctx.emit_const(Const::Keyword(Arc::from(full.as_str()))))
         }
-        FormKind::AutoKeyword(s) => Ok(ctx.emit_const(Const::Keyword(Arc::from(s.as_str())))),
         FormKind::Symbol(s) => lower_symbol(ctx, s),
         FormKind::Vector(elems) => {
             let vars: Result<Vec<VarId>, _> = elems.iter().map(|e| lower_form(ctx, e)).collect();
@@ -352,8 +353,7 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
         return match args.len() {
             1 => {
                 let m = lower_form(ctx, &args[0])?;
-                let local = kw_local_name(s);
-                let k = ctx.emit_const(Const::Keyword(Arc::from(local)));
+                let k = ctx.emit_const(Const::Keyword(Arc::from(s.as_str())));
                 let dst = ctx.fresh_var();
                 ctx.emit(Inst::CallKnown(dst, KnownFn::Get, vec![m, k]));
                 Ok(dst)
@@ -578,7 +578,15 @@ fn lower_destructure_sequential(
 fn lower_emit_nth(ctx: &mut LowerCtx, val: VarId, idx: i64) -> VarId {
     let idx_var = ctx.emit_const(Const::Long(idx));
     let dst = ctx.fresh_var();
-    ctx.emit(Inst::CallKnown(dst, KnownFn::Nth, vec![val, idx_var]));
+    // Sequential destructuring binds missing positions to nil — `(nth coll idx
+    // nil)` — so it must never throw on a short collection.  Use the lenient
+    // nth, not `KnownFn::Nth` (which throws out-of-bounds, matching user-level
+    // `(nth v i)`).
+    ctx.emit(Inst::CallKnown(
+        dst,
+        KnownFn::NthLenient,
+        vec![val, idx_var],
+    ));
     dst
 }
 
@@ -1493,7 +1501,6 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     // Body closure.
     let body_name: Arc<str> =
@@ -1515,7 +1522,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names: capture_names.clone(),
         },
@@ -1562,7 +1569,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 ClosureTemplate {
                     name: None,
                     arity_fn_names: vec![catch_name],
-                    param_counts: vec![ncaptures + 1],
+                    param_counts: vec![1],
                     is_variadic: vec![false],
                     capture_names: capture_names.clone(),
                 },
@@ -1599,7 +1606,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 ClosureTemplate {
                     name: None,
                     arity_fn_names: vec![fin_name],
-                    param_counts: vec![ncaptures],
+                    param_counts: vec![0],
                     is_variadic: vec![false],
                     capture_names: capture_names.clone(),
                 },
@@ -1675,7 +1682,6 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     let body_name: Arc<str> =
         Arc::from(format!("__cljrs_binding_body_{}", fresh_global_name_id()).as_str());
@@ -1696,7 +1702,7 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names,
         },
@@ -1824,7 +1830,6 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
     let all_locals = ctx.get_all_locals();
     let capture_names: Vec<Arc<str>> = all_locals.iter().map(|(n, _)| n.clone()).collect();
     let capture_vars: Vec<VarId> = all_locals.iter().map(|(_, v)| *v).collect();
-    let ncaptures = capture_names.len();
 
     let body_name: Arc<str> =
         Arc::from(format!("__cljrs_with_out_str_{}", fresh_global_name_id()).as_str());
@@ -1846,7 +1851,7 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
         ClosureTemplate {
             name: None,
             arity_fn_names: vec![body_name],
-            param_counts: vec![ncaptures],
+            param_counts: vec![0],
             is_variadic: vec![false],
             capture_names,
         },
@@ -2539,7 +2544,7 @@ fn lower_quote(ctx: &mut LowerCtx, form: &Form) -> R {
         FormKind::Float(f) => Ok(ctx.emit_const(Const::Double(*f))),
         FormKind::Str(s) => Ok(ctx.emit_const(Const::Str(Arc::from(s.as_str())))),
         FormKind::Char(c) => Ok(ctx.emit_const(Const::Char(*c))),
-        FormKind::Keyword(s) => Ok(ctx.emit_const(Const::Keyword(Arc::from(kw_local_name(s))))),
+        FormKind::Keyword(s) => Ok(ctx.emit_const(Const::Keyword(Arc::from(s.as_str())))),
         FormKind::Symbol(s) => Ok(ctx.emit_const(Const::Symbol(Arc::from(s.as_str())))),
         FormKind::Vector(elems) => {
             let vars: Result<Vec<VarId>, _> = elems.iter().map(|e| lower_quote(ctx, e)).collect();
@@ -2633,15 +2638,6 @@ fn versioned_ns_base(ns: &str) -> Option<&str> {
         Some(&ns[..pos])
     } else {
         None
-    }
-}
-
-/// Extract the local (non-namespace) part of a keyword string.
-/// `"ns/foo"` → `"foo"`, `"foo"` → `"foo"`.
-fn kw_local_name(s: &str) -> &str {
-    match s.rfind('/') {
-        Some(pos) => &s[pos + 1..],
-        None => s,
     }
 }
 

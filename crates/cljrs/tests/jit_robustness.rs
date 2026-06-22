@@ -94,3 +94,63 @@ fn closure_bearing_fn_runs_correctly_without_panicking() {
         run.stderr
     );
 }
+
+#[test]
+fn string_join_char_elements_from_jit() {
+    // `clojure.string/join` is never JIT-compiled (builtin-source namespace),
+    // but a hot user function that calls it must still see correct results.
+    // Characters must render as their string value ("80"), not reader syntax
+    // ("\8\0"). Regression for issue #200.
+    let src = r#"
+        (require '[clojure.string :as s])
+        (defn join-chars [chars sep]
+          (s/join sep chars))
+        (dotimes [_ 100]
+          (join-chars [\8 \0] "")
+          (join-chars [\8 \0] "-"))
+        (println (join-chars [\8 \0] ""))
+        (println (join-chars [\8 \0] "-"))
+    "#;
+
+    let run = run_jit(src);
+
+    assert!(
+        run.stdout.contains("80"),
+        "expected \"80\" in stdout, got:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("8-0"),
+        "expected \"8-0\" in stdout, got:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("\\8"),
+        "join produced reader syntax (\\8) instead of char value; stdout:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn contains_q_vector_non_integer_key_returns_false_under_jit() {
+    // Regression for #206: `(contains? [1 2 3] :a)` must return false, not
+    // throw, even when the call is JIT-compiled.
+    let src = r#"
+        (defn check [v k] (contains? v k))
+        (dotimes [_ 100]
+          (check [1 2 3] :a)
+          (check [1 2 3] "x")
+          (check [1 2 3] 0))
+        (println (check [1 2 3] :a))
+        (println (check [1 2 3] "x"))
+        (println (check [1 2 3] 0))
+    "#;
+
+    let run = run_jit(src);
+
+    assert!(
+        run.stdout.contains("false\nfalse\ntrue"),
+        "unexpected output; stdout:\n{}",
+        run.stdout
+    );
+}

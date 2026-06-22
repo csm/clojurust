@@ -2144,7 +2144,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             KnownFn::TryCatchFinally => self.rt.rt_try,
             KnownFn::Dissoc => self.rt.rt_dissoc,
             KnownFn::Disj => self.rt.rt_disj,
-            KnownFn::Nth => self.rt.rt_nth,
+            // `rt_nth` already returns nil on out-of-bounds, which is exactly
+            // the lenient destructuring semantics — so both share the bridge.
+            KnownFn::Nth | KnownFn::NthLenient => self.rt.rt_nth,
             KnownFn::Contains => self.rt.rt_contains,
             KnownFn::Cons => self.rt.rt_alloc_cons,
             KnownFn::Seq => self.rt.rt_seq,

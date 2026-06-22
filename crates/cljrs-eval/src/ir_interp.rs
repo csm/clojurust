@@ -1197,6 +1197,13 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             Ok(result)
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
+        KnownFn::NthLenient => {
+            // Destructuring nth: out-of-bounds yields nil, never throws.  The
+            // 3-arg `nth` returns its default (nil here) for a short collection.
+            let mut args = args;
+            args.push(Value::Nil);
+            builtin_call_native("nth", &args)
+        }
         KnownFn::Aget => builtin_call_native("aget", &args),
         KnownFn::Aset => builtin_call_native("aset", &args),
         KnownFn::Alength => builtin_call_native("alength", &args),
@@ -1337,7 +1344,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         // ── Dynamic binding / exception handling ────────────────────────
         KnownFn::SetBangVar => builtin_call_native("set!", &args),
         KnownFn::WithBindings => eval_ir_with_bindings(args, env),
-        KnownFn::WithOutStr | KnownFn::TryCatchFinally => {
+        KnownFn::TryCatchFinally => eval_ir_try_catch_finally(args, env),
+        KnownFn::WithOutStr => {
             let fn_name = known_fn_to_name(known_fn);
             let callee = load_builtin(env, fn_name)?;
             apply_value(&callee, args, env)
@@ -1395,6 +1403,38 @@ fn eval_ir_with_bindings(args: Vec<Value>, env: &mut Env) -> EvalResult {
     }
     let _guard = cljrs_env::dynamics::push_frame(frame);
     cljrs_env::apply::apply_value(&body, vec![], env)
+}
+
+/// Handle `KnownFn::TryCatchFinally` emitted by `lower_try`.
+///
+/// Args are `[body-fn, catch-fn-or-nil, finally-fn-or-nil]`.  The body thunk
+/// is called with no arguments.  On a thrown exception the catch thunk (if not
+/// nil) is called with the exception value as its sole argument.  The finally
+/// thunk (if not nil) is always called with no arguments before returning.
+fn eval_ir_try_catch_finally(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    let body = args.first().cloned().unwrap_or(Value::Nil);
+    let catch_fn = args.get(1).cloned().unwrap_or(Value::Nil);
+    let finally_fn = args.get(2).cloned().unwrap_or(Value::Nil);
+
+    let body_result = apply_value(&body, vec![], env);
+
+    let ret = match body_result {
+        Ok(val) => Ok(val),
+        Err(EvalError::Thrown(thrown_val)) => {
+            if matches!(catch_fn, Value::Nil) {
+                Err(EvalError::Thrown(thrown_val))
+            } else {
+                apply_value(&catch_fn, vec![thrown_val], env)
+            }
+        }
+        err => err,
+    };
+
+    if !matches!(finally_fn, Value::Nil) {
+        let _ = apply_value(&finally_fn, vec![], env);
+    }
+
+    ret
 }
 
 /// Call a native builtin by name from the global environment.

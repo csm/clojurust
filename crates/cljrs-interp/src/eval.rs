@@ -623,6 +623,20 @@ mod tests {
         assert!(matches!(v, Value::Set(_)));
     }
 
+    #[test]
+    fn test_contains_q_vector_non_integer_key_returns_false() {
+        // Regression for #206: non-integer key on a vector must return false,
+        // not throw a WrongType error.
+        assert_eq!(eval_str("(contains? [1 2 3] :a)").unwrap(), bool_v(false));
+        assert_eq!(
+            eval_str("(contains? [1 2 3] \"x\")").unwrap(),
+            bool_v(false)
+        );
+        // Integer keys still work correctly.
+        assert_eq!(eval_str("(contains? [1 2 3] 0)").unwrap(), bool_v(true));
+        assert_eq!(eval_str("(contains? [1 2 3] 9)").unwrap(), bool_v(false));
+    }
+
     // ── set! ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -695,6 +709,43 @@ mod tests {
     fn test_finally_exception_propagates() {
         // An exception thrown from `finally` supersedes the body's result.
         assert!(eval_str("(try 1 (finally (throw (ex-info \"boom\" {}))))").is_err());
+    }
+
+    #[test]
+    fn test_catch_reader_conditional_type() {
+        // Regression for #210: a reader conditional in the catch type position must
+        // be resolved before matching — previously the catch clause was silently
+        // dropped and the exception escaped.
+
+        // Single-branch: #?(:rust Exception)
+        let v =
+            eval_str(r#"(try (throw (ex-info "boom" {})) (catch #?(:rust Exception) e :caught))"#)
+                .unwrap();
+        let kw_caught = Value::keyword(cljrs_value::Keyword::simple("caught"));
+        assert_eq!(v, kw_caught, "single-branch reader cond");
+
+        // Multi-branch: the :rust branch must win over :clj/:cljs/:default ordering
+        let v = eval_str(concat!(
+            "(try (throw (ex-info \"boom\" {})) ",
+            "(catch #?(:clj Throwable :cljs :default :rust Exception) e :caught))",
+        ))
+        .unwrap();
+        assert_eq!(v, kw_caught, "multi-branch reader cond");
+
+        // A reader conditional whose :rust branch resolves to :default is also a
+        // catch-all and must match any exception.
+        let v =
+            eval_str(r#"(try (throw (ex-info "boom" {})) (catch #?(:rust :default) e :caught))"#)
+                .unwrap();
+        assert_eq!(v, kw_caught, "reader cond resolves to :default");
+
+        // A reader conditional with no :rust branch must NOT catch the exception.
+        let result =
+            eval_str(r#"(try (throw (ex-info "boom" {})) (catch #?(:clj Throwable) e :caught))"#);
+        assert!(
+            result.is_err(),
+            "no matching :rust branch must let exception escape"
+        );
     }
 
     #[test]
