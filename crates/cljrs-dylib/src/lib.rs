@@ -182,9 +182,12 @@ fn build_pinned_wrapper(git: &GitDep, commit: &str) -> Result<PathBuf, String> {
     // first segment, which must match the package's lib name.
     let pkg_ident = crate_name.replace('-', "_");
 
-    // 1. Fetch + checkout at the pinned commit.
-    let bare = cljrs_vcs::fetch_remote(&git.url, commit).map_err(|e| e.to_string())?;
-    let checkout = checkout_at(&bare, crate_name, commit)?;
+    // 1. Fetch + checkout at the pinned commit.  `fetch_remote` populates the
+    //    bare cache (network only if the commit is missing); `worktree_at_commit`
+    //    materializes a files-only checkout from it (shared with the source-path
+    //    materialization used for plain `require` of git deps).
+    cljrs_vcs::fetch_remote(&git.url, commit).map_err(|e| e.to_string())?;
+    let checkout = cljrs_vcs::worktree_at_commit(&git.url, commit).map_err(|e| e.to_string())?;
     let crate_dir = match git.rust_crate_dir.as_deref() {
         Some(sub) => checkout.join(sub),
         None => checkout.clone(),
@@ -233,52 +236,6 @@ fn build_pinned_wrapper(git: &GitDep, commit: &str) -> Result<PathBuf, String> {
         return Err(format!("built wrapper not found at {}", artifact.display()));
     }
     Ok(artifact)
-}
-
-/// Materialize the pinned commit's tree into a working checkout (no `.git`).
-fn checkout_at(bare: &Path, crate_name: &str, commit: &str) -> Result<PathBuf, String> {
-    let dest = dylib_cache_root()
-        .join("checkouts")
-        .join(format!("{crate_name}@{commit}"));
-    // Sentinel marking a previously completed checkout (the worktree has no
-    // `.git`, so we can't probe for one).
-    let sentinel = dest.join(".cljrs-checkout-complete");
-    if sentinel.exists() {
-        return Ok(dest);
-    }
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-
-    // Resolve the pinned commit to its tree and check that tree out into `dest`
-    // with gitoxide — just the files needed to build the crate.
-    let repo = gix::open(bare).map_err(|e| format!("open {}: {e}", bare.display()))?;
-    let tree = repo
-        .rev_parse_single(commit)
-        .map_err(|e| format!("resolve {commit}: {e}"))?
-        .object()
-        .map_err(|e| e.to_string())?
-        .peel_to_tree()
-        .map_err(|e| format!("peel {commit} to tree: {e}"))?;
-    let mut index = repo
-        .index_from_tree(&tree.id)
-        .map_err(|e| format!("index from tree: {e}"))?;
-    let opts = repo
-        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
-        .map_err(|e| e.to_string())?;
-    let odb = repo.objects.clone().into_arc().map_err(|e| e.to_string())?;
-    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
-    gix::worktree::state::checkout(
-        &mut index,
-        &dest,
-        odb,
-        &gix::progress::Discard,
-        &gix::progress::Discard,
-        &should_interrupt,
-        opts,
-    )
-    .map_err(|e| format!("checkout {commit} into {}: {e}", dest.display()))?;
-
-    std::fs::write(&sentinel, commit.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(dest)
 }
 
 /// Write the generated wrapper crate (Cargo.toml, build.rs, src/lib.rs).

@@ -749,6 +749,7 @@ dependencies = [
  "libloading",
  "miette",
  "rustyline",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -879,7 +880,6 @@ dependencies = [
  "cljrs-reader",
  "cljrs-value",
  "cljrs-vcs",
- "gix",
  "libloading",
  "tempfile",
 ]

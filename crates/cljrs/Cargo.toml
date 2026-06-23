@@ -56,3 +56,6 @@ cljrs-io    = { workspace = true, optional = true }
 cljrs-net     = { workspace = true, optional = true }
 cljrs-charset = { workspace = true, optional = true }
 tokio         = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

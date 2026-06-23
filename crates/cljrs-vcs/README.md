@@ -63,6 +63,16 @@ pub fn cache_path_for_url(url: &str) -> PathBuf
 /// Returns the path to the bare repo in the cache.
 pub fn fetch_remote(url: &str, sha: &str) -> VcsResult<PathBuf>
 
+/// Materialize a files-only working checkout of `sha` for `url` from the local
+/// bare cache (network-free; `fetch_remote` must have populated it first).
+/// Cached per (url, sha) under `~/.cljrs/cache/git/worktrees/`.  Used to put a
+/// dependency's source on the source path for a plain `require`.
+pub fn worktree_at_commit(url: &str, sha: &str) -> VcsResult<PathBuf>
+
+/// Check out the tree of `commit` from `repo` (bare or not) into `dest` as a
+/// files-only working tree (no `.git`).  `dest` must already exist.
+pub fn checkout_tree(repo: &Path, commit: &str, dest: &Path) -> VcsResult<()>
+
 /// Verify the PGP or SSH signature on `commit` against `trusted`.
 /// Ok only when the signature is valid AND its key is in the trusted set.
 pub fn verify_commit_signature(repo_root: &Path, commit: &str, trusted: &TrustedKeys) -> VcsResult<()>
