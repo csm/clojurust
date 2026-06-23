@@ -5,7 +5,10 @@
 Pinned native packages: build a dependency's Rust crate at a pinned git
 commit as a cdylib and load it, so versioned symbols (`my.lib/f@<sha>`) can
 resolve to **truly pinned** native code instead of the default verified HEAD
-binding (`:rust/load :dylib` in `cljrs.edn`).
+binding (`:rust/load :dylib` in `cljrs.edn`).  The same machinery also makes a
+`:rust/load :dylib` dependency loadable by a **plain `require`** of its
+namespace, registering the package's exports into the live (unversioned)
+namespace.
 
 ## Status
 
@@ -20,20 +23,24 @@ collisions between two versions of one crate).
 ## File layout
 
 ```
-src/lib.rs  — install (loader hook), wrapper crate generation, cargo build +
-              cache, dlopen + ABI handshake, versioned Registry init
+src/lib.rs  — install (both loader hooks), wrapper crate generation, cargo
+              build + cache, dlopen + ABI handshake, versioned/unversioned
+              Registry init
 build.rs    — captures `rustc -V` for the host side of the ABI fingerprint
 tests/
   pinned_dylib_e2e.rs — gated end-to-end test (CLJRS_DYLIB_E2E=1): two-commit
-              native crate fixture; pinned resolution loads the v1 dylib while
-              HEAD stays untouched
+              native crate fixture; pinned (versioned-symbol) resolution loads
+              the v1 dylib while HEAD stays untouched, and a plain `require`
+              loads the v1 dylib into the unversioned namespace
 ```
 
 ## Public API
 
 ```rust
-/// Install the pinned-native loader hook on the environment (idempotent).
-/// Called by the cljrs CLI during setup_globals.
+/// Install both native loader hooks on the environment (idempotent): the
+/// pinned-native loader (versioned-symbol resolution) and the native-require
+/// loader (plain `require` of a `:rust/load :dylib` dep).  Called by the
+/// cljrs CLI during setup_globals.
 pub fn install(globals: &Arc<GlobalEnv>);
 
 /// The host's ABI fingerprint: "cljrs <version>; <rustc -V>; <debug|release>".
@@ -67,3 +74,14 @@ pub const INIT_SYMBOL: &[u8];  // b"cljrs_dylib_init\0"
    `"<ns>@<commit>"` namespace.
 6. The namespace is marked loaded; subsequent pinned lookups are plain
    namespace hits.
+
+### Plain `require` of a native dep
+
+When `(require '[my.native.lib :as l])` finds no Clojure source for the
+namespace, `cljrs_env`'s unversioned loader consults the installed
+`NativeRequireLoader`.  It runs the same fetch/checkout/wrapper-build pipeline
+(steps 2–4 above), keyed on the dep's pinned `:git/sha`, then runs
+`cljrs_dylib_init` through `Registry::for_require(...)` — an **unversioned**
+view — so the exports land in the live `my.native.lib` namespace.  The loader
+returns and the unversioned loader marks the namespace loaded, so `l/encode`
+resolves like any other namespace.
