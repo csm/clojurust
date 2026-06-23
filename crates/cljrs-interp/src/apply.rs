@@ -515,9 +515,14 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         // Bind params.
         bind_fn_params(arity, &current_args, &mut env)?;
 
-        // Self-reference for named functions.
+        // Self-reference for named functions: use self_ptr when available so
+        // the binding is pointer-equal to the outer Value::Fn holding this fn.
         if let Some(ref name) = f.name {
-            let self_val = Value::Fn(GcPtr::new(f.clone()));
+            let self_val = if let Some(ref p) = f.self_ptr {
+                Value::Fn(p.clone())
+            } else {
+                Value::Fn(GcPtr::new(f.clone()))
+            };
             env.bind(name.clone(), self_val);
         }
 

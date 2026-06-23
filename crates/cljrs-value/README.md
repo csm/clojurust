@@ -282,14 +282,20 @@ pub struct CljxFn {
     pub closed_over_names: Vec<Arc<str>>,
     pub closed_over_vals: Vec<Value>,
     pub is_macro: bool,
-    pub is_async: bool, // ^:async — dispatched via the async runtime when one is registered
+    pub is_async: bool,       // ^:async — dispatched via the async runtime when one is registered
     pub defining_ns: Arc<str>,
+    pub self_ptr: Option<GcPtr<CljxFn>>, // back-pointer for named-fn pointer identity (issue #194)
 }
 ```
 
 `is_async` is set by the interpreter when a `fn`/`defn` carries `^:async` (or an
 `{:async true}` attr-map). `CljxFn::new` defaults it to `false`; `cljrs-env`'s
 `dispatch_if_async` checks it at call time.
+
+`self_ptr` is set immediately after `GcPtr::new(cljrs_fn)` in `eval_fn` (for
+named anonymous functions) so that the self-reference returned from the function
+body is the *same* `GcPtr` as the outer binding, preserving pointer-equality
+semantics (`(= f (f))` → `true`).  `CljxFn::new` defaults it to `None`.
 
 ### Var-rebind hooks (`jit_hooks`, Phases 10.2/10.5)
 
