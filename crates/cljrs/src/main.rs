@@ -688,6 +688,10 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
                     }
                 }
             }
+            // Append each dependency's own source roots so a plain `require` of
+            // a dep's namespace resolves (git deps are materialized from the
+            // local cache — run `cljrs deps fetch` first; no network here).
+            add_dep_source_paths(globals, &config);
             if config.verify_commit_signatures {
                 globals
                     .verify_commit_signatures
@@ -707,6 +711,71 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
         Ok(None) => {}
         Err(e) => eprintln!("cljrs: warning: could not load cljrs.edn: {e}"),
     }
+}
+
+/// Append each declared dependency's own source roots to `globals.source_paths`
+/// so a plain `(require '[dep.ns :as …])` resolves namespaces provided by a
+/// dependency rather than only by the running binary or the local project.
+///
+/// - **Local deps** (`:local/root`) contribute paths from the directory on disk.
+/// - **Git deps** are materialized from the local bare cache at their pinned
+///   `:git/sha` (no network — `cljrs deps fetch` must have populated it).  A
+///   missing cache warns and is skipped rather than aborting the run.
+///
+/// Each dep's roots come from its own `cljrs.edn` `:paths` (resolved relative to
+/// the dep root), defaulting to `src/`.  Only directories that actually exist
+/// are added; pure-native deps (no Clojure source) contribute nothing here and
+/// are brought in by the native-`require` loader instead.
+fn add_dep_source_paths(globals: &Arc<GlobalEnv>, config: &cljrs_deps::DepsConfig) {
+    for (name, dep) in &config.deps {
+        let root = match dep {
+            cljrs_deps::Dependency::Local { root } => {
+                if root.is_dir() {
+                    root.clone()
+                } else {
+                    eprintln!(
+                        "cljrs: warning: local dep {name} not found at {}",
+                        root.display()
+                    );
+                    continue;
+                }
+            }
+            cljrs_deps::Dependency::Git(git) => {
+                match cljrs_vcs::worktree_at_commit(&git.url, &git.sha) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "cljrs: warning: git dep {name} ({}) is not available ({e}); \
+                             run `cljrs deps fetch`",
+                            git.url
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        let mut paths = globals.source_paths.write().unwrap();
+        for p in dep_source_paths(&root) {
+            if p.is_dir() && !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+}
+
+/// The source roots a dependency at `root` contributes: its `cljrs.edn`
+/// `:paths` (already resolved to absolute paths relative to the dep root) if a
+/// parseable config is present, else the conventional `<root>/src`.
+fn dep_source_paths(root: &Path) -> Vec<PathBuf> {
+    let cfg_path = root.join("cljrs.edn");
+    if cfg_path.exists()
+        && let Ok(src) = std::fs::read_to_string(&cfg_path)
+        && let Ok(parsed) = cljrs_deps::parse_config(&src, &cfg_path)
+        && !parsed.paths.is_empty()
+    {
+        return parsed.paths;
+    }
+    vec![root.join("src")]
 }
 
 // ── Source evaluation ─────────────────────────────────────────────────────────

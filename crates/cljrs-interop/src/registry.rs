@@ -83,6 +83,18 @@ impl Registry {
         }
     }
 
+    /// Create an **unversioned view that does not auto-register** the host's
+    /// `#[export]` inventory.
+    ///
+    /// Used when a `:rust/load :dylib` dependency is brought in by a plain
+    /// `require`: the dep's namespaces must land in their real (unversioned)
+    /// names so a plain `(require '[my.lib :as l])` resolves them, but the
+    /// dylib registers its own `#[export]` inventory from inside its init —
+    /// the host's inventory must not be re-run here.
+    pub fn for_require(env: Arc<GlobalEnv>) -> Self {
+        Self { env, version: None }
+    }
+
     /// The target namespace for a registration, versioned when this is a
     /// [`versioned`][Self::versioned] view.
     fn target_ns(&self, ns: &str) -> Arc<str> {

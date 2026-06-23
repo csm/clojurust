@@ -205,3 +205,80 @@ fn pinned_native_dylib_end_to_end() {
     };
     assert_eq!((nf2.get().func)(&[]).unwrap(), Value::Long(1));
 }
+
+/// A `:rust/load :dylib` dependency is brought in by a **plain `require`** of
+/// its namespace (no versioned symbol literal): the dep's crate is built at
+/// its pinned `:git/sha` and its exports land in the live, unversioned
+/// namespace, so `pinlib/build-tag` resolves to the pinned implementation.
+///
+/// Regression test for the native-deps `require` gap (issue #222).
+#[test]
+fn native_dep_loaded_by_plain_require() {
+    if std::env::var("CLJRS_DYLIB_E2E").is_err() {
+        eprintln!("skipping native_dep_loaded_by_plain_require (set CLJRS_DYLIB_E2E=1 to run)");
+        return;
+    }
+
+    let ws_root = workspace_root();
+    let (repo, sha_v1) = make_pinlib_repo(&ws_root);
+
+    // Hermetic dylib/git caches + a pinned workspace for the wrapper deps.
+    let cache_home = tempfile::tempdir().unwrap();
+    // SAFETY: single gated test invocation; no concurrent env readers.
+    unsafe {
+        std::env::set_var("HOME", cache_home.path());
+        std::env::set_var("CLJRS_WORKSPACE_ROOT", &ws_root);
+    }
+
+    let _mutator = cljrs_gc::register_mutator();
+    let globals = cljrs_interp::standard_env_minimal(None, None, None);
+
+    // cljrs.edn equivalent: pinlib is a git dep with :rust/load :dylib, pinned
+    // at the v1 commit.  No Clojure source on the path provides this namespace.
+    let config = cljrs_deps::DepsConfig {
+        deps: vec![(
+            Arc::from("pinlib"),
+            cljrs_deps::Dependency::Git(cljrs_deps::GitDep {
+                url: Arc::from(repo.path().to_string_lossy().as_ref()),
+                sha: Arc::from(sha_v1.as_str()),
+                rust_init: Some(Arc::from("pinlib::cljrs_init")),
+                rust_crate_dir: None,
+                rust_load_dylib: true,
+            }),
+        )],
+        ..Default::default()
+    };
+    *globals.deps_config.write().unwrap() = Some(Arc::new(config));
+
+    cljrs_dylib::install(&globals);
+
+    // A plain `(require '[pinlib :as pl])` must build + load the native dep.
+    let spec = cljrs_env::env::RequireSpec {
+        ns: Arc::from("pinlib"),
+        version: None,
+        alias: Some(Arc::from("pl")),
+        refer: cljrs_env::env::RequireRefer::None,
+    };
+    cljrs_env::loader::load_ns(globals.clone(), &spec, "user")
+        .expect("plain require of a native dep should succeed");
+
+    // The unversioned namespace is now loaded and carries the dylib's export.
+    assert!(globals.is_loaded("pinlib"));
+    let f = globals
+        .lookup_in_ns("pinlib", "build-tag")
+        .expect("pinlib/build-tag must be registered by the dylib");
+    let Value::NativeFunction(nf) = &f else {
+        panic!("expected a native fn, got {f:?}");
+    };
+    assert_eq!(
+        (nf.get().func)(&[]).unwrap(),
+        Value::Long(1),
+        "native dep must be built from the pinned v1 commit"
+    );
+
+    // The alias resolves the unversioned namespace.
+    assert_eq!(
+        globals.resolve_alias("user", "pl").as_deref(),
+        Some("pinlib")
+    );
+}
