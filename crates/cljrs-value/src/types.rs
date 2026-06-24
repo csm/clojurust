@@ -690,6 +690,11 @@ pub struct CljxFn {
     pub is_async: bool,
     /// Namespace in which this function was defined (for macro hygiene).
     pub defining_ns: Arc<str>,
+    /// Back-pointer to the `GcPtr` that owns this `CljxFn`, set immediately
+    /// after allocation so that a named anonymous function's self-reference
+    /// (e.g. `(fn g [] g)`) returns the *identical* pointer to the caller,
+    /// preserving pointer-equality semantics (`(= f (f))` → `true`).
+    pub self_ptr: Option<GcPtr<CljxFn>>,
 }
 
 impl CljxFn {
@@ -709,14 +714,19 @@ impl CljxFn {
             is_macro,
             is_async: false,
             defining_ns,
+            self_ptr: None,
         }
     }
 }
 
 impl cljrs_gc::Trace for CljxFn {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        use cljrs_gc::GcVisitor as _;
         for v in &self.closed_over_vals {
             v.trace(visitor);
+        }
+        if let Some(ref p) = self.self_ptr {
+            visitor.visit(p);
         }
     }
 
