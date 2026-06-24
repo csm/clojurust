@@ -23,6 +23,7 @@ rustls-native-certs = "0.8"
 quinn          = { workspace = true }
 h3             = { workspace = true }
 h3-quinn       = { workspace = true }
+h2             = { workspace = true }
 bytes          = "1"
 http           = "1"
 
