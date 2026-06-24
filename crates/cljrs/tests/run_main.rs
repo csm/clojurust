@@ -69,3 +69,46 @@ fn run_awaits_async_main() {
         "async -main body did not run to completion; stdout was: {stdout}"
     );
 }
+
+fn run_file_with_args(path: &PathBuf, cli_args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cljrs"))
+        .arg("run")
+        .arg(path)
+        .arg("--")
+        .args(cli_args)
+        .output()
+        .expect("run cljrs binary")
+}
+
+#[test]
+fn async_main_receives_cli_args() {
+    let path = write_fixture(
+        "args",
+        r#"
+(defn ^:async -main [& args]
+  (println "count:" (count args))
+  (println "first:" (first args))
+  (println "second:" (second args)))
+"#,
+    );
+    let out = run_file_with_args(&path, &["hello", "world"]);
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("count: 2"),
+        "expected count 2 for two CLI args; stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("first: hello"),
+        "expected first arg to be \"hello\"; stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("second: world"),
+        "expected second arg to be \"world\"; stdout was: {stdout}"
+    );
+}

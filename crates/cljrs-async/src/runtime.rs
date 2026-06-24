@@ -3,8 +3,9 @@
 use cljrs_env::async_hook::AsyncRuntime;
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_gc::GcPtr;
 use cljrs_interp::apply::select_arity;
-use cljrs_value::{NativeObjectBox, Value};
+use cljrs_value::{NativeObjectBox, PersistentList, Value};
 
 use crate::channel::CljChannel;
 use crate::eval_async::{run_async_fn, spawn_future};
@@ -39,30 +40,40 @@ impl AsyncRuntime for AsyncRuntimeImpl {
             // fallback below; only Copy/cloned data escapes.
             let info = {
                 let fr = f.get();
-                select_arity(fr, args.len())
-                    .ok()
-                    .map(|a| (a.ir_arity_id, fr.defining_ns.clone(), fr.name.clone()))
+                select_arity(fr, args.len()).ok().map(|a| {
+                    (
+                        a.ir_arity_id,
+                        fr.defining_ns.clone(),
+                        fr.name.clone(),
+                        a.params.len(),
+                        a.rest_param.is_some(),
+                    )
+                })
             };
-            if let Some((id, ns, name)) = info {
+            if let Some((id, ns, name, n_fixed, is_variadic)) = info {
                 let ctx = (env.globals.clone(), ns.clone());
+                let orig_argc = args.len();
                 // JIT registry (keyed by runtime ir_arity_id).
                 if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
-                    return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                    let packed = pack_for_native(&args, n_fixed, is_variadic);
+                    return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
                 }
-                // AOT registry (keyed by ns/name/arity, registered by the harness).
+                // AOT registry (keyed by ns/name/fixed-param-count, registered by the harness).
                 if let Some(nm) = name.as_deref()
-                    && let Some((poll_fn, n_slots)) = lookup_poll_fn_named(&ns, nm, args.len())
+                    && let Some((poll_fn, n_slots)) = lookup_poll_fn_named(&ns, nm, n_fixed)
                 {
-                    return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                    let packed = pack_for_native(&args, n_fixed, is_variadic);
+                    return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
                 }
                 // One-shot compile attempt (when the JIT installed a hook).
                 if async_jit_enabled()
                     && mark_compile_attempted(id)
                     && let Some(hook) = cljrs_env::async_hook::async_compile_hook()
                 {
-                    hook(&callee, args.len(), &mut env);
+                    hook(&callee, orig_argc, &mut env);
                     if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
-                        return spawn_state_machine(poll_fn, n_slots, args, Some(ctx));
+                        let packed = pack_for_native(&args, n_fixed, is_variadic);
+                        return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
                     }
                 }
             }
@@ -86,6 +97,29 @@ impl AsyncRuntime for AsyncRuntimeImpl {
             Err(EvalError::Runtime("chan-put: channel is closed".into()))
         }
     }
+}
+
+/// Pack args for a compiled (native) async state machine.
+///
+/// Fixed arities pass args through unchanged. Variadic arities must have the
+/// trailing args collected into a `Value::List` (or `Value::Nil` for empty
+/// rest) before being handed to the state machine, which expects exactly
+/// `n_fixed + 1` slot values. This mirrors what `bind_fn_params` does on the
+/// tree-walking path and what `call_jit_native` does on the sync JIT path.
+fn pack_for_native(args: &[Value], n_fixed: usize, is_variadic: bool) -> Vec<Value> {
+    if !is_variadic {
+        return args.to_vec();
+    }
+    let split = n_fixed.min(args.len());
+    let mut v = args[..split].to_vec();
+    let rest_items = &args[split..];
+    let rest_val = if rest_items.is_empty() {
+        Value::Nil
+    } else {
+        Value::List(GcPtr::new(PersistentList::from_iter(rest_items.to_vec())))
+    };
+    v.push(rest_val);
+    v
 }
 
 #[allow(clippy::result_large_err)]

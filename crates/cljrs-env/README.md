@@ -42,6 +42,14 @@ Opt-in pinned native code: `GlobalEnv::set_pinned_native_loader` installs a
 consults it before the HEAD fallback, and a successful load redirects the
 lookup into the freshly registered `"<ns>@<commit>"` namespace.
 
+Plain `require` of a native dep: `GlobalEnv::set_native_require_loader`
+installs a `NativeRequireLoader` callback (also provided by `cljrs-dylib`).
+The unversioned namespace loader (`loader::do_load`) consults it when a
+`require`d namespace has no Clojure source on the source path; a successful
+load registers a `:rust/load :dylib` dep's exports into the **unversioned**
+namespace (built at the dep's pinned `:git/sha`), so a plain
+`(require '[my.native.lib :as l])` of a pure-native package succeeds.
+
 ## gc_roots module
 
 The `gc_roots` module manages GC root registration for the interpreter's Rust call stack. Public API includes:

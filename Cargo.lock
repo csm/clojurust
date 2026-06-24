@@ -726,6 +726,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cljrs-async",
+ "cljrs-base64",
  "cljrs-charset",
  "cljrs-compiler",
  "cljrs-deps",
@@ -749,6 +750,7 @@ dependencies = [
  "libloading",
  "miette",
  "rustyline",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -879,7 +881,6 @@ dependencies = [
  "cljrs-reader",
  "cljrs-value",
  "cljrs-vcs",
- "gix",
  "libloading",
  "tempfile",
 ]
@@ -1068,6 +1069,7 @@ dependencies = [
  "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
