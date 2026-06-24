@@ -1,10 +1,27 @@
+use std::sync::{Arc, Mutex};
+
 use base64::Engine;
 use base64::alphabet::{STANDARD, URL_SAFE};
 use base64::engine::general_purpose::{NO_PAD, PAD};
+use cljrs_env::env::GlobalEnv;
 use cljrs_gc::GcPtr;
 use cljrs_interop::{Registry, wrap_fn1};
 use cljrs_value::Value;
-use std::sync::Mutex;
+
+pub const NS: &str = "cljrs.base64";
+
+/// Register the `cljrs.base64` namespace into `globals`.
+///
+/// Idempotent: the namespace is built only on the first call.
+pub fn init(globals: &Arc<GlobalEnv>) {
+    if globals.is_loaded(NS) {
+        return;
+    }
+    globals.get_or_create_ns(NS);
+    globals.refer_all(NS, "clojure.core");
+    let mut registry = Registry::for_require(globals.clone());
+    register(&mut registry);
+}
 
 fn to_bytes(value: Value) -> Result<Vec<u8>, String> {
     match value {
