@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-vcs"
-version = "0.1.0"
+version = "0.1.176"
 edition = "2024"
 description = "Git subprocess helpers for versioned symbol resolution"
 license.workspace = true
