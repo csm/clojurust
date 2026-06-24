@@ -2,7 +2,7 @@
 
 **Purpose**: TCP/Unix/TLS/QUIC networking for clojurust — channel-oriented sockets delivered as core.async channels.
 
-**Status**: Phases A–G + A2 + Q1 + Q2 + Q3 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport, QUIC server transport, HTTP/3 client).
+**Status**: Phases A–G + A2 + Q1 + Q2 + Q3 + H2 implemented (TCP client + server, framing, UDP datagrams, TLS client/server, Unix-domain stream sockets, lifecycle/timeouts/ergonomics, pool-based I/O, QUIC client transport, QUIC server transport, HTTP/3 client, HTTP/2 client).
 
 **Design**: Follows the aleph/netty-in-core.async model. A connection is a duplex pair of channels — `:in` carries `byte-array` chunks read from the socket, `:out` accepts `byte-array`/string values to write. A server is a channel of connections. Higher-level protocols are higher-order functions over those channels: the `frame` function pipes a raw `:in` channel through a stateful framer spec, emitting complete application messages.
 
@@ -12,7 +12,7 @@
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, `clojure.rust.net.quic`, and `clojure.rust.net` |
+| `src/lib.rs` | `init()` entry point; loads `clojure.rust.net.tcp`, `clojure.rust.net.frame`, `clojure.rust.net.udp`, `clojure.rust.net.tls`, `clojure.rust.net.unix`, `clojure.rust.net.quic`, `clojure.rust.net.h3`, `clojure.rust.net.http2`, and `clojure.rust.net` |
 | `src/pool_io.rs` | Shared pool tasks and bridge helpers: `ReadMsg`, `PoolStreamSetup`, `pool_reader`, `pool_writer`, `read_bridge`, `write_bridge`, `bytes_value`, `net_error` |
 | `src/tcp.rs` | `TcpStreamResource` (Vec<AbortHandle>), `TcpListenerResource` (Vec<AbortHandle>), pool-based connect/accept, `connect`/`listen`/`close` builtins |
 | `src/frame.rs` | `FramerSpec` native object, stateful framers (`LinesFramer`, `DelimiterFramer`, `LengthPrefixedFramer`), `frame`/encode builtins |
@@ -22,6 +22,7 @@
 | `src/quic_config.rs` | Build `quinn::ClientConfig`/`ServerConfig` from opts maps; delegates TLS to `tls::build_client_config`/`build_server_config`, wraps via `QuicClientConfig::try_from`; applies QUIC transport params (`:max-idle-ms`, `:keep-alive-ms`, `:max-streams`) |
 | `src/quic.rs` | `QuicConnectionResource` (holds `quinn::Connection` + `Endpoint` + abort handles), `QuicStreamResource` (abort handles for pool reader/writer + LocalSet bridges), `QuicListenerResource` (holds `Endpoint` + abort handles for pool accept loop + LocalSet bridge), pool accept/open loops, LocalSet bridges, `connect_to`/`open_stream_on`/`listen_on`, `connect`/`open-stream`/`close`/`stream-close`/`listen`/`listen-close` builtins |
 | `src/h3.rs` | `H3Resource` (holds `quinn::Connection` + `Endpoint` + abort handles for pool streaming task and LocalSet body-bridge), pool task for QUIC connect + h3 handshake + request send + response header recv + body streaming, LocalSet body bridge (`local_body_bridge`), `get`/`h3_request` public Rust API, `get`/`request`/`close` Clojure builtins |
+| `src/h2.rs` | `H2Resource` (holds abort handles for the h2 connection driver, pool streaming task, and LocalSet body-bridge), pool task for TCP connect + TLS handshake (ALPN `h2`) + h2 handshake + request send + response header recv + body streaming (with flow-control release), LocalSet body bridge (`local_body_bridge`), `get`/`h2_request` public Rust API, `get`/`request`/`close` Clojure builtins |
 | `src/clojure_rust_net_tcp.cljrs` | Clojure source for `clojure.rust.net.tcp`; `start-server` sugar |
 | `src/clojure_rust_net_frame.cljrs` | Clojure source for `clojure.rust.net.frame`; `pipe-map` helper |
 | `src/clojure_rust_net_udp.cljrs` | Clojure source for `clojure.rust.net.udp`; usage examples |
@@ -29,6 +30,7 @@
 | `src/clojure_rust_net_unix.cljrs` | Clojure source for `clojure.rust.net.unix`; `start-server` sugar |
 | `src/clojure_rust_net_quic.cljrs` | Clojure source for `clojure.rust.net.quic`; `with-stream`, `drain-stream`, `start-server` sugar |
 | `src/clojure_rust_net_h3.cljrs` | Clojure source for `clojure.rust.net.h3`; `drain-body`, `get-string` sugar |
+| `src/clojure_rust_net_http2.cljrs` | Clojure source for `clojure.rust.net.http2`; `drain-body`, `get-string` sugar |
 | `src/clojure_rust_net.cljrs` | Clojure source for umbrella `clojure.rust.net`; dispatches on `:transport` (`:tcp`, `:tls`, `:unix`) |
 | `tests/tcp_client.rs` | Phase A integration tests (connect, send, recv, error path) |
 | `tests/tcp_server.rs` | Phase B integration tests (listen, echo round-trip, close) |
@@ -38,6 +40,8 @@
 | `tests/unix.rs` | Phase F integration tests (Unix echo round-trip, listener unlinks path, stale socket removal) |
 | `tests/lifecycle.rs` | Phase G integration tests (split-err, drain-to, with-open, :connect-timeout-ms) |
 | `tests/quic.rs` | Phases Q1+Q2 integration tests (QUIC echo round-trip via quinn in-test server, QUIC server echo via `listen_on`, listener close, connect-failure path) |
+| `tests/h3.rs` | Phase Q3 integration tests (HTTP/3 GET round-trip via h3 in-test server, :body EOF close, close-before-drain) |
+| `tests/http2.rs` | Phase H2 integration tests (HTTP/2 GET round-trip via h2-over-TLS in-test server, :body EOF close, close-before-drain, connect-failure path) |
 
 ## Public API
 
@@ -136,6 +140,37 @@ builds register stub functions that throw "not supported on this platform".
 ;; => server-map — spawns go-loop that calls (handler conn) for each accepted conn
 ```
 
+### `clojure.rust.net.http2` (Phase H2)
+
+HTTP/2 client over TLS. Each request establishes a fresh TLS connection (ALPN
+`"h2"`) and issues one request. The TCP connect, TLS handshake, h2 handshake,
+and all HTTP/2 I/O run on the `WorkerPool`; the response body is streamed to a
+`:body` channel via a LocalSet bridge.
+
+```clojure
+;; Phase H2 — HTTP/2 GET
+(get "https://host/path")
+(get "https://host/path" opts)
+;; => promise-chan — yields {:status long :headers {"k" "v" ...} :body <chan> :resource <H2Resource>}
+;;    or Value::Error on connection/request failure
+;; :body yields byte-array chunks; closed at EOF or on error
+;; Opts: :insecure-skip-verify, :alpn (default ["h2"]), :roots (same as tls/connect)
+;;       :body-buf (channel depth, default 8)
+
+;; General request
+(request {:method "GET" :url "https://host/path" :headers {"accept" "text/plain"}})
+(request req opts)
+;; :method defaults to "GET"; :url required; no request body is sent yet (POST body is future work)
+
+(close resp)  ;; => nil — aborts all tasks (including the connection driver),
+              ;;          dropping the TLS stream / TCP socket; closes :body
+
+;; Clojure sugar:
+(drain-body resp)        ;; => byte-array of all :body data (^:async context)
+(get-string url)         ;; => response body as a UTF-8 string (^:async context)
+(get-string url opts)
+```
+
 ### `clojure.rust.net` (umbrella)
 
 ```clojure
@@ -229,7 +264,13 @@ pub fn quic::open_stream_on(connection: quinn::Connection, in_buf: usize, out_bu
 pub fn quic::listen_on(host: &str, port: u16, server_config: quinn::ServerConfig, conns_buf: usize, streams_buf: usize, in_buf: usize, out_buf: usize) -> ValueResult<Value>
 pub fn quic_config::client_config(opts: &MapValue) -> ValueResult<quinn::ClientConfig>
 pub fn quic_config::server_config(opts: &MapValue) -> ValueResult<quinn::ServerConfig>
-pub const NS_QUIC: &str  // "clojure.rust.net.quic"
+pub fn h3::get(url: &str, opts: &MapValue, body_buf: usize) -> ValueResult<Value>
+pub fn h3::h3_request(url: &str, method: http::Method, extra_headers: Vec<(String, String)>, opts: &MapValue, body_buf: usize) -> ValueResult<Value>
+pub fn h2::get(url: &str, opts: &MapValue, body_buf: usize) -> ValueResult<Value>
+pub fn h2::h2_request(url: &str, method: http::Method, extra_headers: Vec<(String, String)>, opts: &MapValue, body_buf: usize) -> ValueResult<Value>
+pub const NS_QUIC: &str   // "clojure.rust.net.quic"
+pub const NS_H3: &str     // "clojure.rust.net.h3"
+pub const NS_HTTP2: &str  // "clojure.rust.net.http2"
 ```
 
 `init` registers all namespaces including `clojure.rust.net.quic`, calling `cljrs_async::init` internally. Idempotent.
@@ -273,6 +314,10 @@ Implements `cljrs_value::Resource` (Arc-backed). Holds the `quinn::Endpoint` (ke
 ### `UnixListenerResource` (`#[cfg(unix)]`)
 
 Implements `cljrs_value::Resource` (Arc-backed). Holds the `AbortHandle` for the `accept_loop` task and the socket's filesystem `path`. `close()` aborts the task and **unlinks the socket path** via `std::fs::remove_file`, so the next `listen_on` on the same path does not get EADDRINUSE. `listen_on` also pre-unlinks any stale socket file before binding.
+
+### `H2Resource`
+
+Implements `cljrs_value::Resource` (Arc-backed). Holds `Vec<AbortHandle>` for the HTTP/2 connection driver task, the WorkerPool body-streaming task, and the LocalSet body-bridge task. `close()` aborts all tasks; aborting the connection driver drops the TLS stream, which closes the underlying TCP socket. `resource_type` → `"Http2Connection"`. Unlike QUIC/HTTP/3, h2 has no explicit connection object — the connection lives entirely inside the driver task, so dropping that task is what tears the connection down.
 
 ## Connection Model
 

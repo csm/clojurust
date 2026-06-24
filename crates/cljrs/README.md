@@ -89,6 +89,19 @@ search path (after any `--src-path` CLI flags), and the parsed `DepsConfig` is
 stored in `GlobalEnv.deps_config` so that versioned symbol resolution can use
 it without a second parse.
 
+Each declared dependency's own source roots are also appended to the search
+path, so a plain `(require '[dep.ns :as …])` resolves namespaces provided by a
+dependency:
+
+- **Local deps** (`:local/root`) contribute their `cljrs.edn` `:paths` (or
+  `src/`) from the directory on disk.
+- **Git deps** are materialized from the local bare cache at their pinned
+  `:git/sha` (no network — run `cljrs deps fetch` first; a missing cache warns
+  and is skipped), and contribute the checkout's `:paths` (or `src/`).
+- **Native deps** (`:rust/load :dylib`) carry no Clojure source; they are built
+  and registered on demand by the native-`require` loader (`cljrs-dylib`) when
+  their namespace is first `require`d.
+
 ### Global flags
 
 These appear before the subcommand and apply to every command:

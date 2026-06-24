@@ -64,6 +64,7 @@ cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
 cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
 cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
 cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0" }
+cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.0" }
 cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.0" }
 cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.0" }
 
@@ -90,6 +91,7 @@ arc-swap     = "1"
 quinn        = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3           = "0.0.8"
 h3-quinn     = "0.0.10"
+h2           = "0.4"
 tower-lsp     = "0.20"
 dashmap       = "6"
 

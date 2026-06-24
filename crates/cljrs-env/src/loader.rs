@@ -110,10 +110,20 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
     let (src, file_path): (String, String) = if let Some(builtin) = globals.builtin_source(ns_name)
     {
         (builtin.to_owned(), format!("<builtin:{ns_name}>"))
+    } else if let Some(found) = find_source_file(&rel_path, &src_paths) {
+        found
     } else {
-        find_source_file(&rel_path, &src_paths).ok_or_else(|| {
-            EvalError::Runtime(format!("Could not find namespace {ns_name} on source path"))
-        })?
+        // No Clojure source on the path.  Before giving up, try loading the
+        // namespace from a native dependency declared in `cljrs.edn` with
+        // `:rust/load :dylib` (the hook is installed by `cljrs-dylib`).  A
+        // pure-native package has no `.cljrs`/`.cljc` file, so this is the
+        // only path that brings it in via a plain `require`.
+        if try_native_require(globals, ns_name)? {
+            return Ok(());
+        }
+        return Err(EvalError::Runtime(format!(
+            "Could not find namespace {ns_name} on source path"
+        )));
     };
 
     // Record source location on the namespace for versioned resolution.
@@ -160,6 +170,19 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
     }
 
     Ok(())
+}
+
+/// Consult the native-dependency `require` loader (installed by `cljrs-dylib`)
+/// for `ns_name`.  Returns `Ok(true)` when a `:rust/load :dylib` dep covering
+/// the namespace was built and its exports registered into the unversioned
+/// namespace; `Ok(false)` when no loader is installed or no dep covers the
+/// namespace; `Err` when a covering dep failed to build or load.
+fn try_native_require(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<bool> {
+    let loader = globals.native_require_loader.read().unwrap().clone();
+    match loader {
+        Some(loader) => loader(globals, ns_name),
+        None => Ok(false),
+    }
 }
 
 // ── Versioned namespace loading ───────────────────────────────────────────────

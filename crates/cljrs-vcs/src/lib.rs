@@ -127,6 +127,75 @@ fn url_slug(url: &str) -> String {
         .collect()
 }
 
+/// Materialize a files-only working checkout of `sha` for `url` from the local
+/// bare cache, returning the worktree root.
+///
+/// **Network-free**: the bare cache must already contain `sha` (run
+/// [`fetch_remote`] / `cljrs deps fetch` first).  The checkout is the tree of
+/// `sha` with no `.git`, written under
+/// `~/.cljrs/cache/git/worktrees/<slug>@<sha>/`.  Idempotent and cached per
+/// `(url, sha)` via a `.cljrs-worktree-complete` sentinel (the worktree has no
+/// `.git`, so we cannot probe for one).
+pub fn worktree_at_commit(url: &str, sha: &str) -> VcsResult<PathBuf> {
+    if !is_valid_commit_hash(sha) {
+        return Err(VcsError::InvalidCommit(sha.to_string()));
+    }
+    let bare = cache_path_for_url(url);
+    if !bare.exists() {
+        return Err(VcsError::NoRepo(bare));
+    }
+    let dest = cache_root()
+        .join("worktrees")
+        .join(format!("{}@{sha}", url_slug(url)));
+    let sentinel = dest.join(".cljrs-worktree-complete");
+    if sentinel.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&dest).map_err(VcsError::Io)?;
+    checkout_tree(&bare, sha, &dest)?;
+    std::fs::write(&sentinel, sha.as_bytes()).map_err(VcsError::Io)?;
+    Ok(dest)
+}
+
+/// Check out the tree of `commit` from the repository at `repo` (bare or not)
+/// into `dest` as a files-only working tree (no `.git`).
+///
+/// Used to materialize dependency sources from the local cache without a
+/// network round-trip.  `dest` must already exist.
+pub fn checkout_tree(repo: &Path, commit: &str, dest: &Path) -> VcsResult<()> {
+    let repository = gix::open(repo).map_err(|e| VcsError::Git(e.to_string()))?;
+    let tree = repository
+        .rev_parse_single(commit)
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?
+        .object()
+        .map_err(|_| VcsError::CommitNotFound(commit.to_string()))?
+        .peel_to_tree()
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    let mut index = repository
+        .index_from_tree(&tree.id)
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    let opts = repository
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    let odb = repository
+        .objects
+        .clone()
+        .into_arc()
+        .map_err(|e| VcsError::Git(e.to_string()))?;
+    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+    gix::worktree::state::checkout(
+        &mut index,
+        dest,
+        odb,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &should_interrupt,
+        opts,
+    )
+    .map_err(|e| VcsError::Git(e.to_string()))?;
+    Ok(())
+}
+
 /// Clone or fetch a git repository into the local cache.
 ///
 /// `url`  — an `https://` URL, a local filesystem path, a `file://` URL, or

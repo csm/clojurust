@@ -225,7 +225,15 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Eagerly lower each arity to IR if the compiler is ready.
     //eager_lower_fn(&cljrs_fn, env);
 
-    Ok(Value::Fn(GcPtr::new(cljrs_fn)))
+    let mut ptr = GcPtr::new(cljrs_fn);
+    // For named anonymous functions (fn g ...), store a back-pointer so that
+    // the self-reference returned from the body is pointer-equal to the outer
+    // binding — required for `(= f (f))` to be `true`.
+    if ptr.get().name.is_some() {
+        let self_clone = ptr.clone();
+        ptr.get_mut().self_ptr = Some(self_clone);
+    }
+    Ok(Value::Fn(ptr))
 }
 
 /// Parse one arity: params-form and body forms.

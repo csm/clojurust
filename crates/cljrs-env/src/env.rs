@@ -150,12 +150,25 @@ pub struct GlobalEnv {
     /// implementations into the `"<base_ns>@<commit>"` namespace.
     #[allow(clippy::type_complexity)]
     pub pinned_native_loader: RwLock<Option<PinnedNativeLoader>>,
+    /// Optional loader for **native dependencies on the plain `require` path**
+    /// (`:rust/load :dylib`), installed by `cljrs-dylib`.  Called by the
+    /// unversioned namespace loader with `(globals, ns)` when a `require`d
+    /// namespace has no Clojure source on the source path; returns `Ok(true)`
+    /// when it built the dep's crate at the pinned `:git/sha` and registered
+    /// the package's exports into the **unversioned** namespace, so a plain
+    /// `(require '[my.native.lib :as lib])` brings the native code in.
+    #[allow(clippy::type_complexity)]
+    pub native_require_loader: RwLock<Option<NativeRequireLoader>>,
 }
 
 /// Loader callback for pinned native packages (see
 /// `GlobalEnv::pinned_native_loader`).
 pub type PinnedNativeLoader =
     Arc<dyn Fn(&Arc<GlobalEnv>, &str, &str) -> EvalResult<bool> + Send + Sync>;
+
+/// Loader callback for native dependencies reached through a plain `require`
+/// (see `GlobalEnv::native_require_loader`).
+pub type NativeRequireLoader = Arc<dyn Fn(&Arc<GlobalEnv>, &str) -> EvalResult<bool> + Send + Sync>;
 
 impl std::fmt::Debug for GlobalEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,6 +207,7 @@ impl GlobalEnv {
             enforce_native_versions: AtomicBool::new(false),
             provenance_warned: Mutex::new(HashSet::new()),
             pinned_native_loader: RwLock::new(None),
+            native_require_loader: RwLock::new(None),
         })
     }
 
@@ -511,6 +525,15 @@ impl GlobalEnv {
     /// `cljrs_dylib::install`; first writer wins).
     pub fn set_pinned_native_loader(&self, loader: PinnedNativeLoader) {
         let mut guard = self.pinned_native_loader.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(loader);
+        }
+    }
+
+    /// Install the native-dependency `require` loader (called once by
+    /// `cljrs_dylib::install`; first writer wins).
+    pub fn set_native_require_loader(&self, loader: NativeRequireLoader) {
+        let mut guard = self.native_require_loader.write().unwrap();
         if guard.is_none() {
             *guard = Some(loader);
         }
