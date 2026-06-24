@@ -89,6 +89,7 @@ rustyline    = "18.0.0"
 libloading   = "0.8"
 arc-swap     = "1"
 quinn        = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h2           = "0.4"
 h3           = "0.0.8"
 h3-quinn     = "0.0.10"
 tower-lsp     = "0.20"

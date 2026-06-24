@@ -1,0 +1,56 @@
+;; clojure.rust.net.h2 — HTTP/2 client.
+;;
+;;   get     — (get url) / (get url opts) => promise-chan -> response-map
+;;   request — (request req) / (request req opts) => promise-chan -> response-map
+;;   close   — (close resp) => nil
+;;
+;; Response map shape:
+;;   {:status  200
+;;    :headers {"content-type" "text/plain" ...}
+;;    :body    <chan>    ; byte-array chunks; closed at EOF or error
+;;    :resource <H2Resource>}
+;;
+;; Opts:
+;;   :insecure-skip-verify — skip TLS cert verification (testing only)
+;;   :alpn                 — vector of ALPN strings (default ["h2"])
+;;   :roots                — CA roots (:webpki default, :system, or CA PEM path)
+;;   :body-buf             — :body channel buffer depth (default 8)
+
+(defn drain-body
+  "Drain a response `:body` channel to a byte-array and return it.
+  Must be called in a `go` block (uses `await`).
+
+  Example:
+    (go
+      (let [resp (<! (h2/get \"https://host/\"))
+            body (h2/drain-body resp)]
+        (println (String. body \"UTF-8\"))))"
+  [resp]
+  (let [body-ch (:body resp)]
+    (loop [acc []]
+      (let [v (await (clojure.core.async/take! body-ch))]
+        (if (nil? v)
+          (let [total (reduce + 0 (map count acc))
+                result (byte-array total)]
+            (loop [i 0 chunks acc]
+              (when-let [chunk (first chunks)]
+                (System/arraycopy chunk 0 result i (count chunk))
+                (recur (+ i (count chunk)) (rest chunks))))
+            result)
+          (recur (conj acc v)))))))
+
+(defn get-string
+  "Issue a GET request to `url` and return the response body as a UTF-8 string.
+  Must be called in a `go` block (uses `await`).
+
+  Opts: same as `get`.
+
+  Example:
+    (go (println (await (clojure.core.async/take!
+                          (clojure.rust.net.h2/get-string \"https://host/hello\")))))"
+  ([url] (get-string url {}))
+  ([url opts]
+   (let [resp (await (clojure.core.async/take!
+                       (clojure.rust.net.h2/get url opts)))]
+     (when (some? resp)
+       (String. (drain-body resp) "UTF-8")))))

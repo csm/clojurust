@@ -17,6 +17,7 @@ use std::sync::Arc;
 use cljrs_async::load_source;
 
 pub mod frame;
+pub mod h2;
 pub mod h3;
 mod pool_io;
 pub mod quic;
@@ -25,6 +26,9 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 pub mod unix;
+
+/// Clojure source for `clojure.rust.net.h2`.
+const NET_H2_SOURCE: &str = include_str!("clojure_rust_net_h2.cljrs");
 
 /// Clojure source for `clojure.rust.net.tcp`.
 const NET_TCP_SOURCE: &str = include_str!("clojure_rust_net_tcp.cljrs");
@@ -57,6 +61,7 @@ pub const NS_UDP: &str = "clojure.rust.net.udp";
 pub const NS_TLS: &str = "clojure.rust.net.tls";
 pub const NS_UNIX: &str = "clojure.rust.net.unix";
 pub const NS_QUIC: &str = "clojure.rust.net.quic";
+pub const NS_H2: &str = "clojure.rust.net.h2";
 pub const NS_H3: &str = "clojure.rust.net.h3";
 
 /// Register the networking namespaces.
@@ -112,6 +117,14 @@ pub fn init(globals: &Arc<cljrs_env::env::GlobalEnv>) {
         quic::register(globals, NS_QUIC);
         load_source(globals, NS_QUIC, NET_QUIC_SOURCE);
         globals.mark_loaded(NS_QUIC);
+    }
+
+    if !globals.is_loaded(NS_H2) {
+        globals.get_or_create_ns(NS_H2);
+        globals.refer_all(NS_H2, "clojure.core");
+        h2::register(globals, NS_H2);
+        load_source(globals, NS_H2, NET_H2_SOURCE);
+        globals.mark_loaded(NS_H2);
     }
 
     if !globals.is_loaded(NS_H3) {
