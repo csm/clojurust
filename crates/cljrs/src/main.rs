@@ -136,16 +136,29 @@ enum Commands {
         #[arg(long)]
         gc_hard_limit_mb: Option<usize>,
     },
-    /// AOT-compile a source file to a native binary.
+    /// AOT-compile a source file or project to a native binary.
+    ///
+    /// When `cljrs.edn` is present in the working directory the compiler reads
+    /// `:paths` (source directories), `:deps` (dependency source roots), and
+    /// `:main` (entry-point namespace) from it automatically.  The `-main`
+    /// function is discovered from `:paths` only (not from dependencies); an
+    /// error is raised if more than one `-main` is found and neither `--main`
+    /// nor `:main` resolves the ambiguity.
     Compile {
-        /// Path to the source file, or directory when --test is used.
-        file: PathBuf,
+        /// Path to the source file.  Optional when `cljrs.edn` is present and
+        /// the entry-point namespace can be determined from `--main`, `:main`
+        /// in `cljrs.edn`, or auto-detection of a unique `-main` function.
+        file: Option<PathBuf>,
         /// Output binary path.
         #[arg(short, long)]
         out: PathBuf,
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
+        /// Namespace containing the `-main` entry point (e.g. `my.app.core`).
+        /// Overrides `:main` in `cljrs.edn` and auto-detection.
+        #[arg(long = "main", value_name = "NS")]
+        main_ns: Option<String>,
         /// Compile a test harness that runs all tests in the given file/directory.
         #[arg(long)]
         test: bool,
@@ -473,27 +486,100 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
             file,
             out,
             src_paths,
+            main_ns,
             test,
             gc_soft_limit_mb,
             gc_hard_limit_mb,
         } => {
-            // GC config is for the compiled binary, not the compilation process
             let _gc_config = build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb);
-            // Load cljrs.edn :rust config so native init gets wired into the
-            // generated harness main.rs.
-            let rust_config = std::env::current_dir()
+
+            // Load cljrs.edn; silently absent is fine.
+            let deps_config = std::env::current_dir()
                 .ok()
-                .and_then(|cwd| cljrs_deps::load_config(&cwd).ok().flatten())
-                .and_then(|c| c.rust);
+                .and_then(|cwd| cljrs_deps::load_config(&cwd).ok().flatten());
+
+            let rust_config = deps_config.as_ref().and_then(|c| c.rust.clone());
+
+            // Build combined source paths: CLI flags first, then cljrs.edn :paths,
+            // then each dependency's source roots.
+            let mut all_src_paths = src_paths.clone();
+            if let Some(ref config) = deps_config {
+                for p in &config.paths {
+                    if !all_src_paths.contains(p) {
+                        all_src_paths.push(p.clone());
+                    }
+                }
+                for p in collect_dep_src_paths(config) {
+                    if !all_src_paths.contains(&p) {
+                        all_src_paths.push(p);
+                    }
+                }
+            }
+
             if test {
-                // For test mode, the file is a directory containing test files
-                cljrs_compiler::aot::compile_test_harness(&file, &out, &src_paths)
+                let test_dir = file
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                cljrs_compiler::aot::compile_test_harness(test_dir, &out, &all_src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             } else {
+                let entry_file = match file {
+                    Some(f) => f,
+                    None => {
+                        // Project mode: determine the entry namespace and locate its file.
+                        let project_paths: Vec<PathBuf> = deps_config
+                            .as_ref()
+                            .map(|c| c.paths.clone())
+                            .unwrap_or_default();
+
+                        let effective_ns = if let Some(ns) = main_ns {
+                            // --main CLI flag takes top priority.
+                            ns
+                        } else if let Some(ns) =
+                            deps_config.as_ref().and_then(|c| c.main_ns.as_deref())
+                        {
+                            // :main in cljrs.edn is second priority.
+                            ns.to_string()
+                        } else {
+                            // Auto-detect from project :paths only (not dep paths).
+                            if project_paths.is_empty() {
+                                return Err(miette::miette!(
+                                    "no source paths: add :paths to cljrs.edn or use --src-path"
+                                ));
+                            }
+                            let mains = find_main_namespaces(&project_paths);
+                            match mains.len() {
+                                0 => return Err(miette::miette!(
+                                    "no -main function found in source paths; \
+                                     specify --main or add :main to cljrs.edn"
+                                )),
+                                1 => mains.into_iter().next().unwrap().0,
+                                _ => {
+                                    let list = mains
+                                        .iter()
+                                        .map(|(ns, _)| ns.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    return Err(miette::miette!(
+                                        "multiple -main functions found ({list}); \
+                                         specify --main or add :main to cljrs.edn"
+                                    ));
+                                }
+                            }
+                        };
+
+                        ns_to_file(&effective_ns, &all_src_paths).ok_or_else(|| {
+                            miette::miette!(
+                                "could not find source file for namespace {effective_ns}"
+                            )
+                        })?
+                    }
+                };
+
                 cljrs_compiler::aot::compile_file(
-                    &file,
+                    &entry_file,
                     &out,
-                    &src_paths,
+                    &all_src_paths,
                     rust_config.as_ref(),
                     versioning.verify_commit_signatures,
                 )
@@ -763,6 +849,140 @@ fn add_dep_source_paths(globals: &Arc<GlobalEnv>, config: &cljrs_deps::DepsConfi
             }
         }
     }
+}
+
+/// Collect source paths contributed by every declared dependency in `config`.
+///
+/// Git deps are resolved from the local cache (run `cljrs deps fetch` first);
+/// missing deps emit a warning and are skipped.
+fn collect_dep_src_paths(config: &cljrs_deps::DepsConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for (name, dep) in &config.deps {
+        let root = match dep {
+            cljrs_deps::Dependency::Local { root } => {
+                if root.is_dir() {
+                    root.clone()
+                } else {
+                    eprintln!(
+                        "cljrs: warning: local dep {name} not found at {}",
+                        root.display()
+                    );
+                    continue;
+                }
+            }
+            cljrs_deps::Dependency::Git(git) => {
+                match cljrs_vcs::worktree_at_commit(&git.url, &git.sha) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "cljrs: warning: git dep {name} ({}) is not available ({e}); \
+                             run `cljrs deps fetch`",
+                            git.url
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        for p in dep_source_paths(&root) {
+            if p.is_dir() && !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
+/// Scan `src_paths` for source files that define a top-level `-main` function.
+///
+/// Returns a list of `(namespace_name, file_path)` pairs, one per file that
+/// contains `(defn -main ...)` or `(defn- -main ...)` at the top level.
+/// Only looks at the reader-level form structure (no evaluation).
+fn find_main_namespaces(src_paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    use cljrs_reader::form::FormKind;
+
+    let mut results = Vec::new();
+    for dir in src_paths {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_source_files(dir, &mut files);
+        for file in files {
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let mut parser =
+                cljrs_reader::Parser::new(src, file.display().to_string());
+            let Ok(forms) = parser.parse_all() else {
+                continue;
+            };
+            let mut ns_name: Option<String> = None;
+            let mut has_main = false;
+            for form in &forms {
+                if let FormKind::List(parts) = &form.kind
+                    && let Some(head) = parts.first()
+                    && let FormKind::Symbol(s) = &head.kind
+                {
+                    if s == "ns" {
+                        if let Some(second) = parts.get(1)
+                            && let FormKind::Symbol(n) = &second.kind
+                        {
+                            ns_name = Some(n.clone());
+                        }
+                    } else if (s == "defn" || s == "defn-") && parts.len() >= 2 {
+                        if let FormKind::Symbol(n) = &parts[1].kind
+                            && n == "-main"
+                        {
+                            has_main = true;
+                        }
+                    }
+                }
+            }
+            if has_main {
+                let ns = ns_name.unwrap_or_else(|| {
+                    // Fall back to file-based namespace name if no (ns ...) form.
+                    file_to_namespace(dir, &file).unwrap_or_default()
+                });
+                results.push((ns, file));
+            }
+        }
+    }
+    results
+}
+
+/// Recursively collect `.cljrs` and `.cljc` files under `dir`.
+fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_files(&path, out);
+        } else if let Some(ext) = path.extension() {
+            if ext == "cljrs" || ext == "cljc" {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// Translate a Clojure namespace name into a source file path by searching
+/// `src_paths` for `<ns/with/slashes>.cljrs` or `.cljc`.
+fn ns_to_file(ns: &str, src_paths: &[PathBuf]) -> Option<PathBuf> {
+    let rel: String = ns.replace('.', "/").replace('-', "_");
+    for dir in src_paths {
+        for ext in &["cljrs", "cljc"] {
+            let path = dir.join(format!("{rel}.{ext}"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// The source roots a dependency at `root` contributes: its `cljrs.edn`

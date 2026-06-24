@@ -66,6 +66,15 @@ fn extract_config(form: &Form, config_dir: &Path) -> Result<DepsConfig, String> 
             Some("rust") => {
                 config.rust = Some(extract_rust_config(val, config_dir)?);
             }
+            Some("main") => {
+                let ns = sym_or_kw_name(val)
+                    .or_else(|| match &val.kind {
+                        FormKind::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| ":main must be a symbol or string".to_string())?;
+                config.main_ns = Some(Arc::from(ns));
+            }
             _ => {} // ignore unknown keys
         }
     }
@@ -363,5 +372,23 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.paths.len(), 1);
         assert!(cfg.rust.is_some());
+    }
+
+    #[test]
+    fn main_key_symbol() {
+        let cfg = parse(r#"{:main my.app.core}"#).unwrap();
+        assert_eq!(cfg.main_ns.as_deref(), Some("my.app.core"));
+    }
+
+    #[test]
+    fn main_key_string() {
+        let cfg = parse(r#"{:main "my.app.core"}"#).unwrap();
+        assert_eq!(cfg.main_ns.as_deref(), Some("my.app.core"));
+    }
+
+    #[test]
+    fn no_main_key_is_none() {
+        let cfg = parse(r#"{:paths ["src"]}"#).unwrap();
+        assert!(cfg.main_ns.is_none());
     }
 }

@@ -23,7 +23,7 @@ src/
 |---------------|------------------------------------------------------------------------|
 | `run`         | Interpret a `.cljrs` / `.cljc` source file                             |
 | `repl`        | Start an interactive REPL                                              |
-| `compile`     | AOT-compile a source file (or test directory) to a native binary       |
+| `compile`     | AOT-compile a source file or project (via `cljrs.edn`) to a native binary |
 | `eval`        | Evaluate a single Clojure expression and print the result              |
 | `ir-viz`      | Render the optimized IR + source as a self-contained HTML visualizer   |
 | `test`        | Run `clojure.test` namespaces (named on the CLI or auto-discovered)    |
@@ -64,6 +64,7 @@ run to completion. A synchronous `-main` is awaited as a no-op pass-through.
 
 `compile` additionally accepts:
 - `-o, --out <PATH>` — output binary path (required)
+- `--main <NS>` — namespace containing `-main`; overrides `:main` in `cljrs.edn` and auto-detection
 - `--test` — compile a test harness that runs every test in the given file/directory
 
 `ir-viz` accepts:
@@ -82,12 +83,27 @@ deps are fetched.  `deps status` takes no arguments.
 
 ### `cljrs.edn` auto-discovery
 
-When any command that runs code (`run`, `repl`, `eval`, `test`) starts, it
-walks up the directory tree from the current working directory looking for a
-`cljrs.edn` file.  If found, its `:paths` entries are appended to the source
-search path (after any `--src-path` CLI flags), and the parsed `DepsConfig` is
-stored in `GlobalEnv.deps_config` so that versioned symbol resolution can use
-it without a second parse.
+When any command that runs code (`run`, `repl`, `eval`, `test`, `compile`)
+starts, it walks up the directory tree from the current working directory
+looking for a `cljrs.edn` file.  If found, its `:paths` entries are appended
+to the source search path (after any `--src-path` CLI flags), and the parsed
+`DepsConfig` is stored in `GlobalEnv.deps_config` so that versioned symbol
+resolution can use it without a second parse.
+
+#### `compile` and `cljrs.edn`
+
+`cljrs compile` reads `cljrs.edn` to determine:
+
+1. **Source paths** — `:paths` entries are added to `--src-path` (CLI flags come first).
+2. **Dependency source roots** — each dep's source directories are resolved and appended so `require` resolves correctly during compilation.
+3. **Entry-point namespace** — determined by the following priority:
+   - `--main <NS>` CLI flag (highest priority)
+   - `:main` key in `cljrs.edn` (e.g. `:main my.app.core`)
+   - Auto-detection: scans `:paths` for a unique `-main` function; errors if zero or multiple are found
+
+When `cljrs.edn` is present and the entry-point namespace is known, the
+`file` positional argument may be omitted; the compiler finds the source file
+for the main namespace automatically.
 
 Each declared dependency's own source roots are also appended to the search
 path, so a plain `(require '[dep.ns :as …])` resolves namespaces provided by a
@@ -128,6 +144,8 @@ cljrs repl --src-path src
 
 # AOT compile to a native binary
 cljrs compile app.cljrs -o app
+cljrs compile -o app                       # project mode: reads cljrs.edn
+cljrs compile --main my.app.core -o app   # specify entry namespace explicitly
 cljrs compile tests/ -o run-tests --test --src-path src
 
 # One-shot expression

@@ -40,6 +40,7 @@ pub struct DepsConfig {
     pub enforce_native_versions:  bool,  // :enforce-native-versions — pinned-native
                                          // provenance mismatches error instead of warning
     pub rust:                     Option<RustConfig>,
+    pub main_ns:                  Option<Arc<str>>,  // :main — AOT entry-point namespace
 }
 
 /// A trusted commit signer from `:trusted-signers`: an inline public key
@@ -95,6 +96,9 @@ pub struct Alias {
  ;; :crate is the path (relative to cljrs.edn) to the directory holding Cargo.toml.
  ;; :init  is the fully-qualified Rust path to a fn(registry: &mut Registry) called
  ;;        at startup before any Clojure source is loaded.
+ ;; AOT entry-point namespace (used by `cljrs compile` when no file is given).
+ :main my.app.core
+
  :rust {:crate "."
         :init  "my_project::cljrs_init"}
 
