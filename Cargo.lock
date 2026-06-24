@@ -1069,6 +1069,7 @@ dependencies = [
  "cljrs-stdlib",
  "cljrs-types",
  "cljrs-value",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
