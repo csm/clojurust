@@ -5,6 +5,7 @@ use tokio::task::LocalSet;
 use wasm_bindgen::prelude::*;
 
 use cljrs_async::eval_async::{await_value, eval_async as eval_form_async};
+use cljrs_dom;
 use cljrs_builtins::builtins::{pop_output_capture, push_output_capture};
 use cljrs_env::env::{Env, GlobalEnv};
 use cljrs_reader::Parser;
@@ -65,6 +66,8 @@ impl Repl {
         console_error_panic_hook::set_once();
         let globals = cljrs_interp::standard_env_minimal(None, None, None);
         cljrs_stdlib::register(&globals);
+        cljrs_dom::set_globals(globals.clone());
+        cljrs_dom::register(&globals);
 
         let local = Rc::new(LocalSet::new());
 
