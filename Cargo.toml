@@ -64,6 +64,7 @@ cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
 cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
 cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
 cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0" }
+cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.0" }
 cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.0" }
 cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.0" }
 

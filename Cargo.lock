@@ -726,6 +726,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cljrs-async",
+ "cljrs-base64",
  "cljrs-charset",
  "cljrs-compiler",
  "cljrs-deps",
