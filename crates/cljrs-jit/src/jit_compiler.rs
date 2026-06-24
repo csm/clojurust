@@ -213,6 +213,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_div),
         sym!(rt_rem),
         sym!(rt_eq),
+        sym!(rt_case_eq),
         sym!(rt_lt),
         sym!(rt_gt),
         sym!(rt_lte),

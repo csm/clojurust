@@ -158,6 +158,8 @@ pub fn infer(func: &IrFunction, specs: &[Repr]) -> HashMap<VarId, Repr> {
                                 (None, _) | (_, None) => None,
                                 _ => Some(Repr::Boxed),
                             },
+                            // case= always returns a boolean regardless of operand types.
+                            KnownFn::CaseEq => Some(Repr::Bool),
                             // `(aget arr i)` on a typed array with an unboxed
                             // index yields its unboxed element; `a`/`b` are the
                             // array/index reprs.  A boxed index falls back to
