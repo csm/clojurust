@@ -3,6 +3,10 @@
 //! Registers the `cljrs.dom` namespace with idiomatic Clojure-flavoured
 //! wrappers around the browser DOM: kebab-case names, `!`-suffixed
 //! mutations, events as Clojure maps, and `core.async` channel support.
+#![allow(clippy::type_complexity)]
+// `CljChannel` is not `Send + Sync`, but wasm32 is single-threaded so wrapping
+// it in `Arc` (as the core.async layer does) is sound here.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use std::cell::RefCell;
 use std::sync::Arc;

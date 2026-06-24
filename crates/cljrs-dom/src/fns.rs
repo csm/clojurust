@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use cljrs_gc::GcPtr;
 use cljrs_env::env::GlobalEnv;
+use cljrs_gc::GcPtr;
 use cljrs_value::{Arity, MapValue, NativeFn, PersistentVector, Value, ValueError, ValueResult};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 
 use crate::events::{attach_render_listener, create_event_chan, create_listener, remove_listener};
 use crate::node::{DOM_NODE_TAG, as_web_node, dom_node_value};
@@ -35,12 +35,16 @@ fn get_str(val: &Value) -> ValueResult<String> {
 }
 
 fn get_node_arg(args: &[Value], idx: usize) -> ValueResult<&web_sys::Node> {
-    let val = args.get(idx).ok_or_else(|| ValueError::Other("missing argument".into()))?;
+    let val = args
+        .get(idx)
+        .ok_or_else(|| ValueError::Other("missing argument".into()))?;
     as_web_node(val)
 }
 
 fn get_str_arg(args: &[Value], idx: usize) -> ValueResult<String> {
-    let val = args.get(idx).ok_or_else(|| ValueError::Other("missing argument".into()))?;
+    let val = args
+        .get(idx)
+        .ok_or_else(|| ValueError::Other("missing argument".into()))?;
     get_str(val)
 }
 
@@ -107,7 +111,9 @@ fn builtin_query_all(args: &[Value]) -> ValueResult<Value> {
         .filter_map(|i| list.item(i))
         .map(dom_node_value)
         .collect();
-    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(nodes))))
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+        nodes,
+    ))))
 }
 
 // ── Creation ──────────────────────────────────────────────────────────────────
@@ -164,10 +170,7 @@ fn builtin_replace(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_parent(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?;
-    Ok(node
-        .parent_node()
-        .map(dom_node_value)
-        .unwrap_or(Value::Nil))
+    Ok(node.parent_node().map(dom_node_value).unwrap_or(Value::Nil))
 }
 
 fn builtin_children(args: &[Value]) -> ValueResult<Value> {
@@ -177,7 +180,9 @@ fn builtin_children(args: &[Value]) -> ValueResult<Value> {
         .filter_map(|i| list.item(i))
         .map(dom_node_value)
         .collect();
-    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(nodes))))
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+        nodes,
+    ))))
 }
 
 // ── Attributes ────────────────────────────────────────────────────────────────
@@ -214,14 +219,20 @@ fn builtin_remove_attr(args: &[Value]) -> ValueResult<Value> {
 fn builtin_add_class(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?.clone();
     let name = get_str_arg(args, 1)?;
-    to_element(&node)?.class_list().add_1(&name).map_err(js_err)?;
+    to_element(&node)?
+        .class_list()
+        .add_1(&name)
+        .map_err(js_err)?;
     Ok(args[0].clone())
 }
 
 fn builtin_remove_class(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?.clone();
     let name = get_str_arg(args, 1)?;
-    to_element(&node)?.class_list().remove_1(&name).map_err(js_err)?;
+    to_element(&node)?
+        .class_list()
+        .remove_1(&name)
+        .map_err(js_err)?;
     Ok(args[0].clone())
 }
 
@@ -234,7 +245,10 @@ fn builtin_has_class(args: &[Value]) -> ValueResult<Value> {
 fn builtin_toggle_class(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?.clone();
     let name = get_str_arg(args, 1)?;
-    to_element(&node)?.class_list().toggle(&name).map_err(js_err)?;
+    to_element(&node)?
+        .class_list()
+        .toggle(&name)
+        .map_err(js_err)?;
     Ok(args[0].clone())
 }
 
@@ -242,9 +256,7 @@ fn builtin_toggle_class(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_text(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?;
-    Ok(Value::string(
-        node.text_content().unwrap_or_default(),
-    ))
+    Ok(Value::string(node.text_content().unwrap_or_default()))
 }
 
 fn builtin_set_text(args: &[Value]) -> ValueResult<Value> {
@@ -282,7 +294,10 @@ fn builtin_set_style(args: &[Value]) -> ValueResult<Value> {
     let node = get_node_arg(args, 0)?.clone();
     let prop = get_str_arg(args, 1)?;
     let val = get_str_arg(args, 2)?;
-    to_html_element(&node)?.style().set_property(&prop, &val).map_err(js_err)?;
+    to_html_element(&node)?
+        .style()
+        .set_property(&prop, &val)
+        .map_err(js_err)?;
     Ok(args[0].clone())
 }
 
@@ -332,7 +347,7 @@ fn builtin_listen(args: &[Value]) -> ValueResult<Value> {
         .dyn_ref::<web_sys::EventTarget>()
         .cloned()
         .ok_or_else(|| ValueError::Other("DomNode is not an EventTarget".into()))?;
-    create_listener(&target, event_type, handler).map_err(|e| ValueError::Other(e.into()))
+    create_listener(&target, event_type, handler).map_err(ValueError::Other)
 }
 
 fn builtin_unlisten(args: &[Value]) -> ValueResult<Value> {
@@ -431,7 +446,11 @@ fn render_hiccup(doc: &web_sys::Document, v: &PersistentVector) -> ValueResult<w
     let tag = match v.nth(0) {
         Some(Value::Keyword(k)) => k.get().name.to_string(),
         Some(Value::Str(s)) => s.get().clone(),
-        _ => return Err(ValueError::Other("hiccup tag must be a keyword or string".into())),
+        _ => {
+            return Err(ValueError::Other(
+                "hiccup tag must be a keyword or string".into(),
+            ));
+        }
     };
 
     let el = doc.create_element(&tag).map_err(js_err)?;
@@ -485,44 +504,44 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // Selection
-        ("document",   Arity::Fixed(0), builtin_document),
-        ("body",       Arity::Fixed(0), builtin_body),
-        ("head",       Arity::Fixed(0), builtin_head),
-        ("by-id",      Arity::Fixed(1), builtin_by_id),
-        ("query",      Arity::Fixed(1), builtin_query),
-        ("query-all",  Arity::Fixed(1), builtin_query_all),
+        ("document", Arity::Fixed(0), builtin_document),
+        ("body", Arity::Fixed(0), builtin_body),
+        ("head", Arity::Fixed(0), builtin_head),
+        ("by-id", Arity::Fixed(1), builtin_by_id),
+        ("query", Arity::Fixed(1), builtin_query),
+        ("query-all", Arity::Fixed(1), builtin_query_all),
         // Creation
-        ("create",      Arity::Fixed(1), builtin_create),
+        ("create", Arity::Fixed(1), builtin_create),
         ("create-text", Arity::Fixed(1), builtin_create_text),
         // Tree manipulation
-        ("append!",  Arity::Fixed(2), builtin_append),
+        ("append!", Arity::Fixed(2), builtin_append),
         ("prepend!", Arity::Fixed(2), builtin_prepend),
-        ("remove!",  Arity::Fixed(1), builtin_remove),
+        ("remove!", Arity::Fixed(1), builtin_remove),
         ("replace!", Arity::Fixed(2), builtin_replace),
-        ("parent",   Arity::Fixed(1), builtin_parent),
+        ("parent", Arity::Fixed(1), builtin_parent),
         ("children", Arity::Fixed(1), builtin_children),
         // Attributes
-        ("attr",        Arity::Fixed(2), builtin_attr),
-        ("set-attr!",   Arity::Fixed(3), builtin_set_attr),
+        ("attr", Arity::Fixed(2), builtin_attr),
+        ("set-attr!", Arity::Fixed(3), builtin_set_attr),
         ("remove-attr!", Arity::Fixed(2), builtin_remove_attr),
         // Classes
-        ("add-class!",    Arity::Fixed(2), builtin_add_class),
+        ("add-class!", Arity::Fixed(2), builtin_add_class),
         ("remove-class!", Arity::Fixed(2), builtin_remove_class),
-        ("has-class?",    Arity::Fixed(2), builtin_has_class),
+        ("has-class?", Arity::Fixed(2), builtin_has_class),
         ("toggle-class!", Arity::Fixed(2), builtin_toggle_class),
         // Content
-        ("text",      Arity::Fixed(1), builtin_text),
+        ("text", Arity::Fixed(1), builtin_text),
         ("set-text!", Arity::Fixed(2), builtin_set_text),
-        ("html",      Arity::Fixed(1), builtin_html),
+        ("html", Arity::Fixed(1), builtin_html),
         ("set-html!", Arity::Fixed(2), builtin_set_html),
         // Style & form
-        ("style",      Arity::Fixed(2), builtin_style),
+        ("style", Arity::Fixed(2), builtin_style),
         ("set-style!", Arity::Fixed(3), builtin_set_style),
-        ("value",      Arity::Fixed(1), builtin_value),
+        ("value", Arity::Fixed(1), builtin_value),
         ("set-value!", Arity::Fixed(2), builtin_set_value),
         // Events
-        ("listen!",    Arity::Fixed(3), builtin_listen),
-        ("unlisten!",  Arity::Fixed(1), builtin_unlisten),
+        ("listen!", Arity::Fixed(3), builtin_listen),
+        ("unlisten!", Arity::Fixed(1), builtin_unlisten),
         ("event-chan", Arity::Fixed(2), builtin_event_chan),
         // Hiccup
         ("render!", Arity::Fixed(2), builtin_render),

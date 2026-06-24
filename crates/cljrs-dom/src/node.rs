@@ -45,12 +45,11 @@ pub fn dom_node_value(node: web_sys::Node) -> Value {
 /// Returns `Err` if `val` is not a `DomNode` native object.
 pub fn as_web_node(val: &Value) -> ValueResult<&web_sys::Node> {
     match val {
-        Value::NativeObject(obj) if obj.get().type_tag() == DOM_NODE_TAG => Ok(
-            &obj.get()
-                .downcast_ref::<DomNode>()
-                .expect("DomNode tag but wrong concrete type")
-                .0,
-        ),
+        Value::NativeObject(obj) if obj.get().type_tag() == DOM_NODE_TAG => Ok(&obj
+            .get()
+            .downcast_ref::<DomNode>()
+            .expect("DomNode tag but wrong concrete type")
+            .0),
         other => Err(ValueError::WrongType {
             expected: "DomNode",
             got: other.type_name().to_string(),

@@ -9,10 +9,11 @@ use std::sync::Arc;
 use cljrs_async::channel::CljChannel;
 use cljrs_env::env::Env;
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
-use cljrs_value::{Arity, Keyword, NativeFn, NativeObject, Value, ValueError, ValueResult,
-                  gc_native_object};
-use wasm_bindgen::prelude::*;
+use cljrs_value::{
+    Arity, Keyword, NativeFn, NativeObject, Value, ValueError, ValueResult, gc_native_object,
+};
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::DOM_GLOBALS;
@@ -156,25 +157,21 @@ pub fn create_listener(
     event_type: String,
     handler: Value,
 ) -> Result<Value, String> {
-    let closure = {
-        let event_type_inner = event_type.clone();
-        let _ = event_type_inner; // suppress unused warning
-        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-            let ptr = NonNull::from(&event);
-            ACTIVE_EVENT.with(|ae| *ae.borrow_mut() = Some(ptr));
+    let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let ptr = NonNull::from(&event);
+        ACTIVE_EVENT.with(|ae| *ae.borrow_mut() = Some(ptr));
 
-            let event_map = event_to_map(&event);
+        let event_map = event_to_map(&event);
 
-            DOM_GLOBALS.with(|g| {
-                if let Some(globals) = &*g.borrow() {
-                    let mut env = Env::new(globals.clone(), "user");
-                    let _ = cljrs_env::apply::apply_value(&handler, vec![event_map], &mut env);
-                }
-            });
+        DOM_GLOBALS.with(|g| {
+            if let Some(globals) = &*g.borrow() {
+                let mut env = Env::new(globals.clone(), "user");
+                let _ = cljrs_env::apply::apply_value(&handler, vec![event_map], &mut env);
+            }
+        });
 
-            ACTIVE_EVENT.with(|ae| *ae.borrow_mut() = None);
-        })
-    };
+        ACTIVE_EVENT.with(|ae| *ae.borrow_mut() = None);
+    });
 
     let callback: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
 
@@ -215,11 +212,7 @@ pub fn remove_listener(val: &Value) -> ValueResult<()> {
 
 /// Attach an event handler for use inside `dom/render!` (handler is leaked via
 /// `Closure::forget` since `render!` does not return a listener handle).
-pub fn attach_render_listener(
-    target: &web_sys::EventTarget,
-    event_type: String,
-    handler: Value,
-) {
+pub fn attach_render_listener(target: &web_sys::EventTarget, event_type: String, handler: Value) {
     let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
         let ptr = NonNull::from(&event);
         ACTIVE_EVENT.with(|ae| *ae.borrow_mut() = Some(ptr));
