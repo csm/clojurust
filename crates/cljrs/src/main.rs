@@ -517,9 +517,7 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
             }
 
             if test {
-                let test_dir = file
-                    .as_deref()
-                    .unwrap_or_else(|| std::path::Path::new("."));
+                let test_dir = file.as_deref().unwrap_or_else(|| std::path::Path::new("."));
                 cljrs_compiler::aot::compile_test_harness(test_dir, &out, &all_src_paths)
                     .map_err(|e| miette::miette!("{e}"))?;
             } else {
@@ -549,10 +547,12 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
                             }
                             let mains = find_main_namespaces(&project_paths);
                             match mains.len() {
-                                0 => return Err(miette::miette!(
-                                    "no -main function found in source paths; \
+                                0 => {
+                                    return Err(miette::miette!(
+                                        "no -main function found in source paths; \
                                      specify --main or add :main to cljrs.edn"
-                                )),
+                                    ));
+                                }
                                 1 => mains.into_iter().next().unwrap().0,
                                 _ => {
                                     let list = mains
@@ -912,8 +912,7 @@ fn find_main_namespaces(src_paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let mut parser =
-                cljrs_reader::Parser::new(src, file.display().to_string());
+            let mut parser = cljrs_reader::Parser::new(src, file.display().to_string());
             let Ok(forms) = parser.parse_all() else {
                 continue;
             };
@@ -930,7 +929,8 @@ fn find_main_namespaces(src_paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
                         {
                             ns_name = Some(n.clone());
                         }
-                    } else if (s == "defn" || s == "defn-") && parts.len() >= 2
+                    } else if (s == "defn" || s == "defn-")
+                        && parts.len() >= 2
                         && let FormKind::Symbol(n) = &parts[1].kind
                         && n == "-main"
                     {
