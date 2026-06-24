@@ -669,6 +669,8 @@ fn setup_globals(
             None => init(&globals),
         }
     });
+    #[cfg(feature = "base64")]
+    cljrs_base64::init(&globals);
     globals
 }
 
