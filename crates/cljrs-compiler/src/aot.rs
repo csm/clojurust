@@ -427,11 +427,12 @@ pub fn compile_file(
     // and the `go`/`alt` macros resolve during macro-expansion. The GC
     // service is silently skipped when there is no LocalSet context.
     cljrs_async::init(&globals);
-    // Register I/O, networking, and charset namespaces so that require forms
-    // in source files resolve correctly during macro expansion.
+    // Register I/O, networking, charset, and base64 namespaces so that require
+    // forms in source files resolve correctly during macro expansion.
     cljrs_io::init(&globals);
     cljrs_net::init(&globals);
     cljrs_charset::init(&globals);
+    cljrs_base64::init(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -1210,10 +1211,11 @@ async fn run() {{
     // Register the async runtime (clojure.core.async, ^:async dispatch, await).
     cljrs_async::init(&globals);
 {async_polls}
-    // Register I/O, networking, and charset namespaces.
+    // Register I/O, networking, charset, and base64 namespaces.
     cljrs_io::init(&globals);
     cljrs_net::init(&globals);
     cljrs_charset::init(&globals);
+    cljrs_base64::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -1282,6 +1284,7 @@ const HARNESS_RUNTIME_CRATES: &[&str] = &[
     "cljrs-io",
     "cljrs-net",
     "cljrs-charset",
+    "cljrs-base64",
 ];
 
 /// Runtime crates the AOT *test* harness links against.  The test runner

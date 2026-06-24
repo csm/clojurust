@@ -930,12 +930,11 @@ fn find_main_namespaces(src_paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
                         {
                             ns_name = Some(n.clone());
                         }
-                    } else if (s == "defn" || s == "defn-") && parts.len() >= 2 {
-                        if let FormKind::Symbol(n) = &parts[1].kind
-                            && n == "-main"
-                        {
-                            has_main = true;
-                        }
+                    } else if (s == "defn" || s == "defn-") && parts.len() >= 2
+                        && let FormKind::Symbol(n) = &parts[1].kind
+                        && n == "-main"
+                    {
+                        has_main = true;
                     }
                 }
             }
@@ -962,10 +961,10 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_source_files(&path, out);
-        } else if let Some(ext) = path.extension() {
-            if ext == "cljrs" || ext == "cljc" {
-                out.push(path);
-            }
+        } else if let Some(ext) = path.extension()
+            && (ext == "cljrs" || ext == "cljc")
+        {
+            out.push(path);
         }
     }
 }
