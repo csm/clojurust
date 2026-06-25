@@ -525,7 +525,7 @@ pub fn compile_file(
             interpreted_source.push_str(src_text);
             interpreted_source.push('\n');
         } else {
-            compilable.push(form.clone());
+            compilable.push(qualify_aliases(form, &env.current_ns, &env.globals));
         }
     }
     if !interpreted_source.is_empty() {
@@ -891,6 +891,58 @@ struct CompiledNamespace {
     preamble: String,
 }
 
+/// Rewrite namespace-alias-qualified symbols (`alias/name`) to their fully
+/// qualified form (`real-ns/name`) using `ns`'s alias table.
+///
+/// Compiled `LoadGlobal` bakes in the namespace part of a symbol at lower time
+/// and resolves it at runtime; for a plain alias (`u/wrap`) that resolution
+/// otherwise depends on the namespace *active when the compiled function runs*,
+/// which is the caller's — not the function's defining namespace.  Resolving the
+/// alias here makes the symbol carry its real namespace (`utils/wrap`), so it
+/// resolves correctly no matter where the compiled function is invoked from.
+///
+/// Only var references are rewritten: in Clojure bare symbols inside collection
+/// literals are evaluated, so they are rewritten too, but `quote`d data is left
+/// untouched.
+fn qualify_aliases(form: &cljrs_reader::Form, ns: &str, globals: &Arc<cljrs_env::env::GlobalEnv>) -> cljrs_reader::Form {
+    use cljrs_reader::form::FormKind;
+    let recur = |f: &cljrs_reader::Form| qualify_aliases(f, ns, globals);
+    let map_vec = |v: &[cljrs_reader::Form]| v.iter().map(&recur).collect::<Vec<_>>();
+    let kind = match &form.kind {
+        FormKind::Symbol(s) => match s.find('/') {
+            Some(slash) if s != "/" => {
+                let (alias, rest) = (&s[..slash], &s[slash + 1..]);
+                if !alias.is_empty()
+                    && !rest.is_empty()
+                    && let Some(real) = globals.resolve_alias(ns, alias)
+                    && real.as_ref() != alias
+                {
+                    FormKind::Symbol(format!("{real}/{rest}"))
+                } else {
+                    return form.clone();
+                }
+            }
+            _ => return form.clone(),
+        },
+        FormKind::List(v) => FormKind::List(map_vec(v)),
+        FormKind::Vector(v) => FormKind::Vector(map_vec(v)),
+        FormKind::Map(v) => FormKind::Map(map_vec(v)),
+        FormKind::Set(v) => FormKind::Set(map_vec(v)),
+        FormKind::AnonFn(v) => FormKind::AnonFn(map_vec(v)),
+        FormKind::SyntaxQuote(f) => FormKind::SyntaxQuote(Box::new(recur(f))),
+        FormKind::Unquote(f) => FormKind::Unquote(Box::new(recur(f))),
+        FormKind::UnquoteSplice(f) => FormKind::UnquoteSplice(Box::new(recur(f))),
+        FormKind::Deref(f) => FormKind::Deref(Box::new(recur(f))),
+        FormKind::Var(f) => FormKind::Var(Box::new(recur(f))),
+        FormKind::Meta(m, f) => FormKind::Meta(Box::new(recur(m)), Box::new(recur(f))),
+        FormKind::TaggedLiteral(t, f) => FormKind::TaggedLiteral(t.clone(), Box::new(recur(f))),
+        // `quote`d data and scalars (and reader conditionals, already resolved
+        // for this platform at parse time) are left untouched.
+        _ => return form.clone(),
+    };
+    cljrs_reader::Form::new(kind, form.span.clone())
+}
+
 /// Lower one required namespace to an interpreted preamble plus an optional
 /// natively compiled initializer.
 ///
@@ -931,7 +983,7 @@ fn lower_namespace(
             preamble.push_str(&source[span.start..span.end]);
             preamble.push('\n');
         } else {
-            compilable.push(form.clone());
+            compilable.push(qualify_aliases(form, ns_name, globals));
         }
     }
 
