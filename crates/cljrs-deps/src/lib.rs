@@ -149,6 +149,9 @@ pub struct DepsConfig {
     pub enforce_native_versions: bool,
     /// Optional Rust-crate configuration for mixed Rust/Clojure projects.
     pub rust: Option<RustConfig>,
+    /// The namespace containing `-main`, used as the AOT entry point.
+    /// Set via `:main` in `cljrs.edn` or overridden by `--main` on the CLI.
+    pub main_ns: Option<Arc<str>>,
 }
 
 impl DepsConfig {
