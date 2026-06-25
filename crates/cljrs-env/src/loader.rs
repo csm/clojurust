@@ -103,6 +103,32 @@ pub(crate) fn claim_or_wait(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> Eva
 /// The caller is responsible for claiming/releasing the namespace in the
 /// `loading` map.
 fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
+    // AOT-compiled namespace: a binary produced by `cljrs compile` registers a
+    // loader for each required namespace.  Run it instead of interpreting
+    // source — the loader evaluates a small interpreted preamble (ns/require,
+    // macros) and then calls the namespace's natively compiled initializer.
+    if let Some(loader) = globals.compiled_ns_loader(ns_name) {
+        // Ensure the namespace exists before its compiled `def`s run, then
+        // pre-refer clojure.core so the preamble can use core fns before its
+        // own `(ns ...)` form (mirrors the source-file path below).
+        globals.get_or_create_ns(ns_name);
+        if ns_name.as_ref() != "clojure.core" {
+            globals.refer_all(ns_name, "clojure.core");
+        }
+        // Save and restore *ns* so the caller's namespace is not disturbed by
+        // the `(ns ...)` form in the loaded namespace's preamble.
+        let saved_ns = globals
+            .lookup_var("clojure.core", "*ns*")
+            .and_then(|v| crate::dynamics::deref_var(&v));
+        let result = loader(globals);
+        if let Some(saved) = saved_ns
+            && let Some(var) = globals.lookup_var("clojure.core", "*ns*")
+        {
+            var.get().bind(saved);
+        }
+        return result;
+    }
+
     // Resolve namespace name: check built-in registry first, then disk.
     // Clojure convention: dots → path separators, hyphens → underscores.
     let rel_path = ns_name.replace('.', "/").replace('-', "_");
