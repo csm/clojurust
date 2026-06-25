@@ -904,7 +904,11 @@ struct CompiledNamespace {
 /// Only var references are rewritten: in Clojure bare symbols inside collection
 /// literals are evaluated, so they are rewritten too, but `quote`d data is left
 /// untouched.
-fn qualify_aliases(form: &cljrs_reader::Form, ns: &str, globals: &Arc<cljrs_env::env::GlobalEnv>) -> cljrs_reader::Form {
+fn qualify_aliases(
+    form: &cljrs_reader::Form,
+    ns: &str,
+    globals: &Arc<cljrs_env::env::GlobalEnv>,
+) -> cljrs_reader::Form {
     use cljrs_reader::form::FormKind;
     let recur = |f: &cljrs_reader::Form| qualify_aliases(f, ns, globals);
     let map_vec = |v: &[cljrs_reader::Form]| v.iter().map(&recur).collect::<Vec<_>>();
