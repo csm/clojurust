@@ -190,7 +190,7 @@ pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], form
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
 
 **Async activation (Phase H):** `compile_async_poll_fns` introspects the
 `^:async` fns the program defined (their `def` forms are evaluated into the
@@ -263,7 +263,24 @@ Detects four classes of no-gc memory-safety violations in IR functions:
 3. **LazySeqEscape** — lazy-producing call result is bound as an intermediate and returned unrealized.
 4. **EscapingClosure** — `AllocClosure` stored in a static container.
 
-Multi-file support: when the source file uses `(ns ... (:require [...]))`, the required namespaces are loaded during compilation. Their source files are discovered from `src_dirs`, bundled into the harness as builtin sources, and made available at runtime so the binary is self-contained.
+Multi-file support: when the source file uses `(ns ... (:require [...]))`, the
+required namespaces are loaded during compilation (discovered from `src_dirs`)
+and **each is AOT-compiled into the same object module** — not bundled as
+source and interpreted at startup. `lower_namespace` parses and macro-expands
+each required namespace, partitions its top-level forms into an interpreted
+preamble (`ns`/`require`, `defmacro`, protocol/multimethod forms) and a
+compilable body, and lowers the body to an `__cljrs_ns_init_<i>` function. The
+harness writes each namespace's preamble to `src/ns_<i>_preamble.cljrs`,
+declares its initializer `extern "C"`, and registers a `CompiledNsLoader`
+(`globals.register_compiled_ns_loader`) so that when `require` resolves the
+namespace at runtime, `cljrs_env::loader::do_load` runs the loader — evaluating
+the preamble, then calling the compiled initializer — instead of tree-walking
+source. Transitive `require`s resolve naturally: a namespace's preamble
+contains its own `ns`/`require` form, which triggers loading of its
+dependencies (each via its own compiled loader) before its initializer runs.
+Pinned *versioned* sources (`mylib@<sha>`) are the exception — they still embed
+as interpreted builtin source, since they resolve through the separate
+versioned loader rather than the plain `require` path.
 
 ---
 

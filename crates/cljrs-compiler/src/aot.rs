@@ -467,20 +467,45 @@ pub fn compile_file(
     // failed signature) fails the compile instead of the deployed binary.
     pin_versioned_references(&expanded, &mut env)?;
 
-    // Discover user namespaces loaded during expansion (transitive deps),
-    // plus every pinned source fetched from git (embedded under the
-    // versioned namespace name, e.g. "mylib@abc1234").
-    let mut bundled_sources = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    // Discover user namespaces loaded during expansion (transitive deps).
+    // Each is AOT-compiled into its own initializer (below) rather than
+    // bundled as source and tree-walked at startup.
+    let discovered = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+
+    // Pinned versioned sources (e.g. "mylib@abc1234") stay interpreted: they
+    // resolve through the separate versioned loader — not the plain `require`
+    // path — so they are bundled as builtin source as before.
+    let mut versioned_bundled: Vec<(Arc<str>, String)> = Vec::new();
     for (ns, src) in env.globals.versioned_sources_snapshot() {
-        bundled_sources.push((ns, src.to_string()));
+        versioned_bundled.push((ns, src.to_string()));
     }
-    if !bundled_sources.is_empty() {
+
+    // Lower each discovered namespace to an interpreted preamble (ns/require,
+    // macros) plus an optional natively compiled initializer.
+    let mut compiled_namespaces: Vec<CompiledNamespace> = Vec::new();
+    let mut dep_irs: Vec<(String, IrFunction)> = Vec::new();
+    for (i, (ns, src)) in discovered.iter().enumerate() {
+        let init_symbol = format!("__cljrs_ns_init_{i}");
+        let (preamble, ir_opt) = lower_namespace(ns, src, &init_symbol, &env.globals)?;
+        let init_symbol = if let Some(ir) = ir_opt {
+            dep_irs.push((init_symbol.clone(), ir));
+            Some(init_symbol)
+        } else {
+            None
+        };
+        compiled_namespaces.push(CompiledNamespace {
+            ns: ns.clone(),
+            init_symbol,
+            preamble,
+        });
+    }
+    if !compiled_namespaces.is_empty() {
         eprintln!(
-            "[aot] bundling {} required namespace(s): {}",
-            bundled_sources.len(),
-            bundled_sources
+            "[aot] compiling {} required namespace(s): {}",
+            compiled_namespaces.len(),
+            compiled_namespaces
                 .iter()
-                .map(|(ns, _)| ns.as_ref())
+                .map(|c| c.ns.as_ref())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -500,7 +525,7 @@ pub fn compile_file(
             interpreted_source.push_str(src_text);
             interpreted_source.push('\n');
         } else {
-            compilable.push(form.clone());
+            compilable.push(qualify_aliases(form, &env.current_ns, &env.globals));
         }
     }
     if !interpreted_source.is_empty() {
@@ -564,6 +589,16 @@ pub fn compile_file(
     let func_id = compiler.declare_function("__cljrs_main", 0)?;
     compiler.compile_function(&ir_func, func_id)?;
 
+    // Compile each required namespace's initializer into the same module.
+    // Subfunction symbols are globally unique (per `fresh_global_name_id`),
+    // so initializers can share one object module without name collisions.
+    for (init_symbol, ns_ir) in &dep_irs {
+        declare_subfunctions(ns_ir, &mut compiler)?;
+        compile_subfunctions(ns_ir, &mut compiler)?;
+        let id = compiler.declare_function(init_symbol, 0)?;
+        compiler.compile_function(ns_ir, id)?;
+    }
+
     // ── 4b. Async poll functions (Phase H) ──────────────────────────────
     // Regular `defn`s are compiled into `__cljrs_main`; `^:async` ones stay
     // interpreted (their body has `await`) and so were never evaluated into the
@@ -594,7 +629,8 @@ pub fn compile_file(
         out_path,
         &obj_bytes,
         &interpreted_source,
-        &bundled_sources,
+        &compiled_namespaces,
+        &versioned_bundled,
         &async_polls,
         rust_config,
     )?;
@@ -844,6 +880,126 @@ fn find_user_source(rel: &str, src_dirs: &[PathBuf]) -> Option<String> {
     None
 }
 
+/// One required namespace compiled into the AOT object module: its interpreted
+/// preamble (the `ns`/`require` form and any `defmacro`/protocol/multimethod
+/// definitions that must run through the interpreter) and the symbol of its
+/// natively compiled initializer (`None` when the namespace has no compilable
+/// top-level forms — e.g. a namespace consisting only of `defmacro`s).
+struct CompiledNamespace {
+    ns: Arc<str>,
+    init_symbol: Option<String>,
+    preamble: String,
+}
+
+/// Rewrite namespace-alias-qualified symbols (`alias/name`) to their fully
+/// qualified form (`real-ns/name`) using `ns`'s alias table.
+///
+/// Compiled `LoadGlobal` bakes in the namespace part of a symbol at lower time
+/// and resolves it at runtime; for a plain alias (`u/wrap`) that resolution
+/// otherwise depends on the namespace *active when the compiled function runs*,
+/// which is the caller's — not the function's defining namespace.  Resolving the
+/// alias here makes the symbol carry its real namespace (`utils/wrap`), so it
+/// resolves correctly no matter where the compiled function is invoked from.
+///
+/// Only var references are rewritten: in Clojure bare symbols inside collection
+/// literals are evaluated, so they are rewritten too, but `quote`d data is left
+/// untouched.
+fn qualify_aliases(
+    form: &cljrs_reader::Form,
+    ns: &str,
+    globals: &Arc<cljrs_env::env::GlobalEnv>,
+) -> cljrs_reader::Form {
+    use cljrs_reader::form::FormKind;
+    let recur = |f: &cljrs_reader::Form| qualify_aliases(f, ns, globals);
+    let map_vec = |v: &[cljrs_reader::Form]| v.iter().map(&recur).collect::<Vec<_>>();
+    let kind = match &form.kind {
+        FormKind::Symbol(s) => match s.find('/') {
+            Some(slash) if s != "/" => {
+                let (alias, rest) = (&s[..slash], &s[slash + 1..]);
+                if !alias.is_empty()
+                    && !rest.is_empty()
+                    && let Some(real) = globals.resolve_alias(ns, alias)
+                    && real.as_ref() != alias
+                {
+                    FormKind::Symbol(format!("{real}/{rest}"))
+                } else {
+                    return form.clone();
+                }
+            }
+            _ => return form.clone(),
+        },
+        FormKind::List(v) => FormKind::List(map_vec(v)),
+        FormKind::Vector(v) => FormKind::Vector(map_vec(v)),
+        FormKind::Map(v) => FormKind::Map(map_vec(v)),
+        FormKind::Set(v) => FormKind::Set(map_vec(v)),
+        FormKind::AnonFn(v) => FormKind::AnonFn(map_vec(v)),
+        FormKind::SyntaxQuote(f) => FormKind::SyntaxQuote(Box::new(recur(f))),
+        FormKind::Unquote(f) => FormKind::Unquote(Box::new(recur(f))),
+        FormKind::UnquoteSplice(f) => FormKind::UnquoteSplice(Box::new(recur(f))),
+        FormKind::Deref(f) => FormKind::Deref(Box::new(recur(f))),
+        FormKind::Var(f) => FormKind::Var(Box::new(recur(f))),
+        FormKind::Meta(m, f) => FormKind::Meta(Box::new(recur(m)), Box::new(recur(f))),
+        FormKind::TaggedLiteral(t, f) => FormKind::TaggedLiteral(t.clone(), Box::new(recur(f))),
+        // `quote`d data and scalars (and reader conditionals, already resolved
+        // for this platform at parse time) are left untouched.
+        _ => return form.clone(),
+    };
+    cljrs_reader::Form::new(kind, form.span.clone())
+}
+
+/// Lower one required namespace to an interpreted preamble plus an optional
+/// natively compiled initializer.
+///
+/// `source` is the namespace's Clojure source.  The namespace has already been
+/// loaded into `globals` during the entry file's macro-expansion, so its own
+/// macros and requires are available; here we only macro-expand (never
+/// re-evaluate) in order to partition top-level forms into an interpreted
+/// preamble (ns/require, defmacro, protocols, …) and a compilable body which is
+/// lowered to an `__cljrs_ns_init_*` IR function.  Returns `(preamble, ir)`
+/// where `ir` is `None` if the namespace has no compilable top-level forms.
+fn lower_namespace(
+    ns_name: &str,
+    source: &str,
+    init_symbol: &str,
+    globals: &Arc<cljrs_env::env::GlobalEnv>,
+) -> AotResult<(String, Option<IrFunction>)> {
+    let mut parser = Parser::new(source.to_string(), format!("<{ns_name}>"));
+    let forms = parser.parse_all()?;
+
+    // Macro-expand each form in an env rooted at this namespace so symbol and
+    // alias resolution match how the namespace's own code sees the world.
+    let mut env = cljrs_eval::Env::new(globals.clone(), ns_name);
+    let mut expanded = Vec::with_capacity(forms.len());
+    for form in &forms {
+        match cljrs_interp::macros::macroexpand_all(form, &mut env) {
+            Ok(f) => expanded.push(f),
+            Err(e) => return Err(AotError::Eval(format!("{e:?}"))),
+        }
+    }
+
+    // Partition: interpreted preamble vs compiled body (same rule as the entry
+    // file in `compile_file`).
+    let mut preamble = String::new();
+    let mut compilable = Vec::new();
+    for (i, form) in expanded.iter().enumerate() {
+        if needs_interpreter(&forms[i]) || expanded_needs_interpreter(form) {
+            let span = &forms[i].span;
+            preamble.push_str(&source[span.start..span.end]);
+            preamble.push('\n');
+        } else {
+            compilable.push(qualify_aliases(form, ns_name, globals));
+        }
+    }
+
+    if compilable.is_empty() {
+        return Ok((preamble, None));
+    }
+
+    let mut ir = lower_via_rust(Some(init_symbol), ns_name, &[], &compilable, &mut env)?;
+    optimize_direct_calls(&mut ir);
+    Ok((preamble, Some(ir)))
+}
+
 // ── Harness generation ──────────────────────────────────────────────────────
 
 /// Create a temporary Cargo project that links the compiled object code with
@@ -972,7 +1128,8 @@ fn build_harness(
     out_path: &Path,
     obj_bytes: &[u8],
     interpreted_source: &str,
-    bundled_sources: &[(Arc<str>, String)],
+    compiled_namespaces: &[CompiledNamespace],
+    versioned_bundled: &[(Arc<str>, String)],
     async_polls: &[AsyncPollEntry],
     rust_config: Option<&cljrs_deps::RustConfig>,
 ) -> AotResult<(PathBuf, bool)> {
@@ -1044,19 +1201,62 @@ edition = "2024"
         std::fs::write(harness_dir.join("src/preamble.cljrs"), interpreted_source)?;
     }
 
-    // Write bundled dependency sources.
-    for (i, (ns, src)) in bundled_sources.iter().enumerate() {
-        let filename = format!("bundled_{i}.cljrs");
+    // Write pinned versioned dependency sources (still interpreted at startup —
+    // they resolve through the versioned loader, not the plain require path).
+    let mut bundled_registration = String::new();
+    for (i, (ns, src)) in versioned_bundled.iter().enumerate() {
+        let filename = format!("versioned_{i}.cljrs");
         std::fs::write(harness_dir.join("src").join(&filename), src)?;
-        eprintln!("[aot] bundled {ns} → src/{filename}");
+        eprintln!("[aot] bundled (interpreted) {ns} → src/{filename}");
+        bundled_registration.push_str(&format!(
+            "    globals.register_builtin_source({ns:?}, include_str!({filename:?}));\n"
+        ));
     }
 
-    // Generate registration code for bundled sources.
-    let mut bundled_registration = String::new();
-    for (i, (ns, _)) in bundled_sources.iter().enumerate() {
-        bundled_registration.push_str(&format!(
-            "    globals.register_builtin_source(\"{ns}\", \
-             include_str!(\"bundled_{i}.cljrs\"));\n"
+    // Write the interpreted preamble for each AOT-compiled namespace, and build
+    // the extern declarations + loader registrations that wire each required
+    // namespace's compiled initializer into `require`.
+    let mut ns_init_externs = String::new();
+    let mut compiled_ns_registration = String::new();
+    for (i, cns) in compiled_namespaces.iter().enumerate() {
+        let preamble_file = format!("ns_{i}_preamble.cljrs");
+        std::fs::write(harness_dir.join("src").join(&preamble_file), &cns.preamble)?;
+        let ns = cns.ns.as_ref();
+        let ns_label = format!("<{ns}>");
+        eprintln!(
+            "[aot] compiled namespace {ns} → src/{preamble_file} + {}",
+            cns.init_symbol.as_deref().unwrap_or("(preamble only)")
+        );
+
+        let init_call = match &cns.init_symbol {
+            Some(sym) => {
+                ns_init_externs.push_str(&format!("    fn {sym}() -> *const Value;\n"));
+                format!("        unsafe {{ {sym}(); }}\n")
+            }
+            None => String::new(),
+        };
+
+        compiled_ns_registration.push_str(&format!(
+            r#"    globals.register_compiled_ns_loader({ns:?}, std::sync::Arc::new(
+        |globals: &std::sync::Arc<cljrs_env::env::GlobalEnv>| -> cljrs_env::error::EvalResult<()> {{
+        let mut env = cljrs_eval::Env::new(globals.clone(), {ns:?});
+        cljrs_env::callback::push_eval_context(&env);
+        let preamble = include_str!({preamble_file:?});
+        if !preamble.is_empty() {{
+            let mut parser = cljrs_reader::Parser::new(preamble.to_string(), {ns_label:?}.to_string());
+            let forms = parser.parse_all().map_err(cljrs_env::error::EvalError::Read)?;
+            for form in &forms {{
+                cljrs_eval::eval(form, &mut env)?;
+            }}
+        }}
+        // Re-push the eval context with the (possibly updated) namespace before
+        // running the compiled initializer.
+        cljrs_env::callback::pop_eval_context();
+        cljrs_env::callback::push_eval_context(&env);
+{init_call}        cljrs_env::callback::pop_eval_context();
+        Ok(())
+    }}));
+"#,
         ));
     }
 
@@ -1191,7 +1391,7 @@ use cljrs_value::Value;
 
 unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
-}}
+{ns_init_externs}}}
 
 async fn run() {{
     // Parse environment -X flags.
@@ -1219,7 +1419,10 @@ async fn run() {{
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
-{bundled}{native_init}
+{bundled}
+    // Register AOT-compiled namespace loaders so `require` runs their native
+    // initializers instead of interpreting source.
+{compiled_ns}{native_init}
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
@@ -1260,6 +1463,8 @@ fn main() {{
 "#,
         preamble = preamble_code,
         bundled = bundled_registration,
+        compiled_ns = compiled_ns_registration,
+        ns_init_externs = ns_init_externs,
         native_init = native_init_code,
         main_call = main_call_code,
         async_polls = async_poll_registration,

@@ -50,6 +50,18 @@ load registers a `:rust/load :dylib` dep's exports into the **unversioned**
 namespace (built at the dep's pinned `:git/sha`), so a plain
 `(require '[my.native.lib :as l])` of a pure-native package succeeds.
 
+AOT-compiled namespaces: the binary produced by `cljrs compile` registers a
+`CompiledNsLoader` per required namespace via
+`GlobalEnv::register_compiled_ns_loader`.  `loader::do_load` checks
+`GlobalEnv::compiled_ns_loader` **first** — before builtin source, disk, and
+native fallbacks — and, when one is present, runs it instead of interpreting
+Clojure source.  The loader evaluates the namespace's small interpreted
+preamble (its `ns`/`require` form and any `defmacro`/protocol/multimethod
+definitions) and then calls the namespace's natively compiled initializer, so
+the bulk of a required namespace runs as machine code rather than being
+tree-walked at startup.  `*ns*` is saved/restored around the loader so the
+caller's namespace is undisturbed.
+
 ## gc_roots module
 
 The `gc_roots` module manages GC root registration for the interpreter's Rust call stack. Public API includes:

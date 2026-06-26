@@ -159,7 +159,22 @@ pub struct GlobalEnv {
     /// `(require '[my.native.lib :as lib])` brings the native code in.
     #[allow(clippy::type_complexity)]
     pub native_require_loader: RwLock<Option<NativeRequireLoader>>,
+    /// Loaders for **AOT-compiled namespaces**, installed by the binary
+    /// produced by `cljrs compile`.  Keyed by namespace name.  When a plain
+    /// `require` resolves a namespace that has a registered loader, `load_ns`
+    /// invokes the loader instead of interpreting Clojure source: the loader
+    /// evaluates the namespace's small interpreted preamble (its `ns`/`require`
+    /// and macro definitions) and then calls the namespace's natively compiled
+    /// initializer, so the bulk of the namespace runs as machine code rather
+    /// than being tree-walked at startup.
+    #[allow(clippy::type_complexity)]
+    pub compiled_ns_loaders: RwLock<HashMap<Arc<str>, CompiledNsLoader>>,
 }
+
+/// Loader callback for an AOT-compiled namespace (see
+/// `GlobalEnv::compiled_ns_loaders`).  Given the global env, it loads the
+/// namespace by running its interpreted preamble and its compiled initializer.
+pub type CompiledNsLoader = Arc<dyn Fn(&Arc<GlobalEnv>) -> EvalResult<()> + Send + Sync>;
 
 /// Loader callback for pinned native packages (see
 /// `GlobalEnv::pinned_native_loader`).
@@ -208,6 +223,7 @@ impl GlobalEnv {
             provenance_warned: Mutex::new(HashSet::new()),
             pinned_native_loader: RwLock::new(None),
             native_require_loader: RwLock::new(None),
+            compiled_ns_loaders: RwLock::new(HashMap::new()),
         })
     }
 
@@ -227,6 +243,20 @@ impl GlobalEnv {
     /// Look up an embedded source for a namespace, if one has been registered.
     pub fn builtin_source(&self, ns: &str) -> Option<&'static str> {
         self.builtin_sources.read().unwrap().get(ns).copied()
+    }
+
+    /// Register a loader for an AOT-compiled namespace (called by the harness
+    /// `main` of a binary produced by `cljrs compile`).
+    pub fn register_compiled_ns_loader(&self, ns: &str, loader: CompiledNsLoader) {
+        self.compiled_ns_loaders
+            .write()
+            .unwrap()
+            .insert(Arc::from(ns), loader);
+    }
+
+    /// Look up the loader for an AOT-compiled namespace, if one is registered.
+    pub fn compiled_ns_loader(&self, ns: &str) -> Option<CompiledNsLoader> {
+        self.compiled_ns_loaders.read().unwrap().get(ns).cloned()
     }
 
     /// Mark a namespace as fully loaded from a file.
