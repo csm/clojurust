@@ -467,6 +467,8 @@ Foundations already in place:
 
 ## Phase 11.5 — AOT Clojure → WebAssembly backend
 
+Handoff + design doc: [`docs/wasm-aot-plan.md`](docs/wasm-aot-plan.md).
+
 Native-fast, sandbox-safe browser deployment. A *second* code-generation
 backend over the same regionalized `cljrs-ir` IR (parallel to Cranelift), since
 no in-sandbox native JIT is possible in a browser. Build-time AOT-wasm is the
