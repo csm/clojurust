@@ -142,9 +142,23 @@ fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
     //   would mis-resolve as a global), same restriction as eager lowering.
     // - Bootstrap-era fns (defined before the compiler was ready): never
     //   lowered under eager lowering either; they stay at tree-walk.
+    // Named anonymous functions (`(fn g [] g)`) rely on self_ptr for pointer
+    // identity.  Background lowering would resolve the self-name via
+    // LoadGlobal which fails when no global var exists for that name.  Only
+    // allow lowering if the function either has no name or its name is
+    // already a top-level var in the defining namespace (i.e. it came from
+    // `defn`).
+    let named_without_global = f.name.as_deref().is_some_and(|n| {
+        caller_env
+            .globals
+            .lookup_var_in_ns(&f.defining_ns, n)
+            .is_none()
+    });
+
     if IR_LOWERING_ACTIVE.get()
         || f.is_async
         || !f.closed_over_names.is_empty()
+        || named_without_global
         || crate::jit_state::is_bootstrap_arity(arity_id)
         || no_ir()
         || !caller_env
@@ -239,9 +253,14 @@ fn execute_ir(
     env.push_frame();
     cljrs_interp::apply::bind_fn_params(arity, args, &mut env)?;
 
-    // Self-reference for named functions.
+    // Self-reference for named functions: use self_ptr when available so
+    // the binding is pointer-equal to the outer Value::Fn holding this fn.
     if let Some(ref name) = f.name {
-        let self_val = Value::Fn(GcPtr::new(f.clone()));
+        let self_val = if let Some(ref p) = f.self_ptr {
+            Value::Fn(p.clone())
+        } else {
+            Value::Fn(GcPtr::new(f.clone()))
+        };
         env.bind(name.clone(), self_val);
     }
 

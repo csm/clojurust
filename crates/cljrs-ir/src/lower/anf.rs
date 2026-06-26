@@ -1234,6 +1234,7 @@ fn lower_fn(ctx: &mut LowerCtx, args: &[Form], is_async: bool) -> R {
             arity.rest.as_ref(),
             &arity.body,
             is_async,
+            fn_name.as_deref(),
         )?;
         ctx.add_subfunction(subfn);
 
@@ -1269,6 +1270,7 @@ fn lower_fn_arity(
     rest_param: Option<&Form>,
     body_forms: &[Form],
     is_async: bool,
+    self_name: Option<&str>,
 ) -> Result<IrFunction, LowerError> {
     // Compute raw parameter info (gensym for destructuring patterns).
     struct ParamInfo {
@@ -1345,6 +1347,19 @@ fn lower_fn_arity(
         let id = sub.fresh_var();
         sub.bind_local(pname.clone(), id);
         bound_params.push((pname.clone(), id));
+    }
+
+    // If the arity belongs to a named fn (e.g. `(fn g [] g)`), the self-name
+    // capture arrives as a `Value::Var` cell (filled in by the outer SetBang).
+    // Emit a Deref so that references to the name inside the body resolve to
+    // the actual function value, giving pointer-equal identity on return.
+    if let Some(sname) = self_name
+        && let Some(cap_idx) = capture_names.iter().position(|n| n.as_ref() == sname)
+    {
+        let cap_var = bound_params[cap_idx].1;
+        let deref_id = sub.fresh_var();
+        sub.emit(Inst::Deref(deref_id, cap_var));
+        sub.bind_local(Arc::from(sname), deref_id);
     }
 
     // User params (excluding captures) are the recur targets.
@@ -1514,6 +1529,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
         None,
         &body_forms,
         false,
+        None,
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1561,6 +1577,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 None,
                 &catch_body,
                 false,
+                None,
             )?;
             ctx.add_subfunction(catch_fn_ir);
             let dst = ctx.fresh_var();
@@ -1598,6 +1615,7 @@ fn lower_try(ctx: &mut LowerCtx, args: &[Form]) -> R {
                 None,
                 &fin_body,
                 false,
+                None,
             )?;
             ctx.add_subfunction(fin_fn_ir);
             let dst = ctx.fresh_var();
@@ -1694,6 +1712,7 @@ fn lower_binding(ctx: &mut LowerCtx, args: &[Form]) -> R {
         None,
         &args[1..],
         false,
+        None,
     )?;
     ctx.add_subfunction(body_fn_ir);
     let body_closure = ctx.fresh_var();
@@ -1842,6 +1861,7 @@ fn lower_with_out_str(ctx: &mut LowerCtx, body_forms: &[Form]) -> R {
         None,
         body_forms,
         false,
+        None,
     )?;
     ctx.add_subfunction(body_fn_ir);
 

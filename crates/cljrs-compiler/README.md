@@ -52,7 +52,7 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Constants:** `rt_const_nil`, `rt_const_true`, `rt_const_false`, `rt_const_long(i64)`, `rt_const_double(f64)`, `rt_const_char(u32)`, `rt_const_string(ptr, len)`, `rt_const_keyword(ptr, len)`, `rt_const_symbol(ptr, len)`.  nil, true/false, and longs in `0..1024` are interned once per process via `cljrs_gc::static_alloc` (program-lifetime, **not** GC-heap allocations — nothing traces the intern caches, so GC-managed entries would be swept after two collections and every compiled use would read freed memory; see `tests/interned_scalars.rs`)
 - **Truthiness:** `rt_truthiness(v) -> u8`
 - **Arithmetic:** `rt_add`, `rt_sub`, `rt_mul` (checked — throw on long overflow), `rt_div`, `rt_rem`, `rt_unchecked_add`, `rt_unchecked_sub`, `rt_unchecked_mul` (wrapping), `rt_overflow_error` (builds the integer-overflow exception for the unboxed checked-arithmetic codegen path)
-- **Comparison:** `rt_eq`, `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
+- **Comparison:** `rt_eq`, `rt_case_eq` (type-strict equality for `case` dispatch — `Long`/`BigInt` interchangeable, mixed numerics never equal), `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Primitive arrays:** `rt_alength(arr) -> i64`, `rt_aget_long(arr, i) -> i64`, `rt_aget_double(arr, i) -> f64` (unboxed element loads), `rt_aset_long`/`rt_aset_double` (unboxed stores), `rt_aget`/`rt_aset` (boxed fallback for unknown element types) — all bounds-checked, throwing on out-of-range / type mismatch
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
@@ -190,7 +190,7 @@ pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], form
 pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → ANF lower (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
 
 **Async activation (Phase H):** `compile_async_poll_fns` introspects the
 `^:async` fns the program defined (their `def` forms are evaluated into the
@@ -263,7 +263,24 @@ Detects four classes of no-gc memory-safety violations in IR functions:
 3. **LazySeqEscape** — lazy-producing call result is bound as an intermediate and returned unrealized.
 4. **EscapingClosure** — `AllocClosure` stored in a static container.
 
-Multi-file support: when the source file uses `(ns ... (:require [...]))`, the required namespaces are loaded during compilation. Their source files are discovered from `src_dirs`, bundled into the harness as builtin sources, and made available at runtime so the binary is self-contained.
+Multi-file support: when the source file uses `(ns ... (:require [...]))`, the
+required namespaces are loaded during compilation (discovered from `src_dirs`)
+and **each is AOT-compiled into the same object module** — not bundled as
+source and interpreted at startup. `lower_namespace` parses and macro-expands
+each required namespace, partitions its top-level forms into an interpreted
+preamble (`ns`/`require`, `defmacro`, protocol/multimethod forms) and a
+compilable body, and lowers the body to an `__cljrs_ns_init_<i>` function. The
+harness writes each namespace's preamble to `src/ns_<i>_preamble.cljrs`,
+declares its initializer `extern "C"`, and registers a `CompiledNsLoader`
+(`globals.register_compiled_ns_loader`) so that when `require` resolves the
+namespace at runtime, `cljrs_env::loader::do_load` runs the loader — evaluating
+the preamble, then calling the compiled initializer — instead of tree-walking
+source. Transitive `require`s resolve naturally: a namespace's preamble
+contains its own `ns`/`require` form, which triggers loading of its
+dependencies (each via its own compiled loader) before its initializer runs.
+Pinned *versioned* sources (`mylib@<sha>`) are the exception — they still embed
+as interpreted builtin source, since they resolve through the separate
+versioned loader rather than the plain `require` path.
 
 ---
 

@@ -15,6 +15,7 @@ cljrs-async    = { workspace = true }
 cljrs-io       = { workspace = true }
 cljrs-net      = { workspace = true }
 cljrs-charset  = { workspace = true }
+cljrs-base64   = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-types    = { workspace = true }

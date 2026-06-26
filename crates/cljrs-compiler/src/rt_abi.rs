@@ -718,6 +718,43 @@ pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value
     intern_bool(a == b)
 }
 
+/// Type-strict equality for the `case` macro: Long/BigInt are interchangeable;
+/// mixed numeric types (e.g. Long vs Double) are never equal; non-numeric types
+/// use regular structural equality.
+///
+/// # Safety
+/// Both pointers must be valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_case_eq(a: *const Value, b: *const Value) -> *const Value {
+    let a_val = unsafe { val_ref(a) };
+    let b_val = unsafe { val_ref(b) };
+    let a_bare = a_val.unwrap_meta();
+    let b_bare = b_val.unwrap_meta();
+    let result = match (a_bare, b_bare) {
+        // Long and BigInt are interchangeable in case (Clojure JVM behavior).
+        (Value::Long(_) | Value::BigInt(_), Value::Long(_) | Value::BigInt(_)) => a_val == b_val,
+        (Value::Double(_), Value::Double(_)) => a_val == b_val,
+        (Value::BigDecimal(_), Value::BigDecimal(_)) => a_val == b_val,
+        (Value::Ratio(_), Value::Ratio(_)) => a_val == b_val,
+        // Mixed numeric types are never equal in case dispatch.
+        (
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+            Value::Long(_)
+            | Value::BigInt(_)
+            | Value::Double(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_),
+        ) => false,
+        // Non-numeric types use regular equality.
+        _ => a_val == b_val,
+    };
+    intern_bool(result)
+}
+
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
@@ -4041,6 +4078,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_div as *const () as usize);
     std::hint::black_box(rt_rem as *const () as usize);
     std::hint::black_box(rt_eq as *const () as usize);
+    std::hint::black_box(rt_case_eq as *const () as usize);
     std::hint::black_box(rt_lt as *const () as usize);
     std::hint::black_box(rt_gt as *const () as usize);
     std::hint::black_box(rt_lte as *const () as usize);

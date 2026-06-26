@@ -156,6 +156,10 @@ and compiled tiers (Clojure primitive-long semantics); `UncheckedAdd`/
 family, plus `unchecked-inc`/`-dec`/`-negate` which lower to them).  `inc`/`dec`
 lower to checked `Add`/`Sub`.
 
+`CaseEq` is type-strict equality used by the `case` macro (`case=` builtin).
+Like Clojure's JVM semantics, `Long` and `BigInt` are interchangeable but mixed
+numeric types (`Long` vs `Double`) are never equal.  Always infers `Repr::Bool`.
+
 `Aget`/`Aset`/`Alength` are primitive array access.  On a `^longs`/`^doubles`
 operand (`Repr::LongArray`/`DoubleArray`) with an unboxed index, codegen loads/
 stores unboxed `i64`/`f64` elements; otherwise it uses a boxed bridge.  All

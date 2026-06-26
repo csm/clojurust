@@ -835,6 +835,7 @@ name = "cljrs-compiler"
 version = "0.1.0"
 dependencies = [
  "cljrs-async",
+ "cljrs-base64",
  "cljrs-builtins",
  "cljrs-charset",
  "cljrs-deps",
