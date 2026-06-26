@@ -465,6 +465,30 @@ Foundations already in place:
 
 ---
 
+## Phase 11.5 — AOT Clojure → WebAssembly backend
+
+Native-fast, sandbox-safe browser deployment. A *second* code-generation
+backend over the same regionalized `cljrs-ir` IR (parallel to Cranelift), since
+no in-sandbox native JIT is possible in a browser. Build-time AOT-wasm is the
+top tier; the IR interpreter stays on board as the dynamic-code tier (tiers
+invert vs. native). All upstream passes (ANF lowering, escape analysis, region
+inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
+
+- [x] Scaffold the backend: `cljrs-compiler/src/wasm/` (`mod`, `abi`, `reloop`, `emit`)
+- [x] ABI/region contract: `Value`→`i32` linear-memory offset; `rt_abi` import table; region handle as a hidden trailing `i32` param (mirrors `IrFunction::abi_param_count`)
+- [x] Relooper data model (`Structured`) + acyclic/diamond structuring (wasm-private; Cranelift keeps the raw CFG)
+- [ ] Relooper: dominator-based loop structuring (`recur` back-edges → `Loop`/`Continue`) and multi-predecessor join placement (labeled blocks)
+- [ ] `wasm-encoder` emitter: per-`Inst` lowering, SSA φ resolution to locals, `rt_abi` imports, scratch-array spilling for `Alloc*`
+- [ ] Region intrinsics in wasm: arena (`base/bump/limit`) in linear memory; `rt_region_*` threading; bump allocation into the caller's region
+- [ ] GC heap in linear memory (reuse the `wasm32-unknown-unknown` GC) + `rt_safepoint` at entry/back-edges
+- [ ] `recur` → `loop`/`br`; cross-function tail calls via the wasm tail-call proposal (`return_call`) or a trampoline
+- [ ] `try`/`catch`/`throw` via the wasm exception-handling proposal (or an `rt_abi` error path)
+- [ ] CLI: `cljrs compile <file> --target wasm -o <out>.wasm`; bundle with the runtime + IR interpreter
+- [ ] Wire the IR interpreter into the `cljrs-wasm` bundle as the dynamic-code tier (drop JIT/OSR hooks in-sandbox)
+- [ ] WasmGC (host-managed reference types) — deferred; keep the linear-memory GC for now
+
+---
+
 ## Phase 12 — REPL & Tooling
 
 - [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)

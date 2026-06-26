@@ -17,3 +17,4 @@ pub mod escape;
 pub mod ir;
 pub mod rt_abi;
 pub mod typeinfer;
+pub mod wasm;
