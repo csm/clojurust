@@ -47,17 +47,26 @@ allocation ports for free (a region-parameterised variant takes the handle as a
 hidden trailing `i32` param). The only new, wasm-specific work is the
 **relooper** (`reloop.rs`, recovering structured control flow — wasm-private,
 since Cranelift wants the raw CFG) and the `wasm-encoder` **emitter**
-(`emit.rs`). Current status: module structure, public API, the ABI/region
-contract, and the relooper's acyclic/diamond cases are implemented and tested;
-loops, multi-pred joins, and the encoder itself return `Unimplemented`/
-`Unsupported`.
+(`emit.rs`).
+
+The **relooper is complete for reducible CFGs** (the universal case for Clojure
+source): it implements Ramsey's *"Beyond Relooper"* dominator-tree structuring —
+straight-line code, `if`/`cond` diamonds, sequential and nested merges, and
+`loop`/`recur` loops with conditional exits. It exploits two facts: back edges
+are exactly `Terminator::RecurJump` (so loop headers are the `RecurJump`
+targets), and merge nodes (≥2 forward predecessors) are placed at their
+immediate dominator in ascending reverse-postorder so every `br` jumps forward.
+Irreducible control flow (which Clojure cannot produce) is rejected. Remaining
+work: the `wasm-encoder` emitter (the front half — reloop + signature + tree
+walk — is wired; encoding returns `Unimplemented`).
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
 pub struct WasmBackend { tail_calls: bool, exceptions: bool }
 pub enum WasmError { Reloop(RelooperError), Unsupported(String), Unimplemented(&'static str) }
 // abi:    WasmValType{I32,I64,F64}, RtImport, RT_IMPORTS, lookup(name)
-// reloop: Structured{Simple,Loop,If,Break,Continue,Return,Unreachable,Nil}, LabelId, reloop(func)
+// reloop: Structured{Simple,Labeled,Loop,If,Br,Return,Unreachable,Nil}, reloop(func)
+//         RelooperError{Empty,DanglingTarget,Irreducible}
 // emit:   emit_function(func, structured, cfg), function_signature(func)
 ```
 

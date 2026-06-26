@@ -477,7 +477,7 @@ inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
 - [x] Scaffold the backend: `cljrs-compiler/src/wasm/` (`mod`, `abi`, `reloop`, `emit`)
 - [x] ABI/region contract: `Value`→`i32` linear-memory offset; `rt_abi` import table; region handle as a hidden trailing `i32` param (mirrors `IrFunction::abi_param_count`)
 - [x] Relooper data model (`Structured`) + acyclic/diamond structuring (wasm-private; Cranelift keeps the raw CFG)
-- [ ] Relooper: dominator-based loop structuring (`recur` back-edges → `Loop`/`Continue`) and multi-predecessor join placement (labeled blocks)
+- [x] Relooper: full dominator-based structuring (Ramsey "Beyond Relooper") — `loop`/`recur` back-edges → `Loop`/`Br`-continue, multi-predecessor joins → dominator-placed labeled blocks in ascending RPO, irreducible CFGs rejected
 - [ ] `wasm-encoder` emitter: per-`Inst` lowering, SSA φ resolution to locals, `rt_abi` imports, scratch-array spilling for `Alloc*`
 - [ ] Region intrinsics in wasm: arena (`base/bump/limit`) in linear memory; `rt_region_*` threading; bump allocation into the caller's region
 - [ ] GC heap in linear memory (reuse the `wasm32-unknown-unknown` GC) + `rt_safepoint` at entry/back-edges

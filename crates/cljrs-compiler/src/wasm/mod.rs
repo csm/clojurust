@@ -40,20 +40,22 @@
 //!
 //! # What is new here (the only wasm-specific work)
 //!
-//! - [`reloop`] — recover structured control flow from the IR's arbitrary CFG.
-//!   wasm has only `block`/`loop`/`if` + labeled `br`, no `goto`.  Cranelift
-//!   wants the raw CFG, so this pass is wasm-private and lives *here*, not in
-//!   shared lowering.  Clojure source yields reducible CFGs, so only the cheap
-//!   relooper is required (no node-splitting, no dispatch variable).
+//! - [`reloop`] — recover structured control flow from the IR's arbitrary CFG
+//!   via dominator-tree structuring (Ramsey's "Beyond Relooper").  wasm has only
+//!   `block`/`loop`/`if` + labeled `br`, no `goto`.  Cranelift wants the raw
+//!   CFG, so this pass is wasm-private and lives *here*, not in shared lowering.
+//!   Clojure source yields reducible CFGs, so only the cheap relooper is
+//!   required (no node-splitting, no dispatch variable).
 //! - [`emit`] — walk the structured tree + per-`Inst` lowering to a
 //!   `wasm-encoder` module, with `rt_abi` symbols declared as wasm imports.
 //!
 //! # Status
 //!
-//! **Scaffold.**  The module structure, public API, the relooper data model
-//! (with trivial cases implemented), and the full ABI/region contract are in
-//! place.  The `wasm-encoder` emitter and the relooper's loop/join structuring
-//! are stubbed and return [`WasmError::Unimplemented`].
+//! **Scaffold.**  The module structure, public API, the full ABI/region
+//! contract, and the [`reloop`] relooper (complete for reducible CFGs —
+//! straight-line, `if`/`cond` diamonds, sequential/nested merges, and
+//! `loop`/`recur` loops) are in place.  The `wasm-encoder` emitter is stubbed
+//! and returns [`WasmError::Unimplemented`].
 
 pub mod abi;
 pub mod emit;

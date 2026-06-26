@@ -119,25 +119,20 @@ pub fn function_signature(func: &IrFunction) -> (Vec<WasmValType>, Vec<WasmValTy
 fn walk(node: &Structured) -> Result<(), WasmError> {
     match node {
         Structured::Simple { next, .. } => walk(next),
-        Structured::If {
-            then_arm,
-            else_arm,
-            next,
-            ..
-        } => {
-            walk(then_arm)?;
-            walk(else_arm)?;
-            walk(next)
-        }
-        Structured::Loop { body, next, .. } => {
+        Structured::Labeled { body, next, .. } => {
             walk(body)?;
             walk(next)
         }
-        Structured::Break(_)
-        | Structured::Continue(_)
-        | Structured::Return(_)
-        | Structured::Unreachable
-        | Structured::Nil => Ok(()),
+        Structured::If {
+            then_arm, else_arm, ..
+        } => {
+            walk(then_arm)?;
+            walk(else_arm)
+        }
+        Structured::Loop { body, .. } => walk(body),
+        Structured::Br(_) | Structured::Return(_) | Structured::Unreachable | Structured::Nil => {
+            Ok(())
+        }
     }
 }
 

@@ -9,82 +9,94 @@
 //! and would be pessimized by re-structuring, so this lives in the wasm backend
 //! rather than in shared lowering.
 //!
-//! # Why the cheap relooper suffices
+//! # Algorithm
 //!
-//! Clojure has no `goto`.  `loop`/`recur` produces reducible loop headers (the
-//! IR models these as [`Terminator::RecurJump`] back-edges to a loop header),
-//! and `if`/`cond`/`do` produce structured branches.  Inlining preserves
-//! reducibility.  So every CFG this backend sees is reducible, which means the
-//! relooper never needs node-splitting or a dispatch variable — the structure
-//! recovers directly from the dominator tree / back-edge set.
+//! This implements the dominator-tree structuring of Norman Ramsey's *"Beyond
+//! Relooper: Recursive Translation of Unstructured Control Flow to Structured
+//! Control Flow"* (ICFP 2022), specialized to the two facts that hold for every
+//! CFG this backend sees:
 //!
-//! # Algorithm (target shape)
+//! - **Back edges are exactly [`Terminator::RecurJump`].**  Clojure has no
+//!   `goto`; the only cyclic control flow is `loop`/`recur`, which lowering
+//!   emits as a `RecurJump` to the loop header.  So loop headers are precisely
+//!   the `RecurJump` targets, and every `Jump`/`Branch` edge is forward.
+//! - **The CFG is reducible.**  Structured source + reducible-preserving
+//!   inlining can't manufacture irreducibility, so the relooper never needs
+//!   node-splitting or a dispatch variable.
 //!
-//! Standard reducible-CFG structuring:
+//! The translation is driven by the dominator tree:
 //!
-//! 1. Compute reverse-postorder (RPO) and the dominator tree.
-//! 2. A back-edge `b → h` (where `h` dominates `b`) marks `h` as a loop header;
-//!    wrap the region in a [`Structured::Loop`] whose label a `RecurJump`
-//!    lowers to [`Structured::Continue`].
-//! 3. A two-way [`Terminator::Branch`] becomes [`Structured::If`]; control
-//!    re-merges at the branch's immediate post-dominator, which becomes the
-//!    `If`'s `next` continuation.
-//! 4. A forward edge to a multi-predecessor join lowers to a `br` out of an
-//!    enclosing labeled [`Structured::Block`] whose end is that join.
+//! - A node `X` is translated by [`Relooper::do_tree`].  If `X` is a loop
+//!   header it is wrapped in a [`Structured::Loop`]; a back edge to `X` becomes
+//!   a `br`(continue) to that loop's label.
+//! - A **merge node** (≥2 *forward* predecessors) cannot be inlined at a single
+//!   branch, so it is emitted once, after the code that branches to it, wrapped
+//!   in a labeled [`Structured::Labeled`] block placed at its immediate
+//!   dominator.  Branches to it become `br`(break) to that block's label.
+//! - Merge children of one node are nested in **ascending reverse-postorder**
+//!   (largest RPO outermost), which guarantees every `br` jumps *forward* out of
+//!   enclosing blocks — the only thing wasm permits.
+//! - Any other forward edge targets a node with a single forward predecessor,
+//!   so it is **inlined** directly ([`Relooper::do_branch`]).
+//!
+//! Each block is therefore emitted exactly once: merge nodes via their dominator
+//! [`Structured::Labeled`], every other reachable node by inlining.
 //!
 //! # Status
 //!
-//! **Scaffold.**  The data model is final.  [`reloop`] implements the acyclic
-//! single-successor, return, and simple re-joining diamond cases; loops,
-//! multi-predecessor joins, and `try`/`catch` regions return
-//! [`RelooperError::Unsupported`], with the dominator-based structuring left as
-//! the documented next step.
+//! Implemented for reducible CFGs (the universal case here): straight-line code,
+//! `if`/`cond` diamonds, sequential and nested merges, and `loop`/`recur` loops
+//! including loops with conditional exits.  A forward edge that is actually a
+//! back edge in reverse-postorder (the signature of irreducible control flow)
+//! returns [`RelooperError::Irreducible`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::{Block, BlockId, IrFunction, Terminator, VarId};
 
-/// A label naming an enclosing structured construct, targeted by `br`/continue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LabelId(pub u32);
-
 /// A structured control-flow tree — the relooper's output and the emitter's
-/// input.  Each node maps to a small, fixed wasm shape.
-///
-/// `If` and `Loop` carry an explicit `next` continuation (the code that runs
-/// after the construct), so the tree is a single spine with no implicit merge
-/// blocks for the emitter to rediscover.
+/// input.  Each node maps to a small, fixed wasm shape.  `br` targets are block
+/// ids; the emitter resolves them to `br` depths from its label stack while
+/// walking (a forward target is an enclosing [`Structured::Labeled`]; a backward
+/// target is an enclosing [`Structured::Loop`]).
 #[derive(Debug, Clone)]
 pub enum Structured {
-    /// Emit one IR block's straight-line body (`phis` + `insts`), then `next`.
-    /// The block's own terminator is represented by the surrounding nodes.
+    /// Emit one IR block's straight-line body (`phis` + `insts`), then `next`
+    /// (the translation of its terminator).  The block's own terminator is
+    /// represented by the surrounding nodes, never re-emitted here.
     Simple {
         block: BlockId,
         next: Box<Structured>,
     },
-    /// A reducible loop (`wasm loop`).  A [`Terminator::RecurJump`] to `header`
-    /// lowers to [`Structured::Continue`] of `label`; falling off `body` exits
-    /// the loop and runs `next`.
-    Loop {
-        label: LabelId,
-        header: BlockId,
+    /// A labeled `block` construct: a `br`(break) to `label` exits to `next`.
+    /// Used to place a forward merge node `label` after the `body` that branches
+    /// to it.  `label` is the merge block's id; `next` is its translation.
+    Labeled {
+        label: BlockId,
         body: Box<Structured>,
         next: Box<Structured>,
     },
-    /// Structured two-way branch from a [`Terminator::Branch`].  `then_arm` and
-    /// `else_arm` are the arm bodies (ending in `Nil` at the merge); `next` is
-    /// the post-dominator continuation that runs after either arm.
+    /// A `loop` construct headed by `header`.  A `br`(continue) to `header`
+    /// re-enters the loop; falling off the end of `body` exits it (wasm `loop`
+    /// only repeats on an explicit back-`br`).
+    Loop {
+        header: BlockId,
+        body: Box<Structured>,
+    },
+    /// Structured two-way branch.  The arms are self-contained — each ends in a
+    /// `Br`, `Return`, `Unreachable`, or an inlined subtree — so there is no
+    /// fall-through merge here; a re-joining merge is handled by an enclosing
+    /// [`Structured::Labeled`].
     If {
         cond: VarId,
         then_arm: Box<Structured>,
         else_arm: Box<Structured>,
-        next: Box<Structured>,
     },
-    /// `br` to the end of the labeled enclosing block (exit a join region).
-    Break(LabelId),
-    /// `br` to the top of the labeled enclosing loop (a `recur`).
-    Continue(LabelId),
-    /// Function return of a value.
+    /// `br` to `target`: a forward break to an enclosing labeled block, or a
+    /// backward continue to an enclosing loop header.  The emitter distinguishes
+    /// the two by which construct in its label stack carries `target`.
+    Br(BlockId),
+    /// Return a value from the function.
     Return(VarId),
     /// Unreachable terminator (e.g. after `throw`).
     Unreachable,
@@ -97,15 +109,25 @@ pub enum Structured {
 pub enum RelooperError {
     /// The function has no blocks.
     Empty,
-    /// A control-flow shape the scaffold does not structure yet.
-    Unsupported(String),
+    /// A terminator referenced a block not present in the function.
+    DanglingTarget(BlockId),
+    /// A forward (`Jump`/`Branch`) edge runs backward in reverse-postorder —
+    /// the signature of irreducible control flow, which this backend does not
+    /// support (and which Clojure source cannot produce).
+    Irreducible { from: BlockId, to: BlockId },
 }
 
 impl std::fmt::Display for RelooperError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RelooperError::Empty => write!(f, "function has no blocks"),
-            RelooperError::Unsupported(what) => write!(f, "unsupported control flow: {what}"),
+            RelooperError::DanglingTarget(b) => write!(f, "terminator targets missing block {b}"),
+            RelooperError::Irreducible { from, to } => {
+                write!(
+                    f,
+                    "irreducible control flow: forward edge {from} -> {to} runs backward"
+                )
+            }
         }
     }
 }
@@ -115,67 +137,202 @@ pub fn reloop(func: &IrFunction) -> Result<Structured, RelooperError> {
     if func.blocks.is_empty() {
         return Err(RelooperError::Empty);
     }
-    let cfg = Cfg::new(func);
-    if cfg.has_back_edges() {
-        // Loop structuring (dominator tree + back-edge detection) is the
-        // documented next step; the data model already has `Loop`/`Continue`.
-        return Err(RelooperError::Unsupported(
-            "loops (recur back-edges) — needs dominator-based loop structuring".into(),
-        ));
-    }
-    let entry = func.blocks[0].id;
-    structure_acyclic(&cfg, entry)
+    let r = Relooper::analyze(func)?;
+    r.do_tree(r.entry)
 }
 
-/// A lightweight CFG view over an [`IrFunction`]: block index + predecessor map
-/// keyed by [`BlockId`].
-struct Cfg<'f> {
+// ── Analysis ─────────────────────────────────────────────────────────────────
+
+/// Dominator-tree analysis plus the structuring recursion over one
+/// [`IrFunction`].
+struct Relooper<'f> {
     func: &'f IrFunction,
+    entry: BlockId,
     index: HashMap<BlockId, usize>,
-    preds: HashMap<BlockId, Vec<BlockId>>,
+    /// Reverse-postorder rank; smaller is closer to the entry.  Only reachable
+    /// blocks appear.
+    rpo_num: HashMap<BlockId, u32>,
+    /// Number of *forward* (non-`RecurJump`) predecessors of each block.
+    forward_preds: HashMap<BlockId, usize>,
+    /// Loop headers: the set of `RecurJump` targets.
+    loop_headers: HashSet<BlockId>,
+    /// For each block, its dominator-tree children that are merge nodes, sorted
+    /// by ascending `rpo_num` (largest RPO last → outermost block).
+    merge_children: HashMap<BlockId, Vec<BlockId>>,
 }
 
-impl<'f> Cfg<'f> {
-    fn new(func: &'f IrFunction) -> Self {
+impl<'f> Relooper<'f> {
+    fn analyze(func: &'f IrFunction) -> Result<Self, RelooperError> {
+        let entry = func.blocks[0].id;
         let mut index = HashMap::new();
-        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         for (i, b) in func.blocks.iter().enumerate() {
             index.insert(b.id, i);
-            preds.entry(b.id).or_default();
         }
+
+        // Validate all terminator targets exist up front.
         for b in &func.blocks {
             for s in successors(&b.terminator) {
-                preds.entry(s).or_default().push(b.id);
+                if !index.contains_key(&s) {
+                    return Err(RelooperError::DanglingTarget(s));
+                }
             }
         }
-        Cfg { func, index, preds }
+
+        // Reverse postorder over all edges (back edges included; DFS handles
+        // the cycles via the visited set).
+        let post = postorder(func, entry, &index);
+        let mut rpo_num = HashMap::new();
+        for (rank, id) in post.iter().rev().enumerate() {
+            rpo_num.insert(*id, rank as u32);
+        }
+
+        // Predecessors (all edges) for the dominator fixpoint.
+        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        // Forward-only predecessor counts + loop headers.
+        let mut forward_preds: HashMap<BlockId, usize> = HashMap::new();
+        let mut loop_headers = HashSet::new();
+        for b in &func.blocks {
+            match &b.terminator {
+                Terminator::RecurJump { target, .. } => {
+                    preds.entry(*target).or_default().push(b.id);
+                    loop_headers.insert(*target);
+                }
+                term => {
+                    for s in successors(term) {
+                        preds.entry(s).or_default().push(b.id);
+                        *forward_preds.entry(s).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        let idom = dominators(entry, &post, &rpo_num, &preds);
+
+        // Group merge nodes under their immediate dominator, ascending RPO.
+        let mut merge_children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for b in &func.blocks {
+            let id = b.id;
+            if id == entry || !rpo_num.contains_key(&id) {
+                continue;
+            }
+            if forward_preds.get(&id).copied().unwrap_or(0) >= 2
+                && let Some(&d) = idom.get(&id)
+            {
+                merge_children.entry(d).or_default().push(id);
+            }
+        }
+        for kids in merge_children.values_mut() {
+            kids.sort_by_key(|k| rpo_num[k]);
+        }
+
+        Ok(Relooper {
+            func,
+            entry,
+            index,
+            rpo_num,
+            forward_preds,
+            loop_headers,
+            merge_children,
+        })
     }
 
     fn block(&self, id: BlockId) -> &'f Block {
         &self.func.blocks[self.index[&id]]
     }
 
-    fn pred_count(&self, id: BlockId) -> usize {
-        self.preds.get(&id).map(|p| p.len()).unwrap_or(0)
+    fn is_merge(&self, id: BlockId) -> bool {
+        self.forward_preds.get(&id).copied().unwrap_or(0) >= 2
     }
 
-    /// A back-edge is a `RecurJump`, or a successor that is not later than its
-    /// source in block order.  Reducible Clojure CFGs place loop headers before
-    /// their back-edges, so block-order comparison detects them.
-    fn has_back_edges(&self) -> bool {
-        self.func.blocks.iter().any(|b| {
-            if matches!(b.terminator, Terminator::RecurJump { .. }) {
-                return true;
-            }
-            let src = self.index[&b.id];
-            successors(&b.terminator)
-                .into_iter()
-                .any(|s| self.index[&s] <= src)
+    // ── Structuring recursion ────────────────────────────────────────────────
+
+    /// Translate the subtree rooted at `x`, wrapping it in a [`Structured::Loop`]
+    /// if `x` is a loop header.
+    fn do_tree(&self, x: BlockId) -> Result<Structured, RelooperError> {
+        let empty = Vec::new();
+        let merges = self.merge_children.get(&x).unwrap_or(&empty);
+        let inner = self.node_within(x, merges)?;
+        if self.loop_headers.contains(&x) {
+            Ok(Structured::Loop {
+                header: x,
+                body: Box::new(inner),
+            })
+        } else {
+            Ok(inner)
+        }
+    }
+
+    /// Place `x`'s merge children as nested labeled blocks (largest RPO
+    /// outermost), with `x`'s own code innermost.
+    fn node_within(&self, x: BlockId, merges: &[BlockId]) -> Result<Structured, RelooperError> {
+        if let Some((&outer, rest)) = merges.split_last() {
+            let body = self.node_within(x, rest)?;
+            let next = self.do_tree(outer)?;
+            Ok(Structured::Labeled {
+                label: outer,
+                body: Box::new(body),
+                next: Box::new(next),
+            })
+        } else {
+            self.code_for(x)
+        }
+    }
+
+    /// Emit `x`'s straight-line body followed by the translation of its
+    /// terminator.
+    fn code_for(&self, x: BlockId) -> Result<Structured, RelooperError> {
+        let term = self.translate_terminator(x)?;
+        Ok(Structured::Simple {
+            block: x,
+            next: Box::new(term),
         })
+    }
+
+    fn translate_terminator(&self, x: BlockId) -> Result<Structured, RelooperError> {
+        match &self.block(x).terminator {
+            Terminator::Return(v) => Ok(Structured::Return(*v)),
+            Terminator::Unreachable => Ok(Structured::Unreachable),
+            Terminator::Jump(t) => self.do_branch(x, *t),
+            Terminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let then_arm = self.do_branch(x, *then_block)?;
+                let else_arm = self.do_branch(x, *else_block)?;
+                Ok(Structured::If {
+                    cond: *cond,
+                    then_arm: Box::new(then_arm),
+                    else_arm: Box::new(else_arm),
+                })
+            }
+            // The only back edge: continue to the loop header.
+            Terminator::RecurJump { target, .. } => Ok(Structured::Br(*target)),
+        }
+    }
+
+    /// Translate a forward edge `source -> target`: `br` to a merge node (placed
+    /// by an enclosing labeled block), otherwise inline the target's subtree.
+    fn do_branch(&self, source: BlockId, target: BlockId) -> Result<Structured, RelooperError> {
+        // A forward edge must increase RPO; if it doesn't, the CFG is
+        // irreducible (and not something Clojure source can produce).
+        if self.rpo_num[&target] <= self.rpo_num[&source] {
+            return Err(RelooperError::Irreducible {
+                from: source,
+                to: target,
+            });
+        }
+        if self.is_merge(target) {
+            Ok(Structured::Br(target))
+        } else {
+            self.do_tree(target)
+        }
     }
 }
 
-/// Successor block ids of a terminator.
+// ── CFG helpers ──────────────────────────────────────────────────────────────
+
+/// Successor block ids of a terminator (in branch order).
 fn successors(term: &Terminator) -> Vec<BlockId> {
     match term {
         Terminator::Jump(t) => vec![*t],
@@ -189,77 +346,81 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
     }
 }
 
-/// Structure an acyclic region rooted at `block`: emit the block body, then
-/// recurse on its terminator.  Handles single-successor chains, returns, and
-/// simple re-joining diamonds; bails on multi-predecessor joins it cannot yet
-/// place behind a block label.
-fn structure_acyclic(cfg: &Cfg, block: BlockId) -> Result<Structured, RelooperError> {
-    let tail = match &cfg.block(block).terminator {
-        Terminator::Return(v) => Structured::Return(*v),
-        Terminator::Unreachable => Structured::Unreachable,
-        Terminator::Jump(t) => {
-            if cfg.pred_count(*t) > 1 {
-                return Err(RelooperError::Unsupported(
-                    "forward edge into a multi-predecessor join — needs block-label placement"
-                        .into(),
-                ));
+/// Iterative DFS postorder from `entry` over all edges.
+fn postorder(func: &IrFunction, entry: BlockId, index: &HashMap<BlockId, usize>) -> Vec<BlockId> {
+    let mut visited = HashSet::new();
+    let mut post = Vec::new();
+    let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+    visited.insert(entry);
+    while let Some(&(b, child)) = stack.last() {
+        let succs = successors(&func.blocks[index[&b]].terminator);
+        if child < succs.len() {
+            stack.last_mut().unwrap().1 += 1;
+            let s = succs[child];
+            if visited.insert(s) {
+                stack.push((s, 0));
             }
-            structure_acyclic(cfg, *t)?
+        } else {
+            post.push(b);
+            stack.pop();
         }
-        Terminator::Branch {
-            cond,
-            then_block,
-            else_block,
-        } => structure_diamond(cfg, *cond, *then_block, *else_block)?,
-        Terminator::RecurJump { .. } => {
-            return Err(RelooperError::Unsupported(
-                "recur outside a structured loop".into(),
-            ));
-        }
-    };
-    Ok(Structured::Simple {
-        block,
-        next: Box::new(tail),
-    })
+    }
+    post
 }
 
-/// Structure a `Branch` whose arms re-merge at a common post-dominator (the
-/// classic if/else diamond): each arm is a single block that jumps to the same
-/// merge block.  The merge becomes the `If`'s `next` continuation.
-fn structure_diamond(
-    cfg: &Cfg,
-    cond: VarId,
-    then_block: BlockId,
-    else_block: BlockId,
-) -> Result<Structured, RelooperError> {
-    let then_succ = successors(&cfg.block(then_block).terminator);
-    let else_succ = successors(&cfg.block(else_block).terminator);
+/// Cooper–Harvey–Kennedy iterative dominators.  Returns `idom` for every
+/// reachable block (`entry` maps to itself).
+fn dominators(
+    entry: BlockId,
+    post: &[BlockId],
+    rpo_num: &HashMap<BlockId, u32>,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> HashMap<BlockId, BlockId> {
+    let mut idom: HashMap<BlockId, BlockId> = HashMap::new();
+    idom.insert(entry, entry);
 
-    if let ([then_merge], [else_merge]) = (then_succ.as_slice(), else_succ.as_slice())
-        && then_merge == else_merge
-        && cfg.pred_count(then_block) == 1
-        && cfg.pred_count(else_block) == 1
-    {
-        let then_arm = Structured::Simple {
-            block: then_block,
-            next: Box::new(Structured::Nil),
-        };
-        let else_arm = Structured::Simple {
-            block: else_block,
-            next: Box::new(Structured::Nil),
-        };
-        let merge = structure_acyclic(cfg, *then_merge)?;
-        return Ok(Structured::If {
-            cond,
-            then_arm: Box::new(then_arm),
-            else_arm: Box::new(else_arm),
-            next: Box::new(merge),
-        });
+    // Reverse postorder, skipping the entry.
+    let rpo: Vec<BlockId> = post.iter().rev().copied().collect();
+
+    let intersect = |idom: &HashMap<BlockId, BlockId>, mut a: BlockId, mut b: BlockId| -> BlockId {
+        while a != b {
+            while rpo_num[&a] > rpo_num[&b] {
+                a = idom[&a];
+            }
+            while rpo_num[&b] > rpo_num[&a] {
+                b = idom[&b];
+            }
+        }
+        a
+    };
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &rpo {
+            if b == entry {
+                continue;
+            }
+            let empty = Vec::new();
+            let mut new_idom: Option<BlockId> = None;
+            for &p in preds.get(&b).unwrap_or(&empty) {
+                if !idom.contains_key(&p) {
+                    continue; // predecessor not yet processed
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => intersect(&idom, p, cur),
+                });
+            }
+            if let Some(ni) = new_idom
+                && idom.get(&b) != Some(&ni)
+            {
+                idom.insert(b, ni);
+                changed = true;
+            }
+        }
     }
-
-    Err(RelooperError::Unsupported(
-        "branch arms do not form a simple re-joining diamond yet".into(),
-    ))
+    idom
 }
 
 #[cfg(test)]
@@ -268,17 +429,97 @@ mod tests {
     use crate::ir::{Const, Inst, KnownFn};
     use std::sync::Arc;
 
-    fn ret_const(name: &str) -> IrFunction {
-        let mut f = IrFunction::new(Some(Arc::from(name)), None);
-        let v = f.fresh_var();
-        let b = f.fresh_block();
-        f.blocks.push(Block {
-            id: b,
-            phis: vec![],
-            insts: vec![Inst::Const(v, Const::Long(7))],
-            terminator: Terminator::Return(v),
-        });
-        f
+    /// Builder that pushes blocks in id order for terse test CFGs.
+    struct Fb {
+        f: IrFunction,
+    }
+    impl Fb {
+        fn new() -> Self {
+            Fb {
+                f: IrFunction::new(Some(Arc::from("t")), None),
+            }
+        }
+        fn var(&mut self) -> VarId {
+            self.f.fresh_var()
+        }
+        fn blk(&mut self) -> BlockId {
+            self.f.fresh_block()
+        }
+        fn push(&mut self, id: BlockId, insts: Vec<Inst>, term: Terminator) {
+            self.f.blocks.push(Block {
+                id,
+                phis: vec![],
+                insts,
+                terminator: term,
+            });
+        }
+    }
+
+    /// Collect every `Simple{block}` id, in emission order, to check coverage.
+    fn simple_blocks(s: &Structured, out: &mut Vec<BlockId>) {
+        match s {
+            Structured::Simple { block, next } => {
+                out.push(*block);
+                simple_blocks(next, out);
+            }
+            Structured::Labeled { body, next, .. } => {
+                simple_blocks(body, out);
+                simple_blocks(next, out);
+            }
+            Structured::Loop { body, .. } => simple_blocks(body, out),
+            Structured::If {
+                then_arm, else_arm, ..
+            } => {
+                simple_blocks(then_arm, out);
+                simple_blocks(else_arm, out);
+            }
+            Structured::Br(_)
+            | Structured::Return(_)
+            | Structured::Unreachable
+            | Structured::Nil => {}
+        }
+    }
+
+    fn br_targets(s: &Structured, out: &mut Vec<BlockId>) {
+        match s {
+            Structured::Br(t) => out.push(*t),
+            Structured::Simple { next, .. } => br_targets(next, out),
+            Structured::Labeled { body, next, .. } => {
+                br_targets(body, out);
+                br_targets(next, out);
+            }
+            Structured::Loop { body, .. } => br_targets(body, out),
+            Structured::If {
+                then_arm, else_arm, ..
+            } => {
+                br_targets(then_arm, out);
+                br_targets(else_arm, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn has_loop(s: &Structured) -> bool {
+        match s {
+            Structured::Loop { .. } => true,
+            Structured::Simple { next, .. } => has_loop(next),
+            Structured::Labeled { body, next, .. } => has_loop(body) || has_loop(next),
+            Structured::If {
+                then_arm, else_arm, ..
+            } => has_loop(then_arm) || has_loop(else_arm),
+            _ => false,
+        }
+    }
+
+    /// Assert each block appears exactly once as a `Simple`.
+    fn assert_each_block_once(f: &IrFunction, s: &Structured) {
+        let mut got = Vec::new();
+        simple_blocks(s, &mut got);
+        let mut ids: Vec<u32> = f.blocks.iter().map(|b| b.id.0).collect();
+        ids.sort_unstable();
+        let mut got_ids: Vec<u32> = got.iter().map(|b| b.0).collect();
+        got_ids.sort_unstable();
+        assert_eq!(got_ids, ids, "every block emitted exactly once");
     }
 
     #[test]
@@ -288,104 +529,175 @@ mod tests {
     }
 
     #[test]
-    fn single_return_block_structures() {
-        let f = ret_const("k");
-        match reloop(&f).expect("structure single return") {
+    fn single_return_block() {
+        let mut b = Fb::new();
+        let v = b.var();
+        let b0 = b.blk();
+        b.push(
+            b0,
+            vec![Inst::Const(v, Const::Long(7))],
+            Terminator::Return(v),
+        );
+        let s = reloop(&b.f).unwrap();
+        assert_each_block_once(&b.f, &s);
+        match s {
             Structured::Simple { next, .. } => assert!(matches!(*next, Structured::Return(_))),
             other => panic!("expected Simple -> Return, got {other:?}"),
         }
     }
 
     #[test]
-    fn linear_jump_chain_structures() {
-        let mut f = IrFunction::new(Some(Arc::from("chain")), None);
-        let v = f.fresh_var();
-        let b0 = f.fresh_block();
-        let b1 = f.fresh_block();
-        f.blocks.push(Block {
-            id: b0,
-            phis: vec![],
-            insts: vec![Inst::Const(v, Const::Long(1))],
-            terminator: Terminator::Jump(b1),
-        });
-        f.blocks.push(Block {
-            id: b1,
-            phis: vec![],
-            insts: vec![],
-            terminator: Terminator::Return(v),
-        });
-        assert!(reloop(&f).is_ok());
+    fn linear_chain() {
+        let mut b = Fb::new();
+        let v = b.var();
+        let b0 = b.blk();
+        let b1 = b.blk();
+        b.push(
+            b0,
+            vec![Inst::Const(v, Const::Long(1))],
+            Terminator::Jump(b1),
+        );
+        b.push(b1, vec![], Terminator::Return(v));
+        let s = reloop(&b.f).unwrap();
+        assert_each_block_once(&b.f, &s);
+        // No merge (b1 has one forward pred) → inlined, no Labeled.
+        assert!(!matches!(s, Structured::Labeled { .. }));
     }
 
     #[test]
-    fn simple_diamond_structures_to_if() {
+    fn diamond_places_merge_in_labeled_block() {
         // b0: branch -> b1 / b2 ; b1 -> b3 ; b2 -> b3 ; b3: return
-        let mut f = IrFunction::new(Some(Arc::from("diamond")), None);
-        let c = f.fresh_var();
-        let v = f.fresh_var();
-        let b0 = f.fresh_block();
-        let b1 = f.fresh_block();
-        let b2 = f.fresh_block();
-        let b3 = f.fresh_block();
-        f.blocks.push(Block {
-            id: b0,
-            phis: vec![],
-            insts: vec![Inst::CallKnown(c, KnownFn::IsNil, vec![])],
-            terminator: Terminator::Branch {
+        let mut b = Fb::new();
+        let c = b.var();
+        let v = b.var();
+        let (b0, b1, b2, b3) = (b.blk(), b.blk(), b.blk(), b.blk());
+        b.push(
+            b0,
+            vec![Inst::CallKnown(c, KnownFn::IsNil, vec![])],
+            Terminator::Branch {
                 cond: c,
                 then_block: b1,
                 else_block: b2,
             },
-        });
-        for b in [b1, b2] {
-            f.blocks.push(Block {
-                id: b,
-                phis: vec![],
-                insts: vec![],
-                terminator: Terminator::Jump(b3),
-            });
-        }
-        f.blocks.push(Block {
-            id: b3,
-            phis: vec![],
-            insts: vec![Inst::Const(v, Const::Nil)],
-            terminator: Terminator::Return(v),
-        });
+        );
+        b.push(b1, vec![], Terminator::Jump(b3));
+        b.push(b2, vec![], Terminator::Jump(b3));
+        b.push(b3, vec![Inst::Const(v, Const::Nil)], Terminator::Return(v));
 
-        match reloop(&f).expect("structure diamond") {
-            Structured::Simple { next, .. } => assert!(
-                matches!(*next, Structured::If { .. }),
-                "entry block should be followed by an If"
-            ),
-            other => panic!("expected Simple -> If, got {other:?}"),
+        let s = reloop(&b.f).unwrap();
+        assert_each_block_once(&b.f, &s);
+
+        // Top is a labeled block for the merge b3.
+        match &s {
+            Structured::Labeled { label, body, next } => {
+                assert_eq!(*label, b3);
+                // body holds b0 + the If; both arms br to b3.
+                let mut targets = Vec::new();
+                br_targets(body, &mut targets);
+                assert_eq!(targets, vec![b3, b3]);
+                // next is the merge block's own code, ending in Return.
+                let mut merge_blocks = Vec::new();
+                simple_blocks(next, &mut merge_blocks);
+                assert_eq!(merge_blocks, vec![b3]);
+            }
+            other => panic!("expected Labeled(merge), got {other:?}"),
         }
     }
 
     #[test]
-    fn loops_are_unsupported_for_now() {
-        let mut f = IrFunction::new(Some(Arc::from("loopy")), None);
-        let c = f.fresh_var();
-        let b0 = f.fresh_block();
-        let b1 = f.fresh_block();
-        f.blocks.push(Block {
-            id: b0,
-            phis: vec![],
-            insts: vec![Inst::CallKnown(c, KnownFn::IsNil, vec![])],
-            terminator: Terminator::Branch {
+    fn loop_with_conditional_exit() {
+        // b0: header; branch -> b1 (body) / b2 (exit)
+        // b1: recur back to b0
+        // b2: return
+        let mut b = Fb::new();
+        let c = b.var();
+        let v = b.var();
+        let (b0, b1, b2) = (b.blk(), b.blk(), b.blk());
+        b.push(
+            b0,
+            vec![Inst::CallKnown(c, KnownFn::IsNil, vec![])],
+            Terminator::Branch {
                 cond: c,
                 then_block: b1,
-                else_block: b1,
+                else_block: b2,
             },
-        });
-        f.blocks.push(Block {
-            id: b1,
-            phis: vec![],
-            insts: vec![],
-            terminator: Terminator::RecurJump {
+        );
+        b.push(
+            b1,
+            vec![],
+            Terminator::RecurJump {
                 target: b0,
                 args: vec![],
             },
-        });
-        assert!(matches!(reloop(&f), Err(RelooperError::Unsupported(_))));
+        );
+        b.push(b2, vec![Inst::Const(v, Const::Nil)], Terminator::Return(v));
+
+        let s = reloop(&b.f).unwrap();
+        assert_each_block_once(&b.f, &s);
+        assert!(has_loop(&s), "header should be wrapped in a Loop");
+
+        // The recur in b1 becomes a continue (br) to the header b0.
+        let mut targets = Vec::new();
+        br_targets(&s, &mut targets);
+        assert!(targets.contains(&b0), "recur should br to the loop header");
+    }
+
+    #[test]
+    fn nested_sequential_merges() {
+        // Two diamonds in series: b0?->(b1,b2)->b3?->(b4,b5)->b6
+        let mut b = Fb::new();
+        let c0 = b.var();
+        let c3 = b.var();
+        let v = b.var();
+        let (b0, b1, b2, b3, b4, b5, b6) = (
+            b.blk(),
+            b.blk(),
+            b.blk(),
+            b.blk(),
+            b.blk(),
+            b.blk(),
+            b.blk(),
+        );
+        b.push(
+            b0,
+            vec![Inst::CallKnown(c0, KnownFn::IsNil, vec![])],
+            Terminator::Branch {
+                cond: c0,
+                then_block: b1,
+                else_block: b2,
+            },
+        );
+        b.push(b1, vec![], Terminator::Jump(b3));
+        b.push(b2, vec![], Terminator::Jump(b3));
+        b.push(
+            b3,
+            vec![Inst::CallKnown(c3, KnownFn::IsNil, vec![])],
+            Terminator::Branch {
+                cond: c3,
+                then_block: b4,
+                else_block: b5,
+            },
+        );
+        b.push(b4, vec![], Terminator::Jump(b6));
+        b.push(b5, vec![], Terminator::Jump(b6));
+        b.push(b6, vec![Inst::Const(v, Const::Nil)], Terminator::Return(v));
+
+        let s = reloop(&b.f).unwrap();
+        assert_each_block_once(&b.f, &s);
+
+        // Both merges (b3, b6) are reached via br; both branches of each diamond
+        // target their merge.
+        let mut targets = Vec::new();
+        br_targets(&s, &mut targets);
+        assert_eq!(
+            targets.iter().filter(|&&t| t == b3).count(),
+            2,
+            "both arms of the first diamond br to b3"
+        );
+        assert_eq!(
+            targets.iter().filter(|&&t| t == b6).count(),
+            2,
+            "both arms of the second diamond br to b6"
+        );
     }
 }
