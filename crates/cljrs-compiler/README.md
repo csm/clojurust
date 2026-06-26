@@ -31,7 +31,7 @@ src/
     mod.rs      — public API (`compile_function`, `WasmBackend`, `WasmError`); browser tier model
     abi.rs      — ABI/region contract: Value→i32, rt_abi import table, region-handle threading
     reloop.rs   — relooper: IR CFG → structured control flow (`Structured`); wasm-private
-    emit.rs     — wasm-encoder emitter + per-Inst lowering plan (stubbed; signature/walk wired)
+    emit.rs     — wasm-encoder emitter: IrFunction → validated wasm module (subset)
 ```
 
 ### WebAssembly backend (`wasm/`)
@@ -56,9 +56,19 @@ straight-line code, `if`/`cond` diamonds, sequential and nested merges, and
 are exactly `Terminator::RecurJump` (so loop headers are the `RecurJump`
 targets), and merge nodes (≥2 forward predecessors) are placed at their
 immediate dominator in ascending reverse-postorder so every `br` jumps forward.
-Irreducible control flow (which Clojure cannot produce) is rejected. Remaining
-work: the `wasm-encoder` emitter (the front half — reloop + signature + tree
-walk — is wired; encoding returns `Unimplemented`).
+Irreducible control flow (which Clojure cannot produce) is rejected.
+
+The **emitter produces real, `wasmparser`-validated modules** for a growing
+subset of the IR. Each `VarId` is a boxed `i32` local (the universal repr,
+always correct, mirroring the Cranelift boxed fallback); `rt_abi` symbols are
+imported from the `"rt"` module. The relooper's structured tree maps directly to
+wasm control flow (`Labeled`→`block`, `Loop`→`loop`, `If`→`if`/`else`,
+`Br`→`br N` with depths resolved from a label stack), and SSA φs are resolved as
+parallel moves on the operand stack at each edge — so `loop`/`recur` with a
+swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
+folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), and
+all control flow. Allocation, calls, globals, string/keyword/symbol constants,
+and the region/async ABIs return `Unsupported` — the next lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

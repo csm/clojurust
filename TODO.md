@@ -478,7 +478,8 @@ inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
 - [x] ABI/region contract: `Value`→`i32` linear-memory offset; `rt_abi` import table; region handle as a hidden trailing `i32` param (mirrors `IrFunction::abi_param_count`)
 - [x] Relooper data model (`Structured`) + acyclic/diamond structuring (wasm-private; Cranelift keeps the raw CFG)
 - [x] Relooper: full dominator-based structuring (Ramsey "Beyond Relooper") — `loop`/`recur` back-edges → `Loop`/`Br`-continue, multi-predecessor joins → dominator-placed labeled blocks in ascending RPO, irreducible CFGs rejected
-- [ ] `wasm-encoder` emitter: per-`Inst` lowering, SSA φ resolution to locals, `rt_abi` imports, scratch-array spilling for `Alloc*`
+- [x] `wasm-encoder` emitter (core): boxed `i32` value model, `rt_abi` imports, structured-tree → wasm control flow with label-stack `br` resolution, SSA φ as parallel operand-stack moves, scalar constants, folded arithmetic + binary comparison bridges; emits `wasmparser`-validated modules
+- [ ] `wasm-encoder` emitter (remaining `Inst`s): `Alloc*` (scratch-array spill + `rt_alloc_*`), `Call`/`CallDirect`/`CallWithRegion`, `LoadGlobal`/`LoadVar`/`DefVar`, string/keyword/symbol constants (data segment), region ops, unboxed `Long`/`Double` specialization aligned with `function_signature`
 - [ ] Region intrinsics in wasm: arena (`base/bump/limit`) in linear memory; `rt_region_*` threading; bump allocation into the caller's region
 - [ ] GC heap in linear memory (reuse the `wasm32-unknown-unknown` GC) + `rt_safepoint` at entry/back-edges
 - [ ] `recur` → `loop`/`br`; cross-function tail calls via the wasm tail-call proposal (`return_call`) or a trampoline

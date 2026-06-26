@@ -48,7 +48,7 @@
 //! [`IrFunction::abi_param_count`](crate::ir::IrFunction::abi_param_count) on the native side.
 
 /// A WebAssembly value type, restricted to the four the backend uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WasmValType {
     /// 32-bit integer — every pointer/handle and small integer.
     I32,
