@@ -361,6 +361,23 @@ fn test_higher_order_function() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_anon_fn_reader_macro() {
+    // `#(...)` must be expanded to `(fn* ...)` before lowering (the AOT lowerer
+    // has no eval-time fallback for the AnonFn reader macro).
+    assert_output(
+        "anon_fn",
+        r#"
+(defn sq-sum [xs]
+  (reduce + (map #(* % %) xs)))
+(println (sq-sum [1 2 3]))
+(println (map #(str "-" %) [1 2]))
+"#,
+        "14\n(-1 -2)",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_recursive_defn() {
     assert_output(
         "recursive_defn",
@@ -1200,6 +1217,31 @@ fn test_multi_file_refer() {
 "#,
         )],
         "25\n14",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_multi_file_anon_fn() {
+    // A required namespace using `#(...)` must compile (the AnonFn reader macro
+    // is expanded before lowering). Regression for compiling clojure.tools.cli,
+    // whose source uses `#(...)`.
+    assert_output_multi(
+        "multi_anon_fn",
+        r#"
+(ns my-app
+  (:require [fmt :as fmt]))
+(println (fmt/render ["a" "b" "c"]))
+"#,
+        &[(
+            "fmt.cljrs",
+            r#"
+(ns fmt)
+(defn render [items]
+  (apply str (map #(str "[" % "]") items)))
+"#,
+        )],
+        "[a][b][c]",
     );
 }
 
