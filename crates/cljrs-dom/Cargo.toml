@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-dom"
-version = "0.1.0"
+version = "0.1.185"
 edition = "2024"
 description = "Clean DOM interaction API for WASM targets (cljrs.dom namespace)"
 license.workspace = true
