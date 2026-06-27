@@ -1699,6 +1699,22 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
     }
 }
 
+/// `(next coll)` — equivalent to `(seq (rest coll))`.
+///
+/// Unlike [`rt_rest`], which always returns an (possibly empty) seq, `next`
+/// returns `nil` when no elements remain. This distinction matters for loop
+/// termination: an empty list `()` is truthy, so lowering `next` to `rt_rest`
+/// makes `(when (next coll) ...)` / `doseq` / `loop`-`recur` over `next` never
+/// terminate. See `builtin_next` for the interpreter's matching semantics.
+///
+/// # Safety
+/// `coll` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_next(coll: *const Value) -> *const Value {
+    let rest = unsafe { rt_rest(coll) };
+    unsafe { rt_seq(rest) }
+}
+
 /// `(assoc m k v)`.
 ///
 /// # Safety
@@ -4119,6 +4135,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_count as *const () as usize);
     std::hint::black_box(rt_first as *const () as usize);
     std::hint::black_box(rt_rest as *const () as usize);
+    std::hint::black_box(rt_next as *const () as usize);
     std::hint::black_box(rt_assoc as *const () as usize);
     std::hint::black_box(rt_conj as *const () as usize);
     std::hint::black_box(rt_call as *const () as usize);

@@ -859,6 +859,31 @@ fn test_first_rest() {
     );
 }
 
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_next_returns_nil_when_exhausted() {
+    // `next` must return nil (not an empty seq) once a collection is exhausted.
+    // Regression: the AOT backend lowered both `rest` and `next` to `rt_rest`,
+    // so `(next [1])` produced `()` instead of `nil`. Because `()` is truthy,
+    // `(when (next coll) ...)` and `doseq`/`loop`-`recur` over `next` never
+    // terminated, walking off the end into an unbounded run of nils.
+    assert_output(
+        "next_nil_exhausted",
+        r#"
+(println (next [1]))
+(println (nil? (next [1])))
+(println (when (next [1]) :bug))
+(doseq [a [1 2 3]] (println a))
+(loop [s (seq [10 20])]
+  (when s
+    (println (first s))
+    (recur (next s))))
+(println "done")
+"#,
+        "nil\ntrue\nnil\n1\n2\n3\n10\n20\ndone",
+    );
+}
+
 // ── Protocols & multimethods ──────────────────────────────────────────────
 
 #[test]

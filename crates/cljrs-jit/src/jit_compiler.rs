@@ -231,6 +231,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_into_map),
         sym!(rt_first),
         sym!(rt_rest),
+        sym!(rt_next),
         sym!(rt_assoc),
         sym!(rt_conj),
         sym!(rt_call),
