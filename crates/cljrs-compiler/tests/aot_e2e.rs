@@ -378,6 +378,22 @@ fn test_anon_fn_reader_macro() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_reader_conditional() {
+    // `#?(...)` / `#?@(...)` must be resolved to the `:rust` branch before
+    // lowering (the AOT lowerer has no eval-time fallback for ReaderCond).
+    assert_output(
+        "reader_cond",
+        r#"
+(defn pick [] #?(:clj :jvm :rust :native :default :other))
+(println (pick))
+(println (vec (list 1 #?@(:rust [2 3]) 4)))
+"#,
+        ":native\n[1 2 3 4]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_recursive_defn() {
     assert_output(
         "recursive_defn",
@@ -1242,6 +1258,30 @@ fn test_multi_file_anon_fn() {
 "#,
         )],
         "[a][b][c]",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_multi_file_reader_conditional() {
+    // A required namespace using `#?(...)` must compile (the reader conditional
+    // is resolved to the :rust branch before lowering).
+    assert_output_multi(
+        "multi_reader_cond",
+        r#"
+(ns my-app
+  (:require [plat :as plat]))
+(println (plat/label))
+"#,
+        &[(
+            "plat.cljrs",
+            r#"
+(ns plat)
+(defn label []
+  (str "on-" #?(:rust "rust" :clj "jvm" :default "other")))
+"#,
+        )],
+        "on-rust",
     );
 }
 

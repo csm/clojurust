@@ -403,6 +403,10 @@ pub fn compile_file(
     let forms = parser.parse_all()?;
     eprintln!("[aot] parsed {} top-level form(s)", forms.len());
 
+    // Resolve reader conditionals (`#?(...)`) to the `:rust` branch before
+    // macro-expansion — a selected branch may itself contain macros.
+    let forms = expand_reader_conds_deep(&forms);
+
     // ── 2. Macro-expand ─────────────────────────────────────────────────
     // Boot a full environment so macros resolve correctly.
     let globals = if src_dirs.is_empty() {
@@ -892,6 +896,61 @@ struct CompiledNamespace {
     preamble: String,
 }
 
+/// Recursively resolve reader conditionals (`#?(...)` / `#?@(...)`) to their
+/// `:rust` (or `:default`) branch throughout a form tree.
+///
+/// `macroexpand_all` leaves reader conditionals as `ReaderCond` nodes — the
+/// tree-walking interpreter resolves them at eval time — but the AOT lowerer
+/// rejects an un-expanded `ReaderCond`.  This runs over the whole program before
+/// macro-expansion (a selected branch may itself contain macros), mirroring the
+/// reader→macro pipeline.  Splicing `#?@(...)` is inlined into its enclosing
+/// sequence via `expand_reader_conds`; non-matching conditionals are dropped
+/// (or become `nil` in a value position, matching the interpreter).
+fn expand_reader_conds_deep(forms: &[cljrs_reader::Form]) -> Vec<cljrs_reader::Form> {
+    // Resolve conditionals at this level first (this is what inlines `#?@`),
+    // then recurse into each resulting form's children.
+    cljrs_builtins::form::expand_reader_conds(forms)
+        .iter()
+        .map(expand_reader_cond_form)
+        .collect()
+}
+
+fn expand_reader_cond_form(form: &cljrs_reader::Form) -> cljrs_reader::Form {
+    use cljrs_reader::form::FormKind;
+    let kind = match &form.kind {
+        FormKind::List(v) => FormKind::List(expand_reader_conds_deep(v)),
+        FormKind::Vector(v) => FormKind::Vector(expand_reader_conds_deep(v)),
+        FormKind::Set(v) => FormKind::Set(expand_reader_conds_deep(v)),
+        FormKind::Map(v) => FormKind::Map(expand_reader_conds_deep(v)),
+        FormKind::AnonFn(v) => FormKind::AnonFn(expand_reader_conds_deep(v)),
+        FormKind::Quote(f) => FormKind::Quote(Box::new(expand_reader_cond_form(f))),
+        FormKind::SyntaxQuote(f) => FormKind::SyntaxQuote(Box::new(expand_reader_cond_form(f))),
+        FormKind::Unquote(f) => FormKind::Unquote(Box::new(expand_reader_cond_form(f))),
+        FormKind::UnquoteSplice(f) => FormKind::UnquoteSplice(Box::new(expand_reader_cond_form(f))),
+        FormKind::Deref(f) => FormKind::Deref(Box::new(expand_reader_cond_form(f))),
+        FormKind::Var(f) => FormKind::Var(Box::new(expand_reader_cond_form(f))),
+        FormKind::Meta(m, f) => FormKind::Meta(
+            Box::new(expand_reader_cond_form(m)),
+            Box::new(expand_reader_cond_form(f)),
+        ),
+        FormKind::TaggedLiteral(t, f) => {
+            FormKind::TaggedLiteral(t.clone(), Box::new(expand_reader_cond_form(f)))
+        }
+        // A conditional reached outside a sequence (e.g. wrapped in `quote`):
+        // resolve it directly; an unconsumed splice or no-match becomes `nil`.
+        FormKind::ReaderCond {
+            splicing: false,
+            clauses,
+        } => match cljrs_builtins::form::select_reader_cond(clauses) {
+            Some(sel) => return expand_reader_cond_form(sel),
+            None => FormKind::Nil,
+        },
+        FormKind::ReaderCond { splicing: true, .. } => FormKind::Nil,
+        _ => return form.clone(),
+    };
+    cljrs_reader::Form::new(kind, form.span.clone())
+}
+
 /// Recursively expand anonymous-function reader macros (`#(...)`) into `(fn*
 /// [...] ...)` forms.
 ///
@@ -1005,6 +1064,9 @@ fn lower_namespace(
 ) -> AotResult<(String, Option<IrFunction>)> {
     let mut parser = Parser::new(source.to_string(), format!("<{ns_name}>"));
     let forms = parser.parse_all()?;
+
+    // Resolve reader conditionals to the `:rust` branch before macro-expansion.
+    let forms = expand_reader_conds_deep(&forms);
 
     // Macro-expand each form in an env rooted at this namespace so symbol and
     // alias resolution match how the namespace's own code sees the world.
