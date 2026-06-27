@@ -212,6 +212,17 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32],
         results: &[I32],
     },
+    // ── Scratch buffer (marshalling arrays for alloc bridges) ────────────────
+    // n_bytes → linear-memory offset of a thread-local scratch buffer at least
+    // `n_bytes` wide.  The wasm backend stores a contiguous array of element
+    // `*const Value` pointers here before calling the slice-taking `rt_alloc_*`
+    // / `rt_region_alloc_*` bridges (the wasm analogue of the native backend's
+    // explicit stack slot).
+    RtImport {
+        name: "rt_scratch_ptr",
+        params: &[I32],
+        results: &[I32],
+    },
     // ── GC-heap allocation (slice ptr, n) ────────────────────────────────────
     RtImport {
         name: "rt_alloc_vector",

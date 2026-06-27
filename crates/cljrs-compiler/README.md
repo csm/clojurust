@@ -66,9 +66,12 @@ wasm control flow (`Labeled`→`block`, `Loop`→`loop`, `If`→`if`/`else`,
 `Br`→`br N` with depths resolved from a label stack), and SSA φs are resolved as
 parallel moves on the operand stack at each edge — so `loop`/`recur` with a
 swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
-folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), and
-all control flow. Allocation, calls, globals, string/keyword/symbol constants,
-and the region/async ABIs return `Unsupported` — the next lowering increments.
+folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`),
+collection allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/
+`AllocCons` — element arrays marshalled through an imported linear memory and the
+`rt_scratch_ptr` buffer), and all control flow. Calls, globals, string/keyword/
+symbol constants, and the region/async ABIs return `Unsupported` — the next
+lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
@@ -106,6 +109,7 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Comparison:** `rt_eq`, `rt_case_eq` (type-strict equality for `case` dispatch — `Long`/`BigInt` interchangeable, mixed numerics never equal), `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Primitive arrays:** `rt_alength(arr) -> i64`, `rt_aget_long(arr, i) -> i64`, `rt_aget_double(arr, i) -> f64` (unboxed element loads), `rt_aset_long`/`rt_aset_double` (unboxed stores), `rt_aget`/`rt_aset` (boxed fallback for unknown element types) — all bounds-checked, throwing on out-of-range / type mismatch
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest`, `rt_assoc`, `rt_conj`
+- **Scratch:** `rt_scratch_ptr(n_bytes: u32) -> *mut u8` — a thread-local, monotonically growing scratch buffer the wasm backend uses to marshal element-pointer arrays before the slice-taking `rt_alloc_*` bridges (the native backend uses an on-stack slot instead)
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
 - **Dispatch:** `rt_call(callee, args, nargs)`, `rt_deref(v)`, `rt_load_global(ns, ns_len, name, name_len)`
 

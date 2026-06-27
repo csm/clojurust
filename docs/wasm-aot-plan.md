@@ -105,10 +105,11 @@ dependency, so it is reviewable and unit-tested independently):
   `CallWithRegion`→direct call passing the caller's handle as the trailing arg.
   This mirrors `IrFunction::abi_param_count` on the native side.
 - **Import table.** `RT_IMPORTS: &[RtImport]` describes the subset wired so far
-  (safepoint, constants, arithmetic/comparison bridges, GC-heap + region
-  allocation, inline-cache/deopt bridges) as `(name, params, results)` wasm
-  function types. `lookup(name)` resolves one. Completing it to all of `rt_abi`
-  is mechanical — one `RtImport` per `extern "C"` signature.
+  (safepoint, constants, arithmetic/comparison bridges, the `rt_scratch_ptr`
+  marshalling buffer, GC-heap + region allocation, inline-cache/deopt bridges)
+  as `(name, params, results)` wasm function types. `lookup(name)` resolves one.
+  Completing it to all of `rt_abi` is mechanical — one `RtImport` per `extern
+  "C"` signature.
 
 ### Relooper (`reloop.rs`) — complete for reducible CFGs
 
@@ -173,21 +174,42 @@ Produces real, **`wasmparser`-validated** single-function modules.
 
 **Instructions lowered so far:** scalar constants (`nil`/`bool`/`long`/`double`/
 `char`), `LoadLocal` (→ nil, matching the Cranelift backend), folded boxed
-arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), and all control
-flow. Everything else returns `WasmError::Unsupported`.
+arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), collection
+allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons`), and all
+control flow. Everything else returns `WasmError::Unsupported`.
+
+### Allocation (`Alloc*`) — complete
+
+The first lowering to touch linear memory. Element `*const Value` pointers are
+marshalled into a runtime-provided scratch buffer, then the slice-taking
+`rt_alloc_*` bridge is called (mirrors `codegen.rs::emit_alloc_collection`):
+
+- The module **imports `"rt" "memory"`** the first time an allocation needs to
+  store an element array (memory lives in its own index space, so it does not
+  shift the function indices). `ModuleAsm::needs_memory` records this.
+- `rt_scratch_ptr(n_bytes) -> i32` (new `rt_abi` bridge + `RT_IMPORTS` entry)
+  hands back a thread-local, monotonically growing scratch buffer; the emitter
+  stores its pointer in one extra `i32` local past the `VarId` locals.
+- Each element is stored with `i32.store` at `scratch + i*4` (pointers are wasm
+  `i32`s), then `bridge(scratch, count)` is called. For maps the pairs are
+  flattened to `[k0,v0,…]` and `count` is the **pair** count.
+- Empty literals pass a null pointer + zero count and need no memory.
+- `AllocCons` takes two pointer args directly, no array.
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 16 tests:
+`cargo test -p cljrs-compiler wasm::` — 20 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
 - `reloop`: empty/single-return/linear-chain/diamond/loop-with-exit/nested
   sequential merges, each asserting **every block is emitted exactly once**.
-- `emit`: an arithmetic function, an if/else diamond with a merge φ, and a loop
-  with a φ counter + conditional `recur` — each **validated with `wasmparser`**;
-  plus `Unsupported` coverage for region variants and un-lowered instructions,
-  and the typed-signature accounting.
+- `emit`: an arithmetic function, an if/else diamond with a merge φ, a loop with
+  a φ counter + conditional `recur`, and collection allocation (a two-element
+  vector exercising the scratch buffer + imported memory, an empty vector, a
+  one-pair map, and a cons) — each **validated with `wasmparser`**; plus
+  `Unsupported` coverage for region variants and un-lowered instructions, and the
+  typed-signature accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -196,38 +218,21 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 ## What is next
 
-Ordered by value. The first item is the gateway: it makes real Clojure functions
-(which build collections) compilable, and introduces the first **memory import**
-that the region path also needs.
+Ordered by value. Allocation (the gateway item, now **done** — see the
+"Allocation" section above) made real collection-building functions compilable
+and introduced the linear-memory import + scratch-buffer machinery that the
+region path reuses.
 
-### 1. Allocation (`Alloc*`) — highest value
+### 1. Region operations
 
-`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons`. The native backend
-(`codegen.rs::emit_alloc_collection`) spills the element `*const Value` pointers
-to a contiguous scratch array, then calls `rt_alloc_*(ptr, n)`. In wasm:
-
-- Import a **linear memory** (`(import "rt" "memory" (memory ...))`) — the first
-  time the emitter needs memory.
-- Reserve a scratch region for the pointer array. Decide ownership: simplest is a
-  runtime-provided scratch buffer (e.g. an `rt_scratch_ptr()` import or a fixed
-  imported global) so the emitter does not have to manage a stack/bump pointer of
-  its own yet.
-- For each element: `local.get elem` (i32), `i32.store` at `scratch + i*4`.
-- Push `scratch`, push `n` (i64), `call rt_alloc_vector` (etc.).
-
-`rt_alloc_*` are already in `RT_IMPORTS`. `AllocCons` is simpler (two pointer
-args, no array). Add tests that allocate and validate.
-
-### 2. Region operations
-
-Once the scratch/memory machinery from (1) exists, region ops are mechanical and
+Now that the scratch/memory machinery exists, region ops are mechanical and
 unlock the escape-analysis payoff. Lower `RegionStart`/`RegionAlloc`/`RegionEnd`
 to the `rt_region_*` imports, and `RegionParam`/`CallWithRegion` to the hidden
 trailing-`i32` ABI (see `abi.rs`). Then drop the
 `takes_region_param()`→`Unsupported` guard in `emit_function`. This needs
-multi-function support (2.5) for `CallWithRegion`.
+multi-function support (item 2) for `CallWithRegion`.
 
-### 3. Calls and multi-function modules
+### 2. Calls and multi-function modules
 
 `CallDirect` (same-module direct call), `Call` (dynamic, via the
 `rt_call_ic` inline-cache bridge), `CallWithRegion`. Requires compiling a
@@ -239,7 +244,7 @@ bodies, and resolves `CallDirect` targets to those indices. Closures
 `rt_make_fn*`). Cross-function tail calls use the wasm tail-call proposal
 (`return_call`) when `WasmBackend::tail_calls`, else a trampoline.
 
-### 4. Constants needing a data segment
+### 3. Constants needing a data segment
 
 `Const::Str` / `Const::Keyword` / `Const::Symbol`. Emit the UTF-8 bytes into a
 **data segment** and pass `(ptr, len)` to `rt_const_string`/`_keyword`/`_symbol`
@@ -247,20 +252,20 @@ bodies, and resolves `CallDirect` targets to those indices. Closures
 coordinated with the runtime's linear-memory layout — decide whether the
 emitter owns a rodata region or the runtime reserves one.
 
-### 5. Globals / vars
+### 4. Globals / vars
 
 `LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
 follow `codegen.rs::emit_load_global` / `emit_def_var`. Needs the name-as-data
-machinery from (4) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
+machinery from (3) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
 
-### 6. Exceptions
+### 5. Exceptions
 
 `Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
 (`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
 `rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
 `rt_try` checking the thread-local).
 
-### 7. Unboxed specialization
+### 6. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -268,7 +273,7 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 8. CLI + bundling
+### 7. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the
