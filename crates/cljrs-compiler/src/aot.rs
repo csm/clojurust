@@ -486,22 +486,46 @@ pub fn compile_file(
 
     // Lower each discovered namespace to an interpreted preamble (ns/require,
     // macros) plus an optional natively compiled initializer.
+    //
+    // Graceful degradation: a namespace whose body cannot be lowered or
+    // compiled (an unsupported construct, or a backend/verifier edge case) is
+    // not a hard error — we fall back to bundling its source for interpretation
+    // at startup, exactly as before required namespaces were compiled.  This
+    // keeps the program buildable while compiling every namespace that can be.
     let mut compiled_namespaces: Vec<CompiledNamespace> = Vec::new();
     let mut dep_irs: Vec<(String, IrFunction)> = Vec::new();
+    let mut interpreted_bundled: Vec<(Arc<str>, String)> = Vec::new();
     for (i, (ns, src)) in discovered.iter().enumerate() {
         let init_symbol = format!("__cljrs_ns_init_{i}");
-        let (preamble, ir_opt) = lower_namespace(ns, src, &init_symbol, &env.globals)?;
-        let init_symbol = if let Some(ir) = ir_opt {
-            dep_irs.push((init_symbol.clone(), ir));
-            Some(init_symbol)
-        } else {
-            None
-        };
-        compiled_namespaces.push(CompiledNamespace {
-            ns: ns.clone(),
-            init_symbol,
-            preamble,
-        });
+        match lower_namespace(ns, src, &init_symbol, &env.globals) {
+            Ok((preamble, Some(ir))) if dep_codegen_ok(&ir, &init_symbol) => {
+                dep_irs.push((init_symbol.clone(), ir));
+                compiled_namespaces.push(CompiledNamespace {
+                    ns: ns.clone(),
+                    init_symbol: Some(init_symbol),
+                    preamble,
+                });
+            }
+            // Lowered, but the body could not be compiled by the backend.
+            Ok((_, Some(_))) => {
+                eprintln!("[aot] {ns}: body could not be compiled, bundling as interpreted source");
+                interpreted_bundled.push((ns.clone(), src.clone()));
+            }
+            // No compilable body (e.g. a namespace of only macros): a
+            // preamble-only loader is enough.
+            Ok((preamble, None)) => {
+                compiled_namespaces.push(CompiledNamespace {
+                    ns: ns.clone(),
+                    init_symbol: None,
+                    preamble,
+                });
+            }
+            // Lowering failed outright (an unsupported form): interpret it.
+            Err(e) => {
+                eprintln!("[aot] {ns}: could not be lowered ({e}), bundling as interpreted source");
+                interpreted_bundled.push((ns.clone(), src.clone()));
+            }
+        }
     }
     if !compiled_namespaces.is_empty() {
         eprintln!(
@@ -514,6 +538,9 @@ pub fn compile_file(
                 .join(", ")
         );
     }
+    // Namespaces that fell back to interpretation join the builtin-source
+    // bundle, alongside pinned versioned sources.
+    versioned_bundled.extend(interpreted_bundled);
 
     // ── 2b. Partition: interpreted preamble vs compiled body ─────────
     // Forms that define functions (defn, defmacro) or require interpreter
@@ -1044,6 +1071,28 @@ fn qualify_aliases(
         _ => return form.clone(),
     };
     cljrs_reader::Form::new(kind, form.span.clone())
+}
+
+/// Trial-compile a required namespace's initializer (and its subfunctions) in a
+/// throwaway object module to check the backend can actually compile it.
+///
+/// Lowering can succeed yet still produce IR the Cranelift backend rejects
+/// (e.g. a region-specialization edge case that fails verification).  Probing
+/// here lets `compile_file` fall back to interpreting such a namespace instead
+/// of aborting the whole build.  The probe is discarded; the namespace is
+/// compiled again into the real shared module only if this returns `true`.
+fn dep_codegen_ok(ir: &IrFunction, init_symbol: &str) -> bool {
+    let Ok(mut trial) = Compiler::new() else {
+        return false;
+    };
+    let result = (|| -> AotResult<()> {
+        declare_subfunctions(ir, &mut trial)?;
+        compile_subfunctions(ir, &mut trial)?;
+        let id = trial.declare_function(init_symbol, 0)?;
+        trial.compile_function(ir, id)?;
+        Ok(())
+    })();
+    result.is_ok()
 }
 
 /// Lower one required namespace to an interpreted preamble plus an optional
