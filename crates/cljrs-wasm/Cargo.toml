@@ -19,6 +19,7 @@ cljrs-builtins = { workspace = true }
 cljrs-gc       = { workspace = true }
 cljrs-types    = { workspace = true }
 cljrs-async    = { workspace = true }
+cljrs-dom      = { workspace = true }
 wasm-bindgen          = "0.2"
 wasm-bindgen-futures  = "0.4"
 console_error_panic_hook = "0.1"

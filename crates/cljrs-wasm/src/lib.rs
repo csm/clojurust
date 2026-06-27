@@ -65,6 +65,8 @@ impl Repl {
         console_error_panic_hook::set_once();
         let globals = cljrs_interp::standard_env_minimal(None, None, None);
         cljrs_stdlib::register(&globals);
+        cljrs_dom::set_globals(globals.clone());
+        cljrs_dom::register(&globals);
 
         let local = Rc::new(LocalSet::new());
 
