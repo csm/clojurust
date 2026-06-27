@@ -35,5 +35,8 @@ cranelift-object   = { workspace = true }
 cranelift-native   = { workspace = true }
 target-lexicon     = { workspace = true }
 
+wasm-encoder       = "0.244"
+
 [dev-dependencies]
 tempfile = "3"
+wasmparser = "0.244"
