@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-gc"
-version = "0.1.0"
+version = "0.1.187"
 edition = "2024"
 description = "Tracing garbage collector for clojurust"
 license.workspace = true
