@@ -1067,6 +1067,33 @@ fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
     cljrs_gc::region::unwind_region_stack_to(gc_depth);
 }
 
+// ── Scratch buffer ──────────────────────────────────────────────────────────
+
+thread_local! {
+    /// A reusable, monotonically growing scratch buffer.  The wasm AOT backend
+    /// marshals a contiguous array of element `*const Value` pointers here
+    /// before calling the slice-taking `rt_alloc_*` / `rt_region_alloc_*`
+    /// bridges (the native backend uses an on-stack slot instead).
+    static RT_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Return a pointer to a thread-local scratch buffer at least `n_bytes` wide.
+///
+/// The buffer is reused across calls and grows monotonically; the returned
+/// pointer is valid only until the next `rt_scratch_ptr` call on the same
+/// thread.  Only the wasm backend uses this; the native backend marshals
+/// element arrays in an explicit stack slot.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_scratch_ptr(n_bytes: u32) -> *mut u8 {
+    RT_SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        if buf.len() < n_bytes as usize {
+            buf.resize(n_bytes as usize, 0);
+        }
+        buf.as_mut_ptr()
+    })
+}
+
 // ── Collection construction ─────────────────────────────────────────────────
 
 /// Allocate a vector from `n` element pointers.

@@ -38,16 +38,18 @@
 //!
 //! Emits valid, `wasmparser`-validated modules for the subset: scalar
 //! constants, `LoadLocal`, boxed arithmetic (`+ - * / rem`, folded) and binary
-//! comparison (`= < > <= >=`) via the `rt_abi` bridges, and all control flow
-//! (branches, diamonds, and `loop`/`recur` with φ).  Allocation, calls,
-//! globals, string/keyword/symbol constants, and the region/async ABIs return
-//! [`WasmError::Unsupported`] — the next lowering increments.
+//! comparison (`= < > <= >=`) via the `rt_abi` bridges, collection allocation
+//! (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons` — element arrays
+//! marshalled through an imported linear memory and the `rt_scratch_ptr`
+//! buffer), and all control flow (branches, diamonds, and `loop`/`recur` with
+//! φ).  Calls, globals, string/keyword/symbol constants, and the region/async
+//! ABIs return [`WasmError::Unsupported`] — the next lowering increments.
 
 use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    Ieee64, ImportSection, Instruction, Module, TypeSection, ValType,
+    Ieee64, ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ir::{Block, BlockId, Const, Inst, IrFunction, KnownFn, Repr, Terminator, VarId};
@@ -92,7 +94,10 @@ pub fn emit_function(
             l
         });
     }
-    let declared = next_local - nparams as u32;
+    // One extra i32 local, past all VarId locals, holds the scratch-buffer
+    // pointer transiently while marshalling an allocation's element array.
+    let scratch_local = next_local;
+    let declared = next_local + 1 - nparams as u32;
 
     let block_of: HashMap<BlockId, usize> = func
         .blocks
@@ -113,6 +118,7 @@ pub fn emit_function(
             local_of: &local_of,
             block_of: &block_of,
             forward_preds: &forward_preds,
+            scratch_local,
             labels: Vec::new(),
             current: func.blocks[0].id,
         };
@@ -142,6 +148,21 @@ pub fn emit_function(
     let mut imports = ImportSection::new();
     for (name, ty_idx) in &asm.imports {
         imports.import("rt", name, EntityType::Function(*ty_idx));
+    }
+    if asm.needs_memory {
+        // The runtime owns linear memory; the module imports it.  Memory lives
+        // in its own index space, so this does not shift function indices.
+        imports.import(
+            "rt",
+            "memory",
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            }),
+        );
     }
     module.section(&imports);
 
@@ -214,6 +235,11 @@ struct ModuleAsm {
     /// `(import name, type index)`, in function-index order.
     imports: Vec<(&'static str, u32)>,
     import_map: HashMap<&'static str, u32>,
+    /// Whether the function uses linear memory (e.g. marshalling alloc element
+    /// arrays into the scratch buffer).  When set, the module imports `"rt"
+    /// "memory"`.  Memory imports occupy a separate index space from function
+    /// imports, so this does not affect function indices.
+    needs_memory: bool,
 }
 
 impl ModuleAsm {
@@ -223,6 +249,7 @@ impl ModuleAsm {
             type_map: HashMap::new(),
             imports: Vec::new(),
             import_map: HashMap::new(),
+            needs_memory: false,
         }
     }
 
@@ -281,6 +308,9 @@ struct Emitter<'a> {
     local_of: &'a HashMap<VarId, u32>,
     block_of: &'a HashMap<BlockId, usize>,
     forward_preds: &'a HashMap<BlockId, usize>,
+    /// An i32 local (past all VarId locals) that transiently holds the
+    /// scratch-buffer pointer while marshalling an allocation's element array.
+    scratch_local: u32,
     /// Enclosing control frames; `Some(b)` is a `block`/`loop` labeled `b`,
     /// `None` is an `if`.  Innermost is last.
     labels: Vec<Option<BlockId>>,
@@ -464,6 +494,32 @@ impl Emitter<'_> {
                 self.emit_known(kf, args)?;
                 self.set(*dst)
             }
+            Inst::AllocVector(dst, elems) => {
+                self.emit_alloc("rt_alloc_vector", elems, elems.len() as u64)?;
+                self.set(*dst)
+            }
+            Inst::AllocSet(dst, elems) => {
+                self.emit_alloc("rt_alloc_set", elems, elems.len() as u64)?;
+                self.set(*dst)
+            }
+            Inst::AllocList(dst, elems) => {
+                self.emit_alloc("rt_alloc_list", elems, elems.len() as u64)?;
+                self.set(*dst)
+            }
+            Inst::AllocMap(dst, pairs) => {
+                // Flatten to [k0, v0, k1, v1, ...]; the count is the pair count,
+                // matching `rt_alloc_map`'s contract (mirrors the native backend).
+                let flat: Vec<VarId> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+                self.emit_alloc("rt_alloc_map", &flat, pairs.len() as u64)?;
+                self.set(*dst)
+            }
+            Inst::AllocCons(dst, head, tail) => {
+                // Two pointer args, no element array.
+                self.get(*head)?;
+                self.get(*tail)?;
+                self.call_import("rt_alloc_cons")?;
+                self.set(*dst)
+            }
             // Resolved on edges / by terminators.
             Inst::Phi(..) | Inst::Recur(..) | Inst::SourceLoc(..) => Ok(()),
             other => Err(WasmError::Unsupported(format!(
@@ -542,6 +598,47 @@ impl Emitter<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Lower a slice-taking allocation bridge (`rt_alloc_vector` etc.): marshal
+    /// the element `*const Value` pointers into the scratch buffer, then call
+    /// `bridge(ptr, count)`.  The boxed result is left on the operand stack.
+    ///
+    /// `elems` are the pointers stored contiguously (for maps, the flattened
+    /// key/value sequence); `count` is the value passed to the bridge (element
+    /// count, or pair count for maps).  Mirrors the native
+    /// `codegen.rs::emit_alloc_collection`.
+    fn emit_alloc(&mut self, bridge: &str, elems: &[VarId], count: u64) -> Result<(), WasmError> {
+        let n = elems.len();
+        if n == 0 {
+            // Empty literal: pass a null array pointer and a zero count.
+            self.ins(&Instruction::I32Const(0));
+            self.ins(&Instruction::I64Const(count as i64));
+            return self.call_import(bridge);
+        }
+
+        self.asm.needs_memory = true;
+
+        // scratch = rt_scratch_ptr(n * 4)  — element pointers are wasm i32s.
+        self.ins(&Instruction::I32Const((n * 4) as i32));
+        self.call_import("rt_scratch_ptr")?;
+        self.ins(&Instruction::LocalSet(self.scratch_local));
+
+        // Store each element pointer at scratch + i*4.
+        for (i, e) in elems.iter().enumerate() {
+            self.ins(&Instruction::LocalGet(self.scratch_local));
+            self.get(*e)?;
+            self.ins(&Instruction::I32Store(MemArg {
+                offset: (i * 4) as u64,
+                align: 2, // 2^2 == 4-byte alignment
+                memory_index: 0,
+            }));
+        }
+
+        // bridge(scratch, count)
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I64Const(count as i64));
+        self.call_import(bridge)
     }
 }
 
@@ -697,7 +794,52 @@ mod tests {
 
     #[test]
     fn unsupported_instruction_reports_cleanly() {
-        let mut f = IrFunction::new(Some(Arc::from("alloc")), None);
+        // `Deref` is not yet lowered; it should report cleanly.
+        let mut f = IrFunction::new(Some(Arc::from("deref")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let v = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::Deref(v, x)],
+            terminator: Terminator::Return(v),
+        });
+        match compile(&f) {
+            Err(WasmError::Unsupported(msg)) => assert!(msg.contains("not yet lowered")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// `(fn [x] [x 1])`: build a vector from two boxed elements — exercises the
+    /// scratch-buffer marshalling and the imported linear memory.
+    #[test]
+    fn alloc_vector_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("pair")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let one = f.fresh_var();
+        let v = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(one, Const::Long(1)),
+                Inst::AllocVector(v, vec![x, one]),
+            ],
+            terminator: Terminator::Return(v),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// An empty vector literal passes a null pointer and zero count — no memory
+    /// import needed.
+    #[test]
+    fn alloc_empty_vector_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("empty")), None);
         let v = f.fresh_var();
         let b = f.fresh_block();
         f.blocks.push(Block {
@@ -706,10 +848,47 @@ mod tests {
             insts: vec![Inst::AllocVector(v, vec![])],
             terminator: Terminator::Return(v),
         });
-        match compile(&f) {
-            Err(WasmError::Unsupported(msg)) => assert!(msg.contains("not yet lowered")),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn [k val] {k val})`: build a map from one key/value pair — the count
+    /// passed to the bridge is the pair count, not the pointer count.
+    #[test]
+    fn alloc_map_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("m")), None);
+        let k = f.fresh_var();
+        let val = f.fresh_var();
+        f.params = vec![(Arc::from("k"), k), (Arc::from("val"), val)];
+        let m = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::AllocMap(m, vec![(k, val)])],
+            terminator: Terminator::Return(m),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn [h t] (cons h t))`: a cons cell takes two pointer args, no array.
+    #[test]
+    fn alloc_cons_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("c")), None);
+        let h = f.fresh_var();
+        let t = f.fresh_var();
+        f.params = vec![(Arc::from("h"), h), (Arc::from("t"), t)];
+        let c = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::AllocCons(c, h, t)],
+            terminator: Terminator::Return(c),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
     }
 
     #[test]
