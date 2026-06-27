@@ -465,6 +465,33 @@ Foundations already in place:
 
 ---
 
+## Phase 11.5 — AOT Clojure → WebAssembly backend
+
+Handoff + design doc: [`docs/wasm-aot-plan.md`](docs/wasm-aot-plan.md).
+
+Native-fast, sandbox-safe browser deployment. A *second* code-generation
+backend over the same regionalized `cljrs-ir` IR (parallel to Cranelift), since
+no in-sandbox native JIT is possible in a browser. Build-time AOT-wasm is the
+top tier; the IR interpreter stays on board as the dynamic-code tier (tiers
+invert vs. native). All upstream passes (ANF lowering, escape analysis, region
+inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
+
+- [x] Scaffold the backend: `cljrs-compiler/src/wasm/` (`mod`, `abi`, `reloop`, `emit`)
+- [x] ABI/region contract: `Value`→`i32` linear-memory offset; `rt_abi` import table; region handle as a hidden trailing `i32` param (mirrors `IrFunction::abi_param_count`)
+- [x] Relooper data model (`Structured`) + acyclic/diamond structuring (wasm-private; Cranelift keeps the raw CFG)
+- [x] Relooper: full dominator-based structuring (Ramsey "Beyond Relooper") — `loop`/`recur` back-edges → `Loop`/`Br`-continue, multi-predecessor joins → dominator-placed labeled blocks in ascending RPO, irreducible CFGs rejected
+- [x] `wasm-encoder` emitter (core): boxed `i32` value model, `rt_abi` imports, structured-tree → wasm control flow with label-stack `br` resolution, SSA φ as parallel operand-stack moves, scalar constants, folded arithmetic + binary comparison bridges; emits `wasmparser`-validated modules
+- [ ] `wasm-encoder` emitter (remaining `Inst`s): `Alloc*` (scratch-array spill + `rt_alloc_*`), `Call`/`CallDirect`/`CallWithRegion`, `LoadGlobal`/`LoadVar`/`DefVar`, string/keyword/symbol constants (data segment), region ops, unboxed `Long`/`Double` specialization aligned with `function_signature`
+- [ ] Region intrinsics in wasm: arena (`base/bump/limit`) in linear memory; `rt_region_*` threading; bump allocation into the caller's region
+- [ ] GC heap in linear memory (reuse the `wasm32-unknown-unknown` GC) + `rt_safepoint` at entry/back-edges
+- [ ] `recur` → `loop`/`br`; cross-function tail calls via the wasm tail-call proposal (`return_call`) or a trampoline
+- [ ] `try`/`catch`/`throw` via the wasm exception-handling proposal (or an `rt_abi` error path)
+- [ ] CLI: `cljrs compile <file> --target wasm -o <out>.wasm`; bundle with the runtime + IR interpreter
+- [ ] Wire the IR interpreter into the `cljrs-wasm` bundle as the dynamic-code tier (drop JIT/OSR hooks in-sandbox)
+- [ ] WasmGC (host-managed reference types) — deferred; keep the linear-memory GC for now
+
+---
+
 ## Phase 12 — REPL & Tooling
 
 - [x] Interactive REPL (`cljx repl`): read–eval–print loop (basic; readline deferred)
