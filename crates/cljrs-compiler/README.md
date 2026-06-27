@@ -27,6 +27,57 @@ src/
   typeinfer.rs  — Phase 10.6 scalar representation inference (Repr lattice, fixpoint dataflow)
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
+  wasm/         — AOT Clojure → WebAssembly backend (scaffold; second backend over the same IR)
+    mod.rs      — public API (`compile_function`, `WasmBackend`, `WasmError`); browser tier model
+    abi.rs      — ABI/region contract: Value→i32, rt_abi import table, region-handle threading
+    reloop.rs   — relooper: IR CFG → structured control flow (`Structured`); wasm-private
+    emit.rs     — wasm-encoder emitter: IrFunction → validated wasm module (subset)
+```
+
+### WebAssembly backend (`wasm/`)
+
+**Phase 12-wasm (scaffold).** A second code-generation backend over the same
+regionalized `cljrs-ir` IR, targeting the browser, where no in-sandbox native
+JIT is possible. AOT-wasm is the build-time top tier; the IR interpreter stays
+on board as the dynamic-code tier. Everything upstream of codegen — ANF
+lowering, escape analysis, region inference, `typeinfer`, the `rt_abi` contract
+— is reused unchanged. Because regions are a property of the IR and a region
+handle is just an `i32` linear-memory offset, escape-analysis-driven bump
+allocation ports for free (a region-parameterised variant takes the handle as a
+hidden trailing `i32` param). The only new, wasm-specific work is the
+**relooper** (`reloop.rs`, recovering structured control flow — wasm-private,
+since Cranelift wants the raw CFG) and the `wasm-encoder` **emitter**
+(`emit.rs`).
+
+The **relooper is complete for reducible CFGs** (the universal case for Clojure
+source): it implements Ramsey's *"Beyond Relooper"* dominator-tree structuring —
+straight-line code, `if`/`cond` diamonds, sequential and nested merges, and
+`loop`/`recur` loops with conditional exits. It exploits two facts: back edges
+are exactly `Terminator::RecurJump` (so loop headers are the `RecurJump`
+targets), and merge nodes (≥2 forward predecessors) are placed at their
+immediate dominator in ascending reverse-postorder so every `br` jumps forward.
+Irreducible control flow (which Clojure cannot produce) is rejected.
+
+The **emitter produces real, `wasmparser`-validated modules** for a growing
+subset of the IR. Each `VarId` is a boxed `i32` local (the universal repr,
+always correct, mirroring the Cranelift boxed fallback); `rt_abi` symbols are
+imported from the `"rt"` module. The relooper's structured tree maps directly to
+wasm control flow (`Labeled`→`block`, `Loop`→`loop`, `If`→`if`/`else`,
+`Br`→`br N` with depths resolved from a label stack), and SSA φs are resolved as
+parallel moves on the operand stack at each edge — so `loop`/`recur` with a
+swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
+folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), and
+all control flow. Allocation, calls, globals, string/keyword/symbol constants,
+and the region/async ABIs return `Unsupported` — the next lowering increments.
+
+```rust
+pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
+pub struct WasmBackend { tail_calls: bool, exceptions: bool }
+pub enum WasmError { Reloop(RelooperError), Unsupported(String), Unimplemented(&'static str) }
+// abi:    WasmValType{I32,I64,F64}, RtImport, RT_IMPORTS, lookup(name)
+// reloop: Structured{Simple,Labeled,Loop,If,Br,Return,Unreachable,Nil}, reloop(func)
+//         RelooperError{Empty,DanglingTarget,Irreducible}
+// emit:   emit_function(func, structured, cfg), function_signature(func)
 ```
 
 ---
