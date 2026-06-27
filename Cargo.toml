@@ -31,7 +31,8 @@ members = [
     "crates/cljrs-nrepl",
     "crates/cljrs-base64",
     "crates/cljrs-jit",
-    "crates/cljrs-dylib"]
+    "crates/cljrs-dylib",
+    "crates/cljrs-dom"]
 resolver = "2"
 
 [workspace.package]
@@ -67,6 +68,7 @@ cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0" }
 cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.0" }
 cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.0" }
 cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.0" }
+cljrs-dom          = { path = "crates/cljrs-dom",          version = "0.1.0" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
