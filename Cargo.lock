@@ -872,6 +872,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cljrs-dom"
+version = "0.1.0"
+dependencies = [
+ "cljrs-async",
+ "cljrs-env",
+ "cljrs-gc",
+ "cljrs-value",
+ "getrandom 0.4.2",
+ "js-sys",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "cljrs-dylib"
 version = "0.1.0"
 dependencies = [
@@ -1183,6 +1199,7 @@ version = "0.1.0"
 dependencies = [
  "cljrs-async",
  "cljrs-builtins",
+ "cljrs-dom",
  "cljrs-env",
  "cljrs-gc",
  "cljrs-interp",

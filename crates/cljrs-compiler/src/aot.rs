@@ -525,7 +525,8 @@ pub fn compile_file(
             interpreted_source.push_str(src_text);
             interpreted_source.push('\n');
         } else {
-            compilable.push(qualify_aliases(form, &env.current_ns, &env.globals));
+            let form = expand_anon_fns(form);
+            compilable.push(qualify_aliases(&form, &env.current_ns, &env.globals));
         }
     }
     if !interpreted_source.is_empty() {
@@ -891,6 +892,45 @@ struct CompiledNamespace {
     preamble: String,
 }
 
+/// Recursively expand anonymous-function reader macros (`#(...)`) into `(fn*
+/// [...] ...)` forms.
+///
+/// `macroexpand_all` deliberately leaves `#(...)` as an `AnonFn` node — the
+/// tree-walking interpreter expands it lazily at eval time — but the AOT lowerer
+/// has no such fallback and rejects an un-expanded `AnonFn`.  This pass runs over
+/// the compilable forms before lowering so any `#(...)` (in the entry namespace
+/// or in a compiled required namespace such as `clojure.tools.cli`) is turned
+/// into a lowerable `fn*`.
+fn expand_anon_fns(form: &cljrs_reader::Form) -> cljrs_reader::Form {
+    use cljrs_reader::form::FormKind;
+    let map_vec = |v: &[cljrs_reader::Form]| v.iter().map(expand_anon_fns).collect::<Vec<_>>();
+    let kind = match &form.kind {
+        FormKind::AnonFn(body) => {
+            // Expand this `#(...)`, then recurse so nested forms are handled too.
+            let expanded = cljrs_builtins::form::expand_anon_fn(body, form.span.clone());
+            return expand_anon_fns(&expanded);
+        }
+        FormKind::List(v) => FormKind::List(map_vec(v)),
+        FormKind::Vector(v) => FormKind::Vector(map_vec(v)),
+        FormKind::Map(v) => FormKind::Map(map_vec(v)),
+        FormKind::Set(v) => FormKind::Set(map_vec(v)),
+        FormKind::Quote(f) => FormKind::Quote(Box::new(expand_anon_fns(f))),
+        FormKind::SyntaxQuote(f) => FormKind::SyntaxQuote(Box::new(expand_anon_fns(f))),
+        FormKind::Unquote(f) => FormKind::Unquote(Box::new(expand_anon_fns(f))),
+        FormKind::UnquoteSplice(f) => FormKind::UnquoteSplice(Box::new(expand_anon_fns(f))),
+        FormKind::Deref(f) => FormKind::Deref(Box::new(expand_anon_fns(f))),
+        FormKind::Var(f) => FormKind::Var(Box::new(expand_anon_fns(f))),
+        FormKind::Meta(m, f) => {
+            FormKind::Meta(Box::new(expand_anon_fns(m)), Box::new(expand_anon_fns(f)))
+        }
+        FormKind::TaggedLiteral(t, f) => {
+            FormKind::TaggedLiteral(t.clone(), Box::new(expand_anon_fns(f)))
+        }
+        _ => return form.clone(),
+    };
+    cljrs_reader::Form::new(kind, form.span.clone())
+}
+
 /// Rewrite namespace-alias-qualified symbols (`alias/name`) to their fully
 /// qualified form (`real-ns/name`) using `ns`'s alias table.
 ///
@@ -987,7 +1027,8 @@ fn lower_namespace(
             preamble.push_str(&source[span.start..span.end]);
             preamble.push('\n');
         } else {
-            compilable.push(qualify_aliases(form, ns_name, globals));
+            let form = expand_anon_fns(form);
+            compilable.push(qualify_aliases(&form, ns_name, globals));
         }
     }
 
