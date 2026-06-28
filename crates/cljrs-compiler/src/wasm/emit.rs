@@ -12,9 +12,10 @@
 //! mirrors the Cranelift backend's boxed fallback (`codegen.rs` materializes
 //! unboxed scalars only when `typeinfer` proves a `Long`/`Double`/`Bool` repr;
 //! the `_ =>` arm boxes through `rt_const_*`).  Unboxed specialization that
-//! aligns the wasm signature with [`function_signature`] is a follow-up; until
-//! then the emitter rejects region-parameterised and async poll functions
-//! (whose ABIs add hidden params) with [`WasmError::Unsupported`].
+//! aligns the wasm signature with [`function_signature`] is a follow-up.  The
+//! hidden trailing region param of a region-parameterised callee variant *is*
+//! honored (it is always an `i32`); only the async poll-function ABI
+//! (state-machine params) is still rejected with [`WasmError::Unsupported`].
 //!
 //! # Control flow
 //!
@@ -41,9 +42,12 @@
 //! comparison (`= < > <= >=`) via the `rt_abi` bridges, collection allocation
 //! (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons` — element arrays
 //! marshalled through an imported linear memory and the `rt_scratch_ptr`
-//! buffer), and all control flow (branches, diamonds, and `loop`/`recur` with
-//! φ).  Calls, globals, string/keyword/symbol constants, and the region/async
-//! ABIs return [`WasmError::Unsupported`] — the next lowering increments.
+//! buffer), region operations (`RegionStart`/`RegionAlloc`/`RegionEnd` →
+//! `rt_region_*`, and `RegionParam` → the hidden trailing-`i32` param), and all
+//! control flow (branches, diamonds, and `loop`/`recur` with φ).  Calls
+//! (including `CallWithRegion`, which needs multi-function modules), globals,
+//! string/keyword/symbol constants, and the async ABI return
+//! [`WasmError::Unsupported`] — the next lowering increments.
 
 use std::collections::HashMap;
 
@@ -52,7 +56,9 @@ use wasm_encoder::{
     Ieee64, ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::ir::{Block, BlockId, Const, Inst, IrFunction, KnownFn, Repr, Terminator, VarId};
+use crate::ir::{
+    Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Repr, Terminator, VarId,
+};
 
 use super::abi::{self, RtImport, WasmValType};
 use super::reloop::Structured;
@@ -72,20 +78,23 @@ pub fn emit_function(
             "async poll-function ABI (state-machine params)".into(),
         ));
     }
-    if func.takes_region_param() {
-        return Err(WasmError::Unsupported(
-            "region-parameterised variant ABI (hidden region param)".into(),
-        ));
-    }
+
+    // The ABI param count includes the hidden trailing region handle (an `i32`)
+    // when this is a region-parameterised callee variant — mirroring
+    // [`IrFunction::abi_param_count`].  Visible params occupy wasm locals
+    // `0..nparams`; the region param, if any, is the next local and is bound by
+    // [`Inst::RegionParam`].
+    let nparams = func.params.len();
+    let abi_nparams = func.abi_param_count();
+    let region_param_local = func.takes_region_param().then_some(nparams as u32);
 
     // One i32 local per VarId: visible params first (wasm locals 0..n), then the
-    // remaining VarIds as declared locals.
-    let nparams = func.params.len();
+    // hidden region param (if any), then the remaining VarIds as declared locals.
     let mut local_of: HashMap<VarId, u32> = HashMap::new();
     for (i, (_, vid)) in func.params.iter().enumerate() {
         local_of.insert(*vid, i as u32);
     }
-    let mut next_local = nparams as u32;
+    let mut next_local = abi_nparams as u32;
     for v in 0..func.next_var {
         let vid = VarId(v);
         local_of.entry(vid).or_insert_with(|| {
@@ -97,7 +106,7 @@ pub fn emit_function(
     // One extra i32 local, past all VarId locals, holds the scratch-buffer
     // pointer transiently while marshalling an allocation's element array.
     let scratch_local = next_local;
-    let declared = next_local + 1 - nparams as u32;
+    let declared = next_local + 1 - abi_nparams as u32;
 
     let block_of: HashMap<BlockId, usize> = func
         .blocks
@@ -119,6 +128,7 @@ pub fn emit_function(
             block_of: &block_of,
             forward_preds: &forward_preds,
             scratch_local,
+            region_param_local,
             labels: Vec::new(),
             current: func.blocks[0].id,
         };
@@ -133,7 +143,7 @@ pub fn emit_function(
 
     // Assemble.  The main function type goes last; import types were interned
     // during emission.
-    let main_ty = asm.intern_type(vec![WasmValType::I32; nparams], vec![WasmValType::I32]);
+    let main_ty = asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32]);
 
     let mut module = Module::new();
 
@@ -311,6 +321,10 @@ struct Emitter<'a> {
     /// An i32 local (past all VarId locals) that transiently holds the
     /// scratch-buffer pointer while marshalling an allocation's element array.
     scratch_local: u32,
+    /// The wasm local holding the hidden trailing region handle, present iff
+    /// this is a region-parameterised callee variant.  Bound by
+    /// [`Inst::RegionParam`].
+    region_param_local: Option<u32>,
     /// Enclosing control frames; `Some(b)` is a `block`/`loop` labeled `b`,
     /// `None` is an `if`.  Innermost is last.
     labels: Vec<Option<BlockId>>,
@@ -520,6 +534,34 @@ impl Emitter<'_> {
                 self.call_import("rt_alloc_cons")?;
                 self.set(*dst)
             }
+            // ── Region operations ────────────────────────────────────────────
+            Inst::RegionStart(dst) => {
+                // Allocate and activate a bump region; keep its i32 handle.
+                self.call_import(abi::RT_REGION_START)?;
+                self.set(*dst)
+            }
+            Inst::RegionAlloc(dst, region, kind, operands) => {
+                self.emit_region_alloc(*region, *kind, operands)?;
+                self.set(*dst)
+            }
+            Inst::RegionEnd(region) => {
+                // Pop and free the bump region; drop the bridge's i32 result.
+                self.get(*region)?;
+                self.call_import(abi::RT_REGION_END)?;
+                self.ins(&Instruction::Drop);
+                Ok(())
+            }
+            Inst::RegionParam(dst) => {
+                // Bind the caller's region, received as the hidden trailing
+                // function parameter (mirrors `codegen.rs`'s `region_param`).
+                let l = self.region_param_local.ok_or_else(|| {
+                    WasmError::Unsupported(
+                        "RegionParam in a function compiled without a region parameter".into(),
+                    )
+                })?;
+                self.ins(&Instruction::LocalGet(l));
+                self.set(*dst)
+            }
             // Resolved on edges / by terminators.
             Inst::Phi(..) | Inst::Recur(..) | Inst::SourceLoc(..) => Ok(()),
             other => Err(WasmError::Unsupported(format!(
@@ -636,6 +678,72 @@ impl Emitter<'_> {
         }
 
         // bridge(scratch, count)
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I64Const(count as i64));
+        self.call_import(bridge)
+    }
+
+    /// Lower a region-aware allocation (`rt_region_alloc_*`): like
+    /// [`Self::emit_alloc`] but threads the region `handle` as the leading `i32`
+    /// argument — `bridge(handle, ptr, count)` — bump-allocating into the
+    /// caller's arena instead of the GC heap.  Mirrors the native
+    /// `codegen.rs::emit_region_alloc_collection`.  The boxed result is left on
+    /// the operand stack.
+    fn emit_region_alloc(
+        &mut self,
+        region: VarId,
+        kind: RegionAllocKind,
+        operands: &[VarId],
+    ) -> Result<(), WasmError> {
+        let (bridge, count) = match kind {
+            RegionAllocKind::Vector => ("rt_region_alloc_vector", operands.len() as u64),
+            RegionAllocKind::Set => ("rt_region_alloc_set", operands.len() as u64),
+            RegionAllocKind::List => ("rt_region_alloc_list", operands.len() as u64),
+            // `operands` is the flattened [k0, v0, …]; the bridge wants the pair
+            // count (mirrors the native backend's `n / 2`).
+            RegionAllocKind::Map => ("rt_region_alloc_map", (operands.len() / 2) as u64),
+            RegionAllocKind::Cons => {
+                // Two pointer args directly: rt_region_alloc_cons(handle, h, t).
+                // A degenerate cons falls back to nil, as in the native backend.
+                if operands.len() != 2 {
+                    return self.call_import("rt_const_nil");
+                }
+                self.get(region)?;
+                self.get(operands[0])?;
+                self.get(operands[1])?;
+                return self.call_import("rt_region_alloc_cons");
+            }
+        };
+
+        let n = operands.len();
+        if n == 0 {
+            // Empty literal: handle, null array pointer, zero count.
+            self.get(region)?;
+            self.ins(&Instruction::I32Const(0));
+            self.ins(&Instruction::I64Const(count as i64));
+            return self.call_import(bridge);
+        }
+
+        self.asm.needs_memory = true;
+
+        // scratch = rt_scratch_ptr(n * 4) — element pointers are wasm i32s.
+        self.ins(&Instruction::I32Const((n * 4) as i32));
+        self.call_import("rt_scratch_ptr")?;
+        self.ins(&Instruction::LocalSet(self.scratch_local));
+
+        // Store each element pointer at scratch + i*4.
+        for (i, e) in operands.iter().enumerate() {
+            self.ins(&Instruction::LocalGet(self.scratch_local));
+            self.get(*e)?;
+            self.ins(&Instruction::I32Store(MemArg {
+                offset: (i * 4) as u64,
+                align: 2, // 2^2 == 4-byte alignment
+                memory_index: 0,
+            }));
+        }
+
+        // bridge(handle, scratch, count)
+        self.get(region)?;
         self.ins(&Instruction::LocalGet(self.scratch_local));
         self.ins(&Instruction::I64Const(count as i64));
         self.call_import(bridge)
@@ -775,20 +883,108 @@ mod tests {
         validate(&bytes);
     }
 
+    /// A region-parameterised callee variant: `RegionParam` binds the hidden
+    /// trailing handle, and a `RegionAlloc` bump-allocates into it.  The wasm
+    /// signature gains one trailing `i32` (mirroring `abi_param_count`).
     #[test]
-    fn region_variant_is_unsupported() {
-        let mut f = IrFunction::new(Some(Arc::from("rv")), None);
-        let p = f.fresh_var();
-        f.params = vec![(Arc::from("x"), p)];
-        let rp = f.fresh_var();
+    fn region_param_variant_validates() {
+        use crate::ir::RegionAllocKind;
+        let mut f = IrFunction::new(Some(Arc::from("rv__rg")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let rh = f.fresh_var();
+        let v = f.fresh_var();
         let b = f.fresh_block();
         f.blocks.push(Block {
             id: b,
             phis: vec![],
-            insts: vec![Inst::RegionParam(rp)],
-            terminator: Terminator::Return(p),
+            insts: vec![
+                Inst::RegionParam(rh),
+                Inst::RegionAlloc(v, rh, RegionAllocKind::Vector, vec![x]),
+            ],
+            terminator: Terminator::Return(v),
         });
         assert!(f.takes_region_param());
+        assert_eq!(f.abi_param_count(), 2); // x + hidden region handle
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// A function-scoped region (the `optimize.rs` wrap): `RegionStart` opens an
+    /// arena, `RegionAlloc` bump-allocates, `RegionEnd` frees it.  No hidden
+    /// param — the handle is a plain local.
+    #[test]
+    fn function_scoped_region_validates() {
+        use crate::ir::RegionAllocKind;
+        let mut f = IrFunction::new(Some(Arc::from("scoped")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let rh = f.fresh_var();
+        let v = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionStart(rh),
+                Inst::RegionAlloc(v, rh, RegionAllocKind::Vector, vec![x]),
+                Inst::RegionEnd(rh),
+            ],
+            terminator: Terminator::Return(v),
+        });
+        assert!(!f.takes_region_param());
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// Region-allocated map (pair count) and cons (two direct pointer args).
+    #[test]
+    fn region_alloc_map_and_cons_validate() {
+        use crate::ir::RegionAllocKind;
+        let mut f = IrFunction::new(Some(Arc::from("rmc")), None);
+        let k = f.fresh_var();
+        let val = f.fresh_var();
+        f.params = vec![(Arc::from("k"), k), (Arc::from("val"), val)];
+        let rh = f.fresh_var();
+        let m = f.fresh_var();
+        let c = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionStart(rh),
+                // Flattened [k, val]; the bridge receives a pair count of 1.
+                Inst::RegionAlloc(m, rh, RegionAllocKind::Map, vec![k, val]),
+                Inst::RegionAlloc(c, rh, RegionAllocKind::Cons, vec![k, val]),
+                Inst::RegionEnd(rh),
+            ],
+            terminator: Terminator::Return(c),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `CallWithRegion` still needs multi-function module support (resolving the
+    /// callee to a wasm function index), so it remains unsupported for now.
+    #[test]
+    fn call_with_region_is_unsupported() {
+        let mut f = IrFunction::new(Some(Arc::from("caller")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let rh = f.fresh_var();
+        let r = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionStart(rh),
+                Inst::CallWithRegion(r, Arc::from("callee"), vec![x], rh),
+                Inst::RegionEnd(rh),
+            ],
+            terminator: Terminator::Return(r),
+        });
         assert!(matches!(compile(&f), Err(WasmError::Unsupported(_))));
     }
 

@@ -156,7 +156,9 @@ cannot produce) is rejected via an RPO back-edge check.
 Produces real, **`wasmparser`-validated** single-function modules.
 
 - **Value model.** One boxed `i32` local per `VarId`; visible params are wasm
-  locals `0..n`, remaining `VarId`s are declared locals.
+  locals `0..n`, the hidden trailing region param (if any) is next, and the
+  remaining `VarId`s are declared locals. The signature is sized from
+  `IrFunction::abi_param_count`.
 - **Control flow.** The `Structured` tree maps directly: `Labeled`→`block`,
   `Loop`→`loop`, `If`→`if`/`else`, `Br`→`br N` with the depth resolved from a
   stack of enclosing control frames. A GC `rt_safepoint` is emitted at function
@@ -175,8 +177,33 @@ Produces real, **`wasmparser`-validated** single-function modules.
 **Instructions lowered so far:** scalar constants (`nil`/`bool`/`long`/`double`/
 `char`), `LoadLocal` (→ nil, matching the Cranelift backend), folded boxed
 arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`), collection
-allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons`), and all
-control flow. Everything else returns `WasmError::Unsupported`.
+allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons`), region
+operations (`RegionStart`/`RegionAlloc`/`RegionEnd`/`RegionParam`), and all
+control flow. Everything else (calls including `CallWithRegion`, globals/vars,
+string/keyword/symbol constants, async) returns `WasmError::Unsupported`.
+
+### Region operations (`Region*`) — complete
+
+The escape-analysis payoff: a region is a linear-memory bump arena and a region
+handle is an `i32`, so region ops reuse the allocation machinery verbatim with
+the handle threaded as a leading argument (mirrors
+`codegen.rs::emit_region_alloc_collection`):
+
+- `RegionStart`→`rt_region_start` (keep the `i32` handle), `RegionEnd`→
+  `rt_region_end` (the bridge's `i32` result is dropped).
+- `RegionAlloc`→`rt_region_alloc_*` with the handle as the leading `i32`,
+  reusing the `rt_scratch_ptr` element-array marshalling; maps pass the **pair**
+  count, cons passes its two pointers directly, and a degenerate cons falls back
+  to nil.
+- `RegionParam`→bind the **hidden trailing `i32` parameter**.  `emit_function`
+  now sizes the wasm signature from `IrFunction::abi_param_count` (visible params
+  + one trailing `i32` iff `takes_region_param`), reserves that param's local,
+  and `RegionParam` copies it into its `VarId` local.  The
+  `takes_region_param()`→`Unsupported` guard is gone.
+
+`CallWithRegion` is **still** `Unsupported` — it is a direct call by name and so
+needs multi-function module support (item 1 below) to resolve the callee's wasm
+function index.
 
 ### Allocation (`Alloc*`) — complete
 
@@ -198,18 +225,21 @@ marshalled into a runtime-provided scratch buffer, then the slice-taking
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 20 tests:
+`cargo test -p cljrs-compiler wasm::` — 23 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
 - `reloop`: empty/single-return/linear-chain/diamond/loop-with-exit/nested
   sequential merges, each asserting **every block is emitted exactly once**.
 - `emit`: an arithmetic function, an if/else diamond with a merge φ, a loop with
-  a φ counter + conditional `recur`, and collection allocation (a two-element
+  a φ counter + conditional `recur`, collection allocation (a two-element
   vector exercising the scratch buffer + imported memory, an empty vector, a
-  one-pair map, and a cons) — each **validated with `wasmparser`**; plus
-  `Unsupported` coverage for region variants and un-lowered instructions, and the
-  typed-signature accounting.
+  one-pair map, and a cons), and region operations (a region-parameterised
+  callee variant binding the hidden trailing param, a function-scoped
+  `RegionStart`/`RegionAlloc`/`RegionEnd`, and a region map + cons) — each
+  **validated with `wasmparser`**; plus `Unsupported` coverage for
+  `CallWithRegion` and un-lowered instructions, and the typed-signature
+  accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -218,21 +248,12 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 ## What is next
 
-Ordered by value. Allocation (the gateway item, now **done** — see the
-"Allocation" section above) made real collection-building functions compilable
-and introduced the linear-memory import + scratch-buffer machinery that the
-region path reuses.
+Ordered by value. Allocation and region operations (now **done** — see those
+sections above) made real collection-building and arena-allocating functions
+compilable; region ops in particular reuse the linear-memory import +
+scratch-buffer machinery the allocation item introduced.
 
-### 1. Region operations
-
-Now that the scratch/memory machinery exists, region ops are mechanical and
-unlock the escape-analysis payoff. Lower `RegionStart`/`RegionAlloc`/`RegionEnd`
-to the `rt_region_*` imports, and `RegionParam`/`CallWithRegion` to the hidden
-trailing-`i32` ABI (see `abi.rs`). Then drop the
-`takes_region_param()`→`Unsupported` guard in `emit_function`. This needs
-multi-function support (item 2) for `CallWithRegion`.
-
-### 2. Calls and multi-function modules
+### 1. Calls and multi-function modules
 
 `CallDirect` (same-module direct call), `Call` (dynamic, via the
 `rt_call_ic` inline-cache bridge), `CallWithRegion`. Requires compiling a
@@ -244,7 +265,7 @@ bodies, and resolves `CallDirect` targets to those indices. Closures
 `rt_make_fn*`). Cross-function tail calls use the wasm tail-call proposal
 (`return_call`) when `WasmBackend::tail_calls`, else a trampoline.
 
-### 3. Constants needing a data segment
+### 2. Constants needing a data segment
 
 `Const::Str` / `Const::Keyword` / `Const::Symbol`. Emit the UTF-8 bytes into a
 **data segment** and pass `(ptr, len)` to `rt_const_string`/`_keyword`/`_symbol`
@@ -252,20 +273,20 @@ bodies, and resolves `CallDirect` targets to those indices. Closures
 coordinated with the runtime's linear-memory layout — decide whether the
 emitter owns a rodata region or the runtime reserves one.
 
-### 4. Globals / vars
+### 3. Globals / vars
 
 `LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
 follow `codegen.rs::emit_load_global` / `emit_def_var`. Needs the name-as-data
-machinery from (3) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
+machinery from (2) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
 
-### 5. Exceptions
+### 4. Exceptions
 
 `Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
 (`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
 `rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
 `rt_try` checking the thread-local).
 
-### 6. Unboxed specialization
+### 5. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -273,7 +294,7 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 7. CLI + bundling
+### 6. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the

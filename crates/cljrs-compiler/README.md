@@ -69,9 +69,13 @@ swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
 folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`),
 collection allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/
 `AllocCons` — element arrays marshalled through an imported linear memory and the
-`rt_scratch_ptr` buffer), and all control flow. Calls, globals, string/keyword/
-symbol constants, and the region/async ABIs return `Unsupported` — the next
-lowering increments.
+`rt_scratch_ptr` buffer), region operations (`RegionStart`/`RegionAlloc`/
+`RegionEnd` → the `rt_region_*` bridges with the handle as a leading `i32`, and
+`RegionParam` → the hidden trailing-`i32` param, sizing the signature from
+`IrFunction::abi_param_count`), and all control flow. Calls (including
+`CallWithRegion`, which needs multi-function modules), globals, string/keyword/
+symbol constants, and the async ABI return `Unsupported` — the next lowering
+increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
