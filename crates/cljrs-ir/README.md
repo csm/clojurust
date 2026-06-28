@@ -190,6 +190,18 @@ is structural control flow — values rebind at the loop header without
 leaving the function — and it's what allows a loop-local empty vector
 to reach `NoEscape` and get promoted to a region.
 
+### Element extraction aliases its source
+
+`known_fn_arg_escapes` reports that `First`, `Nth`, `NthLenient`, and
+`Peek` let arg 0 (the collection) escape into their return value.  This
+is because the runtime bridges (`rt_first`/`rt_nth`/`rt_peek`) return an
+*interior pointer* into the collection's storage rather than a freshly
+boxed element — so the returned value shares the collection's lifetime.
+If the extracted element escapes, the collection must be considered
+escaping too; otherwise it could be region-promoted and freed while the
+interior pointer is still live (use-after-free).  `Get` is exempt: its
+bridge clones the value out, so its result does not alias the source.
+
 ### Region allocation
 
 `RegionAllocKind`: `Vector`, `Map`, `Set`, `List`, `Cons`

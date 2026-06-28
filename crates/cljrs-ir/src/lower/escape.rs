@@ -64,11 +64,20 @@ pub struct UseInfo {
 pub(crate) fn known_fn_arg_escapes(func: &KnownFn, arg_index: usize) -> bool {
     use KnownFn::*;
     match func {
-        // Non-escaping: predicates, arithmetic, I/O, lookups that return elements
-        Get | Nth | NthLenient | Count | CountFilter | Contains | First | Add | Sub | Mul | Div
-        | Rem | Eq | Lt | Gt | Lte | Gte | IsNil | IsSeq | IsVector | IsMap | IsEmpty | Peek
-        | Identical | IsNumber | IsString | IsKeyword | IsSymbol | IsBool | IsInt | Str | Deref
-        | AtomDeref | Println | Pr | Prn | Print => false,
+        // Non-escaping: predicates, arithmetic, I/O, lookups that return a
+        // freshly boxed/copied element (`Get` clones the value out).
+        Get | Count | CountFilter | Contains | Add | Sub | Mul | Div | Rem | Eq | Lt | Gt | Lte
+        | Gte | IsNil | IsSeq | IsVector | IsMap | IsEmpty | Identical | IsNumber | IsString
+        | IsKeyword | IsSymbol | IsBool | IsInt | Str | Deref | AtomDeref | Println | Pr | Prn
+        | Print => false,
+
+        // These return an *interior pointer* aliasing arg 0's storage
+        // (`rt_first`/`rt_nth`/`rt_peek` hand back `&elem` into the vector/leaf,
+        // not a fresh box).  The returned element therefore shares the
+        // collection's lifetime: if it escapes, arg 0 must be treated as
+        // escaping too, or arg 0 could be region-allocated and freed while the
+        // interior pointer is still live (use-after-free / heap corruption).
+        First | Nth | NthLenient | Peek => arg_index == 0,
 
         // These return a modified copy of arg 0 → arg 0 escapes; others don't
         Dissoc | Disj => arg_index == 0,

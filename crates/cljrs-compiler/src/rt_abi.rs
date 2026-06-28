@@ -1659,8 +1659,8 @@ pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) };
-    match coll {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
         // Return interior pointer for Vector — no alloc needed.
         Value::Vector(v) => match v.get().nth(0) {
             Some(val) => val as *const Value,
@@ -1668,7 +1668,20 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
         },
         Value::List(l) => box_or_intern_val(l.get().first().cloned().unwrap_or(Value::Nil)),
         Value::Cons(c) => box_or_intern_val(c.get().head.clone()),
-        _ => intern_nil(),
+        Value::Nil => intern_nil(),
+        // Lazy sequences: realize one step, then take the first of that.
+        Value::LazySeq(ls) => {
+            let realized = box_val(ls.get().realize());
+            unsafe { rt_first(realized) }
+        }
+        // Other seqables (String, Map, Set): `seq` them into a List first, then
+        // take the first.  `rt_first` here only ever recurses onto Nil/List, so
+        // there is no unbounded recursion.  Without this arm, `(first "ab")`,
+        // `(first {:a 1})`, etc. wrongly returned nil in compiled code.
+        _ => {
+            let seqd = unsafe { rt_seq(coll) };
+            unsafe { rt_first(seqd) }
+        }
     }
 }
 
@@ -1678,8 +1691,8 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
-    let coll = unsafe { val_ref(coll) };
-    match coll {
+    let coll_ref = unsafe { val_ref(coll) };
+    match coll_ref {
         Value::List(l) => {
             let rest = (*l.get().rest()).clone();
             box_coll_val(Value::List(alloc_inner_coll(rest)))
@@ -1695,7 +1708,22 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
             }
         }
         Value::Cons(c) => box_coll_val(c.get().tail.clone()),
-        _ => box_coll_val(Value::List(alloc_inner_coll(PersistentList::empty()))),
+        // `(rest nil)` / `(rest <empty>)` is the empty seq, never nil.
+        Value::Nil => box_coll_val(Value::List(alloc_inner_coll(PersistentList::empty()))),
+        // Lazy sequences: realize one step, then take the rest of that.
+        Value::LazySeq(ls) => {
+            let realized = box_val(ls.get().realize());
+            unsafe { rt_rest(realized) }
+        }
+        // Other seqables (String, Map, Set): `seq` them into a List first, then
+        // take the rest.  `rt_seq` returns Nil for empty (handled above) or a
+        // List, so recursion is bounded.  Without this arm, `(rest "abc")`
+        // wrongly returned `()` in compiled code — which broke tools.cli's
+        // clumped-short-option loop `(loop [... [c & cs] (rest car)] ...)`.
+        _ => {
+            let seqd = unsafe { rt_seq(coll) };
+            unsafe { rt_rest(seqd) }
+        }
     }
 }
 
