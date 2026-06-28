@@ -884,6 +884,55 @@ fn test_next_returns_nil_when_exhausted() {
     );
 }
 
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_first_rest_on_string() {
+    // `first`/`rest`/`next` must work on seqable values that aren't already
+    // seqs — strings, maps, sets.  Regression: `rt_first`/`rt_rest` only handled
+    // Vector/List/Cons and fell through to nil / empty-seq for everything else,
+    // so `(first "abc")` was nil and `(rest "abc")` was `()`.  tools.cli's
+    // clumped-short-option scanner walks `(rest car)` over the option string, so
+    // this silently produced bogus tokens (and downstream crashes) in AOT.
+    assert_output(
+        "first_rest_string",
+        r#"
+(println (first "abc"))
+(println (rest "abc"))
+(println (next "a"))
+(println (apply str (map (fn [c] (str \- c)) "xy")))
+(println (first {:a 1}))
+(println (first #{:only}))
+"#,
+        "a\n(b c)\nnil\n-x-y\n[:a 1]\n:only",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_loop_destructure_extracted_element_escapes() {
+    // A vector destructured in a loop body whose extracted element is carried
+    // across the back edge via `recur`.  Regression: vector lookups
+    // (`first`/`nth`, hence destructuring) return an *interior pointer* into the
+    // vector's storage, and escape analysis treated those lookups as
+    // non-aliasing.  The temporary `[nil cdr]` vector was region-promoted and
+    // freed at the end of each iteration, leaving the recur-carried element
+    // dangling — heap corruption / wrong results.  This mirrors tools.cli's
+    // `tokenize-args` long-option branch.
+    assert_output(
+        "loop_destructure_escape",
+        r#"
+(defn run [args]
+  (loop [acc [] [car & cdr] args]
+    (if car
+      (let [[_ rst] [nil cdr]]
+        (recur (conj acc car) rst))
+      acc)))
+(println (run ["a" "b" "c"]))
+"#,
+        "[a b c]",
+    );
+}
+
 // ── Protocols & multimethods ──────────────────────────────────────────────
 
 #[test]
