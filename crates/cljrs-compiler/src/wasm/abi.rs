@@ -127,6 +127,37 @@ pub const FUNC_TABLE_BASE: u32 = 0;
 /// validation-time placeholder.
 pub const RODATA_BASE: u32 = 0;
 
+/// The linear-memory and table base addresses the AOT module installs its
+/// read-only data pool and functions at — the two coordination points with the
+/// runtime's actual `wasm32-unknown-unknown` layout.
+///
+/// The emitter owns a rodata region `[rodata_base, …)` in the runtime's imported
+/// memory and a function-table region `[func_table_base, …)` in the runtime's
+/// imported indirect function table; both must be addresses the runtime has
+/// reserved.  Until the module is linked against the runtime these are unknown,
+/// so [`Default`] uses the [`RODATA_BASE`] / [`FUNC_TABLE_BASE`]
+/// validation-time placeholders — a validated module is structurally correct at
+/// any base.  The CLI/bundling step (`compile_file_to_wasm`) threads the
+/// runtime's real reserved bases here once they are known, *finalizing* the two
+/// `0` placeholders the plan tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmLayout {
+    /// Base offset of the read-only data pool in the runtime's linear memory.
+    pub rodata_base: u32,
+    /// Base slot of the AOT functions in the runtime's shared indirect function
+    /// table.
+    pub func_table_base: u32,
+}
+
+impl Default for WasmLayout {
+    fn default() -> Self {
+        WasmLayout {
+            rodata_base: RODATA_BASE,
+            func_table_base: FUNC_TABLE_BASE,
+        }
+    }
+}
+
 /// The subset of the `rt_abi` bridge the scaffold wires as wasm imports.
 ///
 /// This is the contract, not the whole table: it covers safepoints, constant

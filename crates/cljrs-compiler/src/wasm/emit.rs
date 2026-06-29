@@ -321,7 +321,7 @@ pub fn emit_bundle(
             EntityType::Table(TableType {
                 element_type: RefType::FUNCREF,
                 table64: false,
-                minimum: abi::FUNC_TABLE_BASE as u64 + n as u64,
+                minimum: cfg.layout.func_table_base as u64 + n as u64,
                 maximum: None,
                 shared: false,
             }),
@@ -355,7 +355,7 @@ pub fn emit_bundle(
         let mut elements = ElementSection::new();
         elements.active(
             Some(0),
-            &ConstExpr::i32_const(abi::FUNC_TABLE_BASE as i32),
+            &ConstExpr::i32_const(cfg.layout.func_table_base as i32),
             Elements::Functions(Cow::Owned(func_indices)),
         );
         module.section(&elements);
@@ -374,7 +374,7 @@ pub fn emit_bundle(
         let mut data = DataSection::new();
         data.active(
             0,
-            &ConstExpr::i32_const(abi::RODATA_BASE as i32),
+            &ConstExpr::i32_const(cfg.layout.rodata_base as i32),
             asm.rodata.iter().copied(),
         );
         module.section(&data);
@@ -1373,7 +1373,9 @@ impl Emitter<'_> {
         // The pool lives in the runtime's imported linear memory.
         self.asm.needs_memory = true;
         let off = self.asm.intern_rodata(s.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + off) as i32,
+        ));
         self.ins(&Instruction::I64Const(s.len() as i64));
         self.call_import(bridge)
     }
@@ -1384,10 +1386,14 @@ impl Emitter<'_> {
     fn push_name_args(&mut self, ns: &str, name: &str) {
         self.asm.needs_memory = true;
         let ns_off = self.asm.intern_rodata(ns.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + ns_off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + ns_off) as i32,
+        ));
         self.ins(&Instruction::I64Const(ns.len() as i64));
         let name_off = self.asm.intern_rodata(name.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + name_off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + name_off) as i32,
+        ));
         self.ins(&Instruction::I64Const(name.len() as i64));
     }
 
@@ -1599,7 +1605,7 @@ impl Emitter<'_> {
     fn resolve_table_index(&self, name: &str) -> Result<u32, WasmError> {
         self.func_index_of
             .get(name)
-            .map(|pos| abi::FUNC_TABLE_BASE + pos)
+            .map(|pos| self.cfg.layout.func_table_base + pos)
             .ok_or_else(|| {
                 WasmError::Unsupported(format!("closure arity function not in bundle: {name}"))
             })
@@ -2038,6 +2044,42 @@ mod tests {
             }
         }
         0
+    }
+
+    /// The `i32` offset of the (single) active data segment, or `None`.
+    fn data_segment_offset(bytes: &[u8]) -> Option<i32> {
+        use wasmparser::{DataKind, Operator, Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::DataSection(reader)) = payload {
+                for d in reader.into_iter().flatten() {
+                    if let DataKind::Active { offset_expr, .. } = d.kind
+                        && let Ok(Operator::I32Const { value }) =
+                            offset_expr.get_operators_reader().read()
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The `i32` offset of the (single) active element segment, or `None`.
+    fn element_segment_offset(bytes: &[u8]) -> Option<i32> {
+        use wasmparser::{ElementKind, Operator, Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::ElementSection(reader)) = payload {
+                for e in reader.into_iter().flatten() {
+                    if let ElementKind::Active { offset_expr, .. } = e.kind
+                        && let Ok(Operator::I32Const { value }) =
+                            offset_expr.get_operators_reader().read()
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// `(fn [x] (+ x 1))`-shaped IR: one block, a constant, an add, a return.
@@ -3063,6 +3105,7 @@ mod tests {
         let cfg = WasmBackend {
             tail_calls: true,
             exceptions: true,
+            ..WasmBackend::default()
         };
         let on = super::super::compile_bundle(&[&caller, &callee], &cfg).expect("emit");
         validate(&on);
@@ -3071,6 +3114,7 @@ mod tests {
         let cfg_off = WasmBackend {
             tail_calls: false,
             exceptions: true,
+            ..WasmBackend::default()
         };
         let off = super::super::compile_bundle(&[&caller, &callee], &cfg_off).expect("emit");
         validate(&off);
@@ -3234,6 +3278,7 @@ mod tests {
             &WasmBackend {
                 tail_calls: false,
                 exceptions: true,
+                ..WasmBackend::default()
             },
         )
         .expect("emit");
@@ -3302,5 +3347,60 @@ mod tests {
         validate(&bytes);
         assert_eq!(defined_function_count(&bytes), 3);
         assert!(imports_rt(&bytes, "rt_coerce_long"));
+    }
+
+    // ── Configurable memory / table layout (item 2) ──────────────────────────
+
+    /// A non-default [`abi::WasmLayout`] relocates the read-only data pool and the
+    /// function-table element segment to the runtime's reserved bases — the
+    /// CLI/bundling step's "finalize `RODATA_BASE`/`FUNC_TABLE_BASE`" knob.  A
+    /// function that returns a string constant (rodata) and a closure (table)
+    /// exercises both segments.
+    #[test]
+    fn custom_layout_relocates_data_and_element_segments() {
+        let mut inner = IrFunction::new(Some(Arc::from("inner")), None);
+        let iy = inner.fresh_var();
+        inner.params = vec![(Arc::from("y"), iy)];
+        let ib = inner.fresh_block();
+        inner.blocks.push(Block {
+            id: ib,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(iy),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("outer")), None);
+        let ox = outer.fresh_var();
+        outer.params = vec![(Arc::from("x"), ox)];
+        let s = outer.fresh_var();
+        let clo = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(s, Const::Str(Arc::from("hi"))),
+                Inst::AllocClosure(clo, template("inner", &["inner"], &[1], &[false]), vec![ox]),
+            ],
+            terminator: Terminator::Return(clo),
+        });
+        outer.subfunctions.push(inner);
+
+        let cfg = WasmBackend {
+            layout: abi::WasmLayout {
+                rodata_base: 0x1_0000,
+                func_table_base: 100,
+            },
+            ..WasmBackend::default()
+        };
+        let bytes = super::super::compile_bundle(&[&outer], &cfg).expect("emit bundle");
+        validate(&bytes);
+        assert_eq!(data_segment_offset(&bytes), Some(0x1_0000));
+        assert_eq!(element_segment_offset(&bytes), Some(100));
+
+        // The default layout keeps both at the `0` placeholders.
+        let def = super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit");
+        assert_eq!(data_segment_offset(&def), Some(0));
+        assert_eq!(element_segment_offset(&def), Some(0));
     }
 }

@@ -427,33 +427,62 @@ internal body is still unboxed); the caller-side path is left for later.
 The driver that turns a source file into a `.wasm` artifact:
 
 - **`aot::compile_file_to_wasm(src, out, src_dirs)`** lowers the entry namespace
-  to IR (`lower_file_to_ir`: parse → macro-expand → ANF/region optimization),
-  runs `optimize_direct_calls` (so same-unit calls bind to wasm function indices
-  rather than dispatching through `rt_call`), then drives
-  `wasm::compile_bundle(&[&ir_func], …)` over the entry function + its flattened
-  subfunctions and writes the validated bytes. A new `AotError::Wasm(WasmError)`
-  surfaces backend errors.
+  **and its transitively-required user namespaces** to a bundle of IR functions
+  (`lower_file_to_ir_bundle`: parse → macro-expand → per-namespace discovery →
+  ANF/region optimization), runs `optimize_direct_calls` on each (so same-unit
+  calls bind to wasm function indices rather than dispatching through `rt_call`),
+  then drives `wasm::compile_bundle(&refs, …)` over the entry function, each
+  namespace initializer, and their flattened subfunctions, writing the validated
+  bytes. A new `AotError::Wasm(WasmError)` surfaces backend errors.
 - **CLI**: `cljrs compile <file> --target wasm -o <out>.wasm`. `--target`
   (default `native`) selects the backend; `--target wasm` with `--test` is
   rejected (no wasm test harness yet), and an unknown target errors cleanly.
 - **End-to-end tests** (`crates/cljrs-compiler/tests/wasm_compile.rs`): a file of
-  simple `defn`s and a `loop`/`recur` accumulator each compile through the full
-  front-end and **validate with `wasmparser`** — the loop test surfaced (and
-  fixed) a φ parallel-move bug where a boxed φ destination with an unboxed `i64`
-  entry was copied without boxing.
+  simple `defn`s, a `loop`/`recur` accumulator, and a program that `require`s a
+  second user namespace each compile through the full front-end and **validate
+  with `wasmparser`** — the cross-namespace test asserts the dependency's
+  `__cljrs_ns_init_0` initializer is bundled + exported alongside `__cljrs_main`,
+  and the loop test surfaced (and fixed) a φ parallel-move bug where a boxed φ
+  destination with an unboxed `i64` entry was copied without boxing.
 
-**What remains (the actual *bundling*):** the emitted module's `"rt"` imports
-(the `rt_abi` bridges, linear memory, the shared function table) must be
-satisfied by the runtime compiled to `wasm32-unknown-unknown` (the `cljrs-wasm`
-crate already builds the interpreter to that target). Linking the two — and
-wiring the **IR interpreter in as the dynamic-code tier** — is where
-`abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` are finalized against the runtime's
-real linear-memory / table layout. Cross-namespace dependencies are not yet
-bundled (only the entry namespace's functions are emitted).
+### Cross-namespace bundling + configurable layout (`lower_file_to_ir_bundle`, `abi::WasmLayout`) — complete
+
+Two of the three "runtime linking + bundling" pieces are compiler-side and now
+done:
+
+- **Whole-program bundling.** `compile_file_to_wasm` mirrors `compile_file`'s
+  per-namespace initializer discovery (`discover_bundled_sources` →
+  `lower_namespace`): every transitively-`require`d user namespace the backend
+  can lower becomes a `__cljrs_ns_init_N` function in the same module (its
+  subfunctions flattened in). A namespace that cannot be lowered/codegen'd is
+  **skipped**, left for the runtime's IR-interpreter tier — the same graceful
+  degradation the native path uses. Subfunction names are globally unique
+  (`GLOBAL_NAME_CTR`), so there are no collisions across the bundle.
+- **Configurable bases.** `abi::WasmLayout { rodata_base, func_table_base }`
+  (carried on `WasmBackend`, `Default` = the `0` placeholders) replaces the
+  hardcoded `RODATA_BASE` / `FUNC_TABLE_BASE` constants throughout the emitter
+  (the data-segment offset, the element-segment offset + table minimum, the
+  string-constant `(ptr,len)` pairs, and the closure table slots). The
+  CLI/linking step overrides them with the runtime's actually-reserved bases once
+  that layout is known — *finalizing* the two placeholders the plan tracked. A
+  unit test relocates both segments to a non-zero layout and reads the offsets
+  back out of the validated module.
+
+**What remains (the runtime-side step):** the emitted module's `"rt"` imports
+(the `rt_abi` bridges, linear memory, the shared `__indirect_function_table`)
+must be satisfied by the runtime compiled to `wasm32-unknown-unknown` (the
+`cljrs-wasm` crate already builds the interpreter to that target). That requires
+the runtime to **export** the `rt_abi` surface, its memory, and its table, then a
+host (JS) that instantiates the runtime and instantiates the AOT module against
+those exports — reserving `[rodata_base, …)` / `[func_table_base, …)` and passing
+the concrete bases through `WasmLayout`. **Wiring the IR interpreter in as the
+dynamic-code tier** (so a skipped namespace and `eval`/REPL still run) lands in
+the same step. This is genuinely runtime-side integration, not a compiler
+increment, and is the last open item.
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 46 tests:
+`cargo test -p cljrs-compiler wasm::` — 52 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -489,11 +518,19 @@ bundled (only the entry namespace's functions are emitted).
   double addition, a loop accumulator whose `0`-seeded counter infers unboxed
   `Long` so the `+`s lower to checked `i64.add` while `(< i n)` against the boxed
   param stays on `rt_lt`, and a checked long `*` demoting to the boxed `rt_mul` —
-  each asserting the expected operator's presence/absence via `wasmparser`) — each
-  **validated with `wasmparser`**; plus end-to-end CLI coverage in
-  `tests/wasm_compile.rs` (a `defn` file and a `loop`/`recur` accumulator driven
-  through `compile_file_to_wasm` and `wasmparser`-validated), and `Unsupported`
-  coverage for an unbundled
+  each asserting the expected operator's presence/absence via `wasmparser`), and
+  the **typed parameter ABI** (a `^long` and a `^double` param each emitting a
+  trampoline + typed body — asserting two defined functions and the
+  `rt_coerce_long`/`rt_coerce_double` import — the trampoline's `return_call`
+  toggling with `tail_calls`, a non-typed function staying a single boxed body,
+  and a boxed caller reaching a typed callee through its trampoline), and the
+  **configurable layout** (a non-default `WasmLayout` relocating the data and
+  element segments, read back out of the validated module) — each **validated
+  with `wasmparser`**; plus end-to-end CLI coverage in `tests/wasm_compile.rs` (a
+  `defn` file, a `loop`/`recur` accumulator, and a program that `require`s a
+  second namespace — asserting the dependency's `__cljrs_ns_init_0` initializer is
+  bundled + exported — each driven through `compile_file_to_wasm` and
+  `wasmparser`-validated), and `Unsupported` coverage for an unbundled
   direct-call target, an out-of-bundle closure arity, and un-lowered
   instructions, and the closure-constructor import / typed-signature accounting.
 
@@ -507,26 +544,31 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 Ordered by value. Allocation, region operations, calls / multi-function modules,
 closures + the function table + cross-function tail calls, string / keyword /
 symbol constants, globals / vars, exceptions, unboxed scalar values, the
-**typed parameter ABI**, and the **CLI front-end** (`cljrs compile --target
-wasm`, emitting the entry namespace's module) are now **done** — see those
-sections above. The remaining work is making the emitted module *runnable*:
-linking it against the `wasm32-unknown-unknown` runtime.
+**typed parameter ABI**, the **CLI front-end** (`cljrs compile --target wasm`),
+and **cross-namespace bundling + the configurable memory/table layout**
+(`abi::WasmLayout`) are now **done** — see those sections above. The one
+remaining item is runtime-side: making the emitted module *runnable* by linking
+it against the `wasm32-unknown-unknown` runtime.
 
-### 1. Runtime linking + bundling (follow-up to the CLI front-end)
+### 1. Runtime linking (the last, runtime-side step)
 
-The CLI now emits the entry namespace's AOT module (`compile_file_to_wasm`,
-above); the remaining work is to make it *runnable*:
+The compiler now emits a whole-program AOT module
+(`compile_file_to_wasm`: entry namespace + every lowerable required namespace's
+initializer) whose memory/table bases are `WasmLayout`-configurable. What remains
+is genuinely **runtime-side**, not a compiler increment:
 
-- **Link with the runtime** compiled to `wasm32-unknown-unknown` (the
-  `cljrs-wasm` crate already builds the interpreter to that target) so the
-  emitted module's `"rt"` imports — the `rt_abi` bridges, linear memory, and the
-  shared `__indirect_function_table` — are satisfied, and **finalize**
-  `abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` against the runtime's actual
-  linear-memory / table layout (they are `0` placeholders today).
+- **Make the runtime export the `"rt"` surface.** The emitted module imports the
+  `rt_abi` bridges, linear memory, and the shared `__indirect_function_table`
+  from module `"rt"`. The `cljrs-wasm` crate builds the interpreter to
+  `wasm32-unknown-unknown`, but does not yet *export* the `rt_abi` functions (they
+  live in `cljrs-compiler::rt_abi`, a host-side crate) or reserve table/memory
+  regions for the AOT bundle. Exposing them — and a host (JS) that instantiates
+  the runtime, then instantiates the AOT module against the runtime's exports,
+  reserving `[rodata_base, …)` / `[func_table_base, …)` and passing the concrete
+  bases through `WasmLayout` — is the open work.
 - **Wire the IR interpreter in as the dynamic-code tier** (drop the JIT/OSR hooks
-  in-sandbox) so `eval`/REPL/freshly-required namespaces still run.
-- **Bundle whole programs** (cross-namespace dependencies), not just the entry
-  namespace — mirroring `compile_file`'s per-namespace initializer discovery.
+  in-sandbox) so `eval`/REPL/freshly-required namespaces — and any namespace the
+  bundler skipped — still run.
 
 ### Deferred indefinitely
 
