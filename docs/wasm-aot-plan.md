@@ -381,11 +381,46 @@ instead of the heap-allocating boxed bridges.
   `codegen.rs::emit_long_overflow_check`. `rt_overflow_error` was added to
   `RT_IMPORTS`.
 - **Demoted / deferred.** Checked long `*` (wasm has no `i64.mul_hi` for the
-  128-bit overflow check) is demoted to the boxed `rt_mul`. **Parameters keep the
-  boxed ABI** — the signature stays all-`i32`. The typed-parameter ABI (unboxed
-  params + entry guards, `function_signature`) is deferred: it interacts with
-  dynamic dispatch (`rt_call` is boxed) and cross-function calls, each of which
-  would need a boxed-entry trampoline + guard story AOT-wasm doesn't yet have.
+  128-bit overflow check) is demoted to the boxed `rt_mul`. The typed-parameter
+  ABI (unboxed *params* aligned with `function_signature`) landed in the **Typed
+  parameter ABI** increment below.
+
+### Typed parameter ABI (`is_typed`, `emit_trampoline`) — complete
+
+The optimization that aligns a function's wasm *signature* with its static
+`^long`/`^double` parameter hints, so a hinted param arrives unboxed
+(`i64`/`f64`) instead of as a boxed `i32` the body re-unboxes on every use:
+
+- **Two functions per typed function.** A function with a non-boxed
+  `seed_repr` (`is_typed`) compiles to a **typed body** — its signature is
+  `function_signature(func)`, the hinted params are unboxed, and inference is
+  seeded with `seed_reprs` so the param `VarId`s carry their unboxed repr — plus
+  a boxed-entry **trampoline** (`emit_trampoline`) with the all-`i32` signature
+  every dispatcher expects.
+- **The trampoline is the primary entry.** It occupies the same wasm index a
+  non-typed function would (exported under the function name, installed in the
+  shared table, and the target of every `CallDirect`), so all the always-boxed
+  dispatch paths — dynamic `rt_call`, indirect closure calls, cross-function
+  direct calls — reach a typed function **unchanged**. The trampoline coerces
+  each boxed argument (`rt_coerce_long`/`rt_coerce_double`, new `rt_abi`
+  bridges), threads the hidden trailing region handle through verbatim, and
+  `return_call`s the body (or plain `call`+return with `tail_calls` off). The
+  typed bodies are appended after the `n` primaries, so primary indices, table
+  slots, and exports are untouched.
+- **Coerce, don't deopt.** The native backend's prologue guards each spec'd
+  param's tag and returns the deopt sentinel on mismatch; AOT-wasm has no
+  in-sandbox deopt seam, so a violated static hint **coerces** the number (or
+  throws via the thread-local pending-exception slot for a non-number), matching
+  Clojure's `longCast`/`doubleCast` semantics for type-hinted params.
+- **`refine_reprs`** now takes a `keep_params` set so a typed param (which has no
+  def site and would otherwise be demoted back to boxed) stays unboxed, keeping
+  its repr and its wasm local type in lock-step.
+
+**What remains (a follow-up optimization):** a same-bundle `CallDirect` whose
+caller can supply the argument already unboxed could target the typed body
+directly, skipping the trampoline's coerce round-trip for the caller-side win.
+Today every direct call goes through the boxed trampoline (correct, and the
+internal body is still unboxed); the caller-side path is left for later.
 
 ### CLI front-end (`compile_file_to_wasm`, `cljrs compile --target wasm`) — complete (module emission)
 
@@ -471,23 +506,13 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
 closures + the function table + cross-function tail calls, string / keyword /
-symbol constants, globals / vars, exceptions, unboxed scalar values, and the
-**CLI front-end** (`cljrs compile --target wasm`, emitting the entry namespace's
-module) are now **done** — see those sections above. The remaining work is making
-the emitted module *runnable* (linking it against the `wasm32-unknown-unknown`
-runtime) and the typed-parameter ABI optimization.
+symbol constants, globals / vars, exceptions, unboxed scalar values, the
+**typed parameter ABI**, and the **CLI front-end** (`cljrs compile --target
+wasm`, emitting the entry namespace's module) are now **done** — see those
+sections above. The remaining work is making the emitted module *runnable*:
+linking it against the `wasm32-unknown-unknown` runtime.
 
-### 1. Unboxed parameter ABI (follow-up to unboxed scalars)
-
-Unboxed scalars currently cover **intermediate** values only; parameters keep the
-boxed (all-`i32`) ABI. Aligning the signature with `function_signature` (unboxed
-`Long`/`Double` params) needs a boxed-entry trampoline so dynamic dispatch
-(`rt_call`, always boxed) and cross-function callers can still reach the function,
-plus an entry guard story (the native backend's `compile_function_with_specs`
-guards + deopts; AOT-wasm has no deopt seam, so a violated static hint would
-coerce or throw). An optimization on top of the existing internal unboxing.
-
-### 2. Runtime linking + bundling (follow-up to the CLI front-end)
+### 1. Runtime linking + bundling (follow-up to the CLI front-end)
 
 The CLI now emits the entry namespace's AOT module (`compile_file_to_wasm`,
 above); the remaining work is to make it *runnable*:

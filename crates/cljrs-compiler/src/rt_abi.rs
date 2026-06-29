@@ -4257,6 +4257,8 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_value_tag as *const () as usize);
     std::hint::black_box(rt_unbox_long as *const () as usize);
     std::hint::black_box(rt_unbox_double as *const () as usize);
+    std::hint::black_box(rt_coerce_long as *const () as usize);
+    std::hint::black_box(rt_coerce_double as *const () as usize);
     std::hint::black_box(rt_box_bool as *const () as usize);
     std::hint::black_box(rt_deopt as *const () as usize);
     std::hint::black_box(rt_kw_ic_fill as *const () as usize);
@@ -4314,6 +4316,53 @@ pub unsafe extern "C" fn rt_unbox_double(v: *const Value) -> f64 {
     match unsafe { val_ref(v) } {
         Value::Double(n) => *n,
         _ => 0.0,
+    }
+}
+
+/// Coerce a boxed value to a primitive `i64` for a `^long`-hinted parameter.
+///
+/// Mirrors Clojure's `RT/longCast`: a `Long` passes through, a `Double`
+/// truncates toward zero, and a non-number raises a cast exception via the
+/// pending-exception slot (returning `0`).  The AOT-wasm boxed-entry trampoline
+/// calls this to honor a static `^long` hint: its callers are always boxed
+/// (dynamic dispatch through `rt_call`, indirect calls through the shared
+/// table, cross-function `CallDirect`) and so cannot supply an unboxed argument
+/// the typed body expects.  Unlike the native backend there is no deopt seam in
+/// the sandbox, so a violated hint coerces or throws rather than re-dispatching
+/// at Tier 1.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_coerce_long(v: *const Value) -> i64 {
+    match unsafe { val_ref(v) } {
+        Value::Long(n) => *n,
+        Value::Double(f) => *f as i64,
+        _ => {
+            throw_str("cannot coerce value to long".to_string());
+            0
+        }
+    }
+}
+
+/// Coerce a boxed value to a primitive `f64` for a `^double`-hinted parameter.
+///
+/// Mirrors Clojure's `RT/doubleCast`: a `Double` passes through, a `Long` is
+/// widened, and a non-number raises a cast exception via the pending-exception
+/// slot (returning `0.0`).  The companion to [`rt_coerce_long`] for the
+/// boxed-entry trampoline; see its docs for the AOT-wasm rationale.
+///
+/// # Safety
+/// `v` must be a valid `*const Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_coerce_double(v: *const Value) -> f64 {
+    match unsafe { val_ref(v) } {
+        Value::Double(f) => *f,
+        Value::Long(n) => *n as f64,
+        _ => {
+            throw_str("cannot coerce value to double".to_string());
+            0.0
+        }
     }
 }
 
@@ -4903,6 +4952,29 @@ mod tests {
         let b = rt_const_long(32);
         let result = unsafe { rt_add(a, b) };
         assert!(matches!(unsafe { &*result }, Value::Long(42)));
+    }
+
+    #[test]
+    fn test_coerce_long() {
+        // A Long passes through; a Double truncates toward zero (RT/longCast).
+        assert_eq!(unsafe { rt_coerce_long(rt_const_long(42)) }, 42);
+        assert_eq!(unsafe { rt_coerce_long(rt_const_double(3.9)) }, 3);
+        assert_eq!(unsafe { rt_coerce_long(rt_const_double(-3.9)) }, -3);
+    }
+
+    #[test]
+    fn test_coerce_double() {
+        // A Double passes through; a Long widens (RT/doubleCast).
+        assert_eq!(unsafe { rt_coerce_double(rt_const_double(2.5)) }, 2.5);
+        assert_eq!(unsafe { rt_coerce_double(rt_const_long(7)) }, 7.0);
+    }
+
+    #[test]
+    fn test_coerce_non_number_throws() {
+        // A non-number raises a pending exception and returns the zero sentinel.
+        let _ = take_pending_exception(); // drain any prior pending exception
+        assert_eq!(unsafe { rt_coerce_long(rt_const_nil()) }, 0);
+        assert!(take_pending_exception().is_some());
     }
 
     #[test]

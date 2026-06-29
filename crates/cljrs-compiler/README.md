@@ -122,10 +122,22 @@ native backend does (`rt_overflow_error` + `rt_throw` + early boxed-`nil`
 return). A `refine_reprs` pass **demotes back to boxed**, transitively, any
 unboxed producer the emitter can't lower (e.g. checked long `*`, which needs a
 128-bit overflow check wasm can't express), so the repr map only ever marks a
-value unboxed when the emitter can produce it unboxed. Parameters keep the boxed
-ABI (the signature stays all-`i32`); the typed-parameter ABI (unboxed params +
-entry guards) is deferred because it interacts with dynamic dispatch (`rt_call`
-is boxed) and would need a boxed-entry trampoline.
+value unboxed when the emitter can produce it unboxed.
+
+**Typed parameter ABI.** A function with `^long`/`^double` parameter hints
+(`seed_reprs`, `is_typed`) compiles to **two** wasm functions: a *typed body*
+whose hinted params are unboxed `i64`/`f64` (so the body reads them with no
+per-use unbox), and a boxed-entry **trampoline** (`emit_trampoline`) with the
+all-`i32` signature every dispatcher expects. The trampoline is the function's
+primary entry — exported, installed in the shared table, and the target of every
+`CallDirect` — so all the always-boxed dispatch paths (dynamic `rt_call`,
+indirect closure calls, cross-function direct calls) reach a typed function
+unchanged; it coerces each boxed argument (`rt_coerce_long`/`rt_coerce_double`)
+and (tail-)calls the body. There is no in-sandbox deopt seam, so a violated
+static hint *coerces or throws* rather than re-dispatching at Tier 1. The typed
+bodies are appended after the `n` primaries (so primary indices, table slots, and
+exports are unchanged); passing unboxed arguments *directly* on a same-bundle
+`CallDirect` (the caller-side win) is a further optimization left for later.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

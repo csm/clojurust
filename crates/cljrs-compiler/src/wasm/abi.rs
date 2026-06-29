@@ -432,6 +432,22 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32],
         results: &[I32],
     },
+    // Boxed → unboxed coercion for the typed-parameter ABI's boxed-entry
+    // trampoline.  `rt_coerce_long`/`rt_coerce_double` honor a static
+    // `^long`/`^double` hint when a boxed caller (dynamic dispatch, the shared
+    // table, cross-function `CallDirect`) reaches the trampoline: they coerce a
+    // number (or throw via the thread-local pending-exception slot), there being
+    // no deopt seam in the sandbox.
+    RtImport {
+        name: "rt_coerce_long",
+        params: &[I32],
+        results: &[I64],
+    },
+    RtImport {
+        name: "rt_coerce_double",
+        params: &[I32],
+        results: &[F64],
+    },
     RtImport {
         name: "rt_deopt",
         params: &[],
