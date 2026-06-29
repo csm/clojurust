@@ -48,6 +48,33 @@
 //! resolve to their final absolute indices.  Emission is deterministic, so the
 //! import set is identical across passes.
 //!
+//! # Closures and the function table
+//!
+//! [`Inst::AllocClosure`] materializes a closure through `rt_make_fn` /
+//! `rt_make_fn_variadic` / `rt_make_fn_multi`.  An arity function's pointer is,
+//! under `wasm32`, a **table index**, so the module imports the runtime's shared
+//! indirect function table (`"rt" "__indirect_function_table"`, mirroring the
+//! imported memory) and installs every defined function into it with an active
+//! `funcref` element segment at [`abi::FUNC_TABLE_BASE`]; the slot for the
+//! function at bundle position `p` is `FUNC_TABLE_BASE + p`.  The closure name
+//! bytes, the captured-value pointer array, and (multi-arity) the fn-pointer /
+//! param-count / variadic-flag arrays are all marshalled contiguously through a
+//! single `rt_scratch_ptr` reservation — sidestepping the data-segment /
+//! memory-layout coordination by writing the constant bytes into scratch at
+//! call time.
+//!
+//! # Cross-function tail calls
+//!
+//! A block whose trailing instruction is a direct call
+//! ([`Inst::CallDirect`]/[`Inst::CallWithRegion`]) whose result is the
+//! function's return value is lowered to a `return_call` when
+//! [`WasmBackend::tail_calls`] is set, reclaiming the caller's frame before the
+//! callee runs (the callee's `[i32; abi_param_count] → [i32]` signature matches
+//! this function's result).  With `tail_calls` off — or for dynamic `Call`s,
+//! which dispatch through the `rt_call` import — the ordinary `call` + `return`
+//! is emitted instead (correct, but not constant-stack; a trampoline is the
+//! deferred alternative).
+//!
 //! # Status
 //!
 //! Emits valid, `wasmparser`-validated modules for the subset: scalar
@@ -59,22 +86,25 @@
 //! `rt_region_*`, and `RegionParam` → the hidden trailing-`i32` param), calls
 //! (`CallDirect`/`CallWithRegion` → a direct `call` to the resolved wasm index;
 //! `Call` → dynamic dispatch through `rt_call` with arguments marshalled through
-//! the scratch buffer), and all control flow (branches, diamonds, and
-//! `loop`/`recur` with φ).  Closures (`AllocClosure`, which needs a function
-//! table and a data-segment name), globals, string/keyword/symbol constants, the
-//! `rt_call_ic` inline cache (needs a writable IC data region), cross-function
-//! tail calls (`return_call`), and the async ABI return [`WasmError::Unsupported`]
+//! the scratch buffer), closures (`AllocClosure` → `rt_make_fn*` over the shared
+//! function table), cross-function tail calls (`return_call`), and all control
+//! flow (branches, diamonds, and `loop`/`recur` with φ).  Globals,
+//! string/keyword/symbol constants, the `rt_call_ic` inline cache (needs a
+//! writable IC data region), and the async ABI return [`WasmError::Unsupported`]
 //! — the next lowering increments.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    Ieee64, ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind,
+    ExportSection, Function, FunctionSection, Ieee64, ImportSection, Instruction, MemArg,
+    MemoryType, Module, RefType, TableType, TypeSection, ValType,
 };
 
 use crate::ir::{
-    Block, BlockId, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Repr, Terminator, VarId,
+    Block, BlockId, ClosureTemplate, Const, Inst, IrFunction, KnownFn, RegionAllocKind, Repr,
+    Terminator, VarId,
 };
 
 use super::abi::{self, RtImport, WasmValType};
@@ -101,7 +131,7 @@ pub fn emit_function(
 /// must be settled before a `call` to a *defined* function can be encoded.
 pub fn emit_bundle(
     funcs: &[(&IrFunction, &Structured)],
-    _cfg: &WasmBackend,
+    cfg: &WasmBackend,
 ) -> Result<Vec<u8>, WasmError> {
     for (func, _) in funcs {
         if func.takes_state_param() {
@@ -127,7 +157,7 @@ pub fn emit_bundle(
     // each needs.  Defined-function calls use a provisional `func_base` of 0; the
     // bodies are discarded, so the wrong indices never reach the module.
     for (func, structured) in funcs {
-        let _ = emit_one(func, structured, &mut asm, 0, &func_index_of)?;
+        let _ = emit_one(func, structured, &mut asm, 0, &func_index_of, cfg)?;
     }
 
     // Imports are now fully discovered; defined functions start right after them.
@@ -143,6 +173,7 @@ pub fn emit_bundle(
             &mut asm,
             func_base,
             &func_index_of,
+            cfg,
         )?);
     }
 
@@ -176,6 +207,24 @@ pub fn emit_bundle(
             }),
         );
     }
+    if asm.needs_table {
+        // The runtime owns the shared indirect function table; the module imports
+        // it so a closure's `fn_ptr` (a table index) and the runtime's
+        // `call_indirect` agree.  Tables have their own index space, so this does
+        // not shift function indices.  The declared minimum covers the slots the
+        // AOT functions occupy (`[FUNC_TABLE_BASE, +n)`).
+        imports.import(
+            "rt",
+            abi::FUNC_TABLE_NAME,
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                table64: false,
+                minimum: abi::FUNC_TABLE_BASE as u64 + bodies.len() as u64,
+                maximum: None,
+                shared: false,
+            }),
+        );
+    }
     module.section(&imports);
 
     let mut func_section = FunctionSection::new();
@@ -190,6 +239,22 @@ pub fn emit_bundle(
         exports.export(name, ExportKind::Func, func_base + i as u32);
     }
     module.section(&exports);
+
+    if asm.needs_table {
+        // Install every defined function into the shared table at
+        // `[FUNC_TABLE_BASE, +n)`, so a closure's `fn_ptr` for the function at
+        // bundle position `p` is `FUNC_TABLE_BASE + p`.  The element *contents*
+        // are wasm function indices (`func_base + p`); the *slots* are the table
+        // base plus the position.  (Element sections precede the code section.)
+        let func_indices: Vec<u32> = (0..bodies.len() as u32).map(|p| func_base + p).collect();
+        let mut elements = ElementSection::new();
+        elements.active(
+            Some(0),
+            &ConstExpr::i32_const(abi::FUNC_TABLE_BASE as i32),
+            Elements::Functions(Cow::Owned(func_indices)),
+        );
+        module.section(&elements);
+    }
 
     let mut code = CodeSection::new();
     for (body, _) in &bodies {
@@ -211,6 +276,7 @@ fn emit_one(
     asm: &mut ModuleAsm,
     func_base: u32,
     func_index_of: &HashMap<&str, u32>,
+    cfg: &WasmBackend,
 ) -> Result<(Function, u32), WasmError> {
     // The ABI param count includes the hidden trailing region handle (an `i32`)
     // when this is a region-parameterised callee variant — mirroring
@@ -263,6 +329,7 @@ fn emit_one(
             region_param_local,
             func_base,
             func_index_of,
+            cfg,
             labels: Vec::new(),
             current: func.blocks[0].id,
         };
@@ -333,6 +400,12 @@ struct ModuleAsm {
     /// "memory"`.  Memory imports occupy a separate index space from function
     /// imports, so this does not affect function indices.
     needs_memory: bool,
+    /// Whether any function materializes a closure (`AllocClosure`).  When set,
+    /// the module imports the runtime's shared indirect function table and
+    /// installs its defined functions into it with an active element segment, so
+    /// a closure's `fn_ptr` (a table index) resolves.  Like `needs_memory`, this
+    /// occupies a separate index space and does not affect function indices.
+    needs_table: bool,
 }
 
 impl ModuleAsm {
@@ -343,6 +416,7 @@ impl ModuleAsm {
             imports: Vec::new(),
             import_map: HashMap::new(),
             needs_memory: false,
+            needs_table: false,
         }
     }
 
@@ -414,6 +488,9 @@ struct Emitter<'a> {
     /// Maps a callee name to its position among the defined functions, for
     /// [`Inst::CallDirect`]/[`Inst::CallWithRegion`] resolution.
     func_index_of: &'a HashMap<&'a str, u32>,
+    /// Backend feature flags (e.g. whether to emit `return_call` for
+    /// cross-function tail calls).
+    cfg: &'a WasmBackend,
     /// Enclosing control frames; `Some(b)` is a `block`/`loop` labeled `b`,
     /// `None` is an `if`.  Innermost is last.
     labels: Vec<Option<BlockId>>,
@@ -473,6 +550,17 @@ impl Emitter<'_> {
                     self.emit_phi_copies(*block, self.current)?;
                 }
                 self.current = *block;
+                // Cross-function tail call: a block ending in a direct call whose
+                // result is the function's return value becomes a `return_call`,
+                // reclaiming this frame before the callee runs.  Skips the
+                // trailing `local.set` + `local.get`/`return` the normal path
+                // would emit, so `next` (the `Return`) is already satisfied.
+                if self.cfg.tail_calls
+                    && let Structured::Return(rv) = next.as_ref()
+                    && self.try_emit_tail_call(*block, *rv)?
+                {
+                    return Ok(());
+                }
                 self.emit_block_body(*block)?;
                 self.emit_node(next)
             }
@@ -581,6 +669,54 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// If `block` ends in a direct call (`CallDirect`/`CallWithRegion`) whose
+    /// result is exactly `rv`, emit the block's straight-line body followed by a
+    /// `return_call` to the resolved callee and report `true` (the caller then
+    /// skips the `Return` node, since the tail call already returned).  Otherwise
+    /// emit nothing and report `false`, so the caller falls back to the ordinary
+    /// `call` + `return`.
+    ///
+    /// Only direct calls qualify: `return_call` gives a true cross-function tail
+    /// call there, with the callee's signature (`[i32; abi_param_count] →
+    /// [i32]`) matching this function's result.  Dynamic `Call`s (dispatched
+    /// through the `rt_call` import) keep the ordinary call + return.
+    fn try_emit_tail_call(&mut self, block: BlockId, rv: VarId) -> Result<bool, WasmError> {
+        let idx = self.block_of[&block];
+        let insts = &self.func.blocks[idx].insts;
+        let Some(last) = insts.last() else {
+            return Ok(false);
+        };
+        let (name, args, region, dst) = match last {
+            Inst::CallDirect(dst, name, args) => (name.clone(), args.clone(), None, *dst),
+            Inst::CallWithRegion(dst, name, args, r) => {
+                (name.clone(), args.clone(), Some(*r), *dst)
+            }
+            _ => return Ok(false),
+        };
+        if dst != rv {
+            return Ok(false);
+        }
+        let callee = self.resolve_func(&name)?;
+
+        // Everything before the trailing call is ordinary straight-line code.
+        let n = insts.len();
+        for i in 0..n - 1 {
+            let inst = self.func.blocks[idx].insts[i].clone();
+            self.emit_inst(&inst)?;
+        }
+
+        // Tail call: arguments, then the region handle for a region-parameterised
+        // callee, then `return_call` (mirrors `emit_direct_call`'s argument order).
+        for a in &args {
+            self.get(*a)?;
+        }
+        if let Some(r) = region {
+            self.get(r)?;
+        }
+        self.ins(&Instruction::ReturnCall(callee));
+        Ok(true)
+    }
+
     fn emit_inst(&mut self, inst: &Inst) -> Result<(), WasmError> {
         match inst {
             Inst::Const(dst, c) => {
@@ -640,6 +776,10 @@ impl Emitter<'_> {
                 self.get(*head)?;
                 self.get(*tail)?;
                 self.call_import("rt_alloc_cons")?;
+                self.set(*dst)
+            }
+            Inst::AllocClosure(dst, template, captures) => {
+                self.emit_alloc_closure(template, captures)?;
                 self.set(*dst)
             }
             // ── Region operations ────────────────────────────────────────────
@@ -758,6 +898,19 @@ impl Emitter<'_> {
             .map(|pos| self.func_base + pos)
             .ok_or_else(|| {
                 WasmError::Unsupported(format!("direct call to function not in bundle: {name}"))
+            })
+    }
+
+    /// Resolve an arity function name to its **table slot** — the wasm32 function
+    /// pointer the runtime calls through.  This is `FUNC_TABLE_BASE` plus the
+    /// callee's bundle position, not its wasm function index (see
+    /// [`emit_bundle`]'s element segment).
+    fn resolve_table_index(&self, name: &str) -> Result<u32, WasmError> {
+        self.func_index_of
+            .get(name)
+            .map(|pos| abi::FUNC_TABLE_BASE + pos)
+            .ok_or_else(|| {
+                WasmError::Unsupported(format!("closure arity function not in bundle: {name}"))
             })
     }
 
@@ -929,6 +1082,200 @@ impl Emitter<'_> {
         self.ins(&Instruction::I64Const(count as i64));
         self.call_import(bridge)
     }
+
+    /// Materialize a closure value via `rt_make_fn` / `rt_make_fn_variadic` /
+    /// `rt_make_fn_multi` (mirrors `codegen.rs`'s `AllocClosure`).  The arity
+    /// function pointer(s) are wasm32 table indices resolved by
+    /// [`Self::resolve_table_index`]; the closure name bytes, the captured-value
+    /// pointer array, and (for multi-arity) the fn-pointer / param-count /
+    /// variadic-flag arrays are all marshalled contiguously through one scratch
+    /// reservation, since `rt_scratch_ptr` returns a single shared buffer.  The
+    /// boxed closure is left on the operand stack.
+    fn emit_alloc_closure(
+        &mut self,
+        tmpl: &ClosureTemplate,
+        captures: &[VarId],
+    ) -> Result<(), WasmError> {
+        // No compiled arities — no closure value to build; fall back to nil
+        // (mirrors the native backend).
+        if tmpl.arity_fn_names.is_empty() {
+            return self.call_import("rt_const_nil");
+        }
+
+        self.asm.needs_table = true;
+
+        let name_str: &str = tmpl.name.as_deref().unwrap_or(&tmpl.arity_fn_names[0]);
+        let name_bytes = name_str.as_bytes();
+        let name_len = name_bytes.len();
+        let ncaptures = captures.len();
+        let n_arities = tmpl.arity_fn_names.len();
+
+        // Resolve each arity's table slot up front (clean error if a referenced
+        // arity isn't in the bundle).
+        let slots: Vec<u32> = tmpl
+            .arity_fn_names
+            .iter()
+            .map(|f| self.resolve_table_index(f))
+            .collect::<Result<_, _>>()?;
+
+        if n_arities == 1 {
+            // Single arity.  Scratch layout: [name bytes][captures: i32 × k'].
+            let off_name = 0usize;
+            let off_caps = align_up(name_len, 4);
+            let total = off_caps + ncaptures * 4;
+            if total > 0 {
+                self.scratch_reserve(total)?;
+            }
+            self.store_const_bytes(off_name, name_bytes);
+            self.store_ptr_array(off_caps, captures)?;
+
+            // rt_make_fn(name_ptr, name_len, fn_ptr, param_count, captures, ncaptures)
+            self.push_scratch_or_null(off_name, name_len);
+            self.ins(&Instruction::I64Const(name_len as i64));
+            self.ins(&Instruction::I32Const(slots[0] as i32));
+            self.ins(&Instruction::I64Const(tmpl.param_counts[0] as i64));
+            self.push_scratch_or_null(off_caps, ncaptures);
+            self.ins(&Instruction::I64Const(ncaptures as i64));
+            let bridge = if tmpl.is_variadic[0] {
+                "rt_make_fn_variadic"
+            } else {
+                "rt_make_fn"
+            };
+            return self.call_import(bridge);
+        }
+
+        // Multi-arity.  Scratch layout:
+        //   [name][fn_ptrs: i32 × k][param_counts: i64 × k][is_variadic: u8 × k][captures: i32 × k']
+        let off_name = 0usize;
+        let off_fnptrs = align_up(off_name + name_len, 4);
+        let off_pc = align_up(off_fnptrs + n_arities * 4, 8);
+        let off_var = off_pc + n_arities * 8;
+        let off_caps = align_up(off_var + n_arities, 4);
+        let total = off_caps + ncaptures * 4;
+        self.scratch_reserve(total)?;
+
+        self.store_const_bytes(off_name, name_bytes);
+        for (i, &slot) in slots.iter().enumerate() {
+            self.store_const_i32(off_fnptrs + i * 4, slot as i32);
+        }
+        for (i, &pc) in tmpl.param_counts.iter().enumerate() {
+            self.store_const_i64(off_pc + i * 8, pc as i64);
+        }
+        for (i, &v) in tmpl.is_variadic.iter().enumerate() {
+            self.store_const_i8(off_var + i, v as i32);
+        }
+        self.store_ptr_array(off_caps, captures)?;
+
+        // rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts,
+        //                  is_variadic, n_arities, captures, ncaptures)
+        self.push_scratch_or_null(off_name, name_len);
+        self.ins(&Instruction::I64Const(name_len as i64));
+        self.push_scratch_addr(off_fnptrs);
+        self.push_scratch_addr(off_pc);
+        self.push_scratch_addr(off_var);
+        self.ins(&Instruction::I64Const(n_arities as i64));
+        self.push_scratch_or_null(off_caps, ncaptures);
+        self.ins(&Instruction::I64Const(ncaptures as i64));
+        self.call_import("rt_make_fn_multi")
+    }
+
+    // ── Scratch-buffer marshalling helpers ───────────────────────────────────
+
+    /// Reserve `total` bytes of scratch (one `rt_scratch_ptr` call), leaving the
+    /// buffer base in `scratch_local`.
+    fn scratch_reserve(&mut self, total: usize) -> Result<(), WasmError> {
+        self.asm.needs_memory = true;
+        self.ins(&Instruction::I32Const(total as i32));
+        self.call_import("rt_scratch_ptr")?;
+        self.ins(&Instruction::LocalSet(self.scratch_local));
+        Ok(())
+    }
+
+    /// Push the `i32` address `scratch + offset` onto the operand stack.
+    fn push_scratch_addr(&mut self, offset: usize) {
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        if offset != 0 {
+            self.ins(&Instruction::I32Const(offset as i32));
+            self.ins(&Instruction::I32Add);
+        }
+    }
+
+    /// Push `scratch + offset` if `count > 0`, else a null (`0`) pointer — for
+    /// the optional name / captures arrays.
+    fn push_scratch_or_null(&mut self, offset: usize, count: usize) {
+        if count > 0 {
+            self.push_scratch_addr(offset);
+        } else {
+            self.ins(&Instruction::I32Const(0));
+        }
+    }
+
+    /// Store the compile-time-constant `bytes` into scratch at `offset`, one
+    /// `i32.store8` per byte.
+    fn store_const_bytes(&mut self, offset: usize, bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.ins(&Instruction::LocalGet(self.scratch_local));
+            self.ins(&Instruction::I32Const(b as i32));
+            self.ins(&Instruction::I32Store8(MemArg {
+                offset: (offset + i) as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+        }
+    }
+
+    /// Store each variable's boxed `i32` pointer into scratch at `offset + i*4`.
+    fn store_ptr_array(&mut self, offset: usize, vars: &[VarId]) -> Result<(), WasmError> {
+        for (i, v) in vars.iter().enumerate() {
+            self.ins(&Instruction::LocalGet(self.scratch_local));
+            self.get(*v)?;
+            self.ins(&Instruction::I32Store(MemArg {
+                offset: (offset + i * 4) as u64,
+                align: 2, // 2^2 == 4-byte alignment
+                memory_index: 0,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Store a constant `i32` into scratch at `offset`.
+    fn store_const_i32(&mut self, offset: usize, val: i32) {
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I32Const(val));
+        self.ins(&Instruction::I32Store(MemArg {
+            offset: offset as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+    }
+
+    /// Store a constant `i64` into scratch at `offset` (8-byte aligned by the
+    /// caller's layout).
+    fn store_const_i64(&mut self, offset: usize, val: i64) {
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I64Const(val));
+        self.ins(&Instruction::I64Store(MemArg {
+            offset: offset as u64,
+            align: 3, // 2^3 == 8-byte alignment
+            memory_index: 0,
+        }));
+    }
+
+    /// Store a constant byte into scratch at `offset` (an `i32.store8`).
+    fn store_const_i8(&mut self, offset: usize, val: i32) {
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I32Const(val));
+        self.ins(&Instruction::I32Store8(MemArg {
+            offset: offset as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+    }
+}
+
+/// Round `n` up to the next multiple of `a` (a power of two).
+fn align_up(n: usize, a: usize) -> usize {
+    (n + a - 1) & !(a - 1)
 }
 
 #[cfg(test)]
@@ -1421,6 +1768,275 @@ mod tests {
             terminator: Terminator::Return(c),
         });
         let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    fn template(name: &str, fns: &[&str], pcs: &[usize], variadic: &[bool]) -> ClosureTemplate {
+        ClosureTemplate {
+            name: Some(Arc::from(name)),
+            arity_fn_names: fns.iter().map(|s| Arc::from(*s)).collect(),
+            param_counts: pcs.to_vec(),
+            is_variadic: variadic.to_vec(),
+            capture_names: vec![],
+        }
+    }
+
+    /// `(fn outer [x] (fn inner [y] x))`: the outer function materializes a
+    /// single-arity closure over its subfunction, capturing `x`.  The bundle
+    /// imports the shared table, installs both functions via the element segment,
+    /// and `rt_make_fn` receives the inner's table slot.
+    #[test]
+    fn alloc_closure_single_arity_validates() {
+        let mut inner = IrFunction::new(Some(Arc::from("inner")), None);
+        let iy = inner.fresh_var();
+        inner.params = vec![(Arc::from("y"), iy)];
+        let ib = inner.fresh_block();
+        inner.blocks.push(Block {
+            id: ib,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(iy),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("outer")), None);
+        let ox = outer.fresh_var();
+        outer.params = vec![(Arc::from("x"), ox)];
+        let clo = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![Inst::AllocClosure(
+                clo,
+                template("inner", &["inner"], &[1], &[false]),
+                vec![ox],
+            )],
+            terminator: Terminator::Return(clo),
+        });
+        outer.subfunctions.push(inner);
+
+        let bytes =
+            super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit bundle");
+        validate(&bytes);
+    }
+
+    /// A variadic closure with no captures routes through `rt_make_fn_variadic`
+    /// and passes a null captures pointer.
+    #[test]
+    fn alloc_closure_variadic_no_captures_validates() {
+        let mut inner = IrFunction::new(Some(Arc::from("v")), None);
+        let iy = inner.fresh_var();
+        inner.params = vec![(Arc::from("y"), iy)];
+        let ib = inner.fresh_block();
+        inner.blocks.push(Block {
+            id: ib,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(iy),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("mk")), None);
+        let clo = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![Inst::AllocClosure(
+                clo,
+                template("v", &["v"], &[1], &[true]),
+                vec![],
+            )],
+            terminator: Terminator::Return(clo),
+        });
+        outer.subfunctions.push(inner);
+
+        let bytes =
+            super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit bundle");
+        validate(&bytes);
+    }
+
+    /// A multi-arity closure routes through `rt_make_fn_multi`, marshalling the
+    /// fn-pointer / param-count / variadic-flag arrays into one scratch buffer
+    /// alongside a capture.
+    #[test]
+    fn alloc_closure_multi_arity_validates() {
+        let mut a0 = IrFunction::new(Some(Arc::from("f__0")), None);
+        let a0v = a0.fresh_var();
+        let a0b = a0.fresh_block();
+        a0.blocks.push(Block {
+            id: a0b,
+            phis: vec![],
+            insts: vec![Inst::Const(a0v, Const::Nil)],
+            terminator: Terminator::Return(a0v),
+        });
+
+        let mut a1 = IrFunction::new(Some(Arc::from("f__1")), None);
+        let a1x = a1.fresh_var();
+        a1.params = vec![(Arc::from("x"), a1x)];
+        let a1b = a1.fresh_block();
+        a1.blocks.push(Block {
+            id: a1b,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(a1x),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("mk")), None);
+        let cap = outer.fresh_var();
+        outer.params = vec![(Arc::from("c"), cap)];
+        let clo = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![Inst::AllocClosure(
+                clo,
+                template("f", &["f__0", "f__1"], &[0, 1], &[false, false]),
+                vec![cap],
+            )],
+            terminator: Terminator::Return(clo),
+        });
+        outer.subfunctions.push(a0);
+        outer.subfunctions.push(a1);
+
+        let bytes =
+            super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit bundle");
+        validate(&bytes);
+    }
+
+    /// A closure over an arity function not in the bundle cannot resolve a table
+    /// slot, so it reports cleanly.
+    #[test]
+    fn alloc_closure_unknown_arity_is_unsupported() {
+        let mut f = IrFunction::new(Some(Arc::from("mk")), None);
+        let clo = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::AllocClosure(
+                clo,
+                template("gone", &["gone"], &[0], &[false]),
+                vec![],
+            )],
+            terminator: Terminator::Return(clo),
+        });
+        match compile(&f) {
+            Err(WasmError::Unsupported(msg)) => assert!(msg.contains("not in bundle")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A closure with zero compiled arities falls back to nil (no table needed).
+    #[test]
+    fn alloc_closure_no_arities_is_nil() {
+        let mut f = IrFunction::new(Some(Arc::from("mk")), None);
+        let clo = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::AllocClosure(
+                clo,
+                template("e", &[], &[], &[]),
+                vec![],
+            )],
+            terminator: Terminator::Return(clo),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn caller [y] (callee y))` in tail position: with `tail_calls` the
+    /// trailing `CallDirect` becomes a `return_call`.
+    #[test]
+    fn tail_call_direct_emits_return_call() {
+        let mut callee = IrFunction::new(Some(Arc::from("callee")), None);
+        let cx = callee.fresh_var();
+        callee.params = vec![(Arc::from("x"), cx)];
+        let cb = callee.fresh_block();
+        callee.blocks.push(Block {
+            id: cb,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(cx),
+        });
+
+        let mut caller = IrFunction::new(Some(Arc::from("caller")), None);
+        let y = caller.fresh_var();
+        caller.params = vec![(Arc::from("y"), y)];
+        let r = caller.fresh_var();
+        let cb2 = caller.fresh_block();
+        caller.blocks.push(Block {
+            id: cb2,
+            phis: vec![],
+            insts: vec![Inst::CallDirect(r, Arc::from("callee"), vec![y])],
+            terminator: Terminator::Return(r),
+        });
+
+        // tail_calls on: validates (return_call is a default-enabled proposal).
+        let cfg = WasmBackend {
+            tail_calls: true,
+            exceptions: true,
+        };
+        let on = super::super::compile_bundle(&[&caller, &callee], &cfg).expect("emit");
+        validate(&on);
+
+        // tail_calls off: ordinary call + return, still valid.
+        let cfg_off = WasmBackend {
+            tail_calls: false,
+            exceptions: true,
+        };
+        let off = super::super::compile_bundle(&[&caller, &callee], &cfg_off).expect("emit");
+        validate(&off);
+
+        // The tail-call build emits the `return_call` opcode (0x12); the
+        // non-tail build does not.
+        assert!(
+            on.contains(&0x12),
+            "tail_calls build should contain return_call"
+        );
+        assert!(
+            !off.contains(&0x12),
+            "non-tail build should not contain return_call"
+        );
+    }
+
+    /// A `CallWithRegion` in tail position threads the region handle as the
+    /// trailing argument of the `return_call`.
+    #[test]
+    fn tail_call_with_region_validates() {
+        let mut callee = IrFunction::new(Some(Arc::from("callee__rg")), None);
+        let cx = callee.fresh_var();
+        callee.params = vec![(Arc::from("x"), cx)];
+        let crh = callee.fresh_var();
+        let cb = callee.fresh_block();
+        callee.blocks.push(Block {
+            id: cb,
+            phis: vec![],
+            insts: vec![Inst::RegionParam(crh)],
+            terminator: Terminator::Return(cx),
+        });
+        assert!(callee.takes_region_param());
+
+        let mut caller = IrFunction::new(Some(Arc::from("caller__rg")), None);
+        let y = caller.fresh_var();
+        caller.params = vec![(Arc::from("y"), y)];
+        let rh = caller.fresh_var();
+        let r = caller.fresh_var();
+        let cb2 = caller.fresh_block();
+        caller.blocks.push(Block {
+            id: cb2,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionParam(rh),
+                Inst::CallWithRegion(r, Arc::from("callee__rg"), vec![y], rh),
+            ],
+            terminator: Terminator::Return(r),
+        });
+
+        let bytes = super::super::compile_bundle(&[&caller, &callee], &WasmBackend::default())
+            .expect("emit");
         validate(&bytes);
     }
 

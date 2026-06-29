@@ -83,11 +83,21 @@ settled, so `CallDirect` targets resolve to their final indices. Calls lowered:
 `CallDirect`/`CallWithRegion` → a direct `call` to the resolved index (the
 region variant threading the caller's handle as the hidden trailing arg), and
 `Call` → dynamic dispatch through `rt_call` with arguments marshalled through the
-`rt_scratch_ptr` buffer. Closures (`AllocClosure`, which needs a function table
-+ a data-segment name), globals, string/keyword/symbol constants, the
-`rt_call_ic` inline cache (needs a writable IC data region), cross-function tail
-calls (`return_call`), and the async ABI return `Unsupported` — the next
-lowering increments.
+`rt_scratch_ptr` buffer.
+
+**Closures** (`AllocClosure`) lower through `rt_make_fn` / `rt_make_fn_variadic`
+/ `rt_make_fn_multi`. An arity function's pointer is a `wasm32` **table index**,
+so the module imports the runtime's shared indirect function table (`"rt"
+"__indirect_function_table"`, mirroring the imported memory) and installs every
+defined function into it with an active `funcref` element segment at
+`FUNC_TABLE_BASE`; the closure name, captures, and (multi-arity) the
+fn-pointer/param-count/variadic arrays are marshalled contiguously through one
+`rt_scratch_ptr` reservation. **Cross-function tail calls** lower a trailing
+direct call whose result is returned to `return_call` when `WasmBackend::
+tail_calls` is set (else an ordinary `call` + `return`). Globals,
+string/keyword/symbol constants, the `rt_call_ic` inline cache (needs a writable
+IC data region), and the async ABI return `Unsupported` — the next lowering
+increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

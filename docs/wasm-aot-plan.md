@@ -106,10 +106,14 @@ dependency, so it is reviewable and unit-tested independently):
   This mirrors `IrFunction::abi_param_count` on the native side.
 - **Import table.** `RT_IMPORTS: &[RtImport]` describes the subset wired so far
   (safepoint, constants, arithmetic/comparison bridges, the `rt_scratch_ptr`
-  marshalling buffer, GC-heap + region allocation, inline-cache/deopt bridges)
-  as `(name, params, results)` wasm function types. `lookup(name)` resolves one.
-  Completing it to all of `rt_abi` is mechanical — one `RtImport` per `extern
-  "C"` signature.
+  marshalling buffer, GC-heap + region allocation, `rt_call`, the `rt_make_fn*`
+  closure constructors, inline-cache/deopt bridges) as `(name, params, results)`
+  wasm function types. `lookup(name)` resolves one. Completing it to all of
+  `rt_abi` is mechanical — one `RtImport` per `extern "C"` signature.
+- **Shared function table.** A closure's `fn_ptr` is a `wasm32` table index, so
+  `FUNC_TABLE_NAME`/`FUNC_TABLE_BASE` describe the imported
+  `"rt" "__indirect_function_table"` and the base slot at which the emitter
+  installs the bundle's functions (element segment in `emit.rs`).
 
 ### Relooper (`reloop.rs`) — complete for reducible CFGs
 
@@ -250,15 +254,52 @@ a single module, so a direct call resolves its callee to a wasm function index:
   IC slot in linear memory — the same data-segment coordination the
   string/keyword/symbol constants need (item 2), so it is deferred with them.
 
-`AllocClosure` is **still** `Unsupported`: materializing a closure value calls
-`rt_make_fn*` with the arity function's *pointer*, which under `wasm32` is a
-**table index**, so it needs a function table + `ref.func` element segment, plus
-the closure name in a data segment (item 2). Cross-function tail calls
-(`return_call`) are likewise deferred.
+`AllocClosure` and cross-function tail calls landed in the **Closures** increment
+below.
+
+### Closures, the function table, and cross-function tail calls (`emit_alloc_closure`, `try_emit_tail_call`) — complete
+
+The leftovers of the calls increment, now landed:
+
+- **The function table.** A closure's arity-function pointer is, under `wasm32`,
+  a **table index**. The module imports the runtime's shared indirect function
+  table (`"rt" "__indirect_function_table"`, mirroring the imported `"rt"
+  "memory"`) and installs every defined function into it with an active
+  `funcref` element segment at `abi::FUNC_TABLE_BASE`. The function pointer for
+  the defined function at bundle position `p` is `FUNC_TABLE_BASE + p` (the table
+  *slot*, distinct from its wasm function *index* `func_base + p`, which is the
+  element segment's *content*). `ModuleAsm::needs_table` records the import, and
+  the table occupies its own index space so it does not shift function indices.
+  The runtime must reserve `[FUNC_TABLE_BASE, …)` of its table — the table
+  analogue of the rodata coordination the string constants need; the concrete
+  base is finalized in the CLI/bundling step (item 5).
+- **`AllocClosure`** → `rt_make_fn` (single fixed arity), `rt_make_fn_variadic`
+  (single variadic), or `rt_make_fn_multi` (multi-arity), mirroring
+  `codegen.rs::AllocClosure`. The closure name bytes, the captured-value pointer
+  array, and (multi-arity) the fn-pointer / param-count / variadic-flag arrays
+  are marshalled **contiguously through one `rt_scratch_ptr` reservation** at
+  distinct, alignment-respecting offsets — sidestepping the data-segment /
+  memory-layout coordination (item 2) by writing the constant name bytes into
+  scratch at call time rather than into a rodata segment. Zero-arity closures
+  fall back to nil; an arity function not in the bundle reports `Unsupported`.
+- **Cross-function tail calls** (`return_call`). A block whose trailing
+  instruction is a direct call (`CallDirect`/`CallWithRegion`) whose result is
+  the function's return value becomes a `return_call` when
+  `WasmBackend::tail_calls` is set — the callee's `[i32; abi_param_count] →
+  [i32]` signature matches this function's result, and the caller's frame is
+  reclaimed before the callee runs. With `tail_calls` off, or for dynamic `Call`s
+  (dispatched through the `rt_call` import), the ordinary `call` + `return` is
+  emitted (correct but not constant-stack; a trampoline is the deferred
+  alternative). Tail calls are a default-enabled wasm proposal, so the emitted
+  modules still validate.
+
+`rt_call_ic` (the inline cache) remains deferred with the data-segment work:
+until a writable per-call-site IC region is coordinated with the runtime's
+memory layout, `Inst::Call` keeps dispatching through plain `rt_call`.
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 28 tests:
+`cargo test -p cljrs-compiler wasm::` — 36 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -273,9 +314,17 @@ the closure name in a data segment (item 2). Cross-function tail calls
   (a two-function bundle with a `CallDirect`, a bundle with a `CallWithRegion`
   threading the region handle into a region-parameterised variant, a dynamic
   `Call` through `rt_call` with and without arguments, and a bundle flattening a
-  subfunction so a `CallDirect` to it resolves) — each **validated with
-  `wasmparser`**; plus `Unsupported` coverage for an unbundled direct-call target
-  and un-lowered instructions, and the typed-signature accounting.
+  subfunction so a `CallDirect` to it resolves), closures (a single-arity closure
+  capturing a value over a subfunction through the shared table, a variadic
+  closure with no captures, a multi-arity closure marshalling the fn-pointer /
+  param-count / variadic arrays + a capture into one scratch buffer, and a
+  zero-arity-fallback-to-nil), and cross-function tail calls (a `CallDirect` in
+  tail position emitting `return_call` with `tail_calls` on and an ordinary call
+  with it off — asserting the `return_call` opcode's presence/absence — and a
+  tail `CallWithRegion` threading the region handle) — each **validated with
+  `wasmparser`**; plus `Unsupported` coverage for an unbundled direct-call target,
+  an out-of-bundle closure arity, and un-lowered instructions, and the
+  closure-constructor import / typed-signature accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -284,45 +333,38 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 ## What is next
 
-Ordered by value. Allocation, region operations, and calls / multi-function
-modules (now **done** — see those sections above) made real collection-building,
-arena-allocating, and cross-function-calling programs compilable; calls reuse the
-multi-function `emit_bundle` and the scratch-buffer marshalling the allocation
-item introduced.
+Ordered by value. Allocation, region operations, calls / multi-function modules,
+and closures + the function table + cross-function tail calls (now **done** — see
+those sections above) made real collection-building, arena-allocating,
+cross-function-calling, and closure-creating programs compilable; closures reuse
+the multi-function `emit_bundle`, the shared imported function table, and the
+scratch-buffer marshalling the allocation item introduced.
 
-### 1. Closures, the function table, and cross-function tail calls
-
-The leftovers of the calls increment, all blocked on machinery the next two
-items introduce. `AllocClosure` materializes a closure via `rt_make_fn*`, which
-takes the arity function's *pointer* — under `wasm32` a **table index** — so it
-needs a function table populated by a `ref.func` element segment and the closure
-name in a data segment (item 2). Cross-function tail calls use the wasm tail-call
-proposal (`return_call`) when `WasmBackend::tail_calls`, else a trampoline. The
-`rt_call_ic` inline cache (a writable per-call-site IC slot) lands with the
-data-segment work too; until then `Call` dispatches through plain `rt_call`.
-
-### 2. Constants needing a data segment
+### 1. Constants needing a data segment
 
 `Const::Str` / `Const::Keyword` / `Const::Symbol`. Emit the UTF-8 bytes into a
 **data segment** and pass `(ptr, len)` to `rt_const_string`/`_keyword`/`_symbol`
 (already in `RT_IMPORTS`). The data segment's memory placement must be
 coordinated with the runtime's linear-memory layout — decide whether the
-emitter owns a rodata region or the runtime reserves one.
+emitter owns a rodata region or the runtime reserves one. (The closures
+increment marshals its constant name bytes through `rt_scratch_ptr` to avoid this
+coordination; a deduplicated rodata pool is the better long-term home for
+string/keyword/symbol constants, and the closure name can move there too.)
 
-### 3. Globals / vars
+### 2. Globals / vars
 
 `LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
 follow `codegen.rs::emit_load_global` / `emit_def_var`. Needs the name-as-data
-machinery from (2) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
+machinery from (1) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
 
-### 4. Exceptions
+### 3. Exceptions
 
 `Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
 (`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
 `rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
 `rt_try` checking the thread-local).
 
-### 5. Unboxed specialization
+### 4. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -330,13 +372,15 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 6. CLI + bundling
+### 5. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the
 `cljrs-wasm` crate already builds the interpreter to that target), and wire the
 **IR interpreter into the bundle as the dynamic-code tier** (drop the JIT/OSR
-hooks in-sandbox).
+hooks in-sandbox). This is where the imported-table base (`abi::FUNC_TABLE_BASE`)
+and any rodata region are finalized against the runtime's actual linear-memory /
+table layout.
 
 ### Deferred indefinitely
 
