@@ -896,8 +896,17 @@ impl Emitter<'_> {
         if moves.is_empty() {
             return Ok(());
         }
-        for (_, src) in &moves {
-            self.get_raw(*src)?;
+        // Each source is read as the destination's repr.  When `dst` is unboxed,
+        // `meet` guarantees every entry shares that repr, so a raw copy is
+        // type-correct; when `dst` is boxed, an unboxed source must be boxed
+        // first (a φ may join an unboxed value with a boxed one).  Reads precede
+        // all writes, preserving parallel-move semantics.
+        for (dst, src) in &moves {
+            if self.repr_of(*dst) == Repr::Boxed {
+                self.get(*src)?;
+            } else {
+                self.get_raw(*src)?;
+            }
         }
         for (dst, _) in moves.iter().rev() {
             self.set(*dst)?;

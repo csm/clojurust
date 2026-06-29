@@ -295,10 +295,22 @@ via an inline signed-overflow branch matching `rt_add`/etc.), wrapping
 
 ```rust
 pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf], rust_config: Option<&RustConfig>, verify_commit_signatures: bool) -> AotResult<()>;
+pub fn compile_file_to_wasm(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()>;
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 
-pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
+pub enum AotError { Io, Parse, Codegen, Eval, Link, Wasm(WasmError), NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
+
+`compile_file_to_wasm` is the `cljrs compile --target wasm` entry point: it lowers
+the source to IR (`lower_file_to_ir`), rewrites same-unit calls to `CallDirect`
+(`optimize_direct_calls`), then drives `wasm::compile_bundle` over the entry
+function + its flattened subfunctions and writes the validated module. The
+emitted module's `"rt"` imports are satisfied by the runtime built for
+`wasm32-unknown-unknown`; linking the two and wiring the IR interpreter in as the
+dynamic-code tier (finalizing `RODATA_BASE`/`FUNC_TABLE_BASE` against the
+runtime's layout) is the remaining bundling step. Only the entry namespace's
+functions are emitted so far — cross-namespace dependencies still dispatch
+through `rt_call`.
 
 Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
 

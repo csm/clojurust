@@ -387,6 +387,35 @@ instead of the heap-allocating boxed bridges.
   dynamic dispatch (`rt_call` is boxed) and cross-function calls, each of which
   would need a boxed-entry trampoline + guard story AOT-wasm doesn't yet have.
 
+### CLI front-end (`compile_file_to_wasm`, `cljrs compile --target wasm`) — complete (module emission)
+
+The driver that turns a source file into a `.wasm` artifact:
+
+- **`aot::compile_file_to_wasm(src, out, src_dirs)`** lowers the entry namespace
+  to IR (`lower_file_to_ir`: parse → macro-expand → ANF/region optimization),
+  runs `optimize_direct_calls` (so same-unit calls bind to wasm function indices
+  rather than dispatching through `rt_call`), then drives
+  `wasm::compile_bundle(&[&ir_func], …)` over the entry function + its flattened
+  subfunctions and writes the validated bytes. A new `AotError::Wasm(WasmError)`
+  surfaces backend errors.
+- **CLI**: `cljrs compile <file> --target wasm -o <out>.wasm`. `--target`
+  (default `native`) selects the backend; `--target wasm` with `--test` is
+  rejected (no wasm test harness yet), and an unknown target errors cleanly.
+- **End-to-end tests** (`crates/cljrs-compiler/tests/wasm_compile.rs`): a file of
+  simple `defn`s and a `loop`/`recur` accumulator each compile through the full
+  front-end and **validate with `wasmparser`** — the loop test surfaced (and
+  fixed) a φ parallel-move bug where a boxed φ destination with an unboxed `i64`
+  entry was copied without boxing.
+
+**What remains (the actual *bundling*):** the emitted module's `"rt"` imports
+(the `rt_abi` bridges, linear memory, the shared function table) must be
+satisfied by the runtime compiled to `wasm32-unknown-unknown` (the `cljrs-wasm`
+crate already builds the interpreter to that target). Linking the two — and
+wiring the **IR interpreter in as the dynamic-code tier** — is where
+`abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` are finalized against the runtime's
+real linear-memory / table layout. Cross-namespace dependencies are not yet
+bundled (only the entry namespace's functions are emitted).
+
 ### Tests
 
 `cargo test -p cljrs-compiler wasm::` — 46 tests:
@@ -426,7 +455,9 @@ instead of the heap-allocating boxed bridges.
   `Long` so the `+`s lower to checked `i64.add` while `(< i n)` against the boxed
   param stays on `rt_lt`, and a checked long `*` demoting to the boxed `rt_mul` —
   each asserting the expected operator's presence/absence via `wasmparser`) — each
-  **validated with `wasmparser`**; plus `Unsupported`
+  **validated with `wasmparser`**; plus end-to-end CLI coverage in
+  `tests/wasm_compile.rs` (a `defn` file and a `loop`/`recur` accumulator driven
+  through `compile_file_to_wasm` and `wasmparser`-validated), and `Unsupported`
   coverage for an unbundled
   direct-call target, an out-of-bundle closure arity, and un-lowered
   instructions, and the closure-constructor import / typed-signature accounting.
@@ -440,14 +471,11 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
 closures + the function table + cross-function tail calls, string / keyword /
-symbol constants, globals / vars, exceptions, and unboxed scalar values (now
-**done** — see those sections above) made real collection-building,
-arena-allocating, cross-function-calling, closure-creating, string-literal-using,
-global-referencing, throw/try-catch, and native-scalar-arithmetic programs
-compilable; the constants increment introduced the deduplicated rodata data
-segment that globals reuse for their name-as-data, exceptions reuse the boxed
-thread-local error path, and the unboxed increment keeps intermediate scalar
-arithmetic off the boxing bridges.
+symbol constants, globals / vars, exceptions, unboxed scalar values, and the
+**CLI front-end** (`cljrs compile --target wasm`, emitting the entry namespace's
+module) are now **done** — see those sections above. The remaining work is making
+the emitted module *runnable* (linking it against the `wasm32-unknown-unknown`
+runtime) and the typed-parameter ABI optimization.
 
 ### 1. Unboxed parameter ABI (follow-up to unboxed scalars)
 
@@ -459,15 +487,21 @@ plus an entry guard story (the native backend's `compile_function_with_specs`
 guards + deopts; AOT-wasm has no deopt seam, so a violated static hint would
 coerce or throw). An optimization on top of the existing internal unboxing.
 
-### 2. CLI + bundling
+### 2. Runtime linking + bundling (follow-up to the CLI front-end)
 
-`cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
-whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the
-`cljrs-wasm` crate already builds the interpreter to that target), and wire the
-**IR interpreter into the bundle as the dynamic-code tier** (drop the JIT/OSR
-hooks in-sandbox). This is where the imported-table base (`abi::FUNC_TABLE_BASE`)
-and any rodata region are finalized against the runtime's actual linear-memory /
-table layout.
+The CLI now emits the entry namespace's AOT module (`compile_file_to_wasm`,
+above); the remaining work is to make it *runnable*:
+
+- **Link with the runtime** compiled to `wasm32-unknown-unknown` (the
+  `cljrs-wasm` crate already builds the interpreter to that target) so the
+  emitted module's `"rt"` imports — the `rt_abi` bridges, linear memory, and the
+  shared `__indirect_function_table` — are satisfied, and **finalize**
+  `abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` against the runtime's actual
+  linear-memory / table layout (they are `0` placeholders today).
+- **Wire the IR interpreter in as the dynamic-code tier** (drop the JIT/OSR hooks
+  in-sandbox) so `eval`/REPL/freshly-required namespaces still run.
+- **Bundle whole programs** (cross-namespace dependencies), not just the entry
+  namespace — mirroring `compile_file`'s per-namespace initializer discovery.
 
 ### Deferred indefinitely
 
