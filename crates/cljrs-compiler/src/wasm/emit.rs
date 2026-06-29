@@ -75,10 +75,24 @@
 //! is emitted instead (correct, but not constant-stack; a trampoline is the
 //! deferred alternative).
 //!
+//! # String / keyword / symbol constants
+//!
+//! [`Const::Str`]/[`Const::Keyword`]/[`Const::Symbol`] intern their UTF-8 bytes
+//! into a deduplicated read-only data pool ([`ModuleAsm::rodata`]), emitted as a
+//! single active data segment at [`abi::RODATA_BASE`] in the runtime's imported
+//! memory.  A constant resolves to the `(ptr, len)` pair `(RODATA_BASE + offset,
+//! len)` passed to `rt_const_string`/`_keyword`/`_symbol`.  Mirrors
+//! `codegen.rs::emit_string_const` (the native backend defines an anonymous data
+//! object per string); keywords skip the per-call-site inline cache, which is
+//! deferred with the rest of the IC work.  The pool base is the linear-memory
+//! analogue of [`abi::FUNC_TABLE_BASE`] and is finalized against the runtime's
+//! memory layout in the CLI/bundling step.
+//!
 //! # Status
 //!
 //! Emits valid, `wasmparser`-validated modules for the subset: scalar
-//! constants, `LoadLocal`, boxed arithmetic (`+ - * / rem`, folded) and binary
+//! constants, string/keyword/symbol constants (via the rodata data segment),
+//! `LoadLocal`, boxed arithmetic (`+ - * / rem`, folded) and binary
 //! comparison (`= < > <= >=`) via the `rt_abi` bridges, collection allocation
 //! (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons` — element arrays
 //! marshalled through an imported linear memory and the `rt_scratch_ptr`
@@ -88,18 +102,17 @@
 //! `Call` → dynamic dispatch through `rt_call` with arguments marshalled through
 //! the scratch buffer), closures (`AllocClosure` → `rt_make_fn*` over the shared
 //! function table), cross-function tail calls (`return_call`), and all control
-//! flow (branches, diamonds, and `loop`/`recur` with φ).  Globals,
-//! string/keyword/symbol constants, the `rt_call_ic` inline cache (needs a
-//! writable IC data region), and the async ABI return [`WasmError::Unsupported`]
-//! — the next lowering increments.
+//! flow (branches, diamonds, and `loop`/`recur` with φ).  Globals, the
+//! `rt_call_ic` inline cache (needs a writable IC data region), and the async
+//! ABI return [`WasmError::Unsupported`] — the next lowering increments.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, Ieee64, ImportSection, Instruction, MemArg,
-    MemoryType, Module, RefType, TableType, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
+    ExportKind, ExportSection, Function, FunctionSection, Ieee64, ImportSection, Instruction,
+    MemArg, MemoryType, Module, RefType, TableType, TypeSection, ValType,
 };
 
 use crate::ir::{
@@ -262,6 +275,19 @@ pub fn emit_bundle(
     }
     module.section(&code);
 
+    if !asm.rodata.is_empty() {
+        // The string/keyword/symbol constant pool, copied into the runtime's
+        // imported memory at `[RODATA_BASE, +len)` at instantiation.  The data
+        // section follows the code section in wasm's section order.
+        let mut data = DataSection::new();
+        data.active(
+            0,
+            &ConstExpr::i32_const(abi::RODATA_BASE as i32),
+            asm.rodata.iter().copied(),
+        );
+        module.section(&data);
+    }
+
     Ok(module.finish())
 }
 
@@ -406,6 +432,13 @@ struct ModuleAsm {
     /// a closure's `fn_ptr` (a table index) resolves.  Like `needs_memory`, this
     /// occupies a separate index space and does not affect function indices.
     needs_table: bool,
+    /// The deduplicated read-only data pool for string/keyword/symbol constant
+    /// bytes, emitted as a single active data segment at [`abi::RODATA_BASE`].
+    /// A constant at pool offset `o` resolves to the pointer `RODATA_BASE + o`.
+    rodata: Vec<u8>,
+    /// Maps a constant's bytes to its offset in `rodata`, so identical
+    /// constants (and the two emission passes) share one set of bytes.
+    rodata_map: HashMap<Vec<u8>, u32>,
 }
 
 impl ModuleAsm {
@@ -417,7 +450,23 @@ impl ModuleAsm {
             import_map: HashMap::new(),
             needs_memory: false,
             needs_table: false,
+            rodata: Vec::new(),
+            rodata_map: HashMap::new(),
         }
+    }
+
+    /// Intern a constant byte string into the read-only data pool, returning its
+    /// offset within the pool (relative to [`abi::RODATA_BASE`]).  Identical
+    /// byte strings are deduplicated, so repeated string/keyword/symbol
+    /// constants — and the two emission passes — share one set of bytes.
+    fn intern_rodata(&mut self, bytes: &[u8]) -> u32 {
+        if let Some(&off) = self.rodata_map.get(bytes) {
+            return off;
+        }
+        let off = self.rodata.len() as u32;
+        self.rodata.extend_from_slice(bytes);
+        self.rodata_map.insert(bytes.to_vec(), off);
+        off
     }
 
     fn intern_type(&mut self, params: Vec<WasmValType>, results: Vec<WasmValType>) -> u32 {
@@ -836,12 +885,30 @@ impl Emitter<'_> {
                 self.ins(&Instruction::I32Const(*ch as i32));
                 self.call_import("rt_const_char")
             }
-            // Strings/keywords/symbols need their bytes in a data segment
-            // coordinated with the runtime's memory layout — a later increment.
-            Const::Str(_) | Const::Keyword(_) | Const::Symbol(_) => Err(WasmError::Unsupported(
-                "string/keyword/symbol constants (need a data segment)".into(),
-            )),
+            // Strings/keywords/symbols: their UTF-8 bytes live in the read-only
+            // data pool (one active data segment at `RODATA_BASE`); the constant
+            // resolves to the `(ptr, len)` pair passed to the `rt_const_*`
+            // bridge.  Mirrors `codegen.rs::emit_string_const` (the native
+            // backend defines an anonymous data object per string); keywords go
+            // through `rt_const_keyword` rather than the per-call-site inline
+            // cache, which is deferred with the rest of the IC work.
+            Const::Str(s) => self.emit_string_like(s, "rt_const_string"),
+            Const::Keyword(s) => self.emit_string_like(s, "rt_const_keyword"),
+            Const::Symbol(s) => self.emit_string_like(s, "rt_const_symbol"),
         }
+    }
+
+    /// Materialize a string/keyword/symbol constant: intern its UTF-8 bytes into
+    /// the rodata pool, push `(ptr, len)` (`ptr = RODATA_BASE + offset`), and
+    /// call the boxing `rt_const_*` bridge.  The boxed result is left on the
+    /// operand stack.
+    fn emit_string_like(&mut self, s: &str, bridge: &str) -> Result<(), WasmError> {
+        // The pool lives in the runtime's imported linear memory.
+        self.asm.needs_memory = true;
+        let off = self.asm.intern_rodata(s.as_bytes());
+        self.ins(&Instruction::I32Const((abi::RODATA_BASE + off) as i32));
+        self.ins(&Instruction::I64Const(s.len() as i64));
+        self.call_import(bridge)
     }
 
     /// Lower a known-function call to its boxed `rt_abi` bridge, result left on
@@ -1769,6 +1836,68 @@ mod tests {
         });
         let bytes = compile(&f).expect("emit");
         validate(&bytes);
+    }
+
+    /// `(fn [] ["hi" :kw 'sym])`: each string-like constant interns its bytes
+    /// into the rodata pool and resolves to a `(ptr, len)` pair; the module
+    /// imports memory and emits a data segment.
+    #[test]
+    fn string_like_constants_validate() {
+        let mut f = IrFunction::new(Some(Arc::from("consts")), None);
+        let s = f.fresh_var();
+        let k = f.fresh_var();
+        let sy = f.fresh_var();
+        let v = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(s, Const::Str(Arc::from("hi"))),
+                Inst::Const(k, Const::Keyword(Arc::from("kw"))),
+                Inst::Const(sy, Const::Symbol(Arc::from("sym"))),
+                Inst::AllocVector(v, vec![s, k, sy]),
+            ],
+            terminator: Terminator::Return(v),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        // A non-empty data section (id 11) is present for the constant bytes.
+        assert!(
+            bytes.contains(&0x0b),
+            "module should contain a data section for the rodata pool"
+        );
+    }
+
+    /// Identical string constants share one set of bytes in the rodata pool:
+    /// the bytes appear exactly once even when the constant is used twice.
+    #[test]
+    fn duplicate_string_constants_dedupe() {
+        let mut f = IrFunction::new(Some(Arc::from("dup")), None);
+        let a = f.fresh_var();
+        let b = f.fresh_var();
+        let v = f.fresh_var();
+        let blk = f.fresh_block();
+        f.blocks.push(Block {
+            id: blk,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(a, Const::Str(Arc::from("hello"))),
+                Inst::Const(b, Const::Str(Arc::from("hello"))),
+                Inst::AllocVector(v, vec![a, b]),
+            ],
+            terminator: Terminator::Return(v),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        // "hello" appears once in the emitted module (the deduplicated pool),
+        // not twice.
+        let needle = b"hello";
+        let count = bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(
+            count, 1,
+            "deduplicated pool should hold one copy of the bytes"
+        );
     }
 
     fn template(name: &str, fns: &[&str], pcs: &[usize], variadic: &[bool]) -> ClosureTemplate {

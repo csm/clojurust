@@ -65,7 +65,10 @@ imported from the `"rt"` module. The relooper's structured tree maps directly to
 wasm control flow (`Labeled`→`block`, `Loop`→`loop`, `If`→`if`/`else`,
 `Br`→`br N` with depths resolved from a label stack), and SSA φs are resolved as
 parallel moves on the operand stack at each edge — so `loop`/`recur` with a
-swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
+swapping `recur` is correct. Currently lowered: scalar constants,
+string/keyword/symbol constants (UTF-8 bytes interned into a deduplicated
+read-only data pool emitted as one active data segment at `RODATA_BASE`, then
+`(ptr, len)` passed to `rt_const_string`/`_keyword`/`_symbol`), `LoadLocal`,
 folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`),
 collection allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/
 `AllocCons` — element arrays marshalled through an imported linear memory and the
@@ -94,10 +97,9 @@ defined function into it with an active `funcref` element segment at
 fn-pointer/param-count/variadic arrays are marshalled contiguously through one
 `rt_scratch_ptr` reservation. **Cross-function tail calls** lower a trailing
 direct call whose result is returned to `return_call` when `WasmBackend::
-tail_calls` is set (else an ordinary `call` + `return`). Globals,
-string/keyword/symbol constants, the `rt_call_ic` inline cache (needs a writable
-IC data region), and the async ABI return `Unsupported` — the next lowering
-increments.
+tail_calls` is set (else an ordinary `call` + `return`). Globals, the
+`rt_call_ic` inline cache (needs a writable IC data region), and the async ABI
+return `Unsupported` — the next lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

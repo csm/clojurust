@@ -293,13 +293,32 @@ The leftovers of the calls increment, now landed:
   alternative). Tail calls are a default-enabled wasm proposal, so the emitted
   modules still validate.
 
-`rt_call_ic` (the inline cache) remains deferred with the data-segment work:
-until a writable per-call-site IC region is coordinated with the runtime's
-memory layout, `Inst::Call` keeps dispatching through plain `rt_call`.
+`rt_call_ic` (the inline cache) remains deferred with the writable per-call-site
+IC region: until that is coordinated with the runtime's memory layout,
+`Inst::Call` keeps dispatching through plain `rt_call`.
+
+### String / keyword / symbol constants (`emit_string_like`) — complete
+
+`Const::Str` / `Const::Keyword` / `Const::Symbol` intern their UTF-8 bytes into a
+**deduplicated read-only data pool** (`ModuleAsm::rodata` + `rodata_map`) and
+resolve to the `(ptr, len)` pair `(abi::RODATA_BASE + offset, len)` passed to
+`rt_const_string` / `_keyword` / `_symbol` (already in `RT_IMPORTS`). The pool is
+emitted as a **single active data segment** at `abi::RODATA_BASE` in the
+runtime's imported linear memory (the data section follows the code section in
+wasm's section order), so the emitter owns a rodata region whose base the runtime
+reserves — the linear-memory analogue of `FUNC_TABLE_BASE`, finalized against the
+runtime's actual memory layout in the CLI/bundling step. The dedup map makes
+interning idempotent across the two emission passes and collapses repeated
+constants to one set of bytes. Keywords go through `rt_const_keyword` directly,
+**not** the per-call-site inline cache `codegen.rs` uses — that IC is deferred
+with the rest of the `rt_call_ic` work. Mirrors `codegen.rs::emit_string_const`
+(the native backend defines an anonymous data object per string). The closure
+name bytes still marshal through `rt_scratch_ptr`; moving them into this pool is
+a cleanup left for later.
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 36 tests:
+`cargo test -p cljrs-compiler wasm::` — 38 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -321,10 +340,13 @@ memory layout, `Inst::Call` keeps dispatching through plain `rt_call`.
   zero-arity-fallback-to-nil), and cross-function tail calls (a `CallDirect` in
   tail position emitting `return_call` with `tail_calls` on and an ordinary call
   with it off — asserting the `return_call` opcode's presence/absence — and a
-  tail `CallWithRegion` threading the region handle) — each **validated with
-  `wasmparser`**; plus `Unsupported` coverage for an unbundled direct-call target,
-  an out-of-bundle closure arity, and un-lowered instructions, and the
-  closure-constructor import / typed-signature accounting.
+  tail `CallWithRegion` threading the region handle), and string/keyword/symbol
+  constants (a vector of a string + keyword + symbol exercising the rodata data
+  segment, asserting the data section's presence, and a duplicate-string case
+  asserting the deduplicated pool holds one copy of the bytes) — each
+  **validated with `wasmparser`**; plus `Unsupported` coverage for an unbundled
+  direct-call target, an out-of-bundle closure arity, and un-lowered
+  instructions, and the closure-constructor import / typed-signature accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -334,37 +356,28 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 ## What is next
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
-and closures + the function table + cross-function tail calls (now **done** — see
-those sections above) made real collection-building, arena-allocating,
-cross-function-calling, and closure-creating programs compilable; closures reuse
-the multi-function `emit_bundle`, the shared imported function table, and the
-scratch-buffer marshalling the allocation item introduced.
+closures + the function table + cross-function tail calls, and string / keyword /
+symbol constants (now **done** — see those sections above) made real
+collection-building, arena-allocating, cross-function-calling, closure-creating,
+and string-literal-using programs compilable; the constants increment introduced
+the deduplicated rodata data segment that globals (below) reuse for their
+name-as-data.
 
-### 1. Constants needing a data segment
-
-`Const::Str` / `Const::Keyword` / `Const::Symbol`. Emit the UTF-8 bytes into a
-**data segment** and pass `(ptr, len)` to `rt_const_string`/`_keyword`/`_symbol`
-(already in `RT_IMPORTS`). The data segment's memory placement must be
-coordinated with the runtime's linear-memory layout — decide whether the
-emitter owns a rodata region or the runtime reserves one. (The closures
-increment marshals its constant name bytes through `rt_scratch_ptr` to avoid this
-coordination; a deduplicated rodata pool is the better long-term home for
-string/keyword/symbol constants, and the closure name can move there too.)
-
-### 2. Globals / vars
+### 1. Globals / vars
 
 `LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
-follow `codegen.rs::emit_load_global` / `emit_def_var`. Needs the name-as-data
-machinery from (1) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
+follow `codegen.rs::emit_load_global` / `emit_def_var`. Reuse the name-as-data
+rodata pool the constants increment introduced (`ModuleAsm::intern_rodata`), and
+add the var-resolution `rt_abi` bridges to `RT_IMPORTS`.
 
-### 3. Exceptions
+### 2. Exceptions
 
 `Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
 (`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
 `rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
 `rt_try` checking the thread-local).
 
-### 4. Unboxed specialization
+### 3. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -372,7 +385,7 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 5. CLI + bundling
+### 4. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the
