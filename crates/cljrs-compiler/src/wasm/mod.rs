@@ -58,9 +58,11 @@
 //! single-function ([`compile_function`]) and multi-function
 //! ([`compile_bundle`]) — for a growing subset of the IR: scalar constants,
 //! `LoadLocal`, boxed arithmetic/comparison, collection + region allocation,
-//! calls (`CallDirect`/`CallWithRegion`/`Call`), and all control flow.  Closures,
-//! globals, string/keyword/symbol constants, and async still return
-//! [`WasmError::Unsupported`].  See [`emit`]'s module docs for the full status.
+//! calls (`CallDirect`/`CallWithRegion`/`Call`), closures (`AllocClosure` via the
+//! shared imported function table), cross-function tail calls (`return_call`),
+//! and all control flow.  Globals, string/keyword/symbol constants, and async
+//! still return [`WasmError::Unsupported`].  See [`emit`]'s module docs for the
+//! full status.
 
 pub mod abi;
 pub mod emit;

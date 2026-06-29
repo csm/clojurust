@@ -94,6 +94,25 @@ use WasmValType::{F64, I32, I64};
 pub const RT_REGION_START: &str = "rt_region_start";
 pub const RT_REGION_END: &str = "rt_region_end";
 
+/// The shared indirect function table the AOT module imports from the runtime.
+///
+/// A closure's `fn_ptr` is, under `wasm32`, a table index; the runtime's dynamic
+/// dispatch (`rt_call` → `call_indirect`) calls through that same table, so both
+/// modules must share one.  The emitter imports it here, mirroring the imported
+/// `"rt" "memory"`, and installs its defined functions into it with an active
+/// `funcref` element segment.
+pub const FUNC_TABLE_NAME: &str = "__indirect_function_table";
+
+/// Table slot at which the AOT module installs its defined functions.
+///
+/// The element segment is placed at this base, so the function pointer (table
+/// index) for the defined function at bundle position `p` is
+/// `FUNC_TABLE_BASE + p`.  The runtime must reserve `[FUNC_TABLE_BASE, …)` of its
+/// table for the AOT functions — the table analogue of the rodata coordination
+/// the string constants need; the concrete base is finalized in the CLI/bundling
+/// step (item 6).  `0` is the validation-time placeholder.
+pub const FUNC_TABLE_BASE: u32 = 0;
+
 /// The subset of the `rt_abi` bridge the scaffold wires as wasm imports.
 ///
 /// This is the contract, not the whole table: it covers safepoints, constant
@@ -308,6 +327,30 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32, I64],
         results: &[I32],
     },
+    // ── Closure construction ─────────────────────────────────────────────────
+    // rt_make_fn(name_ptr, name_len, fn_ptr, param_count, captures_ptr, ncaptures)
+    // `fn_ptr` is a table index (a wasm32 function pointer); `captures_ptr` is a
+    // contiguous array of `*const Value` (i32 each), marshalled through scratch.
+    RtImport {
+        name: "rt_make_fn",
+        params: &[I32, I64, I32, I64, I32, I64],
+        results: &[I32],
+    },
+    // Same shape as rt_make_fn; the fixed param count excludes the rest param.
+    RtImport {
+        name: "rt_make_fn_variadic",
+        params: &[I32, I64, I32, I64, I32, I64],
+        results: &[I32],
+    },
+    // rt_make_fn_multi(name_ptr, name_len, fn_ptrs, param_counts, is_variadic,
+    //                  n_arities, captures_ptr, ncaptures).  `fn_ptrs` is an array
+    // of i32 table indices, `param_counts` an array of u64, `is_variadic` an array
+    // of u8 — all marshalled contiguously through the scratch buffer.
+    RtImport {
+        name: "rt_make_fn_multi",
+        params: &[I32, I64, I32, I32, I32, I64, I32, I64],
+        results: &[I32],
+    },
     // ── Specialization / inline-cache / deopt bridges (Phase 10.6) ───────────
     RtImport {
         name: "rt_value_tag",
@@ -389,6 +432,20 @@ mod tests {
         let v = lookup("rt_region_alloc_vector").expect("rt_region_alloc_vector in table");
         assert_eq!(v.params.first(), Some(&WasmValType::I32));
         assert_eq!(v.results, &[WasmValType::I32]);
+    }
+
+    #[test]
+    fn closure_constructors_present_and_well_typed() {
+        // rt_make_fn / _variadic share the (name_ptr, name_len, fn_ptr,
+        // param_count, captures, ncaptures) shape and return a boxed value.
+        for name in ["rt_make_fn", "rt_make_fn_variadic"] {
+            let rt = lookup(name).unwrap_or_else(|| panic!("{name} in table"));
+            assert_eq!(rt.params, &[I32, I64, I32, I64, I32, I64]);
+            assert_eq!(rt.results, &[I32]);
+        }
+        let multi = lookup("rt_make_fn_multi").expect("rt_make_fn_multi in table");
+        assert_eq!(multi.params, &[I32, I64, I32, I32, I32, I64, I32, I64]);
+        assert_eq!(multi.results, &[I32]);
     }
 
     #[test]
