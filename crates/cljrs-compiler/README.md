@@ -28,10 +28,10 @@ src/
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
   wasm/         — AOT Clojure → WebAssembly backend (scaffold; second backend over the same IR)
-    mod.rs      — public API (`compile_function`, `WasmBackend`, `WasmError`); browser tier model
+    mod.rs      — public API (`compile_function`, `compile_bundle`, `WasmBackend`, `WasmError`); browser tier model
     abi.rs      — ABI/region contract: Value→i32, rt_abi import table, region-handle threading
     reloop.rs   — relooper: IR CFG → structured control flow (`Structured`); wasm-private
-    emit.rs     — wasm-encoder emitter: IrFunction → validated wasm module (subset)
+    emit.rs     — wasm-encoder emitter: IrFunction(s) → validated wasm module (subset; multi-function)
 ```
 
 ### WebAssembly backend (`wasm/`)
@@ -72,19 +72,32 @@ collection allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/
 `rt_scratch_ptr` buffer), region operations (`RegionStart`/`RegionAlloc`/
 `RegionEnd` → the `rt_region_*` bridges with the handle as a leading `i32`, and
 `RegionParam` → the hidden trailing-`i32` param, sizing the signature from
-`IrFunction::abi_param_count`), and all control flow. Calls (including
-`CallWithRegion`, which needs multi-function modules), globals, string/keyword/
-symbol constants, and the async ABI return `Unsupported` — the next lowering
-increments.
+`IrFunction::abi_param_count`), calls, and all control flow.
+
+`compile_bundle` compiles several functions (each top-level function plus its
+flattened `subfunctions`) into one module so a direct call can resolve its
+callee to a wasm function index. Because imported functions occupy the low
+function-index space, the emitter runs **two passes**: pass 1 discovers each
+body's `rt_abi` imports; pass 2 re-lowers with `func_base = imports.len()`
+settled, so `CallDirect` targets resolve to their final indices. Calls lowered:
+`CallDirect`/`CallWithRegion` → a direct `call` to the resolved index (the
+region variant threading the caller's handle as the hidden trailing arg), and
+`Call` → dynamic dispatch through `rt_call` with arguments marshalled through the
+`rt_scratch_ptr` buffer. Closures (`AllocClosure`, which needs a function table
++ a data-segment name), globals, string/keyword/symbol constants, the
+`rt_call_ic` inline cache (needs a writable IC data region), cross-function tail
+calls (`return_call`), and the async ABI return `Unsupported` — the next
+lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
+pub fn compile_bundle(funcs: &[&IrFunction], cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
 pub struct WasmBackend { tail_calls: bool, exceptions: bool }
 pub enum WasmError { Reloop(RelooperError), Unsupported(String), Unimplemented(&'static str) }
 // abi:    WasmValType{I32,I64,F64}, RtImport, RT_IMPORTS, lookup(name)
 // reloop: Structured{Simple,Labeled,Loop,If,Br,Return,Unreachable,Nil}, reloop(func)
 //         RelooperError{Empty,DanglingTarget,Irreducible}
-// emit:   emit_function(func, structured, cfg), function_signature(func)
+// emit:   emit_function(func, structured, cfg), emit_bundle(funcs, cfg), function_signature(func)
 ```
 
 ---

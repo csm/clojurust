@@ -35,6 +35,19 @@
 //! `Br` site for merge/loop targets and at block entry for inlined
 //! single-predecessor edges.
 //!
+//! # Multi-function modules
+//!
+//! [`emit_bundle`] compiles several [`IrFunction`]s into one module so that a
+//! [`Inst::CallDirect`]/[`Inst::CallWithRegion`] can resolve its callee to a
+//! wasm function index.  In wasm, imported functions occupy the low function-index
+//! space (`0..k`) and defined functions follow (`k..k+n`), so the *number of
+//! imports* must be settled before any `call` to a defined function can be encoded.
+//! The emitter therefore runs **two passes**: pass 1 lowers every body into a
+//! throwaway buffer purely to discover the `rt_abi` imports each one needs; pass 2
+//! re-lowers with `func_base = imports.len()` known, so `CallDirect` targets
+//! resolve to their final absolute indices.  Emission is deterministic, so the
+//! import set is identical across passes.
+//!
 //! # Status
 //!
 //! Emits valid, `wasmparser`-validated modules for the subset: scalar
@@ -43,11 +56,15 @@
 //! (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/`AllocCons` — element arrays
 //! marshalled through an imported linear memory and the `rt_scratch_ptr`
 //! buffer), region operations (`RegionStart`/`RegionAlloc`/`RegionEnd` →
-//! `rt_region_*`, and `RegionParam` → the hidden trailing-`i32` param), and all
-//! control flow (branches, diamonds, and `loop`/`recur` with φ).  Calls
-//! (including `CallWithRegion`, which needs multi-function modules), globals,
-//! string/keyword/symbol constants, and the async ABI return
-//! [`WasmError::Unsupported`] — the next lowering increments.
+//! `rt_region_*`, and `RegionParam` → the hidden trailing-`i32` param), calls
+//! (`CallDirect`/`CallWithRegion` → a direct `call` to the resolved wasm index;
+//! `Call` → dynamic dispatch through `rt_call` with arguments marshalled through
+//! the scratch buffer), and all control flow (branches, diamonds, and
+//! `loop`/`recur` with φ).  Closures (`AllocClosure`, which needs a function
+//! table and a data-segment name), globals, string/keyword/symbol constants, the
+//! `rt_call_ic` inline cache (needs a writable IC data region), cross-function
+//! tail calls (`return_call`), and the async ABI return [`WasmError::Unsupported`]
+//! — the next lowering increments.
 
 use std::collections::HashMap;
 
@@ -66,85 +83,70 @@ use super::{WasmBackend, WasmError};
 
 /// Emit a wasm module containing `func` as a single exported function.
 ///
-/// Pipeline: assign one `i32` local per [`VarId`], walk `structured` lowering
-/// each [`Inst`], then assemble the type/import/function/export/code sections.
+/// A thin wrapper over [`emit_bundle`] for the common single-function case.
 pub fn emit_function(
     func: &IrFunction,
     structured: &Structured,
+    cfg: &WasmBackend,
+) -> Result<Vec<u8>, WasmError> {
+    emit_bundle(&[(func, structured)], cfg)
+}
+
+/// Emit a wasm module containing every `(func, structured)` in `funcs`, each
+/// exported under its name, so that a [`Inst::CallDirect`]/[`Inst::CallWithRegion`]
+/// can resolve its callee to that function's wasm index.
+///
+/// See the module docs ("Multi-function modules") for why this runs two passes:
+/// imported functions occupy the low function-index space, so the import count
+/// must be settled before a `call` to a *defined* function can be encoded.
+pub fn emit_bundle(
+    funcs: &[(&IrFunction, &Structured)],
     _cfg: &WasmBackend,
 ) -> Result<Vec<u8>, WasmError> {
-    if func.takes_state_param() {
-        return Err(WasmError::Unsupported(
-            "async poll-function ABI (state-machine params)".into(),
-        ));
+    for (func, _) in funcs {
+        if func.takes_state_param() {
+            return Err(WasmError::Unsupported(
+                "async poll-function ABI (state-machine params)".into(),
+            ));
+        }
     }
 
-    // The ABI param count includes the hidden trailing region handle (an `i32`)
-    // when this is a region-parameterised callee variant — mirroring
-    // [`IrFunction::abi_param_count`].  Visible params occupy wasm locals
-    // `0..nparams`; the region param, if any, is the next local and is bound by
-    // [`Inst::RegionParam`].
-    let nparams = func.params.len();
-    let abi_nparams = func.abi_param_count();
-    let region_param_local = func.takes_region_param().then_some(nparams as u32);
-
-    // One i32 local per VarId: visible params first (wasm locals 0..n), then the
-    // hidden region param (if any), then the remaining VarIds as declared locals.
-    let mut local_of: HashMap<VarId, u32> = HashMap::new();
-    for (i, (_, vid)) in func.params.iter().enumerate() {
-        local_of.insert(*vid, i as u32);
+    // Map each named function to its position among the *defined* functions.
+    // The absolute wasm index is `func_base + position`, where `func_base` is the
+    // import count (settled after pass 1).  Direct calls resolve through this.
+    let mut func_index_of: HashMap<&str, u32> = HashMap::new();
+    for (i, (func, _)) in funcs.iter().enumerate() {
+        if let Some(name) = func.name.as_deref() {
+            func_index_of.insert(name, i as u32);
+        }
     }
-    let mut next_local = abi_nparams as u32;
-    for v in 0..func.next_var {
-        let vid = VarId(v);
-        local_of.entry(vid).or_insert_with(|| {
-            let l = next_local;
-            next_local += 1;
-            l
-        });
-    }
-    // One extra i32 local, past all VarId locals, holds the scratch-buffer
-    // pointer transiently while marshalling an allocation's element array.
-    let scratch_local = next_local;
-    let declared = next_local + 1 - abi_nparams as u32;
 
-    let block_of: HashMap<BlockId, usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.id, i))
-        .collect();
-    let forward_preds = forward_pred_counts(func);
-
-    let mut body = Function::new([(declared, ValType::I32)]);
     let mut asm = ModuleAsm::new();
 
-    {
-        let mut em = Emitter {
-            func,
-            asm: &mut asm,
-            body: &mut body,
-            local_of: &local_of,
-            block_of: &block_of,
-            forward_preds: &forward_preds,
-            scratch_local,
-            region_param_local,
-            labels: Vec::new(),
-            current: func.blocks[0].id,
-        };
-        // GC safepoint at function entry (mirrors the native backend).
-        em.call_import("rt_safepoint")?;
-        em.emit_node(structured)?;
+    // Pass 1: lower every body into a throwaway buffer to discover the imports
+    // each needs.  Defined-function calls use a provisional `func_base` of 0; the
+    // bodies are discarded, so the wrong indices never reach the module.
+    for (func, structured) in funcs {
+        let _ = emit_one(func, structured, &mut asm, 0, &func_index_of)?;
     }
-    // A guaranteed-valid terminator: every real path already returned, so this
-    // is unreachable, but it makes the function's end stack-polymorphic.
-    body.instruction(&Instruction::Unreachable);
-    body.instruction(&Instruction::End);
 
-    // Assemble.  The main function type goes last; import types were interned
-    // during emission.
-    let main_ty = asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32]);
+    // Imports are now fully discovered; defined functions start right after them.
+    let func_base = asm.imports.len() as u32;
 
+    // Pass 2: re-lower with the settled `func_base`, keeping the bodies + their
+    // interned signature type indices.
+    let mut bodies: Vec<(Function, u32)> = Vec::with_capacity(funcs.len());
+    for (func, structured) in funcs {
+        bodies.push(emit_one(
+            func,
+            structured,
+            &mut asm,
+            func_base,
+            &func_index_of,
+        )?);
+    }
+
+    // ── Assemble ─────────────────────────────────────────────────────────────
     let mut module = Module::new();
 
     let mut types = TypeSection::new();
@@ -176,24 +178,105 @@ pub fn emit_function(
     }
     module.section(&imports);
 
-    let mut funcs = FunctionSection::new();
-    funcs.function(main_ty);
-    module.section(&funcs);
+    let mut func_section = FunctionSection::new();
+    for (_, ty_idx) in &bodies {
+        func_section.function(*ty_idx);
+    }
+    module.section(&func_section);
 
     let mut exports = ExportSection::new();
-    let func_index = asm.imports.len() as u32; // imports occupy 0..k; this fn is k
-    exports.export(
-        func.name.as_deref().unwrap_or("main"),
-        ExportKind::Func,
-        func_index,
-    );
+    for (i, (func, _)) in funcs.iter().enumerate() {
+        let name = func.name.as_deref().unwrap_or("main");
+        exports.export(name, ExportKind::Func, func_base + i as u32);
+    }
     module.section(&exports);
 
     let mut code = CodeSection::new();
-    code.function(&body);
+    for (body, _) in &bodies {
+        code.function(body);
+    }
     module.section(&code);
 
     Ok(module.finish())
+}
+
+/// Lower one function's body to a [`Function`], registering any imports/types it
+/// needs into the shared `asm`.  Returns the body and its interned signature
+/// type index.  `func_base` is the absolute wasm index of the first defined
+/// function (the import count); `func_index_of` maps a callee name to its
+/// position among the defined functions for [`Inst::CallDirect`] resolution.
+fn emit_one(
+    func: &IrFunction,
+    structured: &Structured,
+    asm: &mut ModuleAsm,
+    func_base: u32,
+    func_index_of: &HashMap<&str, u32>,
+) -> Result<(Function, u32), WasmError> {
+    // The ABI param count includes the hidden trailing region handle (an `i32`)
+    // when this is a region-parameterised callee variant — mirroring
+    // [`IrFunction::abi_param_count`].  Visible params occupy wasm locals
+    // `0..nparams`; the region param, if any, is the next local and is bound by
+    // [`Inst::RegionParam`].
+    let nparams = func.params.len();
+    let abi_nparams = func.abi_param_count();
+    let region_param_local = func.takes_region_param().then_some(nparams as u32);
+
+    // One i32 local per VarId: visible params first (wasm locals 0..n), then the
+    // hidden region param (if any), then the remaining VarIds as declared locals.
+    let mut local_of: HashMap<VarId, u32> = HashMap::new();
+    for (i, (_, vid)) in func.params.iter().enumerate() {
+        local_of.insert(*vid, i as u32);
+    }
+    let mut next_local = abi_nparams as u32;
+    for v in 0..func.next_var {
+        let vid = VarId(v);
+        local_of.entry(vid).or_insert_with(|| {
+            let l = next_local;
+            next_local += 1;
+            l
+        });
+    }
+    // One extra i32 local, past all VarId locals, holds the scratch-buffer
+    // pointer transiently while marshalling an allocation's / call's argument array.
+    let scratch_local = next_local;
+    let declared = next_local + 1 - abi_nparams as u32;
+
+    let block_of: HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    let forward_preds = forward_pred_counts(func);
+
+    let mut body = Function::new([(declared, ValType::I32)]);
+
+    {
+        let mut em = Emitter {
+            func,
+            asm,
+            body: &mut body,
+            local_of: &local_of,
+            block_of: &block_of,
+            forward_preds: &forward_preds,
+            scratch_local,
+            region_param_local,
+            func_base,
+            func_index_of,
+            labels: Vec::new(),
+            current: func.blocks[0].id,
+        };
+        // GC safepoint at function entry (mirrors the native backend).
+        em.call_import("rt_safepoint")?;
+        em.emit_node(structured)?;
+    }
+    // A guaranteed-valid terminator: every real path already returned, so this
+    // is unreachable, but it makes the function's end stack-polymorphic.
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
+
+    let ty_idx = asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32]);
+    Ok((body, ty_idx))
 }
 
 /// The wasm function signature for `func`: `(params, results)`.
@@ -325,6 +408,12 @@ struct Emitter<'a> {
     /// this is a region-parameterised callee variant.  Bound by
     /// [`Inst::RegionParam`].
     region_param_local: Option<u32>,
+    /// Absolute wasm index of the first defined (non-imported) function.  A
+    /// direct call to defined function at position `p` is `Call(func_base + p)`.
+    func_base: u32,
+    /// Maps a callee name to its position among the defined functions, for
+    /// [`Inst::CallDirect`]/[`Inst::CallWithRegion`] resolution.
+    func_index_of: &'a HashMap<&'a str, u32>,
     /// Enclosing control frames; `Some(b)` is a `block`/`loop` labeled `b`,
     /// `None` is an `if`.  Innermost is last.
     labels: Vec<Option<BlockId>>,
@@ -508,6 +597,25 @@ impl Emitter<'_> {
                 self.emit_known(kf, args)?;
                 self.set(*dst)
             }
+            // Direct call to another function in this bundle, resolved by name to
+            // its wasm function index (mirrors `codegen.rs::emit_direct_call`).
+            Inst::CallDirect(dst, name, args) => {
+                self.emit_direct_call(name, args, None)?;
+                self.set(*dst)
+            }
+            // Direct call to a region-parameterised variant, threading the
+            // caller's region handle as the hidden trailing argument (mirrors
+            // `codegen.rs::emit_direct_call_with_extra`).
+            Inst::CallWithRegion(dst, name, args, region) => {
+                self.emit_direct_call(name, args, Some(*region))?;
+                self.set(*dst)
+            }
+            // Dynamic dispatch through a boxed callable value (mirrors
+            // `codegen.rs::emit_unknown_call`, minus the inline cache).
+            Inst::Call(dst, callee, args) => {
+                self.emit_dynamic_call(*callee, args)?;
+                self.set(*dst)
+            }
             Inst::AllocVector(dst, elems) => {
                 self.emit_alloc("rt_alloc_vector", elems, elems.len() as u64)?;
                 self.set(*dst)
@@ -640,6 +748,79 @@ impl Emitter<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a callee name to its absolute wasm function index, or report a
+    /// clean [`WasmError::Unsupported`] (mirrors `codegen.rs`'s lookup error).
+    fn resolve_func(&self, name: &str) -> Result<u32, WasmError> {
+        self.func_index_of
+            .get(name)
+            .map(|pos| self.func_base + pos)
+            .ok_or_else(|| {
+                WasmError::Unsupported(format!("direct call to function not in bundle: {name}"))
+            })
+    }
+
+    /// Lower a direct call to a bundled function: push the argument locals, then
+    /// (for a region-parameterised callee) the region handle as the hidden
+    /// trailing argument, then `call` the resolved index.  The boxed result is
+    /// left on the operand stack.
+    fn emit_direct_call(
+        &mut self,
+        name: &str,
+        args: &[VarId],
+        region: Option<VarId>,
+    ) -> Result<(), WasmError> {
+        let idx = self.resolve_func(name)?;
+        for a in args {
+            self.get(*a)?;
+        }
+        if let Some(region) = region {
+            self.get(region)?;
+        }
+        self.ins(&Instruction::Call(idx));
+        Ok(())
+    }
+
+    /// Lower a dynamic call through `rt_call(callee, args_ptr, nargs)`: marshal
+    /// the argument `*const Value` pointers into the scratch buffer, then call the
+    /// bridge.  A zero-arg call passes a null pointer and a zero count.  The boxed
+    /// result is left on the operand stack.
+    ///
+    /// This is the inline-cache-free path; `rt_call_ic` additionally needs a
+    /// writable per-call-site IC slot in linear memory (a data-segment follow-up).
+    fn emit_dynamic_call(&mut self, callee: VarId, args: &[VarId]) -> Result<(), WasmError> {
+        let n = args.len();
+        if n == 0 {
+            self.get(callee)?;
+            self.ins(&Instruction::I32Const(0)); // null args pointer
+            self.ins(&Instruction::I64Const(0)); // zero count
+            return self.call_import("rt_call");
+        }
+
+        self.asm.needs_memory = true;
+
+        // scratch = rt_scratch_ptr(n * 4) — argument pointers are wasm i32s.
+        self.ins(&Instruction::I32Const((n * 4) as i32));
+        self.call_import("rt_scratch_ptr")?;
+        self.ins(&Instruction::LocalSet(self.scratch_local));
+
+        // Store each argument pointer at scratch + i*4.
+        for (i, a) in args.iter().enumerate() {
+            self.ins(&Instruction::LocalGet(self.scratch_local));
+            self.get(*a)?;
+            self.ins(&Instruction::I32Store(MemArg {
+                offset: (i * 4) as u64,
+                align: 2, // 2^2 == 4-byte alignment
+                memory_index: 0,
+            }));
+        }
+
+        // rt_call(callee, scratch, n)
+        self.get(callee)?;
+        self.ins(&Instruction::LocalGet(self.scratch_local));
+        self.ins(&Instruction::I64Const(n as i64));
+        self.call_import("rt_call")
     }
 
     /// Lower a slice-taking allocation bridge (`rt_alloc_vector` etc.): marshal
@@ -965,27 +1146,183 @@ mod tests {
         validate(&bytes);
     }
 
-    /// `CallWithRegion` still needs multi-function module support (resolving the
-    /// callee to a wasm function index), so it remains unsupported for now.
+    /// A direct call to a function not in the bundle cannot resolve to a wasm
+    /// index, so it reports cleanly.
     #[test]
-    fn call_with_region_is_unsupported() {
+    fn call_direct_unknown_target_is_unsupported() {
         let mut f = IrFunction::new(Some(Arc::from("caller")), None);
         let x = f.fresh_var();
         f.params = vec![(Arc::from("x"), x)];
-        let rh = f.fresh_var();
         let r = f.fresh_var();
         let b = f.fresh_block();
         f.blocks.push(Block {
             id: b,
             phis: vec![],
+            insts: vec![Inst::CallDirect(r, Arc::from("missing"), vec![x])],
+            terminator: Terminator::Return(r),
+        });
+        match compile(&f) {
+            Err(WasmError::Unsupported(msg)) => assert!(msg.contains("not in bundle")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A two-function bundle where `caller` directly calls `callee`: the
+    /// `CallDirect` resolves to the callee's wasm index.
+    #[test]
+    fn bundle_direct_call_validates() {
+        // callee: (fn [x] (+ x 1))
+        let mut callee = IrFunction::new(Some(Arc::from("callee")), None);
+        let cx = callee.fresh_var();
+        callee.params = vec![(Arc::from("x"), cx)];
+        let one = callee.fresh_var();
+        let sum = callee.fresh_var();
+        let cb = callee.fresh_block();
+        callee.blocks.push(Block {
+            id: cb,
+            phis: vec![],
             insts: vec![
-                Inst::RegionStart(rh),
-                Inst::CallWithRegion(r, Arc::from("callee"), vec![x], rh),
-                Inst::RegionEnd(rh),
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(sum, KnownFn::Add, vec![cx, one]),
+            ],
+            terminator: Terminator::Return(sum),
+        });
+
+        // caller: (fn [y] (callee y))
+        let mut caller = IrFunction::new(Some(Arc::from("caller")), None);
+        let y = caller.fresh_var();
+        caller.params = vec![(Arc::from("y"), y)];
+        let r = caller.fresh_var();
+        let cb2 = caller.fresh_block();
+        caller.blocks.push(Block {
+            id: cb2,
+            phis: vec![],
+            insts: vec![Inst::CallDirect(r, Arc::from("callee"), vec![y])],
+            terminator: Terminator::Return(r),
+        });
+
+        let bytes = super::super::compile_bundle(&[&caller, &callee], &WasmBackend::default())
+            .expect("emit bundle");
+        validate(&bytes);
+    }
+
+    /// `CallWithRegion` resolves to a bundled region-parameterised variant and
+    /// threads the caller's region handle as the hidden trailing argument.
+    #[test]
+    fn bundle_call_with_region_validates() {
+        use crate::ir::RegionAllocKind;
+
+        // callee variant: takes a hidden trailing region, allocates into it.
+        let mut callee = IrFunction::new(Some(Arc::from("callee__rg")), None);
+        let cx = callee.fresh_var();
+        callee.params = vec![(Arc::from("x"), cx)];
+        let rh = callee.fresh_var();
+        let v = callee.fresh_var();
+        let cb = callee.fresh_block();
+        callee.blocks.push(Block {
+            id: cb,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionParam(rh),
+                Inst::RegionAlloc(v, rh, RegionAllocKind::Vector, vec![cx]),
+            ],
+            terminator: Terminator::Return(v),
+        });
+        assert!(callee.takes_region_param());
+
+        // caller: opens a region and calls the variant, passing its handle.
+        let mut caller = IrFunction::new(Some(Arc::from("caller")), None);
+        let y = caller.fresh_var();
+        caller.params = vec![(Arc::from("y"), y)];
+        let crh = caller.fresh_var();
+        let r = caller.fresh_var();
+        let cb2 = caller.fresh_block();
+        caller.blocks.push(Block {
+            id: cb2,
+            phis: vec![],
+            insts: vec![
+                Inst::RegionStart(crh),
+                Inst::CallWithRegion(r, Arc::from("callee__rg"), vec![y], crh),
+                Inst::RegionEnd(crh),
             ],
             terminator: Terminator::Return(r),
         });
-        assert!(matches!(compile(&f), Err(WasmError::Unsupported(_))));
+
+        let bytes = super::super::compile_bundle(&[&caller, &callee], &WasmBackend::default())
+            .expect("emit bundle");
+        validate(&bytes);
+    }
+
+    /// `(fn [f x] (f x))`: a dynamic call through `rt_call`, with the single
+    /// argument marshalled into the scratch buffer.
+    #[test]
+    fn dynamic_call_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("apply1")), None);
+        let g = f.fresh_var();
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("f"), g), (Arc::from("x"), x)];
+        let r = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::Call(r, g, vec![x])],
+            terminator: Terminator::Return(r),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn [f] (f))`: a zero-arg dynamic call passes a null args pointer and a
+    /// zero count — no memory marshalling needed.
+    #[test]
+    fn dynamic_call_zero_args_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("apply0")), None);
+        let g = f.fresh_var();
+        f.params = vec![(Arc::from("f"), g)];
+        let r = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::Call(r, g, vec![])],
+            terminator: Terminator::Return(r),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// A bundle compiled from a top-level function flattens its subfunctions, so
+    /// a `CallDirect` to a subfunction resolves.
+    #[test]
+    fn bundle_flattens_subfunctions() {
+        let mut sub = IrFunction::new(Some(Arc::from("inner")), None);
+        let sx = sub.fresh_var();
+        sub.params = vec![(Arc::from("x"), sx)];
+        let sb = sub.fresh_block();
+        sub.blocks.push(Block {
+            id: sb,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(sx),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("outer")), None);
+        let oy = outer.fresh_var();
+        outer.params = vec![(Arc::from("y"), oy)];
+        let r = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![Inst::CallDirect(r, Arc::from("inner"), vec![oy])],
+            terminator: Terminator::Return(r),
+        });
+        outer.subfunctions.push(sub);
+
+        let bytes =
+            super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit bundle");
+        validate(&bytes);
     }
 
     #[test]
