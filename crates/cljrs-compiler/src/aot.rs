@@ -27,6 +27,8 @@ pub enum AotError {
     Codegen(crate::codegen::CodegenError),
     Eval(String),
     Link(String),
+    /// The wasm backend could not lower a construct in the program.
+    Wasm(crate::wasm::WasmError),
     /// One or more no-gc memory-safety violations were found by the blacklist
     /// analysis.  Only emitted when the `no-gc` Cargo feature is active.
     #[cfg(feature = "no-gc")]
@@ -41,6 +43,7 @@ impl std::fmt::Display for AotError {
             AotError::Codegen(e) => write!(f, "codegen error: {e:?}"),
             AotError::Eval(e) => write!(f, "eval/lowering error: {e}"),
             AotError::Link(e) => write!(f, "link error: {e}"),
+            AotError::Wasm(e) => write!(f, "wasm backend error: {e}"),
             #[cfg(feature = "no-gc")]
             AotError::NoGcBlacklist(vs) => {
                 writeln!(f, "no-gc blacklist violations:")?;
@@ -68,6 +71,11 @@ impl From<cljrs_types::error::CljxError> for AotError {
 impl From<crate::codegen::CodegenError> for AotError {
     fn from(e: crate::codegen::CodegenError) -> Self {
         AotError::Codegen(e)
+    }
+}
+impl From<crate::wasm::WasmError> for AotError {
+    fn from(e: crate::wasm::WasmError) -> Self {
+        AotError::Wasm(e)
     }
 }
 
@@ -375,6 +383,49 @@ pub fn lower_file_to_ir(
         ir_func.next_var
     );
     Ok((source, ir_func))
+}
+
+/// AOT-compile a source file to a standalone WebAssembly module.
+///
+/// Lowers the entry namespace to IR (parse → macro-expand → ANF/region
+/// optimization, via [`lower_file_to_ir`]), rewrites same-compilation-unit calls
+/// to `CallDirect` ([`optimize_direct_calls`], so they resolve to wasm function
+/// indices), then drives [`crate::wasm::compile_bundle`] over the entry function
+/// and its flattened [`IrFunction::subfunctions`], writing the validated module
+/// bytes to `out_path`.
+///
+/// This produces the **AOT code-generation artifact** for the entry namespace:
+/// a wasm module whose `"rt"` imports (the `rt_abi` bridges, linear memory, and
+/// the shared function table) are satisfied by the runtime compiled to
+/// `wasm32-unknown-unknown`.  Linking the two — and wiring the IR interpreter in
+/// as the dynamic-code tier, which is where the rodata / function-table bases
+/// ([`crate::wasm::abi::RODATA_BASE`], [`crate::wasm::abi::FUNC_TABLE_BASE`]) are
+/// finalized against the runtime's actual memory/table layout — is the remaining
+/// bundling step tracked in `docs/wasm-aot-plan.md`.  Cross-namespace
+/// dependencies are not yet bundled (only the entry namespace's functions are
+/// emitted); same-unit calls resolve directly, others dispatch through `rt_call`.
+pub fn compile_file_to_wasm(
+    src_path: &Path,
+    out_path: &Path,
+    src_dirs: &[PathBuf],
+) -> AotResult<()> {
+    let (_source, mut ir_func) = lower_file_to_ir(src_path, src_dirs, false)?;
+
+    // Resolve same-compilation-unit calls to direct calls so they bind to wasm
+    // function indices rather than dispatching dynamically through `rt_call`.
+    optimize_direct_calls(&mut ir_func);
+
+    eprintln!("[aot] emitting wasm module");
+    let cfg = crate::wasm::WasmBackend::default();
+    let bytes = crate::wasm::compile_bundle(&[&ir_func], &cfg)?;
+
+    std::fs::write(out_path, &bytes)?;
+    eprintln!(
+        "[aot] wrote wasm module ({} bytes) to {}",
+        bytes.len(),
+        out_path.display()
+    );
+    Ok(())
 }
 
 /// Compile a `.cljrs` / `.cljc` source file to a standalone native binary.

@@ -23,7 +23,7 @@ src/
 |---------------|------------------------------------------------------------------------|
 | `run`         | Interpret a `.cljrs` / `.cljc` source file                             |
 | `repl`        | Start an interactive REPL                                              |
-| `compile`     | AOT-compile a source file or project (via `cljrs.edn`) to a native binary |
+| `compile`     | AOT-compile a source file or project (via `cljrs.edn`) to a native binary, or a `.wasm` module with `--target wasm` |
 | `eval`        | Evaluate a single Clojure expression and print the result              |
 | `ir-viz`      | Render the optimized IR + source as a self-contained HTML visualizer   |
 | `test`        | Run `clojure.test` namespaces (named on the CLI or auto-discovered)    |
@@ -63,7 +63,8 @@ run to completion. A synchronous `-main` is awaited as a no-op pass-through.
 - `[-- ARGS…]` — positional arguments forwarded verbatim to `-main`
 
 `compile` additionally accepts:
-- `-o, --out <PATH>` — output binary path (required)
+- `-o, --out <PATH>` — output path (required): a native binary, or a `.wasm` module with `--target wasm`
+- `--target <native|wasm>` — code-generation target (default `native`). `wasm` emits a WebAssembly module via the AOT wasm backend (the entry namespace's functions; the `"rt"` imports are satisfied by the runtime built for `wasm32-unknown-unknown`). `--test` is not yet supported with `wasm`.
 - `--main <NS>` — namespace containing `-main`; overrides `:main` in `cljrs.edn` and auto-detection
 - `--test` — compile a test harness that runs every test in the given file/directory
 

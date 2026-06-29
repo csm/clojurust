@@ -293,13 +293,132 @@ The leftovers of the calls increment, now landed:
   alternative). Tail calls are a default-enabled wasm proposal, so the emitted
   modules still validate.
 
-`rt_call_ic` (the inline cache) remains deferred with the data-segment work:
-until a writable per-call-site IC region is coordinated with the runtime's
-memory layout, `Inst::Call` keeps dispatching through plain `rt_call`.
+`rt_call_ic` (the inline cache) remains deferred with the writable per-call-site
+IC region: until that is coordinated with the runtime's memory layout,
+`Inst::Call` keeps dispatching through plain `rt_call`.
+
+### String / keyword / symbol constants (`emit_string_like`) — complete
+
+`Const::Str` / `Const::Keyword` / `Const::Symbol` intern their UTF-8 bytes into a
+**deduplicated read-only data pool** (`ModuleAsm::rodata` + `rodata_map`) and
+resolve to the `(ptr, len)` pair `(abi::RODATA_BASE + offset, len)` passed to
+`rt_const_string` / `_keyword` / `_symbol` (already in `RT_IMPORTS`). The pool is
+emitted as a **single active data segment** at `abi::RODATA_BASE` in the
+runtime's imported linear memory (the data section follows the code section in
+wasm's section order), so the emitter owns a rodata region whose base the runtime
+reserves — the linear-memory analogue of `FUNC_TABLE_BASE`, finalized against the
+runtime's actual memory layout in the CLI/bundling step. The dedup map makes
+interning idempotent across the two emission passes and collapses repeated
+constants to one set of bytes. Keywords go through `rt_const_keyword` directly,
+**not** the per-call-site inline cache `codegen.rs` uses — that IC is deferred
+with the rest of the `rt_call_ic` work. Mirrors `codegen.rs::emit_string_const`
+(the native backend defines an anonymous data object per string). The closure
+name bytes still marshal through `rt_scratch_ptr`; moving them into this pool is
+a cleanup left for later.
+
+### Globals / vars (`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang`) — complete
+
+The first consumer of the rodata pool's name-as-data, mirroring
+`codegen.rs::emit_load_global` / `emit_load_var` / `emit_def_var`:
+
+- Each bridge takes `(ns_ptr, ns_len, name_ptr, name_len)`; a shared
+  `push_name_args` helper interns both `ns` and `name` into the rodata pool
+  (`intern_rodata`) and pushes the two `(ptr, len)` pairs.
+- `LoadGlobal` → `rt_load_global` (binding value); `LoadVar` → `rt_load_var`
+  (the Var object, for `set!`/`binding`); `DefVar` → `rt_def_var` with the boxed
+  value pushed after the name args; `SetBang` → `rt_set_bang(var, val)`, whose
+  `*const Value` result the IR has no destination for and so is `drop`ped.
+- Versioned `name@sha` references make **no** wasm-side distinction: the runtime
+  `rt_load_global` itself splits the version and resolves it (uncached). The
+  per-call-site versioned IC the Cranelift backend uses
+  (`rt_load_global_versioned_ic`) is deferred with the rest of the `rt_call_ic`
+  inline-cache work, which still needs a writable per-site data slot.
+- The four bridges were added to `RT_IMPORTS`.
+
+### Exceptions (`Throw`, `KnownFn::TryCatchFinally`) — complete (thread-local path)
+
+The boxed, backend-agnostic error path the Cranelift backend uses, so no
+wasm-specific control flow is needed:
+
+- `Throw(val)` → `rt_throw(val)`, which stashes the exception in a thread-local
+  and returns nil (dropped). The throwing block then falls into its
+  `unreachable`/return terminator; the enclosing `rt_try` checks the
+  thread-local after the body runs (mirrors `codegen.rs`'s `Inst::Throw`).
+- `KnownFn::TryCatchFinally` → a fixed three-arg `rt_try(body, catch, finally)`
+  over the boxed thunks, special-cased ahead of the arithmetic/comparison match
+  in `emit_known` (it is neither a fold nor a binary compare).
+- `rt_throw` / `rt_try` were added to `RT_IMPORTS`.
+
+The wasm exception-handling proposal (`try`/`catch`/`throw`, gated on
+`WasmBackend::exceptions`) is a deferred **optimization**: the thread-local path
+is always correct and is what runs today regardless of the flag. Wiring the EH
+proposal would mean encoding tags + structured `try`/`catch` in the emitter and
+relooper — a larger change with no correctness payoff over the thread-local
+path.
+
+### Unboxed scalar values (`typeinfer` + `refine_reprs`) — complete (intermediates)
+
+The optimization payoff: intermediate `Long`/`Double`/`Bool` values live unboxed
+in `i64`/`f64`/`i32` locals, so hot scalar arithmetic compiles to native wasm ops
+instead of the heap-allocating boxed bridges.
+
+- **Repr map.** `emit_one` runs `typeinfer::infer(func, &[])` (the same inference
+  the Cranelift backend uses) then a wasm-private **`refine_reprs`** cleanup that
+  transitively demotes back to `Boxed` any unboxed producer the emitter can't
+  lower, so the map only marks a value unboxed when the emitter can *produce* it
+  unboxed (keeping a value's repr and its local's wasm type in lock-step). Each
+  declared local is typed by its repr.
+- **Box/unbox at boundaries.** `Emitter::get` boxes an unboxed local on demand
+  (`rt_const_long`/`_double`/`rt_box_bool`) wherever a boxed value is needed (call
+  args, collection elements, `return`, boxed φ, the var bridges); `get_i64` /
+  `get_f64` read unboxed operands (`f64.convert_i64_s` for a mixed long→double
+  promotion); φ moves use a raw same-repr copy; an `if` reads a `Bool` directly as
+  its `i32` and treats an unboxed number as constant-true.
+- **Native arithmetic.** Binary `+`/`-`/`*`/`/` and comparisons whose result the
+  map kept unboxed lower to `i64`/`f64` ops. Checked long `+`/`-` emit the
+  signed-overflow branch (`((a^s)&(b^s))<0` / `((a^b)&(a^s))<0`) → `rt_overflow_error`
+  + `rt_throw` + an early boxed-`nil` `return`, mirroring
+  `codegen.rs::emit_long_overflow_check`. `rt_overflow_error` was added to
+  `RT_IMPORTS`.
+- **Demoted / deferred.** Checked long `*` (wasm has no `i64.mul_hi` for the
+  128-bit overflow check) is demoted to the boxed `rt_mul`. **Parameters keep the
+  boxed ABI** — the signature stays all-`i32`. The typed-parameter ABI (unboxed
+  params + entry guards, `function_signature`) is deferred: it interacts with
+  dynamic dispatch (`rt_call` is boxed) and cross-function calls, each of which
+  would need a boxed-entry trampoline + guard story AOT-wasm doesn't yet have.
+
+### CLI front-end (`compile_file_to_wasm`, `cljrs compile --target wasm`) — complete (module emission)
+
+The driver that turns a source file into a `.wasm` artifact:
+
+- **`aot::compile_file_to_wasm(src, out, src_dirs)`** lowers the entry namespace
+  to IR (`lower_file_to_ir`: parse → macro-expand → ANF/region optimization),
+  runs `optimize_direct_calls` (so same-unit calls bind to wasm function indices
+  rather than dispatching through `rt_call`), then drives
+  `wasm::compile_bundle(&[&ir_func], …)` over the entry function + its flattened
+  subfunctions and writes the validated bytes. A new `AotError::Wasm(WasmError)`
+  surfaces backend errors.
+- **CLI**: `cljrs compile <file> --target wasm -o <out>.wasm`. `--target`
+  (default `native`) selects the backend; `--target wasm` with `--test` is
+  rejected (no wasm test harness yet), and an unknown target errors cleanly.
+- **End-to-end tests** (`crates/cljrs-compiler/tests/wasm_compile.rs`): a file of
+  simple `defn`s and a `loop`/`recur` accumulator each compile through the full
+  front-end and **validate with `wasmparser`** — the loop test surfaced (and
+  fixed) a φ parallel-move bug where a boxed φ destination with an unboxed `i64`
+  entry was copied without boxing.
+
+**What remains (the actual *bundling*):** the emitted module's `"rt"` imports
+(the `rt_abi` bridges, linear memory, the shared function table) must be
+satisfied by the runtime compiled to `wasm32-unknown-unknown` (the `cljrs-wasm`
+crate already builds the interpreter to that target). Linking the two — and
+wiring the **IR interpreter in as the dynamic-code tier** — is where
+`abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` are finalized against the runtime's
+real linear-memory / table layout. Cross-namespace dependencies are not yet
+bundled (only the entry namespace's functions are emitted).
 
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 36 tests:
+`cargo test -p cljrs-compiler wasm::` — 46 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -320,11 +439,28 @@ memory layout, `Inst::Call` keeps dispatching through plain `rt_call`.
   param-count / variadic arrays + a capture into one scratch buffer, and a
   zero-arity-fallback-to-nil), and cross-function tail calls (a `CallDirect` in
   tail position emitting `return_call` with `tail_calls` on and an ordinary call
-  with it off — asserting the `return_call` opcode's presence/absence — and a
-  tail `CallWithRegion` threading the region handle) — each **validated with
-  `wasmparser`**; plus `Unsupported` coverage for an unbundled direct-call target,
-  an out-of-bundle closure arity, and un-lowered instructions, and the
-  closure-constructor import / typed-signature accounting.
+  with it off — asserting the `return_call` operator's presence/absence via a
+  `wasmparser` operator scan — and a tail `CallWithRegion` threading the region
+  handle), and string/keyword/symbol
+  constants (a vector of a string + keyword + symbol exercising the rodata data
+  segment, asserting the data section's presence, and a duplicate-string case
+  asserting the deduplicated pool holds one copy of the bytes), and globals /
+  vars (a `LoadGlobal` resolving a namespaced binding through `rt_load_global`
+  with ns/name bytes from the rodata pool, and a `DefVar`/`LoadVar`/`SetBang`
+  trio where the dropped `rt_set_bang` result leaves a balanced stack), and
+  exceptions (a `Throw` stashing via `rt_throw` and falling into an `unreachable`
+  terminator, and a `TryCatchFinally` lowering to the three-arg `rt_try` over its
+  boxed thunks), and unboxed scalars (an `i64.lt_s` long comparison, an `f64.add`
+  double addition, a loop accumulator whose `0`-seeded counter infers unboxed
+  `Long` so the `+`s lower to checked `i64.add` while `(< i n)` against the boxed
+  param stays on `rt_lt`, and a checked long `*` demoting to the boxed `rt_mul` —
+  each asserting the expected operator's presence/absence via `wasmparser`) — each
+  **validated with `wasmparser`**; plus end-to-end CLI coverage in
+  `tests/wasm_compile.rs` (a `defn` file and a `loop`/`recur` accumulator driven
+  through `compile_file_to_wasm` and `wasmparser`-validated), and `Unsupported`
+  coverage for an unbundled
+  direct-call target, an out-of-bundle closure arity, and un-lowered
+  instructions, and the closure-constructor import / typed-signature accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -334,53 +470,38 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 ## What is next
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
-and closures + the function table + cross-function tail calls (now **done** — see
-those sections above) made real collection-building, arena-allocating,
-cross-function-calling, and closure-creating programs compilable; closures reuse
-the multi-function `emit_bundle`, the shared imported function table, and the
-scratch-buffer marshalling the allocation item introduced.
+closures + the function table + cross-function tail calls, string / keyword /
+symbol constants, globals / vars, exceptions, unboxed scalar values, and the
+**CLI front-end** (`cljrs compile --target wasm`, emitting the entry namespace's
+module) are now **done** — see those sections above. The remaining work is making
+the emitted module *runnable* (linking it against the `wasm32-unknown-unknown`
+runtime) and the typed-parameter ABI optimization.
 
-### 1. Constants needing a data segment
+### 1. Unboxed parameter ABI (follow-up to unboxed scalars)
 
-`Const::Str` / `Const::Keyword` / `Const::Symbol`. Emit the UTF-8 bytes into a
-**data segment** and pass `(ptr, len)` to `rt_const_string`/`_keyword`/`_symbol`
-(already in `RT_IMPORTS`). The data segment's memory placement must be
-coordinated with the runtime's linear-memory layout — decide whether the
-emitter owns a rodata region or the runtime reserves one. (The closures
-increment marshals its constant name bytes through `rt_scratch_ptr` to avoid this
-coordination; a deduplicated rodata pool is the better long-term home for
-string/keyword/symbol constants, and the closure name can move there too.)
+Unboxed scalars currently cover **intermediate** values only; parameters keep the
+boxed (all-`i32`) ABI. Aligning the signature with `function_signature` (unboxed
+`Long`/`Double` params) needs a boxed-entry trampoline so dynamic dispatch
+(`rt_call`, always boxed) and cross-function callers can still reach the function,
+plus an entry guard story (the native backend's `compile_function_with_specs`
+guards + deopts; AOT-wasm has no deopt seam, so a violated static hint would
+coerce or throw). An optimization on top of the existing internal unboxing.
 
-### 2. Globals / vars
+### 2. Runtime linking + bundling (follow-up to the CLI front-end)
 
-`LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
-follow `codegen.rs::emit_load_global` / `emit_def_var`. Needs the name-as-data
-machinery from (1) and the var-resolution `rt_abi` bridges added to `RT_IMPORTS`.
+The CLI now emits the entry namespace's AOT module (`compile_file_to_wasm`,
+above); the remaining work is to make it *runnable*:
 
-### 3. Exceptions
-
-`Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
-(`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
-`rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
-`rt_try` checking the thread-local).
-
-### 4. Unboxed specialization
-
-Align the emitted signature with `function_signature` (typed ABI): keep
-`Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
-specialized params and boxing only at boxed-context uses. Mirrors
-`codegen.rs::compile_function_with_specs`. This is an optimization, not a
-correctness requirement — do it after the functional subset is broad.
-
-### 5. CLI + bundling
-
-`cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
-whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the
-`cljrs-wasm` crate already builds the interpreter to that target), and wire the
-**IR interpreter into the bundle as the dynamic-code tier** (drop the JIT/OSR
-hooks in-sandbox). This is where the imported-table base (`abi::FUNC_TABLE_BASE`)
-and any rodata region are finalized against the runtime's actual linear-memory /
-table layout.
+- **Link with the runtime** compiled to `wasm32-unknown-unknown` (the
+  `cljrs-wasm` crate already builds the interpreter to that target) so the
+  emitted module's `"rt"` imports — the `rt_abi` bridges, linear memory, and the
+  shared `__indirect_function_table` — are satisfied, and **finalize**
+  `abi::RODATA_BASE` / `abi::FUNC_TABLE_BASE` against the runtime's actual
+  linear-memory / table layout (they are `0` placeholders today).
+- **Wire the IR interpreter in as the dynamic-code tier** (drop the JIT/OSR hooks
+  in-sandbox) so `eval`/REPL/freshly-required namespaces still run.
+- **Bundle whole programs** (cross-namespace dependencies), not just the entry
+  namespace — mirroring `compile_file`'s per-namespace initializer discovery.
 
 ### Deferred indefinitely
 

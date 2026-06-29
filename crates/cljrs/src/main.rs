@@ -149,9 +149,15 @@ enum Commands {
         /// the entry-point namespace can be determined from `--main`, `:main`
         /// in `cljrs.edn`, or auto-detection of a unique `-main` function.
         file: Option<PathBuf>,
-        /// Output binary path.
+        /// Output path (a native binary, or a `.wasm` module with `--target wasm`).
         #[arg(short, long)]
         out: PathBuf,
+        /// Code-generation target: `native` (default) produces a standalone
+        /// binary via Cranelift; `wasm` produces a WebAssembly module via the
+        /// AOT wasm backend (the entry namespace's functions; the `"rt"` imports
+        /// are satisfied by the runtime built for `wasm32-unknown-unknown`).
+        #[arg(long, default_value = "native", value_name = "TARGET")]
+        target: String,
         /// Source directories to search when resolving `require`.
         #[arg(long = "src-path", value_name = "DIR")]
         src_paths: Vec<PathBuf>,
@@ -485,6 +491,7 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
         Commands::Compile {
             file,
             out,
+            target,
             src_paths,
             main_ns,
             test,
@@ -514,6 +521,18 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
                         all_src_paths.push(p);
                     }
                 }
+            }
+
+            // Validate the code-gen target up front.
+            if target != "native" && target != "wasm" {
+                return Err(miette::miette!(
+                    "unknown --target {target:?} (expected `native` or `wasm`)"
+                ));
+            }
+            if test && target == "wasm" {
+                return Err(miette::miette!(
+                    "--test is not supported with --target wasm yet"
+                ));
             }
 
             if test {
@@ -576,14 +595,19 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
                     }
                 };
 
-                cljrs_compiler::aot::compile_file(
-                    &entry_file,
-                    &out,
-                    &all_src_paths,
-                    rust_config.as_ref(),
-                    versioning.verify_commit_signatures,
-                )
-                .map_err(|e| miette::miette!("{e}"))?;
+                if target == "wasm" {
+                    cljrs_compiler::aot::compile_file_to_wasm(&entry_file, &out, &all_src_paths)
+                        .map_err(|e| miette::miette!("{e}"))?;
+                } else {
+                    cljrs_compiler::aot::compile_file(
+                        &entry_file,
+                        &out,
+                        &all_src_paths,
+                        rust_config.as_ref(),
+                        versioning.verify_commit_signatures,
+                    )
+                    .map_err(|e| miette::miette!("{e}"))?;
+                }
             }
             Ok(0)
         }

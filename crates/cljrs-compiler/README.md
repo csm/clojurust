@@ -65,7 +65,10 @@ imported from the `"rt"` module. The relooper's structured tree maps directly to
 wasm control flow (`Labeled`→`block`, `Loop`→`loop`, `If`→`if`/`else`,
 `Br`→`br N` with depths resolved from a label stack), and SSA φs are resolved as
 parallel moves on the operand stack at each edge — so `loop`/`recur` with a
-swapping `recur` is correct. Currently lowered: scalar constants, `LoadLocal`,
+swapping `recur` is correct. Currently lowered: scalar constants,
+string/keyword/symbol constants (UTF-8 bytes interned into a deduplicated
+read-only data pool emitted as one active data segment at `RODATA_BASE`, then
+`(ptr, len)` passed to `rt_const_string`/`_keyword`/`_symbol`), `LoadLocal`,
 folded boxed arithmetic (`+ - * / rem`), binary comparison (`= < > <= >=`),
 collection allocation (`AllocVector`/`AllocMap`/`AllocSet`/`AllocList`/
 `AllocCons` — element arrays marshalled through an imported linear memory and the
@@ -94,10 +97,35 @@ defined function into it with an active `funcref` element segment at
 fn-pointer/param-count/variadic arrays are marshalled contiguously through one
 `rt_scratch_ptr` reservation. **Cross-function tail calls** lower a trailing
 direct call whose result is returned to `return_call` when `WasmBackend::
-tail_calls` is set (else an ordinary `call` + `return`). Globals,
-string/keyword/symbol constants, the `rt_call_ic` inline cache (needs a writable
-IC data region), and the async ABI return `Unsupported` — the next lowering
-increments.
+tail_calls` is set (else an ordinary `call` + `return`). **Globals / vars**
+(`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang`) lower to the `rt_load_global` /
+`rt_load_var` / `rt_def_var` / `rt_set_bang` bridges, drawing the `(ns, name)`
+byte pairs from the same rodata pool the string constants use (versioned
+`name@sha` names are resolved inside `rt_load_global`, uncached — the
+per-call-site versioned IC is deferred with `rt_call_ic`). **Exceptions**
+(`Throw`, `KnownFn::TryCatchFinally`) lower to the thread-local error path the
+native backend uses: `rt_throw` stashes the exception in a thread-local (its nil
+result dropped) and `rt_try(body, catch, finally)` invokes the body thunk, routes
+a pending exception into the catch thunk, and always runs the finally thunk; the
+wasm exception-handling proposal (gated on `WasmBackend::exceptions`) is a
+deferred alternative. The `rt_call_ic` inline cache (needs a writable IC data
+region) and the async ABI return `Unsupported` — the next lowering increments.
+
+**Unboxed scalars.** `typeinfer::infer` assigns each `VarId` an unboxed `Repr`
+(`Long`→`i64`, `Double`→`f64`, `Bool`→`i32` 0/1) where the boxed bridge's exact
+semantics survive on the raw representation, so a value's wasm local takes that
+machine type and intermediate scalar arithmetic compiles to native `i64`/`f64`
+ops instead of the heap-allocating `rt_*` bridges. Values are **boxed only where
+they flow into a boxed context** (call arg, collection element, `return`, boxed
+φ, var bridge); checked long `+`/`-` emit the same signed-overflow branch the
+native backend does (`rt_overflow_error` + `rt_throw` + early boxed-`nil`
+return). A `refine_reprs` pass **demotes back to boxed**, transitively, any
+unboxed producer the emitter can't lower (e.g. checked long `*`, which needs a
+128-bit overflow check wasm can't express), so the repr map only ever marks a
+value unboxed when the emitter can produce it unboxed. Parameters keep the boxed
+ABI (the signature stays all-`i32`); the typed-parameter ABI (unboxed params +
+entry guards) is deferred because it interacts with dynamic dispatch (`rt_call`
+is boxed) and would need a boxed-entry trampoline.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
@@ -267,10 +295,22 @@ via an inline signed-overflow branch matching `rt_add`/etc.), wrapping
 
 ```rust
 pub fn compile_file(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf], rust_config: Option<&RustConfig>, verify_commit_signatures: bool) -> AotResult<()>;
+pub fn compile_file_to_wasm(src_path: &Path, out_path: &Path, src_dirs: &[PathBuf]) -> AotResult<()>;
 pub fn lower_via_clojure(name: Option<&str>, ns: &str, params: &[Arc<str>], forms: &[Form], env: &mut Env) -> AotResult<IrFunction>;
 
-pub enum AotError { Io, Parse, Codegen, Eval, Link, NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
+pub enum AotError { Io, Parse, Codegen, Eval, Link, Wasm(WasmError), NoGcBlacklist(Vec<BlacklistViolation>) /* no-gc only */ }
 ```
+
+`compile_file_to_wasm` is the `cljrs compile --target wasm` entry point: it lowers
+the source to IR (`lower_file_to_ir`), rewrites same-unit calls to `CallDirect`
+(`optimize_direct_calls`), then drives `wasm::compile_bundle` over the entry
+function + its flattened subfunctions and writes the validated module. The
+emitted module's `"rt"` imports are satisfied by the runtime built for
+`wasm32-unknown-unknown`; linking the two and wiring the IR interpreter in as the
+dynamic-code tier (finalizing `RODATA_BASE`/`FUNC_TABLE_BASE` against the
+runtime's layout) is the remaining bundling step. Only the entry namespace's
+functions are emitted so far — cross-namespace dependencies still dispatch
+through `rt_call`.
 
 Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
 

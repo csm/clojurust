@@ -110,8 +110,22 @@ pub const FUNC_TABLE_NAME: &str = "__indirect_function_table";
 /// `FUNC_TABLE_BASE + p`.  The runtime must reserve `[FUNC_TABLE_BASE, …)` of its
 /// table for the AOT functions — the table analogue of the rodata coordination
 /// the string constants need; the concrete base is finalized in the CLI/bundling
-/// step (item 6).  `0` is the validation-time placeholder.
+/// step (the CLI/bundling item).  `0` is the validation-time placeholder.
 pub const FUNC_TABLE_BASE: u32 = 0;
+
+/// Linear-memory offset at which the AOT module installs its read-only data
+/// pool (string / keyword / symbol constant bytes).
+///
+/// The emitter accumulates every `Const::Str` / `Const::Keyword` /
+/// `Const::Symbol`'s UTF-8 bytes into one deduplicated pool and emits it as a
+/// single active data segment at this base, so a constant at pool offset `o`
+/// resolves to the `(ptr, len)` pair `(RODATA_BASE + o, len)` passed to
+/// `rt_const_string` / `_keyword` / `_symbol`.  This is the linear-memory
+/// analogue of [`FUNC_TABLE_BASE`]: the runtime must reserve `[RODATA_BASE, …)`
+/// for the AOT data, and the concrete base is finalized against the runtime's
+/// actual memory layout in the CLI/bundling step.  `0` is the
+/// validation-time placeholder.
+pub const RODATA_BASE: u32 = 0;
 
 /// The subset of the `rt_abi` bridge the scaffold wires as wasm imports.
 ///
@@ -306,6 +320,52 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32, I32],
         results: &[I32],
     },
+    // ── Globals / vars ───────────────────────────────────────────────────────
+    // All take `(ns_ptr, ns_len, name_ptr, name_len)` with the name bytes living
+    // in the rodata pool.  `rt_load_global` resolves a namespaced binding to its
+    // value (versioned `name@sha` names are handled inside the bridge, uncached —
+    // the per-call-site versioned IC is deferred with `rt_call_ic`);
+    // `rt_load_var` returns the Var object itself (for `set!`/`binding`);
+    // `rt_def_var` interns the var with the given value; `rt_set_bang` mutates a
+    // Var's binding (its `*const Value` result is dropped).
+    RtImport {
+        name: "rt_load_global",
+        params: &[I32, I64, I32, I64],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_load_var",
+        params: &[I32, I64, I32, I64],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_def_var",
+        params: &[I32, I64, I32, I64, I32],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_set_bang",
+        params: &[I32, I32],
+        results: &[I32],
+    },
+    // ── Exceptions (thread-local error path) ─────────────────────────────────
+    // `rt_throw(exc)` stashes the exception in a thread-local and returns nil;
+    // the throwing block then falls into its `unreachable`/return terminator.
+    // `rt_try(body, catch, finally)` invokes the body thunk, routes a pending
+    // thread-local exception into the catch thunk, and always runs the finally
+    // thunk — all three are boxed closures.  This mirrors the Cranelift
+    // backend; the wasm exception-handling proposal (`try`/`catch`/`throw`,
+    // gated on `WasmBackend::exceptions`) is a deferred alternative.
+    RtImport {
+        name: "rt_throw",
+        params: &[I32],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_try",
+        params: &[I32, I32, I32],
+        results: &[I32],
+    },
     // ── A couple of common collection ops ────────────────────────────────────
     RtImport {
         name: "rt_get",
@@ -374,6 +434,14 @@ pub const RT_IMPORTS: &[RtImport] = &[
     },
     RtImport {
         name: "rt_deopt",
+        params: &[],
+        results: &[I32],
+    },
+    // Boxed integer-overflow exception, raised by unboxed checked `+`/`-`/`*`
+    // when the `i64` result overflows (Clojure primitive-long semantics) — the
+    // wasm analogue of `codegen.rs::emit_long_overflow_check`.
+    RtImport {
+        name: "rt_overflow_error",
         params: &[],
         results: &[I32],
     },
