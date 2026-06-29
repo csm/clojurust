@@ -201,9 +201,8 @@ the handle threaded as a leading argument (mirrors
   and `RegionParam` copies it into its `VarId` local.  The
   `takes_region_param()`→`Unsupported` guard is gone.
 
-`CallWithRegion` is **still** `Unsupported` — it is a direct call by name and so
-needs multi-function module support (item 1 below) to resolve the callee's wasm
-function index.
+`CallWithRegion` is lowered as of the **Calls** increment below (it resolves the
+callee's wasm function index in a multi-function module).
 
 ### Allocation (`Alloc*`) — complete
 
@@ -223,9 +222,43 @@ marshalled into a runtime-provided scratch buffer, then the slice-taking
 - Empty literals pass a null pointer + zero count and need no memory.
 - `AllocCons` takes two pointer args directly, no array.
 
+### Calls and multi-function modules (`emit::emit_bundle`) — complete (closures deferred)
+
+The first lowering that needs *more than one* function in a module — a
+[`compile_bundle`](../crates/cljrs-compiler/src/wasm/mod.rs) over a slice of
+[`IrFunction`]s (each top-level function plus its flattened `subfunctions`) into
+a single module, so a direct call resolves its callee to a wasm function index:
+
+- **Two-pass index assignment.** In wasm, imported functions occupy the low
+  function-index space (`0..k`) and defined functions follow (`k..k+n`), so the
+  import count `k` must be settled before any `call` to a *defined* function can
+  be encoded. `emit_bundle` therefore lowers every body twice: pass 1 into a
+  throwaway buffer purely to discover each body's `rt_abi` imports; pass 2 with
+  `func_base = imports.len()` known, so `CallDirect` targets resolve to their
+  final absolute indices. Emission is deterministic, so the import set is
+  identical across passes. `emit_function` is now a one-element `emit_bundle`.
+- **`CallDirect`** → push the argument locals, `call` the resolved index
+  (mirrors `codegen.rs::emit_direct_call`). An unbundled callee reports
+  `Unsupported`.
+- **`CallWithRegion`** → same, plus the caller's region handle pushed as the
+  hidden trailing argument (mirrors `emit_direct_call_with_extra`); the callee
+  variant's `abi_param_count` already accounts for it.
+- **`Call`** (dynamic) → marshal the argument `*const Value` pointers through the
+  `rt_scratch_ptr` buffer and dispatch through `rt_call(callee, args_ptr, nargs)`
+  (a zero-arg call passes a null pointer + zero count). This is the
+  inline-cache-free path; `rt_call_ic` additionally needs a writable per-call-site
+  IC slot in linear memory — the same data-segment coordination the
+  string/keyword/symbol constants need (item 2), so it is deferred with them.
+
+`AllocClosure` is **still** `Unsupported`: materializing a closure value calls
+`rt_make_fn*` with the arity function's *pointer*, which under `wasm32` is a
+**table index**, so it needs a function table + `ref.func` element segment, plus
+the closure name in a data segment (item 2). Cross-function tail calls
+(`return_call`) are likewise deferred.
+
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 23 tests:
+`cargo test -p cljrs-compiler wasm::` — 28 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -236,10 +269,13 @@ marshalled into a runtime-provided scratch buffer, then the slice-taking
   vector exercising the scratch buffer + imported memory, an empty vector, a
   one-pair map, and a cons), and region operations (a region-parameterised
   callee variant binding the hidden trailing param, a function-scoped
-  `RegionStart`/`RegionAlloc`/`RegionEnd`, and a region map + cons) — each
-  **validated with `wasmparser`**; plus `Unsupported` coverage for
-  `CallWithRegion` and un-lowered instructions, and the typed-signature
-  accounting.
+  `RegionStart`/`RegionAlloc`/`RegionEnd`, and a region map + cons), and calls
+  (a two-function bundle with a `CallDirect`, a bundle with a `CallWithRegion`
+  threading the region handle into a region-parameterised variant, a dynamic
+  `Call` through `rt_call` with and without arguments, and a bundle flattening a
+  subfunction so a `CallDirect` to it resolves) — each **validated with
+  `wasmparser`**; plus `Unsupported` coverage for an unbundled direct-call target
+  and un-lowered instructions, and the typed-signature accounting.
 
 Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 `wasmparser = "0.244"` (dev-dep) — both already in the lock transitively.
@@ -248,22 +284,22 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 ## What is next
 
-Ordered by value. Allocation and region operations (now **done** — see those
-sections above) made real collection-building and arena-allocating functions
-compilable; region ops in particular reuse the linear-memory import +
-scratch-buffer machinery the allocation item introduced.
+Ordered by value. Allocation, region operations, and calls / multi-function
+modules (now **done** — see those sections above) made real collection-building,
+arena-allocating, and cross-function-calling programs compilable; calls reuse the
+multi-function `emit_bundle` and the scratch-buffer marshalling the allocation
+item introduced.
 
-### 1. Calls and multi-function modules
+### 1. Closures, the function table, and cross-function tail calls
 
-`CallDirect` (same-module direct call), `Call` (dynamic, via the
-`rt_call_ic` inline-cache bridge), `CallWithRegion`. Requires compiling a
-**bundle** of functions into one module: extend `compile_function` to a
-`compile_bundle(&IrBundle)` that assigns a wasm function index to each, emits all
-bodies, and resolves `CallDirect` targets to those indices. Closures
-(`AllocClosure`) and subfunctions follow the same shape as the Cranelift backend
-(declare all arity functions into the module, materialize closure values via
-`rt_make_fn*`). Cross-function tail calls use the wasm tail-call proposal
-(`return_call`) when `WasmBackend::tail_calls`, else a trampoline.
+The leftovers of the calls increment, all blocked on machinery the next two
+items introduce. `AllocClosure` materializes a closure via `rt_make_fn*`, which
+takes the arity function's *pointer* — under `wasm32` a **table index** — so it
+needs a function table populated by a `ref.func` element segment and the closure
+name in a data segment (item 2). Cross-function tail calls use the wasm tail-call
+proposal (`return_call`) when `WasmBackend::tail_calls`, else a trampoline. The
+`rt_call_ic` inline cache (a writable per-call-site IC slot) lands with the
+data-segment work too; until then `Call` dispatches through plain `rt_call`.
 
 ### 2. Constants needing a data segment
 

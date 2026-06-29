@@ -298,6 +298,16 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32],
         results: &[I32],
     },
+    // ── Calls ────────────────────────────────────────────────────────────────
+    // rt_call(callee, args_ptr, nargs) → boxed result.  Dynamic dispatch through
+    // a boxed callable value; `args_ptr` is a contiguous array of `*const Value`
+    // (marshalled through the scratch buffer), `nargs` the element count.  A
+    // zero-arg call passes a null `args_ptr` and a zero count.
+    RtImport {
+        name: "rt_call",
+        params: &[I32, I32, I64],
+        results: &[I32],
+    },
     // ── Specialization / inline-cache / deopt bridges (Phase 10.6) ───────────
     RtImport {
         name: "rt_value_tag",
@@ -330,10 +340,16 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32, I64],
         results: &[I32],
     },
-    // ic_slot, callee, args_ptr, argc
+    // rt_call_ic(callee, args_ptr, nargs, ic_slot) — `rt_call` with a per-call-site
+    // inline cache for protocol dispatch.  `ic_slot` is a writable 8-byte
+    // linear-memory slot (an index into the runtime's IC entry table, never a GC
+    // pointer).  Wiring this in wasm needs the emitter to own a writable rodata /
+    // IC region coordinated with the runtime's memory layout — the same data-segment
+    // work the string/keyword/symbol constants need — so the emitter currently
+    // lowers `Inst::Call` through plain `rt_call` and keeps this for that follow-up.
     RtImport {
         name: "rt_call_ic",
-        params: &[I32, I32, I32, I64],
+        params: &[I32, I32, I64, I32],
         results: &[I32],
     },
 ];

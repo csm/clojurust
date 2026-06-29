@@ -51,11 +51,16 @@
 //!
 //! # Status
 //!
-//! **Scaffold.**  The module structure, public API, the full ABI/region
-//! contract, and the [`reloop`] relooper (complete for reducible CFGs —
-//! straight-line, `if`/`cond` diamonds, sequential/nested merges, and
-//! `loop`/`recur` loops) are in place.  The `wasm-encoder` emitter is stubbed
-//! and returns [`WasmError::Unimplemented`].
+//! The module structure, public API, the full ABI/region contract, and the
+//! [`reloop`] relooper (complete for reducible CFGs — straight-line, `if`/`cond`
+//! diamonds, sequential/nested merges, and `loop`/`recur` loops) are in place.
+//! The [`emit`] emitter produces real, `wasmparser`-validated modules — both
+//! single-function ([`compile_function`]) and multi-function
+//! ([`compile_bundle`]) — for a growing subset of the IR: scalar constants,
+//! `LoadLocal`, boxed arithmetic/comparison, collection + region allocation,
+//! calls (`CallDirect`/`CallWithRegion`/`Call`), and all control flow.  Closures,
+//! globals, string/keyword/symbol constants, and async still return
+//! [`WasmError::Unsupported`].  See [`emit`]'s module docs for the full status.
 
 pub mod abi;
 pub mod emit;
@@ -133,4 +138,40 @@ impl Default for WasmBackend {
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError> {
     let structured = reloop::reloop(func)?;
     emit::emit_function(func, &structured, cfg)
+}
+
+/// Compile a bundle of [`IrFunction`]s — each top-level function plus all of its
+/// nested [`IrFunction::subfunctions`], flattened — into a single wasm module.
+///
+/// Every function is exported under its name, and an [`crate::ir::Inst::CallDirect`] /
+/// [`crate::ir::Inst::CallWithRegion`] resolves its callee to the bundled
+/// function's wasm index.  This is the multi-function entry point behind item 1
+/// of `docs/wasm-aot-plan.md`; [`compile_function`] is the single-function
+/// special case.
+///
+/// Pipeline: [`reloop::reloop`] each function, then [`emit::emit_bundle`].
+pub fn compile_bundle(funcs: &[&IrFunction], cfg: &WasmBackend) -> Result<Vec<u8>, WasmError> {
+    // Flatten each function with its subfunctions (depth-first), mirroring how
+    // the Cranelift AOT path declares subfunctions before compiling.
+    let mut flat: Vec<&IrFunction> = Vec::new();
+    for func in funcs {
+        collect_funcs(func, &mut flat);
+    }
+
+    let structured: Vec<reloop::Structured> = flat
+        .iter()
+        .map(|f| reloop::reloop(f))
+        .collect::<Result<_, _>>()?;
+
+    let pairs: Vec<(&IrFunction, &reloop::Structured)> =
+        flat.iter().copied().zip(structured.iter()).collect();
+    emit::emit_bundle(&pairs, cfg)
+}
+
+/// Push `func` and all of its (transitive) subfunctions into `out`, depth-first.
+fn collect_funcs<'a>(func: &'a IrFunction, out: &mut Vec<&'a IrFunction>) {
+    out.push(func);
+    for sub in &func.subfunctions {
+        collect_funcs(sub, out);
+    }
 }
