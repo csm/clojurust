@@ -111,6 +111,22 @@ wasm exception-handling proposal (gated on `WasmBackend::exceptions`) is a
 deferred alternative. The `rt_call_ic` inline cache (needs a writable IC data
 region) and the async ABI return `Unsupported` — the next lowering increments.
 
+**Unboxed scalars.** `typeinfer::infer` assigns each `VarId` an unboxed `Repr`
+(`Long`→`i64`, `Double`→`f64`, `Bool`→`i32` 0/1) where the boxed bridge's exact
+semantics survive on the raw representation, so a value's wasm local takes that
+machine type and intermediate scalar arithmetic compiles to native `i64`/`f64`
+ops instead of the heap-allocating `rt_*` bridges. Values are **boxed only where
+they flow into a boxed context** (call arg, collection element, `return`, boxed
+φ, var bridge); checked long `+`/`-` emit the same signed-overflow branch the
+native backend does (`rt_overflow_error` + `rt_throw` + early boxed-`nil`
+return). A `refine_reprs` pass **demotes back to boxed**, transitively, any
+unboxed producer the emitter can't lower (e.g. checked long `*`, which needs a
+128-bit overflow check wasm can't express), so the repr map only ever marks a
+value unboxed when the emitter can produce it unboxed. Parameters keep the boxed
+ABI (the signature stays all-`i32`); the typed-parameter ABI (unboxed params +
+entry guards) is deferred because it interacts with dynamic dispatch (`rt_call`
+is boxed) and would need a boxed-entry trampoline.
+
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
 pub fn compile_bundle(funcs: &[&IrFunction], cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

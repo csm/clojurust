@@ -356,9 +356,40 @@ proposal would mean encoding tags + structured `try`/`catch` in the emitter and
 relooper — a larger change with no correctness payoff over the thread-local
 path.
 
+### Unboxed scalar values (`typeinfer` + `refine_reprs`) — complete (intermediates)
+
+The optimization payoff: intermediate `Long`/`Double`/`Bool` values live unboxed
+in `i64`/`f64`/`i32` locals, so hot scalar arithmetic compiles to native wasm ops
+instead of the heap-allocating boxed bridges.
+
+- **Repr map.** `emit_one` runs `typeinfer::infer(func, &[])` (the same inference
+  the Cranelift backend uses) then a wasm-private **`refine_reprs`** cleanup that
+  transitively demotes back to `Boxed` any unboxed producer the emitter can't
+  lower, so the map only marks a value unboxed when the emitter can *produce* it
+  unboxed (keeping a value's repr and its local's wasm type in lock-step). Each
+  declared local is typed by its repr.
+- **Box/unbox at boundaries.** `Emitter::get` boxes an unboxed local on demand
+  (`rt_const_long`/`_double`/`rt_box_bool`) wherever a boxed value is needed (call
+  args, collection elements, `return`, boxed φ, the var bridges); `get_i64` /
+  `get_f64` read unboxed operands (`f64.convert_i64_s` for a mixed long→double
+  promotion); φ moves use a raw same-repr copy; an `if` reads a `Bool` directly as
+  its `i32` and treats an unboxed number as constant-true.
+- **Native arithmetic.** Binary `+`/`-`/`*`/`/` and comparisons whose result the
+  map kept unboxed lower to `i64`/`f64` ops. Checked long `+`/`-` emit the
+  signed-overflow branch (`((a^s)&(b^s))<0` / `((a^b)&(a^s))<0`) → `rt_overflow_error`
+  + `rt_throw` + an early boxed-`nil` `return`, mirroring
+  `codegen.rs::emit_long_overflow_check`. `rt_overflow_error` was added to
+  `RT_IMPORTS`.
+- **Demoted / deferred.** Checked long `*` (wasm has no `i64.mul_hi` for the
+  128-bit overflow check) is demoted to the boxed `rt_mul`. **Parameters keep the
+  boxed ABI** — the signature stays all-`i32`. The typed-parameter ABI (unboxed
+  params + entry guards, `function_signature`) is deferred: it interacts with
+  dynamic dispatch (`rt_call` is boxed) and cross-function calls, each of which
+  would need a boxed-entry trampoline + guard story AOT-wasm doesn't yet have.
+
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 42 tests:
+`cargo test -p cljrs-compiler wasm::` — 46 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -379,8 +410,9 @@ path.
   param-count / variadic arrays + a capture into one scratch buffer, and a
   zero-arity-fallback-to-nil), and cross-function tail calls (a `CallDirect` in
   tail position emitting `return_call` with `tail_calls` on and an ordinary call
-  with it off — asserting the `return_call` opcode's presence/absence — and a
-  tail `CallWithRegion` threading the region handle), and string/keyword/symbol
+  with it off — asserting the `return_call` operator's presence/absence via a
+  `wasmparser` operator scan — and a tail `CallWithRegion` threading the region
+  handle), and string/keyword/symbol
   constants (a vector of a string + keyword + symbol exercising the rodata data
   segment, asserting the data section's presence, and a duplicate-string case
   asserting the deduplicated pool holds one copy of the bytes), and globals /
@@ -389,7 +421,12 @@ path.
   trio where the dropped `rt_set_bang` result leaves a balanced stack), and
   exceptions (a `Throw` stashing via `rt_throw` and falling into an `unreachable`
   terminator, and a `TryCatchFinally` lowering to the three-arg `rt_try` over its
-  boxed thunks) — each **validated with `wasmparser`**; plus `Unsupported`
+  boxed thunks), and unboxed scalars (an `i64.lt_s` long comparison, an `f64.add`
+  double addition, a loop accumulator whose `0`-seeded counter infers unboxed
+  `Long` so the `+`s lower to checked `i64.add` while `(< i n)` against the boxed
+  param stays on `rt_lt`, and a checked long `*` demoting to the boxed `rt_mul` —
+  each asserting the expected operator's presence/absence via `wasmparser`) — each
+  **validated with `wasmparser`**; plus `Unsupported`
   coverage for an unbundled
   direct-call target, an out-of-bundle closure arity, and un-lowered
   instructions, and the closure-constructor import / typed-signature accounting.
@@ -403,21 +440,24 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
 closures + the function table + cross-function tail calls, string / keyword /
-symbol constants, globals / vars, and exceptions (now **done** — see those
-sections above) made real collection-building, arena-allocating,
-cross-function-calling, closure-creating, string-literal-using,
-global-referencing, and throw/try-catch programs compilable; the constants
-increment introduced the deduplicated rodata data segment that globals reuse for
-their name-as-data, and exceptions reuse the boxed thread-local error path the
-native backend already defines.
+symbol constants, globals / vars, exceptions, and unboxed scalar values (now
+**done** — see those sections above) made real collection-building,
+arena-allocating, cross-function-calling, closure-creating, string-literal-using,
+global-referencing, throw/try-catch, and native-scalar-arithmetic programs
+compilable; the constants increment introduced the deduplicated rodata data
+segment that globals reuse for their name-as-data, exceptions reuse the boxed
+thread-local error path, and the unboxed increment keeps intermediate scalar
+arithmetic off the boxing bridges.
 
-### 1. Unboxed specialization
+### 1. Unboxed parameter ABI (follow-up to unboxed scalars)
 
-Align the emitted signature with `function_signature` (typed ABI): keep
-`Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
-specialized params and boxing only at boxed-context uses. Mirrors
-`codegen.rs::compile_function_with_specs`. This is an optimization, not a
-correctness requirement — do it after the functional subset is broad.
+Unboxed scalars currently cover **intermediate** values only; parameters keep the
+boxed (all-`i32`) ABI. Aligning the signature with `function_signature` (unboxed
+`Long`/`Double` params) needs a boxed-entry trampoline so dynamic dispatch
+(`rt_call`, always boxed) and cross-function callers can still reach the function,
+plus an entry guard story (the native backend's `compile_function_with_specs`
+guards + deopts; AOT-wasm has no deopt seam, so a violated static hint would
+coerce or throw). An optimization on top of the existing internal unboxing.
 
 ### 2. CLI + bundling
 

@@ -111,6 +111,28 @@
 //! `WasmBackend::exceptions`; the thread-local path is always used for now), and
 //! the async ABI return [`WasmError::Unsupported`] — the next lowering
 //! increments.
+//!
+//! # Unboxed scalar values
+//!
+//! [`typeinfer::infer`] assigns each [`VarId`] an unboxed [`Repr`]
+//! (`Long`→`i64`, `Double`→`f64`, `Bool`→`i32` 0/1) where the boxed bridge's
+//! exact semantics are expressible on the raw representation, so a value's wasm
+//! local takes that machine type and intermediate scalar arithmetic compiles to
+//! native `i64`/`f64` ops instead of the boxing `rt_*` bridges (each of which
+//! allocates or interns on the GC heap).  A value is **boxed only where it flows
+//! into a boxed context** — a call argument, collection element, `return`, a
+//! boxed φ, a global/var bridge — via [`Emitter::get`] (which boxes an unboxed
+//! local on demand); unboxed operands are read with [`Emitter::get_i64`] /
+//! [`Emitter::get_f64`].  Checked `+`/`-` on `Long` emit the same signed-overflow
+//! branch the native backend does (`rt_overflow_error` + `rt_throw`, then an
+//! early boxed-`nil` `return`); `Long` `*` (which needs a 128-bit overflow check
+//! wasm cannot express without `i64.mul_hi`) and every other non-trivial unboxed
+//! producer are **demoted back to boxed** by [`refine_reprs`], so the repr map
+//! the emitter consumes only ever marks a value unboxed when the emitter can
+//! produce it unboxed.  Parameters keep the **boxed ABI** (the signature stays
+//! all-`i32`): the typed-parameter ABI (unboxed params + entry guards) is
+//! deferred because it interacts with dynamic dispatch (`rt_call` is boxed) and
+//! cross-function calls, which would each need a boxed-entry trampoline.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -129,6 +151,7 @@ use crate::ir::{
 use super::abi::{self, RtImport, WasmValType};
 use super::reloop::Structured;
 use super::{WasmBackend, WasmError};
+use crate::typeinfer;
 
 /// Emit a wasm module containing `func` as a single exported function.
 ///
@@ -319,25 +342,33 @@ fn emit_one(
     let abi_nparams = func.abi_param_count();
     let region_param_local = func.takes_region_param().then_some(nparams as u32);
 
-    // One i32 local per VarId: visible params first (wasm locals 0..n), then the
-    // hidden region param (if any), then the remaining VarIds as declared locals.
+    // Per-VarId machine representation: `Long`→`i64`, `Double`→`f64`,
+    // everything else (boxed pointers, `Bool` 0/1, region handles)→`i32`.  The
+    // refined map only marks a value unboxed when the emitter can produce it
+    // unboxed (see [`refine_reprs`]).
+    let reprs = refine_reprs(func, typeinfer::infer(func, &[]));
+
+    // Locals: visible params first (wasm locals `0..nparams`, always boxed
+    // `i32`), then the hidden region param (if any), then the remaining VarIds as
+    // declared locals typed by their repr, then one `i32` scratch local.
     let mut local_of: HashMap<VarId, u32> = HashMap::new();
     for (i, (_, vid)) in func.params.iter().enumerate() {
         local_of.insert(*vid, i as u32);
     }
+    let mut decl_types: Vec<ValType> = Vec::new();
     let mut next_local = abi_nparams as u32;
     for v in 0..func.next_var {
         let vid = VarId(v);
-        local_of.entry(vid).or_insert_with(|| {
-            let l = next_local;
+        if let std::collections::hash_map::Entry::Vacant(e) = local_of.entry(vid) {
+            e.insert(next_local);
             next_local += 1;
-            l
-        });
+            decl_types.push(local_valtype(reprs.get(&vid)));
+        }
     }
     // One extra i32 local, past all VarId locals, holds the scratch-buffer
     // pointer transiently while marshalling an allocation's / call's argument array.
     let scratch_local = next_local;
-    let declared = next_local + 1 - abi_nparams as u32;
+    decl_types.push(ValType::I32);
 
     let block_of: HashMap<BlockId, usize> = func
         .blocks
@@ -347,7 +378,9 @@ fn emit_one(
         .collect();
     let forward_preds = forward_pred_counts(func);
 
-    let mut body = Function::new([(declared, ValType::I32)]);
+    // Each declared local is its own single-element run (params come from the
+    // function type, not here).
+    let mut body = Function::new(decl_types.iter().map(|t| (1, *t)));
 
     {
         let mut em = Emitter {
@@ -357,6 +390,7 @@ fn emit_one(
             local_of: &local_of,
             block_of: &block_of,
             forward_preds: &forward_preds,
+            reprs: &reprs,
             scratch_local,
             region_param_local,
             func_base,
@@ -417,6 +451,107 @@ fn valtype(w: &WasmValType) -> ValType {
         WasmValType::I64 => ValType::I64,
         WasmValType::F64 => ValType::F64,
     }
+}
+
+/// The wasm local type carrying a value of the given (optional) repr.
+/// `Long`→`i64`, `Double`→`f64`, everything else (boxed pointers, `Bool` 0/1
+/// payloads, region handles, array handles)→`i32`.
+fn local_valtype(repr: Option<&Repr>) -> ValType {
+    match repr {
+        Some(Repr::Long) => ValType::I64,
+        Some(Repr::Double) => ValType::F64,
+        _ => ValType::I32,
+    }
+}
+
+/// Demote every unboxed repr the emitter cannot *produce* unboxed back to
+/// `Boxed`, transitively, so the returned map only marks a value unboxed when
+/// its defining instruction is one this emitter lowers to native ops with all
+/// the operands it needs already unboxed.
+///
+/// [`typeinfer::infer`] is sound but more ambitious than this backend: it marks
+/// e.g. `Long` `*` results unboxed (the native backend has a 128-bit
+/// `i64.mul_hi`-style overflow check; wasm lacks the primitive), and it can seed
+/// params from specs (the typed-parameter ABI is deferred here).  Keeping a
+/// value unboxed while emitting it boxed — or vice versa — would mistype its
+/// local, so this pass conservatively boxes anything the emitter does not handle
+/// and re-checks dependents until a fixpoint.  Boxing only ever *removes*
+/// entries, so it terminates.
+fn refine_reprs(func: &IrFunction, mut reprs: HashMap<VarId, Repr>) -> HashMap<VarId, Repr> {
+    // Defining instruction of each SSA var (params have none).
+    let mut def: HashMap<VarId, &Inst> = HashMap::new();
+    for block in &func.blocks {
+        for inst in block.phis.iter().chain(block.insts.iter()) {
+            if let Some(d) = inst.dst() {
+                def.insert(d, inst);
+            }
+        }
+    }
+
+    let repr_of = |reprs: &HashMap<VarId, Repr>, v: VarId| -> Repr {
+        reprs.get(&v).copied().unwrap_or(Repr::Boxed)
+    };
+    let is_unboxed_num = |r: Repr| matches!(r, Repr::Long | Repr::Double);
+
+    loop {
+        let mut demote: Vec<VarId> = Vec::new();
+        for (&v, &r) in &reprs {
+            // A param (no def site) is kept boxed — `infer` was seeded with no
+            // specs, so this only fires for a stray seeded local.
+            let Some(inst) = def.get(&v) else {
+                demote.push(v);
+                continue;
+            };
+            let ok = match inst {
+                // Scalar constants are produced directly.
+                Inst::Const(_, Const::Long(_)) => r == Repr::Long,
+                Inst::Const(_, Const::Double(_)) => r == Repr::Double,
+                Inst::Const(_, Const::Bool(_)) => r == Repr::Bool,
+                // A φ is same-repr local copies: every entry must share `r`.
+                Inst::Phi(_, entries) => entries.iter().all(|(_, s)| repr_of(&reprs, *s) == r),
+                // Binary arithmetic / comparison this emitter lowers unboxed.
+                Inst::CallKnown(_, kf, args) if args.len() == 2 => {
+                    let a = repr_of(&reprs, args[0]);
+                    let b = repr_of(&reprs, args[1]);
+                    match (r, kf) {
+                        // Checked `+`/`-` (overflow branch) and unchecked
+                        // `+`/`-`/`*` (wrapping) on two longs.
+                        (
+                            Repr::Long,
+                            KnownFn::Add
+                            | KnownFn::Sub
+                            | KnownFn::UncheckedAdd
+                            | KnownFn::UncheckedSub
+                            | KnownFn::UncheckedMul,
+                        ) => a == Repr::Long && b == Repr::Long,
+                        // `f64` arithmetic (mixed operands promote).
+                        (
+                            Repr::Double,
+                            KnownFn::Add | KnownFn::Sub | KnownFn::Mul | KnownFn::Div,
+                        ) => is_unboxed_num(a) && is_unboxed_num(b),
+                        // Ordered comparisons over two unboxed numbers.
+                        (Repr::Bool, KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte) => {
+                            is_unboxed_num(a) && is_unboxed_num(b)
+                        }
+                        // `=` only when both are longs (i64 equality).
+                        (Repr::Bool, KnownFn::Eq) => a == Repr::Long && b == Repr::Long,
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                demote.push(v);
+            }
+        }
+        if demote.is_empty() {
+            break;
+        }
+        for v in demote {
+            reprs.remove(&v);
+        }
+    }
+    reprs
 }
 
 /// Accumulates the wasm module's interned function types and `rt_abi` imports.
@@ -530,6 +665,9 @@ struct Emitter<'a> {
     local_of: &'a HashMap<VarId, u32>,
     block_of: &'a HashMap<BlockId, usize>,
     forward_preds: &'a HashMap<BlockId, usize>,
+    /// Per-VarId machine representation; absent ⇒ [`Repr::Boxed`].  Drives the
+    /// box/unbox conversions at use sites and the unboxed arithmetic paths.
+    reprs: &'a HashMap<VarId, Repr>,
     /// An i32 local (past all VarId locals) that transiently holds the
     /// scratch-buffer pointer while marshalling an allocation's element array.
     scratch_local: u32,
@@ -581,9 +719,66 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    fn repr_of(&self, v: VarId) -> Repr {
+        self.reprs.get(&v).copied().unwrap_or(Repr::Boxed)
+    }
+
+    /// Push `v` as a **boxed** `*const Value` (`i32`).  An unboxed local is boxed
+    /// on demand through the matching `rt_*` constructor; a boxed local (or a
+    /// region handle) is pushed verbatim.
     fn get(&mut self, v: VarId) -> Result<(), WasmError> {
         let l = self.local(v)?;
         self.ins(&Instruction::LocalGet(l));
+        match self.repr_of(v) {
+            Repr::Long => self.call_import("rt_const_long")?,
+            Repr::Double => self.call_import("rt_const_double")?,
+            Repr::Bool => self.call_import("rt_box_bool")?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Push `v`'s local verbatim (no box/unbox).  Used for φ parallel moves,
+    /// where source and destination always share a repr.
+    fn get_raw(&mut self, v: VarId) -> Result<(), WasmError> {
+        let l = self.local(v)?;
+        self.ins(&Instruction::LocalGet(l));
+        Ok(())
+    }
+
+    /// Push `v` as an unboxed `i64`.  A `Long` local is pushed verbatim; a boxed
+    /// local is unboxed via `rt_unbox_long`.
+    fn get_i64(&mut self, v: VarId) -> Result<(), WasmError> {
+        let l = self.local(v)?;
+        self.ins(&Instruction::LocalGet(l));
+        match self.repr_of(v) {
+            Repr::Long => {}
+            Repr::Boxed => self.call_import("rt_unbox_long")?,
+            other => {
+                return Err(WasmError::Unsupported(format!(
+                    "cannot read {other:?} value as i64"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Push `v` as an unboxed `f64`.  A `Double` local is pushed verbatim; a
+    /// `Long` is converted (`f64.convert_i64_s`, mirroring the native backend's
+    /// mixed-operand promotion); a boxed local is unboxed via `rt_unbox_double`.
+    fn get_f64(&mut self, v: VarId) -> Result<(), WasmError> {
+        let l = self.local(v)?;
+        self.ins(&Instruction::LocalGet(l));
+        match self.repr_of(v) {
+            Repr::Double => {}
+            Repr::Long => self.ins(&Instruction::F64ConvertI64S),
+            Repr::Boxed => self.call_import("rt_unbox_double")?,
+            other => {
+                return Err(WasmError::Unsupported(format!(
+                    "cannot read {other:?} value as f64"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -643,9 +838,8 @@ impl Emitter<'_> {
                 then_arm,
                 else_arm,
             } => {
-                // Branch on the boxed condition's truthiness.
-                self.get(*cond)?;
-                self.call_import("rt_truthiness")?;
+                // Branch on the condition's truthiness (left as an i32 0/1).
+                self.emit_truthy(*cond)?;
                 self.ins(&Instruction::If(BlockType::Empty));
                 self.labels.push(None);
                 self.emit_node(then_arm)?;
@@ -703,12 +897,30 @@ impl Emitter<'_> {
             return Ok(());
         }
         for (_, src) in &moves {
-            self.get(*src)?;
+            self.get_raw(*src)?;
         }
         for (dst, _) in moves.iter().rev() {
             self.set(*dst)?;
         }
         Ok(())
+    }
+
+    /// Push an `i32` truthiness flag (`0`/non-zero) for `v`, consumed directly by
+    /// a wasm `if`.  An unboxed `Bool` is already `0`/`1`; an unboxed number is
+    /// constant-`true` (every number is truthy, matching `rt_truthiness`); a
+    /// boxed value goes through the `rt_truthiness` bridge.
+    fn emit_truthy(&mut self, v: VarId) -> Result<(), WasmError> {
+        match self.repr_of(v) {
+            Repr::Bool => self.get_raw(v),
+            Repr::Long | Repr::Double => {
+                self.ins(&Instruction::I32Const(1));
+                Ok(())
+            }
+            _ => {
+                self.get(v)?;
+                self.call_import("rt_truthiness")
+            }
+        }
     }
 
     // ── Instruction lowering ─────────────────────────────────────────────────
@@ -775,7 +987,16 @@ impl Emitter<'_> {
     fn emit_inst(&mut self, inst: &Inst) -> Result<(), WasmError> {
         match inst {
             Inst::Const(dst, c) => {
-                self.emit_const(c)?;
+                // An unboxed scalar materializes directly into its typed local;
+                // anything else is boxed through an `rt_const_*` bridge.
+                match (self.repr_of(*dst), c) {
+                    (Repr::Long, Const::Long(n)) => self.ins(&Instruction::I64Const(*n)),
+                    (Repr::Double, Const::Double(f)) => {
+                        self.ins(&Instruction::F64Const(Ieee64::from(*f)))
+                    }
+                    (Repr::Bool, Const::Bool(b)) => self.ins(&Instruction::I32Const(i32::from(*b))),
+                    _ => self.emit_const(c)?,
+                }
                 self.set(*dst)
             }
             // In compiled code locals are bound by params / let bindings; an
@@ -784,9 +1005,15 @@ impl Emitter<'_> {
                 self.call_import("rt_const_nil")?;
                 self.set(*dst)
             }
+            // An unboxed result is produced in registers (native `i64`/`f64`
+            // ops, leaving its raw value); otherwise the boxed `rt_*` bridge.
             Inst::CallKnown(dst, kf, args) => {
-                self.emit_known(kf, args)?;
-                self.set(*dst)
+                if self.repr_of(*dst) != Repr::Boxed && args.len() == 2 {
+                    self.emit_known_unboxed(*dst, kf, args[0], args[1])
+                } else {
+                    self.emit_known(kf, args)?;
+                    self.set(*dst)
+                }
             }
             // Direct call to another function in this bundle, resolved by name to
             // its wasm function index (mirrors `codegen.rs::emit_direct_call`).
@@ -1037,6 +1264,132 @@ impl Emitter<'_> {
                 self.call_import(bridge)?;
             }
         }
+        Ok(())
+    }
+
+    /// Lower a binary known call whose result [`refine_reprs`] kept unboxed,
+    /// emitting native `i64`/`f64` ops and storing the raw result into `dst`'s
+    /// typed local (so, unlike [`Self::emit_known`], this sets `dst` itself).
+    /// Mirrors `codegen.rs`'s unboxed known-call path + `emit_long_overflow_check`.
+    fn emit_known_unboxed(
+        &mut self,
+        dst: VarId,
+        kf: &KnownFn,
+        a: VarId,
+        b: VarId,
+    ) -> Result<(), WasmError> {
+        match (self.repr_of(dst), kf) {
+            // ── Checked long `+`/`-`: store the wrapped result, then branch to a
+            // throw on signed overflow (Clojure primitive-long semantics). ──────
+            (Repr::Long, KnownFn::Add | KnownFn::Sub) => {
+                self.get_i64(a)?;
+                self.get_i64(b)?;
+                self.ins(if matches!(kf, KnownFn::Add) {
+                    &Instruction::I64Add
+                } else {
+                    &Instruction::I64Sub
+                });
+                self.set(dst)?; // dst = a ± b (wrapped)
+                self.emit_long_overflow_check(kf, a, b, dst)
+            }
+            // ── Unchecked long `+`/`-`/`*`: plain wrapping ops, no overflow check.
+            (Repr::Long, KnownFn::UncheckedAdd | KnownFn::UncheckedSub | KnownFn::UncheckedMul) => {
+                self.get_i64(a)?;
+                self.get_i64(b)?;
+                self.ins(match kf {
+                    KnownFn::UncheckedAdd => &Instruction::I64Add,
+                    KnownFn::UncheckedSub => &Instruction::I64Sub,
+                    _ => &Instruction::I64Mul,
+                });
+                self.set(dst)
+            }
+            // ── f64 arithmetic (mixed long/double operands promote to f64). ─────
+            (Repr::Double, KnownFn::Add | KnownFn::Sub | KnownFn::Mul | KnownFn::Div) => {
+                self.get_f64(a)?;
+                self.get_f64(b)?;
+                self.ins(match kf {
+                    KnownFn::Add => &Instruction::F64Add,
+                    KnownFn::Sub => &Instruction::F64Sub,
+                    KnownFn::Mul => &Instruction::F64Mul,
+                    _ => &Instruction::F64Div,
+                });
+                self.set(dst)
+            }
+            // ── Ordered comparison → an i32 0/1 boolean. ───────────────────────
+            (Repr::Bool, KnownFn::Lt | KnownFn::Gt | KnownFn::Lte | KnownFn::Gte) => {
+                let both_long = self.repr_of(a) == Repr::Long && self.repr_of(b) == Repr::Long;
+                if both_long {
+                    self.get_i64(a)?;
+                    self.get_i64(b)?;
+                    self.ins(match kf {
+                        KnownFn::Lt => &Instruction::I64LtS,
+                        KnownFn::Gt => &Instruction::I64GtS,
+                        KnownFn::Lte => &Instruction::I64LeS,
+                        _ => &Instruction::I64GeS,
+                    });
+                } else {
+                    self.get_f64(a)?;
+                    self.get_f64(b)?;
+                    self.ins(match kf {
+                        KnownFn::Lt => &Instruction::F64Lt,
+                        KnownFn::Gt => &Instruction::F64Gt,
+                        KnownFn::Lte => &Instruction::F64Le,
+                        _ => &Instruction::F64Ge,
+                    });
+                }
+                self.set(dst)
+            }
+            // ── `=` on two longs → i64 equality. ───────────────────────────────
+            (Repr::Bool, KnownFn::Eq) => {
+                self.get_i64(a)?;
+                self.get_i64(b)?;
+                self.ins(&Instruction::I64Eq);
+                self.set(dst)
+            }
+            (repr, other) => Err(WasmError::Unsupported(format!(
+                "unboxed known call {other:?} → {repr:?} not lowered"
+            ))),
+        }
+    }
+
+    /// After a wrapped `i64` `+`/`-` whose result is already stored in `sum`'s
+    /// local, branch to a throw block when the signed operation overflowed,
+    /// raising the integer-overflow exception and returning boxed `nil` (mirrors
+    /// `codegen.rs::emit_long_overflow_check`).  Signed-overflow predicates:
+    /// add `((a ^ s) & (b ^ s)) < 0`, sub `((a ^ b) & (a ^ s)) < 0`.
+    fn emit_long_overflow_check(
+        &mut self,
+        kf: &KnownFn,
+        a: VarId,
+        b: VarId,
+        sum: VarId,
+    ) -> Result<(), WasmError> {
+        // Compute the overflow predicate as an i32 boolean.
+        if matches!(kf, KnownFn::Add) {
+            self.get_i64(a)?; // a ^ s
+            self.get_raw(sum)?;
+            self.ins(&Instruction::I64Xor);
+            self.get_i64(b)?; // b ^ s
+            self.get_raw(sum)?;
+            self.ins(&Instruction::I64Xor);
+        } else {
+            self.get_i64(a)?; // a ^ b
+            self.get_i64(b)?;
+            self.ins(&Instruction::I64Xor);
+            self.get_i64(a)?; // a ^ s
+            self.get_raw(sum)?;
+            self.ins(&Instruction::I64Xor);
+        }
+        self.ins(&Instruction::I64And);
+        self.ins(&Instruction::I64Const(0));
+        self.ins(&Instruction::I64LtS);
+        self.ins(&Instruction::If(BlockType::Empty));
+        // Overflow: raise the exception (stashed in the thread-local) and return
+        // its boxed-nil result, matching the native backend's throw block.
+        self.call_import("rt_overflow_error")?;
+        self.call_import("rt_throw")?;
+        self.ins(&Instruction::Return);
+        self.ins(&Instruction::End);
         Ok(())
     }
 
@@ -1438,6 +1791,25 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(bytes)
             .expect("emitted module should validate");
+    }
+
+    /// Whether any function body contains a `return_call` operator — a robust
+    /// replacement for scanning the whole module for the raw `0x12` opcode byte
+    /// (which can collide with section-size / index LEB bytes).
+    fn contains_return_call(bytes: &[u8]) -> bool {
+        use wasmparser::{Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::CodeSectionEntry(body)) = payload
+                && let Ok(reader) = body.get_operators_reader()
+            {
+                for op in reader {
+                    if matches!(op, Ok(wasmparser::Operator::ReturnCall { .. })) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn compile(f: &IrFunction) -> Result<Vec<u8>, WasmError> {
@@ -2082,6 +2454,185 @@ mod tests {
         validate(&bytes);
     }
 
+    /// Whether any function body contains a given non-control opcode, detected
+    /// via `wasmparser` operator iteration (robust against LEB byte collisions).
+    fn body_has<F: Fn(&wasmparser::Operator) -> bool>(bytes: &[u8], pred: F) -> bool {
+        use wasmparser::{Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::CodeSectionEntry(body)) = payload
+                && let Ok(reader) = body.get_operators_reader()
+            {
+                for op in reader {
+                    if op.as_ref().map(&pred).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `(let [a 2 b 3] (< a b))`: two unboxed long constants and an unboxed
+    /// comparison — the result is a raw `i32` boolean, boxed only at the return.
+    /// Asserts the emitter used `i64.lt_s` (not the `rt_lt` bridge).
+    #[test]
+    fn unboxed_long_compare() {
+        let mut f = IrFunction::new(Some(Arc::from("cmp")), None);
+        let a = f.fresh_var();
+        let b = f.fresh_var();
+        let c = f.fresh_var();
+        let blk = f.fresh_block();
+        f.blocks.push(Block {
+            id: blk,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(a, Const::Long(2)),
+                Inst::Const(b, Const::Long(3)),
+                Inst::CallKnown(c, KnownFn::Lt, vec![a, b]),
+            ],
+            terminator: Terminator::Return(c),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert!(
+            body_has(&bytes, |op| matches!(op, wasmparser::Operator::I64LtS)),
+            "long comparison should lower to i64.lt_s"
+        );
+    }
+
+    /// `(+ 1.5 2.5)`: unboxed `f64` arithmetic — `f64.add`, boxed at the return.
+    #[test]
+    fn unboxed_double_add() {
+        let mut f = IrFunction::new(Some(Arc::from("dadd")), None);
+        let a = f.fresh_var();
+        let b = f.fresh_var();
+        let s = f.fresh_var();
+        let blk = f.fresh_block();
+        f.blocks.push(Block {
+            id: blk,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(a, Const::Double(1.5)),
+                Inst::Const(b, Const::Double(2.5)),
+                Inst::CallKnown(s, KnownFn::Add, vec![a, b]),
+            ],
+            terminator: Terminator::Return(s),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert!(
+            body_has(&bytes, |op| matches!(op, wasmparser::Operator::F64Add)),
+            "double addition should lower to f64.add"
+        );
+    }
+
+    /// A loop accumulator: `(loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc))`
+    /// shape.  With no param spec, `i`/`acc` still infer unboxed `Long` from the
+    /// `0` seeds, so the `+`s lower to checked `i64.add` (overflow → throw) while
+    /// the `(< i n)` against the boxed param `n` stays on the `rt_lt` bridge —
+    /// exercising checked unboxed add *and* a boxed-compare with one unboxed
+    /// operand (boxed on demand).  Mirrors `typeinfer`'s loop-counter test.
+    #[test]
+    fn unboxed_loop_accumulator() {
+        let mut f = IrFunction::new(Some(Arc::from("sum")), None);
+        let n = f.fresh_var();
+        f.params = vec![(Arc::from("n"), n)];
+
+        let entry = f.fresh_block();
+        let header = f.fresh_block();
+        let body = f.fresh_block();
+        let exit = f.fresh_block();
+
+        let zero1 = f.fresh_var();
+        let zero2 = f.fresh_var();
+        let i = f.fresh_var();
+        let acc = f.fresh_var();
+        let cond = f.fresh_var();
+        let one = f.fresh_var();
+        let i2 = f.fresh_var();
+        let acc2 = f.fresh_var();
+
+        f.blocks.push(Block {
+            id: entry,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(zero1, Const::Long(0)),
+                Inst::Const(zero2, Const::Long(0)),
+            ],
+            // Forward entry into the loop header (the back edge is `body`'s
+            // `RecurJump`); mirrors how `loop` lowering enters the header.
+            terminator: Terminator::Jump(header),
+        });
+        f.blocks.push(Block {
+            id: header,
+            phis: vec![
+                Inst::Phi(i, vec![(entry, zero1), (body, i2)]),
+                Inst::Phi(acc, vec![(entry, zero2), (body, acc2)]),
+            ],
+            insts: vec![Inst::CallKnown(cond, KnownFn::Lt, vec![i, n])],
+            terminator: Terminator::Branch {
+                cond,
+                then_block: body,
+                else_block: exit,
+            },
+        });
+        f.blocks.push(Block {
+            id: body,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(i2, KnownFn::Add, vec![i, one]),
+                Inst::CallKnown(acc2, KnownFn::Add, vec![acc, i]),
+            ],
+            terminator: Terminator::RecurJump {
+                target: header,
+                args: vec![i2, acc2],
+            },
+        });
+        f.blocks.push(Block {
+            id: exit,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(acc),
+        });
+
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        // Checked unboxed long addition (i64.add) and its overflow guard (i64.lt_s).
+        assert!(
+            body_has(&bytes, |op| matches!(op, wasmparser::Operator::I64Add)),
+            "unboxed accumulator should use i64.add"
+        );
+    }
+
+    /// `(* a b)` on two longs is **demoted** to the boxed `rt_mul` bridge (wasm
+    /// lacks an `i64.mul_hi` for the 128-bit overflow check), so it still
+    /// validates with no `i64.mul` in the body.
+    #[test]
+    fn long_mul_demotes_to_boxed() {
+        let mut f = IrFunction::new(Some(Arc::from("prod")), None);
+        let a = f.fresh_var();
+        let b = f.fresh_var();
+        let p = f.fresh_var();
+        let blk = f.fresh_block();
+        f.blocks.push(Block {
+            id: blk,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(a, Const::Long(6)),
+                Inst::Const(b, Const::Long(7)),
+                Inst::CallKnown(p, KnownFn::Mul, vec![a, b]),
+            ],
+            terminator: Terminator::Return(p),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert!(
+            !body_has(&bytes, |op| matches!(op, wasmparser::Operator::I64Mul)),
+            "checked long multiply should stay on the boxed bridge"
+        );
+    }
+
     fn template(name: &str, fns: &[&str], pcs: &[usize], variadic: &[bool]) -> ClosureTemplate {
         ClosureTemplate {
             name: Some(Arc::from(name)),
@@ -2301,14 +2852,13 @@ mod tests {
         let off = super::super::compile_bundle(&[&caller, &callee], &cfg_off).expect("emit");
         validate(&off);
 
-        // The tail-call build emits the `return_call` opcode (0x12); the
-        // non-tail build does not.
+        // The tail-call build emits a `return_call`; the non-tail build does not.
         assert!(
-            on.contains(&0x12),
+            contains_return_call(&on),
             "tail_calls build should contain return_call"
         );
         assert!(
-            !off.contains(&0x12),
+            !contains_return_call(&off),
             "non-tail build should not contain return_call"
         );
     }

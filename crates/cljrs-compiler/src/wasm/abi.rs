@@ -437,6 +437,14 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[],
         results: &[I32],
     },
+    // Boxed integer-overflow exception, raised by unboxed checked `+`/`-`/`*`
+    // when the `i64` result overflows (Clojure primitive-long semantics) — the
+    // wasm analogue of `codegen.rs::emit_long_overflow_check`.
+    RtImport {
+        name: "rt_overflow_error",
+        params: &[],
+        results: &[I32],
+    },
     // ic_slot, key_ptr, key_len → fills a per-call-site keyword cache
     RtImport {
         name: "rt_kw_ic_fill",
