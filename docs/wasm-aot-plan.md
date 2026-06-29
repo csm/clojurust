@@ -335,9 +335,30 @@ The first consumer of the rodata pool's name-as-data, mirroring
   inline-cache work, which still needs a writable per-site data slot.
 - The four bridges were added to `RT_IMPORTS`.
 
+### Exceptions (`Throw`, `KnownFn::TryCatchFinally`) — complete (thread-local path)
+
+The boxed, backend-agnostic error path the Cranelift backend uses, so no
+wasm-specific control flow is needed:
+
+- `Throw(val)` → `rt_throw(val)`, which stashes the exception in a thread-local
+  and returns nil (dropped). The throwing block then falls into its
+  `unreachable`/return terminator; the enclosing `rt_try` checks the
+  thread-local after the body runs (mirrors `codegen.rs`'s `Inst::Throw`).
+- `KnownFn::TryCatchFinally` → a fixed three-arg `rt_try(body, catch, finally)`
+  over the boxed thunks, special-cased ahead of the arithmetic/comparison match
+  in `emit_known` (it is neither a fold nor a binary compare).
+- `rt_throw` / `rt_try` were added to `RT_IMPORTS`.
+
+The wasm exception-handling proposal (`try`/`catch`/`throw`, gated on
+`WasmBackend::exceptions`) is a deferred **optimization**: the thread-local path
+is always correct and is what runs today regardless of the flag. Wiring the EH
+proposal would mean encoding tags + structured `try`/`catch` in the emitter and
+relooper — a larger change with no correctness payoff over the thread-local
+path.
+
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 40 tests:
+`cargo test -p cljrs-compiler wasm::` — 42 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -365,8 +386,11 @@ The first consumer of the rodata pool's name-as-data, mirroring
   asserting the deduplicated pool holds one copy of the bytes), and globals /
   vars (a `LoadGlobal` resolving a namespaced binding through `rt_load_global`
   with ns/name bytes from the rodata pool, and a `DefVar`/`LoadVar`/`SetBang`
-  trio where the dropped `rt_set_bang` result leaves a balanced stack) — each
-  **validated with `wasmparser`**; plus `Unsupported` coverage for an unbundled
+  trio where the dropped `rt_set_bang` result leaves a balanced stack), and
+  exceptions (a `Throw` stashing via `rt_throw` and falling into an `unreachable`
+  terminator, and a `TryCatchFinally` lowering to the three-arg `rt_try` over its
+  boxed thunks) — each **validated with `wasmparser`**; plus `Unsupported`
+  coverage for an unbundled
   direct-call target, an out-of-bundle closure arity, and un-lowered
   instructions, and the closure-constructor import / typed-signature accounting.
 
@@ -379,20 +403,15 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
 closures + the function table + cross-function tail calls, string / keyword /
-symbol constants, and globals / vars (now **done** — see those sections above)
-made real collection-building, arena-allocating, cross-function-calling,
-closure-creating, string-literal-using, and global-referencing programs
-compilable; the constants increment introduced the deduplicated rodata data
-segment that globals reuse for their name-as-data.
+symbol constants, globals / vars, and exceptions (now **done** — see those
+sections above) made real collection-building, arena-allocating,
+cross-function-calling, closure-creating, string-literal-using,
+global-referencing, and throw/try-catch programs compilable; the constants
+increment introduced the deduplicated rodata data segment that globals reuse for
+their name-as-data, and exceptions reuse the boxed thread-local error path the
+native backend already defines.
 
-### 1. Exceptions
-
-`Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
-(`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
-`rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
-`rt_try` checking the thread-local).
-
-### 2. Unboxed specialization
+### 1. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -400,7 +419,7 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 3. CLI + bundling
+### 2. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the

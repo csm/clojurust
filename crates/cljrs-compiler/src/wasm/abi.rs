@@ -348,6 +348,24 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32],
         results: &[I32],
     },
+    // ── Exceptions (thread-local error path) ─────────────────────────────────
+    // `rt_throw(exc)` stashes the exception in a thread-local and returns nil;
+    // the throwing block then falls into its `unreachable`/return terminator.
+    // `rt_try(body, catch, finally)` invokes the body thunk, routes a pending
+    // thread-local exception into the catch thunk, and always runs the finally
+    // thunk — all three are boxed closures.  This mirrors the Cranelift
+    // backend; the wasm exception-handling proposal (`try`/`catch`/`throw`,
+    // gated on `WasmBackend::exceptions`) is a deferred alternative.
+    RtImport {
+        name: "rt_throw",
+        params: &[I32],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_try",
+        params: &[I32, I32, I32],
+        results: &[I32],
+    },
     // ── A couple of common collection ops ────────────────────────────────────
     RtImport {
         name: "rt_get",

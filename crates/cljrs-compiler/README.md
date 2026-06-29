@@ -102,9 +102,14 @@ tail_calls` is set (else an ordinary `call` + `return`). **Globals / vars**
 `rt_load_var` / `rt_def_var` / `rt_set_bang` bridges, drawing the `(ns, name)`
 byte pairs from the same rodata pool the string constants use (versioned
 `name@sha` names are resolved inside `rt_load_global`, uncached — the
-per-call-site versioned IC is deferred with `rt_call_ic`). The `rt_call_ic`
-inline cache (needs a writable IC data region) and the async ABI return
-`Unsupported` — the next lowering increments.
+per-call-site versioned IC is deferred with `rt_call_ic`). **Exceptions**
+(`Throw`, `KnownFn::TryCatchFinally`) lower to the thread-local error path the
+native backend uses: `rt_throw` stashes the exception in a thread-local (its nil
+result dropped) and `rt_try(body, catch, finally)` invokes the body thunk, routes
+a pending exception into the catch thunk, and always runs the finally thunk; the
+wasm exception-handling proposal (gated on `WasmBackend::exceptions`) is a
+deferred alternative. The `rt_call_ic` inline cache (needs a writable IC data
+region) and the async ABI return `Unsupported` — the next lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;

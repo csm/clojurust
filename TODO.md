@@ -490,7 +490,7 @@ inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
 - [ ] `wasm-encoder` emitter (remaining `Inst`s): unboxed `Long`/`Double` specialization aligned with `function_signature`
 - [ ] GC heap in linear memory (reuse the `wasm32-unknown-unknown` GC) + `rt_safepoint` at entry/back-edges
 - [x] `recur` → `loop`/`br`; cross-function tail calls via the wasm tail-call proposal (`return_call`) when `WasmBackend::tail_calls` (a trailing returned `CallDirect`/`CallWithRegion` → `return_call`); a trampoline fallback for `tail_calls` off — and `return_call` for dynamic `Call`s — remain deferred (ordinary `call` + `return` is emitted, correct but not constant-stack)
-- [ ] `try`/`catch`/`throw` via the wasm exception-handling proposal (or an `rt_abi` error path)
+- [x] `throw`/`try`/`catch` via the `rt_abi` thread-local error path: `Inst::Throw` → `rt_throw` (stashes the exception, returns nil which is dropped, block falls into its `unreachable`/return terminator) and `KnownFn::TryCatchFinally` → `rt_try(body, catch, finally)` over the boxed thunks (mirrors the Cranelift backend); the wasm exception-handling proposal (`try`/`catch`/`throw`, gated on `WasmBackend::exceptions`) is a deferred alternative — the thread-local path is always used
 - [ ] CLI: `cljrs compile <file> --target wasm -o <out>.wasm`; bundle with the runtime + IR interpreter
 - [ ] Wire the IR interpreter into the `cljrs-wasm` bundle as the dynamic-code tier (drop JIT/OSR hooks in-sandbox)
 - [ ] WasmGC (host-managed reference types) — deferred; keep the linear-memory GC for now

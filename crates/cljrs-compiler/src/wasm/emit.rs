@@ -103,9 +103,12 @@
 //! the scratch buffer), closures (`AllocClosure` → `rt_make_fn*` over the shared
 //! function table), globals/vars (`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang` →
 //! the `rt_load_global`/`rt_load_var`/`rt_def_var`/`rt_set_bang` bridges with
-//! ns/name bytes drawn from the rodata pool), cross-function tail calls
-//! (`return_call`), and all control flow (branches, diamonds, and `loop`/`recur`
-//! with φ).  The `rt_call_ic` inline cache (needs a writable IC data region) and
+//! ns/name bytes drawn from the rodata pool), exceptions (`Throw` → `rt_throw`
+//! and `KnownFn::TryCatchFinally` → `rt_try`, the thread-local error path),
+//! cross-function tail calls (`return_call`), and all control flow (branches,
+//! diamonds, and `loop`/`recur` with φ).  The `rt_call_ic` inline cache (needs a
+//! writable IC data region), the wasm exception-handling proposal (gated on
+//! `WasmBackend::exceptions`; the thread-local path is always used for now), and
 //! the async ABI return [`WasmError::Unsupported`] — the next lowering
 //! increments.
 
@@ -869,6 +872,17 @@ impl Emitter<'_> {
                 self.ins(&Instruction::Drop);
                 Ok(())
             }
+            // ── Exceptions (thread-local error path) ───────────────────────────
+            // `(throw exc)` — stash the exception in the runtime's thread-local
+            // and continue to the block's terminator (mirrors `codegen.rs`'s
+            // `Inst::Throw`; `rt_throw` returns nil, which is dropped).  The
+            // enclosing `rt_try` checks the thread-local after the body runs.
+            Inst::Throw(val) => {
+                self.get(*val)?;
+                self.call_import("rt_throw")?;
+                self.ins(&Instruction::Drop);
+                Ok(())
+            }
             // ── Region operations ────────────────────────────────────────────
             Inst::RegionStart(dst) => {
                 // Allocate and activate a bump region; keep its i32 handle.
@@ -965,6 +979,24 @@ impl Emitter<'_> {
     /// Lower a known-function call to its boxed `rt_abi` bridge, result left on
     /// the operand stack.
     fn emit_known(&mut self, kf: &KnownFn, args: &[VarId]) -> Result<(), WasmError> {
+        // try/catch/finally is a fixed three-arg bridge, not an arithmetic fold
+        // or binary comparison: `rt_try(body, catch, finally)` invokes the body
+        // thunk, routes a pending thread-local exception into the catch thunk,
+        // and always runs the finally thunk (mirrors `codegen.rs`, where
+        // `KnownFn::TryCatchFinally` maps to `rt_try`).
+        if let KnownFn::TryCatchFinally = kf {
+            if args.len() != 3 {
+                return Err(WasmError::Unsupported(format!(
+                    "try/catch/finally expects 3 thunks, got {}",
+                    args.len()
+                )));
+            }
+            for a in args {
+                self.get(*a)?;
+            }
+            return self.call_import("rt_try");
+        }
+
         let (bridge, is_cmp) = match kf {
             KnownFn::Add => ("rt_add", false),
             KnownFn::Sub => ("rt_sub", false),
@@ -1997,6 +2029,54 @@ mod tests {
                 Inst::SetBang(var_obj, v),
             ],
             terminator: Terminator::Return(defd),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn [e] (throw e))`: `Throw` stashes the exception via `rt_throw`
+    /// (result dropped) and the block falls into its `unreachable` terminator,
+    /// mirroring the native backend's thread-local error path.
+    #[test]
+    fn throw_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("boom")), None);
+        let e = f.fresh_var();
+        f.params = vec![(Arc::from("e"), e)];
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::Throw(e)],
+            terminator: Terminator::Unreachable,
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+    }
+
+    /// `(fn [body catch finally] (try ...))`: `KnownFn::TryCatchFinally` lowers
+    /// to the three-arg `rt_try` bridge over the boxed thunks.
+    #[test]
+    fn try_catch_finally_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("guarded")), None);
+        let body = f.fresh_var();
+        let catch = f.fresh_var();
+        let finally = f.fresh_var();
+        f.params = vec![
+            (Arc::from("body"), body),
+            (Arc::from("catch"), catch),
+            (Arc::from("finally"), finally),
+        ];
+        let r = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::CallKnown(
+                r,
+                KnownFn::TryCatchFinally,
+                vec![body, catch, finally],
+            )],
+            terminator: Terminator::Return(r),
         });
         let bytes = compile(&f).expect("emit");
         validate(&bytes);
