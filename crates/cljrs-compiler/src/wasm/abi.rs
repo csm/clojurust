@@ -320,6 +320,34 @@ pub const RT_IMPORTS: &[RtImport] = &[
         params: &[I32, I32, I32],
         results: &[I32],
     },
+    // ── Globals / vars ───────────────────────────────────────────────────────
+    // All take `(ns_ptr, ns_len, name_ptr, name_len)` with the name bytes living
+    // in the rodata pool.  `rt_load_global` resolves a namespaced binding to its
+    // value (versioned `name@sha` names are handled inside the bridge, uncached —
+    // the per-call-site versioned IC is deferred with `rt_call_ic`);
+    // `rt_load_var` returns the Var object itself (for `set!`/`binding`);
+    // `rt_def_var` interns the var with the given value; `rt_set_bang` mutates a
+    // Var's binding (its `*const Value` result is dropped).
+    RtImport {
+        name: "rt_load_global",
+        params: &[I32, I64, I32, I64],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_load_var",
+        params: &[I32, I64, I32, I64],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_def_var",
+        params: &[I32, I64, I32, I64, I32],
+        results: &[I32],
+    },
+    RtImport {
+        name: "rt_set_bang",
+        params: &[I32, I32],
+        results: &[I32],
+    },
     // ── A couple of common collection ops ────────────────────────────────────
     RtImport {
         name: "rt_get",

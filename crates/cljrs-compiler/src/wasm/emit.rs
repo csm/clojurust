@@ -101,10 +101,13 @@
 //! (`CallDirect`/`CallWithRegion` → a direct `call` to the resolved wasm index;
 //! `Call` → dynamic dispatch through `rt_call` with arguments marshalled through
 //! the scratch buffer), closures (`AllocClosure` → `rt_make_fn*` over the shared
-//! function table), cross-function tail calls (`return_call`), and all control
-//! flow (branches, diamonds, and `loop`/`recur` with φ).  Globals, the
-//! `rt_call_ic` inline cache (needs a writable IC data region), and the async
-//! ABI return [`WasmError::Unsupported`] — the next lowering increments.
+//! function table), globals/vars (`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang` →
+//! the `rt_load_global`/`rt_load_var`/`rt_def_var`/`rt_set_bang` bridges with
+//! ns/name bytes drawn from the rodata pool), cross-function tail calls
+//! (`return_call`), and all control flow (branches, diamonds, and `loop`/`recur`
+//! with φ).  The `rt_call_ic` inline cache (needs a writable IC data region) and
+//! the async ABI return [`WasmError::Unsupported`] — the next lowering
+//! increments.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -831,6 +834,41 @@ impl Emitter<'_> {
                 self.emit_alloc_closure(template, captures)?;
                 self.set(*dst)
             }
+            // ── Globals / vars ─────────────────────────────────────────────────
+            // Resolve a namespaced binding to its value (mirrors
+            // `codegen.rs::emit_load_global`).  Versioned `name@sha` names are
+            // handled inside `rt_load_global` (uncached — the per-call-site
+            // versioned IC is deferred with `rt_call_ic`), so the wasm path makes
+            // no version distinction.
+            Inst::LoadGlobal(dst, ns, name) => {
+                self.push_name_args(ns, name);
+                self.call_import("rt_load_global")?;
+                self.set(*dst)
+            }
+            // Resolve the Var object itself (for `set!`/`binding`), mirroring
+            // `codegen.rs::emit_load_var`.
+            Inst::LoadVar(dst, ns, name) => {
+                self.push_name_args(ns, name);
+                self.call_import("rt_load_var")?;
+                self.set(*dst)
+            }
+            // `(def ns/name val)` — intern the var with its value, mirroring
+            // `codegen.rs::emit_def_var`.
+            Inst::DefVar(dst, ns, name, val) => {
+                self.push_name_args(ns, name);
+                self.get(*val)?;
+                self.call_import("rt_def_var")?;
+                self.set(*dst)
+            }
+            // `(set! var val)` — mutate a Var's binding.  `rt_set_bang` returns a
+            // `*const Value` the IR has no destination for, so it is dropped.
+            Inst::SetBang(var, val) => {
+                self.get(*var)?;
+                self.get(*val)?;
+                self.call_import("rt_set_bang")?;
+                self.ins(&Instruction::Drop);
+                Ok(())
+            }
             // ── Region operations ────────────────────────────────────────────
             Inst::RegionStart(dst) => {
                 // Allocate and activate a bump region; keep its i32 handle.
@@ -909,6 +947,19 @@ impl Emitter<'_> {
         self.ins(&Instruction::I32Const((abi::RODATA_BASE + off) as i32));
         self.ins(&Instruction::I64Const(s.len() as i64));
         self.call_import(bridge)
+    }
+
+    /// Push `(ns_ptr, ns_len, name_ptr, name_len)` for a namespaced reference,
+    /// interning both strings into the rodata pool.  Used by the global/var
+    /// bridges (mirrors `codegen.rs`'s per-name anonymous data objects).
+    fn push_name_args(&mut self, ns: &str, name: &str) {
+        self.asm.needs_memory = true;
+        let ns_off = self.asm.intern_rodata(ns.as_bytes());
+        self.ins(&Instruction::I32Const((abi::RODATA_BASE + ns_off) as i32));
+        self.ins(&Instruction::I64Const(ns.len() as i64));
+        let name_off = self.asm.intern_rodata(name.as_bytes());
+        self.ins(&Instruction::I32Const((abi::RODATA_BASE + name_off) as i32));
+        self.ins(&Instruction::I64Const(name.len() as i64));
     }
 
     /// Lower a known-function call to its boxed `rt_abi` bridge, result left on
@@ -1898,6 +1949,57 @@ mod tests {
             count, 1,
             "deduplicated pool should hold one copy of the bytes"
         );
+    }
+
+    /// `(fn [] clojure.core/+)`: a `LoadGlobal` resolves a namespaced binding
+    /// through `rt_load_global`, with the ns/name bytes drawn from the rodata
+    /// pool (so the module imports memory and emits a data segment).
+    #[test]
+    fn load_global_validates() {
+        let mut f = IrFunction::new(Some(Arc::from("g")), None);
+        let v = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![Inst::LoadGlobal(
+                v,
+                Arc::from("clojure.core"),
+                Arc::from("+"),
+            )],
+            terminator: Terminator::Return(v),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert!(
+            bytes.contains(&0x0b),
+            "module should contain a data section for the ns/name bytes"
+        );
+    }
+
+    /// `(def my.ns/x v)` followed by `(set! var v)`: `DefVar` interns the var
+    /// with a value, `LoadVar` resolves the Var object, and `SetBang` mutates it
+    /// (its bridge result is dropped, leaving a balanced stack).
+    #[test]
+    fn def_var_load_var_set_bang_validate() {
+        let mut f = IrFunction::new(Some(Arc::from("d")), None);
+        let v = f.fresh_var();
+        f.params = vec![(Arc::from("v"), v)];
+        let defd = f.fresh_var();
+        let var_obj = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::DefVar(defd, Arc::from("my.ns"), Arc::from("x"), v),
+                Inst::LoadVar(var_obj, Arc::from("my.ns"), Arc::from("x")),
+                Inst::SetBang(var_obj, v),
+            ],
+            terminator: Terminator::Return(defd),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
     }
 
     fn template(name: &str, fns: &[&str], pcs: &[usize], variadic: &[bool]) -> ClosureTemplate {

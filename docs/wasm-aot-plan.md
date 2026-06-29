@@ -316,9 +316,28 @@ with the rest of the `rt_call_ic` work. Mirrors `codegen.rs::emit_string_const`
 name bytes still marshal through `rt_scratch_ptr`; moving them into this pool is
 a cleanup left for later.
 
+### Globals / vars (`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang`) — complete
+
+The first consumer of the rodata pool's name-as-data, mirroring
+`codegen.rs::emit_load_global` / `emit_load_var` / `emit_def_var`:
+
+- Each bridge takes `(ns_ptr, ns_len, name_ptr, name_len)`; a shared
+  `push_name_args` helper interns both `ns` and `name` into the rodata pool
+  (`intern_rodata`) and pushes the two `(ptr, len)` pairs.
+- `LoadGlobal` → `rt_load_global` (binding value); `LoadVar` → `rt_load_var`
+  (the Var object, for `set!`/`binding`); `DefVar` → `rt_def_var` with the boxed
+  value pushed after the name args; `SetBang` → `rt_set_bang(var, val)`, whose
+  `*const Value` result the IR has no destination for and so is `drop`ped.
+- Versioned `name@sha` references make **no** wasm-side distinction: the runtime
+  `rt_load_global` itself splits the version and resolves it (uncached). The
+  per-call-site versioned IC the Cranelift backend uses
+  (`rt_load_global_versioned_ic`) is deferred with the rest of the `rt_call_ic`
+  inline-cache work, which still needs a writable per-site data slot.
+- The four bridges were added to `RT_IMPORTS`.
+
 ### Tests
 
-`cargo test -p cljrs-compiler wasm::` — 38 tests:
+`cargo test -p cljrs-compiler wasm::` — 40 tests:
 
 - `abi`: Value→wasm-type mapping, region contract well-typed, no duplicate
   imports.
@@ -343,7 +362,10 @@ a cleanup left for later.
   tail `CallWithRegion` threading the region handle), and string/keyword/symbol
   constants (a vector of a string + keyword + symbol exercising the rodata data
   segment, asserting the data section's presence, and a duplicate-string case
-  asserting the deduplicated pool holds one copy of the bytes) — each
+  asserting the deduplicated pool holds one copy of the bytes), and globals /
+  vars (a `LoadGlobal` resolving a namespaced binding through `rt_load_global`
+  with ns/name bytes from the rodata pool, and a `DefVar`/`LoadVar`/`SetBang`
+  trio where the dropped `rt_set_bang` result leaves a balanced stack) — each
   **validated with `wasmparser`**; plus `Unsupported` coverage for an unbundled
   direct-call target, an out-of-bundle closure arity, and un-lowered
   instructions, and the closure-constructor import / typed-signature accounting.
@@ -356,28 +378,21 @@ Dependencies added to `cljrs-compiler`: `wasm-encoder = "0.244"` (dep),
 ## What is next
 
 Ordered by value. Allocation, region operations, calls / multi-function modules,
-closures + the function table + cross-function tail calls, and string / keyword /
-symbol constants (now **done** — see those sections above) made real
-collection-building, arena-allocating, cross-function-calling, closure-creating,
-and string-literal-using programs compilable; the constants increment introduced
-the deduplicated rodata data segment that globals (below) reuse for their
-name-as-data.
+closures + the function table + cross-function tail calls, string / keyword /
+symbol constants, and globals / vars (now **done** — see those sections above)
+made real collection-building, arena-allocating, cross-function-calling,
+closure-creating, string-literal-using, and global-referencing programs
+compilable; the constants increment introduced the deduplicated rodata data
+segment that globals reuse for their name-as-data.
 
-### 1. Globals / vars
-
-`LoadGlobal` / `LoadVar` / `DefVar` / `SetBang`. These resolve namespaced names;
-follow `codegen.rs::emit_load_global` / `emit_def_var`. Reuse the name-as-data
-rodata pool the constants increment introduced (`ModuleAsm::intern_rodata`), and
-add the var-resolution `rt_abi` bridges to `RT_IMPORTS`.
-
-### 2. Exceptions
+### 1. Exceptions
 
 `Throw` / `KnownFn::TryCatchFinally`. Use the wasm exception-handling proposal
 (`try`/`catch`/`throw`) when `WasmBackend::exceptions`, else thread the
 `rt_abi` thread-local error path the Cranelift backend uses (`rt_throw` +
 `rt_try` checking the thread-local).
 
-### 3. Unboxed specialization
+### 2. Unboxed specialization
 
 Align the emitted signature with `function_signature` (typed ABI): keep
 `Long`/`Double` values unboxed in `i64`/`f64` locals per `typeinfer`, guarding
@@ -385,7 +400,7 @@ specialized params and boxing only at boxed-context uses. Mirrors
 `codegen.rs::compile_function_with_specs`. This is an optimization, not a
 correctness requirement — do it after the functional subset is broad.
 
-### 4. CLI + bundling
+### 3. CLI + bundling
 
 `cljrs compile <file> --target wasm -o <out>.wasm`. Drive `compile_bundle` over a
 whole program, link with the runtime compiled to `wasm32-unknown-unknown` (the

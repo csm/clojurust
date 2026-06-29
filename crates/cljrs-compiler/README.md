@@ -97,9 +97,14 @@ defined function into it with an active `funcref` element segment at
 fn-pointer/param-count/variadic arrays are marshalled contiguously through one
 `rt_scratch_ptr` reservation. **Cross-function tail calls** lower a trailing
 direct call whose result is returned to `return_call` when `WasmBackend::
-tail_calls` is set (else an ordinary `call` + `return`). Globals, the
-`rt_call_ic` inline cache (needs a writable IC data region), and the async ABI
-return `Unsupported` — the next lowering increments.
+tail_calls` is set (else an ordinary `call` + `return`). **Globals / vars**
+(`LoadGlobal`/`LoadVar`/`DefVar`/`SetBang`) lower to the `rt_load_global` /
+`rt_load_var` / `rt_def_var` / `rt_set_bang` bridges, drawing the `(ns, name)`
+byte pairs from the same rodata pool the string constants use (versioned
+`name@sha` names are resolved inside `rt_load_global`, uncached — the
+per-call-site versioned IC is deferred with `rt_call_ic`). The `rt_call_ic`
+inline cache (needs a writable IC data region) and the async ABI return
+`Unsupported` — the next lowering increments.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
