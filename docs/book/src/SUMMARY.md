@@ -45,3 +45,8 @@
 - [Overview](memory/index.md)
 - [The bump allocator](memory/bump-allocator.md)
 - [JIT & tiered execution](memory/jit.md)
+
+# WebAssembly
+
+- [Overview](wasm/index.md)
+- [The AOT backend](wasm/aot-backend.md)

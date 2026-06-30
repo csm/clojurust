@@ -6,9 +6,9 @@ This is the handoff document for the **AOT Clojure → WebAssembly backend** —
 second code-generation backend over the same `cljrs-ir` IR as the Cranelift
 backend, targeting native-fast, sandbox-safe deployment in the browser.
 
-> For the reader-facing reference guide to the whole feature — architecture,
-> design decisions, and how each piece works — see [`wasm-aot.md`](./wasm-aot.md).
-> *This* document is the increment-by-increment build log and open-task list.
+> The reader-facing guide lives in the mdBook under the
+> [WebAssembly](book/src/wasm/index.md) chapter. *This* document is the
+> increment-by-increment build log and open-task list it links to.
 
 The work lives entirely in `crates/cljrs-compiler/src/wasm/` and is developed on
 branch `claude/wasm-aot-jit-compilation-gpz5nl`.
