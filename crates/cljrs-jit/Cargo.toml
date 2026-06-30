@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-jit"
-version = "0.1.0"
+version = "0.1.194"
 edition = "2024"
 description = "In-process JIT compiler (Cranelift) for clojurust — Phase 10.1"
 license.workspace = true
