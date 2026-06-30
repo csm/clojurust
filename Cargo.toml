@@ -40,35 +40,35 @@ license = "EPL-1.0"
 repository = "https://github.com/csm/clojurust"
 
 [workspace.dependencies]
-cljrs-types        = { path = "crates/cljrs-types",        version = "0.1.0" }
-cljrs-gc           = { path = "crates/cljrs-gc",           version = "0.1.0" }
-cljrs-value        = { path = "crates/cljrs-value",        version = "0.1.0" }
-cljrs-reader       = { path = "crates/cljrs-reader",       version = "0.1.0" }
-cljrs-eval         = { path = "crates/cljrs-eval",         version = "0.1.0" }
-cljrs-stdlib       = { path = "crates/cljrs-stdlib",       version = "0.1.0" }
-cljrs-runtime      = { path = "crates/cljrs-runtime",      version = "0.1.0" }
-cljrs-ir           = { path = "crates/cljrs-ir",           version = "0.1.0" }
-cljrs-compiler     = { path = "crates/cljrs-compiler",     version = "0.1.0" }
-cljrs-interop      = { path = "crates/cljrs-interop",      version = "0.1.0" }
-cljrs-export-macro = { path = "crates/cljrs-export-macro", version = "0.1.0" }
-cljrs-logging      = { path = "crates/cljrs-logging",      version = "0.1.0" }
-cljrs-env          = { path = "crates/cljrs-env",          version = "0.1.0" }
-cljrs-builtins     = { path = "crates/cljrs-builtins",     version = "0.1.0" }
-cljrs-interp       = { path = "crates/cljrs-interp",       version = "0.1.0" }
-cljrs-ir-prebuild  = { path = "crates/cljrs-ir-prebuild",  version = "0.1.0" }
-cljrs-ir-viz       = { path = "crates/cljrs-ir-viz",       version = "0.1.0" }
-cljrs-deps         = { path = "crates/cljrs-deps",         version = "0.1.0" }
-cljrs-vcs          = { path = "crates/cljrs-vcs",          version = "0.1.0" }
-cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0" }
-cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0" }
-cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0" }
-cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0" }
-cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
-cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0" }
-cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.0" }
-cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.0" }
-cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.0" }
-cljrs-dom          = { path = "crates/cljrs-dom",          version = "0.1.0" }
+cljrs-types        = { path = "crates/cljrs-types",        version = "0.1.195" }
+cljrs-gc           = { path = "crates/cljrs-gc",           version = "0.1.195" }
+cljrs-value        = { path = "crates/cljrs-value",        version = "0.1.195" }
+cljrs-reader       = { path = "crates/cljrs-reader",       version = "0.1.195" }
+cljrs-eval         = { path = "crates/cljrs-eval",         version = "0.1.195" }
+cljrs-stdlib       = { path = "crates/cljrs-stdlib",       version = "0.1.195" }
+cljrs-runtime      = { path = "crates/cljrs-runtime",      version = "0.1.195" }
+cljrs-ir           = { path = "crates/cljrs-ir",           version = "0.1.195" }
+cljrs-compiler     = { path = "crates/cljrs-compiler",     version = "0.1.195" }
+cljrs-interop      = { path = "crates/cljrs-interop",      version = "0.1.195" }
+cljrs-export-macro = { path = "crates/cljrs-export-macro", version = "0.1.195" }
+cljrs-logging      = { path = "crates/cljrs-logging",      version = "0.1.195" }
+cljrs-env          = { path = "crates/cljrs-env",          version = "0.1.195" }
+cljrs-builtins     = { path = "crates/cljrs-builtins",     version = "0.1.195" }
+cljrs-interp       = { path = "crates/cljrs-interp",       version = "0.1.195" }
+cljrs-ir-prebuild  = { path = "crates/cljrs-ir-prebuild",  version = "0.1.195" }
+cljrs-ir-viz       = { path = "crates/cljrs-ir-viz",       version = "0.1.195" }
+cljrs-deps         = { path = "crates/cljrs-deps",         version = "0.1.195" }
+cljrs-vcs          = { path = "crates/cljrs-vcs",          version = "0.1.195" }
+cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.195" }
+cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.195" }
+cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.195" }
+cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.195" }
+cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.195" }
+cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.195" }
+cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.195" }
+cljrs-jit          = { path = "crates/cljrs-jit",          version = "0.1.195" }
+cljrs-dylib        = { path = "crates/cljrs-dylib",        version = "0.1.195" }
+cljrs-dom          = { path = "crates/cljrs-dom",          version = "0.1.195" }
 
 miette       = { version = "7", features = ["fancy"] }
 thiserror    = "2"
