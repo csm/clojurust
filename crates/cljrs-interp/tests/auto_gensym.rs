@@ -38,7 +38,8 @@ fn auto_gensym_symbol_tokenizes_as_one_token() {
 fn auto_gensym_is_consistent_within_one_syntax_quote() {
     // Every occurrence of `x#` in the same syntax-quote must read out to the
     // same generated symbol.
-    let result = eval_src("(let [expanded `(let [x# 1] x#)] (= (nth (nth expanded 1) 0) (nth expanded 2)))");
+    let result =
+        eval_src("(let [expanded `(let [x# 1] x#)] (= (nth (nth expanded 1) 0) (nth expanded 2)))");
     assert_eq!(result, Value::Bool(true));
 }
 
