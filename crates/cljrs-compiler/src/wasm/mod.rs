@@ -56,13 +56,15 @@
 //! diamonds, sequential/nested merges, and `loop`/`recur` loops) are in place.
 //! The [`emit`] emitter produces real, `wasmparser`-validated modules — both
 //! single-function ([`compile_function`]) and multi-function
-//! ([`compile_bundle`]) — for a growing subset of the IR: scalar constants,
-//! `LoadLocal`, boxed arithmetic/comparison, collection + region allocation,
-//! calls (`CallDirect`/`CallWithRegion`/`Call`), closures (`AllocClosure` via the
-//! shared imported function table), cross-function tail calls (`return_call`),
-//! and all control flow.  Globals, string/keyword/symbol constants, and async
-//! still return [`WasmError::Unsupported`].  See [`emit`]'s module docs for the
-//! full status.
+//! ([`compile_bundle`]) — for most of the IR: scalar + string/keyword/symbol
+//! constants, `LoadLocal`, boxed and unboxed arithmetic/comparison, collection +
+//! region allocation, calls (`CallDirect`/`CallWithRegion`/`Call`), closures
+//! (`AllocClosure` via the shared imported function table), cross-function tail
+//! calls (`return_call`), globals/vars, exceptions (the thread-local error path),
+//! the typed parameter ABI (unboxed `^long`/`^double` params + a boxed-entry
+//! trampoline), and all control flow.  The async poll-function ABI and the
+//! `rt_call_ic` inline cache still return [`WasmError::Unsupported`].  See
+//! [`emit`]'s module docs for the full status.
 
 pub mod abi;
 pub mod emit;
@@ -116,6 +118,12 @@ pub struct WasmBackend {
     /// (`KnownFn::TryCatchFinally`, `Inst::Throw`).  When `false`, the emitter
     /// must thread an explicit error path through `rt_abi`.
     pub exceptions: bool,
+    /// The linear-memory / function-table base addresses the emitted module
+    /// installs its read-only data and functions at.  Defaults to the
+    /// validation-time placeholders ([`abi::WasmLayout::default`]); the
+    /// CLI/bundling step overrides them with the runtime's actual reserved
+    /// bases once the module is linked.
+    pub layout: abi::WasmLayout,
 }
 
 impl Default for WasmBackend {
@@ -123,6 +131,7 @@ impl Default for WasmBackend {
         Self {
             tail_calls: true,
             exceptions: true,
+            layout: abi::WasmLayout::default(),
         }
     }
 }

@@ -122,17 +122,30 @@ native backend does (`rt_overflow_error` + `rt_throw` + early boxed-`nil`
 return). A `refine_reprs` pass **demotes back to boxed**, transitively, any
 unboxed producer the emitter can't lower (e.g. checked long `*`, which needs a
 128-bit overflow check wasm can't express), so the repr map only ever marks a
-value unboxed when the emitter can produce it unboxed. Parameters keep the boxed
-ABI (the signature stays all-`i32`); the typed-parameter ABI (unboxed params +
-entry guards) is deferred because it interacts with dynamic dispatch (`rt_call`
-is boxed) and would need a boxed-entry trampoline.
+value unboxed when the emitter can produce it unboxed.
+
+**Typed parameter ABI.** A function with `^long`/`^double` parameter hints
+(`seed_reprs`, `is_typed`) compiles to **two** wasm functions: a *typed body*
+whose hinted params are unboxed `i64`/`f64` (so the body reads them with no
+per-use unbox), and a boxed-entry **trampoline** (`emit_trampoline`) with the
+all-`i32` signature every dispatcher expects. The trampoline is the function's
+primary entry — exported, installed in the shared table, and the target of every
+`CallDirect` — so all the always-boxed dispatch paths (dynamic `rt_call`,
+indirect closure calls, cross-function direct calls) reach a typed function
+unchanged; it coerces each boxed argument (`rt_coerce_long`/`rt_coerce_double`)
+and (tail-)calls the body. There is no in-sandbox deopt seam, so a violated
+static hint *coerces or throws* rather than re-dispatching at Tier 1. The typed
+bodies are appended after the `n` primaries (so primary indices, table slots, and
+exports are unchanged); passing unboxed arguments *directly* on a same-bundle
+`CallDirect` (the caller-side win) is a further optimization left for later.
 
 ```rust
 pub fn compile_function(func: &IrFunction, cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
 pub fn compile_bundle(funcs: &[&IrFunction], cfg: &WasmBackend) -> Result<Vec<u8>, WasmError>;
-pub struct WasmBackend { tail_calls: bool, exceptions: bool }
+pub struct WasmBackend { tail_calls: bool, exceptions: bool, layout: abi::WasmLayout }
 pub enum WasmError { Reloop(RelooperError), Unsupported(String), Unimplemented(&'static str) }
-// abi:    WasmValType{I32,I64,F64}, RtImport, RT_IMPORTS, lookup(name)
+// abi:    WasmValType{I32,I64,F64}, RtImport, RT_IMPORTS, lookup(name),
+//         WasmLayout{rodata_base,func_table_base} (memory/table bases; Default = 0 placeholders)
 // reloop: Structured{Simple,Labeled,Loop,If,Br,Return,Unreachable,Nil}, reloop(func)
 //         RelooperError{Empty,DanglingTarget,Irreducible}
 // emit:   emit_function(func, structured, cfg), emit_bundle(funcs, cfg), function_signature(func)
@@ -302,15 +315,20 @@ pub enum AotError { Io, Parse, Codegen, Eval, Link, Wasm(WasmError), NoGcBlackli
 ```
 
 `compile_file_to_wasm` is the `cljrs compile --target wasm` entry point: it lowers
-the source to IR (`lower_file_to_ir`), rewrites same-unit calls to `CallDirect`
-(`optimize_direct_calls`), then drives `wasm::compile_bundle` over the entry
-function + its flattened subfunctions and writes the validated module. The
-emitted module's `"rt"` imports are satisfied by the runtime built for
-`wasm32-unknown-unknown`; linking the two and wiring the IR interpreter in as the
-dynamic-code tier (finalizing `RODATA_BASE`/`FUNC_TABLE_BASE` against the
-runtime's layout) is the remaining bundling step. Only the entry namespace's
-functions are emitted so far — cross-namespace dependencies still dispatch
-through `rt_call`.
+the source **and its transitively-required user namespaces** to a bundle of IR
+functions (`lower_file_to_ir_bundle`: entry `__cljrs_main` + one
+`__cljrs_ns_init_N` per lowerable required namespace, mirroring `compile_file`'s
+`discover_bundled_sources`/`lower_namespace`), rewrites same-unit calls to
+`CallDirect` (`optimize_direct_calls`), then drives `wasm::compile_bundle` over
+every function + its flattened subfunctions and writes the validated module. A
+namespace the backend can't lower is skipped (left for the runtime's
+IR-interpreter tier), the same graceful degradation the native path uses; the
+memory/table bases are `WasmLayout`-configurable (`Default` = the `0`
+placeholders). The emitted module's `"rt"` imports are satisfied by the runtime
+built for `wasm32-unknown-unknown`; making the runtime *export* that surface,
+instantiating the AOT module against it (passing the runtime's reserved bases
+through `WasmLayout`), and wiring the IR interpreter in as the dynamic-code tier
+is the remaining runtime-side step.
 
 Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
 

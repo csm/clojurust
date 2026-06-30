@@ -385,39 +385,148 @@ pub fn lower_file_to_ir(
     Ok((source, ir_func))
 }
 
+/// Lower a source file **and its transitively-required user namespaces** to a
+/// bundle of IR functions for the wasm backend.
+///
+/// Returns `(name, IrFunction)` pairs: the entry `__cljrs_main` first, then one
+/// `__cljrs_ns_init_N` initializer per discovered namespace the backend can
+/// lower.  This mirrors [`compile_file`]'s per-namespace initializer discovery
+/// (`discover_bundled_sources` → [`lower_namespace`]); a namespace that cannot be
+/// lowered or codegen'd is **skipped** (left for the runtime's IR-interpreter
+/// tier), exactly as the native path falls back to bundling it as interpreted
+/// source.  Every returned function is `optimize_direct_calls`-rewritten so its
+/// same-unit calls resolve to wasm function indices; cross-namespace calls stay
+/// dynamic (`rt_call`).
+fn lower_file_to_ir_bundle(
+    src_path: &Path,
+    src_dirs: &[PathBuf],
+) -> AotResult<Vec<(String, IrFunction)>> {
+    eprintln!("[aot] reading {}", src_path.display());
+    let source = std::fs::read_to_string(src_path)?;
+    let filename = src_path.display().to_string();
+    let mut parser = Parser::new(source.clone(), filename);
+    let forms = parser.parse_all()?;
+    let forms = expand_reader_conds_deep(&forms);
+
+    // Boot the same environment `compile_file` does so `require`d namespaces (and
+    // the async/io/net/charset/base64 builtins they may pull in) resolve.
+    let globals = if src_dirs.is_empty() {
+        cljrs_stdlib::standard_env()
+    } else {
+        cljrs_stdlib::standard_env_with_paths(src_dirs.to_vec())
+    };
+    cljrs_async::init(&globals);
+    cljrs_io::init(&globals);
+    cljrs_net::init(&globals);
+    cljrs_charset::init(&globals);
+    cljrs_base64::init(&globals);
+    let mut env = cljrs_eval::Env::new(globals, "user");
+
+    // Snapshot loaded namespaces before expansion so we can detect which user
+    // namespaces `require` pulled in (transitive deps).
+    let pre_loaded: std::collections::HashSet<Arc<str>> =
+        env.globals.loaded.lock().unwrap().clone();
+
+    let mut expanded = Vec::with_capacity(forms.len());
+    for form in &forms {
+        if needs_interpreter(form) {
+            cljrs_eval::eval(form, &mut env).map_err(|e| AotError::Eval(format!("{e:?}")))?;
+        }
+        let f = cljrs_interp::macros::macroexpand_all(form, &mut env)
+            .map_err(|e| AotError::Eval(format!("{e:?}")))?;
+        expanded.push(f);
+    }
+    eprintln!("[aot] macro-expanded {} form(s)", expanded.len());
+
+    // ── Discovered required namespaces → initializers (graceful skip) ────────
+    let discovered = discover_bundled_sources(&env.globals, &pre_loaded, src_dirs);
+    let mut bundle: Vec<(String, IrFunction)> = Vec::new();
+    for (i, (ns, src)) in discovered.iter().enumerate() {
+        let init_symbol = format!("__cljrs_ns_init_{i}");
+        match lower_namespace(ns, src, &init_symbol, &env.globals) {
+            Ok((_, Some(ir))) if dep_codegen_ok(&ir, &init_symbol) => {
+                bundle.push((init_symbol, ir));
+            }
+            _ => {
+                eprintln!("[aot] {ns}: not wasm-compilable, left for the IR-interpreter tier");
+            }
+        }
+    }
+    if !bundle.is_empty() {
+        eprintln!(
+            "[aot] bundled {} required namespace initializer(s)",
+            bundle.len()
+        );
+    }
+
+    // ── Entry namespace → __cljrs_main ───────────────────────────────────────
+    let mut compilable = Vec::new();
+    for (i, form) in expanded.iter().enumerate() {
+        if needs_interpreter(&forms[i]) || expanded_needs_interpreter(form) {
+            continue;
+        }
+        compilable.push(form.clone());
+    }
+    let compilable_forms = if compilable.is_empty() {
+        let nil_form = cljrs_reader::Form::new(
+            cljrs_reader::form::FormKind::Nil,
+            cljrs_types::span::Span::new(Arc::new("<aot>".to_string()), 0, 0, 1, 1),
+        );
+        vec![nil_form]
+    } else {
+        compilable
+    };
+    let current_ns = env.current_ns.to_string();
+    let mut main = lower_via_rust(
+        Some("__cljrs_main"),
+        &current_ns,
+        &[],
+        &compilable_forms,
+        &mut env,
+    )?;
+    optimize_direct_calls(&mut main);
+    eprintln!(
+        "[aot] lowered entry to {} block(s), {} var(s)",
+        main.blocks.len(),
+        main.next_var
+    );
+
+    // Entry main first, then the namespace initializers.
+    let mut out = vec![("__cljrs_main".to_string(), main)];
+    out.extend(bundle);
+    Ok(out)
+}
+
 /// AOT-compile a source file to a standalone WebAssembly module.
 ///
-/// Lowers the entry namespace to IR (parse → macro-expand → ANF/region
-/// optimization, via [`lower_file_to_ir`]), rewrites same-compilation-unit calls
-/// to `CallDirect` ([`optimize_direct_calls`], so they resolve to wasm function
-/// indices), then drives [`crate::wasm::compile_bundle`] over the entry function
-/// and its flattened [`IrFunction::subfunctions`], writing the validated module
-/// bytes to `out_path`.
+/// Lowers the entry namespace **and its transitively-required user namespaces**
+/// to a bundle of IR functions ([`lower_file_to_ir_bundle`]: parse →
+/// macro-expand → per-namespace discovery → ANF/region optimization →
+/// `optimize_direct_calls`), then drives [`crate::wasm::compile_bundle`] over the
+/// entry function, each namespace initializer, and their flattened
+/// [`IrFunction::subfunctions`], writing the validated module bytes to
+/// `out_path`.
 ///
-/// This produces the **AOT code-generation artifact** for the entry namespace:
-/// a wasm module whose `"rt"` imports (the `rt_abi` bridges, linear memory, and
-/// the shared function table) are satisfied by the runtime compiled to
-/// `wasm32-unknown-unknown`.  Linking the two — and wiring the IR interpreter in
-/// as the dynamic-code tier, which is where the rodata / function-table bases
-/// ([`crate::wasm::abi::RODATA_BASE`], [`crate::wasm::abi::FUNC_TABLE_BASE`]) are
-/// finalized against the runtime's actual memory/table layout — is the remaining
-/// bundling step tracked in `docs/wasm-aot-plan.md`.  Cross-namespace
-/// dependencies are not yet bundled (only the entry namespace's functions are
-/// emitted); same-unit calls resolve directly, others dispatch through `rt_call`.
+/// This produces the **AOT code-generation artifact**: a wasm module whose `"rt"`
+/// imports (the `rt_abi` bridges, linear memory, and the shared function table)
+/// are satisfied by the runtime compiled to `wasm32-unknown-unknown`.  The
+/// rodata / function-table bases default to the validation-time placeholders
+/// ([`crate::wasm::abi::WasmLayout::default`]); the final linking step overrides
+/// them with the runtime's actual reserved bases via [`crate::wasm::WasmBackend`]
+/// once it knows that layout.  Wiring the IR interpreter in as the dynamic-code
+/// tier (so a namespace skipped above still runs) is the remaining runtime-side
+/// step tracked in `docs/wasm-aot-plan.md`.
 pub fn compile_file_to_wasm(
     src_path: &Path,
     out_path: &Path,
     src_dirs: &[PathBuf],
 ) -> AotResult<()> {
-    let (_source, mut ir_func) = lower_file_to_ir(src_path, src_dirs, false)?;
+    let bundle = lower_file_to_ir_bundle(src_path, src_dirs)?;
 
-    // Resolve same-compilation-unit calls to direct calls so they bind to wasm
-    // function indices rather than dispatching dynamically through `rt_call`.
-    optimize_direct_calls(&mut ir_func);
-
-    eprintln!("[aot] emitting wasm module");
+    eprintln!("[aot] emitting wasm module ({} function(s))", bundle.len());
+    let refs: Vec<&IrFunction> = bundle.iter().map(|(_, ir)| ir).collect();
     let cfg = crate::wasm::WasmBackend::default();
-    let bytes = crate::wasm::compile_bundle(&[&ir_func], &cfg)?;
+    let bytes = crate::wasm::compile_bundle(&refs, &cfg)?;
 
     std::fs::write(out_path, &bytes)?;
     eprintln!(

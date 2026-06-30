@@ -129,13 +129,27 @@
 //! wasm cannot express without `i64.mul_hi`) and every other non-trivial unboxed
 //! producer are **demoted back to boxed** by [`refine_reprs`], so the repr map
 //! the emitter consumes only ever marks a value unboxed when the emitter can
-//! produce it unboxed.  Parameters keep the **boxed ABI** (the signature stays
-//! all-`i32`): the typed-parameter ABI (unboxed params + entry guards) is
-//! deferred because it interacts with dynamic dispatch (`rt_call` is boxed) and
-//! cross-function calls, which would each need a boxed-entry trampoline.
+//! produce it unboxed.
+//!
+//! # Typed parameter ABI
+//!
+//! A function with `^long`/`^double` parameter hints (`seed_reprs`, see
+//! [`is_typed`]) compiles to **two** wasm functions: a *typed body* whose hinted
+//! params are unboxed `i64`/`f64` (so the body reads them with no per-use unbox),
+//! and a boxed-entry **trampoline** ([`emit_trampoline`]) with the all-`i32`
+//! signature every dispatcher expects.  The trampoline is the function's primary
+//! entry — exported, installed in the shared table, and the target of every
+//! `CallDirect` — so all the existing always-boxed dispatch paths (dynamic
+//! `rt_call`, indirect closure calls, cross-function direct calls) reach a typed
+//! function unchanged; the trampoline coerces each boxed argument
+//! (`rt_coerce_long`/`rt_coerce_double`) and (tail-)calls the body.  There is no
+//! in-sandbox deopt seam, so a violated static hint *coerces or throws* rather
+//! than re-dispatching at Tier 1.  Passing unboxed arguments *directly* on a
+//! same-bundle `CallDirect` (skipping the trampoline for the caller-side win) is
+//! a further optimization left for later.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
@@ -193,31 +207,77 @@ pub fn emit_bundle(
         }
     }
 
+    // A function with `^long`/`^double` param hints ([`is_typed`]) compiles to a
+    // boxed-entry trampoline (its *primary* wasm function, at the same index a
+    // non-typed function would occupy) plus a *typed body* appended after all
+    // `n` primaries.  The `k`-th typed function's typed body is at wasm index
+    // `func_base + n + k`; `typed_ordinal[p]` is that `k` for primary position
+    // `p` (`None` for non-typed functions).
+    let n = funcs.len();
+    let typed: Vec<bool> = funcs.iter().map(|(f, _)| is_typed(f)).collect();
+    let mut typed_ordinal: Vec<Option<usize>> = vec![None; n];
+    let mut n_typed = 0usize;
+    for (p, &is_t) in typed.iter().enumerate() {
+        if is_t {
+            typed_ordinal[p] = Some(n_typed);
+            n_typed += 1;
+        }
+    }
+
     let mut asm = ModuleAsm::new();
 
     // Pass 1: lower every body into a throwaway buffer to discover the imports
-    // each needs.  Defined-function calls use a provisional `func_base` of 0; the
-    // bodies are discarded, so the wrong indices never reach the module.
-    for (func, structured) in funcs {
-        let _ = emit_one(func, structured, &mut asm, 0, &func_index_of, cfg)?;
+    // each needs.  Defined-function calls (and the trampoline→typed-body call)
+    // use provisional indices of 0; the bodies are discarded, so the wrong
+    // indices never reach the module.  Both the trampoline and the typed body of
+    // a typed function are emitted so their imports (e.g. `rt_coerce_long`) are
+    // discovered before `func_base` is settled.
+    for (p, (func, structured)) in funcs.iter().enumerate() {
+        if typed[p] {
+            let _ = emit_trampoline(func, &mut asm, 0, cfg)?;
+            let _ = emit_one(func, structured, &mut asm, 0, &func_index_of, cfg, true)?;
+        } else {
+            let _ = emit_one(func, structured, &mut asm, 0, &func_index_of, cfg, false)?;
+        }
     }
 
     // Imports are now fully discovered; defined functions start right after them.
     let func_base = asm.imports.len() as u32;
 
     // Pass 2: re-lower with the settled `func_base`, keeping the bodies + their
-    // interned signature type indices.
-    let mut bodies: Vec<(Function, u32)> = Vec::with_capacity(funcs.len());
-    for (func, structured) in funcs {
-        bodies.push(emit_one(
-            func,
-            structured,
-            &mut asm,
-            func_base,
-            &func_index_of,
-            cfg,
-        )?);
+    // interned signature type indices.  Primaries (one per function, in order)
+    // occupy `func_base..func_base+n`; typed bodies are appended after them.
+    let mut primaries: Vec<(Function, u32)> = Vec::with_capacity(n);
+    let mut typed_bodies: Vec<(Function, u32)> = Vec::with_capacity(n_typed);
+    for (p, (func, structured)) in funcs.iter().enumerate() {
+        if let Some(k) = typed_ordinal[p] {
+            let typed_body_index = func_base + n as u32 + k as u32;
+            primaries.push(emit_trampoline(func, &mut asm, typed_body_index, cfg)?);
+            typed_bodies.push(emit_one(
+                func,
+                structured,
+                &mut asm,
+                func_base,
+                &func_index_of,
+                cfg,
+                true,
+            )?);
+        } else {
+            primaries.push(emit_one(
+                func,
+                structured,
+                &mut asm,
+                func_base,
+                &func_index_of,
+                cfg,
+                false,
+            )?);
+        }
     }
+
+    // The module's defined functions, in wasm-index order: all `n` primaries,
+    // then the typed bodies.
+    let bodies: Vec<&(Function, u32)> = primaries.iter().chain(typed_bodies.iter()).collect();
 
     // ── Assemble ─────────────────────────────────────────────────────────────
     let mut module = Module::new();
@@ -261,7 +321,7 @@ pub fn emit_bundle(
             EntityType::Table(TableType {
                 element_type: RefType::FUNCREF,
                 table64: false,
-                minimum: abi::FUNC_TABLE_BASE as u64 + bodies.len() as u64,
+                minimum: cfg.layout.func_table_base as u64 + n as u64,
                 maximum: None,
                 shared: false,
             }),
@@ -270,7 +330,7 @@ pub fn emit_bundle(
     module.section(&imports);
 
     let mut func_section = FunctionSection::new();
-    for (_, ty_idx) in &bodies {
+    for (_, ty_idx) in bodies.iter().copied() {
         func_section.function(*ty_idx);
     }
     module.section(&func_section);
@@ -283,23 +343,26 @@ pub fn emit_bundle(
     module.section(&exports);
 
     if asm.needs_table {
-        // Install every defined function into the shared table at
+        // Install every function's *primary* entry into the shared table at
         // `[FUNC_TABLE_BASE, +n)`, so a closure's `fn_ptr` for the function at
         // bundle position `p` is `FUNC_TABLE_BASE + p`.  The element *contents*
         // are wasm function indices (`func_base + p`); the *slots* are the table
-        // base plus the position.  (Element sections precede the code section.)
-        let func_indices: Vec<u32> = (0..bodies.len() as u32).map(|p| func_base + p).collect();
+        // base plus the position.  For a typed function the primary is its boxed
+        // trampoline, so indirect (always-boxed) dispatch lands on the trampoline
+        // — the appended typed bodies are never table-installed.  (Element
+        // sections precede the code section.)
+        let func_indices: Vec<u32> = (0..n as u32).map(|p| func_base + p).collect();
         let mut elements = ElementSection::new();
         elements.active(
             Some(0),
-            &ConstExpr::i32_const(abi::FUNC_TABLE_BASE as i32),
+            &ConstExpr::i32_const(cfg.layout.func_table_base as i32),
             Elements::Functions(Cow::Owned(func_indices)),
         );
         module.section(&elements);
     }
 
     let mut code = CodeSection::new();
-    for (body, _) in &bodies {
+    for (body, _) in bodies.iter().copied() {
         code.function(body);
     }
     module.section(&code);
@@ -311,7 +374,7 @@ pub fn emit_bundle(
         let mut data = DataSection::new();
         data.active(
             0,
-            &ConstExpr::i32_const(abi::RODATA_BASE as i32),
+            &ConstExpr::i32_const(cfg.layout.rodata_base as i32),
             asm.rodata.iter().copied(),
         );
         module.section(&data);
@@ -332,6 +395,7 @@ fn emit_one(
     func_base: u32,
     func_index_of: &HashMap<&str, u32>,
     cfg: &WasmBackend,
+    typed: bool,
 ) -> Result<(Function, u32), WasmError> {
     // The ABI param count includes the hidden trailing region handle (an `i32`)
     // when this is a region-parameterised callee variant — mirroring
@@ -346,7 +410,31 @@ fn emit_one(
     // everything else (boxed pointers, `Bool` 0/1, region handles)→`i32`.  The
     // refined map only marks a value unboxed when the emitter can produce it
     // unboxed (see [`refine_reprs`]).
-    let reprs = refine_reprs(func, typeinfer::infer(func, &[]));
+    //
+    // For a *typed* body the inference is seeded with the function's static
+    // `^long`/`^double` parameter hints (`seed_reprs`), so the hinted params
+    // carry their unboxed repr (the wasm signature materializes them unboxed —
+    // see [`function_signature`]); `keep_params` stops [`refine_reprs`] from
+    // demoting those (otherwise-def-less) params back to boxed.  A non-typed
+    // body keeps the all-boxed param ABI.
+    let (specs, keep_params): (&[Repr], HashSet<VarId>) = if typed {
+        let keep = func
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                matches!(
+                    func.seed_reprs.get(*i).copied().unwrap_or(Repr::Boxed),
+                    Repr::Long | Repr::Double
+                )
+            })
+            .map(|(_, (_, vid))| *vid)
+            .collect();
+        (&func.seed_reprs, keep)
+    } else {
+        (&[], HashSet::new())
+    };
+    let reprs = refine_reprs(func, typeinfer::infer(func, specs), &keep_params);
 
     // Locals: visible params first (wasm locals `0..nparams`, always boxed
     // `i32`), then the hidden region param (if any), then the remaining VarIds as
@@ -408,16 +496,24 @@ fn emit_one(
     body.instruction(&Instruction::Unreachable);
     body.instruction(&Instruction::End);
 
-    let ty_idx = asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32]);
+    // A typed body's signature carries the hinted params unboxed
+    // (`function_signature`); a non-typed body is all-`i32` (boxed).
+    let ty_idx = if typed {
+        let (params, results) = function_signature(func);
+        asm.intern_type(params, results)
+    } else {
+        asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32])
+    };
     Ok((body, ty_idx))
 }
 
 /// The wasm function signature for `func`: `(params, results)`.
 ///
 /// Honors the hidden trailing region param and the poll-function ABI, mirroring
-/// [`IrFunction::abi_param_count`].  This describes the *eventual* typed ABI;
-/// [`emit_function`] currently emits a boxed-only (all-`i32`) signature and
-/// rejects the region/poll cases.
+/// [`IrFunction::abi_param_count`].  The visible params carry their static
+/// `^long`/`^double` hint (`seed_reprs`) unboxed; this is the signature of a
+/// *typed body* ([`is_typed`]).  A non-typed body uses the all-`i32` boxed
+/// signature instead (sized from [`IrFunction::abi_param_count`]).
 pub fn function_signature(func: &IrFunction) -> (Vec<WasmValType>, Vec<WasmValType>) {
     if func.takes_state_param() {
         return (
@@ -441,6 +537,80 @@ pub fn function_signature(func: &IrFunction) -> (Vec<WasmValType>, Vec<WasmValTy
     }
 
     (params, vec![WasmValType::I32])
+}
+
+/// Whether `func` is compiled with the **typed parameter ABI** — i.e. at least
+/// one visible parameter carries a static `^long`/`^double` hint
+/// (`seed_reprs`), so its wasm signature takes that argument unboxed
+/// (`i64`/`f64`) rather than as a boxed `i32`.
+///
+/// A typed function compiles to *two* wasm functions: the typed body (the
+/// optimized code, whose hinted params are already unboxed) and a boxed-entry
+/// **trampoline** ([`emit_trampoline`]) that coerces boxed arguments and calls
+/// it.  The trampoline is the function's primary entry — exported, installed in
+/// the shared table, and the target of every `CallDirect` — so all the existing
+/// boxed dispatch paths reach a typed function unchanged.  Async poll functions
+/// (whose `seed_reprs` are cleared during lowering) are never typed.
+fn is_typed(func: &IrFunction) -> bool {
+    !func.takes_state_param()
+        && func
+            .seed_reprs
+            .iter()
+            .any(|r| matches!(r, Repr::Long | Repr::Double))
+}
+
+/// Emit the boxed-entry **trampoline** for a typed function (see [`is_typed`]).
+///
+/// The trampoline has the all-`i32` boxed signature every dispatcher expects
+/// (`[i32; abi_param_count] → [i32]`).  It coerces each `^long`/`^double`-hinted
+/// argument from its boxed form (`rt_coerce_long`/`rt_coerce_double`), passes
+/// the remaining boxed pointers (and the hidden trailing region handle, if any)
+/// through unchanged, and calls the typed body at `typed_body_index`.  With the
+/// tail-call proposal it `return_call`s the body so no frame is added; otherwise
+/// it `call`s and returns the boxed result.  This is the wasm answer to "the
+/// typed-parameter ABI needs a boxed-entry trampoline + guard story": the guard
+/// is a coercion, there being no in-sandbox deopt seam.
+fn emit_trampoline(
+    func: &IrFunction,
+    asm: &mut ModuleAsm,
+    typed_body_index: u32,
+    cfg: &WasmBackend,
+) -> Result<(Function, u32), WasmError> {
+    let nparams = func.params.len();
+    let abi_nparams = func.abi_param_count();
+
+    // No declared locals: the trampoline only reads its own params.
+    let mut body = Function::new(std::iter::empty());
+    for i in 0..nparams {
+        body.instruction(&Instruction::LocalGet(i as u32));
+        match func.seed_reprs.get(i).copied().unwrap_or(Repr::Boxed) {
+            Repr::Long => {
+                let idx = asm.import(abi::lookup("rt_coerce_long").expect("rt_coerce_long import"));
+                body.instruction(&Instruction::Call(idx));
+            }
+            Repr::Double => {
+                let idx =
+                    asm.import(abi::lookup("rt_coerce_double").expect("rt_coerce_double import"));
+                body.instruction(&Instruction::Call(idx));
+            }
+            // Boxed params (and any non-numeric hint) pass through verbatim.
+            _ => {}
+        }
+    }
+    // The hidden trailing region handle, if present, is already an `i32` and
+    // passes through unchanged.
+    if func.takes_region_param() {
+        body.instruction(&Instruction::LocalGet(nparams as u32));
+    }
+    if cfg.tail_calls {
+        body.instruction(&Instruction::ReturnCall(typed_body_index));
+    } else {
+        body.instruction(&Instruction::Call(typed_body_index));
+    }
+    body.instruction(&Instruction::End);
+
+    let ty_idx = asm.intern_type(vec![WasmValType::I32; abi_nparams], vec![WasmValType::I32]);
+    Ok((body, ty_idx))
 }
 
 // ── Module assembly state ────────────────────────────────────────────────────
@@ -477,7 +647,11 @@ fn local_valtype(repr: Option<&Repr>) -> ValType {
 /// local, so this pass conservatively boxes anything the emitter does not handle
 /// and re-checks dependents until a fixpoint.  Boxing only ever *removes*
 /// entries, so it terminates.
-fn refine_reprs(func: &IrFunction, mut reprs: HashMap<VarId, Repr>) -> HashMap<VarId, Repr> {
+fn refine_reprs(
+    func: &IrFunction,
+    mut reprs: HashMap<VarId, Repr>,
+    keep_params: &HashSet<VarId>,
+) -> HashMap<VarId, Repr> {
     // Defining instruction of each SSA var (params have none).
     let mut def: HashMap<VarId, &Inst> = HashMap::new();
     for block in &func.blocks {
@@ -496,10 +670,15 @@ fn refine_reprs(func: &IrFunction, mut reprs: HashMap<VarId, Repr>) -> HashMap<V
     loop {
         let mut demote: Vec<VarId> = Vec::new();
         for (&v, &r) in &reprs {
-            // A param (no def site) is kept boxed — `infer` was seeded with no
-            // specs, so this only fires for a stray seeded local.
+            // A param (no def site) is normally kept boxed — but a typed-ABI
+            // param whose unboxed repr is materialized by the wasm function
+            // signature (`keep_params`, the `^long`/`^double`-hinted params) is
+            // genuinely produced unboxed and must stay so, or its local's wasm
+            // type and its repr would disagree.
             let Some(inst) = def.get(&v) else {
-                demote.push(v);
+                if !keep_params.contains(&v) {
+                    demote.push(v);
+                }
                 continue;
             };
             let ok = match inst {
@@ -1194,7 +1373,9 @@ impl Emitter<'_> {
         // The pool lives in the runtime's imported linear memory.
         self.asm.needs_memory = true;
         let off = self.asm.intern_rodata(s.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + off) as i32,
+        ));
         self.ins(&Instruction::I64Const(s.len() as i64));
         self.call_import(bridge)
     }
@@ -1205,10 +1386,14 @@ impl Emitter<'_> {
     fn push_name_args(&mut self, ns: &str, name: &str) {
         self.asm.needs_memory = true;
         let ns_off = self.asm.intern_rodata(ns.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + ns_off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + ns_off) as i32,
+        ));
         self.ins(&Instruction::I64Const(ns.len() as i64));
         let name_off = self.asm.intern_rodata(name.as_bytes());
-        self.ins(&Instruction::I32Const((abi::RODATA_BASE + name_off) as i32));
+        self.ins(&Instruction::I32Const(
+            (self.cfg.layout.rodata_base + name_off) as i32,
+        ));
         self.ins(&Instruction::I64Const(name.len() as i64));
     }
 
@@ -1420,7 +1605,7 @@ impl Emitter<'_> {
     fn resolve_table_index(&self, name: &str) -> Result<u32, WasmError> {
         self.func_index_of
             .get(name)
-            .map(|pos| abi::FUNC_TABLE_BASE + pos)
+            .map(|pos| self.cfg.layout.func_table_base + pos)
             .ok_or_else(|| {
                 WasmError::Unsupported(format!("closure arity function not in bundle: {name}"))
             })
@@ -1824,6 +2009,77 @@ mod tests {
     fn compile(f: &IrFunction) -> Result<Vec<u8>, WasmError> {
         let s = super::super::reloop::reloop(f).expect("reloop");
         emit_function(f, &s, &WasmBackend::default())
+    }
+
+    /// Whether the module imports the named `rt_abi` bridge from `"rt"`.
+    fn imports_rt(bytes: &[u8], name: &str) -> bool {
+        use wasmparser::{Parser, Payload, TypeRef};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::ImportSection(reader)) = payload {
+                // Each `Imports` group iterates into individual `Import`s.
+                for group in reader.into_iter().flatten() {
+                    for item in group {
+                        if let Ok((_, imp)) = item
+                            && imp.module == "rt"
+                            && imp.name == name
+                            && matches!(imp.ty, TypeRef::Func(_))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Number of *defined* (non-imported) functions in the module — one entry
+    /// per code-section body.  A typed function contributes two (trampoline +
+    /// typed body); every other function contributes one.
+    fn defined_function_count(bytes: &[u8]) -> usize {
+        use wasmparser::{Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::CodeSectionStart { count, .. }) = payload {
+                return count as usize;
+            }
+        }
+        0
+    }
+
+    /// The `i32` offset of the (single) active data segment, or `None`.
+    fn data_segment_offset(bytes: &[u8]) -> Option<i32> {
+        use wasmparser::{DataKind, Operator, Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::DataSection(reader)) = payload {
+                for d in reader.into_iter().flatten() {
+                    if let DataKind::Active { offset_expr, .. } = d.kind
+                        && let Ok(Operator::I32Const { value }) =
+                            offset_expr.get_operators_reader().read()
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The `i32` offset of the (single) active element segment, or `None`.
+    fn element_segment_offset(bytes: &[u8]) -> Option<i32> {
+        use wasmparser::{ElementKind, Operator, Parser, Payload};
+        for payload in Parser::new(0).parse_all(bytes) {
+            if let Ok(Payload::ElementSection(reader)) = payload {
+                for e in reader.into_iter().flatten() {
+                    if let ElementKind::Active { offset_expr, .. } = e.kind
+                        && let Ok(Operator::I32Const { value }) =
+                            offset_expr.get_operators_reader().read()
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// `(fn [x] (+ x 1))`-shaped IR: one block, a constant, an add, a return.
@@ -2849,6 +3105,7 @@ mod tests {
         let cfg = WasmBackend {
             tail_calls: true,
             exceptions: true,
+            ..WasmBackend::default()
         };
         let on = super::super::compile_bundle(&[&caller, &callee], &cfg).expect("emit");
         validate(&on);
@@ -2857,6 +3114,7 @@ mod tests {
         let cfg_off = WasmBackend {
             tail_calls: false,
             exceptions: true,
+            ..WasmBackend::default()
         };
         let off = super::super::compile_bundle(&[&caller, &callee], &cfg_off).expect("emit");
         validate(&off);
@@ -2926,5 +3184,223 @@ mod tests {
         let (params, results) = function_signature(&f);
         assert_eq!(params, vec![WasmValType::I64]);
         assert_eq!(results, vec![WasmValType::I32]);
+    }
+
+    // ── Typed parameter ABI (item 1) ─────────────────────────────────────────
+
+    /// `(fn [^long n] (+ n 1))`: the `^long` hint makes the function compile to a
+    /// typed body (its param is an unboxed `i64`, so the `+ 1` is a checked
+    /// `i64.add`) plus a boxed-entry trampoline that coerces the boxed argument
+    /// (`rt_coerce_long`) and `return_call`s the body.
+    #[test]
+    fn typed_long_param_emits_trampoline_and_typed_body() {
+        let mut f = IrFunction::new(Some(Arc::from("addone")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        f.seed_reprs = vec![Repr::Long];
+        let one = f.fresh_var();
+        let sum = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(sum, KnownFn::Add, vec![x, one]),
+            ],
+            terminator: Terminator::Return(sum),
+        });
+
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        // Trampoline + typed body.
+        assert_eq!(defined_function_count(&bytes), 2);
+        // The trampoline coerces the `^long` argument.
+        assert!(imports_rt(&bytes, "rt_coerce_long"));
+        // The trampoline tail-calls the typed body (tail calls on by default).
+        assert!(contains_return_call(&bytes));
+    }
+
+    /// `(fn [^double x] (+ x 1.0))`: the `^double` hint yields an unboxed `f64`
+    /// param (so `+ 1.0` is an `f64.add`) and a trampoline coercing via
+    /// `rt_coerce_double`.
+    #[test]
+    fn typed_double_param_coerces_via_double_bridge() {
+        let mut f = IrFunction::new(Some(Arc::from("addhalf")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        f.seed_reprs = vec![Repr::Double];
+        let one = f.fresh_var();
+        let sum = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(one, Const::Double(1.0)),
+                Inst::CallKnown(sum, KnownFn::Add, vec![x, one]),
+            ],
+            terminator: Terminator::Return(sum),
+        });
+
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert_eq!(defined_function_count(&bytes), 2);
+        assert!(imports_rt(&bytes, "rt_coerce_double"));
+        assert!(!imports_rt(&bytes, "rt_coerce_long"));
+    }
+
+    /// With the tail-call proposal disabled the trampoline falls back to a plain
+    /// `call` + return, so no `return_call` appears (a function that merely
+    /// returns its `^long` param has no other call site).
+    #[test]
+    fn typed_param_trampoline_without_tail_calls_uses_plain_call() {
+        let mut f = IrFunction::new(Some(Arc::from("identity_long")), None);
+        let n = f.fresh_var();
+        f.params = vec![(Arc::from("n"), n)];
+        f.seed_reprs = vec![Repr::Long];
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(n),
+        });
+        let s = super::super::reloop::reloop(&f).expect("reloop");
+
+        let with_tc = emit_function(&f, &s, &WasmBackend::default()).expect("emit");
+        validate(&with_tc);
+        assert!(contains_return_call(&with_tc));
+
+        let no_tc = emit_function(
+            &f,
+            &s,
+            &WasmBackend {
+                tail_calls: false,
+                exceptions: true,
+                ..WasmBackend::default()
+            },
+        )
+        .expect("emit");
+        validate(&no_tc);
+        assert!(!contains_return_call(&no_tc));
+    }
+
+    /// A non-typed function is unaffected: `(fn [x] (+ x 1))` with no hint emits a
+    /// single boxed body and no coercion import.
+    #[test]
+    fn untyped_function_unchanged_single_body() {
+        let mut f = IrFunction::new(Some(Arc::from("addone_boxed")), None);
+        let x = f.fresh_var();
+        f.params = vec![(Arc::from("x"), x)];
+        let one = f.fresh_var();
+        let sum = f.fresh_var();
+        let b = f.fresh_block();
+        f.blocks.push(Block {
+            id: b,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(one, Const::Long(1)),
+                Inst::CallKnown(sum, KnownFn::Add, vec![x, one]),
+            ],
+            terminator: Terminator::Return(sum),
+        });
+        let bytes = compile(&f).expect("emit");
+        validate(&bytes);
+        assert_eq!(defined_function_count(&bytes), 1);
+        assert!(!imports_rt(&bytes, "rt_coerce_long"));
+    }
+
+    /// A boxed caller reaches a typed callee through its trampoline: a `CallDirect`
+    /// to `(fn [^long n] n)` resolves to the callee's primary (the boxed
+    /// trampoline), so the caller passes a boxed argument and the bundle still
+    /// validates.  The bundle has three defined functions: the caller's boxed
+    /// body, the callee trampoline, and the callee typed body.
+    #[test]
+    fn boxed_caller_reaches_typed_callee_via_trampoline() {
+        let mut callee = IrFunction::new(Some(Arc::from("id_long")), None);
+        let cn = callee.fresh_var();
+        callee.params = vec![(Arc::from("n"), cn)];
+        callee.seed_reprs = vec![Repr::Long];
+        let cb = callee.fresh_block();
+        callee.blocks.push(Block {
+            id: cb,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(cn),
+        });
+
+        let mut caller = IrFunction::new(Some(Arc::from("call_id")), None);
+        let y = caller.fresh_var();
+        caller.params = vec![(Arc::from("y"), y)];
+        let r = caller.fresh_var();
+        let bb = caller.fresh_block();
+        caller.blocks.push(Block {
+            id: bb,
+            phis: vec![],
+            insts: vec![Inst::CallDirect(r, Arc::from("id_long"), vec![y])],
+            terminator: Terminator::Return(r),
+        });
+
+        let bytes = super::super::compile_bundle(&[&caller, &callee], &WasmBackend::default())
+            .expect("emit");
+        validate(&bytes);
+        assert_eq!(defined_function_count(&bytes), 3);
+        assert!(imports_rt(&bytes, "rt_coerce_long"));
+    }
+
+    // ── Configurable memory / table layout (item 2) ──────────────────────────
+
+    /// A non-default [`abi::WasmLayout`] relocates the read-only data pool and the
+    /// function-table element segment to the runtime's reserved bases — the
+    /// CLI/bundling step's "finalize `RODATA_BASE`/`FUNC_TABLE_BASE`" knob.  A
+    /// function that returns a string constant (rodata) and a closure (table)
+    /// exercises both segments.
+    #[test]
+    fn custom_layout_relocates_data_and_element_segments() {
+        let mut inner = IrFunction::new(Some(Arc::from("inner")), None);
+        let iy = inner.fresh_var();
+        inner.params = vec![(Arc::from("y"), iy)];
+        let ib = inner.fresh_block();
+        inner.blocks.push(Block {
+            id: ib,
+            phis: vec![],
+            insts: vec![],
+            terminator: Terminator::Return(iy),
+        });
+
+        let mut outer = IrFunction::new(Some(Arc::from("outer")), None);
+        let ox = outer.fresh_var();
+        outer.params = vec![(Arc::from("x"), ox)];
+        let s = outer.fresh_var();
+        let clo = outer.fresh_var();
+        let ob = outer.fresh_block();
+        outer.blocks.push(Block {
+            id: ob,
+            phis: vec![],
+            insts: vec![
+                Inst::Const(s, Const::Str(Arc::from("hi"))),
+                Inst::AllocClosure(clo, template("inner", &["inner"], &[1], &[false]), vec![ox]),
+            ],
+            terminator: Terminator::Return(clo),
+        });
+        outer.subfunctions.push(inner);
+
+        let cfg = WasmBackend {
+            layout: abi::WasmLayout {
+                rodata_base: 0x1_0000,
+                func_table_base: 100,
+            },
+            ..WasmBackend::default()
+        };
+        let bytes = super::super::compile_bundle(&[&outer], &cfg).expect("emit bundle");
+        validate(&bytes);
+        assert_eq!(data_segment_offset(&bytes), Some(0x1_0000));
+        assert_eq!(element_segment_offset(&bytes), Some(100));
+
+        // The default layout keeps both at the `0` placeholders.
+        let def = super::super::compile_bundle(&[&outer], &WasmBackend::default()).expect("emit");
+        assert_eq!(data_segment_offset(&def), Some(0));
+        assert_eq!(element_segment_offset(&def), Some(0));
     }
 }
