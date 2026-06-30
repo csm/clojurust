@@ -16,6 +16,12 @@ use crate::token::Token;
 /// Returns `true` if `ch` is a valid constituent character for a symbol or
 /// keyword.  Defined *negatively*: everything that isn't a delimiter, whitespace,
 /// or special syntax character is a symbol constituent.
+///
+/// `#` is included here: it is a *non-terminating* macro character in the
+/// Clojure reader, meaning it doesn't end a symbol token that's already in
+/// progress (only a leading `#` triggers `#`-dispatch — see
+/// [`is_symbol_start`]). This is what makes auto-gensym symbols like `x#`
+/// tokenize as a single symbol rather than `x` followed by a stray `#`.
 fn is_symbol_char(ch: char) -> bool {
     !matches!(
         ch,
@@ -35,16 +41,16 @@ fn is_symbol_char(ch: char) -> bool {
             | '~'
             | '^'
             | '@'
-            | '#'
             | '\\'
             | ':'
     )
 }
 
-/// Returns `true` if `ch` can *start* a symbol (not a digit, not `+`/`-` when
-/// the following char is a digit — but the caller handles the `+`/`-` case).
+/// Returns `true` if `ch` can *start* a symbol (not a digit, not `#` since a
+/// leading `#` always triggers `#`-dispatch, not `+`/`-` when the following
+/// char is a digit — but the caller handles the `+`/`-` case).
 fn is_symbol_start(ch: char) -> bool {
-    is_symbol_char(ch) && !ch.is_ascii_digit()
+    is_symbol_char(ch) && !ch.is_ascii_digit() && ch != '#'
 }
 
 // ─── Lexer ───────────────────────────────────────────────────────────────────
@@ -1105,6 +1111,28 @@ mod tests {
         assert_eq!(lex_one("+"), Token::Symbol("+".to_string()));
         assert_eq!(lex_one("-"), Token::Symbol("-".to_string()));
         assert_eq!(lex_one("+foo"), Token::Symbol("+foo".to_string()));
+    }
+
+    #[test]
+    fn test_auto_gensym_symbol() {
+        // `x#` is a single symbol token (trailing `#` is auto-gensym syntax,
+        // not a `#`-dispatch macro — `#` is non-terminating mid-token).
+        assert_eq!(lex_one("x#"), Token::Symbol("x#".to_string()));
+        let toks = lex_all("`(let [x# 1] x#)");
+        assert_eq!(
+            toks,
+            vec![
+                Token::SyntaxQuote,
+                Token::LParen,
+                Token::Symbol("let".to_string()),
+                Token::LBracket,
+                Token::Symbol("x#".to_string()),
+                Token::Int(1),
+                Token::RBracket,
+                Token::Symbol("x#".to_string()),
+                Token::RParen,
+            ]
+        );
     }
 
     // ── Keywords ─────────────────────────────────────────────────────────

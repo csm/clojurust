@@ -37,7 +37,7 @@ Every distinct lexical form the reader can produce:
 | `Ratio(String)` | `3/4`, `-1/2` | full text including `/` |
 | `Char(char)` | `\a`, `\newline`, `\u0041` | named chars and `\uXXXX` resolved |
 | `Str(String)` | `"hello\n"` | escape sequences fully processed |
-| `Symbol(String)` | `foo`, `ns/name`, `/`, `..` | |
+| `Symbol(String)` | `foo`, `ns/name`, `/`, `..`, `x#` | trailing `#` (auto-gensym) is part of the symbol |
 | `Keyword(String)` | `:foo`, `:ns/name` | leading `:` stripped |
 | `AutoKeyword(String)` | `::foo`, `::ns/alias` | leading `::` stripped |
 | `LParen` / `RParen` | `(` / `)` | |
@@ -102,6 +102,17 @@ impl Iterator for Lexer {
   consumed as part of a ratio when the character immediately after it is a digit.
 - Radix literals: `NNrDIGITS` where `NN` is 2–36. Overflow of `i64` yields
   `BigInt`.
+
+#### `#` mid-symbol (auto-gensym)
+
+`#` is a *non-terminating* macro character: a leading `#` always triggers
+`#`-dispatch (`#(`, `#{`, `#'`, …), but a `#` encountered while a symbol or
+keyword token is already in progress is just appended to that token instead
+of ending it. This is what makes `x#` lex as the single symbol `Symbol("x#")`
+rather than `Symbol("x")` followed by a stray dispatch token — required for
+auto-gensym symbols inside syntax-quote (`` `(let [x# 1] x#) ``), which
+`cljrs-interp::syntax_quote` resolves to a unique `x__N__auto__` symbol per
+syntax-quote form.
 
 ---
 
