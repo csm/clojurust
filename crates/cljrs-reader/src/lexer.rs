@@ -22,6 +22,12 @@ use crate::token::Token;
 /// progress (only a leading `#` triggers `#`-dispatch — see
 /// [`is_symbol_start`]). This is what makes auto-gensym symbols like `x#`
 /// tokenize as a single symbol rather than `x` followed by a stray `#`.
+///
+/// `:` is included here too — it is also non-terminating, so a keyword like
+/// `:xlink:href` reads as one token with the literal name `xlink:href`
+/// rather than splitting into two keywords at the embedded colon. Only a
+/// *leading* `:`/`::` is special (it triggers keyword dispatch — see
+/// [`is_symbol_start`]).
 fn is_symbol_char(ch: char) -> bool {
     !matches!(
         ch,
@@ -42,15 +48,15 @@ fn is_symbol_char(ch: char) -> bool {
             | '^'
             | '@'
             | '\\'
-            | ':'
     )
 }
 
 /// Returns `true` if `ch` can *start* a symbol (not a digit, not `#` since a
-/// leading `#` always triggers `#`-dispatch, not `+`/`-` when the following
-/// char is a digit — but the caller handles the `+`/`-` case).
+/// leading `#` always triggers `#`-dispatch, not `:` since a leading `:`
+/// always triggers keyword dispatch, not `+`/`-` when the following char is
+/// a digit — but the caller handles the `+`/`-` case).
 fn is_symbol_start(ch: char) -> bool {
-    is_symbol_char(ch) && !ch.is_ascii_digit() && ch != '#'
+    is_symbol_char(ch) && !ch.is_ascii_digit() && ch != '#' && ch != ':'
 }
 
 // ─── Lexer ───────────────────────────────────────────────────────────────────
@@ -1141,6 +1147,25 @@ mod tests {
     fn test_keyword() {
         assert_eq!(lex_one(":foo"), Token::Keyword("foo".to_string()));
         assert_eq!(lex_one(":ns/name"), Token::Keyword("ns/name".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_with_embedded_colon() {
+        // An embedded `:` is a literal name character, not a sub-token
+        // boundary — `:xlink:href` is one keyword, not two.
+        assert_eq!(
+            lex_one(":xlink:href"),
+            Token::Keyword("xlink:href".to_string())
+        );
+        let toks = lex_all("[:xlink:href]");
+        assert_eq!(
+            toks,
+            vec![
+                Token::LBracket,
+                Token::Keyword("xlink:href".to_string()),
+                Token::RBracket,
+            ]
+        );
     }
 
     #[test]

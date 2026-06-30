@@ -287,6 +287,24 @@ impl GlobalEnv {
         aliases.get(alias).cloned()
     }
 
+    /// Resolve an auto-resolved keyword name (the text after `::`) to its
+    /// fully-qualified `ns/name` form.
+    ///
+    /// `::kw` qualifies with `current_ns` directly; `::alias/kw` looks
+    /// `alias` up in `current_ns`'s alias table (populated by `(require
+    /// '[... :as alias])`) and qualifies with the resolved namespace.
+    pub fn resolve_auto_keyword(&self, current_ns: &str, name: &str) -> Result<String, String> {
+        match name.split_once('/') {
+            Some((alias, kw_name)) => match self.resolve_alias(current_ns, alias) {
+                Some(ns) => Ok(format!("{ns}/{kw_name}")),
+                None => Err(format!(
+                    "invalid token: ::{name} (no such namespace alias: {alias})"
+                )),
+            },
+            None => Ok(format!("{current_ns}/{name}")),
+        }
+    }
+
     /// Return the namespace with this name, creating it if it doesn't exist.
     pub fn get_or_create_ns(&self, name: &str) -> GcPtr<Namespace> {
         // Fast path: already exists.

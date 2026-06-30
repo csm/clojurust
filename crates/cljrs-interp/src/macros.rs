@@ -21,7 +21,7 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
         // them.  In Clojure, ::kw is resolved at READ time; since cljrs keeps
         // AutoKeyword forms in the AST until eval, we resolve them here — the
         // last point at which env.current_ns reflects the call site.
-        let resolved = resolve_auto_kws(form, &env.current_ns);
+        let resolved = resolve_auto_kws(form, env)?;
         let parts = if let FormKind::List(p) = &resolved.kind {
             p
         } else {
@@ -48,39 +48,59 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
     Ok(form.clone())
 }
 
-/// Walk a form tree and replace every `AutoKeyword(s)` with `Keyword("{ns}/{s}")`.
+/// Walk a form tree and replace every `AutoKeyword(s)` with its
+/// fully-qualified `Keyword`, resolving an `alias/name` prefix against the
+/// caller's namespace alias table (see `GlobalEnv::resolve_auto_keyword`).
 ///
 /// `::kw` must be resolved using the namespace at the call site (not the
 /// macro's definition namespace).  Clojure resolves it at read time; we do it
 /// here, just before the form is handed to the macro, so the macro always
 /// receives fully-qualified keywords.
-pub(crate) fn resolve_auto_kws(form: &Form, ns: &str) -> Form {
+pub(crate) fn resolve_auto_kws(form: &Form, env: &Env) -> EvalResult<Form> {
     let kind = match &form.kind {
-        FormKind::AutoKeyword(s) => FormKind::Keyword(format!("{ns}/{s}")),
-        FormKind::List(items) => {
-            FormKind::List(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
+        FormKind::AutoKeyword(s) => {
+            let full = env
+                .globals
+                .resolve_auto_keyword(&env.current_ns, s)
+                .map_err(EvalError::Runtime)?;
+            FormKind::Keyword(full)
         }
-        FormKind::Vector(items) => {
-            FormKind::Vector(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
-        }
-        FormKind::Map(items) => {
-            FormKind::Map(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
-        }
-        FormKind::Set(items) => {
-            FormKind::Set(items.iter().map(|f| resolve_auto_kws(f, ns)).collect())
-        }
+        FormKind::List(items) => FormKind::List(
+            items
+                .iter()
+                .map(|f| resolve_auto_kws(f, env))
+                .collect::<EvalResult<Vec<_>>>()?,
+        ),
+        FormKind::Vector(items) => FormKind::Vector(
+            items
+                .iter()
+                .map(|f| resolve_auto_kws(f, env))
+                .collect::<EvalResult<Vec<_>>>()?,
+        ),
+        FormKind::Map(items) => FormKind::Map(
+            items
+                .iter()
+                .map(|f| resolve_auto_kws(f, env))
+                .collect::<EvalResult<Vec<_>>>()?,
+        ),
+        FormKind::Set(items) => FormKind::Set(
+            items
+                .iter()
+                .map(|f| resolve_auto_kws(f, env))
+                .collect::<EvalResult<Vec<_>>>()?,
+        ),
         // ::kw is resolved at read time in Clojure, so resolve inside quote too.
-        FormKind::Quote(inner) => FormKind::Quote(Box::new(resolve_auto_kws(inner, ns))),
+        FormKind::Quote(inner) => FormKind::Quote(Box::new(resolve_auto_kws(inner, env)?)),
         FormKind::SyntaxQuote(inner) => {
-            FormKind::SyntaxQuote(Box::new(resolve_auto_kws(inner, ns)))
+            FormKind::SyntaxQuote(Box::new(resolve_auto_kws(inner, env)?))
         }
-        FormKind::Unquote(inner) => FormKind::Unquote(Box::new(resolve_auto_kws(inner, ns))),
+        FormKind::Unquote(inner) => FormKind::Unquote(Box::new(resolve_auto_kws(inner, env)?)),
         FormKind::UnquoteSplice(inner) => {
-            FormKind::UnquoteSplice(Box::new(resolve_auto_kws(inner, ns)))
+            FormKind::UnquoteSplice(Box::new(resolve_auto_kws(inner, env)?))
         }
-        _ => return form.clone(),
+        _ => return Ok(form.clone()),
     };
-    Form::new(kind, form.span.clone())
+    Ok(Form::new(kind, form.span.clone()))
 }
 
 /// Fully expand a form until the head is no longer a macro.

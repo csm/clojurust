@@ -1132,12 +1132,34 @@ fn prepend_macro_params(form: &Form) -> Form {
 }
 
 fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
-    let name = require_sym(args, 0, "defmacro")?;
+    // The name may carry reader metadata, e.g. `(defmacro ^:private foo ...)`,
+    // possibly stacked (`^:a ^:b foo`).
+    let mut current = args
+        .first()
+        .ok_or_else(|| EvalError::Runtime("defmacro requires a symbol at position 0".into()))?
+        .clone();
+    let mut name_meta: Option<Value> = None;
+    while let FormKind::Meta(meta_form, inner) = current.kind {
+        let meta_val = compile_meta_form(&meta_form, env)?;
+        name_meta = merge_meta(name_meta, Some(meta_val));
+        current = *inner;
+    }
+    let name = match &current.kind {
+        FormKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::Runtime(
+                "defmacro requires a symbol at position 0".into(),
+            ));
+        }
+    };
+
     let mut rest_start = 1;
     if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Str(_)) {
         rest_start += 1;
     }
+    let mut attr_meta = None;
     if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Map(_)) {
+        attr_meta = Some(eval(&args[rest_start], env)?);
         rest_start += 1;
     }
     // Prepend implicit &form and &env params to each arity.
@@ -1166,7 +1188,10 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
 
     let var = env
         .globals
-        .intern(&env.current_ns, Arc::from(name), macro_val.clone());
+        .intern(&env.current_ns, Arc::from(name.as_str()), macro_val.clone());
+    if let Some(m) = merge_meta(name_meta, attr_meta) {
+        var.get().set_meta(m);
+    }
     Ok(Value::Var(var))
 }
 
