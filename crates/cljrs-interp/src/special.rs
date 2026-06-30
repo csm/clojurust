@@ -1410,7 +1410,9 @@ fn extract_ns_name_form(form: Option<&Form>, env: &mut Env) -> EvalResult<(Strin
     }
     match &current.kind {
         FormKind::Symbol(s) => Ok((s.clone(), meta_acc)),
-        _ => Err(EvalError::Runtime("ns requires a symbol at position 0".into())),
+        _ => Err(EvalError::Runtime(
+            "ns requires a symbol at position 0".into(),
+        )),
     }
 }
 
