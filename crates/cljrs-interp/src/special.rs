@@ -1395,17 +1395,72 @@ fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
 
 // ── ns ────────────────────────────────────────────────────────────────────────
 
+/// Extract the ns name and optional metadata from the `ns` macro's name form.
+/// Handles plain symbols and `^meta` shorthand / map forms, e.g.
+/// `(ns ^{:doc "..."} my.ns ...)` or `(ns ^:no-doc my.ns ...)`.
+fn extract_ns_name_form(form: Option<&Form>, env: &mut Env) -> EvalResult<(String, Option<Value>)> {
+    let mut current = form
+        .ok_or_else(|| EvalError::Runtime("ns requires a symbol at position 0".into()))?
+        .clone();
+    let mut meta_acc: Option<Value> = None;
+    while let FormKind::Meta(meta_form, inner) = current.kind {
+        let meta_val = compile_meta_form(&meta_form, env)?;
+        meta_acc = merge_meta(meta_acc, Some(meta_val));
+        current = *inner;
+    }
+    match &current.kind {
+        FormKind::Symbol(s) => Ok((s.clone(), meta_acc)),
+        _ => Err(EvalError::Runtime(
+            "ns requires a symbol at position 0".into(),
+        )),
+    }
+}
+
+/// Merge two optional metadata maps, with `overlay` entries taking
+/// precedence over `base` entries (matching Clojure's `(merge base overlay)`).
+fn merge_meta(base: Option<Value>, overlay: Option<Value>) -> Option<Value> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(Value::Map(b)), Some(Value::Map(o))) => {
+            let mut merged = b;
+            for (k, v) in o.iter() {
+                merged = merged.assoc(k.clone(), v.clone());
+            }
+            Some(Value::Map(merged))
+        }
+        (_, Some(o)) => Some(o),
+    }
+}
+
 fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
-    let name = require_sym(args, 0, "ns")?;
-    env.globals.get_or_create_ns(name);
-    env.current_ns = Arc::from(name);
+    let (name, name_meta) = extract_ns_name_form(args.first(), env)?;
+    env.globals.get_or_create_ns(&name);
+    env.current_ns = Arc::from(name.as_str());
     // Auto-refer clojure.core (Clojure default behaviour).
     if name != "clojure.core" {
-        env.globals.refer_all(name, "clojure.core");
+        env.globals.refer_all(&name, "clojure.core");
     }
     sync_star_ns(env);
 
-    for clause in &args[1..] {
+    // Optional docstring, then optional attr-map, before reference clauses.
+    let mut rest = &args[1..];
+    if matches!(rest.first().map(|f| &f.kind), Some(FormKind::Str(_))) {
+        rest = &rest[1..];
+    }
+    let mut attr_meta = None;
+    if matches!(rest.first().map(|f| &f.kind), Some(FormKind::Map(_))) {
+        attr_meta = Some(eval(&rest[0], env)?);
+        rest = &rest[1..];
+    }
+
+    if let Some(m) = merge_meta(name_meta, attr_meta) {
+        let ns_ptr = env.globals.get_or_create_ns(&env.current_ns);
+        ns_ptr.get().set_meta(m);
+    }
+
+    for clause in rest {
         if let FormKind::List(items) = &clause.kind {
             match items.first().map(|f| &f.kind) {
                 Some(FormKind::Keyword(k)) if k == "require" => {
@@ -1414,7 +1469,7 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
                     for spec_form in &expanded {
                         let spec =
                             parse_require_spec_form(spec_form).map_err(EvalError::Runtime)?;
-                        load_ns(env.globals.clone(), &spec, name)?;
+                        load_ns(env.globals.clone(), &spec, &name)?;
                     }
                 }
                 // Other clauses (:refer-clojure, :use, :import) — skip for now.

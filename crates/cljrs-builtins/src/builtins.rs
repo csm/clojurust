@@ -7373,6 +7373,7 @@ fn builtin_meta(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => Ok(vp.get().get_meta().unwrap_or(Value::Nil)),
         Value::Atom(a) => Ok(a.get().get_meta().unwrap_or(Value::Nil)),
+        Value::Namespace(ns) => Ok(ns.get().get_meta().unwrap_or(Value::Nil)),
         Value::WithMeta(_, meta) => Ok(meta.as_ref().clone()),
         _ => Ok(Value::Nil),
     }
@@ -7383,6 +7384,10 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Var(vp) => {
             vp.get().set_meta(args[1].clone());
+            Ok(args[0].clone())
+        }
+        Value::Namespace(ns) => {
+            ns.get().set_meta(args[1].clone());
             Ok(args[0].clone())
         }
         _ => Ok(args[0].clone().with_meta(args[1].clone())),

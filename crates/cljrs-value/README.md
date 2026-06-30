@@ -336,9 +336,21 @@ module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
 ```rust
 pub struct Namespace {
     pub name: Arc<str>,
-    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,  // own vars
-    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,   // imported names
-    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,    // ns alias → ns name
+    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,        // own vars
+    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,         // imported names
+    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,          // ns alias → ns name
+    pub source_file: Mutex<Option<Arc<str>>>,                 // path the ns was loaded from
+    pub git_repo_root: Mutex<Option<Arc<str>>>,               // repo root of source_file, if any
+    pub is_versioned: bool,                                   // true for `name@commit` namespaces
+    pub meta: Mutex<Option<Value>>,                           // from `(ns ^{...} name ...)` / attr-map
+}
+
+impl Namespace {
+    pub fn new(name: impl Into<Arc<str>>) -> Self;
+    pub fn new_versioned(name: impl Into<Arc<str>>) -> Self;
+    pub fn set_source_location(&self, file: &str, repo_root: Option<&str>);
+    pub fn get_meta(&self) -> Option<Value>;
+    pub fn set_meta(&self, m: Value);
 }
 ```
 
