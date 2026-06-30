@@ -42,25 +42,32 @@ cljrs_dom::register(&globals);            // registers cljrs.dom namespace
 
 #### Creation
 ```clojure
-(dom/create "div")        ; => DomNode
-(dom/create-text "hello") ; => DomNode (text node)
+(dom/create "div")            ; => DomNode
+(dom/create-text "hello")     ; => DomNode (text node)
+(dom/create-ns ns "tag")      ; => DomNode (createElementNS, e.g. SVG)
 ```
 
 #### Tree manipulation
 ```clojure
-(dom/append!  parent child) ; => parent
-(dom/prepend! parent child) ; => parent
-(dom/remove!  el)           ; => nil
-(dom/replace! old new)      ; => nil
-(dom/parent   el)           ; => DomNode | nil
-(dom/children el)           ; => [DomNode ...]
+(dom/append!        parent child)            ; => parent
+(dom/prepend!       parent child)            ; => parent
+(dom/insert-before! parent child ref-or-nil) ; => parent
+(dom/remove!        el)                      ; => nil
+(dom/replace!       old new)                 ; => nil
+(dom/parent         el)                      ; => DomNode | nil
+(dom/children       el)                      ; => [DomNode ...]
+(dom/child-at       el idx)                  ; => DomNode | nil  (O(1), unlike `children`)
+(dom/child-count    el)                      ; => Long
+(dom/connected?     el)                      ; => boolean  (Node.isConnected)
 ```
 
 #### Attributes
 ```clojure
-(dom/attr         el "name")        ; => String | nil
-(dom/set-attr!    el "name" val)    ; => el
-(dom/remove-attr! el "name")        ; => el
+(dom/attr            el "name")             ; => String | nil
+(dom/set-attr!       el "name" val)         ; => el
+(dom/remove-attr!    el "name")             ; => el
+(dom/set-attr-ns!    el ns "name" val)      ; => el  (setAttributeNS, e.g. xlink:href)
+(dom/remove-attr-ns! el ns "name")          ; => el
 ```
 
 #### Classes
@@ -81,21 +88,42 @@ cljrs_dom::register(&globals);            // registers cljrs.dom namespace
 
 #### Style & form values
 ```clojure
-(dom/style      el "prop")       ; => String
-(dom/set-style! el "prop" val)   ; => el
-(dom/value      el)              ; => String  (input/select/textarea)
-(dom/set-value! el val)          ; => el
+(dom/style          el "prop")       ; => String
+(dom/set-style!     el "prop" val)   ; => el
+(dom/remove-style!  el "prop")       ; => el  (style.removeProperty)
+(dom/computed-style el "prop")       ; => String  (getComputedStyle(el).getPropertyValue)
+(dom/value          el)              ; => String  (input/select/textarea)
+(dom/set-value!     el val)          ; => el
+(dom/set-checked!   el bool)         ; => el  (HtmlInputElement.checked property)
+(dom/set-selected!  el bool)         ; => el  (HtmlOptionElement.selected property)
+(dom/set-prop!      el "name" val)   ; => el  (generic DOM property setter, via Reflect.set)
+(dom/get-prop       el "name")       ; => String | Double | boolean | nil
 ```
 
 #### Events
 ```clojure
 ; Managed callback — returns a DomListener that keeps the handler alive
-(dom/listen!   el "click" handler-fn) ; => DomListener
-(dom/unlisten! listener)              ; => nil  (removes handler immediately)
+; opts is an optional map: {:capture bool :passive bool :once bool}
+(dom/listen!   el "click" handler-fn)       ; => DomListener
+(dom/listen!   el "click" handler-fn opts)  ; => DomListener
+(dom/unlisten! listener)                    ; => nil  (removes handler immediately)
 
 ; Channel-based — returns a core.async channel; listener is leaked
 (dom/event-chan el "input")           ; => channel
 ```
+
+#### Scheduling
+```clojure
+(dom/request-animation-frame f) ; => Long (request id); calls (f) on the next frame
+```
+
+#### Node memory
+```clojure
+(dom/remember! node value) ; => node  (associate an arbitrary value with a node)
+(dom/recall    node)       ; => value | nil
+```
+Identity is tracked via an expando id stamped onto the node; unlike a true
+`WeakMap`, entries are not released when the node itself becomes unreachable.
 
 Event maps delivered to callbacks:
 ```clojure

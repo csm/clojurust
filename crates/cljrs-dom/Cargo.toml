@@ -42,7 +42,9 @@ features = [
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
+    "HtmlOptionElement",
     "DomTokenList",
     "HtmlHeadElement",
+    "AddEventListenerOptions",
     "console",
 ]

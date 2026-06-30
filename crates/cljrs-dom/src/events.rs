@@ -105,12 +105,25 @@ pub fn event_to_map(event: &web_sys::Event) -> Value {
 
 pub const DOM_LISTENER_TAG: &str = "DomListener";
 
+/// Event-listener options recognised by `listen!`/`unlisten!`.
+///
+/// `capture` must match between `addEventListener` and `removeEventListener`
+/// or removal silently fails (per the DOM spec, capture is part of the
+/// listener's identity; passive/once are not).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListenerOptions {
+    pub capture: bool,
+    pub passive: bool,
+    pub once: bool,
+}
+
 /// Holds a live DOM event listener. Removing the event listener and freeing
 /// the wasm-bindgen `Closure` both happen in `Drop`.
 pub struct DomListener {
     target: web_sys::EventTarget,
     event_type: String,
     callback: js_sys::Function,
+    capture: bool,
     // Kept alive so the Rust closure is not freed while the listener is active.
     _closure: Closure<dyn FnMut(web_sys::Event)>,
 }
@@ -141,9 +154,11 @@ impl NativeObject for DomListener {
 
 impl Drop for DomListener {
     fn drop(&mut self) {
-        let _ = self
-            .target
-            .remove_event_listener_with_callback(&self.event_type, &self.callback);
+        let _ = self.target.remove_event_listener_with_callback_and_bool(
+            &self.event_type,
+            &self.callback,
+            self.capture,
+        );
     }
 }
 
@@ -156,6 +171,7 @@ pub fn create_listener(
     target: &web_sys::EventTarget,
     event_type: String,
     handler: Value,
+    opts: ListenerOptions,
 ) -> Result<Value, String> {
     let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
         let ptr = NonNull::from(&event);
@@ -175,14 +191,23 @@ pub fn create_listener(
 
     let callback: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
 
+    let add_opts = web_sys::AddEventListenerOptions::new();
+    add_opts.set_capture(opts.capture);
+    add_opts.set_passive(opts.passive);
+    add_opts.set_once(opts.once);
     target
-        .add_event_listener_with_callback(&event_type, &callback)
+        .add_event_listener_with_callback_and_add_event_listener_options(
+            &event_type,
+            &callback,
+            &add_opts,
+        )
         .map_err(|e| format!("addEventListener failed: {:?}", e))?;
 
     Ok(Value::NativeObject(gc_native_object(DomListener {
         target: target.clone(),
         event_type,
         callback,
+        capture: opts.capture,
         _closure: closure,
     })))
 }
@@ -200,7 +225,11 @@ pub fn remove_listener(val: &Value) -> ValueResult<()> {
                 .expect("DomListener tag but wrong concrete type");
             let _ = listener
                 .target
-                .remove_event_listener_with_callback(&listener.event_type, &listener.callback);
+                .remove_event_listener_with_callback_and_bool(
+                    &listener.event_type,
+                    &listener.callback,
+                    listener.capture,
+                );
             Ok(())
         }
         other => Err(ValueError::WrongType {
