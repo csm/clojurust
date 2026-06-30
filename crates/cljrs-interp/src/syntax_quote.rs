@@ -52,7 +52,10 @@ fn sq_form(
         FormKind::Char(c) => Ok(Value::Char(*c)),
         FormKind::Keyword(s) => Ok(Value::keyword(Keyword::parse(s))),
         FormKind::AutoKeyword(s) => {
-            let full = format!("{}/{}", env.current_ns, s);
+            let full = env
+                .globals
+                .resolve_auto_keyword(&env.current_ns, s)
+                .map_err(EvalError::Runtime)?;
             Ok(Value::keyword(Keyword::parse(&full)))
         }
 

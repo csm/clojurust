@@ -119,3 +119,60 @@ fn auto_kw_equality_with_direct_let() {
     let result = eval_in_ns("my.app", r#"(= ::error ::error)"#);
     assert_eq!(result, Value::Bool(true));
 }
+
+// ── ::alias/kw resolution via namespace aliases ──────────────────────────────
+//
+// These set up the alias directly via `add_alias` (what `(require '[ns :as
+// alias])` does internally) rather than loading a real namespace from disk,
+// so the test doesn't depend on the stdlib source path being configured.
+
+fn eval_with_alias(ns: &str, alias: &str, target_ns: &str, src: &str) -> Value {
+    let (globals, mut env) = make_env();
+    env.current_ns = Arc::from(ns);
+    globals.get_or_create_ns(ns);
+    globals.get_or_create_ns(target_ns);
+    globals.add_alias(ns, alias, target_ns);
+    let mut parser = cljrs_reader::Parser::new(src.to_string(), "<test>".to_string());
+    let forms = parser.parse_all().expect("parse error");
+    let mut result = Value::Nil;
+    for form in forms {
+        result = cljrs_interp::eval::eval(&form, &mut env).expect("eval error");
+    }
+    result
+}
+
+#[test]
+fn auto_kw_alias_resolves_via_require_as() {
+    let result = eval_with_alias("my.app", "s", "clojure.string", "::s/foo");
+    assert_eq!(result, kw("clojure.string", "foo"));
+}
+
+#[test]
+fn auto_kw_alias_resolves_inside_syntax_quote() {
+    let result = eval_with_alias("my.app", "s", "clojure.string", "`::s/foo");
+    assert_eq!(result, kw("clojure.string", "foo"));
+}
+
+#[test]
+fn auto_kw_alias_resolves_when_spliced_through_macro() {
+    let result = eval_with_alias(
+        "my.app",
+        "s",
+        "clojure.string",
+        r#"(do (defmacro show [k] k) (show ::s/foo))"#,
+    );
+    assert_eq!(result, kw("clojure.string", "foo"));
+}
+
+#[test]
+fn auto_kw_unknown_alias_is_an_error() {
+    let (_, mut env) = make_env();
+    env.current_ns = Arc::from("my.app");
+    let mut parser = cljrs_reader::Parser::new("::nope/foo".to_string(), "<test>".to_string());
+    let form = parser.parse_all().expect("parse error").remove(0);
+    let result = cljrs_interp::eval::eval(&form, &mut env);
+    assert!(
+        result.is_err(),
+        "unresolved alias must error, not silently produce a bogus keyword"
+    );
+}

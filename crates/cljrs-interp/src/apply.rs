@@ -696,11 +696,10 @@ fn macro_apply(
     // In Clojure, ::kw is resolved at read time; we approximate that here so a
     // macro splicing its arguments into a new form cannot re-resolve them against
     // the macro's own namespace.
-    let ns = env.current_ns.clone();
     let resolved_args: Vec<Form> = arg_forms
         .iter()
-        .map(|f| crate::macros::resolve_auto_kws(f, &ns))
-        .collect();
+        .map(|f| crate::macros::resolve_auto_kws(f, env))
+        .collect::<EvalResult<Vec<Form>>>()?;
 
     // &form: the whole call expression as a list value.
     let form_val = {
