@@ -513,6 +513,8 @@ pub struct Namespace {
     /// `true` for namespaces loaded from a specific commit (`name@hash`).
     /// Versioned namespaces are immutable: `intern()` will refuse new bindings.
     pub is_versioned: bool,
+    /// Metadata attached via `(ns ^{...} name ...)` or an `ns` attr-map.
+    pub meta: Mutex<Option<Value>>,
 }
 
 impl Namespace {
@@ -525,6 +527,7 @@ impl Namespace {
             source_file: Mutex::new(None),
             git_repo_root: Mutex::new(None),
             is_versioned: false,
+            meta: Mutex::new(None),
         }
     }
 
@@ -541,6 +544,14 @@ impl Namespace {
         *self.source_file.lock().unwrap() = Some(Arc::from(file));
         *self.git_repo_root.lock().unwrap() = repo_root.map(Arc::from);
     }
+
+    pub fn get_meta(&self) -> Option<Value> {
+        self.meta.lock().unwrap().clone()
+    }
+
+    pub fn set_meta(&self, m: Value) {
+        *self.meta.lock().unwrap() = Some(m);
+    }
 }
 
 impl cljrs_gc::Trace for Namespace {
@@ -556,6 +567,12 @@ impl cljrs_gc::Trace for Namespace {
             let refers = self.refers.lock().unwrap();
             for var in refers.values() {
                 visitor.visit(var);
+            }
+        }
+        {
+            let meta = self.meta.lock().unwrap();
+            if let Some(m) = meta.as_ref() {
+                m.trace(visitor);
             }
         }
     }
