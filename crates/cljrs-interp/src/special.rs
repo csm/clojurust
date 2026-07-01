@@ -2003,13 +2003,19 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
             _ => return Err(EvalError::Runtime("binding targets must be symbols".into())),
         };
         let parsed = cljrs_value::Symbol::parse(&sym_str);
-        let ns_part = parsed
-            .namespace
-            .as_deref()
-            .unwrap_or(env.current_ns.as_ref());
+        let ns_part: Arc<str> = match parsed.namespace.as_deref() {
+            // Resolve `alias/*var*` through the current ns's `:require :as`
+            // aliases, same as ordinary qualified-symbol lookup (`eval_symbol`)
+            // — otherwise `(binding [alias/*x* v] ...)` never finds the var.
+            Some(ns_part) => env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part)),
+            None => env.current_ns.clone(),
+        };
         let var_ptr = env
             .globals
-            .lookup_var_in_ns(ns_part, &parsed.name)
+            .lookup_var_in_ns(&ns_part, &parsed.name)
             .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
         let val = eval(&pair[1], env)?;
         frame.insert(cljrs_env::dynamics::var_key_of(&var_ptr), val);
