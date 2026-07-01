@@ -1073,3 +1073,5 @@
   [re s]
   (let [matcher (re-matcher re s)]
     (seq (take-while identity (repeatedly #(re-find matcher))))))
+
+(defn map-entry? [x] (and (vector? x) (= 2 (count x))))
