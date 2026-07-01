@@ -301,6 +301,11 @@
   ([test then] (list 'if test nil then))
   ([test then else] (list 'if test else then)))
 
+(defmacro declare
+  "defs the supplied var names with no bindings, useful for making forward declarations."
+  [& names]
+  (cons 'do (map (fn [n] (list 'def n)) names)))
+
 (defmacro if-let
   ([bindings then] (list 'if-let bindings then nil))
   ([bindings then else]
