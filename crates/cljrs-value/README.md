@@ -426,6 +426,9 @@ pub struct Protocol {
     pub methods: Vec<ProtocolMethod>,
     /// type_tag → { method_name → impl fn }
     pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+    /// Set by `(defprotocol Name :extend-via-metadata true ...)`; see dispatch
+    /// note below.
+    pub extend_via_metadata: bool,
 }
 
 pub struct ProtocolMethod {
@@ -457,6 +460,11 @@ pub struct MultiFn {
 pub fn protocol_generation() -> u64;
 pub fn bump_protocol_generation();
 ```
+
+When `Protocol::extend_via_metadata` is set, `apply_value`'s `ProtocolFn` arm
+(`cljrs-env/src/apply.rs`) checks the dispatch value's metadata for an entry
+keyed by the exact `ProtocolFn` before falling back to the `impls` type-tag
+lookup — see that crate's README for the dispatch order.
 
 ### `clone` — isolate copy boundary (Phase B2)
 

@@ -165,6 +165,20 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
                     pf_ref.method_name
                 ))
             })?;
+
+            // `(defprotocol P :extend-via-metadata true ...)` — an instance
+            // implements the protocol by carrying an impl fn in its metadata,
+            // keyed by this exact `ProtocolFn` (e.g. `(with-meta {} {my-method
+            // (fn [this] ...)})`).  Metadata impls win over type-tag impls, and
+            // apply even to values (like a plain map) with no `extend-type`.
+            if pf_ref.protocol.get().extend_via_metadata
+                && let Some(Value::Map(m)) = dispatch_val.get_meta()
+                && let Some(impl_fn) = m.get(callee)
+            {
+                let _impl_root = crate::gc_roots::root_value(&impl_fn);
+                return apply_value(&impl_fn, args, env);
+            }
+
             let tag = type_tag_of(dispatch_val);
             let impls = pf_ref.protocol.get().impls.lock().unwrap();
             let impl_fn = impls

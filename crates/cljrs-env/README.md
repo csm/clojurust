@@ -83,8 +83,14 @@ collection.
 ## apply module
 
 `apply_value` applies an evaluated callee to evaluated args (functions,
-keywords, maps, sets, vars, protocol/multimethod dispatch). Protocol dispatch
-helpers shared with the Phase 10.6 inline caches:
+keywords, maps, sets, vars, protocol/multimethod dispatch). For a
+`Value::ProtocolFn` callee whose protocol has `extend_via_metadata` set (`(defprotocol
+Name :extend-via-metadata true ...)`), dispatch first checks the first arg's
+metadata for an entry keyed by the `ProtocolFn` itself (e.g. `(with-meta {}
+{my-method (fn [this] ...)})`) before falling back to the type-tag `impls`
+lookup — this lets a value implement a protocol without a matching
+`extend-type`/`extend-protocol`. Protocol dispatch helpers shared with the
+Phase 10.6 inline caches:
 
 - `type_tag_of(val: &Value) -> Arc<str>` — canonical protocol dispatch tag of a value
 - `type_tag_matches(val: &Value, tag: &str) -> bool` — allocation-free equality

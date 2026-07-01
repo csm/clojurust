@@ -111,15 +111,25 @@ pub struct Protocol {
     pub methods: Vec<ProtocolMethod>,
     /// type_tag → { method_name → impl fn }
     pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+    /// `(defprotocol Name :extend-via-metadata true ...)` — when set, protocol
+    /// dispatch consults the dispatch value's metadata (keyed by this
+    /// protocol's `ProtocolFn`s) before falling back to type-tag impls.
+    pub extend_via_metadata: bool,
 }
 
 impl Protocol {
-    pub fn new(name: Arc<str>, ns: Arc<str>, methods: Vec<ProtocolMethod>) -> Self {
+    pub fn new(
+        name: Arc<str>,
+        ns: Arc<str>,
+        methods: Vec<ProtocolMethod>,
+        extend_via_metadata: bool,
+    ) -> Self {
         Self {
             name,
             ns,
             methods,
             impls: Mutex::new(HashMap::new()),
+            extend_via_metadata,
         }
     }
 }

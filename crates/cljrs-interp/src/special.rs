@@ -1653,8 +1653,25 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     };
 
     let mut methods: Vec<ProtocolMethod> = Vec::new();
+    let mut extend_via_metadata = false;
 
-    for form in &args[methods_start..] {
+    let rest = &args[methods_start..];
+    let mut i = 0;
+    while i < rest.len() {
+        // Protocol options are flat `:keyword value` pairs interspersed
+        // among the method signatures, e.g. `:extend-via-metadata true`.
+        if let FormKind::Keyword(kw) = &rest[i].kind {
+            if kw == "extend-via-metadata" {
+                extend_via_metadata = matches!(
+                    rest.get(i + 1).map(|f| &f.kind),
+                    Some(FormKind::Bool(true))
+                );
+            }
+            i += 2;
+            continue;
+        }
+        let form = &rest[i];
+        i += 1;
         // Each method spec is (method-name [params...] "doc"?)
         let parts = match &form.kind {
             FormKind::List(parts) => parts,
@@ -1694,7 +1711,7 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     let ns: Arc<str> = env.current_ns.clone();
-    let proto = Protocol::new(proto_name.clone(), ns, methods.clone());
+    let proto = Protocol::new(proto_name.clone(), ns, methods.clone(), extend_via_metadata);
     let proto_ptr = GcPtr::new(proto);
 
     // Intern the protocol itself.

@@ -104,6 +104,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] `defprotocol` — define named protocol with method signatures
 - [x] `extend-type` / `extend-protocol` — implement protocols on types
 - [x] Protocol dispatch on first-arg type tag (`type_tag_of`)
+- [x] `:extend-via-metadata true` — dispatch consults the first arg's metadata (keyed by the `ProtocolFn`) before falling back to type-tag `impls`
 - [x] `defmulti` / `defmethod` — arbitrary dispatch multimethods
 - [x] `prefer-method`, `remove-method`, `methods`, `satisfies?`, `extends?`, `isa?` (equality stub), `type`
 - [ ] Inline protocol dispatch cache — Phase 10 JIT optimization

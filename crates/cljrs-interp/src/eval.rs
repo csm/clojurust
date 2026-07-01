@@ -1141,6 +1141,46 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_via_metadata() {
+        // `:extend-via-metadata true` lets an instance implement a protocol by
+        // carrying the impl fn in its own metadata, keyed by the protocol fn
+        // itself — no `extend-type`/`extend-protocol` needed.
+        let result = eval_str(
+            r#"
+            (defprotocol IRender
+              :extend-via-metadata true
+              (create-element [this tag-name]))
+            (def renderer (with-meta {} {create-element (fn [this tag-name] (str "made-" tag-name))}))
+            (create-element renderer "div")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::string("made-div"));
+    }
+
+    #[test]
+    fn test_extend_via_metadata_falls_back_to_type_tag() {
+        // Metadata impls take priority, but a value without metadata still
+        // dispatches on its type tag as usual.
+        let result = eval_str(
+            r#"
+            (defprotocol IRender
+              :extend-via-metadata true
+              (create-element [this tag-name]))
+            (extend-type Map
+              IRender
+              (create-element [this tag-name] (str "type-tag-" tag-name)))
+            [(create-element {} "span")
+             (create-element (with-meta {} {create-element (fn [this tag-name] (str "meta-" tag-name))}) "div")]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains("type-tag-span"), "got: {s}");
+        assert!(s.contains("meta-div"), "got: {s}");
+    }
+
+    #[test]
     fn test_satisfies() {
         let result = eval_str(
             r#"
