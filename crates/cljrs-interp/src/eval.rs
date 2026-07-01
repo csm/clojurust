@@ -1143,14 +1143,17 @@ mod tests {
     #[test]
     fn test_extend_via_metadata() {
         // `:extend-via-metadata true` lets an instance implement a protocol by
-        // carrying the impl fn in its own metadata, keyed by the protocol fn
-        // itself — no `extend-type`/`extend-protocol` needed.
+        // carrying the impl fn in its own metadata, keyed by the protocol
+        // method's fully-qualified symbol (matching real Clojure's
+        // `MethodImplCache` dispatch, which looks up `(.sym cache)` in
+        // `(meta x)`) — no `extend-type`/`extend-protocol` needed. Idiomatic
+        // usage produces that qualified symbol via syntax-quote.
         let result = eval_str(
             r#"
             (defprotocol IRender
               :extend-via-metadata true
               (create-element [this tag-name]))
-            (def renderer (with-meta {} {create-element (fn [this tag-name] (str "made-" tag-name))}))
+            (def renderer (with-meta {} {`create-element (fn [this tag-name] (str "made-" tag-name))}))
             (create-element renderer "div")
             "#,
         )
@@ -1171,13 +1174,45 @@ mod tests {
               IRender
               (create-element [this tag-name] (str "type-tag-" tag-name)))
             [(create-element {} "span")
-             (create-element (with-meta {} {create-element (fn [this tag-name] (str "meta-" tag-name))}) "div")]
+             (create-element (with-meta {} {`create-element (fn [this tag-name] (str "meta-" tag-name))}) "div")]
             "#,
         )
         .unwrap();
         let s = format!("{}", result);
         assert!(s.contains("type-tag-span"), "got: {s}");
         assert!(s.contains("meta-div"), "got: {s}");
+    }
+
+    #[test]
+    fn test_extend_via_metadata_cross_ns() {
+        // Mirrors Replicant's mutation_log fake renderer: `IRender` is
+        // defined in `replicant.core`, and a test namespace `:refer`s the
+        // method and implements it purely via metadata (no `extend-type`).
+        // Syntax-quoting `create-element` there must resolve to the
+        // protocol's home namespace (`replicant.core/create-element`), which
+        // is exactly the key the dispatcher looks up.
+        let dir = temp_ns_dir("extend_via_metadata_cross_ns");
+        std::fs::create_dir_all(dir.join("replicant")).unwrap();
+        std::fs::write(
+            dir.join("replicant").join("core.cljrs"),
+            r#"(ns replicant.core)
+               (defprotocol IRender
+                 :extend-via-metadata true
+                 (create-element [this tag-name]))"#,
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src(
+            r#"
+            (ns mutation-log-test
+              (:require [replicant.core :refer [create-element]]))
+            (def renderer (with-meta {} {`create-element (fn [this tag-name] (str "made-" tag-name))}))
+            (create-element renderer "div")
+            "#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result, Value::string("made-div"));
     }
 
     #[test]

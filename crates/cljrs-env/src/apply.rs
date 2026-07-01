@@ -168,15 +168,25 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
 
             // `(defprotocol P :extend-via-metadata true ...)` — an instance
             // implements the protocol by carrying an impl fn in its metadata,
-            // keyed by this exact `ProtocolFn` (e.g. `(with-meta {} {my-method
-            // (fn [this] ...)})`).  Metadata impls win over type-tag impls, and
-            // apply even to values (like a plain map) with no `extend-type`.
+            // keyed by the fully-qualified symbol naming the protocol method
+            // (e.g. `` (with-meta {} {`my-method (fn [this] ...)}) ``, which
+            // syntax-quote expands to `{my.ns/my-method (fn [this] ...)}`).
+            // This mirrors real Clojure's `MethodImplCache` dispatch, which
+            // looks the method up in `(meta x)` by `(.sym cache)` — the var's
+            // qualified symbol, not the callable itself.  Metadata impls win
+            // over type-tag impls, and apply even to values (like a plain
+            // map) with no `extend-type`.
             if pf_ref.protocol.get().extend_via_metadata
                 && let Some(Value::Map(m)) = dispatch_val.get_meta()
-                && let Some(impl_fn) = m.get(callee)
             {
-                let _impl_root = crate::gc_roots::root_value(&impl_fn);
-                return apply_value(&impl_fn, args, env);
+                let proto = pf_ref.protocol.get();
+                let method_sym = Value::Symbol(cljrs_gc::GcPtr::new(
+                    cljrs_value::Symbol::qualified(proto.ns.clone(), pf_ref.method_name.clone()),
+                ));
+                if let Some(impl_fn) = m.get(&method_sym) {
+                    let _impl_root = crate::gc_roots::root_value(&impl_fn);
+                    return apply_value(&impl_fn, args, env);
+                }
             }
 
             let tag = type_tag_of(dispatch_val);
