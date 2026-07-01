@@ -1662,10 +1662,8 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
         // among the method signatures, e.g. `:extend-via-metadata true`.
         if let FormKind::Keyword(kw) = &rest[i].kind {
             if kw == "extend-via-metadata" {
-                extend_via_metadata = matches!(
-                    rest.get(i + 1).map(|f| &f.kind),
-                    Some(FormKind::Bool(true))
-                );
+                extend_via_metadata =
+                    matches!(rest.get(i + 1).map(|f| &f.kind), Some(FormKind::Bool(true)));
             }
             i += 2;
             continue;
