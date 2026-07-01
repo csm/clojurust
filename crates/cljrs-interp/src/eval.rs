@@ -1141,6 +1141,46 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_via_metadata() {
+        // `:extend-via-metadata true` lets an instance implement a protocol by
+        // carrying the impl fn in its own metadata, keyed by the protocol fn
+        // itself — no `extend-type`/`extend-protocol` needed.
+        let result = eval_str(
+            r#"
+            (defprotocol IRender
+              :extend-via-metadata true
+              (create-element [this tag-name]))
+            (def renderer (with-meta {} {create-element (fn [this tag-name] (str "made-" tag-name))}))
+            (create-element renderer "div")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, Value::string("made-div"));
+    }
+
+    #[test]
+    fn test_extend_via_metadata_falls_back_to_type_tag() {
+        // Metadata impls take priority, but a value without metadata still
+        // dispatches on its type tag as usual.
+        let result = eval_str(
+            r#"
+            (defprotocol IRender
+              :extend-via-metadata true
+              (create-element [this tag-name]))
+            (extend-type Map
+              IRender
+              (create-element [this tag-name] (str "type-tag-" tag-name)))
+            [(create-element {} "span")
+             (create-element (with-meta {} {create-element (fn [this tag-name] (str "meta-" tag-name))}) "div")]
+            "#,
+        )
+        .unwrap();
+        let s = format!("{}", result);
+        assert!(s.contains("type-tag-span"), "got: {s}");
+        assert!(s.contains("meta-div"), "got: {s}");
+    }
+
+    #[test]
     fn test_satisfies() {
         let result = eval_str(
             r#"
@@ -1761,6 +1801,53 @@ mod tests {
         eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();
         let result = eval_src("(with-bindings* {#'*x* 99} (fn [] *x*))", &mut env).unwrap();
         assert_eq!(result, Value::Long(99));
+    }
+
+    #[test]
+    fn test_binding_fully_qualified_cross_ns_dynamic_var() {
+        let (_, mut env) = make_env();
+        let result = eval_src(
+            r#"
+            (ns other.ns)
+            (def ^:dynamic *dispatch* nil)
+            (ns user)
+            (binding [other.ns/*dispatch* (fn [x] x)]
+              (other.ns/*dispatch* 42))
+            "#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(42));
+    }
+
+    #[test]
+    fn test_binding_aliased_cross_ns_dynamic_var() {
+        // (binding [alias/*var* v] ...) must resolve `alias` through the
+        // current ns's `:require :as` aliases, exactly like ordinary
+        // qualified-symbol lookup — this is how Replicant's public
+        // `set-dispatch!`/life-cycle dispatch binds `*dispatch*` across
+        // namespaces.
+        let dir = temp_ns_dir("binding_aliased_cross_ns_dynamic_var");
+        std::fs::create_dir_all(dir.join("replicant")).unwrap();
+        std::fs::write(
+            dir.join("replicant").join("core.cljrs"),
+            r#"(ns replicant.core)
+               (def ^:dynamic *dispatch* nil)
+               (defn call-dispatch [x] (*dispatch* x))"#,
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src(
+            r#"
+            (ns life-cycle-test
+              (:require [replicant.core :as r]))
+            (binding [r/*dispatch* (fn [x] x)]
+              (r/call-dispatch 42))
+            "#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Long(42));
     }
 
     #[test]

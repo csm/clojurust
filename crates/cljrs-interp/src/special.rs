@@ -1653,8 +1653,23 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     };
 
     let mut methods: Vec<ProtocolMethod> = Vec::new();
+    let mut extend_via_metadata = false;
 
-    for form in &args[methods_start..] {
+    let rest = &args[methods_start..];
+    let mut i = 0;
+    while i < rest.len() {
+        // Protocol options are flat `:keyword value` pairs interspersed
+        // among the method signatures, e.g. `:extend-via-metadata true`.
+        if let FormKind::Keyword(kw) = &rest[i].kind {
+            if kw == "extend-via-metadata" {
+                extend_via_metadata =
+                    matches!(rest.get(i + 1).map(|f| &f.kind), Some(FormKind::Bool(true)));
+            }
+            i += 2;
+            continue;
+        }
+        let form = &rest[i];
+        i += 1;
         // Each method spec is (method-name [params...] "doc"?)
         let parts = match &form.kind {
             FormKind::List(parts) => parts,
@@ -1694,7 +1709,7 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     let ns: Arc<str> = env.current_ns.clone();
-    let proto = Protocol::new(proto_name.clone(), ns, methods.clone());
+    let proto = Protocol::new(proto_name.clone(), ns, methods.clone(), extend_via_metadata);
     let proto_ptr = GcPtr::new(proto);
 
     // Intern the protocol itself.
@@ -1986,13 +2001,19 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
             _ => return Err(EvalError::Runtime("binding targets must be symbols".into())),
         };
         let parsed = cljrs_value::Symbol::parse(&sym_str);
-        let ns_part = parsed
-            .namespace
-            .as_deref()
-            .unwrap_or(env.current_ns.as_ref());
+        let ns_part: Arc<str> = match parsed.namespace.as_deref() {
+            // Resolve `alias/*var*` through the current ns's `:require :as`
+            // aliases, same as ordinary qualified-symbol lookup (`eval_symbol`)
+            // — otherwise `(binding [alias/*x* v] ...)` never finds the var.
+            Some(ns_part) => env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part)),
+            None => env.current_ns.clone(),
+        };
         let var_ptr = env
             .globals
-            .lookup_var_in_ns(ns_part, &parsed.name)
+            .lookup_var_in_ns(&ns_part, &parsed.name)
             .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
         let val = eval(&pair[1], env)?;
         frame.insert(cljrs_env::dynamics::var_key_of(&var_ptr), val);
