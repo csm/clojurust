@@ -269,6 +269,11 @@
   (dorun coll)
   coll)
 
+(defn run!
+  [proc coll]
+  (reduce #(proc %2) nil coll)
+  nil)
+
 (defn some [pred coll]
   (loop [s (seq coll)]
     (when s
@@ -1068,6 +1073,22 @@
       (if (empty? steps)
         g
         (last steps)))))
+
+(defmacro some->
+  [expr & forms]
+  (let [g (gensym)
+        steps (map (fn [step] (list (quote if) (list (quote nil?) g) nil (list (quote ->) g step)))
+                   forms)]
+    (list (quote let) (into [g expr] (interleave (repeat g) (butlast steps)))
+      (if (empty? steps) g (last steps)))))
+
+(defmacro some->>
+  [expr & forms]
+  (let [g (gensym)
+        steps (map (fn [step] (list (quote if) (list (quote nil?) g) nil (list (quote ->>) g step)))
+                   forms)]
+    (list (quote let) (into [g expr] (interleave (repeat g) (butlast steps)))
+      (if (empty? steps) g (last steps)))))
 
 (defn re-seq
   [re s]
