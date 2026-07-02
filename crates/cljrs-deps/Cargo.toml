@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-deps"
-version = "0.1.0"
+version = "0.1.204"
 edition = "2024"
 description = "cljrs.edn project configuration parser and dependency model"
 license.workspace = true

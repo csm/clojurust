@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-lsp"
-version = "0.1.0"
+version = "0.1.204"
 edition = "2024"
 description = "Language Server Protocol implementation for clojurust (.cljrs/.cljc)"
 license.workspace = true
