@@ -1216,6 +1216,40 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_via_metadata_cross_ns_via_alias() {
+        // The `:refer` case above never touches the buggy path: a `:refer`d
+        // bare symbol resolves through `lookup_var_in_ns`, which was always
+        // correct. Real usage syntax-quotes an *aliased* symbol instead —
+        // `` `p/attached? `` — which used to hit `qualify_symbol`'s "already
+        // has a slash, keep as-is" branch and leak the alias text (`p/...`)
+        // into the produced symbol instead of resolving it to the protocol's
+        // home namespace (`replicant.protocols/...`), so the metadata key
+        // never matched.
+        let dir = temp_ns_dir("extend_via_metadata_cross_ns_via_alias");
+        std::fs::create_dir_all(dir.join("replicant")).unwrap();
+        std::fs::write(
+            dir.join("replicant").join("protocols.cljrs"),
+            r#"(ns replicant.protocols)
+               (defprotocol IRender
+                 :extend-via-metadata true
+                 (attached? [this el]))"#,
+        )
+        .unwrap();
+        let (_, mut env) = make_env_with_paths(vec![dir]);
+        let result = eval_src(
+            r#"
+            (ns mutation-log-test
+              (:require [replicant.protocols :as p]))
+            (def r (with-meta {:log []} {`p/attached? (fn [_ el] el)}))
+            (p/attached? r :el)
+            "#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result, Value::keyword(Keyword::simple("el")));
+    }
+
+    #[test]
     fn test_satisfies() {
         let result = eval_str(
             r#"
