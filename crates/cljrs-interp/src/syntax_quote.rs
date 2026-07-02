@@ -176,7 +176,10 @@ fn sq_seq(
 /// Qualify a symbol name for use inside syntax-quote.
 ///
 /// - `foo#` → unique gensym `foo__N__auto__` (same N within one backtick).
-/// - `ns/foo` → kept as-is (already qualified).
+/// - `alias/foo` → resolved through the current ns's `:require :as` aliases
+///   to `real-ns/foo`, exactly like `::alias/kw` and `(binding [alias/*x*
+///   ...])`; not just kept as-is, since call sites (e.g. protocol-metadata
+///   dispatch) key on the *resolved* qualified symbol, not the alias text.
 /// - Special literals (`nil`, `true`, `false`) → kept as-is.
 /// - Special forms (`def`, `if`, `try`, `catch`, `let`, …) → kept as-is.
 /// - Symbols that resolve in the current namespace → qualified with resolved ns.
@@ -186,8 +189,17 @@ fn qualify_symbol(
     env: &Env,
     gensyms: &mut std::collections::HashMap<String, Arc<str>>,
 ) -> String {
-    // Already qualified.
-    if s.contains('/') {
+    // Already qualified (but not the bare `/` division symbol, or a
+    // dangling/leading slash — neither has a real ns part to resolve).
+    if let Some(idx) = s.find('/') {
+        if idx > 0 && idx < s.len() - 1 {
+            let (ns_part, name_part) = (&s[..idx], &s[idx + 1..]);
+            let resolved_ns = env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part));
+            return format!("{resolved_ns}/{name_part}");
+        }
         return s.to_string();
     }
     // Special literals.
