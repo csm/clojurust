@@ -4696,6 +4696,25 @@ pub unsafe extern "C" fn rt_call_ic(
     {
         let arg_slice = unsafe { std::slice::from_raw_parts(args, nargs as usize) };
         let dispatch_val = unsafe { val_ref(arg_slice[0]) };
+        let pf_ref = pf.get();
+
+        // `:extend-via-metadata true` — mirror `apply_value`'s priority
+        // exactly: a metadata impl wins over any type-tag impl, and (unlike
+        // the type-tag impl) can vary per instance, so it is checked on
+        // every call rather than being folded into the inline cache below.
+        if pf_ref.protocol.get().extend_via_metadata
+            && let Some(Value::Map(m)) = dispatch_val.get_meta()
+        {
+            let proto = pf_ref.protocol.get();
+            let method_sym = Value::Symbol(GcPtr::new(Symbol::qualified(
+                proto.ns.clone(),
+                pf_ref.method_name.clone(),
+            )));
+            if let Some(impl_fn) = m.get(&method_sym) {
+                return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
+            }
+        }
+
         let generation = cljrs_value::protocol_generation();
         let callee_id = pf.get() as *const _ as usize;
 
@@ -4726,7 +4745,6 @@ pub unsafe extern "C" fn rt_call_ic(
         // `rt_call` for the canonical error path.
         jit_stats::PROTO_IC_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tag = cljrs_env::apply::type_tag_of(dispatch_val);
-        let pf_ref = pf.get();
         let impl_fn = {
             let impls = pf_ref.protocol.get().impls.lock().unwrap();
             impls
@@ -4975,6 +4993,89 @@ mod tests {
         let _ = take_pending_exception(); // drain any prior pending exception
         assert_eq!(unsafe { rt_coerce_long(rt_const_nil()) }, 0);
         assert!(take_pending_exception().is_some());
+    }
+
+    /// `rt_call_ic` must consult `:extend-via-metadata` before (and in
+    /// preference to) its type-tag inline cache — otherwise a JIT-compiled
+    /// call site would silently stop honoring per-instance metadata impls
+    /// once a generic `extend-type` impl warms the cache.  Regression for
+    /// the JIT-tier half of the metadata-dispatch bugfix in
+    /// `cljrs_env::apply::apply_value`.
+    #[test]
+    fn test_rt_call_ic_prefers_metadata_impl_over_type_tag() {
+        use cljrs_value::{NativeFn, Protocol, ProtocolFn, ProtocolMethod};
+
+        let _mutator = cljrs_gc::register_mutator();
+        let globals = cljrs_interp::standard_env_minimal(None, None, None);
+        let env = cljrs_env::env::Env::new(globals, "user");
+        cljrs_env::callback::push_eval_context(&env);
+
+        let method_name: Arc<str> = Arc::from("create-element");
+        let proto_ns: Arc<str> = Arc::from("test.ns");
+
+        let proto = Protocol::new(
+            Arc::from("IRender"),
+            proto_ns.clone(),
+            vec![ProtocolMethod {
+                name: method_name.clone(),
+                min_arity: 1,
+                variadic: false,
+            }],
+            true, // :extend-via-metadata true
+        );
+        // A generic type-tag impl for Map — must lose to the metadata impl.
+        let type_tag_impl = Value::NativeFunction(GcPtr::new(NativeFn::new(
+            "type-tag-impl",
+            cljrs_value::Arity::Fixed(1),
+            |_args| Ok(Value::Long(111)),
+        )));
+        proto
+            .impls
+            .lock()
+            .unwrap()
+            .entry(Arc::from("Map"))
+            .or_default()
+            .insert(method_name.clone(), type_tag_impl);
+        let proto_ptr = GcPtr::new(proto);
+
+        let pf = ProtocolFn {
+            protocol: proto_ptr,
+            method_name: method_name.clone(),
+            min_arity: 1,
+            variadic: false,
+        };
+        let callee = box_val(Value::ProtocolFn(GcPtr::new(pf)));
+
+        // Per-instance metadata impl, keyed by the fully-qualified method
+        // symbol — exactly what `(with-meta {} {`create-element (fn ...)})`
+        // produces via syntax-quote.
+        let meta_impl = Value::NativeFunction(GcPtr::new(NativeFn::new(
+            "meta-impl",
+            cljrs_value::Arity::Fixed(1),
+            |_args| Ok(Value::Long(222)),
+        )));
+        let meta_map = Value::Map(MapValue::from_pairs(vec![(
+            Value::Symbol(GcPtr::new(Symbol::qualified(proto_ns, method_name))),
+            meta_impl,
+        )]));
+        let dispatch_val = box_val(Value::Map(MapValue::from_pairs(vec![])).with_meta(meta_map));
+
+        let mut slot: usize = 0;
+        let args = [dispatch_val];
+        let result = unsafe { rt_call_ic(callee, args.as_ptr(), 1, &mut slot) };
+        assert!(
+            matches!(unsafe { &*result }, Value::Long(222)),
+            "expected metadata impl (222) to win, got {:?}",
+            unsafe { &*result }
+        );
+
+        // The metadata check bypasses the IC entirely for metadata-dispatch
+        // protocols, so a second call must still consult it (not the stale
+        // type-tag cache slot, which was never filled).
+        let result2 = unsafe { rt_call_ic(callee, args.as_ptr(), 1, &mut slot) };
+        assert!(matches!(unsafe { &*result2 }, Value::Long(222)));
+
+        cljrs_env::callback::pop_eval_context();
     }
 
     #[test]
