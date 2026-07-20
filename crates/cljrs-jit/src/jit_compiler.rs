@@ -335,6 +335,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_unbox_long),
         sym!(rt_unbox_double),
         sym!(rt_box_bool),
+        sym!(rt_gas_charge),
         sym!(rt_deopt),
         sym!(rt_kw_ic_fill),
         sym!(rt_call_ic),

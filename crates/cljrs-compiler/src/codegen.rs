@@ -195,6 +195,7 @@ struct RuntimeFuncs {
     rt_unbox_long: FuncId,
     rt_unbox_double: FuncId,
     rt_box_bool: FuncId,
+    rt_gas_charge: FuncId,
     rt_deopt: FuncId,
     rt_kw_ic_fill: FuncId,
     rt_call_ic: FuncId,
@@ -548,6 +549,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 }
             }
 
+            self.emit_gas_checkpoint((ir_block.phis.len() + ir_block.insts.len() + 1) as u64)?;
+
             // Translate regular instructions.
             for inst in &ir_block.insts {
                 self.translate_inst(inst)?;
@@ -618,6 +621,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     self.builder.def_var(var, param);
                 }
             }
+
+            self.emit_gas_checkpoint((ir_block.phis.len() + ir_block.insts.len() + 1) as u64)?;
 
             for inst in &ir_block.insts {
                 self.translate_inst(inst)?;
@@ -777,18 +782,21 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
 
             Inst::CallKnown(dst, known_fn, args) => {
                 let val = self.emit_known_call(*dst, known_fn, args)?;
+                self.emit_gas_checkpoint(0)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
             Inst::Call(dst, callee, args) => {
                 let val = self.emit_unknown_call(*callee, args)?;
+                self.emit_gas_checkpoint(0)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
 
             Inst::CallDirect(dst, fn_name, args) => {
                 let val = self.emit_direct_call(fn_name, args)?;
+                self.emit_gas_checkpoint(0)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
@@ -1092,6 +1100,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 // opportunistic rt_abi allocation and GC root tracing).
                 let region_val = self.use_var(*region);
                 let val = self.emit_direct_call_with_extra(fn_name, args, region_val)?;
+                self.emit_gas_checkpoint(0)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, val);
             }
@@ -1210,8 +1219,27 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .iconst(types::I32, cljrs_async::state_machine::POLL_THREW as i64);
                 self.builder.ins().return_(&[threw]);
 
-                // Ready → bind the resolved value; the continuation emits here.
+                // Gas exhaustion is not a catchable thrown value.
                 self.builder.switch_to_block(cont2);
+                let gas_block = self.builder.create_block();
+                let ready_block = self.builder.create_block();
+                let is_gas = self.builder.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    code,
+                    cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
+                );
+                self.builder
+                    .ins()
+                    .brif(is_gas, gas_block, &[], ready_block, &[]);
+                self.builder.switch_to_block(gas_block);
+                let exhausted = self.builder.ins().iconst(
+                    types::I32,
+                    cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
+                );
+                self.builder.ins().return_(&[exhausted]);
+
+                // Ready → bind the resolved value; the continuation emits here.
+                self.builder.switch_to_block(ready_block);
                 let result = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, result);
@@ -1369,6 +1397,31 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn emit_safepoint(&mut self) {
         let func_ref = self.import_func(self.rt.rt_safepoint);
         self.builder.ins().call(func_ref, &[]);
+    }
+
+    /// Charge a weighted basic block and return a type-correct exhaustion
+    /// sentinel immediately when the active gas meter is exhausted.
+    fn emit_gas_checkpoint(&mut self, cost: u64) -> CodegenResult<()> {
+        let cost = self.builder.ins().iconst(types::I64, cost as i64);
+        let charged = self.call_rt_1(self.rt.rt_gas_charge, cost)?;
+        let continue_block = self.builder.create_block();
+        let exhausted_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(charged, continue_block, &[], exhausted_block, &[]);
+        self.builder.switch_to_block(exhausted_block);
+        if self.is_poll_fn {
+            let exhausted = self.builder.ins().iconst(
+                types::I32,
+                cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
+            );
+            self.builder.ins().return_(&[exhausted]);
+        } else {
+            let nil = self.call_rt_0(self.rt.rt_const_nil)?;
+            self.builder.ins().return_(&[nil]);
+        }
+        self.builder.switch_to_block(continue_block);
+        Ok(())
     }
 
     /// Inferred machine representation of `var_id` (Boxed if unknown).
@@ -2743,6 +2796,7 @@ fn declare_runtime_funcs<M: Module>(
         rt_unbox_long: declare_rt(module, "rt_unbox_long", &[ptr], types::I64)?,
         rt_unbox_double: declare_rt(module, "rt_unbox_double", &[ptr], types::F64)?,
         rt_box_bool: declare_rt(module, "rt_box_bool", &[types::I8], ptr)?,
+        rt_gas_charge: declare_rt(module, "rt_gas_charge", &[types::I64], types::I8)?,
         rt_deopt: declare_rt(module, "rt_deopt", &[], ptr)?,
         rt_kw_ic_fill: declare_rt(module, "rt_kw_ic_fill", &[ptr, types::I64, ptr], ptr)?,
         rt_call_ic: declare_rt(module, "rt_call_ic", &[ptr, ptr, types::I64, ptr], ptr)?,

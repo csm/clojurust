@@ -243,6 +243,9 @@ mod tests {
 
     #[test]
     fn process_request_publishes_and_registers() {
+        let _sweep_guard = crate::ir_cache::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let id = 0xC500_0001u64;
         let gid = 0xC500_0001usize;
         let ns = "test.worker-ns";
@@ -267,6 +270,9 @@ mod tests {
 
     #[test]
     fn process_request_relowers_marked_arity_despite_cache_hit() {
+        let _sweep_guard = crate::ir_cache::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // A rebind of a consumed external invalidates the dependent and
         // marks it; if the (stale) IR is still cached when the worker runs —
         // the mark-then-invalidate window seen from the worker thread — the

@@ -67,6 +67,11 @@ pub fn ir_cache_ttl_secs() -> u64 {
 
 static IR_CACHE: RwLock<Option<HashMap<u64, IrCacheEntry>>> = RwLock::new(None);
 
+/// Serializes tests that publish cache entries with tests that run a
+/// synthetic far-future sweep over the process-global cache.
+#[cfg(test)]
+pub(crate) static SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Look up a cached IR function by arity ID, refreshing its last-access time.
 /// Returns `None` if not cached or if lowering previously failed.
 /// Returns `Some(ir)` if cached.
@@ -191,10 +196,8 @@ mod tests {
     // The sweep itself is global, though: a far-future `sweep_idle` from one
     // test would evict another test's entry mid-setup.  Serialize every test
     // that sweeps (or whose entries a sweep could evict) on this lock.
-    static SWEEP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn sweep_guard() -> std::sync::MutexGuard<'static, ()> {
-        SWEEP_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        SWEEP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     #[test]

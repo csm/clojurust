@@ -1079,6 +1079,21 @@ fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
     cljrs_gc::region::unwind_region_stack_to(gc_depth);
 }
 
+/// Close every region opened by native code on this thread.
+///
+/// Gas exhaustion crosses the entire compiled call stack, so no native frame
+/// will execute its matching `RegionEnd`. Interpreter-owned region-stack
+/// entries are deliberately left alone.
+fn unwind_all_native_regions() {
+    loop {
+        let region = RT_REGION_STACK.with(|stack| stack.borrow_mut().pop());
+        match region {
+            Some(region) => cljrs_gc::region::close_region(region),
+            None => break,
+        }
+    }
+}
+
 // ── Scratch buffer ──────────────────────────────────────────────────────────
 
 thread_local! {
@@ -3764,7 +3779,9 @@ pub unsafe extern "C" fn rt_try(
                 // Unwind any regions opened inside the try body.
                 unwind_regions_to(region_depth, rt_region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
-                if !matches!(catch, Value::Nil) {
+                if matches!(&val_err, cljrs_value::ValueError::GasExhausted) {
+                    rt_const_nil()
+                } else if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {
                         cljrs_value::ValueError::Thrown(v) => v,
                         other => Value::Str(GcPtr::new(other.to_string())),
@@ -4311,6 +4328,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_coerce_long as *const () as usize);
     std::hint::black_box(rt_coerce_double as *const () as usize);
     std::hint::black_box(rt_box_bool as *const () as usize);
+    std::hint::black_box(rt_gas_charge as *const () as usize);
     std::hint::black_box(rt_deopt as *const () as usize);
     std::hint::black_box(rt_kw_ic_fill as *const () as usize);
     std::hint::black_box(rt_load_global_versioned_ic as *const () as usize);
@@ -4421,6 +4439,16 @@ pub unsafe extern "C" fn rt_coerce_double(v: *const Value) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
     intern_bool(b != 0)
+}
+
+/// Charge a weighted compiled basic-block checkpoint.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_gas_charge(cost: u64) -> u8 {
+    let charged = cljrs_env::gas::charge(cost);
+    if !charged {
+        unwind_all_native_regions();
+    }
+    u8::from(charged)
 }
 
 /// The deoptimization sentinel: a unique, process-lifetime `Value` address
@@ -4899,7 +4927,8 @@ pub extern "C" fn rt_async_register(sm: *mut CljxStateMachine, val: *const Value
 }
 
 /// Check whether the registered (`pending`) value has resolved.  Returns the
-/// poll code: `0` pending, `1` ready, `2` failed.  On ready/failed the resolved
+/// poll code: `0` pending, `1` ready, `2` failed, `3` gas exhausted. On
+/// ready/failed the resolved
 /// (or thrown) value replaces `pending`, so [`rt_async_take_result`] returns it.
 ///
 /// # Safety
@@ -4917,6 +4946,7 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
             sm.pending = e;
             2
         }
+        Readiness::GasExhausted => cljrs_async::state_machine::POLL_GAS_EXHAUSTED,
     }
 }
 

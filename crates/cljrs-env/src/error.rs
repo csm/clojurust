@@ -8,6 +8,10 @@ pub enum EvalError {
     #[error("runtime error: {0}")]
     Runtime(String),
 
+    /// The cooperative execution-credit budget was exhausted.
+    #[error("gas exhausted")]
+    GasExhausted,
+
     #[error("unbound symbol: {0}")]
     UnboundSymbol(String),
 
@@ -77,6 +81,7 @@ impl EvalError {
 pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
     match err {
         ValueError::Thrown(v) => EvalError::Thrown(v),
+        ValueError::GasExhausted => EvalError::GasExhausted,
         other => {
             let msg = other.to_string();
             EvalError::Thrown(Value::Error(cljrs_gc::GcPtr::new(

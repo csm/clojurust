@@ -166,6 +166,7 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     };
     result.map_err(|e| match e {
         crate::error::EvalError::Thrown(v) => ValueError::Thrown(v),
+        crate::error::EvalError::GasExhausted => ValueError::GasExhausted,
         other => ValueError::Other(format!("{other}")),
     })
 }

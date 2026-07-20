@@ -178,7 +178,7 @@ Failures anywhere (transform declined, codegen error, panic) mark the
 Inline caches (keyword constants, protocol dispatch) live in the shared
 codegen + rt_abi (`cljrs-compiler`), so AOT binaries get them too; this crate
 only registers the new bridge symbols (`rt_value_tag`, `rt_unbox_long`,
-`rt_unbox_double`, `rt_box_bool`, `rt_deopt`, `rt_kw_ic_fill`, `rt_call_ic`)
+`rt_unbox_double`, `rt_box_bool`, `rt_gas_charge`, `rt_deopt`, `rt_kw_ic_fill`, `rt_call_ic`)
 with the `JITBuilder`.
 
 End-to-end evidence: `crates/cljrs/tests/jit_specialization.rs`.

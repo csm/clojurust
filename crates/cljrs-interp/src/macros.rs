@@ -107,6 +107,19 @@ pub(crate) fn resolve_auto_kws(form: &Form, env: &Env) -> EvalResult<Form> {
 pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
     let mut current = form.clone();
     loop {
+        // `macroexpand_1` returns an unchanged clone for non-macro forms.  Do
+        // not use structural equality to discover that case: IEEE NaN is not
+        // equal to itself, so a form containing `##NaN` would otherwise make
+        // this fixed-point loop run forever.
+        let is_macro_call = matches!(
+            &current.kind,
+            FormKind::List(parts)
+                if matches!(parts.first().map(|f| &f.kind), Some(FormKind::Symbol(s)) if resolve_macro(s, env).is_some())
+        );
+        if !is_macro_call {
+            return Ok(current);
+        }
+
         let expanded = macroexpand_1(&current, env)?;
         if expanded == current {
             return Ok(current);

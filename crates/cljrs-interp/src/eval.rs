@@ -21,6 +21,9 @@ use regex::Regex;
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    if !cljrs_env::gas::charge(1) {
+        return Err(EvalError::GasExhausted);
+    }
     match &form.kind {
         // ── Atoms ─────────────────────────────────────────────────────────
         FormKind::Nil => Ok(Value::Nil),
@@ -150,6 +153,17 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         } => eval_reader_cond(clauses, env),
         FormKind::TaggedLiteral(tag, inner) => eval_tagged_literal(tag, inner, env),
     }
+}
+
+/// Evaluate a form with a cooperative execution-credit budget.
+///
+/// Nested tree-walker, IR-interpreter, and JIT work shares this budget.  The
+/// existing [`eval`] entry point remains unmetered unless called inside this
+/// dynamic scope.
+pub fn eval_with_gas(form: &Form, env: &mut Env, credits: u64) -> EvalResult {
+    let meter = cljrs_env::gas::GasMeter::new(credits);
+    let _guard = cljrs_env::gas::GasGuard::install(meter);
+    eval(form, env)
 }
 
 // ── List / call dispatch ──────────────────────────────────────────────────────
@@ -335,6 +349,10 @@ pub fn deref_value(v: Value) -> EvalResult {
                     FutureState::Failed(v) => {
                         f.get().mark_observed();
                         return Err(EvalError::Thrown(v.clone()));
+                    }
+                    FutureState::GasExhausted => {
+                        f.get().mark_observed();
+                        return Err(EvalError::GasExhausted);
                     }
                     FutureState::Cancelled => {
                         return Err(EvalError::Runtime("future was cancelled".into()));

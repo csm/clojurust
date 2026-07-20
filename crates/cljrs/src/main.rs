@@ -1249,6 +1249,7 @@ fn format_eval_error(e: EvalError) -> miette::Report {
         } => miette::miette!("Wrong number of args ({got}) passed to {name}; expected {expected}"),
         EvalError::NotCallable(s) => miette::miette!("Not a function: {}", s),
         EvalError::Runtime(msg) => miette::miette!("{}", msg),
+        EvalError::GasExhausted => miette::miette!("gas exhausted"),
         EvalError::Read(e) => miette::Report::from(e),
         EvalError::Recur(_) => miette::miette!("recur outside of loop/fn"),
         EvalError::CommitSignatureVerificationFailed { commit, reason } => {

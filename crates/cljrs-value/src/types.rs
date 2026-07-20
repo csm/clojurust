@@ -1102,6 +1102,9 @@ pub enum FutureState {
     /// `Value::Error`) so `await`/`deref` can re-throw it with its
     /// `ex-data`/`ex-cause` intact, rather than a stringified message.
     Failed(Value),
+    /// The future exhausted the evaluation budget. Kept distinct from a
+    /// thrown value so user-level catch clauses cannot intercept it.
+    GasExhausted,
     Cancelled,
 }
 

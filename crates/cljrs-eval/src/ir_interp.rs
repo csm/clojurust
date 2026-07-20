@@ -349,6 +349,14 @@ fn interpret_ir_inner(
     loop {
         let block = &ir_func.blocks[current_block_idx];
 
+        // Charge one weighted checkpoint per basic block.  Using the number
+        // of IR operations keeps Tier 1 and generated native code on the same
+        // approximate scale without putting a branch around every operation.
+        let block_cost = (block.phis.len() + block.insts.len() + 1) as u64;
+        if !cljrs_env::gas::charge(block_cost) {
+            return Err(EvalError::GasExhausted);
+        }
+
         // Resolve phi nodes based on predecessor.
         for phi in &block.phis {
             if let Inst::Phi(dst, entries) = phi {

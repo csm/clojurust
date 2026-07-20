@@ -548,6 +548,7 @@ fn eval_error_message(e: &EvalError) -> String {
             got,
         } => format!("Wrong number of args ({got}) passed to {name}; expected {expected}"),
         EvalError::NotCallable(s) => format!("Not a function: {s}"),
+        EvalError::GasExhausted => "gas exhausted".to_string(),
         EvalError::Recur(_) => "recur outside of loop/fn".to_string(),
         other => other.to_string(),
     }

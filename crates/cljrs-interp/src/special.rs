@@ -1005,6 +1005,10 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
             result = Err(EvalError::Recur(args));
             None
         }
+        Err(EvalError::GasExhausted) => {
+            result = Err(EvalError::GasExhausted);
+            None
+        }
         Err(other) => Some(other),
     };
 
@@ -2347,6 +2351,10 @@ fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
                     FutureState::Failed(v) => {
                         f.get().mark_observed();
                         return Err(EvalError::Thrown(v.clone()));
+                    }
+                    FutureState::GasExhausted => {
+                        f.get().mark_observed();
+                        return Err(EvalError::GasExhausted);
                     }
                     FutureState::Cancelled => {
                         return Err(EvalError::Runtime("future was cancelled".into()));

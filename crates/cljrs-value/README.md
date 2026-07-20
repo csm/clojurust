@@ -415,7 +415,7 @@ pub struct CljxPromise {
 }
 
 pub struct CljxFuture {
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(String) | Cancelled
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Cancelled
     pub cond: Condvar,
 }
 

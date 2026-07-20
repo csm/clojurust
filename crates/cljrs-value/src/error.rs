@@ -38,6 +38,9 @@ pub enum ValueError {
     #[error("{0}")]
     Other(String),
 
+    #[error("gas exhausted")]
+    GasExhausted,
+
     #[error("out of range")]
     OutOfRange,
 
@@ -88,6 +91,7 @@ impl ExceptionInfo {
                 ValueError::OddMap { .. } => "OddMap",
                 ValueError::Unsupported => "Unsupported",
                 ValueError::Other(_) => "Other",
+                ValueError::GasExhausted => "GasExhausted",
                 ValueError::OutOfRange => "OutOfRange",
                 ValueError::TransientAlreadyPersisted => "TransientAlreadyPersisted",
                 ValueError::Parse => "ParseError",

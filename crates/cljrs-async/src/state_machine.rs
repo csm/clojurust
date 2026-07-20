@@ -8,7 +8,8 @@
 //! extern "C" fn(*mut CljxStateMachine, *mut *const Value) -> i32
 //! ```
 //!
-//! returning [`POLL_PENDING`] / [`POLL_READY`] / [`POLL_THREW`].  This module
+//! returning [`POLL_PENDING`] / [`POLL_READY`] / [`POLL_THREW`] /
+//! [`POLL_GAS_EXHAUSTED`].  This module
 //! supplies the runtime side: the [`CljxStateMachine`] that holds the resume
 //! state and the spilled live values, the [`CompiledAsyncTask`] `Future`
 //! adapter that drives the poll function on the existing `LocalSet` executor,
@@ -59,6 +60,8 @@ pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
 /// Poll-function return code: the task threw; the thrown value is in `pending`.
 pub const POLL_THREW: i32 = 2;
+/// Poll-function return code: the active gas meter was exhausted.
+pub const POLL_GAS_EXHAUSTED: i32 = 3;
 
 /// The C-ABI signature of a compiled poll function.  The result/thrown value is
 /// returned in-band (`CljxStateMachine::pending`), not through an out-pointer.
@@ -114,6 +117,8 @@ pub enum Readiness {
     Ready(Value),
     /// The awaited future failed; the thrown value.
     Failed(Value),
+    /// The awaited computation exhausted its evaluation budget.
+    GasExhausted,
 }
 
 /// Check whether an awaited value has resolved, without blocking.  Mirrors
@@ -130,6 +135,10 @@ pub fn check_ready(val: &Value) -> Readiness {
             FutureState::Failed(v) => {
                 f.get().mark_observed();
                 Readiness::Failed(v.clone())
+            }
+            FutureState::GasExhausted => {
+                f.get().mark_observed();
+                Readiness::GasExhausted
             }
             FutureState::Cancelled => Readiness::Failed(Value::Str(cljrs_gc::GcPtr::new(
                 "future was cancelled".into(),
@@ -197,6 +206,7 @@ impl Future for CompiledAsyncTask {
             }
             POLL_READY => Poll::Ready(Ok(this.sm.pending.clone())),
             POLL_THREW => Poll::Ready(Err(EvalError::Thrown(this.sm.pending.clone()))),
+            POLL_GAS_EXHAUSTED => Poll::Ready(Err(EvalError::GasExhausted)),
             other => Poll::Ready(Err(EvalError::Runtime(format!(
                 "compiled async poll returned invalid code {other}"
             )))),
@@ -347,6 +357,7 @@ mod tests {
                     sm.pending = e;
                     POLL_THREW
                 }
+                Readiness::GasExhausted => POLL_GAS_EXHAUSTED,
             },
             _ => POLL_PENDING,
         }

@@ -6035,6 +6035,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                         f.get().mark_observed();
                         Err(ValueError::Thrown(v.clone()))
                     }
+                    FutureState::GasExhausted => {
+                        f.get().mark_observed();
+                        Err(ValueError::GasExhausted)
+                    }
                     FutureState::Cancelled => Err(ValueError::Other("future was cancelled".into())),
                     FutureState::Running => {
                         let (guard, _) = f
@@ -6050,6 +6054,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             FutureState::Failed(v) => {
                                 f.get().mark_observed();
                                 Err(ValueError::Thrown(v.clone()))
+                            }
+                            FutureState::GasExhausted => {
+                                f.get().mark_observed();
+                                Err(ValueError::GasExhausted)
                             }
                             FutureState::Cancelled => {
                                 Err(ValueError::Other("future was cancelled".into()))
@@ -6069,6 +6077,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                         FutureState::Failed(v) => {
                             f.get().mark_observed();
                             return Err(ValueError::Thrown(v.clone()));
+                        }
+                        FutureState::GasExhausted => {
+                            f.get().mark_observed();
+                            return Err(ValueError::GasExhausted);
                         }
                         FutureState::Cancelled => {
                             return Err(ValueError::Other("future was cancelled".into()));

@@ -7,6 +7,7 @@ pub mod callback;
 pub mod dynamics;
 pub mod env;
 pub mod error;
+pub mod gas;
 pub mod gc_roots;
 pub mod loader;
 pub mod taps;

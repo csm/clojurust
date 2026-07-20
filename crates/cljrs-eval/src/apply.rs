@@ -391,11 +391,17 @@ fn call_jit_native(
     // in ALLOC_ROOTS.  Clone it before the alloc frame drops.
     let result = unsafe { (*result_ptr).clone() };
 
+    let gas_exhausted = cljrs_env::gas::is_exhausted();
+
     // An uncaught `(throw …)` inside native code stashes the thrown value in a
     // thread-local and returns the nil sentinel.  Surface it as an error here
     // (while the alloc frame still roots it), exactly as Tier-1 would have
     // propagated it — and so a stale slot cannot misfire a later `rt_try`.
-    if let Some(thrown) = crate::jit_state::take_pending_exception() {
+    let pending_exception = crate::jit_state::take_pending_exception();
+    if gas_exhausted {
+        return Err(cljrs_env::error::EvalError::GasExhausted);
+    }
+    if let Some(thrown) = pending_exception {
         return Err(cljrs_env::error::EvalError::Thrown(thrown));
     }
     Ok(result)

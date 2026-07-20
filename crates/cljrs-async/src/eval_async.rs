@@ -49,12 +49,20 @@ where
     cljrs_gc::region::poison_active_regions();
     let future = GcPtr::new(CljxFuture::new());
     let task_future = future.clone();
+    let gas_meters = cljrs_env::gas::active_meters();
     tokio::task::spawn_local(async move {
         // Root the result future across GC cycles: the spawning scope's alloc
         // frame may have dropped before the task gets to run.
         let anchor = Value::Future(task_future.clone());
         let _root = cljrs_env::gc_roots::root_value(&anchor);
-        let result = task.await;
+        let mut task = Box::pin(task);
+        let result = std::future::poll_fn(|cx| {
+            // LocalSet tasks share an OS thread, so TLS state must be scoped
+            // to one poll and removed before another task can run.
+            let _gas_guards = cljrs_env::gas::install_meters(&gas_meters);
+            task.as_mut().poll(cx)
+        })
+        .await;
         settle_future(&task_future, result);
     });
     Value::Future(future)
@@ -67,6 +75,7 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
         Ok(v) => FutureState::Done(v),
         // Preserve the thrown value (and any non-Thrown error as a fresh
         // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
+        Err(EvalError::GasExhausted) => FutureState::GasExhausted,
         Err(e) => FutureState::Failed(e.to_error_value()),
     };
     drop(state);
@@ -235,6 +244,10 @@ pub async fn await_value(val: Value) -> EvalResult {
                             f.get().mark_observed();
                             return Err(EvalError::Thrown(v.clone()));
                         }
+                        FutureState::GasExhausted => {
+                            f.get().mark_observed();
+                            return Err(EvalError::GasExhausted);
+                        }
                         FutureState::Cancelled => {
                             return Err(EvalError::Runtime("future was cancelled".into()));
                         }
@@ -289,6 +302,10 @@ async fn eval_try_async(args: &[Form], env: &mut Env) -> EvalResult {
         }
         Err(EvalError::Recur(recur_args)) => {
             result = Err(EvalError::Recur(recur_args));
+            None
+        }
+        Err(EvalError::GasExhausted) => {
+            result = Err(EvalError::GasExhausted);
             None
         }
         Err(other) => Some(other),
