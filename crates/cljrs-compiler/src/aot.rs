@@ -1853,25 +1853,9 @@ const TEST_HARNESS_RUNTIME_CRATES: &[&str] = &[
 fn link_with_cargo(harness_dir: &Path, out_path: &Path, offline: bool) -> AotResult<()> {
     eprintln!("[aot] building harness with cargo...");
 
-    let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("build").arg("--release");
-    if offline {
-        cmd.arg("--offline");
-    }
-    let output = cmd.current_dir(harness_dir).output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AotError::Link(format!("cargo build failed:\n{stderr}")));
-    }
-
-    // The binary is at target/release/cljrs-aot-harness.
-    let bin_name = if cfg!(target_os = "windows") {
-        "cljrs-aot-harness.exe"
-    } else {
-        "cljrs-aot-harness"
-    };
-    let built = harness_dir.join("target/release").join(bin_name);
+    let output = cargo_build_harness_release(harness_dir, offline)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let built = harness_bin_from_cargo_stdout(&stdout)?;
     std::fs::copy(&built, out_path)?;
 
     // Clean up the harness directory.
@@ -1889,8 +1873,26 @@ fn link_with_cargo_test_harness(
 ) -> AotResult<()> {
     eprintln!("[aot] building harness with cargo...");
 
+    let output = cargo_build_harness_release(harness_dir, offline)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let built = harness_bin_from_cargo_stdout(&stdout)?;
+    std::fs::copy(&built, out_path)?;
+
+    // Keep the harness directory for debugging
+    eprintln!("[aot] harness directory kept at {}", harness_dir.display());
+
+    Ok(())
+}
+
+/// Run `cargo build --release --message-format=json` in the harness directory.
+fn cargo_build_harness_release(
+    harness_dir: &Path,
+    offline: bool,
+) -> AotResult<std::process::Output> {
     let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("build").arg("--release");
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--message-format=json");
     if offline {
         cmd.arg("--offline");
     }
@@ -1900,20 +1902,59 @@ fn link_with_cargo_test_harness(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AotError::Link(format!("cargo build failed:\n{stderr}")));
     }
+    Ok(output)
+}
 
-    // The binary is at target/release/cljrs-aot-harness.
-    let bin_name = if cfg!(target_os = "windows") {
-        "cljrs-aot-harness.exe"
-    } else {
-        "cljrs-aot-harness"
-    };
-    let built = harness_dir.join("target/release").join(bin_name);
-    std::fs::copy(&built, out_path)?;
+/// Name of the temporary harness package / bin target generated for AOT link.
+const AOT_HARNESS_BIN: &str = "cljrs-aot-harness";
 
-    // Keep the harness directory for debugging
-    eprintln!("[aot] harness directory kept at {}", harness_dir.display());
+/// Select the harness executable from cargo `--message-format=json` NDJSON.
+///
+/// Cargo may place binaries under `target/release`, a custom `CARGO_TARGET_DIR`,
+/// or a target-triple subdir. The last matching `compiler-artifact` message for
+/// bin `cljrs-aot-harness` with a non-null `executable` is authoritative.
+fn harness_bin_from_cargo_stdout(stdout: &str) -> AotResult<PathBuf> {
+    let mut last: Option<PathBuf> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(path) = compiler_artifact_bin_executable(line, AOT_HARNESS_BIN) {
+            last = Some(path);
+        }
+    }
+    last.ok_or_else(|| {
+        AotError::Link(format!(
+            "cargo build produced no compiler-artifact executable for bin `{AOT_HARNESS_BIN}` \
+             (expected via --message-format=json; handles CARGO_TARGET_DIR / triple layouts)"
+        ))
+    })
+}
 
-    Ok(())
+/// Parse one cargo JSON message line.
+///
+/// Returns `Some(executable)` only for a `compiler-artifact` whose target is
+/// bin `bin_name` and whose `executable` field is a non-empty string.
+fn compiler_artifact_bin_executable(line: &str, bin_name: &str) -> Option<PathBuf> {
+    let msg: serde_json::Value = serde_json::from_str(line).ok()?;
+    if msg.get("reason")?.as_str()? != "compiler-artifact" {
+        return None;
+    }
+    let target = msg.get("target")?;
+    if target.get("name")?.as_str()? != bin_name {
+        return None;
+    }
+    let kinds = target.get("kind")?.as_array()?;
+    let is_bin = kinds.iter().any(|k| k.as_str() == Some("bin"));
+    if !is_bin {
+        return None;
+    }
+    let exe = msg.get("executable")?.as_str()?;
+    if exe.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(exe))
 }
 
 /// How the generated harness depends on the clojurust runtime crates.
@@ -2592,5 +2633,54 @@ mod tests {
         {
             assert_eq!(v, env!("CARGO_PKG_VERSION"));
         }
+    }
+
+    #[test]
+    fn harness_bin_picks_last_matching_compiler_artifact() {
+        let stdout = r#"
+{"reason":"compiler-artifact","package_id":"lib 0.1.0","target":{"kind":["lib"],"name":"other","src_path":"/x"},"executable":null}
+{"reason":"compiler-artifact","package_id":"cljrs-aot-harness 0.1.0","target":{"kind":["bin"],"name":"cljrs-aot-harness","src_path":"/h"},"executable":"/tmp/first/target/release/cljrs-aot-harness"}
+{"reason":"build-finished","success":true}
+{"reason":"compiler-artifact","package_id":"cljrs-aot-harness 0.1.0","target":{"kind":["bin"],"crate_types":["bin"],"name":"cljrs-aot-harness","src_path":"/h"},"executable":"/custom/CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/cljrs-aot-harness","filenames":["/custom/CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/cljrs-aot-harness"]}
+"#;
+        let path = harness_bin_from_cargo_stdout(stdout).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/custom/CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/cljrs-aot-harness"
+            )
+        );
+    }
+
+    #[test]
+    fn harness_bin_ignores_wrong_name_non_bin_and_null_executable() {
+        let stdout = r#"
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other-bin"},"executable":"/tmp/other"}
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"cljrs-aot-harness"},"executable":"/tmp/lib.rlib"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"cljrs-aot-harness"},"executable":null}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"cljrs-aot-harness"},"executable":""}
+{"reason":"not-an-artifact","target":{"kind":["bin"],"name":"cljrs-aot-harness"},"executable":"/tmp/nope"}
+"#;
+        let err = harness_bin_from_cargo_stdout(stdout).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cljrs-aot-harness"),
+            "error should mention missing harness bin, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn harness_bin_errors_on_empty_stdout() {
+        let err = harness_bin_from_cargo_stdout("").unwrap_err();
+        assert!(matches!(err, AotError::Link(_)));
+    }
+
+    #[test]
+    fn compiler_artifact_helper_accepts_bin_with_executable() {
+        let line = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"cljrs-aot-harness"},"executable":"/out/cljrs-aot-harness"}"#;
+        assert_eq!(
+            compiler_artifact_bin_executable(line, AOT_HARNESS_BIN),
+            Some(PathBuf::from("/out/cljrs-aot-harness"))
+        );
     }
 }

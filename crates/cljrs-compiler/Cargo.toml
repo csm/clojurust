@@ -37,6 +37,8 @@ target-lexicon     = { workspace = true }
 
 wasm-encoder       = "0.244"
 
+serde_json         = "1"
+
 [dev-dependencies]
 tempfile = "3"
 wasmparser = "0.244"
