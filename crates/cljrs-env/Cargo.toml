@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-env"
-version = "0.1.0"
+version = "0.1.244"
 edition = "2024"
 description = "Deprecated re-export shim for cljrs-runtime::env"
 license.workspace = true
