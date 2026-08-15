@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-eval"
-version = "0.1.0"
+version = "0.1.246"
 edition = "2024"
 description = "Deprecated re-export shim for cljrs-runtime::tiered"
 license.workspace = true
