@@ -65,12 +65,12 @@ impl AsyncRuntime for AsyncRuntimeImpl {
                     let packed = pack_for_native(&args, n_fixed, is_variadic);
                     return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
                 }
-                // One-shot compile attempt (when the JIT installed a hook).
+                // One-shot compile attempt (when the runtime has a JIT).
                 if async_jit_enabled()
                     && mark_compile_attempted(id)
-                    && let Some(hook) = cljrs_env::async_hook::async_compile_hook()
+                    && let Some(backend) = env.globals.jit_backend()
                 {
-                    hook(&callee, orig_argc, &mut env);
+                    backend.compile_async_arity(&callee, orig_argc, &mut env);
                     if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
                         let packed = pack_for_native(&args, n_fixed, is_variadic);
                         return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));

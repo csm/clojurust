@@ -7,16 +7,23 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["wasm-aot"]
+# The WebAssembly AOT backend (`src/wasm/`) and its `compile_file_to_wasm`
+# driver.  On by default so `cljrs compile --target wasm` works out of the box;
+# `--no-default-features` drops the backend and the `wasm-encoder` dependency
+# for hosts that only ever produce native binaries.
+wasm-aot = ["dep:wasm-encoder"]
 aot_full_test = []
-no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-stdlib/no-gc"]
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-eval/no-gc", "cljrs-interp/no-gc", "cljrs-stdlib/no-gc", "cljrs-async/no-gc"]
 
 [dependencies]
 cljrs-runtime = { workspace = true }
+cljrs-logging  = { workspace = true }
+# The async runtime is an ABI dependency, not a product extension: codegen and
+# rt_abi implement `cljrs_async::state_machine`'s poll contract.  I/O,
+# networking, charset, and Base64 are extensions the *host* selects and are
+# deliberately absent here — see `src/extensions.rs`.
 cljrs-async    = { workspace = true }
-cljrs-io       = { workspace = true }
-cljrs-net      = { workspace = true }
-cljrs-charset  = { workspace = true }
-cljrs-base64   = { workspace = true }
 cljrs-builtins = { workspace = true }
 cljrs-deps     = { workspace = true }
 cljrs-types    = { workspace = true }
@@ -33,14 +40,22 @@ cranelift-codegen  = { workspace = true }
 cranelift-frontend = { workspace = true }
 cranelift-module   = { workspace = true }
 cranelift-object   = { workspace = true }
+cranelift-jit      = { workspace = true }
 cranelift-native   = { workspace = true }
 target-lexicon     = { workspace = true }
 
-wasm-encoder       = "0.244"
+wasm-encoder       = { version = "0.244", optional = true }
 
 serde_json         = "1"
 
 [dev-dependencies]
+# Extensions the end-to-end tests compile programs against, exactly as a host
+# would supply them.
+cljrs-io      = { workspace = true }
+cljrs-net     = { workspace = true }
+cljrs-charset = { workspace = true }
+cljrs-base64  = { workspace = true }
 tempfile = "3"
 wasmparser = "0.244"
 proptest = "1"
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

@@ -1,15 +1,34 @@
 //! JIT invocation counters and native function pointer cache.
 //!
 //! Bridges the Tier-1 IR interpreter and the background JIT compiler
-//! (`cljrs-jit`). Each JIT-eligible arity has one [`JitEntry`] keyed by
+//! ([`JitBackend`]). Each JIT-eligible arity has one [`JitEntry`] keyed by
 //! `ir_arity_id`. The flow is:
 //!
-//! 1. `record_call` bumps the invocation counter; crossing the threshold
-//!    triggers the enqueue hook (installed by `cljrs_jit::init`).
-//! 2. The background worker compiles the function and calls `store_native_fn`.
-//! 3. `get_native_fn` returns the pointer; `call_cljrs_fn` calls it.
-//! 4. `dispatch_jit_call` transmutes the raw pointer to the correct arity
+//! 1. [`JitState::record_call`] bumps the invocation counter; crossing the
+//!    threshold enqueues a compile on the runtime's backend.
+//! 2. The background worker compiles the function and calls
+//!    [`JitState::store_native_fn`] on the runtime that asked.
+//! 3. [`JitState::get_native_fn`] returns the pointer; `call_cljrs_fn` calls it.
+//! 4. [`dispatch_jit_call`] transmutes the raw pointer to the correct arity
 //!    and invokes the native code.
+//!
+//! ## What is per-runtime and what is not
+//!
+//! Every *table* here belongs to one runtime, reached through
+//! [`GlobalEnv::jit`](crate::env::env::GlobalEnv::jit): counters, argument
+//! profiles, published pointers, OSR entries, the specialization ban list,
+//! and the bootstrap watermark.  Two runtimes in one process never promote,
+//! deoptimize, or invalidate each other's code.
+//!
+//! Three things are deliberately process-wide, because they describe the
+//! process rather than a runtime:
+//!
+//! - **Thresholds** — configuration, set once from CLI flags or the
+//!   environment before any runtime is built.
+//! - **Active native frames** ([`push_jit_frame`], [`live_epochs`]) — a
+//!   *thread* can have frames from several runtimes on its stack, and code
+//!   reclamation asks "is any thread executing this module?".
+//! - **[`dispatch_jit_call`]** — a pure transmute-and-call.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -17,6 +36,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cljrs_ir::IrFunction;
 use cljrs_value::Value;
+
+use crate::tiered::backend::JitBackend;
+use crate::tiered::tiers::Tiers;
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
 
@@ -72,6 +94,35 @@ pub fn jit_threshold() -> u32 {
         .unwrap_or(DEFAULT_JIT_THRESHOLD)
 }
 
+/// Per-process override; 0 means "env var or default".
+static OSR_THRESHOLD_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_osr_threshold(t: u32) {
+    OSR_THRESHOLD_OVERRIDE.store(t, Ordering::Relaxed);
+}
+
+/// Back-edge count at which a loop header is considered hot.  Defaults to the
+/// invocation threshold ([`jit_threshold`]); override with
+/// `CLJRS_OSR_THRESHOLD` or [`set_osr_threshold`].
+pub fn osr_threshold() -> u32 {
+    let v = OSR_THRESHOLD_OVERRIDE.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    std::env::var("CLJRS_OSR_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(jit_threshold)
+}
+
+/// Entry-guard failures tolerated before a specialization is discarded.
+pub fn deopt_limit() -> u32 {
+    std::env::var("CLJRS_JIT_DEOPT_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10)
+}
+
 // ── Per-arity state ───────────────────────────────────────────────────────────
 
 pub struct JitEntry {
@@ -90,12 +141,13 @@ pub struct JitEntry {
     /// whether a frame executing this code is live at a safepoint.
     pub epoch: AtomicU64,
     /// Observed argument-type bitmasks, one byte per IR parameter (Phase
-    /// 10.6).  OR-accumulated by [`record_call`] until the compile is
-    /// queued; the JIT worker reads it to decide per-parameter
-    /// specializations ([`arg_type_profile`]).
+    /// 10.6).  OR-accumulated by [`JitState::record_call`] until the compile
+    /// is queued; the JIT worker reads it to decide per-parameter
+    /// specializations ([`JitState::arg_type_profile`]).
     pub arg_profile: Mutex<Vec<u8>>,
     /// Entry-guard failures of the published specialized code.  Crossing
-    /// [`deopt_limit`] discards the specialization (see [`record_deopt`]).
+    /// [`deopt_limit`] discards the specialization (see
+    /// [`JitState::record_deopt`]).
     pub deopt_count: AtomicU32,
 }
 
@@ -113,6 +165,10 @@ impl JitEntry {
     }
 }
 
+// SAFETY: all fields are atomics, inherently Send+Sync.
+unsafe impl Send for JitEntry {}
+unsafe impl Sync for JitEntry {}
+
 // ── Argument type profiles (Phase 10.6) ──────────────────────────────────────
 
 /// Profile bitmask bits: the observed type classes of one argument position.
@@ -127,431 +183,6 @@ fn profile_tag(v: &Value) -> u8 {
         Value::Long(_) => PROFILE_LONG,
         Value::Double(_) => PROFILE_DOUBLE,
         _ => PROFILE_OTHER,
-    }
-}
-
-/// Snapshot the accumulated argument-type profile for `arity_id` (one
-/// bitmask byte per IR parameter), if any calls were profiled.
-pub fn arg_type_profile(arity_id: u64) -> Option<Vec<u8>> {
-    let guard = JIT_TABLE.read().unwrap();
-    let entry = guard.as_ref()?.get(&arity_id)?.clone();
-    drop(guard);
-    let prof = entry.arg_profile.lock().unwrap();
-    if prof.is_empty() {
-        None
-    } else {
-        Some(prof.clone())
-    }
-}
-
-// SAFETY: all fields are atomics, inherently Send+Sync.
-unsafe impl Send for JitEntry {}
-unsafe impl Sync for JitEntry {}
-
-static JIT_TABLE: RwLock<Option<HashMap<u64, Arc<JitEntry>>>> = RwLock::new(None);
-
-fn get_or_create_entry(arity_id: u64) -> Arc<JitEntry> {
-    {
-        let guard = JIT_TABLE.read().unwrap();
-        if let Some(cache) = guard.as_ref()
-            && let Some(e) = cache.get(&arity_id)
-        {
-            return e.clone();
-        }
-    }
-    let mut guard = JIT_TABLE.write().unwrap();
-    let cache = guard.get_or_insert_with(HashMap::new);
-    cache
-        .entry(arity_id)
-        .or_insert_with(|| Arc::new(JitEntry::new()))
-        .clone()
-}
-
-/// Return the compiled native function pointer and its reclamation epoch for
-/// `arity_id`, if native code is currently published.
-///
-/// The caller **must** keep the returned `epoch` live (via [`push_jit_frame`])
-/// for the entire native call, so code unloading at a stop-the-world safepoint
-/// does not free the backing module while it executes.
-pub fn get_native_fn(arity_id: u64) -> Option<(*const (), u64)> {
-    let guard = JIT_TABLE.read().unwrap();
-    let cache = guard.as_ref()?;
-    let entry = cache.get(&arity_id)?;
-    let ptr = entry.native_fn_ptr.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        let epoch = entry.epoch.load(Ordering::Acquire);
-        Some((ptr as *const (), epoch))
-    }
-}
-
-/// Publish a compiled native function pointer and its reclamation epoch for
-/// `arity_id`.  Called by the JIT worker thread after successful compilation.
-///
-/// Stores the epoch before the pointer (release ordering) so that any reader
-/// that observes a non-null pointer also observes the matching epoch.
-pub fn store_native_fn(arity_id: u64, ptr: *const (), epoch: u64) {
-    let entry = get_or_create_entry(arity_id);
-    entry.epoch.store(epoch, Ordering::Release);
-    entry.native_fn_ptr.store(ptr as *mut (), Ordering::Release);
-}
-
-/// Clear the published native pointer for `arity_id` and return the epoch that
-/// was backing it, if any.
-///
-/// Called when a var holding this function is redefined: future dispatches fall
-/// back to the interpreter immediately (the pointer is nulled), and the
-/// returned epoch is handed to the code cache so the now-superseded module is
-/// reclaimed at the next safepoint once no frame is executing it.  Also drops
-/// the per-arity table entry, keeping `JIT_TABLE` bounded across a long REPL
-/// session of redefinitions.
-pub fn take_native_epoch(arity_id: u64) -> Option<u64> {
-    let mut guard = JIT_TABLE.write().unwrap();
-    let cache = guard.as_mut()?;
-    let entry = cache.remove(&arity_id)?;
-    let ptr = entry
-        .native_fn_ptr
-        .swap(std::ptr::null_mut(), Ordering::AcqRel);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(entry.epoch.load(Ordering::Acquire))
-    }
-}
-
-// ── Stale-epoch hook ──────────────────────────────────────────────────────────
-//
-// Routing staled module epochs to the JIT's code cache without depending on
-// `cljrs-jit`: the JIT installs `code_cache::mark_stale` here at init.
-
-type StaleEpochFn = fn(u64);
-static STALE_EPOCH_HOOK: OnceLock<StaleEpochFn> = OnceLock::new();
-
-/// Install the stale-epoch sink (installed once by `cljrs_jit::init`).
-pub fn set_stale_epoch_hook(f: StaleEpochFn) {
-    let _ = STALE_EPOCH_HOOK.set(f);
-}
-
-/// Null any published native code for `arity_id` (whole-function and OSR
-/// entries) and hand the backing epochs to the code cache for reclamation.
-///
-/// Used by cross-defn invalidation; a no-op when nothing was compiled or no
-/// JIT is linked.
-pub fn stale_native_code(arity_id: u64) {
-    let mut epochs = Vec::new();
-    if let Some(epoch) = take_native_epoch(arity_id) {
-        epochs.push(epoch);
-    }
-    epochs.extend(take_osr_epochs(arity_id));
-    if let Some(hook) = STALE_EPOCH_HOOK.get() {
-        for epoch in epochs {
-            hook(epoch);
-        }
-    }
-}
-
-// ── Enqueue hook ──────────────────────────────────────────────────────────────
-
-type EnqueueFn = Box<dyn Fn(u64, Arc<IrFunction>) + Send + Sync + 'static>;
-static ENQUEUE_HOOK: OnceLock<EnqueueFn> = OnceLock::new();
-
-/// Install the JIT compilation enqueue hook.
-///
-/// The hook is called (from the Tier-1 dispatch hot path) when a function
-/// crosses the invocation threshold.  It must be non-blocking: enqueue onto a
-/// channel and return immediately.  Called at most once per arity.
-///
-/// Installed once by `cljrs_jit::init`.
-pub fn set_enqueue_hook(f: impl Fn(u64, Arc<IrFunction>) + Send + Sync + 'static) {
-    let _ = ENQUEUE_HOOK.set(Box::new(f));
-}
-
-/// Record a call to `arity_id`.
-///
-/// Bumps the invocation counter and folds the call's argument types into the
-/// arity's type profile (`profile_args` are the positional call arguments
-/// matching the IR parameters; for a variadic arity the caller passes only
-/// the fixed prefix, leaving the rest-list parameter unprofiled — it is
-/// padded with [`PROFILE_OTHER`] so it can never be specialized).  When the
-/// counter crosses [`jit_threshold`] for the first time, submits a
-/// compilation request via the enqueue hook.
-///
-/// Called on every Tier-1 IR dispatch; must be cheap.  Profiling stops once
-/// the compile is queued, so the steady-state cost is one atomic increment,
-/// one compare, and one relaxed load.
-pub fn record_call(arity_id: u64, ir_func: Arc<IrFunction>, profile_args: &[Value]) {
-    let entry = get_or_create_entry(arity_id);
-    let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-    if !entry.compile_queued.load(Ordering::Relaxed) {
-        let n_params = ir_func.params.len();
-        let mut prof = entry.arg_profile.lock().unwrap();
-        if prof.len() < n_params {
-            prof.resize(n_params, 0);
-        }
-        for (i, slot) in prof.iter_mut().enumerate().take(n_params) {
-            *slot |= profile_args
-                .get(i)
-                .map(profile_tag)
-                .unwrap_or(PROFILE_OTHER);
-        }
-    }
-
-    if count < jit_threshold() {
-        return;
-    }
-    // Threshold crossed — enqueue exactly once.
-    if entry.compile_queued.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if let Some(hook) = ENQUEUE_HOOK.get() {
-        cljrs_logging::feat_debug!("jit", "enqueue arity_id={} (count={})", arity_id, count);
-        hook(arity_id, ir_func);
-    }
-}
-
-// ── Bootstrap watermark (Phase 10.7) ─────────────────────────────────────────
-//
-// Arity ids are minted from a monotonic counter, so a single snapshot taken
-// when the compiler becomes ready separates bootstrap-era definitions
-// (the clojure.core bootstrap) from everything defined afterwards (user code).  Background lowering excludes
-// bootstrap arities: they were never lowered under eager lowering either
-// (the compiler was not ready when they were defined), and some bootstrap
-// patterns are known to miscompile under the JIT (see TODO.md Phase 10.7
-// notes).  User code gets the warm tier; the bootstrap stays at tree-walk,
-// exactly as before.
-
-static BOOTSTRAP_ARITY_WATERMARK: AtomicU64 = AtomicU64::new(0);
-
-/// Record the bootstrap/user boundary: every arity id strictly below `w` was
-/// defined before the compiler became ready.  Called by
-/// the runtime builder with `crate::interp::arity::next_arity_id()`.
-pub fn set_bootstrap_arity_watermark(w: u64) {
-    BOOTSTRAP_ARITY_WATERMARK.store(w, Ordering::Relaxed);
-}
-
-/// Whether `arity_id` belongs to a bootstrap-era definition (excluded from
-/// background lowering).
-pub fn is_bootstrap_arity(arity_id: u64) -> bool {
-    arity_id < BOOTSTRAP_ARITY_WATERMARK.load(Ordering::Relaxed)
-}
-
-// ── Tier-0 warm-up accounting (Phase 10.7) ───────────────────────────────────
-//
-// Tree-walked calls (no cached IR yet) bump the same per-arity counter as
-// Tier-1 dispatch.  Crossing `ir_threshold` tells the dispatch seam to
-// snapshot the function (macroexpand on the calling thread — macros need the
-// interpreter) and enqueue background lowering.  Once the IR is published the
-// counter restarts so `jit_threshold` measures pure Tier-1 invocations and
-// the argument-type profile covers a full window.
-
-/// Record a Tier-0 (tree-walk) call to `arity_id`.
-///
-/// Returns `true` exactly when the warm threshold is crossed and no lowering
-/// request has been enqueued yet — the caller should snapshot the function
-/// and enqueue, then call [`mark_lower_queued`] on success.  Uses `>=` so a
-/// failed enqueue (full queue) retries on the next call.
-pub fn record_interp_call(arity_id: u64) -> bool {
-    let threshold = ir_threshold();
-    if threshold == u32::MAX {
-        return false;
-    }
-    let entry = get_or_create_entry(arity_id);
-    let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
-    count >= threshold && !entry.lower_queued.load(Ordering::Relaxed)
-}
-
-/// Whether a JIT compile has been queued (or published) for `arity_id`.
-/// Used by the cold-IR sweep: an arity with an in-flight compile still needs
-/// its IR as the deoptimization fallback.
-pub fn compile_queued(arity_id: u64) -> bool {
-    let guard = JIT_TABLE.read().unwrap();
-    guard
-        .as_ref()
-        .and_then(|c| c.get(&arity_id))
-        .is_some_and(|e| e.compile_queued.load(Ordering::Relaxed))
-}
-
-/// Whether a background lowering request is already queued for `arity_id`.
-/// Fast skip for the Tier-0 dispatch path.
-pub fn lower_queued(arity_id: u64) -> bool {
-    let guard = JIT_TABLE.read().unwrap();
-    guard
-        .as_ref()
-        .and_then(|c| c.get(&arity_id))
-        .is_some_and(|e| e.lower_queued.load(Ordering::Relaxed))
-}
-
-/// Mark that a background lowering request was accepted for `arity_id`.
-pub fn mark_lower_queued(arity_id: u64) {
-    let entry = get_or_create_entry(arity_id);
-    entry.lower_queued.store(true, Ordering::Relaxed);
-}
-
-/// Clear the lowering-queued flag for `arity_id`, re-arming the dispatch
-/// seam's enqueue.  Used by the lowering worker when it abandons an arity
-/// after exhausting its rebind-retry budget.
-pub fn clear_lower_queued(arity_id: u64) {
-    let guard = JIT_TABLE.read().unwrap();
-    if let Some(entry) = guard.as_ref().and_then(|c| c.get(&arity_id)) {
-        entry.lower_queued.store(false, Ordering::Relaxed);
-    }
-}
-
-/// Called by the lowering worker when it publishes IR for `arity_id`.
-///
-/// Restarts the invocation counter so the JIT threshold counts pure Tier-1
-/// calls (and the argument-type profile gets a full window).  Deliberately
-/// does *not* drop the `JitEntry`: `lower_queued` must stay set, or the
-/// Tier-0 path could re-enqueue between publish and the next IR dispatch.
-pub fn on_ir_published(arity_id: u64) {
-    let entry = get_or_create_entry(arity_id);
-    entry.invocation_count.store(0, Ordering::Relaxed);
-}
-
-/// Drop the `JitEntry` for `arity_id` iff it has no published native code and
-/// no queued compile.  Returns whether it was dropped.
-///
-/// Used by the cold-IR TTL sweep: dropping the entry clears the counters and
-/// `lower_queued`, so an evicted function can re-warm from zero.
-pub fn evict_entry_if_cold(arity_id: u64) -> bool {
-    let mut guard = JIT_TABLE.write().unwrap();
-    let Some(cache) = guard.as_mut() else {
-        return false;
-    };
-    let Some(entry) = cache.get(&arity_id) else {
-        return false;
-    };
-    if !entry.native_fn_ptr.load(Ordering::Acquire).is_null()
-        || entry.compile_queued.load(Ordering::Relaxed)
-    {
-        return false;
-    }
-    cache.remove(&arity_id);
-    true
-}
-
-/// Drop all OSR entries for `arity_id` and hand their published epochs to the
-/// code cache for reclamation.  Used by the cold-IR TTL sweep: OSR-entry code
-/// is only reachable from Tier-1 interpretation of the evicted IR, so it is
-/// equally cold.  A no-op when nothing was compiled or no JIT is linked.
-pub fn stale_osr_code(arity_id: u64) {
-    let epochs = take_osr_epochs(arity_id);
-    if let Some(hook) = STALE_EPOCH_HOOK.get() {
-        for epoch in epochs {
-            hook(epoch);
-        }
-    }
-}
-
-// ── Pending-exception hook ────────────────────────────────────────────────────
-//
-// Compiled code signals `(throw …)` by stashing the thrown value in a
-// thread-local owned by `cljrs-compiler`'s rt_abi (this crate cannot depend on
-// it).  `cljrs_jit::init` installs a taker so the dispatch seam can convert an
-// uncaught native throw back into `Err(EvalError::Thrown)` instead of silently
-// returning the nil sentinel (and leaking the stale pending slot into the next
-// `rt_try` on this thread).
-
-type PendingExceptionFn = fn() -> Option<Value>;
-static PENDING_EXCEPTION_HOOK: OnceLock<PendingExceptionFn> = OnceLock::new();
-
-/// Install the pending-exception taker (installed once by `cljrs_jit::init`).
-pub fn set_pending_exception_hook(f: PendingExceptionFn) {
-    let _ = PENDING_EXCEPTION_HOOK.set(f);
-}
-
-/// Take (and clear) the thread's pending exception, if any.
-///
-/// Called by the JIT-native and OSR dispatch seams immediately after native
-/// code returns.  Returns `None` when no hook is installed (no JIT linked).
-pub fn take_pending_exception() -> Option<Value> {
-    PENDING_EXCEPTION_HOOK.get().and_then(|f| f())
-}
-
-// ── Deoptimization (Phase 10.6) ──────────────────────────────────────────────
-//
-// A specialized compilation guards its parameter types at entry; on a guard
-// failure the native code returns a unique sentinel pointer (owned by
-// rt_abi, which cljrs-eval cannot depend on — hence the hook).  The dispatch
-// seam detects the sentinel, re-executes the call at Tier 1 (sound: guards
-// precede all side effects), and counts the failure.  Crossing the deopt
-// limit discards the specialized code and bans the arity from further
-// specialization, so the next compile is generic.
-
-type DeoptSentinelFn = fn() -> usize;
-static DEOPT_SENTINEL_HOOK: OnceLock<DeoptSentinelFn> = OnceLock::new();
-
-/// Install the deopt-sentinel address provider (installed once by
-/// `cljrs_jit::init`).
-pub fn set_deopt_sentinel_hook(f: DeoptSentinelFn) {
-    let _ = DEOPT_SENTINEL_HOOK.set(f);
-}
-
-/// Whether `result` is the deopt sentinel returned by a failed entry guard.
-#[inline]
-pub fn is_deopt_result(result: *const Value) -> bool {
-    DEOPT_SENTINEL_HOOK
-        .get()
-        .is_some_and(|f| f() == result as usize)
-}
-
-/// Arities whose specialization repeatedly deoptimized; the JIT worker
-/// compiles these generically (all parameters boxed).
-static SPEC_BANNED: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
-
-/// Whether `arity_id` may be compiled with type specializations.
-pub fn specialization_allowed(arity_id: u64) -> bool {
-    let guard = SPEC_BANNED.read().unwrap();
-    !guard.as_ref().is_some_and(|s| s.contains(&arity_id))
-}
-
-/// Entry-guard failures tolerated before a specialization is discarded.
-pub fn deopt_limit() -> u32 {
-    std::env::var("CLJRS_JIT_DEOPT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(10)
-}
-
-/// Record an entry-guard deopt for `arity_id`.
-///
-/// Once the failure count crosses [`deopt_limit`], the specialized code is
-/// unpublished (dispatch falls back to Tier 1 immediately), its module is
-/// handed to the code cache for reclamation, the arity is banned from
-/// re-specialization, and its invocation counter restarts so the generic
-/// recompile triggers through the ordinary hot path.
-pub fn record_deopt(arity_id: u64) {
-    let entry = get_or_create_entry(arity_id);
-    let failures = entry.deopt_count.fetch_add(1, Ordering::Relaxed) + 1;
-    cljrs_logging::feat_debug!(
-        "jit",
-        "deopt arity_id={} (failure #{} of {})",
-        arity_id,
-        failures,
-        deopt_limit()
-    );
-    if failures < deopt_limit() {
-        return;
-    }
-    {
-        let mut guard = SPEC_BANNED.write().unwrap();
-        guard.get_or_insert_with(HashSet::new).insert(arity_id);
-    }
-    // Unpublish + reclaim the specialized code.  `take_native_epoch` also
-    // drops the JitEntry, so the arity re-counts from zero and re-enqueues a
-    // (now generic) compile when hot again.
-    if let Some(epoch) = take_native_epoch(arity_id)
-        && let Some(hook) = STALE_EPOCH_HOOK.get()
-    {
-        cljrs_logging::feat_debug!(
-            "jit",
-            "specialization discarded arity_id={} epoch={}",
-            arity_id,
-            epoch
-        );
-        hook(epoch);
     }
 }
 
@@ -600,129 +231,495 @@ pub enum OsrPoll {
     Failed,
 }
 
-static OSR_TABLE: RwLock<Option<HashMap<(u64, u32), OsrState>>> = RwLock::new(None);
+// ── One runtime's JIT tables ─────────────────────────────────────────────────
 
-type OsrEnqueueFn = Box<dyn Fn(u64, u32, Arc<IrFunction>) + Send + Sync + 'static>;
-static OSR_ENQUEUE_HOOK: OnceLock<OsrEnqueueFn> = OnceLock::new();
-
-/// Install the OSR compilation enqueue hook (installed once by
-/// `cljrs_jit::init`).  Receives `(arity_id, header_block, function)`; must be
-/// non-blocking.
-pub fn set_osr_enqueue_hook(f: impl Fn(u64, u32, Arc<IrFunction>) + Send + Sync + 'static) {
-    let _ = OSR_ENQUEUE_HOOK.set(Box::new(f));
+/// The Tier-2 state of one runtime.
+///
+/// Owned by that runtime's [`Tiers`]; see the module docs for the split
+/// between this and the handful of genuinely process-wide items below.
+pub struct JitState {
+    entries: RwLock<HashMap<u64, Arc<JitEntry>>>,
+    osr: RwLock<HashMap<(u64, u32), OsrState>>,
+    /// Arities whose specialization repeatedly deoptimized; the JIT worker
+    /// compiles these generically (all parameters boxed).
+    spec_banned: RwLock<HashSet<u64>>,
+    /// Every arity id below this was defined before the compiler became ready
+    /// (the `clojure.core` bootstrap); see [`JitState::is_bootstrap_arity`].
+    bootstrap_watermark: AtomicU64,
+    /// The compiler attached to this runtime, if any.
+    backend: OnceLock<Arc<dyn JitBackend>>,
+    /// Handle to the enclosing tier state, so a compile request can name the
+    /// runtime the worker must publish into.
+    tiers: Weak<Tiers>,
 }
 
-/// Per-process override; 0 means "env var or default".
-static OSR_THRESHOLD_OVERRIDE: AtomicU32 = AtomicU32::new(0);
-
-pub fn set_osr_threshold(t: u32) {
-    OSR_THRESHOLD_OVERRIDE.store(t, Ordering::Relaxed);
-}
-
-/// Back-edge count at which a loop header is considered hot.  Defaults to the
-/// invocation threshold ([`jit_threshold`]); override with
-/// `CLJRS_OSR_THRESHOLD` or [`set_osr_threshold`].
-pub fn osr_threshold() -> u32 {
-    let v = OSR_THRESHOLD_OVERRIDE.load(Ordering::Relaxed);
-    if v != 0 {
-        return v;
+impl JitState {
+    pub(crate) fn new(tiers: Weak<Tiers>) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            osr: RwLock::new(HashMap::new()),
+            spec_banned: RwLock::new(HashSet::new()),
+            bootstrap_watermark: AtomicU64::new(0),
+            backend: OnceLock::new(),
+            tiers,
+        }
     }
-    std::env::var("CLJRS_OSR_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or_else(jit_threshold)
-}
 
-/// Poll for a compiled OSR entry for the loop at `header` in `arity_id`.
-pub fn osr_poll(arity_id: u64, header: u32) -> OsrPoll {
-    let guard = OSR_TABLE.read().unwrap();
-    match guard.as_ref().and_then(|m| m.get(&(arity_id, header))) {
-        None => OsrPoll::NotRequested,
-        Some(OsrState::Queued) => OsrPoll::Pending,
-        Some(OsrState::Ready(slot)) => OsrPoll::Ready(slot.clone()),
-        Some(OsrState::Failed) => OsrPoll::Failed,
+    // ── Backend ──────────────────────────────────────────────────────────────
+
+    /// Attach a JIT compiler to this runtime.  Idempotent: the first backend
+    /// installed wins, later attempts are ignored.
+    pub fn install_backend(&self, backend: Arc<dyn JitBackend>) {
+        let _ = self.backend.set(backend);
     }
-}
 
-/// Request OSR compilation for the loop at `header` in `arity_id`.  Idempotent:
-/// only the first request per `(arity_id, header)` enqueues (and pays for one
-/// `IrFunction` clone); with no JIT installed the entry is marked failed so
-/// callers stop polling.
-pub fn osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
-    let hook = OSR_ENQUEUE_HOOK.get();
-    {
-        let mut guard = OSR_TABLE.write().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        match map.entry((arity_id, header)) {
-            std::collections::hash_map::Entry::Occupied(_) => return,
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(if hook.is_some() {
-                    OsrState::Queued
-                } else {
-                    OsrState::Failed
-                });
+    /// This runtime's JIT compiler, or `None` when no JIT is linked or
+    /// installed (dispatch then stops at Tier 1).
+    pub fn backend(&self) -> Option<&Arc<dyn JitBackend>> {
+        self.backend.get()
+    }
+
+    // ── Entry table ──────────────────────────────────────────────────────────
+
+    fn entry(&self, arity_id: u64) -> Arc<JitEntry> {
+        {
+            let guard = self.entries.read().unwrap();
+            if let Some(e) = guard.get(&arity_id) {
+                return e.clone();
+            }
+        }
+        self.entries
+            .write()
+            .unwrap()
+            .entry(arity_id)
+            .or_insert_with(|| Arc::new(JitEntry::new()))
+            .clone()
+    }
+
+    /// Return the compiled native function pointer and its reclamation epoch
+    /// for `arity_id`, if native code is currently published.
+    ///
+    /// The caller **must** keep the returned `epoch` live (via
+    /// [`push_jit_frame`]) for the entire native call, so code unloading at a
+    /// stop-the-world safepoint does not free the backing module while it
+    /// executes.
+    pub fn get_native_fn(&self, arity_id: u64) -> Option<(*const (), u64)> {
+        let guard = self.entries.read().unwrap();
+        let entry = guard.get(&arity_id)?;
+        let ptr = entry.native_fn_ptr.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            let epoch = entry.epoch.load(Ordering::Acquire);
+            Some((ptr as *const (), epoch))
+        }
+    }
+
+    /// Publish a compiled native function pointer and its reclamation epoch
+    /// for `arity_id`.  Called by the JIT worker thread after successful
+    /// compilation.
+    ///
+    /// Stores the epoch before the pointer (release ordering) so that any
+    /// reader that observes a non-null pointer also observes the matching
+    /// epoch.
+    pub fn store_native_fn(&self, arity_id: u64, ptr: *const (), epoch: u64) {
+        let entry = self.entry(arity_id);
+        entry.epoch.store(epoch, Ordering::Release);
+        entry.native_fn_ptr.store(ptr as *mut (), Ordering::Release);
+    }
+
+    /// Clear the published native pointer for `arity_id` and return the epoch
+    /// that was backing it, if any.
+    ///
+    /// Called when a var holding this function is redefined: future dispatches
+    /// fall back to the interpreter immediately (the pointer is nulled), and
+    /// the returned epoch is handed to the code cache so the now-superseded
+    /// module is reclaimed at the next safepoint once no frame is executing
+    /// it.  Also drops the per-arity table entry, keeping the table bounded
+    /// across a long REPL session of redefinitions.
+    pub fn take_native_epoch(&self, arity_id: u64) -> Option<u64> {
+        let entry = self.entries.write().unwrap().remove(&arity_id)?;
+        let ptr = entry
+            .native_fn_ptr
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(entry.epoch.load(Ordering::Acquire))
+        }
+    }
+
+    /// Null any published native code for `arity_id` (whole-function and OSR
+    /// entries) and hand the backing epochs to the code cache for reclamation.
+    ///
+    /// Used by cross-defn invalidation and by the var-rebind hook; a no-op
+    /// when nothing was compiled or no JIT is installed.
+    pub fn stale_native_code(&self, arity_id: u64) {
+        let mut epochs = Vec::new();
+        if let Some(epoch) = self.take_native_epoch(arity_id) {
+            epochs.push(epoch);
+        }
+        epochs.extend(self.take_osr_epochs(arity_id));
+        if let Some(backend) = self.backend() {
+            for epoch in epochs {
+                backend.mark_stale(epoch);
             }
         }
     }
-    if let Some(hook) = hook {
-        cljrs_logging::feat_debug!(
-            "jit",
-            "osr enqueue arity_id={} header=bb{}",
-            arity_id,
-            header
-        );
-        hook(arity_id, header, Arc::new(ir_func.clone()));
-    }
-}
 
-/// Publish a compiled OSR entry.  Called by the JIT worker thread.
-pub fn store_osr_fn(
-    arity_id: u64,
-    header: u32,
-    ptr: *const (),
-    epoch: u64,
-    live_ins: Vec<cljrs_ir::VarId>,
-) {
-    let mut guard = OSR_TABLE.write().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(
-        (arity_id, header),
-        OsrState::Ready(OsrSlot {
-            fn_ptr: ptr,
-            epoch,
-            live_ins: live_ins.into(),
-        }),
-    );
-}
-
-/// Record that OSR compilation for `(arity_id, header)` declined or failed, so
-/// interpreters stop polling and the loop stays at Tier 1.
-pub fn mark_osr_failed(arity_id: u64, header: u32) {
-    let mut guard = OSR_TABLE.write().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert((arity_id, header), OsrState::Failed);
-}
-
-/// Drop all OSR entries for `arity_id` (the owning var was rebound), returning
-/// the epochs of published code so the caller can hand them to the code cache
-/// for reclamation once no frame executes them.
-pub fn take_osr_epochs(arity_id: u64) -> Vec<u64> {
-    let mut guard = OSR_TABLE.write().unwrap();
-    let Some(map) = guard.as_mut() else {
-        return Vec::new();
-    };
-    let keys: Vec<(u64, u32)> = map
-        .keys()
-        .filter(|(a, _)| *a == arity_id)
-        .copied()
-        .collect();
-    let mut epochs = Vec::new();
-    for key in keys {
-        if let Some(OsrState::Ready(slot)) = map.remove(&key) {
-            epochs.push(slot.epoch);
+    /// Snapshot the accumulated argument-type profile for `arity_id` (one
+    /// bitmask byte per IR parameter), if any calls were profiled.
+    pub fn arg_type_profile(&self, arity_id: u64) -> Option<Vec<u8>> {
+        let entry = self.entries.read().unwrap().get(&arity_id)?.clone();
+        let prof = entry.arg_profile.lock().unwrap();
+        if prof.is_empty() {
+            None
+        } else {
+            Some(prof.clone())
         }
     }
-    epochs
+
+    /// Record a call to `arity_id`.
+    ///
+    /// Bumps the invocation counter and folds the call's argument types into
+    /// the arity's type profile (`profile_args` are the positional call
+    /// arguments matching the IR parameters; for a variadic arity the caller
+    /// passes only the fixed prefix, leaving the rest-list parameter
+    /// unprofiled — it is padded with [`PROFILE_OTHER`] so it can never be
+    /// specialized).  When the counter crosses [`jit_threshold`] for the first
+    /// time, submits a compilation request to this runtime's backend.
+    ///
+    /// Called on every Tier-1 IR dispatch; must be cheap.  Profiling stops
+    /// once the compile is queued, so the steady-state cost is one atomic
+    /// increment, one compare, and one relaxed load.
+    pub fn record_call(&self, arity_id: u64, ir_func: Arc<IrFunction>, profile_args: &[Value]) {
+        let entry = self.entry(arity_id);
+        let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if !entry.compile_queued.load(Ordering::Relaxed) {
+            let n_params = ir_func.params.len();
+            let mut prof = entry.arg_profile.lock().unwrap();
+            if prof.len() < n_params {
+                prof.resize(n_params, 0);
+            }
+            for (i, slot) in prof.iter_mut().enumerate().take(n_params) {
+                *slot |= profile_args
+                    .get(i)
+                    .map(profile_tag)
+                    .unwrap_or(PROFILE_OTHER);
+            }
+        }
+
+        if count < jit_threshold() {
+            return;
+        }
+        // Threshold crossed — enqueue exactly once.
+        if entry.compile_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(backend) = self.backend() {
+            cljrs_logging::feat_debug!("jit", "enqueue arity_id={} (count={})", arity_id, count);
+            if !backend.enqueue_function(self.tiers.clone(), arity_id, ir_func) {
+                // The bounded queue is full.  Re-arm the trigger so the next
+                // Tier-1 call retries rather than pinning this arity forever.
+                entry.compile_queued.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Record a Tier-0 (tree-walk) call to `arity_id`.
+    ///
+    /// Returns `true` exactly when the warm threshold is crossed and no
+    /// lowering request has been enqueued yet — the caller should snapshot the
+    /// function and enqueue, then call [`Self::mark_lower_queued`] on success.
+    /// Uses `>=` so a failed enqueue (full queue) retries on the next call.
+    pub fn record_interp_call(&self, arity_id: u64) -> bool {
+        let threshold = ir_threshold();
+        if threshold == u32::MAX {
+            return false;
+        }
+        let entry = self.entry(arity_id);
+        let count = entry.invocation_count.fetch_add(1, Ordering::Relaxed) + 1;
+        count >= threshold && !entry.lower_queued.load(Ordering::Relaxed)
+    }
+
+    /// Whether a JIT compile has been queued (or published) for `arity_id`.
+    /// Used by the cold-IR sweep: an arity with an in-flight compile still
+    /// needs its IR as the deoptimization fallback.
+    pub fn compile_queued(&self, arity_id: u64) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .get(&arity_id)
+            .is_some_and(|e| e.compile_queued.load(Ordering::Relaxed))
+    }
+
+    /// Whether the cold-IR sweep must keep `arity_id`'s IR: native code is
+    /// published (the IR is its deoptimization fallback) or a compile is in
+    /// flight (the worker will need it).
+    pub fn pins_ir(&self, arity_id: u64) -> bool {
+        self.get_native_fn(arity_id).is_some() || self.compile_queued(arity_id)
+    }
+
+    /// Whether a background lowering request is already queued for `arity_id`.
+    /// Fast skip for the Tier-0 dispatch path.
+    pub fn lower_queued(&self, arity_id: u64) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .get(&arity_id)
+            .is_some_and(|e| e.lower_queued.load(Ordering::Relaxed))
+    }
+
+    /// Mark that a background lowering request was accepted for `arity_id`.
+    pub fn mark_lower_queued(&self, arity_id: u64) {
+        self.entry(arity_id)
+            .lower_queued
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the lowering-queued flag for `arity_id`, re-arming the dispatch
+    /// seam's enqueue.  Used by the lowering worker when it abandons an arity
+    /// after exhausting its rebind-retry budget.
+    pub fn clear_lower_queued(&self, arity_id: u64) {
+        if let Some(entry) = self.entries.read().unwrap().get(&arity_id) {
+            entry.lower_queued.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Called by the lowering worker when it publishes IR for `arity_id`.
+    ///
+    /// Restarts the invocation counter so the JIT threshold counts pure Tier-1
+    /// calls (and the argument-type profile gets a full window).  Deliberately
+    /// does *not* drop the `JitEntry`: `lower_queued` must stay set, or the
+    /// Tier-0 path could re-enqueue between publish and the next IR dispatch.
+    pub fn on_ir_published(&self, arity_id: u64) {
+        self.entry(arity_id)
+            .invocation_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// Drop the `JitEntry` for `arity_id` iff it has no published native code
+    /// and no queued compile.  Returns whether it was dropped.
+    ///
+    /// Used by the cold-IR TTL sweep: dropping the entry clears the counters
+    /// and `lower_queued`, so an evicted function can re-warm from zero.
+    pub fn evict_entry_if_cold(&self, arity_id: u64) -> bool {
+        let mut guard = self.entries.write().unwrap();
+        let Some(entry) = guard.get(&arity_id) else {
+            return false;
+        };
+        if !entry.native_fn_ptr.load(Ordering::Acquire).is_null()
+            || entry.compile_queued.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        guard.remove(&arity_id);
+        true
+    }
+
+    // ── Bootstrap watermark (Phase 10.7) ─────────────────────────────────────
+    //
+    // Arity ids are minted from a monotonic counter, so a single snapshot
+    // taken when the compiler becomes ready separates bootstrap-era
+    // definitions (the clojure.core bootstrap) from everything defined
+    // afterwards (user code).  Background lowering excludes bootstrap
+    // arities: they were never lowered under eager lowering either (the
+    // compiler was not ready when they were defined), and some bootstrap
+    // patterns are known to miscompile under the JIT (see TODO.md Phase 10.7
+    // notes).  User code gets the warm tier; the bootstrap stays at
+    // tree-walk, exactly as before.
+
+    /// Record the bootstrap/user boundary: every arity id strictly below `w`
+    /// was defined before this runtime's compiler became ready.  Called by the
+    /// runtime builder with `crate::interp::arity::next_arity_id()`.
+    pub fn set_bootstrap_watermark(&self, w: u64) {
+        self.bootstrap_watermark.store(w, Ordering::Relaxed);
+    }
+
+    /// Whether `arity_id` belongs to a bootstrap-era definition (excluded from
+    /// background lowering).
+    pub fn is_bootstrap_arity(&self, arity_id: u64) -> bool {
+        arity_id < self.bootstrap_watermark.load(Ordering::Relaxed)
+    }
+
+    // ── Deoptimization (Phase 10.6) ──────────────────────────────────────────
+    //
+    // A specialized compilation guards its parameter types at entry; on a
+    // guard failure the native code returns a unique sentinel pointer owned by
+    // the compiler.  The dispatch seam detects the sentinel, re-executes the
+    // call at Tier 1 (sound: guards precede all side effects), and counts the
+    // failure.  Crossing the deopt limit discards the specialized code and
+    // bans the arity from further specialization, so the next compile is
+    // generic.
+
+    /// Whether `result` is the deopt sentinel returned by a failed entry
+    /// guard.  Always false without a backend: nothing produced native code.
+    #[inline]
+    pub fn is_deopt_result(&self, result: *const Value) -> bool {
+        self.backend()
+            .is_some_and(|b| b.deopt_sentinel() == result as usize)
+    }
+
+    /// Take (and clear) the thread's pending exception, if any.
+    ///
+    /// Called by the JIT-native and OSR dispatch seams immediately after
+    /// native code returns.  Returns `None` when no JIT is installed.
+    pub fn take_pending_exception(&self) -> Option<Value> {
+        self.backend().and_then(|b| b.take_pending_exception())
+    }
+
+    /// Whether `arity_id` may be compiled with type specializations.
+    pub fn specialization_allowed(&self, arity_id: u64) -> bool {
+        !self.spec_banned.read().unwrap().contains(&arity_id)
+    }
+
+    /// Record an entry-guard deopt for `arity_id`.
+    ///
+    /// Once the failure count crosses [`deopt_limit`], the specialized code is
+    /// unpublished (dispatch falls back to Tier 1 immediately), its module is
+    /// handed to the code cache for reclamation, the arity is banned from
+    /// re-specialization, and its invocation counter restarts so the generic
+    /// recompile triggers through the ordinary hot path.
+    pub fn record_deopt(&self, arity_id: u64) {
+        let entry = self.entry(arity_id);
+        let failures = entry.deopt_count.fetch_add(1, Ordering::Relaxed) + 1;
+        cljrs_logging::feat_debug!(
+            "jit",
+            "deopt arity_id={} (failure #{} of {})",
+            arity_id,
+            failures,
+            deopt_limit()
+        );
+        if failures < deopt_limit() {
+            return;
+        }
+        self.spec_banned.write().unwrap().insert(arity_id);
+        // Unpublish + reclaim the specialized code.  `take_native_epoch` also
+        // drops the JitEntry, so the arity re-counts from zero and re-enqueues
+        // a (now generic) compile when hot again.
+        if let Some(epoch) = self.take_native_epoch(arity_id)
+            && let Some(backend) = self.backend()
+        {
+            cljrs_logging::feat_debug!(
+                "jit",
+                "specialization discarded arity_id={} epoch={}",
+                arity_id,
+                epoch
+            );
+            backend.mark_stale(epoch);
+        }
+    }
+
+    // ── OSR table ────────────────────────────────────────────────────────────
+
+    /// Poll for a compiled OSR entry for the loop at `header` in `arity_id`.
+    pub fn osr_poll(&self, arity_id: u64, header: u32) -> OsrPoll {
+        match self.osr.read().unwrap().get(&(arity_id, header)) {
+            None => OsrPoll::NotRequested,
+            Some(OsrState::Queued) => OsrPoll::Pending,
+            Some(OsrState::Ready(slot)) => OsrPoll::Ready(slot.clone()),
+            Some(OsrState::Failed) => OsrPoll::Failed,
+        }
+    }
+
+    /// Request OSR compilation for the loop at `header` in `arity_id`.
+    /// Idempotent: only the first request per `(arity_id, header)` enqueues
+    /// (and pays for one `IrFunction` clone); with no JIT installed the entry
+    /// is marked failed so callers stop polling.
+    pub fn osr_request(&self, arity_id: u64, header: u32, ir_func: &IrFunction) {
+        let has_backend = self.backend().is_some();
+        {
+            let mut guard = self.osr.write().unwrap();
+            match guard.entry((arity_id, header)) {
+                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(if has_backend {
+                        OsrState::Queued
+                    } else {
+                        OsrState::Failed
+                    });
+                }
+            }
+        }
+        if let Some(backend) = self.backend() {
+            cljrs_logging::feat_debug!(
+                "jit",
+                "osr enqueue arity_id={} header=bb{}",
+                arity_id,
+                header
+            );
+            if !backend.enqueue_osr(
+                self.tiers.clone(),
+                arity_id,
+                header,
+                Arc::new(ir_func.clone()),
+            ) {
+                self.osr.write().unwrap().remove(&(arity_id, header));
+            }
+        }
+    }
+
+    /// Publish a compiled OSR entry.  Called by the JIT worker thread.
+    pub fn store_osr_fn(
+        &self,
+        arity_id: u64,
+        header: u32,
+        ptr: *const (),
+        epoch: u64,
+        live_ins: Vec<cljrs_ir::VarId>,
+    ) {
+        self.osr.write().unwrap().insert(
+            (arity_id, header),
+            OsrState::Ready(OsrSlot {
+                fn_ptr: ptr,
+                epoch,
+                live_ins: live_ins.into(),
+            }),
+        );
+    }
+
+    /// Record that OSR compilation for `(arity_id, header)` declined or
+    /// failed, so interpreters stop polling and the loop stays at Tier 1.
+    pub fn mark_osr_failed(&self, arity_id: u64, header: u32) {
+        self.osr
+            .write()
+            .unwrap()
+            .insert((arity_id, header), OsrState::Failed);
+    }
+
+    /// Drop all OSR entries for `arity_id` (the owning var was rebound),
+    /// returning the epochs of published code so the caller can hand them to
+    /// the code cache for reclamation once no frame executes them.
+    pub fn take_osr_epochs(&self, arity_id: u64) -> Vec<u64> {
+        let mut guard = self.osr.write().unwrap();
+        let keys: Vec<(u64, u32)> = guard
+            .keys()
+            .filter(|(a, _)| *a == arity_id)
+            .copied()
+            .collect();
+        let mut epochs = Vec::new();
+        for key in keys {
+            if let Some(OsrState::Ready(slot)) = guard.remove(&key) {
+                epochs.push(slot.epoch);
+            }
+        }
+        epochs
+    }
+
+    /// Drop all OSR entries for `arity_id` and hand their published epochs to
+    /// the code cache for reclamation.  Used by the cold-IR TTL sweep:
+    /// OSR-entry code is only reachable from Tier-1 interpretation of the
+    /// evicted IR, so it is equally cold.  A no-op when nothing was compiled
+    /// or no JIT is installed.
+    pub fn stale_osr_code(&self, arity_id: u64) {
+        let epochs = self.take_osr_epochs(arity_id);
+        if let Some(backend) = self.backend() {
+            for epoch in epochs {
+                backend.mark_stale(epoch);
+            }
+        }
+    }
 }
 
 // ── Active JIT frame tracking (for code unloading) ──────────────────────────────
@@ -730,6 +727,10 @@ pub fn take_osr_epochs(arity_id: u64) -> Vec<u64> {
 // Code unloading (Phase 10.2) frees a superseded `JITModule` only once no frame
 // is executing its code.  We track that precisely: each in-flight native call
 // pushes its code epoch onto a per-thread stack for the duration of the call.
+//
+// This is per *thread*, not per runtime: one thread can have native frames from
+// several runtimes on its stack, and the question reclamation asks is "is any
+// thread executing this module?".
 //
 // At a stop-the-world safepoint every mutator thread is parked, so the reclaimer
 // can read all threads' stacks to compute the set of epochs that must not be
@@ -790,7 +791,7 @@ pub fn push_jit_frame(epoch: u64) -> JitFrameGuard {
 
 /// The epoch of the innermost native frame on this thread, if any.
 ///
-/// Used by the closure-escape hook: a closure value materialized by
+/// Used by the closure-escape path: a closure value materialized by
 /// `rt_make_fn*` captures a raw pointer into the module of the currently
 /// executing native code, so that module (this epoch) must be pinned against
 /// reclamation.
@@ -921,18 +922,36 @@ pub unsafe fn dispatch_jit_call(fn_ptr: *const (), args: &[*const Value]) -> *co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiered::tiers::Tiers;
+
+    fn jit() -> Arc<Tiers> {
+        Tiers::new(0xF000_0000)
+    }
 
     #[test]
     fn epoch_round_trips_through_store_get_take() {
-        // Use sentinel ids/ptrs unlikely to collide with concurrent tests.
+        let t = jit();
         let id = 0xF100_0001;
         let ptr = 0x1234usize as *const ();
-        store_native_fn(id, ptr, 777);
-        assert_eq!(get_native_fn(id), Some((ptr, 777)));
+        t.jit().store_native_fn(id, ptr, 777);
+        assert_eq!(t.jit().get_native_fn(id), Some((ptr, 777)));
         // take returns the epoch and removes the entry.
-        assert_eq!(take_native_epoch(id), Some(777));
-        assert_eq!(get_native_fn(id), None);
-        assert_eq!(take_native_epoch(id), None);
+        assert_eq!(t.jit().take_native_epoch(id), Some(777));
+        assert_eq!(t.jit().get_native_fn(id), None);
+        assert_eq!(t.jit().take_native_epoch(id), None);
+    }
+
+    /// Published native code belongs to the runtime that compiled it: a
+    /// second runtime asked about the same arity id sees nothing.
+    #[test]
+    fn native_code_is_per_runtime() {
+        let a = jit();
+        let b = jit();
+        let id = 0xF100_0002;
+        a.jit().store_native_fn(id, 0x1234usize as *const (), 778);
+        assert!(a.jit().get_native_fn(id).is_some());
+        assert!(b.jit().get_native_fn(id).is_none());
+        assert!(!b.jit().compile_queued(id));
     }
 
     #[test]
@@ -948,13 +967,15 @@ mod tests {
     #[test]
     fn osr_slot_round_trips_and_rebind_takes_epochs() {
         use cljrs_ir::VarId;
+        let t = jit();
         let id = 0xF200_0001;
         // Unpublished header polls as NotRequested.
-        assert!(matches!(osr_poll(id, 1), OsrPoll::NotRequested));
+        assert!(matches!(t.jit().osr_poll(id, 1), OsrPoll::NotRequested));
 
         let ptr = 0x5678usize as *const ();
-        store_osr_fn(id, 1, ptr, 901, vec![VarId(3), VarId(4)]);
-        match osr_poll(id, 1) {
+        t.jit()
+            .store_osr_fn(id, 1, ptr, 901, vec![VarId(3), VarId(4)]);
+        match t.jit().osr_poll(id, 1) {
             OsrPoll::Ready(slot) => {
                 assert_eq!(slot.fn_ptr, ptr);
                 assert_eq!(slot.epoch, 901);
@@ -964,26 +985,28 @@ mod tests {
         }
 
         // A second loop in the same arity that failed to compile.
-        mark_osr_failed(id, 7);
-        assert!(matches!(osr_poll(id, 7), OsrPoll::Failed));
+        t.jit().mark_osr_failed(id, 7);
+        assert!(matches!(t.jit().osr_poll(id, 7), OsrPoll::Failed));
 
         // Rebinding the var takes only the published epochs and clears all
         // entries for the arity.
-        let epochs = take_osr_epochs(id);
+        let epochs = t.jit().take_osr_epochs(id);
         assert_eq!(epochs, vec![901]);
-        assert!(matches!(osr_poll(id, 1), OsrPoll::NotRequested));
-        assert!(matches!(osr_poll(id, 7), OsrPoll::NotRequested));
+        assert!(matches!(t.jit().osr_poll(id, 1), OsrPoll::NotRequested));
+        assert!(matches!(t.jit().osr_poll(id, 7), OsrPoll::NotRequested));
     }
 
     #[test]
-    fn osr_request_without_hook_marks_failed() {
-        // The test binary never installs the OSR enqueue hook (that's
-        // cljrs_jit::init's job), so a request must immediately fail closed
-        // rather than leave interpreters polling forever.
+    fn osr_request_without_backend_marks_failed() {
+        // No backend is installed on a bare `Tiers` (that is
+        // `cljrs_compiler::jit::install`'s job), so a request must
+        // immediately fail closed rather than leave interpreters polling
+        // forever.
+        let t = jit();
         let id = 0xF200_0002;
         let ir = IrFunction::new(None, None);
-        osr_request(id, 2, &ir);
-        assert!(matches!(osr_poll(id, 2), OsrPoll::Failed));
+        t.jit().osr_request(id, 2, &ir);
+        assert!(matches!(t.jit().osr_poll(id, 2), OsrPoll::Failed));
     }
 
     #[test]
@@ -991,52 +1014,54 @@ mod tests {
         // Single test for the whole lifecycle: set_ir_threshold is a
         // process-global override, so splitting this across tests would race.
         set_ir_threshold(3);
+        let t = jit();
         let id = 0xF300_0001;
 
         // Below the threshold: no trigger.
-        assert!(!record_interp_call(id));
-        assert!(!record_interp_call(id));
+        assert!(!t.jit().record_interp_call(id));
+        assert!(!t.jit().record_interp_call(id));
         // Crossing (and staying past) the threshold triggers until a request
         // is accepted — a full queue must be able to retry.
-        assert!(record_interp_call(id));
-        assert!(record_interp_call(id));
+        assert!(t.jit().record_interp_call(id));
+        assert!(t.jit().record_interp_call(id));
 
         // Once queued, the trigger disarms.
-        mark_lower_queued(id);
-        assert!(lower_queued(id));
-        assert!(!record_interp_call(id));
+        t.jit().mark_lower_queued(id);
+        assert!(t.jit().lower_queued(id));
+        assert!(!t.jit().record_interp_call(id));
 
         // Worker abandons the request: re-armed.
-        clear_lower_queued(id);
-        assert!(record_interp_call(id));
+        t.jit().clear_lower_queued(id);
+        assert!(t.jit().record_interp_call(id));
 
         // Worker publishes: counter restarts so jit_threshold measures pure
         // Tier-1 calls; the (re-armed) trigger stays quiet below threshold.
-        on_ir_published(id);
-        assert!(!record_interp_call(id));
+        t.jit().on_ir_published(id);
+        assert!(!t.jit().record_interp_call(id));
 
         // u32::MAX disables background lowering entirely.
         set_ir_threshold(u32::MAX);
         for _ in 0..10 {
-            assert!(!record_interp_call(id));
+            assert!(!t.jit().record_interp_call(id));
         }
         set_ir_threshold(0); // restore env/default for other tests
     }
 
     #[test]
     fn evict_entry_if_cold_respects_native_and_queued() {
+        let t = jit();
         let id = 0xF300_0002;
-        mark_lower_queued(id); // creates the entry
+        t.jit().mark_lower_queued(id); // creates the entry
         // Published native code pins the entry.
-        store_native_fn(id, 0x4242usize as *const (), 555);
-        assert!(!evict_entry_if_cold(id));
-        assert_eq!(take_native_epoch(id), Some(555)); // also drops the entry
+        t.jit().store_native_fn(id, 0x4242usize as *const (), 555);
+        assert!(!t.jit().evict_entry_if_cold(id));
+        assert_eq!(t.jit().take_native_epoch(id), Some(555)); // also drops the entry
 
         // A fresh cold entry is evictable.
-        mark_lower_queued(id);
-        assert!(evict_entry_if_cold(id));
-        assert!(!lower_queued(id));
-        assert!(!evict_entry_if_cold(id)); // already gone
+        t.jit().mark_lower_queued(id);
+        assert!(t.jit().evict_entry_if_cold(id));
+        assert!(!t.jit().lower_queued(id));
+        assert!(!t.jit().evict_entry_if_cold(id)); // already gone
     }
 
     #[test]

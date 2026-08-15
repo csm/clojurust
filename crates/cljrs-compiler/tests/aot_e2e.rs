@@ -13,6 +13,8 @@
 use std::process::Command;
 use std::sync::Mutex;
 
+mod common;
+
 /// Serialize all AOT tests — each invokes `cargo build` in a harness project,
 /// and concurrent cargo processes fight over the crates.io index lock.
 #[allow(dead_code)]
@@ -37,16 +39,7 @@ fn compile_and_run(name: &str, source: &str) -> String {
         .spawn({
             let src = src_path.clone();
             let bin = bin_path.clone();
-            move || {
-                cljrs_compiler::aot::compile_file(
-                    &src,
-                    &bin,
-                    &[],
-                    None,
-                    false,
-                    cljrs_compiler::aot::OpacityPolicy::Report,
-                )
-            }
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &common::session(vec![]))
         })
         .unwrap()
         .join()
@@ -1209,16 +1202,7 @@ fn compile_and_run_multi(name: &str, main_source: &str, deps: &[(&str, &str)]) -
             let src = src_path.clone();
             let bin = bin_path.clone();
             let src_dir = src_dir.clone();
-            move || {
-                cljrs_compiler::aot::compile_file(
-                    &src,
-                    &bin,
-                    &[src_dir],
-                    None,
-                    false,
-                    cljrs_compiler::aot::OpacityPolicy::Report,
-                )
-            }
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &common::session(vec![src_dir]))
         })
         .unwrap()
         .join()
@@ -2491,16 +2475,7 @@ fn test_versioned_snapshot_is_self_contained() {
             let src = src_path.clone();
             let bin = bin_path.clone();
             let src_dir = src_dir.clone();
-            move || {
-                cljrs_compiler::aot::compile_file(
-                    &src,
-                    &bin,
-                    &[src_dir],
-                    None,
-                    false,
-                    cljrs_compiler::aot::OpacityPolicy::Report,
-                )
-            }
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &common::session(vec![src_dir]))
         })
         .unwrap()
         .join()
@@ -2598,16 +2573,7 @@ fn test_versioned_bad_commit_fails_at_compile_time() {
             let src = src_path.clone();
             let bin = bin_path.clone();
             let src_dir = src_dir.clone();
-            move || {
-                cljrs_compiler::aot::compile_file(
-                    &src,
-                    &bin,
-                    &[src_dir],
-                    None,
-                    false,
-                    cljrs_compiler::aot::OpacityPolicy::Report,
-                )
-            }
+            move || cljrs_compiler::aot::compile_file(&src, &bin, &common::session(vec![src_dir]))
         })
         .unwrap()
         .join()
@@ -2694,10 +2660,8 @@ fn compile_gated(name: &str, source: &str) -> cljrs_compiler::aot::AotResult<()>
                 cljrs_compiler::aot::compile_file(
                     &src,
                     &bin,
-                    &[],
-                    None,
-                    false,
-                    cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled,
+                    &common::session(vec![])
+                        .opacity(cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled),
                 )
             }
         })
@@ -2741,6 +2705,7 @@ fn require_fully_compiled_accepts_plain_defn() {
     .expect("a defn-only program must pass the gate");
 }
 
+#[cfg(feature = "wasm-aot")]
 #[test]
 fn require_fully_compiled_rejects_an_incomplete_wasm_module() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2756,8 +2721,7 @@ fn require_fully_compiled_rejects_an_incomplete_wasm_module() {
     let err = cljrs_compiler::aot::compile_file_to_wasm(
         &src,
         &out,
-        &[],
-        cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled,
+        &common::session(vec![]).opacity(cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled),
     )
     .expect_err("defmulti/defmethod cannot be lowered, so the module is incomplete");
     let msg = format!("{err}");
@@ -2765,6 +2729,7 @@ fn require_fully_compiled_rejects_an_incomplete_wasm_module() {
     assert!(!out.exists(), "nothing may be written on rejection");
 }
 
+#[cfg(feature = "wasm-aot")]
 #[test]
 fn require_fully_compiled_accepts_a_complete_wasm_module() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2774,8 +2739,7 @@ fn require_fully_compiled_accepts_a_complete_wasm_module() {
     cljrs_compiler::aot::compile_file_to_wasm(
         &src,
         &out,
-        &[],
-        cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled,
+        &common::session(vec![]).opacity(cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled),
     )
     .expect("a plain defn lowers, so nothing is omitted");
     assert!(out.exists());

@@ -753,7 +753,6 @@ dependencies = [
  "cljrs-io",
  "cljrs-ir",
  "cljrs-ir-viz",
- "cljrs-jit",
  "cljrs-logging",
  "cljrs-lsp",
  "cljrs-net",
@@ -855,6 +854,7 @@ dependencies = [
  "cljrs-interp",
  "cljrs-io",
  "cljrs-ir",
+ "cljrs-logging",
  "cljrs-net",
  "cljrs-reader",
  "cljrs-runtime",
@@ -863,6 +863,7 @@ dependencies = [
  "cljrs-value",
  "cranelift-codegen",
  "cranelift-frontend",
+ "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
@@ -870,6 +871,7 @@ dependencies = [
  "serde_json",
  "target-lexicon",
  "tempfile",
+ "tokio",
  "wasm-encoder",
  "wasmparser",
 ]
@@ -1007,31 +1009,6 @@ dependencies = [
  "cljrs-ir",
  "cljrs-reader",
  "cljrs-types",
-]
-
-[[package]]
-name = "cljrs-jit"
-version = "0.1.0"
-dependencies = [
- "cljrs-async",
- "cljrs-compiler",
- "cljrs-env",
- "cljrs-eval",
- "cljrs-gc",
- "cljrs-interp",
- "cljrs-ir",
- "cljrs-logging",
- "cljrs-reader",
- "cljrs-runtime",
- "cljrs-stdlib",
- "cljrs-value",
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

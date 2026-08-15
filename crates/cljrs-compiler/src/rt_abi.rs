@@ -1847,24 +1847,23 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
 
 // ── Function/closure construction ───────────────────────────────────────────
 
-/// Hook invoked whenever `rt_make_fn*` wraps a compiled function pointer into
-/// a closure value.
+/// Called whenever `rt_make_fn*` wraps a compiled function pointer into a
+/// closure value.
 ///
-/// Installed by `cljrs_jit::init`: the resulting `Value::NativeFunction` lives
-/// on the GC heap and captures a raw pointer into the executing JIT module, so
-/// the JIT pins that module's reclamation epoch.  Unset under AOT, where code
-/// is never unloaded.
-static CLOSURE_ESCAPE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
-
-/// Install the closure-escape hook (installed once by `cljrs_jit::init`).
-pub fn set_closure_escape_hook(f: fn()) {
-    let _ = CLOSURE_ESCAPE_HOOK.set(f);
-}
-
+/// The resulting `Value::NativeFunction` lives on the GC heap and captures a
+/// raw pointer into the *executing* module, which the active-frame scan cannot
+/// see — so the JIT code cache pins that module's reclamation epoch and never
+/// unloads it (a bounded leak, but sound).
+///
+/// Under AOT there is no executing JIT frame, so `current_jit_epoch` is `None`
+/// and this is a no-op: AOT code is never unloaded in the first place.  Before
+/// the JIT moved into this package the call had to be routed through a
+/// process-global `OnceLock` hook; [`crate::jit::code_cache`] is now a sibling
+/// module, so it is a direct call.
 #[inline]
 fn notify_closure_escape() {
-    if let Some(hook) = CLOSURE_ESCAPE_HOOK.get() {
-        hook();
+    if let Some(epoch) = cljrs_runtime::tiered::jit_state::current_jit_epoch() {
+        crate::jit::code_cache::pin_epoch(epoch);
     }
 }
 
@@ -3722,12 +3721,13 @@ fn take_pending_exception() -> Option<*const Value> {
 
 /// Take (and clear) the thread's pending exception as an owned `Value`.
 ///
-/// Called by the JIT-native dispatch seam (via the hook installed by
-/// `cljrs_jit::init`) right after native code returns, so an uncaught throw
-/// propagates to the interpreter caller instead of being swallowed as nil.
-/// The caller must invoke this while the JIT frame's alloc roots are still
-/// live (the pending pointer targets a Value boxed inside the native frame).
-pub fn take_pending_exception_value() -> Option<Value> {
+/// Reached from the JIT-native dispatch seam through
+/// [`JitBackend::take_pending_exception`](cljrs_runtime::tiered::backend::JitBackend::take_pending_exception)
+/// right after native code returns, so an uncaught throw propagates to the
+/// interpreter caller instead of being swallowed as nil.  The caller must
+/// invoke this while the JIT frame's alloc roots are still live (the pending
+/// pointer targets a Value boxed inside the native frame).
+pub(crate) fn take_pending_exception_value() -> Option<Value> {
     take_pending_exception().map(|ptr| unsafe { val_ref(ptr) }.clone())
 }
 
@@ -4455,8 +4455,8 @@ pub extern "C" fn rt_gas_charge(cost: u64) -> u8 {
 /// that compiled code can never produce as an ordinary result.
 ///
 /// A specialized function whose entry type guard fails returns this pointer;
-/// the dispatch seam (`call_jit_native`, cljrs-eval/src/apply.rs) compares
-/// the raw result address against it and, on a match, re-executes the call at
+/// the dispatch seam (`call_jit_native`, cljrs-runtime/src/tiered/apply.rs)
+/// compares the raw result address against it and, on a match, re-executes at
 /// Tier 1.  The sentinel is `Box::leak`ed — deliberately **not** a GC heap
 /// object — so it can never be swept, reused, or aliased by a real result.
 fn deopt_sentinel() -> *const Value {
@@ -4465,8 +4465,9 @@ fn deopt_sentinel() -> *const Value {
 }
 
 /// Address of the deopt sentinel, for the dispatch seam's pointer compare
-/// (installed into `cljrs_eval::jit_state` as a hook by `cljrs_jit::init`).
-pub fn deopt_sentinel_addr() -> usize {
+/// (reached through
+/// [`JitBackend::deopt_sentinel`](cljrs_runtime::tiered::backend::JitBackend::deopt_sentinel)).
+pub(crate) fn deopt_sentinel_addr() -> usize {
     deopt_sentinel() as usize
 }
 

@@ -18,13 +18,13 @@ This plan does not remove the tree-walking interpreter, JIT, AOT compiler, no-GC
 | 1. Remove obsolete debris | Complete | `cljrs-ir-prebuild` folded into `cljrs::commands::ir`; 34 packages → 33 |
 | 2. Create the merged runtime | Complete | `cljrs-env`/`-builtins`/`-interp`/`-eval` merged into `cljrs-runtime`; the four remain as re-export shims until Stage 6 |
 | 3. Simplify runtime state | Complete | One builder, one dispatch path; per-instance IR cache |
-| 4. Merge JIT and compiler packages | Not started | |
+| 4. Merge JIT and compiler packages | Complete | `cljrs-jit` folded into `cljrs-compiler::jit`; 33 packages → 32 |
 | 5. Consolidate project and CLI tools | Not started | |
 | 6. Remove compatibility packages | Not started | |
 
-Package count: 34 at baseline, 33 now, approximately 23 at target. Stage 2 does
+Package count: 34 at baseline, 32 now, approximately 23 at target. Stage 2 does
 not change the count — it moves four packages' code into `cljrs-runtime` and
-leaves them as re-export shims; Stage 6 deletes the shims and takes 33 → 29.
+leaves them as re-export shims; Stage 6 deletes the shims and takes 32 → 28.
 
 ### Corrections found while measuring the baseline
 
@@ -141,7 +141,7 @@ When none of these rules apply, use a Rust module.
 | `cljrs-runtime` | Replace stub and expand | Environment, builtins, tree walker, tiered evaluation, and runtime construction. |
 | `cljrs-stdlib` | Keep | Embedded standard-library sources and native namespace helpers. |
 | `cljrs-ir` | Keep | IR model, Rust lowering, optimization, OSR transforms, and serialization. |
-| `cljrs-compiler` | Expand | Shared code generation, JIT, native AOT, and optional WASM AOT. |
+| `cljrs-compiler` | Expand | Shared code generation, JIT, native AOT, and optional WASM AOT. *(Stage 4: done.)* |
 
 ### Interop and extension packages
 
@@ -169,11 +169,11 @@ When none of these rules apply, use a Rust module.
 
 | Current package | Target location |
 |---|---|
-| `cljrs-env` | `cljrs-runtime::env` |
-| `cljrs-builtins` | `cljrs-runtime::builtins` |
-| `cljrs-interp` | `cljrs-runtime::interp` |
-| `cljrs-eval` | `cljrs-runtime::tiered` |
-| `cljrs-jit` | `cljrs-compiler::jit` |
+| `cljrs-env` | `cljrs-runtime::env` *(done, stage 2)* |
+| `cljrs-builtins` | `cljrs-runtime::builtins` *(done, stage 2)* |
+| `cljrs-interp` | `cljrs-runtime::interp` *(done, stage 2)* |
+| `cljrs-eval` | `cljrs-runtime::tiered` *(done, stage 2)* |
+| `cljrs-jit` | `cljrs-compiler::jit` *(done, stage 4)* |
 | `cljrs-ir-viz` | Internal `cljrs::commands::ir` module |
 | `cljrs-ir-prebuild` | Internal CLI module or removal |
 | `cljrs-deps` | `cljrs-project::config` |
@@ -597,6 +597,130 @@ Validation gate:
 - Native AOT end-to-end tests pass.
 - A compiler build without network extensions does not compile `cljrs-net`.
 - The compiler does not select optional product extensions.
+
+#### Stage 4 outcome
+
+**1, 8. `cljrs-jit` is gone.** Its five source files moved with `git mv` into
+`crates/cljrs-compiler/src/jit/` and its three integration tests into
+`crates/cljrs-compiler/tests/jit_*.rs`. The only edits to moved code were path
+rewrites. It satisfied no boundary rule: the shared codegen was its only
+reason to be separate, and the CLI was its only consumer. Package count
+33 → 32.
+
+**2, 3. One compiler, shared surfaces.** JIT and AOT now run the same
+`typeinfer::infer` (the JIT seeds it from Tier-1 argument profiles, AOT and
+wasm from static `^long`/`^double` hints), the same `codegen::Compiler<M>`,
+and the same `rt_abi`. The pieces that existed only to cross the old package
+boundary stopped being public API — `codegen::new_compiler_from_module`,
+`rt_abi::take_pending_exception_value`, `rt_abi::deopt_sentinel_addr` are
+`pub(crate)` — and one hook disappeared outright: `rt_abi`'s closure-escape
+`OnceLock` is now a direct call to `jit::code_cache::pin_epoch`, with the same
+`current_jit_epoch()` guard that made it a no-op under AOT.
+
+**4. The JIT state belongs to the runtime.** This is the item Stage 3
+explicitly deferred, along with the weak `IrCache` index it left behind.
+
+`Tiers` (`cljrs_runtime::tiered::tiers`) holds one runtime's `IrCache` plus
+`JitState` and is owned by its `GlobalEnv`. `jit_state`'s four process-global
+tables — `JIT_TABLE`, `OSR_TABLE`, `SPEC_BANNED`, `BOOTSTRAP_ARITY_WATERMARK` —
+became fields of `JitState`, and its free functions became methods reached
+through `GlobalEnv::jit()` on paths that already had the environment in hand.
+Two runtimes in one process no longer share invocation counters,
+argument-type profiles, published native pointers, OSR entries, or
+specialization bans.
+
+Six process-global `OnceLock` hooks collapsed into one per-runtime handle.
+`JitBackend` (`tiered::backend`) carries enqueue, OSR enqueue, mark-stale,
+pending-exception, deopt-sentinel, and async-compile; `cljrs_compiler::jit::install(&runtime)`
+attaches it. It stays a trait — `cljrs-compiler` depends on `cljrs-runtime`,
+so the call can only go one way — but it is now a stateless seam for an
+optional system, which is exactly the kind of hook the plan keeps. The
+async-JIT hook in `env::async_hook` is gone: the dispatcher asks the calling
+runtime for its backend.
+
+Background workers carry `Weak<Tiers>` in their requests instead of an arity
+id resolved through a process-wide index (`GlobalEnv` owns `GcPtr`s and is not
+`Send`; `Tiers` is). A compile or lowering publishes into exactly the runtime
+that asked, or is discarded when that runtime was dropped meanwhile. Stage 3's
+weak `IrCache` index is deleted.
+
+Three things stay process-wide, because they describe the process rather than
+a runtime, and the outcome is stated here so a later reader does not mistake
+them for leftovers:
+
+- **Thresholds** (`CLJRS_JIT_THRESHOLD`, `--ir-threshold`, …) — configuration,
+  set before any runtime is built.
+- **Active native frames** (`push_jit_frame` / `live_epochs`) — a *thread* can
+  hold frames from several runtimes, and reclamation asks whether any thread
+  is executing a module.
+- **The code cache and compile worker** — one executable-memory budget, one
+  background thread.
+
+`Var::bind`'s rebind notification is also still global: it sees two values and
+no runtime at all. It iterates the live tier states; arity ids come from one
+process-wide counter, so that is exact for the owning runtime and a no-op in
+every other.
+
+**5, 6. The compiler does not choose extensions.** `aot.rs` named the optional
+packages directly — five `init(&globals)` calls at two compile-time sites, a
+hard-coded registration block in the generated harness, and the packages in
+`cljrs-compiler`'s own `[dependencies]`. `extensions::Extension` now describes
+one extension generically (the package to add to the harness, a function
+pointer to register it at compile time, and the path to that same function for
+generated source), and `CompileSession` carries the set with the source paths,
+`:rust` crate config, signature policy, and opacity policy. `compile_file` and
+`compile_file_to_wasm` take `&CompileSession`.
+
+`cljrs::extensions::default_set()` builds the set from the CLI's own Cargo
+features, so `cljrs run` and `cljrs compile` of one program see the same
+namespaces — default CLI behavior preserved, which the plan's risk section
+asks for. `cljrs-io`, `cljrs-net`, `cljrs-charset`, and `cljrs-base64` left
+the compiler's dependencies (dev-dependencies now; the end-to-end tests supply
+them the way a host does). `cljrs-async` stays, because `codegen` and `rt_abi`
+implement its state-machine poll ABI — the compiler's own contract, not a
+product choice — and `cljrs-async` stays in the harness's base crate list for
+the same reason. Registering `clojure.core.async` is still the host's call.
+
+**7. `wasm-aot`.** The WebAssembly backend, `compile_file_to_wasm`, and the
+`wasm-encoder` dependency sit behind a default-on feature;
+`--no-default-features` builds a native-only compiler.
+
+Gate results:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace` | 1153 passed, 0 failed, 26 ignored, 148 targets (Stage 3: 1148/23/150 — three targets fewer because `cljrs-jit`'s tests moved into `cljrs-compiler`, and the new tests are the per-runtime isolation cases) |
+| JIT promotion | pass — `osr_promotion::single_call_hot_loop_promotes_mid_run`, `background_lowering::tiering_up_mid_run_keeps_results_correct`, `jit_specialization::monomorphic_long_profile_unboxes_hot_loop_arithmetic` |
+| Deoptimization | pass — `jit_specialization::type_guard_violation_deopts_to_tier1_with_correct_results` |
+| Native AOT end-to-end | pass — `cljrs-compiler`'s `aot_e2e` (harness generation now emits host-supplied extension registration), plus the Clojure suite compiled and run below |
+| A compiler build without network extensions does not compile `cljrs-net` | pass — `cargo tree -p cljrs-compiler --edges normal` contains no `cljrs-net`, `cljrs-io`, `cljrs-charset`, or `cljrs-base64` |
+| The compiler does not select optional product extensions | pass — no `cljrs_*::init` call remains in `aot.rs`; the harness emits `ExtensionSet::harness_init_code()` |
+| Clojure test suite (interpreter) | 240 namespaces, 308 tests, 5,486 assertions, 0 failures |
+| Clojure test suite (AOT) | same: 308 tests, 5,486 assertions, 0 failures |
+| `cljrs eval`, `run samples/graph.cljrs`, `run samples/core_async.cljrs`, `compile -o life-sample samples/life.cljrs` + run, `compile --target wasm` | pass |
+| `cljrs ir build --ns clojure.core` | 151 functions lowered, 2 unsupported — identical to stages 1, 2, and 3 |
+
+`no-gc` — **green for the whole workspace**, the first time in this plan:
+
+| Package | Baseline | After Stage 3 | Now |
+|---|---|---|---|
+| `cljrs-gc`, `cljrs-value`, `cljrs-runtime`, `cljrs-env`, `cljrs-builtins`, `cljrs-interp`, `cljrs-eval`, `cljrs-tx`, `cljrs-stdlib`, `cljrs-compiler`, `cljrs` | mixed | pass | pass |
+| `cljrs-async` | fail | fail | **pass** |
+
+Baseline defect 1 was the last one standing: `cljrs-async` had no `no-gc`
+feature at all, so a `no-gc` workspace build stopped at the CLI. It now
+forwards `no-gc` to its runtime dependencies, `cljrs-compiler` forwards to it,
+and `cljrs` forwards weakly (`cljrs-async?/no-gc`) since its async dependency
+is optional.
+
+Deferred by design: `defn_registry`'s cross-defn registry stays keyed by
+`GlobalEnv::id` in process-global maps rather than moving into `Tiers`. It is
+correct as it stands (Stage 3 replaced its address-derived keys with counter
+ids), it is not JIT state, and moving it would have enlarged an already large
+stage. `cljrs-compiler`'s `cljrs-env`/`cljrs-interp`/`cljrs-eval` imports are
+still the Stage 2 shims; Stage 6 rewrites them.
 
 ### Stage 5: Consolidate project and CLI tools
 

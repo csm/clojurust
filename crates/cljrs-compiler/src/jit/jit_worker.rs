@@ -1,38 +1,47 @@
 //! Background JIT compilation worker thread.
 //!
 //! Receives compilation requests on a channel, compiles each `IrFunction` via
-//! Cranelift, hands the module to the epoch-tagged [`code_cache`](crate::code_cache),
-//! and atomically publishes the resulting function pointer + epoch via
-//! `cljrs_eval::jit_state`.
+//! Cranelift, hands the module to the epoch-tagged [`code_cache`](crate::jit::code_cache),
+//! and atomically publishes the resulting function pointer + epoch into the
+//! JIT state of the runtime that asked.
+//!
+//! Every request carries a `Weak<Tiers>` naming that runtime: `GlobalEnv` is
+//! not `Send`, its tier state is, so the worker can publish precisely rather
+//! than into a process-global table — and a runtime dropped while its request
+//! sat in the queue simply gets its compile discarded.
 //!
 //! Two request kinds arrive on the same channel:
 //! - whole-function compiles (invocation counter crossed the threshold), and
 //! - OSR-entry compiles (a loop back-edge counter crossed the threshold —
 //!   Phase 10.4).  The worker builds the OSR-entry variant with
 //!   [`cljrs_ir::osr::build_osr_function`], compiles it, and publishes
-//!   `(fn_ptr, epoch, live-ins)` via `jit_state::store_osr_fn`; failures are
-//!   recorded via `jit_state::mark_osr_failed` so interpreters stop polling.
+//!   `(fn_ptr, epoch, live-ins)` via `JitState::store_osr_fn`; failures are
+//!   recorded via `JitState::mark_osr_failed` so interpreters stop polling.
 //!
 //! Ownership of every compiled `JITModule` lives in the `code_cache`, which
 //! reclaims superseded modules at stop-the-world safepoints (Phase 10.2).
 
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Weak};
 
-use cljrs_compiler::typeinfer::Repr;
+use crate::typeinfer::Repr;
 use cljrs_ir::{BlockId, IrFunction};
+use cljrs_runtime::tiered::jit_state::{JitState, PROFILE_DOUBLE, PROFILE_LONG};
+use cljrs_runtime::tiered::tiers::Tiers;
 
-use crate::code_cache;
-use crate::jit_compiler::compile_jit;
+use crate::jit::code_cache;
+use crate::jit::jit_compiler::compile_jit;
 
 pub(crate) enum CompileRequest {
     /// Whole-function compile for a hot arity.
     Function {
+        tiers: Weak<Tiers>,
         arity_id: u64,
         ir_func: Arc<IrFunction>,
     },
     /// OSR-entry compile for a hot loop header inside `arity_id`.
     Osr {
+        tiers: Weak<Tiers>,
         arity_id: u64,
         header: u32,
         ir_func: Arc<IrFunction>,
@@ -49,15 +58,28 @@ pub(crate) fn start_worker(rx: Receiver<CompileRequest>) {
 
 fn worker_loop(rx: Receiver<CompileRequest>) {
     for req in &rx {
+        // A runtime dropped while its request waited has nothing to publish
+        // into; the compile is simply skipped.
         match req {
-            CompileRequest::Function { arity_id, ir_func } => {
-                compile_function_request(arity_id, &ir_func)
+            CompileRequest::Function {
+                tiers,
+                arity_id,
+                ir_func,
+            } => {
+                if let Some(tiers) = tiers.upgrade() {
+                    compile_function_request(&tiers, arity_id, &ir_func);
+                }
             }
             CompileRequest::Osr {
+                tiers,
                 arity_id,
                 header,
                 ir_func,
-            } => compile_osr_request(arity_id, header, &ir_func),
+            } => {
+                if let Some(tiers) = tiers.upgrade() {
+                    compile_osr_request(tiers.jit(), arity_id, header, &ir_func);
+                }
+            }
         }
     }
 }
@@ -67,22 +89,22 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
 /// exactly one scalar class (`PROFILE_LONG` or `PROFILE_DOUBLE`); anything
 /// mixed or non-scalar stays boxed.  Returns `None` when nothing would be
 /// specialized — the compile is then fully generic and needs no guards.
-fn specs_from_profile(arity_id: u64, ir_func: &IrFunction) -> Option<Vec<Repr>> {
+fn specs_from_profile(jit: &JitState, arity_id: u64, ir_func: &IrFunction) -> Option<Vec<Repr>> {
     if std::env::var("CLJRS_JIT_NO_SPEC").is_ok() {
         return None;
     }
-    if !cljrs_eval::jit_state::specialization_allowed(arity_id) {
+    if !jit.specialization_allowed(arity_id) {
         return None;
     }
-    let profile = cljrs_eval::jit_state::arg_type_profile(arity_id)?;
+    let profile = jit.arg_type_profile(arity_id)?;
     if profile.len() != ir_func.params.len() {
         return None;
     }
     let specs: Vec<Repr> = profile
         .iter()
         .map(|&bits| match bits {
-            cljrs_eval::jit_state::PROFILE_LONG => Repr::Long,
-            cljrs_eval::jit_state::PROFILE_DOUBLE => Repr::Double,
+            PROFILE_LONG => Repr::Long,
+            PROFILE_DOUBLE => Repr::Double,
             _ => Repr::Boxed,
         })
         .collect();
@@ -93,8 +115,8 @@ fn specs_from_profile(arity_id: u64, ir_func: &IrFunction) -> Option<Vec<Repr>> 
     }
 }
 
-fn compile_function_request(arity_id: u64, ir_func: &Arc<IrFunction>) {
-    let specs = specs_from_profile(arity_id, ir_func).unwrap_or_default();
+fn compile_function_request(tiers: &Arc<Tiers>, arity_id: u64, ir_func: &Arc<IrFunction>) {
+    let specs = specs_from_profile(tiers.jit(), arity_id, ir_func).unwrap_or_default();
     cljrs_logging::feat_debug!("jit", "compiling arity_id={} specs={:?}", arity_id, specs);
 
     // Isolate each compilation: a panic in codegen (e.g. an unsupported IR
@@ -127,7 +149,7 @@ fn compile_function_request(arity_id: u64, ir_func: &Arc<IrFunction>) {
             // a cold-IR eviction while we compiled means publishing would
             // resurrect stale code for a live arity id — mark the module
             // stale instead; it is reclaimed at the next STW safepoint.
-            let current = cljrs_eval::ir_cache::get_cached(arity_id);
+            let current = tiers.ir_cache().get(arity_id);
             if !current.is_some_and(|cur| Arc::ptr_eq(&cur, ir_func)) {
                 cljrs_logging::feat_debug!(
                     "jit",
@@ -147,7 +169,7 @@ fn compile_function_request(arity_id: u64, ir_func: &Arc<IrFunction>) {
             );
             // Atomically publish the function pointer + epoch so future
             // calls on mutator threads skip the interpreter.
-            cljrs_eval::jit_state::store_native_fn(arity_id, fn_ptr, epoch);
+            tiers.jit().store_native_fn(arity_id, fn_ptr, epoch);
         }
         Err(e) => {
             cljrs_logging::feat_debug!("jit", "compile error arity_id={}: {}", arity_id, e,);
@@ -156,7 +178,7 @@ fn compile_function_request(arity_id: u64, ir_func: &Arc<IrFunction>) {
     }
 }
 
-fn compile_osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
+fn compile_osr_request(jit: &JitState, arity_id: u64, header: u32, ir_func: &IrFunction) {
     cljrs_logging::feat_debug!(
         "jit",
         "osr compiling arity_id={} header=bb{}",
@@ -189,7 +211,7 @@ fn compile_osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
                 fn_ptr,
                 live_ins.len(),
             );
-            cljrs_eval::jit_state::store_osr_fn(arity_id, header, fn_ptr, epoch, live_ins);
+            jit.store_osr_fn(arity_id, header, fn_ptr, epoch, live_ins);
         }
         Ok(Err(e)) => {
             cljrs_logging::feat_debug!(
@@ -199,7 +221,7 @@ fn compile_osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
                 header,
                 e,
             );
-            cljrs_eval::jit_state::mark_osr_failed(arity_id, header);
+            jit.mark_osr_failed(arity_id, header);
         }
         Err(_) => {
             cljrs_logging::feat_debug!(
@@ -208,7 +230,7 @@ fn compile_osr_request(arity_id: u64, header: u32, ir_func: &IrFunction) {
                 arity_id,
                 header
             );
-            cljrs_eval::jit_state::mark_osr_failed(arity_id, header);
+            jit.mark_osr_failed(arity_id, header);
         }
     }
 }

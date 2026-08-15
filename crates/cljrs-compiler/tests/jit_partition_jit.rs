@@ -11,13 +11,13 @@ use cljrs_reader::Parser;
 use cljrs_value::Value;
 
 fn make_env() -> (std::sync::Arc<cljrs_env::env::GlobalEnv>, Env) {
-    cljrs_jit::init();
     let _mutator = cljrs_gc::register_mutator();
     let globals = {
         let runtime = cljrs_runtime::Runtime::builder()
             .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
             .build()
             .expect("runtime");
+        cljrs_compiler::jit::install(&runtime);
         cljrs_stdlib::install(&runtime);
         runtime.into_globals()
     };

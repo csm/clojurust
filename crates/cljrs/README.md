@@ -13,6 +13,9 @@ interactively exploring clojurust programs.
 src/
   main.rs           — CLI entry point: Clap structs, miette error hook, subcommand
                       dispatch, REPL loop, test harness, GC-stats reporter
+  extensions.rs     — `default_set()`: the runtime extensions this build ships,
+                      handed to the compiler for `cljrs compile` (the compiler
+                      backend does not choose them)
   commands/
     mod.rs          — module index for the internal command implementations
     ir.rs           — the `ir` subcommand: `IrCommands` enum, dispatch, bundle
@@ -209,7 +212,8 @@ cljrs deps status              # show cached vs missing deps
 | Feature             | Effect                                                                        |
 |---------------------|-------------------------------------------------------------------------------|
 | `async` (default **on**) | Pulls in `cljrs-async` and `cljrs-io` and builds the Tokio runtime that drives top-level async evaluation (see implementation notes). Without it, `^:async`/`core.async`/`clojure.rust.io.async` are unavailable and evaluation is purely synchronous. |
-| `no-gc` (default off) | Propagated to `cljrs-gc`/`cljrs-value`/`cljrs-eval`/`cljrs-compiler`/`cljrs-stdlib`/`cljrs-jit`.  Disables the tracing GC; only region-allocated and stack values are permitted.  Compiles fail (`AotError::NoGcBlacklist`) if the program contains allocations the optimizer can't lift onto regions. |
+| `net`, `charset`, `base64` (default **on**) | Network transports and protocols, charset codecs, Base64.  Each feature adds its package to both the interpreted runtime (`setup_globals`) and the compile-time extension set (`extensions::default_set`), so `cljrs run` and `cljrs compile` of the same program see the same namespaces. |
+| `no-gc` (default off) | Propagated to `cljrs-gc`/`cljrs-value`/`cljrs-eval`/`cljrs-compiler`/`cljrs-stdlib`.  Disables the tracing GC; only region-allocated and stack values are permitted.  Compiles fail (`AotError::NoGcBlacklist`) if the program contains allocations the optimizer can't lift onto regions. |
 | `enable-rustyline`  | Pulls in `rustyline` for a line-editing REPL.  Without it, `cljrs repl` falls back to a plain `BufRead` loop.                                                                                |
 
 Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.

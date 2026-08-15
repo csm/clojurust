@@ -15,7 +15,8 @@ no-gc = [
     "cljrs-eval/no-gc",
     "cljrs-compiler/no-gc",
     "cljrs-stdlib/no-gc",
-    "cljrs-jit/no-gc",
+    # Weak: only forwarded when the optional `async` feature pulls the package in.
+    "cljrs-async?/no-gc",
 ]
 enable-rustyline = ["rustyline"]
 async   = ["dep:cljrs-async", "dep:cljrs-io", "dep:tokio"]
@@ -43,7 +44,6 @@ cljrs-deps     = { workspace = true }
 cljrs-vcs      = { workspace = true, features = ["ssh"] }
 cljrs-lsp      = { workspace = true }
 cljrs-nrepl    = { workspace = true }
-cljrs-jit      = { workspace = true }
 cljrs-dylib    = { workspace = true }
 cljrs-ir       = { workspace = true }
 clap          = { workspace = true }

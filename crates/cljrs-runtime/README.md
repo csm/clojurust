@@ -93,7 +93,9 @@ src/
     lower.rs            — orchestrates the pure-Rust cljrs_ir::lower pipeline
     lower_worker.rs     — background IR-lowering worker thread ("cljrs-ir-lower")
     defn_registry.rs    — cross-defn IR registry and invalidation edges
-    jit_state.rs        — JIT counters, native-fn table, epochs, OSR slots
+    jit_state.rs        — JitState: per-runtime JIT counters, native-fn table, epochs, OSR slots
+    tiers.rs            — Tiers: one runtime's IrCache + JitState, and the index of live ones
+    backend.rs          — JitBackend: the seam a compiler installs on a runtime
 
 tests/
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
@@ -359,7 +361,7 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `gc_safepoint(env: &Env)` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
-- `set_stw_reclaim_hook(f)` — registers a stop-the-world reclaim hook; multiple hooks may be registered and each runs (in registration order) inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked.  Registrants: `cljrs-jit` frees superseded native code (Phase 10.2); the `tiered` lowering worker sweeps idle Tier-1 IR (Phase 10.7)
+- `set_stw_reclaim_hook(f)` — registers a stop-the-world reclaim hook; multiple hooks may be registered and each runs (in registration order) inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked.  Registrants: the compiler's JIT code cache frees superseded native code (Phase 10.2); the `tiered` lowering worker sweeps idle Tier-1 IR (Phase 10.7)
 
 Root tracing covers all namespaces (including immutable `ns@commit`
 namespaces) **and** the values in `GlobalEnv::version_cache`, so versioned
@@ -398,7 +400,7 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 
 ### `async_hook` submodule
 
-The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`). Also hosts the async-JIT compile hook: `set_async_compile_hook` / `async_compile_hook` (`fn(&Value, usize, &mut Env)`), installed by `cljrs-jit::init` and called by the async dispatcher to lower + compile + register a native poll function for a called `^:async` arity (a no-op when the JIT is absent).
+The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  Async-JIT activation is *not* here: the dispatcher reaches it through the calling runtime's own backend (`GlobalEnv::jit_backend()` → `JitBackend::compile_async_arity`), so a runtime without a JIT simply keeps tree-walking `^:async` bodies.
 
 ---
 
@@ -812,54 +814,116 @@ Tier 1 IR ──(jit_threshold, 1000 calls; counter restarts at IR publish)─�
   escape hatch for the known limitation that a long-running loop entered at
   Tier 0 cannot tier up mid-call, since the tree-walker has no OSR).
 
-### JIT state & code unloading (`jit_state`)
+### Per-runtime tier state (`tiers`)
 
-`jit_state` is the seam between the Tier-1 interpreter and the background JIT
-(`cljrs-jit`). Public surface:
+`Tiers` is the Tier-1 + Tier-2 state of one runtime, owned by its `GlobalEnv`
+and reached through it:
 
 ```rust
-pub fn set_jit_threshold(t: u32);                 // calls before compile (default 1000)
-pub fn set_ir_threshold(t: u32);                  // Tier-0 calls before background lowering
-                                                  // (default 50; u32::MAX disables)
-pub fn record_interp_call(arity_id) -> bool;      // Tier-0 call accounting; true = snapshot+enqueue
-pub fn lower_queued(arity_id) -> bool;            // dedup gate for the warm/relower paths
-pub fn mark_lower_queued(arity_id);               // set on accepted enqueue
-pub fn clear_lower_queued(arity_id);              // worker re-arms after abandoning an arity
-pub fn on_ir_published(arity_id);                 // worker: restart counter at IR publish
-pub fn evict_entry_if_cold(arity_id) -> bool;     // TTL sweep: drop entry unless native/queued
-pub fn stale_osr_code(arity_id);                  // TTL sweep: stale published OSR entries
-pub fn compile_queued(arity_id) -> bool;          // TTL sweep: in-flight JIT needs the IR
-pub fn set_bootstrap_arity_watermark(w: u64);     // the runtime builder snapshots the boundary
-pub fn is_bootstrap_arity(arity_id) -> bool;      // bootstrap fns excluded from background lowering
-pub fn record_call(arity_id, ir_func, profile_args);  // bump counter + arg-type profile; enqueue when hot
-pub fn arg_type_profile(arity_id) -> Option<Vec<u8>>; // per-param type bitmasks (PROFILE_LONG/_DOUBLE/_OTHER)
-pub fn set_enqueue_hook(f);                        // installed by cljrs_jit::init
-pub fn store_native_fn(arity_id, ptr, epoch);      // worker publishes compiled code
-pub fn get_native_fn(arity_id) -> Option<(*const (), u64)>;   // (fn_ptr, epoch)
-pub fn take_native_epoch(arity_id) -> Option<u64>; // on redefinition: null ptr, drop entry, return epoch
-pub fn push_jit_frame(epoch) -> JitFrameGuard;     // mark a native frame live for its call
-pub fn current_jit_epoch() -> Option<u64>;         // innermost native frame's epoch (closure-escape pinning)
-pub fn live_epochs() -> HashSet<u64>;              // epochs with a live frame (call at STW only)
-pub fn set_pending_exception_hook(f);              // installed by cljrs_jit::init (rt_abi taker)
-pub fn take_pending_exception() -> Option<Value>;  // uncaught native throw, taken at the dispatch seam
-pub fn set_stale_epoch_hook(f);                    // installed by cljrs_jit::init (code_cache::mark_stale)
-pub fn stale_native_code(arity_id);                // null ptr + route epochs to the stale hook (10.5)
-pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
+pub struct Tiers { /* IrCache + JitState */ }
 
-// Deoptimization (Phase 10.6):
-pub fn set_deopt_sentinel_hook(f: fn() -> usize);  // installed by cljrs_jit::init (rt_abi sentinel addr)
-pub fn is_deopt_result(ptr: *const Value) -> bool; // dispatch seam: did the entry guard fail?
-pub fn record_deopt(arity_id);                     // count a guard failure; past deopt_limit():
-                                                   // unpublish + stale the specialized code, ban
-                                                   // the arity from re-specialization
-pub fn specialization_allowed(arity_id) -> bool;   // worker: may this arity be specialized?
-pub fn deopt_limit() -> u32;                       // CLJRS_JIT_DEOPT_LIMIT (default 10)
+impl Tiers {
+    pub fn globals_id(&self) -> u64;               // identity of the owning runtime
+    pub fn ir_cache(&self) -> &IrCache;            // Tier-1 lowered IR
+    pub fn jit(&self) -> &JitState;                // Tier-2 counters + native code
+    pub fn handle(&self) -> Weak<Tiers>;           // for a background worker's request
+    pub fn sweep(&self, now, ttl_secs) -> Vec<u64>;// TTL evict IR + drop its JIT bookkeeping
+}
+
+pub fn live() -> Vec<Arc<Tiers>>;                  // every live runtime's tier state
+pub fn sweep_idle(now, ttl_secs) -> Vec<u64>;      // STW reclaim hook: sweep them all
 ```
 
+`GlobalEnv::tiers()`, `::ir_cache()`, `::jit()`, and `::jit_backend()` are the
+accessors dispatch uses.  Two runtimes in one process never read, evict,
+promote, or deoptimize each other's code.
+
+Background workers cannot hold an `Arc<GlobalEnv>` (it owns `GcPtr`s and is
+not `Send`); `Tiers` is `Send + Sync`, so a lowering or compile request
+carries `Tiers::handle()` and the worker publishes into exactly the runtime
+that asked — or finds it dropped and discards the result.  `live()` exists for
+the one path with no runtime in hand at all: `Var::bind`'s rebind
+notification.
+
+### The JIT seam (`backend`)
+
+```rust
+pub trait JitBackend: Send + Sync {
+    fn enqueue_function(&self, tiers: Weak<Tiers>, arity_id: u64, ir: Arc<IrFunction>) -> bool;
+    fn enqueue_osr(&self, tiers: Weak<Tiers>, arity_id: u64, header: u32, ir: Arc<IrFunction>) -> bool;
+    fn mark_stale(&self, epoch: u64);
+    fn take_pending_exception(&self) -> Option<Value>;
+    fn deopt_sentinel(&self) -> usize;
+    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env);
+}
+```
+
+One optional-system seam, installed per runtime by
+`cljrs_compiler::jit::install(&runtime)` (`JitState::install_backend`).  It
+replaces the five process-global `OnceLock` hooks this module used to carry
+(enqueue, OSR enqueue, stale-epoch, pending-exception, deopt-sentinel) plus
+the async-compile hook in `env::async_hook`: the *state* those hooks reached
+is now runtime-owned, and only the call into the compiler remains — which is
+unavoidable, since `cljrs-compiler` depends on this package.
+
+### JIT state & code unloading (`jit_state`)
+
+`JitState` is one runtime's Tier-2 state.  Public surface (methods on
+`GlobalEnv::jit()`):
+
+```rust
+pub fn install_backend(&self, backend: Arc<dyn JitBackend>);
+pub fn backend(&self) -> Option<&Arc<dyn JitBackend>>;
+pub fn record_interp_call(&self, arity_id) -> bool;      // Tier-0 accounting; true = snapshot+enqueue
+pub fn lower_queued(&self, arity_id) -> bool;            // dedup gate for the warm/relower paths
+pub fn mark_lower_queued(&self, arity_id);               // set on accepted enqueue
+pub fn clear_lower_queued(&self, arity_id);              // worker re-arms after abandoning an arity
+pub fn on_ir_published(&self, arity_id);                 // worker: restart counter at IR publish
+pub fn evict_entry_if_cold(&self, arity_id) -> bool;     // TTL sweep: drop entry unless native/queued
+pub fn stale_osr_code(&self, arity_id);                  // TTL sweep: stale published OSR entries
+pub fn compile_queued(&self, arity_id) -> bool;          // TTL sweep: in-flight JIT needs the IR
+pub fn pins_ir(&self, arity_id) -> bool;                 // TTL sweep: native published or compile queued
+pub fn set_bootstrap_watermark(&self, w: u64);           // the runtime builder snapshots the boundary
+pub fn is_bootstrap_arity(&self, arity_id) -> bool;      // bootstrap fns excluded from background lowering
+pub fn record_call(&self, arity_id, ir_func, profile_args);  // bump counter + arg-type profile; enqueue when hot
+pub fn arg_type_profile(&self, arity_id) -> Option<Vec<u8>>; // per-param bitmasks (PROFILE_LONG/_DOUBLE/_OTHER)
+pub fn store_native_fn(&self, arity_id, ptr, epoch);     // worker publishes compiled code
+pub fn get_native_fn(&self, arity_id) -> Option<(*const (), u64)>;  // (fn_ptr, epoch)
+pub fn take_native_epoch(&self, arity_id) -> Option<u64>;// on redefinition: null ptr, drop entry, return epoch
+pub fn stale_native_code(&self, arity_id);               // null ptr + hand epochs to the backend (10.5)
+pub fn take_pending_exception(&self) -> Option<Value>;   // uncaught native throw, taken at the dispatch seam
+
+// Deoptimization (Phase 10.6):
+pub fn is_deopt_result(&self, ptr: *const Value) -> bool;// dispatch seam: did the entry guard fail?
+pub fn record_deopt(&self, arity_id);                    // count a guard failure; past deopt_limit():
+                                                         // unpublish + stale the specialized code, ban
+                                                         // the arity from re-specialization
+pub fn specialization_allowed(&self, arity_id) -> bool;  // worker: may this arity be specialized?
+```
+
+Process-wide items in the same module — configuration and thread state, not
+runtime state:
+
+```rust
+pub fn set_jit_threshold(t: u32) / jit_threshold() -> u32;   // calls before compile (default 1000)
+pub fn set_ir_threshold(t: u32)  / ir_threshold() -> u32;    // Tier-0 calls before background lowering
+                                                             // (default 50; u32::MAX disables)
+pub fn set_osr_threshold(t: u32) / osr_threshold() -> u32;   // back-edges before an OSR compile
+pub fn deopt_limit() -> u32;                                 // CLJRS_JIT_DEOPT_LIMIT (default 10)
+pub fn push_jit_frame(epoch) -> JitFrameGuard;   // mark a native frame live for its call
+pub fn current_jit_epoch() -> Option<u64>;       // innermost native frame's epoch (closure-escape pinning)
+pub fn live_epochs() -> HashSet<u64>;            // epochs with a live frame (call at STW only)
+pub unsafe fn dispatch_jit_call(fn_ptr, args) -> *const Value;
+```
+
+Frame tracking is per *thread*, not per runtime: one thread can hold native
+frames from several runtimes, and reclamation asks whether any thread is
+executing a module.
+
 `call_jit_native` checks `is_deopt_result` on every native return: a
-specialized function whose entry type guard failed returns rt_abi's sentinel
-*before any side effect*, so the seam simply re-executes the call at Tier 1
-(`execute_ir`) — exact interpreter semantics for the violating call.
+specialized function whose entry type guard failed returns the compiler's
+sentinel *before any side effect*, so the seam simply re-executes the call at
+Tier 1 (`execute_ir`) — exact interpreter semantics for the violating call.
 
 Type profiles (Phase 10.6): `record_call` ORs each positional argument's type
 class (`PROFILE_LONG` / `PROFILE_DOUBLE` / `PROFILE_OTHER`) into
@@ -881,8 +945,8 @@ the invocation counter cannot promote it.  Instead:
    which passes the arity ID) counts back-edges per `RecurJump` target.  The
    counters are local to one execution on purpose: hot-within-one-call is
    exactly the case invocation tiering misses.
-2. Crossing `osr_threshold()` calls `jit_state::osr_request`, which enqueues
-   `(arity_id, header_block, IrFunction)` to the JIT worker exactly once.
+2. Crossing `osr_threshold()` calls `JitState::osr_request`, which enqueues
+   `(arity_id, header_block, IrFunction)` on the runtime's backend exactly once.
 3. The worker builds the OSR-entry variant (`cljrs_ir::osr::build_osr_function`),
    compiles it, and publishes `(fn_ptr, epoch, live_ins)` via `store_osr_fn`.
 4. At each subsequent loop-header entry (after φ resolution, so the loop
@@ -891,18 +955,20 @@ the invocation counter cannot promote it.  Instead:
    (`try_osr_enter`) — the native frame finishes the loop *and* the rest of
    the function, and its return value becomes the call's result.
 
-OSR `jit_state` surface:
+OSR `JitState` surface (plus the process-wide `set_osr_threshold` /
+`osr_threshold` above):
 
 ```rust
-pub fn set_osr_threshold(t: u32);                  // back-edges before compile
-pub fn osr_threshold() -> u32;                     // override → CLJRS_OSR_THRESHOLD → jit_threshold()
-pub fn set_osr_enqueue_hook(f);                    // installed by cljrs_jit::init
-pub fn osr_request(arity_id, header, ir_func);     // idempotent compile request
-pub fn osr_poll(arity_id, header) -> OsrPoll;      // NotRequested | Pending | Ready(OsrSlot) | Failed
-pub fn store_osr_fn(arity_id, header, ptr, epoch, live_ins);  // worker publishes
-pub fn mark_osr_failed(arity_id, header);          // worker declines; interpreters stop polling
-pub fn take_osr_epochs(arity_id) -> Vec<u64>;      // on redefinition: drop entries, return epochs
+pub fn osr_request(&self, arity_id, header, ir_func);  // idempotent compile request
+pub fn osr_poll(&self, arity_id, header) -> OsrPoll;   // NotRequested | Pending | Ready(OsrSlot) | Failed
+pub fn store_osr_fn(&self, arity_id, header, ptr, epoch, live_ins);  // worker publishes
+pub fn mark_osr_failed(&self, arity_id, header);       // worker declines; interpreters stop polling
+pub fn take_osr_epochs(&self, arity_id) -> Vec<u64>;   // on redefinition: drop entries, return epochs
 ```
+
+With no backend installed `osr_request` marks the header failed immediately,
+so interpreters stop polling instead of waiting for a compile that will never
+come.
 
 `OsrSlot { fn_ptr, epoch, live_ins }` carries the interpreter registers to pass
 (in parameter order); the transfer uses the same rooting + `push_jit_frame`

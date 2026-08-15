@@ -20,19 +20,26 @@
 //!   *new* call reaches the old code) and moves the old epoch to the stale set.
 //! - **Safepoint reclaim** ([`reclaim_at_stw`]): at the existing stop-the-world
 //!   GC safepoint — when every mutator thread is parked — we scan all active JIT
-//!   frames ([`cljrs_eval::jit_state::live_epochs`]).  A stale epoch with **no**
+//!   frames (`cljrs_runtime::tiered::jit_state::live_epochs`).  A stale epoch with **no**
 //!   live frame can have no in-flight and no future caller, so its module memory
 //!   is freed.  This piggybacks on the GC's quiescent point and sidesteps the
 //!   unload-vs-execute race without a separate protocol.
 //!
 //! Because emitted code embeds no GC pointers (constants are materialized via
 //! `rt_abi` runtime calls), freeing a module never disturbs the heap.
+//!
+//! This registry is process-wide on purpose: it accounts for the executable
+//! memory of the whole process, and the frame scan that decides what is safe
+//! to free is across *threads*, which are not partitioned by runtime.  The
+//! per-runtime half of the JIT — which arity has which pointer, how hot it is,
+//! whether its specialization deoptimized — lives in
+//! `cljrs_runtime::tiered::jit_state::JitState`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::jit_compiler::CompiledFn;
+use crate::jit::jit_compiler::CompiledFn;
 
 /// Monotonic epoch source.  Never reused, so an epoch uniquely identifies one
 /// compiled module for the life of the process.
@@ -82,8 +89,8 @@ pub(crate) fn register(arity_id: u64, compiled: CompiledFn) -> u64 {
 /// for reclamation at the next safepoint.  No-op if the epoch is unknown or
 /// already stale.
 ///
-/// Public (beyond the crate) only as the stale-epoch hook target installed
-/// into `cljrs_eval::jit_state` by [`crate::init`].
+/// Public (beyond the crate) as the target of `JitBackend::mark_stale`, which
+/// a runtime calls when it supersedes an arity's published code.
 pub fn mark_stale(epoch: u64) {
     let mut state = cache().lock().unwrap();
     if let Some(record) = state.live.remove(&epoch) {
@@ -100,8 +107,8 @@ pub fn mark_stale(epoch: u64) {
 
 /// Pin `epoch` so its module is never freed.
 ///
-/// Called (via the closure-escape hook installed in `init`) whenever JIT code
-/// materializes a closure value through `rt_make_fn*`: the resulting
+/// Called by `rt_abi::notify_closure_escape` whenever JIT code materializes a
+/// closure value through `rt_make_fn*`: the resulting
 /// `NativeFunction` captures a raw pointer into the module and lives on the GC
 /// heap, where the active-frame scan cannot see it.  A pinned module survives
 /// `mark_stale` indefinitely — a deliberate, bounded leak; precise reclamation
@@ -136,7 +143,7 @@ fn select_reclaimable(
 ///
 /// Returns the number of modules freed this pass.
 pub fn reclaim_at_stw() -> usize {
-    let live_frames = cljrs_eval::jit_state::live_epochs();
+    let live_frames = cljrs_runtime::tiered::jit_state::live_epochs();
     let mut state = cache().lock().unwrap();
 
     let stale_epochs: HashSet<u64> = state.stale.keys().copied().collect();
@@ -291,8 +298,8 @@ mod reclaim_integration {
                     cljrs_stdlib::install(&runtime);
                     runtime.into_globals()
                 };
-                let mut env = cljrs_eval::Env::new(globals, "user");
-                cljrs_compiler::aot::lower_via_rust(Some(&name), "user", &params, &forms, &mut env)
+                let mut env = cljrs_runtime::env::env::Env::new(globals, "user");
+                crate::aot::lower_via_rust(Some(&name), "user", &params, &forms, &mut env)
                     .expect("lowering should succeed")
             })
             .unwrap()
@@ -304,51 +311,54 @@ mod reclaim_integration {
     fn redefinition_reclaims_native_code_only_when_no_frame_is_live() {
         let ir = build_ir("f", &[Arc::from("x")], "(+ x 1)");
         let arity_id = 0xC0DE_0001u64;
+        let tiers = cljrs_runtime::tiered::tiers::Tiers::new(0xC0DE_0001);
+        let jit = tiers.jit();
 
         // Emulate the worker: compile, register (→ epoch), publish ptr + epoch.
         let compiled =
-            crate::jit_compiler::compile_jit(&format!("__cljrs_jit_{arity_id}"), &ir, &[]).unwrap();
+            crate::jit::jit_compiler::compile_jit(&format!("__cljrs_jit_{arity_id}"), &ir, &[])
+                .unwrap();
         let fn_ptr = compiled.fn_ptr;
-        let epoch = crate::code_cache::register(arity_id, compiled);
-        cljrs_eval::jit_state::store_native_fn(arity_id, fn_ptr, epoch);
-        assert!(crate::code_cache::is_live(epoch));
+        let epoch = crate::jit::code_cache::register(arity_id, compiled);
+        jit.store_native_fn(arity_id, fn_ptr, epoch);
+        assert!(crate::jit::code_cache::is_live(epoch));
         assert_eq!(
-            cljrs_eval::jit_state::get_native_fn(arity_id),
+            jit.get_native_fn(arity_id),
             Some((fn_ptr, epoch)),
             "dispatch table should resolve to the compiled code + epoch",
         );
 
         // Emulate redefinition: the rebind hook nulls dispatch and stales the
         // old epoch.
-        let taken = cljrs_eval::jit_state::take_native_epoch(arity_id).unwrap();
+        let taken = jit.take_native_epoch(arity_id).unwrap();
         assert_eq!(taken, epoch);
         assert_eq!(
-            cljrs_eval::jit_state::get_native_fn(arity_id),
+            jit.get_native_fn(arity_id),
             None,
             "future calls must no longer dispatch to stale code",
         );
-        crate::code_cache::mark_stale(epoch);
-        assert!(crate::code_cache::is_stale(epoch));
-        assert!(!crate::code_cache::is_live(epoch));
+        crate::jit::code_cache::mark_stale(epoch);
+        assert!(crate::jit::code_cache::is_stale(epoch));
+        assert!(!crate::jit::code_cache::is_live(epoch));
 
         // A frame executing this epoch defers reclamation.
         {
-            let _frame = cljrs_eval::jit_state::push_jit_frame(epoch);
-            crate::code_cache::reclaim_at_stw();
+            let _frame = cljrs_runtime::tiered::jit_state::push_jit_frame(epoch);
+            crate::jit::code_cache::reclaim_at_stw();
             assert!(
-                crate::code_cache::is_stale(epoch),
+                crate::jit::code_cache::is_stale(epoch),
                 "must not free code while a frame is executing it",
             );
         }
 
         // With no live frame, the next safepoint reclaim frees the module.
-        let before = crate::code_cache::reclaimed_count();
-        let freed = crate::code_cache::reclaim_at_stw();
+        let before = crate::jit::code_cache::reclaimed_count();
+        let freed = crate::jit::code_cache::reclaim_at_stw();
         assert!(
             freed >= 1,
             "stale module with no live frame should be freed"
         );
-        assert!(!crate::code_cache::is_stale(epoch));
-        assert!(crate::code_cache::reclaimed_count() > before);
+        assert!(!crate::jit::code_cache::is_stale(epoch));
+        assert!(crate::jit::code_cache::reclaimed_count() > before);
     }
 }

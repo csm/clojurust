@@ -359,13 +359,20 @@ rt.block_on(local.run_until(async {
 ```
 
 **Calling `init` outside a `LocalSet`:** `init` is also called with no Tokio runtime
-at all — by the AOT compiler (which registers `clojure.core.async` only so that
-`require`/`go`/`await` resolve during macro-expansion) and by unit tests, as well as
+at all — by the AOT compiler (through the host's `ExtensionSet`, which registers
+`clojure.core.async` only so that `require`/`go`/`await` resolve during
+macro-expansion) and by unit tests, as well as
 before a `LocalSet` context exists on WASM (e.g. in `Repl::new()`). `spawn_gc_service`
 probes `tokio::runtime::Handle::try_current()` and silently no-ops when there is no
 runtime, so these callers see no spurious panic. Re-call `init` from inside a
 `LocalSet::run_until` block to start the GC service.
 `timeout` uses `gloo_timers::future::sleep` on `wasm32` instead of `tokio::time::sleep`.
+
+**Build features:** `no-gc` (default off) forwards the no-GC build to
+`cljrs-gc`, `cljrs-value`, `cljrs-runtime`, `cljrs-env`, `cljrs-builtins`, and
+`cljrs-interp`, so a `no-gc` workspace build can include the async extension.
+The `cljrs` CLI forwards it weakly (`cljrs-async?/no-gc`), i.e. only when its
+own `async` feature pulls this package in.
 
 **Timer portability:** On `wasm32` the `time` feature of tokio is present but
 `platform_sleep` (used internally by `timeout`) delegates to `gloo-timers` so that

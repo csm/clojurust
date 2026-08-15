@@ -423,9 +423,11 @@ impl Compiler<ObjectModule> {
 
 /// Build a `Compiler<M>` from a caller-supplied `module` and `ptr_type`.
 ///
-/// This constructor is used by the JIT backend (`cljrs-jit`) which constructs
-/// its own `JITModule` before handing it to the shared codegen.
-pub fn new_compiler_from_module<M: Module>(
+/// Used by the JIT tier ([`crate::jit`]), which constructs its own
+/// `JITModule` before handing it to this shared codegen — the same
+/// `compile_function` / `compile_function_with_specs` and the same
+/// `typeinfer` pass the AOT `ObjectModule` path uses.
+pub(crate) fn new_compiler_from_module<M: Module>(
     mut module: M,
     ptr_type: types::Type,
 ) -> CodegenResult<Compiler<M>> {

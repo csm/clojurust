@@ -18,12 +18,14 @@
 #![allow(clippy::type_complexity)]
 
 pub mod apply;
+pub mod backend;
 pub mod defn_registry;
 pub mod ir_cache;
 pub mod ir_interp;
 pub mod jit_state;
 pub mod lower;
 mod lower_worker;
+pub mod tiers;
 
 pub use crate::env::callback::invoke;
 pub use crate::env::env::{Env, GlobalEnv};
@@ -33,9 +35,9 @@ pub use crate::env::loader::load_ns;
 pub use crate::interp::eval::{eval, eval_with_gas};
 
 pub use apply::force_eager_lowering;
-pub use jit_state::{
-    set_enqueue_hook, set_ir_threshold, set_jit_threshold, set_osr_threshold, store_native_fn,
-};
+pub use backend::JitBackend;
+pub use jit_state::{set_ir_threshold, set_jit_threshold, set_osr_threshold};
+pub use tiers::Tiers;
 
 use std::sync::Arc;
 

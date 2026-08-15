@@ -1,3 +1,4 @@
+#![cfg(feature = "wasm-aot")]
 //! End-to-end AOT → WebAssembly compilation test.
 //!
 //! Writes a `.cljrs` source file, drives the full front-end +
@@ -6,6 +7,8 @@
 //! argument parsing.
 
 use std::sync::Mutex;
+
+mod common;
 
 /// Serialize the tests: each boots a full stdlib environment.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -21,13 +24,8 @@ fn compile_to_wasm(name: &str, source: &str) -> Vec<u8> {
     let out_path = dir.join(format!("{name}.wasm"));
     std::fs::write(&src_path, source).unwrap();
 
-    cljrs_compiler::aot::compile_file_to_wasm(
-        &src_path,
-        &out_path,
-        &[],
-        cljrs_compiler::aot::OpacityPolicy::Report,
-    )
-    .unwrap_or_else(|e| panic!("compile_file_to_wasm failed: {e}"));
+    cljrs_compiler::aot::compile_file_to_wasm(&src_path, &out_path, &common::session(vec![]))
+        .unwrap_or_else(|e| panic!("compile_file_to_wasm failed: {e}"));
 
     std::fs::read(&out_path).unwrap()
 }
@@ -110,8 +108,7 @@ fn bundles_required_namespace_initializer() {
     cljrs_compiler::aot::compile_file_to_wasm(
         &src_path,
         &out_path,
-        std::slice::from_ref(&dir),
-        cljrs_compiler::aot::OpacityPolicy::Report,
+        &common::session(vec![dir.clone()]),
     )
     .unwrap_or_else(|e| panic!("compile_file_to_wasm failed: {e}"));
 

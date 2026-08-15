@@ -34,8 +34,8 @@ fn build_ir(name: &str, params: &[Arc<str>], body_src: &str) -> IrFunction {
                 cljrs_stdlib::install(&runtime);
                 runtime.into_globals()
             };
-            let mut env = cljrs_eval::Env::new(globals, "user");
-            cljrs_compiler::aot::lower_via_rust(Some(&name), "user", &params, &forms, &mut env)
+            let mut env = cljrs_runtime::env::env::Env::new(globals, "user");
+            crate::aot::lower_via_rust(Some(&name), "user", &params, &forms, &mut env)
                 .expect("lowering should succeed")
         })
         .unwrap()
@@ -73,10 +73,10 @@ fn osr_entry_compiles_and_resumes_natively_mid_loop() {
         osr.live_ins.len()
     );
 
-    let compiled =
-        crate::jit_compiler::compile_jit("__cljrs_jit_osr_test", &osr.func, &[]).expect("compile");
+    let compiled = crate::jit::jit_compiler::compile_jit("__cljrs_jit_osr_test", &osr.func, &[])
+        .expect("compile");
     let fn_ptr = compiled.fn_ptr;
-    let epoch = crate::code_cache::register(0xC0DE_0540, compiled);
+    let epoch = crate::jit::code_cache::register(0xC0DE_0540, compiled);
 
     // Mid-loop interpreter state for n=10, paused at i=5: acc = 0+1+2+3+4 = 10.
     // The transform orders live-ins as [header φ dsts (i, acc), then outer (n)].
@@ -84,13 +84,14 @@ fn osr_entry_compiles_and_resumes_natively_mid_loop() {
 
     // Same transfer protocol as ir_interp::try_osr_enter.
     let result = {
-        let _jit_frame = cljrs_eval::jit_state::push_jit_frame(epoch);
-        let _arg_roots = cljrs_env::gc_roots::root_values(&call_args);
+        let _jit_frame = cljrs_runtime::tiered::jit_state::push_jit_frame(epoch);
+        let _arg_roots = cljrs_runtime::env::gc_roots::root_values(&call_args);
         let _alloc_frame = cljrs_gc::push_alloc_frame();
         let arg_ptrs: Vec<*const Value> = call_args.iter().map(|v| v as *const Value).collect();
         // SAFETY: the OSR entry was compiled with `live_ins.len()` `*const
         // Value` params; all arg pointers are rooted and live for the call.
-        let result_ptr = unsafe { cljrs_eval::jit_state::dispatch_jit_call(fn_ptr, &arg_ptrs) };
+        let result_ptr =
+            unsafe { cljrs_runtime::tiered::jit_state::dispatch_jit_call(fn_ptr, &arg_ptrs) };
         unsafe { (*result_ptr).clone() }
     };
 

@@ -104,10 +104,12 @@ pub struct GlobalEnv {
     /// exists — and is raised once to `execution_mode.target_tier()` when the
     /// builder finishes bootstrapping.
     tier_state: AtomicU8,
-    /// This runtime's cache of lowered IR, keyed by arity id.  Instance
-    /// state: two runtimes in one process never read or evict each other's
-    /// entries, and the cache dies with the runtime.
-    ir_cache: Arc<crate::tiered::ir_cache::IrCache>,
+    /// This runtime's Tier-1 and Tier-2 state: the lowered-IR cache, the JIT
+    /// counters and native-code tables, and the JIT backend attached to this
+    /// runtime.  Instance state: two runtimes in one process never read,
+    /// evict, or invalidate each other's entries, and everything dies with
+    /// the runtime.
+    tiers: Arc<crate::tiered::tiers::Tiers>,
     /// Optional async runtime registered by `cljrs-async`.
     /// `None` when the library is not linked; `Some` after `cljrs_async::init`.
     pub async_rt: RwLock<Option<Arc<dyn AsyncRuntime>>>,
@@ -223,7 +225,7 @@ impl GlobalEnv {
             gc_config: RwLock::new(None),
             execution_mode,
             tier_state: AtomicU8::new(TierState::TreeWalk as u8),
-            ir_cache: crate::tiered::ir_cache::IrCache::new(id),
+            tiers: crate::tiered::tiers::Tiers::new(id),
             async_rt: RwLock::new(None),
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
@@ -462,10 +464,31 @@ impl GlobalEnv {
         self.id
     }
 
+    /// This runtime's Tier-1/Tier-2 state.
+    #[inline(always)]
+    pub fn tiers(&self) -> &Arc<crate::tiered::tiers::Tiers> {
+        &self.tiers
+    }
+
     /// This runtime's cache of lowered IR.
     #[inline(always)]
-    pub fn ir_cache(&self) -> &Arc<crate::tiered::ir_cache::IrCache> {
-        &self.ir_cache
+    pub fn ir_cache(&self) -> &crate::tiered::ir_cache::IrCache {
+        self.tiers.ir_cache()
+    }
+
+    /// This runtime's JIT counters, profiles, and native-code tables.
+    #[inline(always)]
+    pub fn jit(&self) -> &crate::tiered::jit_state::JitState {
+        self.tiers.jit()
+    }
+
+    /// The JIT compiler attached to this runtime, if any.
+    ///
+    /// `None` when no JIT is linked or installed; callers then keep to the
+    /// interpreter tiers.  Installed by `cljrs_compiler::jit::install`.
+    #[inline(always)]
+    pub fn jit_backend(&self) -> Option<Arc<dyn crate::tiered::backend::JitBackend>> {
+        self.tiers.jit().backend().cloned()
     }
 
     // ── Execution mode and tier state ────────────────────────────────────

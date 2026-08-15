@@ -3,9 +3,9 @@
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Module};
 
-use cljrs_compiler::codegen::new_compiler_from_module;
-use cljrs_compiler::rt_abi;
-use cljrs_compiler::typeinfer::Repr;
+use crate::codegen::new_compiler_from_module;
+use crate::rt_abi;
+use crate::typeinfer::Repr;
 use cljrs_ir::IrFunction;
 
 /// A successfully compiled JIT function.
@@ -137,7 +137,7 @@ pub(crate) fn compile_jit_poll(
 /// other (mirrors `aot.rs::declare_subfunctions`).
 fn declare_subfunctions<M: cranelift_module::Module>(
     ir_func: &IrFunction,
-    compiler: &mut cljrs_compiler::codegen::Compiler<M>,
+    compiler: &mut crate::codegen::Compiler<M>,
 ) -> Result<(), String> {
     for sub in &ir_func.subfunctions {
         let name = sub.name.as_deref().unwrap_or("__cljrs_anon");
@@ -153,7 +153,7 @@ fn declare_subfunctions<M: cranelift_module::Module>(
 /// `aot.rs::compile_subfunctions`).
 fn compile_subfunctions<M: cranelift_module::Module>(
     ir_func: &IrFunction,
-    compiler: &mut cljrs_compiler::codegen::Compiler<M>,
+    compiler: &mut crate::codegen::Compiler<M>,
 ) -> Result<(), String> {
     for sub in &ir_func.subfunctions {
         compile_subfunctions(sub, compiler)?;

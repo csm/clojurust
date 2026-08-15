@@ -114,8 +114,7 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`cljrs-compiler`](crates/cljrs-compiler) | Cranelift codegen (generic over `Module`), type inference, AOT object/binary emission, C-ABI runtime bridge | working |
-| [`cljrs-jit`](crates/cljrs-jit) | In-process JIT: hot-arity native compilation, type specialization + inline caches, OSR, code unloading, region threading | working |
+| [`cljrs-compiler`](crates/cljrs-compiler) | Cranelift codegen (generic over `Module`), type inference, C-ABI runtime bridge, AOT object/binary emission, and the in-process JIT (`jit/`): hot-arity native compilation, type specialization + inline caches, OSR, code unloading, region threading | working |
 | [`cljrs-ir-viz`](crates/cljrs-ir-viz) | HTML visualizer for optimized IR + region allocation (`cljrs ir viz`) | implemented |
 
 ### Interop
@@ -239,7 +238,7 @@ Source code
   Tier 1: IR interp (runtime::tiered) hot arities lowered to ANF/SSA IR
     |                                  (background lower worker), interpreted
     v                                  faster; OSR counters on hot loops
-  Tier 2: JIT native (cljrs-jit)     hottest arities compiled to native code
+  Tier 2: JIT native (compiler::jit) hottest arities compiled to native code
     |                                  via Cranelift: type specialization,
     v                                  inline caches, OSR, region threading;
   Result (Value)                      deopt back to Tier 1 on guard failure
@@ -287,14 +286,12 @@ cljrs-runtime -------> cljrs-value, cljrs-gc, cljrs-reader, cljrs-ir
 cljrs-stdlib --------> cljrs-runtime (via shims), cljrs-ir
     |
 cljrs-compiler ------> cljrs-runtime (via shims), cljrs-ir, cljrs-stdlib
-    |                    (Cranelift AOT)
-    |                  + cljrs-async, cljrs-io, cljrs-net, cljrs-charset,
-    |                    cljrs-base64 — extensions its AOT harness initializes
+    |                    (Cranelift JIT + AOT)
+    |                  + cljrs-async — the state-machine poll ABI its codegen
+    |                    implements.  I/O, net, charset and base64 are *not*
+    |                    dependencies: the host passes an ExtensionSet
     |
-cljrs-jit -----------> cljrs-compiler, cljrs-runtime (via shims), cljrs-ir
-    |                    (Cranelift JIT)
-    |
-cljrs (binary) ------> cljrs-stdlib, cljrs-compiler, cljrs-jit, cljrs-lsp,
+cljrs (binary) ------> cljrs-stdlib, cljrs-compiler, cljrs-lsp,
                        cljrs-nrepl, cljrs-deps, cljrs-vcs, cljrs-ir-viz,
                        cljrs-interop  (+ async/net/charset behind features)
 ```
@@ -325,8 +322,7 @@ crates/
   cljrs-stdlib/          # embedded standard library namespaces
   cljrs-logging/         # feature-gated debug/trace logging
   # compilation
-  cljrs-compiler/        # Cranelift codegen + AOT
-  cljrs-jit/             # in-process JIT
+  cljrs-compiler/        # Cranelift codegen + JIT + AOT
   cljrs-ir-viz/          # IR HTML visualizer
   # interop
   cljrs-interop/         # Rust <-> Clojure FFI

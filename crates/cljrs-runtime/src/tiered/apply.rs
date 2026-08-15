@@ -11,7 +11,7 @@ static EAGER_LOWER_FORCED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Force eager IR lowering to be enabled for all threads, regardless of
-/// the `CLJRS_EAGER_LOWER` environment variable.  Called by `cljrs_jit::init`.
+/// the `CLJRS_EAGER_LOWER` environment variable.
 pub fn force_eager_lowering() {
     EAGER_LOWER_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -41,7 +41,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         //    `ExecutionMode::Tiered` reaches native code; `TieredNoJit` stops
         //    at Tier 1 even when a JIT backend is linked in.
         if caller_env.globals.tier_state().jit_enabled()
-            && let Some((fn_ptr, epoch)) = crate::tiered::jit_state::get_native_fn(arity_id)
+            && let Some((fn_ptr, epoch)) = caller_env.globals.jit().get_native_fn(arity_id)
         {
             return call_jit_native(f, fn_ptr, epoch, arity, args, caller_env);
         }
@@ -94,7 +94,7 @@ fn try_ir_path(
     if crate::tiered::defn_registry::relower_pending()
         && crate::tiered::defn_registry::relower_marked(arity_id)
         && !IR_LOWERING_ACTIVE.get()
-        && !crate::tiered::jit_state::lower_queued(arity_id)
+        && !caller_env.globals.jit().lower_queued(arity_id)
     {
         request_background_lower(f, caller_env);
     }
@@ -116,7 +116,10 @@ fn try_ir_path(
     } else {
         args
     };
-    crate::tiered::jit_state::record_call(arity_id, Arc::clone(&ir_func), profile_args);
+    caller_env
+        .globals
+        .jit()
+        .record_call(arity_id, Arc::clone(&ir_func), profile_args);
 
     Some(execute_ir(f, arity, &ir_func, args, caller_env))
 }
@@ -163,14 +166,14 @@ fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
         || f.is_async
         || !f.closed_over_names.is_empty()
         || named_without_global
-        || crate::tiered::jit_state::is_bootstrap_arity(arity_id)
+        || caller_env.globals.jit().is_bootstrap_arity(arity_id)
         || no_ir()
         || !caller_env.globals.ir_enabled()
     {
         return;
     }
 
-    if !crate::tiered::jit_state::record_interp_call(arity_id) {
+    if !caller_env.globals.jit().record_interp_call(arity_id) {
         return;
     }
 
@@ -181,7 +184,7 @@ fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
     // of their patterns are known to miscompile (TODO.md Phase 10.7 notes).
     // Pin the queued flag so this is a one-time check per arity.
     if caller_env.globals.builtin_source(&f.defining_ns).is_some() {
-        crate::tiered::jit_state::mark_lower_queued(arity_id);
+        caller_env.globals.jit().mark_lower_queued(arity_id);
         return;
     }
 
@@ -189,7 +192,7 @@ fn maybe_request_lowering(f: &CljxFn, arity_id: u64, caller_env: &mut Env) {
     // (e.g. an eager-lowering failure); pin the queued flag so the per-call
     // gates above stay the steady-state cost.
     if !caller_env.globals.ir_cache().should_attempt(arity_id) {
-        crate::tiered::jit_state::mark_lower_queued(arity_id);
+        caller_env.globals.jit().mark_lower_queued(arity_id);
         return;
     }
 
@@ -227,7 +230,7 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
 
     let accepted =
         crate::tiered::lower_worker::enqueue(crate::tiered::lower_worker::LowerRequest {
-            globals_id: caller_env.globals.id(),
+            tiers: caller_env.globals.tiers().handle(),
             name: f.name.clone(),
             ns: f.defining_ns.clone(),
             is_async: f.is_async,
@@ -235,7 +238,7 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
         });
     if accepted {
         for id in arity_ids {
-            crate::tiered::jit_state::mark_lower_queued(id);
+            caller_env.globals.jit().mark_lower_queued(id);
         }
     }
 }
@@ -381,8 +384,8 @@ fn call_jit_native(
     // failure is counted; repeated violations discard the specialization
     // (record_deopt), after which dispatch returns to Tier 1 until a generic
     // recompile is published.
-    if crate::tiered::jit_state::is_deopt_result(result_ptr) {
-        crate::tiered::jit_state::record_deopt(arity.ir_arity_id);
+    if caller_env.globals.jit().is_deopt_result(result_ptr) {
+        caller_env.globals.jit().record_deopt(arity.ir_arity_id);
         if let Some(ir_func) = caller_env.globals.ir_cache().get(arity.ir_arity_id) {
             return execute_ir(f, arity, &ir_func, args, caller_env);
         }
@@ -399,7 +402,7 @@ fn call_jit_native(
     // thread-local and returns the nil sentinel.  Surface it as an error here
     // (while the alloc frame still roots it), exactly as Tier-1 would have
     // propagated it — and so a stale slot cannot misfire a later `rt_try`.
-    let pending_exception = crate::tiered::jit_state::take_pending_exception();
+    let pending_exception = caller_env.globals.jit().take_pending_exception();
     if gas_exhausted {
         return Err(crate::env::error::EvalError::GasExhausted);
     }

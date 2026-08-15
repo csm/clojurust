@@ -246,6 +246,12 @@ pub fn take_relower(arity_id: u64) -> bool {
 /// Install the invalidation hook into `cljrs-value`'s var-rebind notification
 /// (idempotent).  Called from `eager_lower_fn` the first time a defn is
 /// registered, so plain (non-JIT) eager-lowering sessions are also covered.
+///
+/// `Var::bind` is the one path in the system with no runtime in hand — it
+/// sees a value being replaced, nothing more — so the hook applies the
+/// invalidation to every live runtime ([`tiers::live`]).  Arity ids come from
+/// one process-wide counter, so this is exact for the runtime that owns the
+/// id and a no-op in every other.
 pub fn install_invalidation_hook() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -258,13 +264,19 @@ pub fn install_invalidation_hook() {
             let Some(name) = f.name.as_deref() else {
                 return;
             };
-            for dep in on_redefined(&f.defining_ns, name) {
-                // Remove the stale cached IR; `try_ir_path` re-lowers on the
-                // dependent's next dispatch (take_relower).
-                crate::tiered::ir_cache::invalidate(dep);
-                // Null any published native pointer and route the backing
-                // epochs to the JIT's code cache for reclamation.
-                crate::tiered::jit_state::stale_native_code(dep);
+            let deps = on_redefined(&f.defining_ns, name);
+            if deps.is_empty() {
+                return;
+            }
+            for tiers in crate::tiered::tiers::live() {
+                for &dep in &deps {
+                    // Remove the stale cached IR; `try_ir_path` re-lowers on
+                    // the dependent's next dispatch (take_relower).
+                    tiers.ir_cache().invalidate(dep);
+                    // Null any published native pointer and route the backing
+                    // epochs to the JIT's code cache for reclamation.
+                    tiers.jit().stale_native_code(dep);
+                }
             }
         });
     });

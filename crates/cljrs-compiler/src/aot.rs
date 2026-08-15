@@ -16,6 +16,7 @@ use std::sync::Arc;
 use cljrs_reader::Parser;
 
 use crate::codegen::Compiler;
+use crate::extensions::CompileSession;
 use cljrs_ir::IrFunction;
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ pub enum AotError {
     Eval(String),
     Link(String),
     /// The wasm backend could not lower a construct in the program.
+    #[cfg(feature = "wasm-aot")]
     Wasm(crate::wasm::WasmError),
     /// The opacity policy forbids embedded Clojure source and the binary would
     /// still carry some.
@@ -46,6 +48,7 @@ impl std::fmt::Display for AotError {
             AotError::Codegen(e) => write!(f, "codegen error: {e:?}"),
             AotError::Eval(e) => write!(f, "eval/lowering error: {e}"),
             AotError::Link(e) => write!(f, "link error: {e}"),
+            #[cfg(feature = "wasm-aot")]
             AotError::Wasm(e) => write!(f, "wasm backend error: {e}"),
             AotError::SourceEmbedded(audit) => {
                 writeln!(
@@ -93,6 +96,7 @@ impl From<crate::codegen::CodegenError> for AotError {
         AotError::Codegen(e)
     }
 }
+#[cfg(feature = "wasm-aot")]
 impl From<crate::wasm::WasmError> for AotError {
     fn from(e: crate::wasm::WasmError) -> Self {
         AotError::Wasm(e)
@@ -432,10 +436,12 @@ pub fn lower_file_to_ir(
 /// source.  Every returned function is `optimize_direct_calls`-rewritten so its
 /// same-unit calls resolve to wasm function indices; cross-namespace calls stay
 /// dynamic (`rt_call`).
+#[cfg(feature = "wasm-aot")]
 fn lower_file_to_ir_bundle(
     src_path: &Path,
-    src_dirs: &[PathBuf],
+    session: &CompileSession,
 ) -> AotResult<(Vec<(String, IrFunction)>, BundleAudit)> {
+    let src_dirs = session.src_dirs();
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
     let filename = src_path.display().to_string();
@@ -443,8 +449,8 @@ fn lower_file_to_ir_bundle(
     let forms = parser.parse_all()?;
     let forms = expand_reader_conds_deep(&forms);
 
-    // Boot the same environment `compile_file` does so `require`d namespaces (and
-    // the async/io/net/charset/base64 builtins they may pull in) resolve.
+    // Boot the same environment `compile_file` does so `require`d namespaces
+    // (and any extension namespaces they pull in) resolve.
     let globals = if src_dirs.is_empty() {
         {
             let runtime = cljrs_runtime::Runtime::builder()
@@ -465,11 +471,7 @@ fn lower_file_to_ir_bundle(
             runtime.into_globals()
         }
     };
-    cljrs_async::init(&globals);
-    cljrs_io::init(&globals);
-    cljrs_net::init(&globals);
-    cljrs_charset::init(&globals);
-    cljrs_base64::init(&globals);
+    session.extensions().register_all(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect which user
@@ -560,6 +562,7 @@ fn lower_file_to_ir_bundle(
 
 /// How a dropped form was spelled: `(defmulti route ...)` renders as
 /// `(defmulti route)`, enough to find it without echoing the body.
+#[cfg(feature = "wasm-aot")]
 fn form_head(form: &cljrs_reader::Form) -> String {
     use cljrs_reader::form::FormKind;
     match &form.kind {
@@ -597,15 +600,15 @@ fn form_head(form: &cljrs_reader::Form) -> String {
 /// once it knows that layout.  Wiring the IR interpreter in as the dynamic-code
 /// tier (so a namespace skipped above still runs) is the remaining runtime-side
 /// step tracked in `docs/wasm-aot-plan.md`.
+#[cfg(feature = "wasm-aot")]
 pub fn compile_file_to_wasm(
     src_path: &Path,
     out_path: &Path,
-    src_dirs: &[PathBuf],
-    opacity: OpacityPolicy,
+    session: &CompileSession,
 ) -> AotResult<()> {
-    let (bundle, audit) = lower_file_to_ir_bundle(src_path, src_dirs)?;
+    let (bundle, audit) = lower_file_to_ir_bundle(src_path, session)?;
 
-    match audit.verdict(opacity) {
+    match audit.verdict(session.opacity_policy()) {
         OpacityVerdict::Rejected => return Err(AotError::Eval(audit.to_string())),
         OpacityVerdict::Tolerated => eprintln!(
             "[aot] {} unit(s) of the program left out of the wasm module \
@@ -631,24 +634,22 @@ pub fn compile_file_to_wasm(
 
 /// Compile a `.cljrs` / `.cljc` source file to a standalone native binary.
 ///
-/// `src_path` is the input source file.  `out_path` is the desired output
-/// binary.  `src_dirs` are additional directories for `require` resolution
-/// during macro expansion.  `rust_config`, when present, causes the generated
-/// harness to depend on the user's Rust crate and call its `cljrs_init` hook
-/// before loading any Clojure code.  `verify_commit_signatures` enables
-/// `git verify-commit` on every versioned pin resolved during compilation
-/// (the produced binary trusts its embedded sources, so verification happens
-/// here, at compile time).  `opacity` decides what happens when the binary
-/// would still carry readable Clojure source; [`audit_source`] reports the same
-/// set without applying any policy.
-pub fn compile_file(
-    src_path: &Path,
-    out_path: &Path,
-    src_dirs: &[PathBuf],
-    rust_config: Option<&cljrs_deps::RustConfig>,
-    verify_commit_signatures: bool,
-    opacity: OpacityPolicy,
-) -> AotResult<()> {
+/// `src_path` is the input source file, `out_path` the desired output binary,
+/// and `session` everything else the compile needs: source directories for
+/// `require` resolution, the [`ExtensionSet`](crate::extensions::ExtensionSet) the program may use, the user's
+/// `:rust` crate configuration, whether to verify versioned commit
+/// signatures, and what to do if the binary would still carry readable
+/// Clojure source ([`audit_source`] reports the same set without applying any
+/// policy).
+///
+/// The compiler does not choose extensions.  The host builds the set from its
+/// own features and project configuration, and this function registers it
+/// both here (so macro expansion resolves the namespaces) and in the
+/// generated harness (so the produced binary does).
+pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) -> AotResult<()> {
+    let src_dirs = session.src_dirs();
+    let verify_commit_signatures = session.verifies_commit_signatures();
+    let opacity = session.opacity_policy();
     eprintln!("[aot] reading {}", src_path.display());
     let source = std::fs::read_to_string(src_path)?;
     let filename = src_path.display().to_string();
@@ -697,16 +698,12 @@ pub fn compile_file(
             globals.load_trusted_signers(&config);
         }
     }
-    // Register clojure.core.async so that (require '[clojure.core.async ...])
-    // and the `go`/`alt` macros resolve during macro-expansion. The GC
-    // service is silently skipped when there is no LocalSet context.
-    cljrs_async::init(&globals);
-    // Register I/O, networking, charset, and base64 namespaces so that require
-    // forms in source files resolve correctly during macro expansion.
-    cljrs_io::init(&globals);
-    cljrs_net::init(&globals);
-    cljrs_charset::init(&globals);
-    cljrs_base64::init(&globals);
+    // Register the host's extensions (clojure.core.async, I/O, networking,
+    // charset, Base64, …) so `require` forms and the macros they bring —
+    // `go`, `alt` — resolve during macro expansion.  Each extension's async
+    // GC service, if it has one, is silently skipped when there is no
+    // LocalSet context.
+    session.extensions().register_all(&globals);
     let mut env = cljrs_eval::Env::new(globals, "user");
 
     // Snapshot loaded namespaces before expansion so we can detect
@@ -951,7 +948,7 @@ pub fn compile_file(
         &compiled_namespaces,
         &versioned_bundled,
         &async_polls,
-        rust_config,
+        session,
     )?;
     link_with_cargo(&harness_dir, out_path, offline)?;
 
@@ -1092,6 +1089,7 @@ impl BundleAudit {
         self.omissions.len()
     }
 
+    #[cfg(feature = "wasm-aot")]
     pub(crate) fn record(&mut self, kind: OmissionKind, ns: Option<String>, detail: String) {
         self.omissions.push(Omission { kind, ns, detail });
     }
@@ -1873,8 +1871,10 @@ fn build_harness(
     compiled_namespaces: &[CompiledNamespace],
     versioned_bundled: &[(Arc<str>, String)],
     async_polls: &[AsyncPollEntry],
-    rust_config: Option<&cljrs_deps::RustConfig>,
+    session: &CompileSession,
 ) -> AotResult<(PathBuf, bool)> {
+    let rust_config = session.rust_config_ref();
+    let extensions = session.extensions();
     // Place the harness in a temp dir next to the output.
     let harness_dir = out_path
         .parent()
@@ -1907,10 +1907,16 @@ fn build_harness(
             native_deps.push_str(&format!("{crate_name} = {{ path = \"{crate_dir}\" }}\n"));
         }
     }
-    let runtime_deps: String = HARNESS_RUNTIME_CRATES
-        .iter()
-        .map(|c| deps.dep_line(c))
-        .collect();
+    // The harness links the base runtime plus whatever the host's extensions
+    // need, deduplicated: an extension may name a package the base already
+    // pulls in (`cljrs-async` is part of the async ABI the compiler emits).
+    let mut harness_crates: Vec<&str> = HARNESS_RUNTIME_CRATES.to_vec();
+    for name in extensions.crate_names() {
+        if !harness_crates.contains(&name) {
+            harness_crates.push(name);
+        }
+    }
+    let runtime_deps: String = harness_crates.iter().map(|c| deps.dep_line(c)).collect();
     let cargo_toml = format!(
         r#"[package]
 name = "cljrs-aot-harness"
@@ -2114,15 +2120,8 @@ async fn run() {{
     // time — an AOT binary never fetches from git at runtime.
     globals.set_versioned_offline(true);
 
-    // Register the async runtime (clojure.core.async, ^:async dispatch, await).
-    cljrs_async::init(&globals);
-{async_polls}
-    // Register I/O, networking, charset, and base64 namespaces.
-    cljrs_io::init(&globals);
-    cljrs_net::init(&globals);
-    cljrs_charset::init(&globals);
-    cljrs_base64::init(&globals);
-
+    // Register the extensions this program was compiled with.
+{extension_init}{async_polls}
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 {bundled}
@@ -2174,6 +2173,7 @@ fn main() {{
         native_init = native_init_code,
         main_call = main_call_code,
         async_polls = async_poll_registration,
+        extension_init = extensions.harness_init_code(),
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
 
@@ -2181,6 +2181,13 @@ fn main() {{
 }
 
 /// Runtime crates the AOT harness `main()` links against, in dependency order.
+///
+/// The base set only — every optional product extension comes from the host's
+/// [`ExtensionSet`](crate::extensions::ExtensionSet).  `cljrs-async` is in the base set because it is part of
+/// the ABI this compiler emits (`await` on a `^:async` `-main`, and the
+/// state-machine poll functions registered below), not because the compiler
+/// decided the program should have `clojure.core.async`; registering that
+/// namespace is still the host's call.
 const HARNESS_RUNTIME_CRATES: &[&str] = &[
     "cljrs-logging",
     "cljrs-types",
@@ -2193,10 +2200,6 @@ const HARNESS_RUNTIME_CRATES: &[&str] = &[
     "cljrs-stdlib",
     "cljrs-compiler",
     "cljrs-async",
-    "cljrs-io",
-    "cljrs-net",
-    "cljrs-charset",
-    "cljrs-base64",
 ];
 
 /// Runtime crates the AOT *test* harness links against.  The test harness

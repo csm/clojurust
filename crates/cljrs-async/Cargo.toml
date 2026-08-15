@@ -6,6 +6,18 @@ description = "Async support for clojurust — clojure.core.async via Tokio"
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Propagate the no-GC build to every runtime dependency, so a `no-gc` workspace
+# build can include the async extension instead of stopping at the CLI.
+no-gc = [
+    "cljrs-gc/no-gc",
+    "cljrs-value/no-gc",
+    "cljrs-runtime/no-gc",
+    "cljrs-env/no-gc",
+    "cljrs-builtins/no-gc",
+    "cljrs-interp/no-gc",
+]
+
 [dependencies]
 cljrs-runtime = { workspace = true }
 cljrs-types    = { workspace = true }

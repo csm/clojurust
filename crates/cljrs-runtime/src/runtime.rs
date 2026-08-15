@@ -236,9 +236,9 @@ impl RuntimeBuilder {
             if target.ir_enabled() {
                 // Functions defined before this point (the clojure.core
                 // bootstrap) stay excluded from background lowering.
-                crate::tiered::jit_state::set_bootstrap_arity_watermark(
-                    crate::interp::arity::next_arity_id(),
-                );
+                globals
+                    .jit()
+                    .set_bootstrap_watermark(crate::interp::arity::next_arity_id());
             }
             globals.set_tier_state(target);
         }

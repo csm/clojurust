@@ -24,6 +24,7 @@ use cljrs_value::{
 use crate::env::apply::apply_value;
 use crate::env::env::{Env, GlobalEnv};
 use crate::env::error::{EvalError, EvalResult};
+use crate::tiered::jit_state::{OsrPoll, OsrSlot};
 
 // ── Register file ───────────────────────────────────────────────────────────
 
@@ -165,6 +166,7 @@ fn record_back_edge(
     arity_id: u64,
     target: BlockId,
     ir_func: &IrFunction,
+    globals: &GlobalEnv,
 ) {
     let ol = osr.get_or_insert_with(|| {
         Box::new(OsrLocal {
@@ -186,21 +188,20 @@ fn record_back_edge(
     if count == 1 {
         // A previous execution may already have requested (or finished)
         // compilation of this loop — start polling right away.
-        match crate::tiered::jit_state::osr_poll(arity_id, target.0) {
-            crate::tiered::jit_state::OsrPoll::Ready(_)
-            | crate::tiered::jit_state::OsrPoll::Pending => {
+        match globals.jit().osr_poll(arity_id, target.0) {
+            OsrPoll::Ready(_) | OsrPoll::Pending => {
                 ol.polling = Some(target);
                 return;
             }
-            crate::tiered::jit_state::OsrPoll::Failed => {
+            OsrPoll::Failed => {
                 ol.dead.insert(target.0);
                 return;
             }
-            crate::tiered::jit_state::OsrPoll::NotRequested => {}
+            OsrPoll::NotRequested => {}
         }
     }
     if count >= ol.threshold {
-        crate::tiered::jit_state::osr_request(arity_id, target.0, ir_func);
+        globals.jit().osr_request(arity_id, target.0, ir_func);
         ol.polling = Some(target);
     }
 }
@@ -211,11 +212,7 @@ fn record_back_edge(
 ///
 /// Returns `None` (caller keeps interpreting) if any live-in register is not
 /// yet initialized — a conservatively declined transfer, not an error.
-fn try_osr_enter(
-    slot: &crate::tiered::jit_state::OsrSlot,
-    regs: &Registers,
-    env: &mut Env,
-) -> Option<EvalResult> {
+fn try_osr_enter(slot: &OsrSlot, regs: &Registers, env: &mut Env) -> Option<EvalResult> {
     let mut call_args: Vec<Value> = Vec::with_capacity(slot.live_ins.len());
     for var in slot.live_ins.iter() {
         let v = regs.values.get(var.0 as usize).and_then(|v| v.as_ref())?;
@@ -248,7 +245,7 @@ fn try_osr_enter(
     // Same as `call_jit_native`: an uncaught `(throw …)` inside native code
     // stashes the thrown value and returns the nil sentinel — surface it as an
     // error while the alloc frame still roots it.
-    if let Some(thrown) = crate::tiered::jit_state::take_pending_exception() {
+    if let Some(thrown) = env.globals.jit().take_pending_exception() {
         return Some(Err(crate::env::error::EvalError::Thrown(thrown)));
     }
     Some(Ok(result))
@@ -376,8 +373,8 @@ fn interpret_ir_inner(
         if let Some(ol) = osr.as_deref_mut()
             && ol.polling == Some(block.id)
         {
-            match crate::tiered::jit_state::osr_poll(ol.arity_id, block.id.0) {
-                crate::tiered::jit_state::OsrPoll::Ready(slot) => {
+            match globals.jit().osr_poll(ol.arity_id, block.id.0) {
+                OsrPoll::Ready(slot) => {
                     // Regions opened before the loop stay open across the
                     // transfer (the OSR variant drops their RegionEnds) and
                     // are closed as usual when `region_stack` unwinds after
@@ -388,7 +385,7 @@ fn interpret_ir_inner(
                     ol.polling = None;
                     ol.dead.insert(block.id.0);
                 }
-                crate::tiered::jit_state::OsrPoll::Failed => {
+                OsrPoll::Failed => {
                     ol.polling = None;
                     ol.dead.insert(block.id.0);
                 }
@@ -436,7 +433,7 @@ fn interpret_ir_inner(
                 // Loop back-edge counter: a hot header triggers background OSR
                 // compilation; the transfer happens at the header entry above.
                 if let Some(arity_id) = osr_arity_id {
-                    record_back_edge(&mut osr, arity_id, *target, ir_func);
+                    record_back_edge(&mut osr, arity_id, *target, ir_func, globals);
                 }
 
                 // Jump to the target (loop header) block.
@@ -1727,7 +1724,10 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
     // (param_count, is_variadic, ir).
     let mut registered: Vec<(usize, bool, Arc<IrFunction>)> = Vec::new();
 
-    let ir_cache = env.globals.ir_cache().clone();
+    // Hold the tier state by `Arc` rather than borrowing it out of `env`,
+    // which the lowering call below needs mutably.
+    let tiers = env.globals.tiers().clone();
+    let ir_cache = tiers.ir_cache();
 
     for arity in &f.arities {
         let arity_id = arity.ir_arity_id;

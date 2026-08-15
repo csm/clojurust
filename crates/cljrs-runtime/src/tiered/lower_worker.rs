@@ -10,9 +10,11 @@
 //! the JIT exactly as before (the Tier-1 counter restarts at publish).
 //!
 //! The worker is **not** a GC mutator: it never touches `Value`, `Env`, or
-//! the GC heap.  Everything it consumes (`Form`, `Arc<str>`) is plain data,
-//! and all registries it updates (`ir_cache`, `defn_registry`, `jit_state`)
-//! are lock-protected statics.
+//! the GC heap.  Everything it consumes (`Form`, `Arc<str>`) is plain data.
+//! A request carries a `Weak<Tiers>` naming the runtime that enqueued it —
+//! `GlobalEnv` is not `Send`, its tier state is — so the worker publishes
+//! into exactly that runtime's IR cache and JIT tables, or drops the result
+//! if the runtime died while the request sat in the queue.
 //!
 //! ## Rebind races
 //!
@@ -52,7 +54,8 @@ pub(crate) struct LowerArityRequest {
 /// cross-defn registration (`register_defn`) sees the complete fn, exactly
 /// as eager lowering does.
 pub(crate) struct LowerRequest {
-    pub globals_id: u64,
+    /// The runtime to publish into; see the module docs.
+    pub tiers: std::sync::Weak<crate::tiered::tiers::Tiers>,
     pub name: Option<Arc<str>>,
     pub ns: Arc<str>,
     pub is_async: bool,
@@ -75,7 +78,7 @@ pub(crate) fn enqueue(req: LowerRequest) -> bool {
         // The sweep hook and the rebind-invalidation hook are only needed
         // once background lowering actually produces cache entries.
         crate::env::gc_roots::set_stw_reclaim_hook(|| {
-            crate::tiered::ir_cache::sweep_idle(
+            crate::tiered::tiers::sweep_idle(
                 crate::tiered::ir_cache::now_secs(),
                 crate::tiered::ir_cache::ir_cache_ttl_secs(),
             );
@@ -112,14 +115,12 @@ fn process_request(req: &LowerRequest) {
     // The request names the runtime that enqueued it; that runtime owns the
     // cache this lowering publishes into.  A runtime dropped while its
     // request sat in the queue has nothing left to publish to.
-    let Some(ir_cache) = crate::tiered::ir_cache::by_globals_id(req.globals_id) else {
-        cljrs_logging::feat_debug!(
-            "ir",
-            "dropping lower request for dead runtime id={}",
-            req.globals_id
-        );
+    let Some(tiers) = req.tiers.upgrade() else {
+        cljrs_logging::feat_debug!("ir", "dropping lower request for dead runtime");
         return;
     };
+    let ir_cache = tiers.ir_cache();
+    let globals_id = tiers.globals_id();
 
     // Arities lowered (or already cached), collected for the cross-defn
     // registry: (param_count, is_variadic, ir).
@@ -154,7 +155,7 @@ fn process_request(req: &LowerRequest) {
                 arity.destructure_rest.as_ref(),
                 &arity.expanded_body,
                 &req.ns,
-                req.globals_id,
+                globals_id,
                 Some(id),
                 true,
                 req.is_async,
@@ -169,7 +170,7 @@ fn process_request(req: &LowerRequest) {
                         ir_cache.invalidate(id);
                         continue;
                     }
-                    crate::tiered::jit_state::on_ir_published(id);
+                    tiers.jit().on_ir_published(id);
                     registered.push((arity.params.len(), arity.rest_param.is_some(), ir));
                     cljrs_logging::feat_debug!(
                         "ir",
@@ -200,7 +201,7 @@ fn process_request(req: &LowerRequest) {
             // absent and clear `lower_queued` so the dispatch seam can
             // re-trigger lowering on a later call.
             ir_cache.invalidate(id);
-            crate::tiered::jit_state::clear_lower_queued(id);
+            tiers.jit().clear_lower_queued(id);
             cljrs_logging::feat_debug!(
                 "ir",
                 "background lower abandoned after {} rebind retries arity_id={} ({:?})",
@@ -218,7 +219,7 @@ fn process_request(req: &LowerRequest) {
         && !registered.is_empty()
         && let Some(name) = &req.name
     {
-        crate::tiered::defn_registry::register_defn(req.globals_id, &req.ns, name, registered);
+        crate::tiered::defn_registry::register_defn(globals_id, &req.ns, name, registered);
     }
 }
 
@@ -235,9 +236,14 @@ mod tests {
     }
 
     /// An identity-function arity request: `(fn [x] x)`.
-    fn identity_request(arity_id: u64, fn_name: &str, ns: &str, gid: u64) -> LowerRequest {
+    fn identity_request(
+        arity_id: u64,
+        fn_name: &str,
+        ns: &str,
+        tiers: &Arc<crate::tiered::tiers::Tiers>,
+    ) -> LowerRequest {
         LowerRequest {
-            globals_id: gid,
+            tiers: tiers.handle(),
             name: Some(Arc::from(fn_name)),
             ns: Arc::from(ns),
             is_async: false,
@@ -255,14 +261,15 @@ mod tests {
 
     #[test]
     fn process_request_publishes_and_registers() {
-        let _sweep_guard = crate::tiered::ir_cache::SWEEP_TEST_LOCK
+        let _sweep_guard = crate::tiered::tiers::SWEEP_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let id = 0xC500_0001u64;
         let gid = 0xC500_0001u64;
-        let ir_cache = crate::tiered::ir_cache::IrCache::new(gid);
+        let tiers = crate::tiered::tiers::Tiers::new(gid);
+        let ir_cache = tiers.ir_cache();
         let ns = "test.worker-ns";
-        let req = identity_request(id, "ident", ns, gid);
+        let req = identity_request(id, "ident", ns, &tiers);
 
         assert!(ir_cache.should_attempt(id));
         process_request(&req);
@@ -283,7 +290,7 @@ mod tests {
 
     #[test]
     fn process_request_relowers_marked_arity_despite_cache_hit() {
-        let _sweep_guard = crate::tiered::ir_cache::SWEEP_TEST_LOCK
+        let _sweep_guard = crate::tiered::tiers::SWEEP_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         // A rebind of a consumed external invalidates the dependent and
@@ -292,7 +299,8 @@ mod tests {
         // mark must force a re-lower, and must be consumed by it.
         let id = 0xC500_0011u64;
         let gid = 0xC500_0011u64;
-        let ir_cache = crate::tiered::ir_cache::IrCache::new(gid);
+        let tiers = crate::tiered::tiers::Tiers::new(gid);
+        let ir_cache = tiers.ir_cache();
         let callee_ns: Arc<str> = Arc::from("test.worker-relower-ns");
         let callee: Arc<str> = Arc::from("callee");
 
@@ -310,7 +318,7 @@ mod tests {
             id,
             "dependent",
             "test.worker-relower-ns",
-            gid,
+            &tiers,
         ));
 
         // Fresh IR replaced the stale one and the mark was consumed.

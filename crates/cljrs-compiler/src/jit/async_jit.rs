@@ -2,9 +2,9 @@
 //! functions on demand.
 //!
 //! `cljrs-async` drives `^:async` dispatch but cannot compile (it sits below
-//! this crate).  [`crate::init`] installs [`compile_async_arity`] as the
-//! `cljrs_env` async-compile hook; the async dispatcher calls it once per arity
-//! the first time that arity is invoked.  The hook lowers the arity to a state
+//! this crate).  It reaches this code through the runtime's `JitBackend`
+//! ([`crate::jit::Jit::compile_async_arity`]), once per arity, the first time
+//! that arity is invoked.  The call lowers the arity to a state
 //! machine ([`cljrs_ir::lower::lower_async`]), JIT-compiles its poll function,
 //! and registers it in `cljrs_async`'s poll-fn registry, after which dispatch
 //! runs the native state machine.  Any unsupported construct (channels, spawn,
@@ -14,11 +14,11 @@
 use std::sync::Mutex;
 
 use cljrs_async::state_machine::{PollFn, register_poll_fn};
-use cljrs_env::env::Env;
-use cljrs_interp::apply::select_arity;
+use cljrs_runtime::env::env::Env;
+use cljrs_runtime::interp::apply::select_arity;
 use cljrs_value::Value;
 
-use crate::jit_compiler::{CompiledFn, compile_jit_poll};
+use crate::jit::jit_compiler::{CompiledFn, compile_jit_poll};
 
 /// Compiled poll-fn modules kept alive for the process lifetime: each registered
 /// `poll_fn` pointer points into its module's executable memory.  Redefining an
@@ -26,8 +26,8 @@ use crate::jit_compiler::{CompiledFn, compile_jit_poll};
 /// is future work, mirroring the closure-escape epoch pinning elsewhere.
 static KEEPALIVE: Mutex<Vec<CompiledFn>> = Mutex::new(Vec::new());
 
-/// The async-compile hook installed by [`crate::init`].  Lowers the called
-/// `^:async` arity to a state machine, JIT-compiles its poll function, and
+/// Lowers the called `^:async` arity to a state machine, JIT-compiles its
+/// poll function, and
 /// registers it under the arity's `ir_arity_id`.  A no-op on any lowering or
 /// codegen failure, so the arity keeps tree-walking.
 pub(crate) fn compile_async_arity(callee: &Value, nargs: usize, env: &mut Env) {
@@ -72,7 +72,7 @@ pub(crate) fn compile_async_arity(callee: &Value, nargs: usize, env: &mut Env) {
     // mid-scope and would leave the region stack unbalanced.  Async bodies use
     // the GC heap; region promotion for them is future work (close regions
     // before a suspend, reopen on resume).
-    let ir = match cljrs_eval::lower::lower_arity(
+    let ir = match cljrs_runtime::tiered::lower::lower_arity(
         name.as_deref(),
         &params,
         rest_param.as_ref(),
