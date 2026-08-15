@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "clap",
  "cljrs-async",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-async"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-base64"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "base64",
  "cljrs-gc",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-blake3"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "blake3",
  "cljrs-gc",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-charset"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-async",
  "cljrs-gc",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-compiler"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-async",
  "cljrs-base64",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-export-macro"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-gc"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "bigdecimal",
  "num-bigint",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interop"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-export-macro",
  "cljrs-gc",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-io"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-async",
  "cljrs-gc",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-ir"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-reader",
  "cljrs-types",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-lsp"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-reader",
  "cljrs-types",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-net"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "bytes",
  "cljrs-async",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-nrepl"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-project"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-reader"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-types",
  "miette",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-runtime"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "bigdecimal",
  "cljrs-gc",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-stdlib"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-ir",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-tx"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-types"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "miette",
  "serde",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-value"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "arc-swap",
  "bigdecimal",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "cljrs-wasm"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-async",
  "cljrs-gc",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "rust-interop-example"
-version = "0.1.0"
+version = "0.1.248"
 dependencies = [
  "cljrs-gc",
  "cljrs-interop",
