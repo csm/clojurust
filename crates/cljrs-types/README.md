@@ -80,5 +80,5 @@ pub type CljxResult<T> = Result<T, CljxError>;
 
 | Crate | Role |
 |-------|------|
-| `miette` (workspace) | Diagnostic trait + `NamedSource`, `SourceSpan` |
+| `miette` (workspace) | Diagnostic trait + `NamedSource`, `SourceSpan`. Types only — miette's `fancy` renderer is **not** enabled here, so this crate does not link `owo-colors`, `supports-color`, `terminal_size`/`rustix`, `textwrap`, or `backtrace`. A host that wants rendered reports enables `fancy` on its own `miette` dependency (the `cljrs` CLI does). |
 | `thiserror` (workspace) | `#[derive(Error)]` codegen |

@@ -56,7 +56,11 @@ cljrs-tx           = { path = "crates/cljrs-tx",           version = "0.1.0" }
 
 tracing            = "0.1.44"
 tracing-subscriber = "0.3.23"
-miette       = { version = "7", features = ["fancy"] }
+# Types only (`Diagnostic` derive, `SourceSpan`, `NamedSource`, `Report`).
+# The `fancy` feature is the *renderer* — it pulls owo-colors, supports-color,
+# terminal_size/rustix, textwrap, backtrace, addr2line/gimli/object. Only crates
+# that actually print a report to a terminal should enable it (see crates/cljrs).
+miette       = { version = "7" }
 thiserror    = "2"
 inventory    = "0.3"
 clap         = { version = "4", features = ["derive"] }

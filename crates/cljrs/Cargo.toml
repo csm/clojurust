@@ -46,7 +46,9 @@ cljrs-lsp      = { workspace = true }
 cljrs-nrepl    = { workspace = true }
 cljrs-ir       = { workspace = true }
 clap          = { workspace = true }
-miette        = { workspace = true }
+# The CLI is the one crate that renders diagnostics to a terminal, so it is the
+# one crate that opts into miette's `fancy` renderer.
+miette        = { workspace = true, features = ["fancy"] }
 tracing            = { workspace = true }
 rustyline   = { workspace = true, optional = true }
 libloading  = { workspace = true }

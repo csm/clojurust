@@ -132,7 +132,16 @@ error *value* if you would rather hand the failure back to guest code than
 propagate it into Rust.
 
 Reader errors keep their source spans, so `miette` renders them with the
-offending line highlighted if your host uses it.
+offending line highlighted if your host uses it. The clojurust library crates
+depend on miette for its *types* only — `Diagnostic`, `SourceSpan`,
+`NamedSource` — and deliberately do not enable its `fancy` feature, so
+embedding the runtime does not drag in a terminal renderer (`owo-colors`,
+`supports-color`, `terminal_size`, `textwrap`, `backtrace`). If you want that
+rendering, enable it on your own dependency:
+
+```toml
+miette = { version = "7", features = ["fancy"] }
+```
 
 ## GC discipline
 

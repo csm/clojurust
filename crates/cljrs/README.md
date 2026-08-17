@@ -285,7 +285,7 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 | `tracing` (workspace)       | `Level` for the `--debug` / `--trace` default; `--debug` / `--trace` / `-X` all build one `Targets` filter and install the stderr subscriber through `cljrs_runtime::logging`, which owns the `tracing-subscriber` dependency |
 | `cljrs-project` (workspace) | `config` — `cljrs.edn` parser, `DepsConfig` / `Dependency` types; `vcs` — pure-Rust (gitoxide) git helpers: `fetch_remote`, `cache_path_for_url`, native signature verification |
 | `clap` (workspace)          | CLI argument parsing                                              |
-| `miette` (workspace)        | Rich terminal error rendering                                     |
+| `miette` (workspace, `fancy`) | Rich terminal error rendering. The CLI is the only crate that enables miette's `fancy` feature — the library crates take the type half alone, so embedders do not inherit the renderer |
 | `rustyline` (workspace, optional) | Line-editing REPL when `enable-rustyline` is on              |
 | `libloading` (workspace)    | `dlopen` for the project `:rust` cdylib and pinned native packages |
 | `serde_json`                | Reading `target_directory` out of `cargo metadata` output          |

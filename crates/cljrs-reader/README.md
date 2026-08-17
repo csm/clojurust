@@ -302,4 +302,4 @@ pub use token::Token;
 | Crate | Role |
 |-------|------|
 | `cljrs-types` (workspace) | `Span`, `CljxError`, `CljxResult` |
-| `miette` (workspace) | `NamedSource` used in error construction |
+| `miette` (workspace) | `NamedSource` used in error construction. Types only — the `fancy` renderer is not enabled here; see `cljrs-types`. |
