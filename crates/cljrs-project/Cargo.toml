@@ -1,6 +1,6 @@
 [package]
 name = "cljrs-project"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "clojurust project layer: cljrs.edn configuration, dependency resolution, and git/VCS operations"
 license.workspace = true

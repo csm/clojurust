@@ -31,8 +31,8 @@ license = "EPL-1.0"
 repository = "https://github.com/csm/clojurust"
 
 [workspace.dependencies]
-cljrs-types        = { path = "crates/cljrs-types",        version = "0.1.0" }
-cljrs-gc           = { path = "crates/cljrs-gc",           version = "0.1.0" }
+cljrs-types        = { path = "crates/cljrs-types",        version = "0.2.0" }
+cljrs-gc           = { path = "crates/cljrs-gc",           version = "0.2.0" }
 # `default-features = false` on every workspace crate that carries a `default`
 # feature list, so no internal edge silently re-enables one. Cargo unions
 # features across *all* edges to a package, so a single edge left at its
@@ -42,26 +42,26 @@ cljrs-gc           = { path = "crates/cljrs-gc",           version = "0.1.0" }
 # `deps`, `wasm-aot`) and keeps them in its own `default`, leaving plain builds
 # unchanged while a size-constrained embedding can actually opt out.
 # See crates/cljrs-value/src/regex.rs.
-cljrs-value        = { path = "crates/cljrs-value",        version = "0.1.0", default-features = false }
-cljrs-reader       = { path = "crates/cljrs-reader",       version = "0.1.0" }
-cljrs-stdlib       = { path = "crates/cljrs-stdlib",       version = "0.1.0", default-features = false }
-cljrs-runtime      = { path = "crates/cljrs-runtime",      version = "0.1.0", default-features = false }
-cljrs-ir           = { path = "crates/cljrs-ir",           version = "0.1.0" }
-cljrs-compiler     = { path = "crates/cljrs-compiler",     version = "0.1.0", default-features = false }
-cljrs-interop      = { path = "crates/cljrs-interop",      version = "0.1.0", default-features = false }
-cljrs-export-macro = { path = "crates/cljrs-export-macro", version = "0.1.0" }
+cljrs-value        = { path = "crates/cljrs-value",        version = "0.2.0", default-features = false }
+cljrs-reader       = { path = "crates/cljrs-reader",       version = "0.2.0" }
+cljrs-stdlib       = { path = "crates/cljrs-stdlib",       version = "0.2.0", default-features = false }
+cljrs-runtime      = { path = "crates/cljrs-runtime",      version = "0.2.0", default-features = false }
+cljrs-ir           = { path = "crates/cljrs-ir",           version = "0.2.0" }
+cljrs-compiler     = { path = "crates/cljrs-compiler",     version = "0.2.0", default-features = false }
+cljrs-interop      = { path = "crates/cljrs-interop",      version = "0.2.0", default-features = false }
+cljrs-export-macro = { path = "crates/cljrs-export-macro", version = "0.2.0" }
 # Default-off so each member opts in to what it needs: the config model alone
 # (nothing extra), `vcs` for local git + signature verification, `vcs-net` for
 # network fetch. See crates/cljrs-project/Cargo.toml.
-cljrs-project      = { path = "crates/cljrs-project",      version = "0.1.0", default-features = false }
-cljrs-async        = { path = "crates/cljrs-async",        version = "0.1.0", default-features = false }
-cljrs-io           = { path = "crates/cljrs-io",           version = "0.1.0", default-features = false }
-cljrs-net          = { path = "crates/cljrs-net",          version = "0.1.0", default-features = false }
-cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.1.0", default-features = false }
-cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.1.0" }
-cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.1.0", default-features = false }
-cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.1.0", default-features = false }
-cljrs-tx           = { path = "crates/cljrs-tx",           version = "0.1.0", default-features = false }
+cljrs-project      = { path = "crates/cljrs-project",      version = "0.2.0", default-features = false }
+cljrs-async        = { path = "crates/cljrs-async",        version = "0.2.0", default-features = false }
+cljrs-io           = { path = "crates/cljrs-io",           version = "0.2.0", default-features = false }
+cljrs-net          = { path = "crates/cljrs-net",          version = "0.2.0", default-features = false }
+cljrs-charset      = { path = "crates/cljrs-charset",      version = "0.2.0", default-features = false }
+cljrs-lsp          = { path = "crates/cljrs-lsp",          version = "0.2.0" }
+cljrs-nrepl        = { path = "crates/cljrs-nrepl",        version = "0.2.0", default-features = false }
+cljrs-base64       = { path = "crates/cljrs-base64",       version = "0.2.0", default-features = false }
+cljrs-tx           = { path = "crates/cljrs-tx",           version = "0.2.0", default-features = false }
 
 tracing            = "0.1.44"
 tracing-subscriber = "0.3.23"
