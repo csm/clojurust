@@ -522,6 +522,18 @@ Phase 10.6 inline caches:
   `rt_call_ic`'s hot path in `cljrs-compiler`)
 - `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
 
+Multimethod dispatch tries the exact `pr_str(dispatch-val)` key first, then the
+ad-hoc hierarchy, then `:default`. Hierarchy dispatch uses:
+
+- `isa_in_global_hierarchy(child, parent, env) -> bool` — `(isa? child parent)`
+  against `clojure.core/global-hierarchy` (defined in `bootstrap.cljrs`),
+  including element-wise vector matching; falls back to `child == parent` when
+  the var is absent
+
+When several registered dispatch values match and none dominates the others —
+by `prefer-method` or by being a descendant of them — dispatch errors with
+`Multiple methods in multimethod ...`, as on the JVM.
+
 ### `callback` submodule
 
 Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_context`). The context is pushed automatically around native builtin calls and by the Tier-1 IR executor; rt_abi bridges (`rt_call`, `rt_load_global`, the HOF bridges) dispatch through it. Public API includes:
@@ -636,6 +648,16 @@ Callers phrase `OddArity` in their own words (`map literal must have an even
 number of forms`, `let* binding vector must have even length`, ...), so the
 parity rule lives here while the message stays at the boundary.
 
+### Reader metadata on values
+
+`form_to_value` attaches a `^meta` annotation to the value it denotes, so
+`(meta '^{:x 1} [1])` answers `{:x 1}` as on the JVM. Shorthands expand as the
+reader does (`^:kw` → `{:kw true}`, `^Sym` → `{:tag Sym}`), stacked
+annotations merge with the outer one winning (`merge_meta_values`), and values
+that cannot carry metadata (`supports_meta` — the JVM's `IObj`) drop it rather
+than growing a wrapper. A nil annotation carries nothing, and
+`(with-meta x nil)` clears metadata instead of storing a nil-meta wrapper.
+
 ### Phase B3 — `shared-atom` (cross-isolate, two-tier atom ADR)
 
 `shared-atom` is the cross-isolate tier of the two-tier atom design in
@@ -652,6 +674,17 @@ the isolate boundary and be mutated concurrently:
   demote, and `swap!`/`compare-and-set!` use a single lock-free CAS with retry.
 
 ---
+
+### Ad-hoc hierarchies
+
+`derive`, `underive`, `isa?`, `parents`, `ancestors` and `descendants` are
+defined in `bootstrap.cljrs`, not registered as native builtins: a hierarchy is
+a plain `{:parents {} :descendants {} :ancestors {}}` value and every operation
+on it is pure data manipulation. The 3-arity forms are pure functions of that
+value; the 2-arity forms read and `alter-var-root`
+`clojure.core/global-hierarchy`. `make-hierarchy` stays native
+(`builtin_make_hierarchy`). Multimethod dispatch consults the same var — see
+`env::apply::isa_in_global_hierarchy`.
 
 ## Module `interp`
 

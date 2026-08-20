@@ -541,19 +541,6 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
         "make-hierarchy",
         "Creates a new, independent global hierarchy for use with derive/isa?.",
     ),
-    (
-        "ancestors",
-        "Returns the immediate and indirect parents of tag, as a set.",
-    ),
-    (
-        "descendants",
-        "Returns the immediate and indirect children of tag, as a set.",
-    ),
-    ("parents", "Returns the immediate parents of tag, as a set."),
-    (
-        "isa?",
-        "Returns true if (= child parent), or child is directly or transitively derived from parent.",
-    ),
     // Seq ops
     ("seq", "Returns a seq on coll, or nil if coll is empty/nil."),
     ("first", "Returns the first item in coll."),
@@ -1444,17 +1431,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        // Hierarchy (stubs — return global hierarchy or nil)
+        // Hierarchy — derive/underive/isa?/parents/ancestors/descendants are
+        // defined in bootstrap.cljrs and documented there.
         ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
-        ("derive", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("underive", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("ancestors", Arity::Variadic { min: 1 }, builtin_ancestors),
-        (
-            "descendants",
-            Arity::Variadic { min: 1 },
-            builtin_descendants,
-        ),
-        ("parents", Arity::Variadic { min: 1 }, builtin_parents),
         // Tap system
         (
             "add-tap",
@@ -1545,7 +1524,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
-        ("isa?", Arity::Fixed(2), builtin_isa_q),
         // Records / reify
         (
             "make-type-instance",
@@ -7189,26 +7167,6 @@ fn builtin_make_hierarchy(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Map(MapValue::Hash(GcPtr::new(m))))
 }
 
-fn builtin_ancestors(args: &[Value]) -> ValueResult<Value> {
-    // Stub: return empty set
-    let _ = args;
-    Ok(Value::Set(SetValue::Hash(GcPtr::new(
-        cljrs_value::collections::PersistentHashSet::empty(),
-    ))))
-}
-
-fn builtin_descendants(args: &[Value]) -> ValueResult<Value> {
-    let _ = args;
-    Ok(Value::Set(SetValue::Hash(GcPtr::new(
-        cljrs_value::collections::PersistentHashSet::empty(),
-    ))))
-}
-
-fn builtin_parents(args: &[Value]) -> ValueResult<Value> {
-    let _ = args;
-    Ok(Value::Nil)
-}
-
 // ── bound-fn* ────────────────────────────────────────────────────────────────
 
 fn builtin_bound_fn_star(args: &[Value]) -> ValueResult<Value> {
@@ -7927,6 +7885,7 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
     };
     let key = format!("{}", args[1]);
     mf.get().methods.lock().unwrap().remove(&key);
+    mf.get().dispatch_vals.lock().unwrap().remove(&key);
     Ok(Value::MultiFn(mf.clone()))
 }
 
@@ -7946,11 +7905,6 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
         m = m.assoc(Value::string(k.clone()), v.clone());
     }
     Ok(Value::Map(m))
-}
-
-fn builtin_isa_q(args: &[Value]) -> ValueResult<Value> {
-    // Stub: equality only; full hierarchy deferred.
-    Ok(Value::Bool(args[0] == args[1]))
 }
 
 // ── Phase 7 — Concurrency primitives ─────────────────────────────────────────
@@ -8452,6 +8406,9 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
             ns.get().set_meta(args[1].clone());
             Ok(args[0].clone())
         }
+        // `(with-meta x nil)` clears metadata; storing a nil-meta wrapper would
+        // leave a value that is no longer `identical?` to itself after a clone.
+        _ if matches!(args[1], Value::Nil) => Ok(args[0].unwrap_meta().clone()),
         _ => Ok(args[0].clone().with_meta(args[1].clone())),
     }
 }

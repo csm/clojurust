@@ -5,8 +5,7 @@
 (when-var-exists
   underive
 
-  #?@(:rust nil
-      :default
+  #?@(:default
       [(def shape-hierarchy
          (-> (make-hierarchy)
              (derive ::circle ::shape)

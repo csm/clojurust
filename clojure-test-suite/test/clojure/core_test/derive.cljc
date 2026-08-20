@@ -3,8 +3,7 @@
             [clojure.core-test.portability #?(:cljs :refer-macros :default :refer) [when-var-exists]]))
 
 (when-var-exists derive
-  #?(:rust nil
-     :default
+  #?(:default
      (deftest test-derive
 
        (testing "derive tag parent"
@@ -15,7 +14,7 @@
                              success)
                            ::rect ::shape
                            'n/a 'n/b
-                           #?(:cljs js/String :lpy python/str :default String) ::object))
+                           #?(:cljs js/String :lpy python/str :rust ::string :default String) ::object))
 
        (testing "derive h tag parent"
          (are [expected h tag parent] (= expected (derive h tag parent))
@@ -34,9 +33,9 @@
                                        :descendants {'n/b #{'n/a}}
                                        :parents     {'n/a #{'n/b}}} (make-hierarchy) 'n/a 'n/b
 
-                                      {:ancestors   {#?(:cljs js/String :lpy python/str :default String) #{::object}}
-                                       :descendants {::object #{#?(:cljs js/String :lpy python/str :default String)}}
-                                       :parents     {#?(:cljs js/String :lpy python/str :default String) #{::object}}} (make-hierarchy) #?(:cljs js/String :lpy python/str :default String) ::object
+                                      {:ancestors   {#?(:cljs js/String :lpy python/str :rust ::string :default String) #{::object}}
+                                       :descendants {::object #{#?(:cljs js/String :lpy python/str :rust ::string :default String)}}
+                                       :parents     {#?(:cljs js/String :lpy python/str :rust ::string :default String) #{::object}}} (make-hierarchy) #?(:cljs js/String :lpy python/str :rust ::string :default String) ::object
 
                                       {:ancestors   {::rect #{::shape}, ::square #{::rect ::shape}}
                                        :descendants {::rect #{::square}, ::shape #{::rect ::square}}
@@ -76,11 +75,12 @@
                                          ::a :b
                                          'a 'b
                                          'n/a 'b
-                                         #?(:cljs js/String :lpy python/str :default String) :b)))
+                                         #?(:cljs js/String :lpy python/str :rust ::string :default String) :b)))
 
          (testing "more invalid parents"
            (are [tag parent] (thrown? #?(:cljs js/Error :bb Error :default Exception) (derive tag parent))
-                             ::tag #?(:cljs js/String :lpy python/str :default String)
+                             #?@(:rust [] ; no host classes on :rust — 42 / "parent" cover non-Named parents
+                                 :default [::tag #?(:cljs js/String :lpy python/str :default String)])
                              ::tag 42
                              ::tag "parent"))
 

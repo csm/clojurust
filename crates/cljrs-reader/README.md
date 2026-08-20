@@ -139,6 +139,23 @@ impl Form {
     /// Total heap bytes owned by this form tree, excluding the Form struct itself.
     /// Used by GcSize implementations to accurately track memory pressure.
     pub fn heap_size(&self) -> usize
+
+    // ── Metadata ──
+    /// This form with every `^meta` wrapper removed (stacked metadata included).
+    pub fn unmeta(&self) -> &Form
+    /// The `^meta` forms attached here, outermost first, plus the annotated form.
+    pub fn peel_meta(&self) -> (Vec<&Form>, &Form)
+
+    // ── Structural views ──
+    // Each reports the shape of `unmeta()`, so `^m form` has the same shape as
+    // `form`. Special-form parsers ask these instead of matching `FormKind`
+    // directly, which is what keeps a `^hint` from changing how a form parses.
+    pub fn as_symbol(&self) -> Option<&str>
+    pub fn as_keyword(&self) -> Option<&str>
+    pub fn as_string(&self) -> Option<&str>
+    pub fn as_list(&self) -> Option<&[Form]>
+    pub fn as_vector(&self) -> Option<&[Form]>
+    pub fn as_map(&self) -> Option<&[Form]>
 }
 
 impl FormKind {

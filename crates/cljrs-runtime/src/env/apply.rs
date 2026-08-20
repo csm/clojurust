@@ -19,9 +19,88 @@ fn check_arity(arity: &Arity, argc: usize, name: &str) -> EvalResult<()> {
     }
 }
 
+/// `(isa? child parent)` against the hierarchy held in
+/// `clojure.core/global-hierarchy`, including element-wise vector matching.
+///
+/// Answers `child == parent` when the var is absent or malformed.
+pub fn isa_in_global_hierarchy(child: &Value, parent: &Value, env: &Env) -> bool {
+    if child == parent {
+        return true;
+    }
+    let ancestors = env
+        .globals
+        .lookup_var("clojure.core", "global-hierarchy")
+        .and_then(|v| v.get().deref())
+        .and_then(|h| match h {
+            Value::Map(m) => m.get(&Value::keyword(cljrs_value::Keyword::simple("ancestors"))),
+            _ => None,
+        });
+    if let Some(Value::Map(ancestors)) = &ancestors
+        && let Some(Value::Set(of_child)) = ancestors.get(child)
+        && of_child.contains(parent)
+    {
+        return true;
+    }
+    if let (Value::Vector(c), Value::Vector(p)) = (child, parent) {
+        let (c, p) = (c.get(), p.get());
+        return c.count() == p.count()
+            && (0..c.count()).all(|i| match (c.nth(i), p.nth(i)) {
+                (Some(cv), Some(pv)) => isa_in_global_hierarchy(cv, pv, env),
+                _ => false,
+            });
+    }
+    false
+}
+
+/// The method key a dispatch value inherits, or `None` when no registered
+/// dispatch value is an ancestor of it.
+///
+/// Errors when several unrelated methods match and no `prefer-method` call
+/// separates them — the same ambiguity Clojure reports.
+fn hierarchy_method_key(
+    mf: &cljrs_value::MultiFn,
+    dispatch_val: &Value,
+    env: &Env,
+) -> EvalResult<Option<String>> {
+    let dispatch_vals = mf.dispatch_vals.lock().unwrap();
+    let matches: Vec<(String, Value)> = dispatch_vals
+        .iter()
+        .filter(|(k, v)| {
+            k.as_str() != mf.default_dispatch && isa_in_global_hierarchy(dispatch_val, v, env)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if matches.len() <= 1 {
+        return Ok(matches.into_iter().next().map(|(k, _)| k));
+    }
+
+    let prefers = mf.prefers.lock().unwrap();
+    let dominates = |a: &(String, Value), b: &(String, Value)| {
+        prefers.get(&a.0).is_some_and(|over| over.contains(&b.0))
+            || isa_in_global_hierarchy(&a.1, &b.1, env)
+    };
+    let best: Vec<&(String, Value)> = matches
+        .iter()
+        .filter(|a| matches.iter().all(|b| a.0 == b.0 || dominates(a, b)))
+        .collect();
+    match best.as_slice() {
+        [only] => Ok(Some(only.0.clone())),
+        _ => Err(EvalError::Runtime(format!(
+            "Multiple methods in multimethod '{}' match dispatch value {}: {}, and neither is preferred",
+            mf.name,
+            dispatch_val,
+            matches
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ))),
+    }
+}
+
 /// Return the canonical type tag for a value (used by protocol dispatch).
 pub fn type_tag_of(val: &Value) -> Arc<str> {
-    match val {
+    match val.unwrap_meta() {
         Value::Nil => Arc::from("nil"),
         Value::Bool(_) => Arc::from("Boolean"),
         Value::Long(_) => Arc::from("Long"),
@@ -215,16 +294,27 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             cljrs_gc::safepoint();
             let key = format!("{}", dispatch_val);
             let methods = mf_ref.methods.lock().unwrap();
-            let impl_fn = methods
-                .get(&key)
-                .or_else(|| methods.get(&mf_ref.default_dispatch))
-                .cloned()
-                .ok_or_else(|| {
-                    EvalError::Runtime(format!(
-                        "No method in multimethod '{}' for dispatch value {}",
-                        mf_ref.name, key
-                    ))
-                })?;
+            let exact = methods.get(&key).cloned();
+            let impl_fn = match exact {
+                Some(f) => f,
+                None => {
+                    let inherited = hierarchy_method_key(mf_ref, &dispatch_val, env)?;
+                    match inherited.and_then(|k| methods.get(&k).cloned()) {
+                        Some(f) => f,
+                        None => {
+                            methods
+                                .get(&mf_ref.default_dispatch)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    EvalError::Runtime(format!(
+                                        "No method in multimethod '{}' for dispatch value {}",
+                                        mf_ref.name, key
+                                    ))
+                                })?
+                        }
+                    }
+                }
+            };
             drop(methods);
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
