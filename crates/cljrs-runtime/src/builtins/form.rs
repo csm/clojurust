@@ -222,6 +222,55 @@ pub fn resolve_auto_forms(form: &Form, env: &crate::env::env::Env) -> EvalResult
     Ok(Form::new(kind, form.span.clone()))
 }
 
+/// True for values that carry metadata (the JVM's `IObj`).
+///
+/// Scalars silently drop an annotation rather than growing a `WithMeta`
+/// wrapper no other tier expects.
+pub fn supports_meta(value: &Value) -> bool {
+    matches!(
+        value.unwrap_meta(),
+        Value::List(_)
+            | Value::Vector(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::Symbol(_)
+            | Value::Cons(_)
+            | Value::LazySeq(_)
+            | Value::Fn(_)
+            | Value::TypeInstance(_)
+    )
+}
+
+/// The map a `^meta` form denotes *as data*, expanding the reader shorthands
+/// (`^:kw` → `{:kw true}`, `^Sym` / `^"Str"` → `{:tag …}`).
+///
+/// Nothing is evaluated: inside `quote` the annotation is data, so
+/// `'^{:x (+ 1 2)} [1]` keeps the unevaluated list.
+fn meta_form_to_value(meta: &Form) -> EvalResult<Value> {
+    Ok(match &meta.kind {
+        FormKind::Keyword(k) => Value::Map(
+            MapValue::empty().assoc(Value::keyword(Keyword::parse(k)), Value::Bool(true)),
+        ),
+        FormKind::Symbol(_) | FormKind::Str(_) => Value::Map(
+            MapValue::empty().assoc(Value::keyword(Keyword::parse("tag")), form_to_value(meta)?),
+        ),
+        _ => form_to_value(meta)?,
+    })
+}
+
+/// Assoc every entry of `overlay` onto `base`, as the reader does for stacked
+/// metadata (`^:a ^:b x`): both survive, the outer annotation wins a clash.
+pub fn merge_meta_values(base: &Value, overlay: &Value) -> Value {
+    match (base, overlay) {
+        (Value::Map(base), Value::Map(overlay)) => {
+            let mut merged = base.clone();
+            overlay.for_each(|k, v| merged = merged.assoc(k.clone(), v.clone()));
+            Value::Map(merged)
+        }
+        _ => overlay.clone(),
+    }
+}
+
 /// Convert a `Form` to its literal `Value` without evaluating.
 /// Used by `quote` and macro expansion.
 ///
@@ -285,7 +334,19 @@ pub fn form_to_value(form: &Form) -> EvalResult<Value> {
         FormKind::UnquoteSplice(inner) => reader_form_value("unquote-splicing", inner)?,
         FormKind::Deref(inner) => reader_form_value("deref", inner)?,
         FormKind::Var(inner) => reader_form_value("var", inner)?,
-        FormKind::Meta(_meta, inner) => form_to_value(inner)?,
+        FormKind::Meta(meta, inner) => {
+            let value = form_to_value(inner)?;
+            let m = meta_form_to_value(meta)?;
+            if supports_meta(&value) && !matches!(m, Value::Nil) {
+                let merged = match value.get_meta() {
+                    Some(existing) => merge_meta_values(existing, &m),
+                    None => m,
+                };
+                value.with_meta(merged)
+            } else {
+                value
+            }
+        }
         FormKind::AnonFn(body) => {
             // Expand #(...) to (fn* [...] ...) so it round-trips correctly through quote.
             let expanded = expand_anon_fn(body, form.span.clone());

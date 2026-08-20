@@ -8452,6 +8452,9 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
             ns.get().set_meta(args[1].clone());
             Ok(args[0].clone())
         }
+        // `(with-meta x nil)` clears metadata; storing a nil-meta wrapper would
+        // leave a value that is no longer `identical?` to itself after a clone.
+        _ if matches!(args[1], Value::Nil) => Ok(args[0].unwrap_meta().clone()),
         _ => Ok(args[0].clone().with_meta(args[1].clone())),
     }
 }

@@ -636,6 +636,16 @@ Callers phrase `OddArity` in their own words (`map literal must have an even
 number of forms`, `let* binding vector must have even length`, ...), so the
 parity rule lives here while the message stays at the boundary.
 
+### Reader metadata on values
+
+`form_to_value` attaches a `^meta` annotation to the value it denotes, so
+`(meta '^{:x 1} [1])` answers `{:x 1}` as on the JVM. Shorthands expand as the
+reader does (`^:kw` → `{:kw true}`, `^Sym` → `{:tag Sym}`), stacked
+annotations merge with the outer one winning (`merge_meta_values`), and values
+that cannot carry metadata (`supports_meta` — the JVM's `IObj`) drop it rather
+than growing a wrapper. A nil annotation carries nothing, and
+`(with-meta x nil)` clears metadata instead of storing a nil-meta wrapper.
+
 ### Phase B3 — `shared-atom` (cross-isolate, two-tier atom ADR)
 
 `shared-atom` is the cross-isolate tier of the two-tier atom design in

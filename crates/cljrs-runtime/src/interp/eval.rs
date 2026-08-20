@@ -142,9 +142,22 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
                 Err(EvalError::Runtime("var requires a symbol".into()))
             }
         }
-        FormKind::Meta(_, form) => {
-            // Ignore metadata in Phase 4; just eval the annotated form.
-            eval(form, env)
+        FormKind::Meta(meta, form) => {
+            // `^m expr` evaluates `expr` and attaches the annotation, as the
+            // JVM reader does. Values that cannot carry metadata drop it.
+            let value = eval(form, env)?;
+            if !crate::builtins::form::supports_meta(&value) {
+                return Ok(value);
+            }
+            let m = crate::interp::special::compile_meta_form(meta, env)?;
+            if matches!(m, Value::Nil) {
+                return Ok(value);
+            }
+            let merged = match value.get_meta() {
+                Some(existing) => crate::builtins::form::merge_meta_values(existing, &m),
+                None => m,
+            };
+            Ok(value.with_meta(merged))
         }
 
         // ── Dispatch ──────────────────────────────────────────────────────
@@ -194,7 +207,7 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     // Check for special form.
-    if let FormKind::Symbol(s) = &forms[0].kind
+    if let Some(s) = forms[0].as_symbol()
         && is_special_form(s)
     {
         return eval_special(s, &forms[1..], env);
