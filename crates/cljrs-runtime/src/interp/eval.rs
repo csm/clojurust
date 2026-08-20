@@ -194,7 +194,7 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     // Check for special form.
-    if let FormKind::Symbol(s) = &forms[0].kind
+    if let Some(s) = forms[0].as_symbol()
         && is_special_form(s)
     {
         return eval_special(s, &forms[1..], env);

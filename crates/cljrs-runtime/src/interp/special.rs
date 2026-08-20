@@ -197,12 +197,9 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     let mut is_async = false;
     let peeled: Vec<Form>;
     let args: &[Form] = if matches!(args.first().map(|f| &f.kind), Some(FormKind::Meta(..))) {
-        let mut head = args[0].clone();
-        while let FormKind::Meta(meta, inner) = head.kind {
-            is_async |= meta_form_is_async(&meta);
-            head = *inner;
-        }
-        peeled = std::iter::once(head)
+        let (metas, head) = args[0].peel_meta();
+        is_async |= metas.iter().any(|m| meta_form_is_async(m));
+        peeled = std::iter::once(head.clone())
             .chain(args[1..].iter().cloned())
             .collect();
         &peeled
@@ -226,7 +223,9 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
         return Err(EvalError::Runtime("fn* requires params and body".into()));
     }
 
-    let arities = match &rest[0].kind {
+    // A `^hint` on the params vector or on an arity clause is advisory — the
+    // structural shape is the form underneath it.
+    let arities = match &rest[0].unmeta().kind {
         FormKind::Vector(_) => {
             // Single arity: (fn* [params] body...)
             vec![parse_arity(&rest[0], &rest[1..])?]
@@ -235,7 +234,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
             // Multi-arity: (fn* ([params] body...) ...)
             rest.iter()
                 .map(|arity_form| {
-                    if let FormKind::List(forms) = &arity_form.kind {
+                    if let Some(forms) = arity_form.as_list() {
                         if forms.is_empty() {
                             return Err(EvalError::Runtime("arity clause requires params".into()));
                         }
@@ -284,13 +283,10 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Parse one arity: params-form and body forms.
 pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity> {
-    let param_forms = match &params_form.kind {
-        FormKind::Vector(v) => v,
-        _ => {
-            return Err(EvalError::Runtime(
-                "fn arity params must be a vector".into(),
-            ));
-        }
+    let Some(param_forms) = params_form.as_vector() else {
+        return Err(EvalError::Runtime(
+            "fn arity params must be a vector".into(),
+        ));
     };
 
     let mut params: Vec<Arc<str>> = Vec::new();
@@ -383,9 +379,9 @@ fn desugar_pre_post_conditions(body: &[Form]) -> Vec<Form> {
         None => return body.to_vec(),
     };
 
-    let entries = match &first.kind {
-        FormKind::Map(entries) => entries,
-        _ => return body.to_vec(),
+    let entries = match first.as_map() {
+        Some(entries) => entries,
+        None => return body.to_vec(),
     };
 
     let mut pre_conds: Vec<Form> = Vec::new();
@@ -541,11 +537,11 @@ fn eval_if(args: &[Form], env: &mut Env) -> EvalResult {
 // ── let* ──────────────────────────────────────────────────────────────────────
 
 fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
-    let bindings = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Vector(v)) => expand_pairs(v)
+    let bindings = match args.first().and_then(|f| f.as_vector()) {
+        Some(v) => expand_pairs(v)
             .map_err(|_| EvalError::Runtime("let* binding vector must have even length".into()))?
             .into_owned(),
-        _ => return Err(EvalError::Runtime("let* requires a binding vector".into())),
+        None => return Err(EvalError::Runtime("let* requires a binding vector".into())),
     };
 
     let body = &args[1..];
@@ -733,11 +729,11 @@ fn eval_chain_normally(
 // ── loop* / recur ─────────────────────────────────────────────────────────────
 
 pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
-    let bindings = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Vector(v)) => expand_pairs(v)
+    let bindings = match args.first().and_then(|f| f.as_vector()) {
+        Some(v) => expand_pairs(v)
             .map_err(|_| EvalError::Runtime("loop* binding vector must have even length".into()))?
             .into_owned(),
-        _ => return Err(EvalError::Runtime("loop* requires a binding vector".into())),
+        None => return Err(EvalError::Runtime("loop* requires a binding vector".into())),
     };
 
     let body = &args[1..];
@@ -1034,6 +1030,11 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
     result
 }
 
+/// The class name or `:default` keyword naming what a `catch` clause catches.
+fn catch_target(f: &Form) -> Option<&str> {
+    f.as_symbol().or_else(|| f.as_keyword())
+}
+
 /// Split try args into (body, catch clauses, finally body).
 ///
 /// Public so the async evaluator can parse `try` forms identically.
@@ -1043,8 +1044,8 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
     let mut fin_body: &[Form] = &[];
 
     for (i, form) in args.iter().enumerate() {
-        if let FormKind::List(parts) = &form.kind
-            && let Some(FormKind::Symbol(s)) = parts.first().map(|f| &f.kind)
+        if let Some(parts) = form.as_list()
+            && let Some(s) = parts.first().and_then(|f| f.as_symbol())
         {
             if s == "catch" {
                 if i < body_end {
@@ -1054,22 +1055,25 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
                 // the ClojureScript `:default` catch-all keyword, or a reader
                 // conditional `#?(:rust Exception :clj ...)` whose selected branch
                 // resolves to one of those.
-                let type_sym = match parts.get(1).map(|f| &f.kind) {
-                    Some(FormKind::Symbol(s)) => s.as_str(),
-                    Some(FormKind::Keyword(s)) => s.as_str(),
-                    Some(FormKind::ReaderCond {
-                        splicing: false,
-                        clauses,
-                    }) => match select_reader_cond(clauses).map(|f| &f.kind) {
-                        Some(FormKind::Symbol(s)) => s.as_str(),
-                        Some(FormKind::Keyword(s)) => s.as_str(),
-                        _ => continue,
+                let type_sym = match parts.get(1) {
+                    Some(f) => match catch_target(f) {
+                        Some(name) => name,
+                        None => match &f.unmeta().kind {
+                            FormKind::ReaderCond {
+                                splicing: false,
+                                clauses,
+                            } => match select_reader_cond(clauses).and_then(catch_target) {
+                                Some(name) => name,
+                                None => continue,
+                            },
+                            _ => continue,
+                        },
                     },
-                    _ => continue,
+                    None => continue,
                 };
-                let binding = match parts.get(2).map(|f| &f.kind) {
-                    Some(FormKind::Symbol(s)) => s.as_str(),
-                    _ => continue,
+                let binding = match parts.get(2).and_then(|f| f.as_symbol()) {
+                    Some(s) => s,
+                    None => continue,
                 };
                 catches.push(CatchClause {
                     type_sym,
@@ -1095,13 +1099,13 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
 
 pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
     // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
-    let (name, mut is_async) = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Symbol(s)) => (s.clone(), false),
-        Some(FormKind::Meta(meta, inner)) => match &inner.kind {
-            FormKind::Symbol(s) => (s.clone(), meta_form_is_async(meta)),
-            _ => return Err(EvalError::Runtime("defn name must be a symbol".into())),
-        },
-        _ => return Err(EvalError::Runtime("defn requires a symbol name".into())),
+    let name_form = args
+        .first()
+        .ok_or_else(|| EvalError::Runtime("defn requires a symbol name".into()))?;
+    let (name_metas, name_sym) = name_form.peel_meta();
+    let (name, mut is_async) = match &name_sym.kind {
+        FormKind::Symbol(s) => (s.clone(), name_metas.iter().any(|m| meta_form_is_async(m))),
+        _ => return Err(EvalError::Runtime("defn name must be a symbol".into())),
     };
     // Optional docstring and/or metadata map after the name.
     // Valid orderings: (defn name body...), (defn name "doc" body...),
@@ -1109,13 +1113,13 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
     let mut rest_start = 1;
     let mut docstring: Option<String> = None;
     if rest_start < args.len()
-        && let FormKind::Str(s) = &args[rest_start].kind
+        && let Some(s) = args[rest_start].as_string()
     {
-        docstring = Some(s.clone());
+        docstring = Some(s.to_string());
         rest_start += 1;
     }
     let mut attr_meta: Option<Value> = None;
-    if rest_start < args.len() && matches!(args[rest_start].kind, FormKind::Map(_)) {
+    if rest_start < args.len() && args[rest_start].as_map().is_some() {
         // An attr-map such as `{:async true}` can also request async dispatch.
         is_async |= meta_form_is_async(&args[rest_start]);
         attr_meta = Some(eval(&args[rest_start], env)?);
@@ -1158,7 +1162,7 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
 /// - Multi-arity clause list `([params...] body...)` → `([&form &env params...] body...)`
 fn prepend_macro_params(form: &Form) -> Form {
     let span = form.span.clone();
-    match &form.kind {
+    match &form.unmeta().kind {
         FormKind::Vector(params) => {
             let mut new_params = vec![
                 Form::new(FormKind::Symbol("&form".to_string()), span.clone()),
@@ -1701,15 +1705,15 @@ fn eval_load_file(args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
     // (letfn [(f [params] body...) ...] body...)
-    let bindings = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Vector(v)) => expand_reader_conds_cow(v).into_owned(),
-        _ => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
+    let bindings = match args.first().and_then(|f| f.as_vector()) {
+        Some(v) => expand_reader_conds_cow(v).into_owned(),
+        None => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
     };
 
     env.push_frame();
 
     for binding in &bindings {
-        if let FormKind::List(parts) = &binding.kind {
+        if let Some(parts) = binding.as_list() {
             if parts.is_empty() {
                 continue;
             }
@@ -1723,16 +1727,13 @@ fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
                     return Err(e);
                 }
             };
-            let name = match &parts[0].kind {
-                FormKind::Symbol(s) => s.clone(),
-                _ => {
-                    env.pop_frame();
-                    return Err(EvalError::Runtime(
-                        "letfn binding name must be a symbol".into(),
-                    ));
-                }
+            let Some(name) = parts[0].as_symbol() else {
+                env.pop_frame();
+                return Err(EvalError::Runtime(
+                    "letfn binding name must be a symbol".into(),
+                ));
             };
-            env.bind(Arc::from(name.as_str()), fn_val);
+            env.bind(Arc::from(name), fn_val);
         }
     }
 
@@ -1804,7 +1805,7 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     let proto_name: Arc<str> = Arc::from(name);
 
     // Skip optional docstring.
-    let methods_start = if args.len() > 1 && matches!(args[1].kind, FormKind::Str(_)) {
+    let methods_start = if args.len() > 1 && args[1].as_string().is_some() {
         2
     } else {
         1
@@ -1818,10 +1819,12 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     while i < rest.len() {
         // Protocol options are flat `:keyword value` pairs interspersed
         // among the method signatures, e.g. `:extend-via-metadata true`.
-        if let FormKind::Keyword(kw) = &rest[i].kind {
+        if let Some(kw) = rest[i].as_keyword() {
             if kw == "extend-via-metadata" {
-                extend_via_metadata =
-                    matches!(rest.get(i + 1).map(|f| &f.kind), Some(FormKind::Bool(true)));
+                extend_via_metadata = matches!(
+                    rest.get(i + 1).map(|f| &f.unmeta().kind),
+                    Some(FormKind::Bool(true))
+                );
             }
             i += 2;
             continue;
@@ -1829,35 +1832,26 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
         let form = &rest[i];
         i += 1;
         // Each method spec is (method-name [params...] "doc"?)
-        let parts = match &form.kind {
-            FormKind::List(parts) => parts,
-            _ => continue, // skip unknown forms
+        let parts = match form.as_list() {
+            Some(parts) => parts,
+            None => continue, // skip unknown forms
         };
         if parts.is_empty() {
             continue;
         }
-        let method_name = match &parts[0].kind {
-            FormKind::Symbol(s) => Arc::from(s.as_str()),
-            _ => continue,
+        let method_name: Arc<str> = match parts[0].as_symbol() {
+            Some(s) => Arc::from(s),
+            None => continue,
         };
         // Find the parameter vector (first vector in parts).
-        let (min_arity, variadic) = if let Some(params_form) =
-            parts.iter().find(|f| matches!(f.kind, FormKind::Vector(_)))
-        {
-            if let FormKind::Vector(param_forms) = &params_form.kind {
-                let variadic = param_forms
-                    .iter()
-                    .any(|p| matches!(&p.kind, FormKind::Symbol(s) if s == "&"));
-                let fixed: usize = param_forms
-                    .iter()
-                    .filter(|p| !matches!(&p.kind, FormKind::Symbol(s) if s == "&"))
-                    .count();
+        let (min_arity, variadic) = match parts.iter().find_map(|f| f.as_vector()) {
+            Some(param_forms) => {
+                let is_amp = |p: &Form| p.as_symbol() == Some("&");
+                let variadic = param_forms.iter().any(is_amp);
+                let fixed = param_forms.iter().filter(|p| !is_amp(p)).count();
                 (fixed, variadic)
-            } else {
-                (1, false)
             }
-        } else {
-            (1, false)
+            None => (1, false),
         };
         methods.push(ProtocolMethod {
             name: method_name,
@@ -1904,20 +1898,17 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
             "extend-type requires a type symbol".into(),
         ));
     }
-    let type_sym = match &args[0].kind {
-        FormKind::Symbol(s) => s.clone(),
-        _ => {
-            return Err(EvalError::Runtime(
-                "extend-type: first arg must be a type symbol".into(),
-            ));
-        }
+    let Some(type_sym) = args[0].as_symbol() else {
+        return Err(EvalError::Runtime(
+            "extend-type: first arg must be a type symbol".into(),
+        ));
     };
     let type_tag = crate::interp::apply::resolve_type_tag(&type_sym);
 
     let mut current_proto: Option<GcPtr<Protocol>> = None;
 
     for form in &args[1..] {
-        match &form.kind {
+        match &form.unmeta().kind {
             FormKind::Symbol(s) => {
                 // Look up protocol in env.
                 let val = env.globals.lookup_in_ns(&env.current_ns, s);
@@ -1941,9 +1932,9 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
                 if parts.is_empty() {
                     continue;
                 }
-                let method_name = match &parts[0].kind {
-                    FormKind::Symbol(s) => Arc::from(s.as_str()),
-                    _ => continue,
+                let method_name: Arc<str> = match parts[0].as_symbol() {
+                    Some(s) => Arc::from(s),
+                    None => continue,
                 };
                 let fn_val = build_impl_fn(parts, env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
@@ -1970,15 +1961,12 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
             "extend-protocol requires a protocol".into(),
         ));
     }
-    let proto_sym = match &args[0].kind {
-        FormKind::Symbol(s) => s.clone(),
-        _ => {
-            return Err(EvalError::Runtime(
-                "extend-protocol: first arg must be a protocol symbol".into(),
-            ));
-        }
+    let Some(proto_sym) = args[0].as_symbol() else {
+        return Err(EvalError::Runtime(
+            "extend-protocol: first arg must be a protocol symbol".into(),
+        ));
     };
-    let proto_val = env.globals.lookup_in_ns(&env.current_ns, &proto_sym);
+    let proto_val = env.globals.lookup_in_ns(&env.current_ns, proto_sym);
     let proto_ptr = match proto_val {
         Some(Value::Protocol(p)) => p,
         _ => {
@@ -1992,7 +1980,7 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
     let mut current_type: Option<Arc<str>> = None;
 
     for form in &args[1..] {
-        match &form.kind {
+        match &form.unmeta().kind {
             FormKind::Symbol(s) => {
                 current_type = Some(crate::interp::apply::resolve_type_tag(s));
             }
@@ -2003,9 +1991,9 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
                 if parts.is_empty() {
                     continue;
                 }
-                let method_name = match &parts[0].kind {
-                    FormKind::Symbol(s) => Arc::from(s.as_str()),
-                    _ => continue,
+                let method_name: Arc<str> = match parts[0].as_symbol() {
+                    Some(s) => Arc::from(s),
+                    None => continue,
                 };
                 let fn_val = build_impl_fn(parts, env)?;
                 let mut impls = proto_ptr.get().impls.lock().unwrap();
@@ -2038,10 +2026,7 @@ fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
     let body = &parts[2..];
     let arity = parse_arity(params_form, body)?;
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
-    let fn_name = match &parts[0].kind {
-        FormKind::Symbol(s) => Some(Arc::from(s.as_str())),
-        _ => None,
-    };
+    let fn_name: Option<Arc<str>> = parts[0].as_symbol().map(Arc::from);
     let cljrs_fn = CljxFn::new(
         fn_name,
         vec![arity],
@@ -2060,7 +2045,7 @@ fn eval_defmulti(args: &[Form], env: &mut Env) -> EvalResult {
     let name = require_sym(args, 0, "defmulti")?;
     let name_arc: Arc<str> = Arc::from(name);
 
-    let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
+    let rest_start = if args.len() > 2 && args[1].as_string().is_some() {
         2
     } else {
         1
@@ -2142,20 +2127,19 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
 // ── binding ───────────────────────────────────────────────────────────────────
 
 fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
-    let pairs = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Vector(v)) => expand_pairs(v)
+    let pairs = match args.first().and_then(|f| f.as_vector()) {
+        Some(v) => expand_pairs(v)
             .map_err(|_| EvalError::Runtime("binding vector must have even count".into()))?
             .into_owned(),
-        _ => return Err(EvalError::Runtime("binding requires a vector".into())),
+        None => return Err(EvalError::Runtime("binding requires a vector".into())),
     };
 
     let mut frame: HashMap<usize, Value> = HashMap::new();
     for pair in pairs.chunks(2) {
-        let sym_str = match &pair[0].kind {
-            FormKind::Symbol(s) => s.clone(),
-            _ => return Err(EvalError::Runtime("binding targets must be symbols".into())),
+        let Some(sym_str) = pair[0].as_symbol() else {
+            return Err(EvalError::Runtime("binding targets must be symbols".into()));
         };
-        let parsed = cljrs_value::Symbol::parse(&sym_str);
+        let parsed = cljrs_value::Symbol::parse(sym_str);
         let ns_part: Arc<str> = match parsed.namespace.as_deref() {
             // Resolve `alias/*var*` through the current ns's `:require :as`
             // aliases, same as ordinary qualified-symbol lookup (`eval_symbol`)
@@ -2169,7 +2153,7 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
         let var_ptr = env
             .globals
             .lookup_var_in_ns(&ns_part, &parsed.name)
-            .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
+            .ok_or_else(|| EvalError::UnboundSymbol(sym_str.to_string()))?;
         let val = eval(&pair[1], env)?;
         frame.insert(crate::env::dynamics::var_key_of(&var_ptr), val);
     }
@@ -2192,22 +2176,19 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     let type_tag: Arc<str> = Arc::from(type_name);
 
     // Parse field names from the vector.
-    let field_names: Vec<Arc<str>> = match &args[1].kind {
-        FormKind::Vector(fields) => fields
-            .iter()
-            .map(|f| match &f.kind {
-                FormKind::Symbol(s) => Ok(Arc::from(s.as_str())),
-                _ => Err(EvalError::Runtime(
-                    "defrecord field names must be symbols".into(),
-                )),
-            })
-            .collect::<EvalResult<_>>()?,
-        _ => {
-            return Err(EvalError::Runtime(
-                "defrecord requires a field vector as second arg".into(),
-            ));
-        }
+    let Some(fields) = args[1].as_vector() else {
+        return Err(EvalError::Runtime(
+            "defrecord requires a field vector as second arg".into(),
+        ));
     };
+    let field_names: Vec<Arc<str>> = fields
+        .iter()
+        .map(|f| {
+            f.as_symbol()
+                .map(Arc::from)
+                .ok_or_else(|| EvalError::Runtime("defrecord field names must be symbols".into()))
+        })
+        .collect::<EvalResult<_>>()?;
 
     // Register protocol implementations (same as extend-type inner logic).
     register_impls_for_tag(&type_tag, &args[2..], env)?;
@@ -2338,7 +2319,7 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
     let mut current_proto: Option<GcPtr<cljrs_value::Protocol>> = None;
 
     for form in forms {
-        match &form.kind {
+        match &form.unmeta().kind {
             FormKind::Symbol(s) => {
                 let val = env.globals.lookup_in_ns(&env.current_ns, s);
                 match val {
@@ -2360,9 +2341,9 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
                 if parts.is_empty() {
                     continue;
                 }
-                let method_name = match &parts[0].kind {
-                    FormKind::Symbol(s) => Arc::from(s.as_str()),
-                    _ => continue,
+                let method_name: Arc<str> = match parts[0].as_symbol() {
+                    Some(s) => Arc::from(s),
+                    None => continue,
                 };
                 let fn_val = build_impl_fn(parts, env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
@@ -2391,12 +2372,9 @@ pub fn sync_star_ns(env: &mut Env) {
 }
 
 fn require_sym<'a>(args: &'a [Form], idx: usize, form_name: &str) -> EvalResult<&'a str> {
-    match args.get(idx).map(|f| &f.kind) {
-        Some(FormKind::Symbol(s)) => Ok(s.as_str()),
-        _ => Err(EvalError::Runtime(format!(
-            "{form_name} requires a symbol at position {idx}"
-        ))),
-    }
+    args.get(idx).and_then(|f| f.as_symbol()).ok_or_else(|| {
+        EvalError::Runtime(format!("{form_name} requires a symbol at position {idx}"))
+    })
 }
 
 // ── with-out-str ──────────────────────────────────────────────────────────────
