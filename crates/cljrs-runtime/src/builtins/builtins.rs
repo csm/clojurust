@@ -11,7 +11,9 @@ use crate::builtins::new::{builtin_exception_dot, builtin_new};
 use crate::builtins::regex::{
     builtin_re_find, builtin_re_groups, builtin_re_matcher, builtin_re_matches, builtin_re_pattern,
 };
-use crate::builtins::time::builtin_nanotime;
+use crate::builtins::time::{
+    builtin_current_time_millis, builtin_nanotime, builtin_system_nano_time, init_clock,
+};
 use crate::builtins::transients::{
     builtin_assoc_bang, builtin_conj_bang, builtin_disj_bang, builtin_dissoc_bang,
     builtin_persistent_bang, builtin_pop_bang, builtin_transient,
@@ -538,21 +540,38 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
         "Removes the method of a multimethod associated with dispatch-val.",
     ),
     (
+        "System/currentTimeMillis",
+        "Returns the current time in milliseconds since the Unix epoch.",
+    ),
+    (
+        "System/nanoTime",
+        "Returns a monotonic time in nanoseconds from an arbitrary origin; only differences are meaningful.",
+    ),
+    (
+        "Thread/sleep",
+        "Blocks the current thread for n milliseconds.",
+    ),
+    (
+        "eval",
+        "Evaluates a form data structure and returns the result. Sees namespace bindings, not the enclosing lexical scope.",
+    ),
+    (
+        "future-call",
+        "Runs a zero-arg fn as a task and returns a future. Read it with (await f), not @f.",
+    ),
+    ("future?", "Returns true if x is a future."),
+    ("future-done?", "Returns true if the future has settled."),
+    (
+        "future-cancelled?",
+        "Returns true if the future was cancelled.",
+    ),
+    (
+        "future-cancel",
+        "Cancels a still-running future, so awaiting it raises. Returns false if it had already settled.",
+    ),
+    (
         "make-hierarchy",
         "Creates a new, independent global hierarchy for use with derive/isa?.",
-    ),
-    (
-        "ancestors",
-        "Returns the immediate and indirect parents of tag, as a set.",
-    ),
-    (
-        "descendants",
-        "Returns the immediate and indirect children of tag, as a set.",
-    ),
-    ("parents", "Returns the immediate parents of tag, as a set."),
-    (
-        "isa?",
-        "Returns true if (= child parent), or child is directly or transitively derived from parent.",
     ),
     // Seq ops
     ("seq", "Returns a seq on coll, or nil if coll is empty/nil."),
@@ -1066,6 +1085,8 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
+    // Fix `System/nanoTime`'s origin at startup rather than at the first read.
+    init_clock();
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // Arithmetic
         ("+", Arity::Variadic { min: 0 }, builtin_add),
@@ -1444,17 +1465,9 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
         ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        // Hierarchy (stubs — return global hierarchy or nil)
+        // Hierarchy — derive/underive/isa?/parents/ancestors/descendants are
+        // defined in bootstrap.cljrs and documented there.
         ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
-        ("derive", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("underive", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("ancestors", Arity::Variadic { min: 1 }, builtin_ancestors),
-        (
-            "descendants",
-            Arity::Variadic { min: 1 },
-            builtin_descendants,
-        ),
-        ("parents", Arity::Variadic { min: 1 }, builtin_parents),
         // Tap system
         (
             "add-tap",
@@ -1545,7 +1558,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
-        ("isa?", Arity::Fixed(2), builtin_isa_q),
         // Records / reify
         (
             "make-type-instance",
@@ -1656,6 +1668,25 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ),
         // time utils
         ("nanotime", Arity::Fixed(0), builtin_nanotime),
+        (
+            "System/currentTimeMillis",
+            Arity::Fixed(0),
+            builtin_current_time_millis,
+        ),
+        ("System/nanoTime", Arity::Fixed(0), builtin_system_nano_time),
+        ("Thread/sleep", Arity::Fixed(1), builtin_sleep),
+        // eval — intercepted where the environment is available
+        ("eval", Arity::Fixed(1), builtin_eval_sentinel),
+        // futures — the executor comes from the installed async runtime
+        ("future-call", Arity::Fixed(1), builtin_future_call),
+        ("future?", Arity::Fixed(1), builtin_future_q),
+        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
+        (
+            "future-cancelled?",
+            Arity::Fixed(1),
+            builtin_future_cancelled_q,
+        ),
+        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
     ];
 
     let docs: HashMap<&str, &str> = BUILTIN_DOCS.iter().copied().collect();
@@ -7189,26 +7220,6 @@ fn builtin_make_hierarchy(_args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Map(MapValue::Hash(GcPtr::new(m))))
 }
 
-fn builtin_ancestors(args: &[Value]) -> ValueResult<Value> {
-    // Stub: return empty set
-    let _ = args;
-    Ok(Value::Set(SetValue::Hash(GcPtr::new(
-        cljrs_value::collections::PersistentHashSet::empty(),
-    ))))
-}
-
-fn builtin_descendants(args: &[Value]) -> ValueResult<Value> {
-    let _ = args;
-    Ok(Value::Set(SetValue::Hash(GcPtr::new(
-        cljrs_value::collections::PersistentHashSet::empty(),
-    ))))
-}
-
-fn builtin_parents(args: &[Value]) -> ValueResult<Value> {
-    let _ = args;
-    Ok(Value::Nil)
-}
-
 // ── bound-fn* ────────────────────────────────────────────────────────────────
 
 fn builtin_bound_fn_star(args: &[Value]) -> ValueResult<Value> {
@@ -7927,6 +7938,7 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
     };
     let key = format!("{}", args[1]);
     mf.get().methods.lock().unwrap().remove(&key);
+    mf.get().dispatch_vals.lock().unwrap().remove(&key);
     Ok(Value::MultiFn(mf.clone()))
 }
 
@@ -7946,11 +7958,6 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
         m = m.assoc(Value::string(k.clone()), v.clone());
     }
     Ok(Value::Map(m))
-}
-
-fn builtin_isa_q(args: &[Value]) -> ValueResult<Value> {
-    // Stub: equality only; full hierarchy deferred.
-    Ok(Value::Bool(args[0] == args[1]))
 }
 
 // ── Phase 7 — Concurrency primitives ─────────────────────────────────────────
@@ -8074,52 +8081,6 @@ fn builtin_deliver(args: &[Value]) -> ValueResult<Value> {
             got: v.type_name().to_string(),
         }),
     }
-}
-
-// These functions are kept for future use but are not currently registered.
-#[allow(dead_code)]
-fn builtin_future_done_q(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
-        Value::Future(f) => Ok(Value::Bool(f.get().is_done())),
-        v => Err(ValueError::WrongType {
-            expected: "future",
-            got: v.type_name().to_string(),
-        }),
-    }
-}
-
-#[allow(dead_code)]
-fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
-        Value::Future(f) => Ok(Value::Bool(f.get().is_cancelled())),
-        v => Err(ValueError::WrongType {
-            expected: "future",
-            got: v.type_name().to_string(),
-        }),
-    }
-}
-
-#[allow(dead_code)]
-fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
-    match &args[0] {
-        Value::Future(f) => {
-            let mut state = f.get().state.lock().unwrap();
-            if matches!(&*state, FutureState::Running) {
-                *state = FutureState::Cancelled;
-                f.get().cond.notify_all();
-            }
-            Ok(Value::Bool(true))
-        }
-        v => Err(ValueError::WrongType {
-            expected: "future",
-            got: v.type_name().to_string(),
-        }),
-    }
-}
-
-#[allow(dead_code)]
-fn builtin_future_call_star(_args: &[Value]) -> ValueResult<Value> {
-    Err(ValueError::Other("future is not yet implemented".into()))
 }
 
 #[allow(dead_code)]
@@ -8452,8 +8413,73 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
             ns.get().set_meta(args[1].clone());
             Ok(args[0].clone())
         }
+        // `(with-meta x nil)` clears metadata; storing a nil-meta wrapper would
+        // leave a value that is no longer `identical?` to itself after a clone.
+        _ if matches!(args[1], Value::Nil) => Ok(args[0].unwrap_meta().clone()),
         _ => Ok(args[0].clone().with_meta(args[1].clone())),
     }
+}
+
+// ── futures ──────────────────────────────────────────────────────────────────
+
+/// `(future-call thunk)` — run a zero-arg fn as a task, returning a future.
+///
+/// The task runs on the installed async runtime's executor, which is this
+/// isolate's: cooperative, not parallel, since every Clojure value is `!Send`.
+/// Read the result with `(await f)`; `(deref f)` blocks the one thread the task
+/// needs in order to finish.
+fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
+    let thunk = args.first().cloned().unwrap_or(Value::Nil);
+    let (globals, ns) = crate::env::callback::capture_eval_context()
+        .ok_or_else(|| ValueError::Other("future called outside an eval context".into()))?;
+    let rt = globals.async_runtime().ok_or_else(|| {
+        ValueError::Other(
+            "future requires an async runtime (build with the `async` feature)".into(),
+        )
+    })?;
+    let call_env = crate::env::env::Env::new(globals, &ns);
+    Ok(rt.spawn_async_call(thunk, Vec::new(), call_env))
+}
+
+fn builtin_future_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(matches!(args.first(), Some(Value::Future(_)))))
+}
+
+fn as_future(args: &[Value]) -> ValueResult<GcPtr<cljrs_value::CljxFuture>> {
+    match args.first() {
+        Some(Value::Future(f)) => Ok(f.clone()),
+        other => Err(ValueError::WrongType {
+            expected: "future",
+            got: other.map_or_else(|| "nothing".to_string(), |v| v.type_name().to_string()),
+        }),
+    }
+}
+
+/// `(future-done? f)` — true once the task has settled, cancelled included.
+fn builtin_future_done_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(as_future(args)?.get().is_done()))
+}
+
+/// `(future-cancelled? f)`
+fn builtin_future_cancelled_q(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(as_future(args)?.get().is_cancelled()))
+}
+
+/// `(future-cancel f)` — mark a still-running future cancelled, so awaiting it
+/// raises instead of yielding a value. False if it had already settled.
+///
+/// The task is cooperative and is not interrupted; what is cancelled is the
+/// result, as for a JVM future already past its interruption point.
+fn builtin_future_cancel(args: &[Value]) -> ValueResult<Value> {
+    Ok(Value::Bool(as_future(args)?.get().cancel()))
+}
+
+/// Sentinel — `eval` is intercepted in `eval_call` because it needs env.
+fn builtin_eval_sentinel(_args: &[Value]) -> ValueResult<Value> {
+    Err(ValueError::WrongType {
+        expected: "intercepted",
+        got: "eval sentinel should not be called directly".to_string(),
+    })
 }
 
 /// Sentinel — `vary-meta` is intercepted in `eval_call` because it needs env.

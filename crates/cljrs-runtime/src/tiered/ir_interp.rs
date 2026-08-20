@@ -1095,6 +1095,7 @@ fn dispatch_sentinel_by_name(
         }
         "alter-var-root" => crate::interp::apply::eval_alter_var_root(args, env),
         "vary-meta" => crate::interp::apply::eval_vary_meta(args, env),
+        "eval" => crate::interp::apply::eval_eval(args, env),
         "with-bindings*" => crate::interp::apply::eval_with_bindings_star(args, env),
         "send" | "send-off" => crate::interp::apply::eval_send_to_agent(args, env),
         _ => {
@@ -1114,6 +1115,7 @@ fn is_sentinel(name: &str) -> bool {
             | "make-delay"
             | "alter-var-root"
             | "vary-meta"
+            | "eval"
             | "with-bindings*"
             | "send"
             | "send-off"

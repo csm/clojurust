@@ -177,6 +177,13 @@ deadlocks, because the task that would resolve the future cannot run while the o
 thread is parked. In Phase B, await async results from within async context. A top-level
 blocking bridge is a later phase.
 
+`clojure.core/future` (registered in `cljrs-runtime`, executed through the
+`AsyncRuntime` hook this crate installs) inherits exactly this rule: its body is
+a task on the caller's executor, so it is cooperative rather than parallel and
+must be read with `(await f)`, not `@f`. See "`future` — cooperative, not
+parallel" in `cljrs-runtime/README.md`. Parallelism across OS threads is the
+isolate boundary, where values cross by copy.
+
 ## File layout
 
 | File | Description |
@@ -299,7 +306,10 @@ pub mod eval_async {
 
     /// Asynchronously evaluate a single form. Handles await/do/if/let and
     /// function-call arguments with yielding; delegates other forms to the
-    /// synchronous evaluator.
+    /// synchronous evaluator. A call whose head is a form-intercepted native
+    /// (`cljrs_interp::apply::is_form_intercepted` — `apply`, `swap!`, `eval`,
+    /// …) is handed to the synchronous evaluator whole, since those need the
+    /// unevaluated forms.
     pub async fn eval_async(form: &Form, env: &mut Env) -> Result<Value, EvalError>;
 
     /// Cooperatively await a Clojure value inside a LocalSet context.

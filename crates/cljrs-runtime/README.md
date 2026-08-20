@@ -522,6 +522,18 @@ Phase 10.6 inline caches:
   `rt_call_ic`'s hot path in `cljrs-compiler`)
 - `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
 
+Multimethod dispatch tries the exact `pr_str(dispatch-val)` key first, then the
+ad-hoc hierarchy, then `:default`. Hierarchy dispatch uses:
+
+- `isa_in_global_hierarchy(child, parent, env) -> bool` — `(isa? child parent)`
+  against `clojure.core/global-hierarchy` (defined in `bootstrap.cljrs`),
+  including element-wise vector matching; falls back to `child == parent` when
+  the var is absent
+
+When several registered dispatch values match and none dominates the others —
+by `prefer-method` or by being a descendant of them — dispatch errors with
+`Multiple methods in multimethod ...`, as on the JVM.
+
 ### `callback` submodule
 
 Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_context`). The context is pushed automatically around native builtin calls and by the Tier-1 IR executor; rt_abi bridges (`rt_call`, `rt_load_global`, the HOF bridges) dispatch through it. Public API includes:
@@ -636,6 +648,16 @@ Callers phrase `OddArity` in their own words (`map literal must have an even
 number of forms`, `let* binding vector must have even length`, ...), so the
 parity rule lives here while the message stays at the boundary.
 
+### Reader metadata on values
+
+`form_to_value` attaches a `^meta` annotation to the value it denotes, so
+`(meta '^{:x 1} [1])` answers `{:x 1}` as on the JVM. Shorthands expand as the
+reader does (`^:kw` → `{:kw true}`, `^Sym` → `{:tag Sym}`), stacked
+annotations merge with the outer one winning (`merge_meta_values`), and values
+that cannot carry metadata (`supports_meta` — the JVM's `IObj`) drop it rather
+than growing a wrapper. A nil annotation carries nothing, and
+`(with-meta x nil)` clears metadata instead of storing a nil-meta wrapper.
+
 ### Phase B3 — `shared-atom` (cross-isolate, two-tier atom ADR)
 
 `shared-atom` is the cross-isolate tier of the two-tier atom design in
@@ -652,6 +674,63 @@ the isolate boundary and be mutated concurrently:
   demote, and `swap!`/`compare-and-set!` use a single lock-free CAS with retry.
 
 ---
+
+### Ad-hoc hierarchies
+
+`derive`, `underive`, `isa?`, `parents`, `ancestors` and `descendants` are
+defined in `bootstrap.cljrs`, not registered as native builtins: a hierarchy is
+a plain `{:parents {} :descendants {} :ancestors {}}` value and every operation
+on it is pure data manipulation. The 3-arity forms are pure functions of that
+value; the 2-arity forms read and `alter-var-root`
+`clojure.core/global-hierarchy`. `make-hierarchy` stays native
+(`builtin_make_hierarchy`). Multimethod dispatch consults the same var — see
+`env::apply::isa_in_global_hierarchy`.
+
+### Host clock (`time.rs`)
+
+- `(nanotime)` — nanoseconds since the Unix epoch (wall clock).
+- `(System/currentTimeMillis)` — milliseconds since the Unix epoch.
+- `(System/nanoTime)` — nanoseconds from a fixed origin taken at startup
+  (`init_clock`, called from `register_all`). Monotonic and unaffected by
+  wall-clock adjustments, so only differences are meaningful.
+- `(Thread/sleep ms)` — blocks the current thread, same as `(sleep ms)`.
+
+The `System/…` and `Thread/…` names follow the existing `Math/…` convention: a
+JVM static's name registered as an ordinary builtin, so portable code that
+reaches for a clock resolves without a reader conditional.
+
+### `eval`
+
+`eval` is registered as a sentinel and intercepted where the environment is
+available (`interp::apply::eval_call`, and by name in the IR interpreter and
+the async tree-walker). It converts the form *value* back into a `Form`
+(`interp::macros::value_to_form`) and evaluates it in a fresh top-level
+environment of the current namespace, so it sees vars but not the caller's
+locals.
+
+### `future` — cooperative, not parallel
+
+`(future body…)` (bootstrap macro) expands to `(future-call (fn [] body…))`,
+which hands the thunk to the installed async runtime's executor and returns a
+`Value::Future` immediately. Alongside it: `future?`, `future-done?`,
+`future-cancelled?`, `future-cancel`, and `realized?`.
+
+**How this differs from the JVM, and why.** Every Clojure value is `!Send` —
+`GcPtr` cannot cross a thread, which is what makes per-isolate heaps collectable
+without cross-thread coordination. A future therefore cannot run on another OS
+thread; it is a task on the *caller's* executor. Consequences:
+
+- The body does not start until the caller yields. `(let [f (future (f!))] …)`
+  runs nothing until something awaits.
+- **Read a future with `(await f)`, never `@f`.** `deref` blocks the one thread
+  the task needs in order to finish, so it hangs. This is the same rule Phase C
+  already enforces inside `^:async` bodies, where `@future` is a runtime error;
+  in sync code it is currently a hang, which is the known sharp edge here.
+- `future-cancel` marks the result cancelled (awaiting it raises) but does not
+  interrupt a task already running, like a JVM future past its interrupt point.
+
+Genuine parallelism across threads is the isolate boundary
+(`cljrs-async`'s `Isolate` + `isolate-chan`), where values cross by copy.
 
 ## Module `interp`
 
@@ -737,6 +816,14 @@ the keyword shorthand `^:async` or an explicit `{:async true}` map.  `fn`/`defn`
 use it to set `CljxFn::is_async`, which `env::apply::dispatch_if_async`
 checks at call time to route through the async runtime.
 
+### Which natives need form-level interception
+
+`is_form_intercepted(name) -> bool` is the canonical list of natives that
+`eval_call` intercepts because they need unevaluated forms or the environment.
+The async tree-walker (`cljrs-async`) and the IR interpreter consult it instead
+of keeping their own copies; the `match` in `eval_call` must have an arm for
+every name it reports.
+
 ### Special handlers in `apply.rs`
 
 Each handler evaluates its key expressions under the correct allocation context:
@@ -770,6 +857,7 @@ implement sentinel operations without hitting the stub errors registered in
 | `make_delay_from_fn(f, globals, ns)` | `make-delay` — wrap zero-arg fn in a `Delay` |
 | `eval_alter_var_root(args, env)` | `alter-var-root` — apply f to var root, store result |
 | `eval_vary_meta(args, env)` | `vary-meta` — apply f to obj metadata |
+| `eval_eval(args, env)` | `eval` — convert a form value back to a `Form` and evaluate it at top level of the current namespace (vars visible, caller's locals not) |
 | `eval_with_bindings_star(args, env)` | `with-bindings*` — push binding frame, call f |
 | `eval_send_to_agent(args, env)` | `send` / `send-off` — dispatch action to agent |
 | `dispatch_method(method, target, args)` | `(.method target args…)` — interop method dispatch on an evaluated target (strings, vectors, seqs) |

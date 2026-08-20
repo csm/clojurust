@@ -207,7 +207,9 @@ pub struct MultiFn {
     pub dispatch_fn: Value,
     /// pr_str(dispatch-val) → implementation fn
     pub methods: Mutex<HashMap<String, Value>>,
-    /// recorded preferences (for future derive/hierarchy)
+    /// pr_str(dispatch-val) → the dispatch value itself, for `isa?` lookups
+    pub dispatch_vals: Mutex<HashMap<String, Value>>,
+    /// recorded preferences: pr_str(preferred) → pr_str(over)
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
     /// normally ":default"
     pub default_dispatch: String,
@@ -219,6 +221,7 @@ impl MultiFn {
             name,
             dispatch_fn,
             methods: Mutex::new(HashMap::new()),
+            dispatch_vals: Mutex::new(HashMap::new()),
             prefers: Mutex::new(HashMap::new()),
             default_dispatch,
         }
@@ -231,6 +234,12 @@ impl cljrs_gc::Trace for MultiFn {
         {
             let methods = self.methods.lock().unwrap();
             for v in methods.values() {
+                v.trace(visitor);
+            }
+        }
+        {
+            let dispatch_vals = self.dispatch_vals.lock().unwrap();
+            for v in dispatch_vals.values() {
                 v.trace(visitor);
             }
         }
@@ -1175,6 +1184,21 @@ impl CljxFuture {
     /// True if explicitly cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+    }
+
+    /// Mark a still-running future cancelled, waking anyone waiting on it.
+    ///
+    /// Returns false when it had already settled. The task itself is not
+    /// interrupted; what is cancelled is the result.
+    pub fn cancel(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(&*state, FutureState::Running) {
+            *state = FutureState::Cancelled;
+            self.cond.notify_all();
+            true
+        } else {
+            false
+        }
     }
 
     /// Mark this future's result as observed. Call when a consumer reads the
