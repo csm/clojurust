@@ -1368,3 +1368,139 @@
      (:doc (doc-data (var ~sym)))
      (catch Exception e# nil)))
 
+
+;; ── Ad-hoc hierarchies ───────────────────────────────────────────────────────
+;; A hierarchy is the value {:parents {} :descendants {} :ancestors {}}.
+;; The 3-arity fns below are pure functions of such a value; the 2-arity fns
+;; read and update the one held in `global-hierarchy`.
+
+(defn- named?
+  "True if x is a keyword or a symbol."
+  [x]
+  (or (keyword? x) (symbol? x)))
+
+(defn- hierarchy?
+  "True if x is a map carrying the :parents, :descendants and :ancestors
+  relation maps."
+  [x]
+  (and (map? x)
+       (map? (:parents x))
+       (map? (:descendants x))
+       (map? (:ancestors x))))
+
+(defn- check-hierarchy!
+  "Throws unless h is a hierarchy."
+  [h]
+  (when-not (hierarchy? h)
+    (throw (ex-info (str "Not a hierarchy: " (pr-str h)) {:hierarchy h}))))
+
+(defn- check-tag!
+  "Throws unless tag is a keyword or symbol, optionally requiring a namespace."
+  [tag namespaced?]
+  (when-not (named? tag)
+    (throw (ex-info (str "Not a valid tag: " (pr-str tag)) {:tag tag})))
+  (when (and namespaced? (nil? (namespace tag)))
+    (throw (ex-info (str "Tag must be namespaced: " (pr-str tag)) {:tag tag}))))
+
+(def global-hierarchy
+  "The hierarchy `derive`, `isa?`, `parents`, `ancestors` and `descendants`
+  use when called without an explicit hierarchy."
+  (make-hierarchy))
+
+(defn- extend-relation
+  "Adds target (and everything targets relates it to) to the entry of source
+  and of every source it already relates to."
+  [m source sources target targets]
+  (reduce (fn [ret k]
+            (assoc ret k (reduce conj
+                                 (get targets k #{})
+                                 (cons target (get targets target)))))
+          m
+          (cons source (get sources source))))
+
+(defn derive
+  "Establishes a parent/child relationship between parent and tag. Both must
+  be namespaced keywords or symbols. With a hierarchy h, returns the modified
+  hierarchy; without one, alters the global hierarchy and returns nil."
+  ([tag parent]
+   (check-tag! tag true)
+   (check-tag! parent true)
+   (alter-var-root (var global-hierarchy)
+                   (fn [h] (derive h tag parent)))
+   nil)
+  ([h tag parent]
+   (check-hierarchy! h)
+   (check-tag! tag false)
+   (check-tag! parent false)
+   (when (= tag parent)
+     (throw (ex-info (str "Cyclic derivation: " (pr-str tag) " has itself as ancestor")
+                     {:tag tag :parent parent})))
+   (let [tp (:parents h)
+         td (:descendants h)
+         ta (:ancestors h)]
+     (if (contains? (get tp tag) parent)
+       h
+       (do
+         (when (contains? (get ta parent) tag)
+           (throw (ex-info (str "Cyclic derivation: " (pr-str parent)
+                                " has " (pr-str tag) " as ancestor")
+                           {:tag tag :parent parent})))
+         {:parents (assoc tp tag (conj (get tp tag #{}) parent))
+          :ancestors (extend-relation ta tag td parent ta)
+          :descendants (extend-relation td parent ta tag td)})))))
+
+(defn underive
+  "Removes a parent/child relationship between parent and tag. With a
+  hierarchy h, returns the modified hierarchy; without one, alters the global
+  hierarchy and returns nil."
+  ([tag parent]
+   (alter-var-root (var global-hierarchy)
+                   (fn [h] (underive h tag parent)))
+   nil)
+  ([h tag parent]
+   (check-hierarchy! h)
+   (let [parent-map (:parents h)
+         childs-parents (if (get parent-map tag)
+                          (disj (get parent-map tag) parent)
+                          #{})
+         new-parents (if (not-empty childs-parents)
+                       (assoc parent-map tag childs-parents)
+                       (dissoc parent-map tag))
+         deriv-seq (flatten (map (fn [e] (cons (first e) (interpose (first e) (second e))))
+                                 (seq new-parents)))]
+     (if (contains? (get parent-map tag) parent)
+       (reduce (fn [ret pair] (derive ret (first pair) (second pair)))
+               (make-hierarchy)
+               (partition 2 deriv-seq))
+       h))))
+
+(defn isa?
+  "True if child is the same as parent, or a descendant of it in the
+  hierarchy. Vectors are compared element-wise."
+  ([child parent] (isa? global-hierarchy child parent))
+  ([h child parent]
+   (boolean
+    (or (= child parent)
+        (contains? (get (:ancestors h) child) parent)
+        (and (vector? parent)
+             (vector? child)
+             (= (count parent) (count child))
+             (loop [ret true i 0]
+               (if (or (not ret) (= i (count parent)))
+                 ret
+                 (recur (isa? h (nth child i) (nth parent i)) (inc i)))))))))
+
+(defn parents
+  "Returns the immediate parents of tag, or nil if it has none."
+  ([tag] (parents global-hierarchy tag))
+  ([h tag] (not-empty (get (:parents h) tag))))
+
+(defn ancestors
+  "Returns the immediate and indirect parents of tag, or nil if it has none."
+  ([tag] (ancestors global-hierarchy tag))
+  ([h tag] (not-empty (get (:ancestors h) tag))))
+
+(defn descendants
+  "Returns the immediate and indirect children of tag, or nil if it has none."
+  ([tag] (descendants global-hierarchy tag))
+  ([h tag] (not-empty (get (:descendants h) tag))))

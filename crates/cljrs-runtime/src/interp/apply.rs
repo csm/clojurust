@@ -173,6 +173,49 @@ impl Thunk for ClosureThunk {
     }
 }
 
+/// Native fns that [`eval_call`] intercepts at the form level, because they
+/// need unevaluated forms or the environment.
+///
+/// The `match` in [`eval_call`] must have an arm for every name here; other
+/// evaluators (the async tree-walker, the IR interpreter) consult this
+/// predicate to decide when to hand a call back to the synchronous path.
+pub fn is_form_intercepted(name: &str) -> bool {
+    matches!(
+        name,
+        "apply"
+            | "atom"
+            | "reset!"
+            | "swap!"
+            | "volatile!"
+            | "vreset!"
+            | "agent"
+            | "make-lazy-seq"
+            | "make-delay"
+            | "vswap!"
+            | "send"
+            | "send-off"
+            | "with-bindings*"
+            | "alter-var-root"
+            | "vary-meta"
+            | "eval"
+            | "find-ns"
+            | "the-ns"
+            | "ns-interns"
+            | "ns-publics"
+            | "ns-refers"
+            | "ns-map"
+            | "all-ns"
+            | "create-ns"
+            | "ns-aliases"
+            | "remove-ns"
+            | "alter-meta!"
+            | "ns-resolve"
+            | "resolve"
+            | "intern"
+            | "bound-fn*"
+    )
+}
+
 /// Evaluate a call expression `(func-form arg1 arg2 ...)`.
 ///
 /// Handles:
@@ -220,6 +263,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             "with-bindings*" => return handle_with_bindings(arg_forms, env),
             "alter-var-root" => return handle_alter_var_root(arg_forms, env),
             "vary-meta" => return handle_vary_meta(arg_forms, env),
+            "eval" => return handle_eval(arg_forms, env),
             "find-ns" | "the-ns" => return handle_find_ns(arg_forms, env),
             "ns-interns" | "ns-publics" => return handle_ns_interns(arg_forms, env),
             "ns-refers" => return handle_ns_refers(arg_forms, env),
@@ -1228,6 +1272,39 @@ fn handle_vary_meta(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         vp.get().set_meta(new_meta);
     }
     Ok(obj)
+}
+
+// ── eval ─────────────────────────────────────────────────────────────────────
+
+/// `(eval form)` — evaluate a form *value*.
+fn handle_eval(arg_forms: &[Form], env: &mut Env) -> EvalResult {
+    let [arg] = arg_forms else {
+        return Err(EvalError::Arity {
+            name: "eval".into(),
+            expected: "1".into(),
+            got: arg_forms.len(),
+        });
+    };
+    let value = eval(arg, env)?;
+    eval_eval(vec![value], env)
+}
+
+/// Execute `eval` with an already-evaluated arg: `[form-value]`.
+///
+/// The form is evaluated in a fresh top-level environment of the current
+/// namespace, so it sees vars but not the caller's locals — as on the JVM.
+pub fn eval_eval(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    let [value] = args.as_slice() else {
+        return Err(EvalError::Arity {
+            name: "eval".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let span = cljrs_types::span::Span::new(Arc::new("<eval>".to_string()), 0, 0, 1, 1);
+    let form = crate::interp::macros::value_to_form(value, span)?;
+    let mut top = Env::new(env.globals.clone(), &env.current_ns);
+    eval(&form, &mut top)
 }
 
 // ── Value-level special form dispatch (used by IR interpreter) ───────────────

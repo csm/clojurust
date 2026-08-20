@@ -457,7 +457,7 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
 async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env) -> EvalResult {
     let callee = eval(head, env)?;
     match &callee {
-        Value::NativeFunction(nf) if is_form_intercepted(&nf.get().name) => {
+        Value::NativeFunction(nf) if cljrs_runtime::interp::apply::is_form_intercepted(&nf.get().name) => {
             return eval(whole, env);
         }
         // A macro head should have been expanded already, but guard regardless.
@@ -472,45 +472,6 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
         argv.push(Box::pin(eval_async(a, env)).await?);
     }
     cljrs_runtime::env::apply::apply_value(&callee, argv, env)
-}
-
-/// Native functions that `cljrs_runtime::interp::eval_call` intercepts at the form level
-/// (they require unevaluated forms or env access) and that therefore cannot be
-/// driven through `apply_value` with pre-evaluated arguments.
-fn is_form_intercepted(name: &str) -> bool {
-    matches!(
-        name,
-        "apply"
-            | "atom"
-            | "reset!"
-            | "swap!"
-            | "volatile!"
-            | "vreset!"
-            | "agent"
-            | "make-lazy-seq"
-            | "make-delay"
-            | "vswap!"
-            | "send"
-            | "send-off"
-            | "with-bindings*"
-            | "alter-var-root"
-            | "vary-meta"
-            | "find-ns"
-            | "the-ns"
-            | "ns-interns"
-            | "ns-publics"
-            | "ns-refers"
-            | "ns-map"
-            | "all-ns"
-            | "create-ns"
-            | "ns-aliases"
-            | "remove-ns"
-            | "alter-meta!"
-            | "ns-resolve"
-            | "resolve"
-            | "intern"
-            | "bound-fn*"
-    )
 }
 
 /// Flatten `recur` arguments for a variadic arity so the rest collection is

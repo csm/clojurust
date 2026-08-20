@@ -299,7 +299,10 @@ pub mod eval_async {
 
     /// Asynchronously evaluate a single form. Handles await/do/if/let and
     /// function-call arguments with yielding; delegates other forms to the
-    /// synchronous evaluator.
+    /// synchronous evaluator. A call whose head is a form-intercepted native
+    /// (`cljrs_interp::apply::is_form_intercepted` — `apply`, `swap!`, `eval`,
+    /// …) is handed to the synchronous evaluator whole, since those need the
+    /// unevaluated forms.
     pub async fn eval_async(form: &Form, env: &mut Env) -> Result<Value, EvalError>;
 
     /// Cooperatively await a Clojure value inside a LocalSet context.

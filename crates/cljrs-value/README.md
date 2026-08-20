@@ -571,7 +571,12 @@ pub struct ProtocolFn {
 pub struct MultiFn {
     pub name: Arc<str>,
     pub dispatch_fn: Value,
+    /// pr_str(dispatch-val) → implementation fn
     pub methods: Mutex<HashMap<String, Value>>,
+    /// pr_str(dispatch-val) → the dispatch value itself; `apply_value` scans it
+    /// with `isa?` when no method matches the key exactly (hierarchy dispatch)
+    pub dispatch_vals: Mutex<HashMap<String, Value>>,
+    /// pr_str(preferred) → pr_str(over), from `prefer-method`
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
     pub default_dispatch: String,  // normally ":default"
 }
