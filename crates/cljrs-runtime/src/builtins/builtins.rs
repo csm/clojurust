@@ -1443,7 +1443,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("load-file", Arity::Fixed(1), builtin_stub_nil),
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
-        ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
         // Hierarchy (stubs — return global hierarchy or nil)
         ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
         ("derive", Arity::Variadic { min: 2 }, builtin_stub_nil),

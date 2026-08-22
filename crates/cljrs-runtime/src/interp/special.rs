@@ -54,6 +54,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "defmulti" => eval_defmulti(args, env),
         "defmethod" => eval_defmethod(args, env),
         "defrecord" => eval_defrecord(args, env),
+        "deftype" => eval_deftype(args, env),
         "reify" => eval_reify(args, env),
         "load-file" => eval_load_file(args, env),
         "binding" => eval_binding(args, env),
@@ -2312,6 +2313,22 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
 }
 
 // ── reify ─────────────────────────────────────────────────────────────────────
+
+fn eval_deftype(args: &[Form], _env: &mut Env) -> EvalResult {
+    // deftype is not implemented. It is a SPECIAL FORM (not a builtin) purely so
+    // this error fires at the deftype form itself, unevaluated, rather than the
+    // builtin path evaluating `(deftype T [x y])`'s args and reporting the far
+    // more confusing "Unable to resolve symbol: T". A real implementation needs
+    // mutable/volatile fields, set! over them, and array interop — see the
+    // hive kanban [CLJRS-DEFTYPE].
+    let name = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Symbol(s)) => s.as_str(),
+        _ => "<name>",
+    };
+    Err(EvalError::Runtime(format!(
+        "deftype is not implemented (defining {name}); use defrecord where a map-backed type suffices"
+    )))
+}
 
 fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
     // (reify Proto1 (method [this] body) ...)
