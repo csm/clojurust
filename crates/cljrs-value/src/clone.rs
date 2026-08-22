@@ -401,7 +401,19 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         // ── Records ──
         Value::TypeInstance(p) => {
             let ti = p.get();
-            let fields = serialize_map_pairs(&ti.fields)?;
+            // Fold any mutable-field slots into the serialized field map: the
+            // snapshot preserves their VALUES. Mutability itself is runtime
+            // state and is not restored (deserialize sets `mutable: None`).
+            let fields = match ti.mutable.as_ref().map(|a| a.get().deref()) {
+                Some(Value::Map(mm)) => {
+                    let mut merged = ti.fields.clone();
+                    for (k, v) in mm.iter() {
+                        merged = merged.assoc(k.clone(), v.clone());
+                    }
+                    serialize_map_pairs(&merged)?
+                }
+                _ => serialize_map_pairs(&ti.fields)?,
+            };
             Ok(SerializedValue::TypeInstance {
                 type_tag: ti.type_tag.clone(),
                 fields,
@@ -680,6 +692,7 @@ pub fn deserialize(sv: SerializedValue) -> Value {
             Value::TypeInstance(GcPtr::new(TypeInstance {
                 type_tag,
                 fields: MapValue::from_pairs(pairs),
+                mutable: None,
             }))
         }
 

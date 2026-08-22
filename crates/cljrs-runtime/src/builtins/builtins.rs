@@ -1443,7 +1443,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("load-file", Arity::Fixed(1), builtin_stub_nil),
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
-        ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
         // Hierarchy (stubs — return global hierarchy or nil)
         ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
         ("derive", Arity::Variadic { min: 2 }, builtin_stub_nil),
@@ -1551,6 +1550,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
             "make-type-instance",
             Arity::Fixed(2),
             builtin_make_type_instance,
+        ),
+        (
+            "make-type-instance-mut",
+            Arity::Fixed(3),
+            builtin_make_type_instance_mut,
         ),
         ("record?", Arity::Fixed(1), builtin_record_q),
         ("instance?", Arity::Fixed(2), builtin_instance_q),
@@ -3549,6 +3553,7 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
         return Ok(apply_meta(Value::TypeInstance(GcPtr::new(TypeInstance {
             type_tag: ti.get().type_tag.clone(),
             fields,
+            mutable: ti.get().mutable.clone(),
         }))));
     }
     let mut result = match coll {
@@ -5517,6 +5522,7 @@ fn assoc_in_impl(m: Value, keys: &[Value], val: Value) -> ValueResult<Value> {
         Value::TypeInstance(ti) => Value::TypeInstance(GcPtr::new(TypeInstance {
             type_tag: ti.get().type_tag.clone(),
             fields: ti.get().fields.assoc(k.clone(), updated),
+            mutable: ti.get().mutable.clone(),
         })),
         _ => Value::Map(MapValue::empty().assoc(k.clone(), updated)),
     };
@@ -8201,6 +8207,51 @@ fn builtin_make_type_instance(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
         type_tag,
         fields,
+        mutable: None,
+    })))
+}
+
+/// `(make-type-instance-mut type-tag immutable-map mutable-map)` — like
+/// `make-type-instance`, but the keys in `mutable-map` become interior-mutable
+/// slots (an `Atom` cell) that `set!` can update in place. Used by the `deftype`
+/// positional constructor when the type declares `^:unsynchronized-mutable` or
+/// `^:volatile-mutable` fields.
+fn builtin_make_type_instance_mut(args: &[Value]) -> ValueResult<Value> {
+    let type_tag = match &args[0] {
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "string or symbol",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let fields = match &args[1] {
+        Value::Map(m) => m.clone(),
+        Value::Nil => MapValue::empty(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "map",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let mut_map = match &args[2] {
+        Value::Map(m) => m.clone(),
+        Value::Nil => MapValue::empty(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "map",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let cell = GcPtr::new(Atom::new(Value::Map(mut_map)));
+    Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
+        type_tag,
+        fields,
+        mutable: Some(cell),
     })))
 }
 

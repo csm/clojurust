@@ -259,12 +259,11 @@ fn execute_ir(
     let _caller_root = crate::env::gc_roots::push_env_root(caller_env);
     let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
-    // Bind params (including destructuring) into the env so LoadLocal can find them.
     env.push_frame();
-    crate::interp::apply::bind_fn_params(arity, args, &mut env)?;
 
-    // Self-reference for named functions: use self_ptr when available so
-    // the binding is pointer-equal to the outer Value::Fn holding this fn.
+    // Self-reference BEFORE the params, so a parameter sharing the function's
+    // own name shadows it rather than being overwritten by it. See the same
+    // ordering in interp::apply.
     if let Some(ref name) = f.name {
         let self_val = if let Some(ref p) = f.self_ptr {
             Value::Fn(p.clone())
@@ -273,6 +272,9 @@ fn execute_ir(
         };
         env.bind(name.clone(), self_val);
     }
+
+    // Bind params (including destructuring) into the env so LoadLocal can find them.
+    crate::interp::apply::bind_fn_params(arity, args, &mut env)?;
 
     // Push eval context so IR closures (which use with_eval_context) can
     // call back into the interpreter.

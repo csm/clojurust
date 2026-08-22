@@ -300,6 +300,29 @@ pub fn dispatch_method(method: &str, target: &Value, args: &[Value]) -> EvalResu
         Value::List(_) | Value::Cons(_) | Value::LazySeq(_) => {
             dispatch_seq_method(method, target, args)
         }
+        Value::TypeInstance(ti) => {
+            // `.-field` reads a deftype/defrecord field. There are no host
+            // methods to call on an interpreter instance, so a plain `.method`
+            // is unsupported (protocol methods are called as `(proto-fn inst)`).
+            if let Some(field) = method.strip_prefix('-') {
+                let key = Value::keyword(cljrs_value::Keyword::simple(field));
+                let inst = ti.get();
+                // A mutable field lives in the interior-mutable cell; an
+                // immutable one in the field map.
+                if let Some(atom) = &inst.mutable
+                    && let Value::Map(m) = atom.get().deref()
+                    && let Some(v) = m.get(&key)
+                {
+                    return Ok(v);
+                }
+                Ok(inst.fields.get(&key).unwrap_or(Value::Nil))
+            } else {
+                Err(EvalError::Runtime(format!(
+                    ".{method} not supported on {} (only .-field access is)",
+                    target.type_name()
+                )))
+            }
+        }
         _ => Err(EvalError::Runtime(format!(
             ".{method} not supported on type {}",
             target.type_name()
@@ -516,11 +539,14 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         #[cfg(not(feature = "no-gc"))]
         let _call_frame = cljrs_gc::push_alloc_frame();
 
-        // Bind params.
-        bind_fn_params(arity, &current_args, &mut env)?;
-
         // Self-reference for named functions: use self_ptr when available so
         // the binding is pointer-equal to the outer Value::Fn holding this fn.
+        //
+        // BEFORE the params, not after: both bind into this one frame, so
+        // binding the fn's own name last OVERWROTE a parameter that shared it.
+        // `(defn text [text] {:text text})` then returned the function as its
+        // own :text. In Clojure the name is visible in the body but a parameter
+        // shadows it, which is exactly what this order gives.
         if let Some(ref name) = f.name {
             let self_val = if let Some(ref p) = f.self_ptr {
                 Value::Fn(p.clone())
@@ -529,6 +555,9 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
             };
             env.bind(name.clone(), self_val);
         }
+
+        // Bind params.
+        bind_fn_params(arity, &current_args, &mut env)?;
 
         // Eval body, catching Recur.
         // Under no-gc: push a scratch region; evaluate all-but-last in it,

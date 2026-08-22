@@ -2088,10 +2088,22 @@ fn lower_set_bang(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ));
     }
     let FormKind::Symbol(sym_str) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm(
-            "set! target must be a symbol".into(),
+        // A non-symbol target, e.g. `(set! (.-field inst) v)` — a deftype
+        // mutable-field write. The IR var-store path cannot express it; decline
+        // to lower so the method tree-walks (eval_set_bang handles it).
+        return Err(LowerError::UnsupportedForm(
+            "set! on a non-symbol target (deftype mutable field)".into(),
         ));
     };
+    // A set! whose target is a LOCAL binding is a deftype mutable-field write
+    // (the field is bound as a let* local in the synthesized method body). The
+    // var-store path would silently target a global var; decline to lower so
+    // the method tree-walks, where eval_set_bang updates the interior cell.
+    if ctx.lookup_local(sym_str).is_some() {
+        return Err(LowerError::UnsupportedForm(
+            "set! on a local binding (deftype mutable field)".into(),
+        ));
+    }
     let (var_ns, var_name) = split_sym(sym_str, ctx.ns());
     let var_dst = ctx.fresh_var();
     ctx.emit(Inst::LoadVar(var_dst, var_ns, var_name));

@@ -1823,6 +1823,7 @@ pub unsafe extern "C" fn rt_assoc(
                 Value::TypeInstance(alloc_inner_coll(TypeInstance {
                     type_tag: ti.get().type_tag.clone(),
                     fields,
+                    mutable: ti.get().mutable.clone(),
                 })),
                 meta,
             ))

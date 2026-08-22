@@ -1342,11 +1342,21 @@ impl cljrs_gc::Trace for MapValue {
 pub struct TypeInstance {
     pub type_tag: Arc<str>,
     pub fields: MapValue,
+    /// Mutable `deftype` fields (`^:unsynchronized-mutable` /
+    /// `^:volatile-mutable`), held in an interior-mutable cell — an `Atom` over
+    /// a keyword→value map — so `set!` can update them in place. `None` for
+    /// `defrecord`, `reify`, and immutable `deftype`s. Instances are `!Send`,
+    /// so one shared cell needs no stronger volatility than an `Atom`.
+    pub mutable: Option<GcPtr<crate::types::Atom>>,
 }
 
 impl cljrs_gc::Trace for TypeInstance {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        use cljrs_gc::GcVisitor as _;
         self.fields.trace(visitor);
+        if let Some(m) = &self.mutable {
+            visitor.visit(m);
+        }
     }
 }
 
