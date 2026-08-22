@@ -1945,7 +1945,7 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
                     FormKind::Symbol(s) => Arc::from(s.as_str()),
                     _ => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, &[], env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
@@ -2007,7 +2007,7 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
                     FormKind::Symbol(s) => Arc::from(s.as_str()),
                     _ => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, &[], env)?;
                 let mut impls = proto_ptr.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
@@ -2027,7 +2027,67 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
 /// `parts[0]` is the method name symbol (ignored here — caller handles it).
 /// `parts[1]` is the params vector.
 /// `parts[2..]` is the body.
-fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
+/// Bring a defrecord's FIELDS into scope in a method body, as
+/// `(let* [f (:f this) ...] body...)`.
+///
+/// The bare field symbol is the idiomatic form — `(mutable? [_] (valid-sha? sha))`
+/// — and it read as an unbound symbol, because a method impl is built as an
+/// ordinary fn whose only bindings are its own params. Clojure compiles the
+/// fields as instance fields of the generated class, so they are simply in
+/// scope.
+///
+/// A field whose name a PARAM already takes is skipped: the param shadows the
+/// field in Clojure, and binding it here would shadow the param instead.
+/// Returns None when there is nothing to bind, or when the first param is not
+/// a plain symbol (a destructured `this` has no name to read the fields from).
+fn synth_field_scope(params_form: &Form, fields: &[Arc<str>], body: &[Form]) -> Option<Vec<Form>> {
+    let param_forms = match &params_form.kind {
+        FormKind::Vector(v) => v,
+        _ => return None,
+    };
+    let this_name = match param_forms.first().map(|f| &f.kind) {
+        Some(FormKind::Symbol(s)) => s.clone(),
+        _ => return None,
+    };
+    let param_names: Vec<&str> = param_forms
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FormKind::Symbol(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let span = params_form.span.clone();
+    let mut bindings: Vec<Form> = Vec::new();
+    for field in fields {
+        if param_names.contains(&field.as_ref()) {
+            continue;
+        }
+        bindings.push(Form::new(
+            FormKind::Symbol(field.to_string()),
+            span.clone(),
+        ));
+        bindings.push(Form::new(
+            FormKind::List(vec![
+                Form::new(FormKind::Keyword(field.to_string()), span.clone()),
+                Form::new(FormKind::Symbol(this_name.clone()), span.clone()),
+            ]),
+            span.clone(),
+        ));
+    }
+    if bindings.is_empty() {
+        return None;
+    }
+
+    let mut let_forms = vec![
+        Form::new(FormKind::Symbol("let*".to_string()), span.clone()),
+        Form::new(FormKind::Vector(bindings), span.clone()),
+    ];
+    let_forms.extend_from_slice(body);
+    Some(vec![Form::new(FormKind::List(let_forms), span)])
+}
+
+fn build_impl_fn(parts: &[Form], fields: &[Arc<str>], env: &mut Env) -> EvalResult<Value> {
     if parts.len() < 2 {
         return Err(EvalError::Runtime(
             "protocol method impl requires params and body".into(),
@@ -2036,6 +2096,18 @@ fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
     // parts[1] should be the params vector.
     let params_form = &parts[1];
     let body = &parts[2..];
+    let scoped;
+    let body: &[Form] = if fields.is_empty() {
+        body
+    } else {
+        match synth_field_scope(params_form, fields, body) {
+            Some(v) => {
+                scoped = v;
+                &scoped
+            }
+            None => body,
+        }
+    };
     let arity = parse_arity(params_form, body)?;
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
     let fn_name = match &parts[0].kind {
@@ -2210,7 +2282,9 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     };
 
     // Register protocol implementations (same as extend-type inner logic).
-    register_impls_for_tag(&type_tag, &args[2..], env)?;
+    // The field names go with them: a defrecord method body may name its fields
+    // directly, which reify has no equivalent of.
+    register_impls_for_tag(&type_tag, &args[2..], &field_names, env)?;
 
     // Generate constructors in clojure.core.
     // ->TypeName: positional constructor
@@ -2320,8 +2394,8 @@ fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
 
-    // Register protocol implementations.
-    register_impls_for_tag(&type_tag, args, env)?;
+    // Register protocol implementations. reify has no fields.
+    register_impls_for_tag(&type_tag, args, &[], env)?;
 
     // Return an empty TypeInstance with the unique tag.
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
@@ -2334,7 +2408,12 @@ fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Parse `Proto (method [params] body) ...` segments and register them under `type_tag`.
 /// Shared by `defrecord` and `reify`.
-fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) -> EvalResult<()> {
+fn register_impls_for_tag(
+    type_tag: &Arc<str>,
+    forms: &[Form],
+    fields: &[Arc<str>],
+    env: &mut Env,
+) -> EvalResult<()> {
     let mut current_proto: Option<GcPtr<cljrs_value::Protocol>> = None;
 
     for form in forms {
@@ -2364,7 +2443,7 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
                     FormKind::Symbol(s) => Arc::from(s.as_str()),
                     _ => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, fields, env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
