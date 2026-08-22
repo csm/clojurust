@@ -638,6 +638,34 @@ Pinned *versioned* sources (`mylib@<sha>`) are the exception — they still embe
 as interpreted builtin source, since they resolve through the separate
 versioned loader rather than the plain `require` path.
 
+**Structural entry namespace:** the *entry* file's own `ns` form is normally an
+interpreted form too, so it ships as readable text and `--require-fully-compiled`
+rejects the program. When that `ns` is the **only** interpreted form and carries
+no clause richer than `:require` — no `:import`, `:gen-class`, docstring or
+`:refer-clojure` — `structural_ns_form` recognises it and the harness establishes
+the namespace directly instead: `get_or_create_ns`, `refer_core`, `sync_star_ns`
+(so `(resolve '-main)` looks in the entry namespace rather than `user`), then one
+`load_ns` call per require. No source text is emitted, so a single-file program
+can pass the opacity gate.
+
+Require specs are parsed by `cljrs_runtime::interp::special::parse_require_spec_form`
+— the same function `eval_ns` uses — and emitted whole, alias and `:refer` and
+`@version` included. This path must not re-derive spec parsing: aliases are
+resolved at compile time by `qualify_aliases`, but `:refer` is not. A bare `f`
+lowers to `LoadGlobal(<entry-ns>, "f")` and is resolved through the namespace's
+refer table at *runtime*, and `rt_call` on a nil callee returns nil rather than
+erroring — so a dropped refer produces a program that runs and prints wrong
+answers. A dropped `@version` likewise routes a pinned require to the plain
+loader instead of the versioned one.
+
+The structural path is taken only when the `ns` is the *first* interpreted form;
+otherwise it is restored at the head of the preamble, which would reorder the
+program if anything interpreted had preceded it. Any other interpreted form
+present at all forces the textual preamble, since that form may depend on the
+aliases and refers the `ns` installs. Required namespaces still ship their own
+`ns`/`require` preambles as text, so multi-file programs remain rejected by
+`--require-fully-compiled` through the `NamespacePreamble` channel.
+
 ---
 
 ## Features

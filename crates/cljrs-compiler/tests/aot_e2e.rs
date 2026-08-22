@@ -47,7 +47,17 @@ fn compile_and_run(name: &str, source: &str) -> String {
 
     result.unwrap_or_else(|e| panic!("compilation failed for {name}: {e:?}"));
 
-    let output = Command::new(&bin_path)
+    run_binary(name, &bin_path)
+}
+
+/// Run an already-built AOT binary and return its stdout.
+///
+/// Split out so the gated and ungated paths assert program BEHAVIOUR the same
+/// way. A compile that succeeds is not evidence that the program runs: an entry
+/// namespace can be created, pass every gate, and still exit 0 having resolved
+/// nothing.
+fn run_binary(name: &str, bin_path: &std::path::Path) -> String {
+    let output = Command::new(bin_path)
         .output()
         .unwrap_or_else(|e| panic!("failed to run {name} binary: {e}"));
 
@@ -2667,6 +2677,81 @@ fn compile_gated(name: &str, source: &str) -> cljrs_compiler::aot::AotResult<()>
         .unwrap()
         .join()
         .unwrap()
+}
+
+/// Compile under `RequireFullyCompiled` and run the result.
+///
+/// The gate rejects any embedded source text, so a program that reaches a
+/// binary here MUST have taken the structural entry-ns path. Running it then
+/// proves the namespace that path establishes actually resolves.
+#[cfg(feature = "aot_full_test")]
+fn compile_gated_and_run(name: &str, source: &str) -> String {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join("cljrs_aot_tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join(format!("{name}.cljrs"));
+    let bin_path = dir.join(format!("{name}_bin"));
+    std::fs::write(&src_path, source).unwrap();
+
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn({
+            let src = src_path.clone();
+            let bin = bin_path.clone();
+            move || {
+                cljrs_compiler::aot::compile_file(
+                    &src,
+                    &bin,
+                    &common::session(vec![])
+                        .opacity(cljrs_compiler::aot::OpacityPolicy::RequireFullyCompiled),
+                )
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("gated compilation failed for {name}: {e:?}"));
+
+    run_binary(name, &bin_path)
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn structural_entry_ns_compiles_opaquely_and_runs() {
+    // The `ns` form is the only interpreted form, so the entry namespace is
+    // established structurally and no text is embedded — which is what lets the
+    // gate pass at all. The harness then resolves `-main` through `*ns*`, so
+    // this also pins the `sync_star_ns` binding: without it the program exits 0
+    // having run nothing, and a compile-only test would still be green.
+    let out = compile_gated_and_run(
+        "gate_structural_ns",
+        r#"
+(ns my-app)
+(defn weigh [x] (+ (* x 31) 7))
+(defn -main [& _] (println (weigh 10)))
+"#,
+    );
+    assert_eq!(out.trim(), "317");
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn structural_entry_ns_keeps_referred_names_resolvable() {
+    // The regression this PR's review caught: `:refer` was dropped from the
+    // structurally emitted spec, so `square` lowered to LoadGlobal(my-app,
+    // "square") and resolved to nil at runtime. `rt_call` on a nil callee
+    // returns nil rather than erroring, so the binary printed "nil" and exited
+    // 0. Only running it and reading stdout catches that.
+    let out = compile_gated_and_run(
+        "gate_structural_ns_refer",
+        r#"
+(ns my-app
+  (:require [clojure.string :refer [upper-case]]))
+(defn -main [& _] (println (upper-case "ok")))
+"#,
+    );
+    assert_eq!(out.trim(), "OK");
 }
 
 #[test]

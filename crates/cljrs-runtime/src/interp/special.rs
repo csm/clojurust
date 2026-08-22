@@ -1415,7 +1415,11 @@ fn spec_element(form: &Form) -> Option<&Form> {
 
 /// Parse a `RequireSpec` from a raw `Form` (unevaluated, used in `ns` macro).
 /// Also handles versioned namespace symbols such as `my.ns@abc1234`.
-fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
+///
+/// Public so the AOT compiler can establish an entry namespace from the same
+/// parse `eval_ns` uses. A second implementation there would drift: it already
+/// did, dropping `:refer` and `@version` from structurally emitted requires.
+pub fn parse_require_spec_form(form: &Form) -> Result<RequireSpec, String> {
     match &form.kind {
         FormKind::Symbol(s) => {
             let sym = cljrs_value::Symbol::parse(s);
