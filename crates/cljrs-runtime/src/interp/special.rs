@@ -1701,6 +1701,13 @@ fn eval_load_file(args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
     // (letfn [(f [params] body...) ...] body...)
+    //
+    // Three passes, because a closure here captures VALUES, not cells:
+    // `eval_fn` snapshots `env.all_local_bindings()`, so a name bound after the
+    // closure was built is invisible to it forever. Binding each fn as it was
+    // built therefore gave letfn `let`-like sequential scope — a backward
+    // reference resolved, a forward one or a mutual pair raised "unbound
+    // symbol", which defeats the only reason letfn exists.
     let bindings = match args.first().map(|f| &f.kind) {
         Some(FormKind::Vector(v)) => expand_reader_conds_cow(v).into_owned(),
         _ => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
@@ -1708,14 +1715,35 @@ fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
 
     env.push_frame();
 
+    // Pass 1: bind every name to nil, so the pass-2 snapshot CONTAINS all of
+    // them. A capture list cannot grow after the fact; it can only be corrected.
     for binding in &bindings {
         if let FormKind::List(parts) = &binding.kind {
             if parts.is_empty() {
                 continue;
             }
-            // parts[0] = name, parts[1] = params, parts[2..] = body
-            // Reuse eval_fn: it expects (optional-name params body...)
-            // We pass parts directly since parts[0] is the function name symbol.
+            match &parts[0].kind {
+                FormKind::Symbol(s) => env.bind(Arc::from(s.as_str()), Value::Nil),
+                _ => {
+                    env.pop_frame();
+                    return Err(EvalError::Runtime(
+                        "letfn binding name must be a symbol".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pass 2: build the closures. Each captures the real value of any sibling
+    // already built and nil for the rest.
+    let mut built: Vec<(Arc<str>, Value)> = Vec::new();
+    for binding in &bindings {
+        if let FormKind::List(parts) = &binding.kind {
+            if parts.is_empty() {
+                continue;
+            }
+            // parts[0] is the name, so eval_fn sees this as a NAMED fn and wires
+            // up its self-reference; pass 3 handles every other direction.
             let fn_val = match eval_fn(parts, env) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1723,16 +1751,29 @@ fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
                     return Err(e);
                 }
             };
-            let name = match &parts[0].kind {
-                FormKind::Symbol(s) => s.clone(),
-                _ => {
-                    env.pop_frame();
-                    return Err(EvalError::Runtime(
-                        "letfn binding name must be a symbol".into(),
-                    ));
-                }
+            let name: Arc<str> = match &parts[0].kind {
+                FormKind::Symbol(s) => Arc::from(s.as_str()),
+                _ => unreachable!("pass 1 rejected every non-symbol name"),
             };
-            env.bind(Arc::from(name.as_str()), fn_val);
+            env.bind(Arc::clone(&name), fn_val.clone());
+            built.push((name, fn_val));
+        }
+    }
+
+    // Pass 3: replace the nil placeholders each closure captured with the
+    // sibling it actually names. This is what makes the scope MUTUAL rather
+    // than sequential, and it necessarily builds a reference cycle between
+    // co-recursive fns — which is inherent to letfn, not an artifact here.
+    for (_, fn_val) in &built {
+        if let Value::Fn(ptr) = fn_val {
+            let mut ptr = ptr.clone();
+            let f = ptr.get_mut();
+            for i in 0..f.closed_over_names.len() {
+                let captured = f.closed_over_names[i].clone();
+                if let Some((_, real)) = built.iter().find(|(n, _)| *n == captured) {
+                    f.closed_over_vals[i] = real.clone();
+                }
+            }
         }
     }
 
