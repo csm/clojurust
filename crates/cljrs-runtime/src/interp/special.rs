@@ -1800,8 +1800,8 @@ fn extract_ns_name(v: &Value) -> EvalResult<String> {
 
 fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
     // (defprotocol Name "doc?" (method [this & args] "doc?") ...)
-    let name = require_sym(args, 0, "defprotocol")?;
-    let proto_name: Arc<str> = Arc::from(name);
+    let (name, name_meta) = require_sym_meta(args, 0, "defprotocol", env)?;
+    let proto_name: Arc<str> = Arc::from(name.as_str());
 
     // Skip optional docstring.
     let methods_start = if args.len() > 1 && matches!(args[1].kind, FormKind::Str(_)) {
@@ -1876,6 +1876,9 @@ fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
         proto_name.clone(),
         Value::Protocol(proto_ptr.clone()),
     );
+    if let Some(meta_val) = name_meta {
+        proto_var.get().set_meta(meta_val);
+    }
 
     // Create and intern a ProtocolFn for each method.
     for method in &methods {
@@ -2057,8 +2060,8 @@ fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
 
 fn eval_defmulti(args: &[Form], env: &mut Env) -> EvalResult {
     // (defmulti name dispatch-fn-form) or (defmulti name "doc" dispatch-fn :default val)
-    let name = require_sym(args, 0, "defmulti")?;
-    let name_arc: Arc<str> = Arc::from(name);
+    let (name, name_meta) = require_sym_meta(args, 0, "defmulti", env)?;
+    let name_arc: Arc<str> = Arc::from(name.as_str());
 
     let rest_start = if args.len() > 2 && matches!(args[1].kind, FormKind::Str(_)) {
         2
@@ -2091,6 +2094,9 @@ fn eval_defmulti(args: &[Form], env: &mut Env) -> EvalResult {
     let var = env
         .globals
         .intern(&env.current_ns, name_arc, Value::MultiFn(GcPtr::new(mfn)));
+    if let Some(meta_val) = name_meta {
+        var.get().set_meta(meta_val);
+    }
     Ok(Value::Var(var))
 }
 
@@ -2103,7 +2109,11 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
             "defmethod requires name, dispatch-val, params, and body".into(),
         ));
     }
-    let multi_name = require_sym(args, 0, "defmethod")?;
+    // The name here RESOLVES an existing multimethod rather than defining one, so
+    // any metadata on it is inert — unwrapped so the form still reads, discarded
+    // because there is no new var to carry it.
+    let (multi_name, _) = require_sym_meta(args, 0, "defmethod", env)?;
+    let multi_name = multi_name.as_str();
 
     let mf_ptr = match env.globals.lookup_in_ns(&env.current_ns, multi_name) {
         Some(Value::MultiFn(mf)) => mf,
@@ -2188,8 +2198,11 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
             "defrecord requires a name and field vector".into(),
         ));
     }
-    let type_name = require_sym(args, 0, "defrecord")?;
-    let type_tag: Arc<str> = Arc::from(type_name);
+    // Record metadata belongs to the generated type, which has no var to hold it
+    // here; unwrapped so the form reads, and deliberately not silently applied
+    // somewhere it would not belong.
+    let (type_name, _) = require_sym_meta(args, 0, "defrecord", env)?;
+    let type_tag: Arc<str> = Arc::from(type_name.as_str());
 
     // Parse field names from the vector.
     let field_names: Vec<Arc<str>> = match &args[1].kind {
@@ -2302,7 +2315,7 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     }
 
     // Intern the type name as a Symbol value so `(instance? TypeName x)` works.
-    let type_sym = cljrs_value::Symbol::simple(type_name);
+    let type_sym = cljrs_value::Symbol::simple(type_name.clone());
     globals.intern(
         &ns,
         Arc::from(type_name),
@@ -2390,12 +2403,43 @@ pub fn sync_star_ns(env: &mut Env) {
     }
 }
 
-fn require_sym<'a>(args: &'a [Form], idx: usize, form_name: &str) -> EvalResult<&'a str> {
-    match args.get(idx).map(|f| &f.kind) {
-        Some(FormKind::Symbol(s)) => Ok(s.as_str()),
-        _ => Err(EvalError::Runtime(format!(
-            "{form_name} requires a symbol at position {idx}"
-        ))),
+/// The symbol at `idx`, unwrapping any `^meta` wrapper, together with the
+/// metadata it carried.
+///
+/// `(defprotocol ^:private Driver ...)` reads as `Meta(:private, Symbol("Driver"))`,
+/// so matching `FormKind::Symbol` alone rejects a form Clojure accepts. malli's
+/// `malli.impl.regex` opens with five such protocols, which made all of malli
+/// unloadable.
+///
+/// The metadata is RETURNED rather than discarded: dropping it would trade a
+/// loud error for a silent loss of `^:private`, and callers that intern a var
+/// attach it there.
+fn require_sym_meta(
+    args: &[Form],
+    idx: usize,
+    form_name: &str,
+    env: &mut Env,
+) -> EvalResult<(String, Option<Value>)> {
+    fn peel(form: &Form, env: &mut Env) -> EvalResult<Option<(String, Option<Value>)>> {
+        match &form.kind {
+            FormKind::Symbol(s) => Ok(Some((s.clone(), None))),
+            // `^:a ^:b x` nests Meta forms; unwrap all, outer mark winning.
+            FormKind::Meta(meta_form, inner) => {
+                let meta_val = compile_meta_form(meta_form, env)?;
+                match peel(inner, env)? {
+                    Some((name, inner_meta)) => {
+                        Ok(Some((name, merge_meta(inner_meta, Some(meta_val)))))
+                    }
+                    None => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+    let err = || EvalError::Runtime(format!("{form_name} requires a symbol at position {idx}"));
+    match args.get(idx) {
+        Some(form) => peel(form, env)?.ok_or_else(err),
+        None => Err(err()),
     }
 }
 
