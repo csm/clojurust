@@ -155,7 +155,12 @@ pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
 /// - Regular `{sym :key}` direct bindings
 pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalResult<()> {
     // First pass: collect :or defaults.
-    let mut defaults: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    // The default is an EXPRESSION, held unevaluated until its symbol is bound.
+    // Storing `form_to_value` here is what made `:or {rules default-rules}` bind
+    // the SYMBOL `default-rules`; and evaluating every default up front would
+    // break `{:keys [a b] :or {b (inc a)}}`, which Clojure supports because it
+    // emits one `(get m :k default)` per symbol, in binding order.
+    let mut defaults: std::collections::HashMap<String, Form> = std::collections::HashMap::new();
     let mut i = 0;
     while i + 1 < pattern.len() {
         let k = &pattern[i];
@@ -168,7 +173,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 let mut j = 0;
                 while j + 1 < or_forms.len() {
                     if let FormKind::Symbol(sym) = &or_forms[j].kind {
-                        defaults.insert(sym.clone(), form_to_value(&or_forms[j + 1])?);
+                        defaults.insert(sym.clone(), or_forms[j + 1].clone());
                     }
                     j += 2;
                 }
@@ -219,10 +224,15 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                                     None => Value::keyword(Keyword::simple(parsed.name.clone())),
                                 };
                             let mut bound_val = get_val(&key);
-                            if matches!(bound_val, Value::Nil)
-                                && let Some(d) = defaults.get(parsed.name.as_ref())
-                            {
-                                bound_val = d.clone();
+                            if let Some(d) = defaults.get(parsed.name.as_ref()) {
+                                // Evaluated whether or not the key was present:
+                                // Clojure's `(get m :k default)` evaluates its
+                                // third argument eagerly, so a throwing or
+                                // side-effecting default must still fire here.
+                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                if matches!(bound_val, Value::Nil) {
+                                    bound_val = dv;
+                                }
                             }
                             env.bind(parsed.name.clone(), bound_val);
                         }
@@ -235,10 +245,15 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                         if let FormKind::Symbol(sym) = &sym_form.kind {
                             let key = Value::string(sym.clone());
                             let mut bound_val = get_val(&key);
-                            if matches!(bound_val, Value::Nil)
-                                && let Some(d) = defaults.get(sym.as_str())
-                            {
-                                bound_val = d.clone();
+                            if let Some(d) = defaults.get(sym.as_str()) {
+                                // Evaluated whether or not the key was present:
+                                // Clojure's `(get m :k default)` evaluates its
+                                // third argument eagerly, so a throwing or
+                                // side-effecting default must still fire here.
+                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                if matches!(bound_val, Value::Nil) {
+                                    bound_val = dv;
+                                }
                             }
                             env.bind(Arc::from(sym.as_str()), bound_val);
                         }
@@ -258,10 +273,15 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                                     None => Value::symbol(Symbol::simple(parsed.name.clone())),
                                 };
                             let mut bound_val = get_val(&key);
-                            if matches!(bound_val, Value::Nil)
-                                && let Some(d) = defaults.get(parsed.name.as_ref())
-                            {
-                                bound_val = d.clone();
+                            if let Some(d) = defaults.get(parsed.name.as_ref()) {
+                                // Evaluated whether or not the key was present:
+                                // Clojure's `(get m :k default)` evaluates its
+                                // third argument eagerly, so a throwing or
+                                // side-effecting default must still fire here.
+                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                if matches!(bound_val, Value::Nil) {
+                                    bound_val = dv;
+                                }
                             }
                             env.bind(parsed.name.clone(), bound_val);
                         }
@@ -283,11 +303,13 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 let lookup_key = form_to_value(v)?;
                 let mut bound_val = get_val(&lookup_key);
                 // Apply defaults for simple symbol bindings.
-                if matches!(bound_val, Value::Nil)
-                    && let FormKind::Symbol(sym) = &k.kind
+                if let FormKind::Symbol(sym) = &k.kind
                     && let Some(d) = defaults.get(sym.as_str())
                 {
-                    bound_val = d.clone();
+                    let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                    if matches!(bound_val, Value::Nil) {
+                        bound_val = dv;
+                    }
                 }
                 // Bind via pattern to support nested destructuring.
                 bind_pattern(k, bound_val, env)?;
