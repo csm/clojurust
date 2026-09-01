@@ -701,10 +701,14 @@ fn bind_fn_params_impl(
         if destructure && let Some(ref pattern) = arity.destructure_rest {
             // When the rest pattern is a map destructure (e.g. `& {:keys [bar]}`),
             // convert the rest args list into a map of alternating key-value pairs,
-            // matching Clojure's keyword-arguments convention.
+            // matching Clojure's keyword-arguments convention.  The compiled
+            // tiers emit `KnownFn::KwargsToMap` for the same conversion.
             let destructure_val = if matches!(pattern.kind, FormKind::Map(_)) {
                 let items = value_to_seq_vec(&rest_val);
-                Value::Map(MapValue::from_flat_entries(items))
+                Value::Map(
+                    MapValue::from_kwargs(items)
+                        .map_err(crate::env::error::value_error_to_eval_error)?,
+                )
             } else {
                 rest_val
             };

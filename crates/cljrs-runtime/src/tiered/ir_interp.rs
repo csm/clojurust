@@ -1263,6 +1263,16 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             Ok(result)
         }
         KnownFn::Nth => builtin_call_native("nth", &args),
+        KnownFn::KwargsToMap => {
+            // A map-shaped rest pattern destructures the trailing arguments as
+            // keyword arguments; fold the rest list into the map the pattern's
+            // `get`s read, exactly as `bind_fn_params` does for the tree-walker.
+            let items = crate::interp::destructure::value_to_seq_vec(&args[0]);
+            Ok(Value::Map(
+                MapValue::from_kwargs(items)
+                    .map_err(crate::env::error::value_error_to_eval_error)?,
+            ))
+        }
         KnownFn::NthLenient => {
             // Destructuring nth: out-of-bounds yields nil, never throws.  The
             // 3-arg `nth` returns its default (nil here) for a short collection.

@@ -32,6 +32,17 @@ const PROGRAM: &str = r#"
   ;; counts how many times it actually ran (issue #363).
   [{:keys [x] :or {x (do (swap! parity-or-default-count inc) 1)}}]
   x)
+(defn parity-kwargs
+  ;; A map-shaped rest pattern is Clojure's keyword-argument convention: the
+  ;; trailing arguments are folded into a map before the pattern binds, so the
+  ;; lowered tiers must fold too or every key reads nil (issue #368).
+  [& {:keys [a b] :or {b 5}}]
+  [a b])
+(defn parity-kwargs-fixed [x & {:keys [a]}] [x a])
+(defn parity-seq-rest
+  ;; The other rest shape: `& [a b]` destructures the list itself, unfolded.
+  [& [a b]]
+  [a b])
 (def parity-input [1 2 3 4])
 (def parity-literal-sink nil)
 (def parity-seq-sink nil)
@@ -46,6 +57,9 @@ const PROGRAM: &str = r#"
   (parity-mul 2 3)
   ;; 50 calls that all supply `:x`; each still evaluates the default.
   (parity-or-default {:x 7})
+  (parity-kwargs :a 1)
+  (parity-kwargs-fixed 0 :a 3)
+  (parity-seq-rest 1 2)
   ;; Keeping allocation-heavy results reachable also prevents AOT's region
   ;; optimizer from turning the JIT warm-up into an allocation stress test.
   (def parity-literal-sink (parity-literals))
@@ -70,6 +84,17 @@ const PROGRAM: &str = r#"
 (println (str "or-default-hit|value|" (pr-str (parity-or-default {:x 7}))))
 (println (str "or-default-miss|value|" (pr-str (parity-or-default {}))))
 (println (str "or-default-effects|value|" (pr-str @parity-or-default-count)))
+(println (str "kwargs|value|" (pr-str (parity-kwargs :a 1))))
+(println (str "kwargs-fixed|value|" (pr-str (parity-kwargs-fixed 0 :a 3))))
+(println (str "kwargs-trailing-map|value|" (pr-str (parity-kwargs {:a 1}))))
+(println (str "kwargs-mixed|value|" (pr-str (parity-kwargs :a 1 {:b 2}))))
+(println (str "seq-rest|value|" (pr-str (parity-seq-rest 1 2))))
+(println
+  (str "kwargs-odd|"
+       (try
+         (str "value|" (pr-str (parity-kwargs :a 1 :b)))
+         (catch Exception e
+           (str "error|" (ex-message e))))))
 (println
   (str "arithmetic-error|"
        (try
@@ -241,7 +266,7 @@ fn parse_records(tier: Tier, output: &Output) -> BTreeMap<String, Outcome> {
             tier.name()
         );
     }
-    assert_eq!(records.len(), 13, "{} stdout:\n{stdout}", tier.name());
+    assert_eq!(records.len(), 19, "{} stdout:\n{stdout}", tier.name());
     records
 }
 
@@ -274,6 +299,20 @@ fn values_and_errors_match_across_all_execution_tiers() {
     assert_eq!(tree["or-default-miss"], Outcome::Value("1".to_string()));
     assert_eq!(tree["or-default-effects"], Outcome::Value("52".to_string()));
     assert_eq!(tree["seq-loop"], Outcome::Value("[1 2 3 4]".to_string()));
+    // A map-shaped rest pattern binds its keyword arguments; a sequential one
+    // still destructures the rest list positionally (issue #368).
+    assert_eq!(tree["kwargs"], Outcome::Value("[1 5]".to_string()));
+    assert_eq!(tree["kwargs-fixed"], Outcome::Value("[0 3]".to_string()));
+    assert_eq!(
+        tree["kwargs-trailing-map"],
+        Outcome::Value("[1 5]".to_string())
+    );
+    assert_eq!(tree["kwargs-mixed"], Outcome::Value("[1 2]".to_string()));
+    assert_eq!(tree["seq-rest"], Outcome::Value("[1 2]".to_string()));
+    assert_eq!(
+        tree["kwargs-odd"],
+        Outcome::Error("No value supplied for key: :b".to_string())
+    );
     assert_eq!(
         tree["overflow-add"],
         Outcome::Value("9223372036854775808N".to_string())

@@ -127,6 +127,13 @@ pub enum KnownFn {
     /// Emitted only by destructuring lowering; user-level `(nth v i)` stays
     /// [`KnownFn::Nth`], which throws on out-of-bounds.
     NthLenient,
+    /// Fold a variadic function's rest list into a map, Clojure's
+    /// keyword-argument convention (`(defn f [& {:keys [a]}] ...)`).  Emitted
+    /// only by the destructuring lowering of a map-shaped rest pattern, and
+    /// only there: the rest parameter holds a *list*, so the pattern's `get`s
+    /// must run against this conversion's result, not the list.  Mirrors the
+    /// tree-walker's `MapValue::from_kwargs` in `bind_fn_params`.
+    KwargsToMap,
     Count,
     Contains,
 
@@ -1057,6 +1064,7 @@ impl KnownFn {
             | KnownFn::LazySeq
             | KnownFn::Pop
             | KnownFn::Vec
+            | KnownFn::KwargsToMap
             | KnownFn::Str
             | KnownFn::Transient
             | KnownFn::PersistentBang => Effect::Alloc,

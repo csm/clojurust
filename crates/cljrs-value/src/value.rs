@@ -202,6 +202,46 @@ impl MapValue {
         Self::from_pairs(pairs)
     }
 
+    /// Build a map from a kwargs-style trailing-argument list.
+    ///
+    /// This is the conversion a variadic function performs when its rest
+    /// parameter carries a map destructuring pattern (`(defn f [& {:keys [a]}]
+    /// ...)`): the trailing arguments arrive as a list and are read as
+    /// alternating key-value pairs, so `(f :a 1)` binds `a` to `1`.
+    ///
+    /// A trailing map is also accepted — on its own (`(f {:a 1})`) or after
+    /// pairs (`(f :a 1 {:b 2})`) — and its entries are merged last, so they win
+    /// over an earlier pair for the same key.  A trailing `nil` contributes
+    /// nothing, matching a call that supplied no arguments at all.
+    ///
+    /// Errors when the list has an odd length and its final element is neither
+    /// a map nor nil: that argument is a key with no value.
+    pub fn from_kwargs(entries: Vec<Value>) -> crate::error::ValueResult<Self> {
+        let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(entries.len().div_ceil(2));
+        let mut i = 0;
+        while i < entries.len() {
+            if i + 1 < entries.len() {
+                pairs.push((entries[i].clone(), entries[i + 1].clone()));
+                i += 2;
+                continue;
+            }
+            // `unwrap_meta` first: a `with-meta` map is still a map here, as it
+            // is for every other collection operation.
+            match entries[i].unwrap_meta() {
+                Value::Map(m) => pairs.extend(m.iter().map(|(k, v)| (k.clone(), v.clone()))),
+                Value::Nil => {}
+                other => {
+                    return Err(crate::error::ValueError::Other(format!(
+                        "No value supplied for key: {}",
+                        PrintValue(other)
+                    )));
+                }
+            }
+            i += 1;
+        }
+        Ok(Self::from_pairs(pairs))
+    }
+
     pub fn get(&self, key: &Value) -> Option<Value> {
         match self {
             MapValue::Array(m) => m.get().get(key).cloned(),
@@ -1485,6 +1525,53 @@ mod tests {
         assert_eq!(Value::Double(f64::INFINITY).to_string(), "##Inf");
         assert_eq!(Value::Double(f64::NEG_INFINITY).to_string(), "##-Inf");
         assert_eq!(Value::Double(f64::NAN).to_string(), "##NaN");
+    }
+
+    // ── Keyword-argument maps ─────────────────────────────────────────────────
+
+    fn kwargs(entries: Vec<Value>) -> Result<MapValue, String> {
+        MapValue::from_kwargs(entries).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_from_kwargs_pairs() {
+        let m = kwargs(vec![kw("a"), int(1), kw("b"), int(2)]).expect("even list");
+        assert_eq!(m.get(&kw("a")), Some(int(1)));
+        assert_eq!(m.get(&kw("b")), Some(int(2)));
+        assert_eq!(kwargs(vec![]).expect("empty list").count(), 0);
+    }
+
+    #[test]
+    fn test_from_kwargs_last_duplicate_wins() {
+        let m = kwargs(vec![kw("a"), int(1), kw("a"), int(2)]).expect("even list");
+        assert_eq!(m.get(&kw("a")), Some(int(2)));
+        assert_eq!(m.count(), 1);
+    }
+
+    #[test]
+    fn test_from_kwargs_trailing_map() {
+        let trailing = Value::Map(MapValue::from_pairs(vec![(kw("b"), int(2))]));
+        // Alone.
+        let m = kwargs(vec![trailing.clone()]).expect("lone trailing map");
+        assert_eq!(m.get(&kw("b")), Some(int(2)));
+        // After pairs, and merged last: its entry wins over the pair's.
+        let m = kwargs(vec![kw("a"), int(1), trailing]).expect("pairs then map");
+        assert_eq!(m.get(&kw("a")), Some(int(1)));
+        assert_eq!(m.get(&kw("b")), Some(int(2)));
+        let over = Value::Map(MapValue::from_pairs(vec![(kw("a"), int(9))]));
+        let m = kwargs(vec![kw("a"), int(1), over]).expect("pairs then map");
+        assert_eq!(m.get(&kw("a")), Some(int(9)));
+    }
+
+    #[test]
+    fn test_from_kwargs_trailing_nil_supplies_nothing() {
+        assert_eq!(kwargs(vec![Value::Nil]).expect("lone nil").count(), 0);
+    }
+
+    #[test]
+    fn test_from_kwargs_key_without_value_errors() {
+        let err = kwargs(vec![kw("a"), int(1), kw("b")]).expect_err("odd list");
+        assert_eq!(err, "No value supplied for key: :b");
     }
 }
 

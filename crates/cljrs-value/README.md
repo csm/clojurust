@@ -323,6 +323,22 @@ Whole-number doubles hash like their `Long` equivalent.
 threshold, or `AssocResult::Promote(Vec<(Value, Value)>)` when the map is full.
 `MapValue::assoc` handles the transparent promotion to `PersistentHashMap`.
 
+`MapValue` builds from evaluated elements three ways: `from_pairs(Vec<(Value,
+Value)>)`, `from_flat_entries(Vec<Value>)` (a flat `[k0 v0 k1 v1 …]` vector,
+whose length must be even), and
+
+```rust
+pub fn from_kwargs(entries: Vec<Value>) -> ValueResult<Self>;
+```
+
+which reads a variadic function's trailing arguments as keyword arguments — the
+conversion behind `(defn f [& {:keys [a]}] …)`.  Unlike `from_flat_entries` it
+also accepts a trailing map, alone (`(f {:a 1})`) or after pairs (`(f :a 1 {:b
+2})`), merging its entries last, and treats a trailing `nil` as no arguments;
+an odd list whose final element is neither is `Err` ("No value supplied for
+key"), the error every execution tier reports for it.  All three resolve
+duplicate keys by assoc, so the last wins.
+
 All collections implement `PartialEq`, `Debug`, `Clone`, and `cljrs_gc::Trace`.
 `PersistentList`, `PersistentVector`, and `PersistentHashSet` implement
 `std::iter::FromIterator<Value>`.

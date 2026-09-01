@@ -45,9 +45,16 @@ fn run_destructured(pattern_src: &str, body_src: &str, arg: Value) -> Value {
     let destructures: Vec<(usize, Form)> = vec![(0, pattern)];
     let body = parse_body(body_src);
 
-    let ir: IrFunction =
-        lower_fn_body_destructured(Some("test"), "user", &params, &destructures, &body, false)
-            .expect("lower");
+    let ir: IrFunction = lower_fn_body_destructured(
+        Some("test"),
+        "user",
+        &params,
+        &destructures,
+        None,
+        &body,
+        false,
+    )
+    .expect("lower");
 
     // The destructured names must resolve to locals, never to globals.
     assert!(

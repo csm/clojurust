@@ -231,7 +231,7 @@ pub fn lower_fn_body(
     body: &[Form],
     is_async: bool,
 ) -> Result<IrFunction, LowerError> {
-    lower_fn_body_destructured(name, ns, params, &[], body, is_async)
+    lower_fn_body_destructured(name, ns, params, &[], None, body, is_async)
 }
 
 /// Lower a function arity's body, told what the lowering namespace binds.
@@ -242,16 +242,27 @@ pub fn lower_fn_body(
 /// (`cljrs_runtime::tiered::lower::core_shadows_for`), so a namespace that
 /// `def`s, `:refer`s, or `:refer-clojure :exclude`s a core name does not get
 /// core's semantics inlined at its call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_fn_body_shadowed(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_param_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
 ) -> Result<IrFunction, LowerError> {
-    lower_fn_body_impl(name, ns, params, destructures, body, is_async, shadows)
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        rest_param_index,
+        body,
+        is_async,
+        shadows,
+    )
 }
 
 /// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
@@ -265,11 +276,17 @@ pub fn lower_fn_body_shadowed(
 /// `lower_fn_arity` does for inner `fn*` forms.  The result is that the body's
 /// references to the destructured names (`a`, `b`, …) resolve to real IR locals
 /// instead of being emitted as `LoadGlobal` for non-existent vars.
+///
+/// `rest_param_index` names the variadic rest parameter's position in `params`
+/// (its last element, when the arity has one), or `None` for a fixed arity: a
+/// map pattern there is a kwargs destructure rather than a destructure of the
+/// rest list itself — see [`lower_destructure_rest_binding`].
 pub fn lower_fn_body_destructured(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_param_index: Option<usize>,
     body: &[Form],
     is_async: bool,
 ) -> Result<IrFunction, LowerError> {
@@ -278,6 +295,7 @@ pub fn lower_fn_body_destructured(
         ns,
         params,
         destructures,
+        rest_param_index,
         body,
         is_async,
         &CoreShadows::none(),
@@ -290,6 +308,7 @@ fn lower_fn_body_impl(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_param_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
@@ -320,7 +339,11 @@ fn lower_fn_body_impl(
     // before the body is lowered, so the body sees the pattern's names.
     for (idx, pattern) in destructures {
         let var = bound_params[*idx].1;
-        lower_destructure_binding(&mut ctx, pattern, var)?;
+        if rest_param_index == Some(*idx) {
+            lower_destructure_rest_binding(&mut ctx, pattern, var)?;
+        } else {
+            lower_destructure_binding(&mut ctx, pattern, var)?;
+        }
     }
 
     // Lower the body; emit a Return terminator.
@@ -765,6 +788,30 @@ fn lower_if(ctx: &mut LowerCtx, args: &[Form]) -> R {
 }
 
 // ── Destructuring ─────────────────────────────────────────────────────────────
+
+/// Bind a *rest* parameter's destructuring pattern against the rest list.
+///
+/// A map-shaped rest pattern is Clojure's keyword-argument convention
+/// (`(defn f [& {:keys [a]}] ...)`): the trailing arguments arrive as a list,
+/// and the pattern is applied to that list folded into a map, so `(f :a 1)`
+/// binds `a` to `1`.  Destructuring the list directly would emit
+/// `(get '(:a 1) :a)` — nil for every key.  The tree-walk interpreter performs
+/// the same conversion in `bind_fn_params`.
+///
+/// Every other pattern shape (a plain symbol, or a sequential `[a b]`) really
+/// does destructure the list itself, and is bound unchanged.
+fn lower_destructure_rest_binding(
+    ctx: &mut LowerCtx,
+    pattern: &Form,
+    val: VarId,
+) -> Result<(), LowerError> {
+    if matches!(pattern.kind, FormKind::Map(_)) {
+        let as_map = ctx.fresh_var();
+        ctx.emit(Inst::CallKnown(as_map, KnownFn::KwargsToMap, vec![val]));
+        return lower_destructure_binding(ctx, pattern, as_map);
+    }
+    lower_destructure_binding(ctx, pattern, val)
+}
 
 fn lower_destructure_binding(
     ctx: &mut LowerCtx,
@@ -1706,7 +1753,7 @@ fn lower_fn_arity(
         && let Some(ref pat) = ri.pattern
     {
         let gensym_var = sub.lookup_local(&ri.name).unwrap();
-        lower_destructure_binding(&mut sub, pat, gensym_var)?;
+        lower_destructure_rest_binding(&mut sub, pat, gensym_var)?;
     }
 
     // Push loop header for recur.

@@ -117,6 +117,7 @@ struct RuntimeFuncs {
     rt_dissoc: FuncId,
     rt_disj: FuncId,
     rt_nth: FuncId,
+    rt_kwargs_to_map: FuncId,
     rt_contains: FuncId,
     rt_seq: FuncId,
     rt_lazy_seq: FuncId,
@@ -2213,6 +2214,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             // `rt_nth` already returns nil on out-of-bounds, which is exactly
             // the lenient destructuring semantics — so both share the bridge.
             KnownFn::Nth | KnownFn::NthLenient => self.rt.rt_nth,
+            KnownFn::KwargsToMap => self.rt.rt_kwargs_to_map,
             KnownFn::Contains => self.rt.rt_contains,
             KnownFn::Cons => self.rt.rt_alloc_cons,
             KnownFn::Seq => self.rt.rt_seq,
@@ -2704,6 +2706,7 @@ fn declare_runtime_funcs<M: Module>(
         rt_dissoc: declare_rt(module, "rt_dissoc", &[ptr, ptr], ptr)?,
         rt_disj: declare_rt(module, "rt_disj", &[ptr, ptr], ptr)?,
         rt_nth: declare_rt(module, "rt_nth", &[ptr, ptr], ptr)?,
+        rt_kwargs_to_map: declare_rt(module, "rt_kwargs_to_map", &[ptr], ptr)?,
         rt_contains: declare_rt(module, "rt_contains", &[ptr, ptr], ptr)?,
         rt_seq: declare_rt(module, "rt_seq", &[ptr], ptr)?,
         rt_lazy_seq: declare_rt(module, "rt_lazy_seq", &[ptr], ptr)?,

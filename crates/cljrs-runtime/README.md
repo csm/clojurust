@@ -136,6 +136,11 @@ tests/
                                      eagerly (`(get m :k default)`), identically
                                      in the tree-walker and the IR tier (own
                                      binary — forced eager lowering; issue #363)
+  kwargs_rest_destructure.rs       — a map-shaped rest pattern (`& {:keys [..]}`)
+                                     binds keyword arguments in both tiers, and
+                                     a sequential one still destructures the rest
+                                     list (own binary — forced eager lowering;
+                                     issue #368)
 ```
 
 ---
@@ -973,6 +978,14 @@ lowerer never emits `LoadLocal`, so the env copy is never read.  Producing it
 anyway would evaluate each `:or` default twice per call — destructuring defaults
 are eager, so a side-effecting one would fire once here and once in the prologue
 (issue #363).
+
+A rest parameter whose pattern is a *map* is Clojure's keyword-argument
+convention: `bind_fn_params` folds the rest list into a map
+(`MapValue::from_kwargs`) before binding the pattern, so `(f :a 1)` binds `a` to
+`1`.  The lowered prologue performs the same fold — `KnownFn::KwargsToMap`,
+emitted only for that pattern position — so a kwargs function answers alike
+whichever tier runs it (issue #368).  A sequential rest pattern (`& [a b]`)
+destructures the list itself and is bound unchanged.
 
 ### Value-level special form helpers (IR interpreter API)
 

@@ -2875,6 +2875,26 @@ pub unsafe extern "C" fn rt_disj(set: *const Value, val: *const Value) -> *const
     }
 }
 
+/// Fold a variadic function's rest list into a kwargs map.
+///
+/// The bridge for [`KnownFn::KwargsToMap`](cljrs_ir::KnownFn::KwargsToMap):
+/// a rest parameter destructured with a map pattern (`(defn f [& {:keys [a]}]
+/// ...)`) receives its trailing arguments as a list, which the destructuring
+/// `get`s must read as a map.  Same conversion as the tree-walker's
+/// `bind_fn_params`, so a kwargs function answers alike in every tier.
+///
+/// # Safety
+/// The pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_kwargs_to_map(rest: *const Value) -> *const Value {
+    let rest = unsafe { val_ref(rest) };
+    let items = cljrs_runtime::interp::destructure::value_to_seq_vec(rest);
+    match cljrs_value::MapValue::from_kwargs(items) {
+        Ok(m) => box_coll_val(Value::Map(m)),
+        Err(e) => throw_str(e.to_string()),
+    }
+}
+
 /// `(nth coll idx)`.
 ///
 /// # Safety
@@ -4286,6 +4306,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_dissoc as *const () as usize);
     std::hint::black_box(rt_disj as *const () as usize);
     std::hint::black_box(rt_nth as *const () as usize);
+    std::hint::black_box(rt_kwargs_to_map as *const () as usize);
     std::hint::black_box(rt_contains as *const () as usize);
     std::hint::black_box(rt_seq as *const () as usize);
     std::hint::black_box(rt_lazy_seq as *const () as usize);

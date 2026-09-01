@@ -287,11 +287,17 @@ pub fn lower_expanded_arity(
         destructures.push((params.len(), rest_pat.clone()));
     }
 
+    // The rest parameter, when present, is `all_params`' last element; the
+    // lowerer needs to know which index that is, since a map-shaped pattern
+    // there is a kwargs destructure, not a destructure of the list itself.
+    let rest_param_index = rest_param.map(|_| all_params.len() - 1);
+
     let ir = cljrs_ir::lower::lower_fn_body_shadowed(
         name,
         ns,
         &all_params,
         &destructures,
+        rest_param_index,
         expanded_body,
         is_async,
         shadows,

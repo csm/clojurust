@@ -215,6 +215,20 @@ for `[a b c]` patterns — a short collection binds the missing positions to
 `nil` rather than throwing.  Both compile to the `rt_nth` bridge (already
 nil-on-OOB); the IR interpreter appends the nil default for `NthLenient`.
 
+`KwargsToMap` folds a variadic function's rest *list* into a map.  A rest
+parameter destructured with a map pattern is Clojure's keyword-argument
+convention (`(defn f [& {:keys [a]}] ...)`): the trailing arguments arrive as a
+list, and `(f :a 1)` must bind `a` to `1`, so the pattern's `get`s have to run
+against the folded map — destructuring the list itself yields `(get '(:a 1) :a)`,
+nil for every key (issue #368).  A trailing map is accepted in place of the
+pairs or after them (`(f {:a 1})`, `(f :a 1 {:b 2})`), and an odd list whose
+last element is not a map throws "No value supplied for key".  Like
+`NthLenient` this variant is emitted only by destructuring lowering, never by
+`known.rs` name resolution — no Clojure function names it.  It compiles to the
+`rt_kwargs_to_map` bridge; both it and the IR interpreter call
+`MapValue::from_kwargs`, the same conversion the tree-walker's
+`bind_fn_params` performs.
+
 ### `:or` destructuring defaults are eager
 
 `destructure` expands a symbol carrying an `:or` entry to `(get m :k default)`,
@@ -299,11 +313,18 @@ pub fn lower_fn_body_shadowed(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_param_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
 ) -> Result<IrFunction, LowerError>;
 ```
+
+`rest_param_index` names the variadic rest parameter's position in `params`
+(the last element, when the arity has one), or `None` for a fixed arity.  The
+prologue needs it because a map-shaped destructuring pattern means something
+different there — see `KwargsToMap` above.  `lower_fn_body_destructured` takes
+the same argument, in the same position.
 
 Lexical bindings are handled by the lowerer itself: `LowerCtx::core_call_name`
 consults `lookup_local` first, so a `let`-bound or parameter `inc` is a call to
