@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::env::env::Env;
-use crate::env::error::{EvalError, EvalResult};
+use crate::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 use crate::interp::destructure::value_to_seq_vec;
 use crate::interp::eval::eval;
 
@@ -702,9 +702,9 @@ fn bind_fn_params_impl(
             // When the rest pattern is a map destructure (e.g. `& {:keys [bar]}`),
             // convert the rest args list into a map of alternating key-value pairs,
             // matching Clojure's keyword-arguments convention.
-            let destructure_val = if matches!(pattern.kind, FormKind::Map(_)) {
+            let destructure_val = if pattern.is_kwargs_rest_pattern() {
                 let items = value_to_seq_vec(&rest_val);
-                Value::Map(MapValue::from_kwargs_entries(items))
+                Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)?
             } else {
                 rest_val
             };

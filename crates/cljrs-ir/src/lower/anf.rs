@@ -1747,7 +1747,7 @@ fn lower_fn_arity(
         && let Some(ref pat) = ri.pattern
     {
         let mut gensym_var = sub.lookup_local(&ri.name).unwrap();
-        if matches!(pat.kind, FormKind::Map(_)) {
+        if pat.is_kwargs_rest_pattern() {
             let normalized = sub.fresh_var();
             sub.emit(Inst::CallKnown(
                 normalized,

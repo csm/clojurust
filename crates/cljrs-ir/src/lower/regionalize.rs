@@ -238,6 +238,9 @@ fn call_result_safe_for_deep(
                     dst: call_dst,
                 } => {
                     // Element extractors return an inner pointer by reference.
+                    // `KwargsMap` counts: a single trailing argument is handed
+                    // straight back (Clojure's `(first s)` case), so its result
+                    // can alias an element of the rest seq it was given.
                     if matches!(
                         kf,
                         KnownFn::First
@@ -245,6 +248,7 @@ fn call_result_safe_for_deep(
                             | KnownFn::NthLenient
                             | KnownFn::Get
                             | KnownFn::Peek
+                            | KnownFn::KwargsMap
                     ) {
                         return false;
                     }

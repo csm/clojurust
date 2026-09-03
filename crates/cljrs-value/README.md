@@ -323,6 +323,25 @@ Whole-number doubles hash like their `Long` equivalent.
 threshold, or `AssocResult::Promote(Vec<(Value, Value)>)` when the map is full.
 `MapValue::assoc` handles the transparent promotion to `PersistentHashMap`.
 
+### Keyword-argument rest normalization
+
+```rust
+pub fn Value::from_kwargs_rest(entries: Vec<Value>) -> Result<Value, ValueError>;
+```
+
+Clojure's `seq-to-map-for-destructuring`: the value a *map-shaped* variadic
+rest pattern (`[& {:keys [a b]}]`) destructures against, given the trailing
+arguments as a flat vector. Zero or one argument returns that argument
+verbatim — so `(f {:a 1})` binds the caller's own map (sortedness and metadata
+intact) and `(f)` / `(f nil)` bind `nil`; two or more are alternating
+key/value pairs, optionally closed by a trailing map whose entries merge over
+and beat them. A dangling key is a `ValueError`, not a dropped argument.
+
+This lives here rather than in a tier because every tier has to agree on it:
+the tree-walker calls it from `bind_fn_params`, and the IR interpreter and
+compiled code reach it through `KnownFn::KwargsMap` / `rt_kwargs_map`. Issue
+#368 was those paths disagreeing.
+
 All collections implement `PartialEq`, `Debug`, `Clone`, and `cljrs_gc::Trace`.
 `PersistentList`, `PersistentVector`, and `PersistentHashSet` implement
 `std::iter::FromIterator<Value>`.

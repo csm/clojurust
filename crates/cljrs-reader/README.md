@@ -164,6 +164,14 @@ impl Form {
     pub fn as_list(&self) -> Option<&[Form]>
     pub fn as_vector(&self) -> Option<&[Form]>
     pub fn as_map(&self) -> Option<&[Form]>
+
+    // ── Destructuring shape ──
+    /// True when this form, used as a variadic `&` rest pattern, selects
+    /// Clojure's keyword-argument convention — i.e. it is map-shaped, so the
+    /// trailing arguments are normalized into a map before the pattern is
+    /// applied rather than destructured as a seq. Shared by the tree-walker
+    /// and both lowerers so the tiers cannot disagree (issue #368).
+    pub fn is_kwargs_rest_pattern(&self) -> bool
 }
 
 impl FormKind {

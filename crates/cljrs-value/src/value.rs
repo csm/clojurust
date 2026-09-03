@@ -6,7 +6,7 @@ use crate::collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet, TransientMap, TransientSet, TransientVector,
 };
-use crate::error::ExceptionInfo;
+use crate::error::{ExceptionInfo, ValueError};
 use crate::hash::{
     ClojureHash, hash_combine_ordered, hash_combine_unordered, hash_i64, hash_string, hash_u128,
 };
@@ -200,27 +200,6 @@ impl MapValue {
             .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
             .collect();
         Self::from_pairs(pairs)
-    }
-
-    /// Build the map used by a map-shaped variadic rest binding. A trailing
-    /// map is accepted in addition to alternating key/value arguments, as in
-    /// Clojure's keyword-argument convention.
-    pub fn from_kwargs_entries(mut entries: Vec<Value>) -> Self {
-        let trailing = match entries.last() {
-            Some(Value::Map(map)) if !entries.len().is_multiple_of(2) => {
-                let map = map.clone();
-                entries.pop();
-                Some(map)
-            }
-            _ => None,
-        };
-        let mut result = Self::from_flat_entries(entries);
-        if let Some(map) = trailing {
-            for (key, value) in map.iter() {
-                result = result.assoc(key.clone(), value.clone());
-            }
-        }
-        result
     }
 
     pub fn get(&self, key: &Value) -> Option<Value> {
@@ -1132,6 +1111,59 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
     }
 }
 
+// ── Keyword-argument rest normalization ──────────────────────────────────────
+
+impl Value {
+    /// Normalize a variadic rest sequence into the value a *map-shaped* rest
+    /// pattern (`[& {:keys [a b]}]`) destructures against.
+    ///
+    /// This is Clojure's `seq-to-map-for-destructuring`, and every execution
+    /// tier must agree on it — the tree-walker calls it from `bind_fn_params`,
+    /// the IR interpreter and the compiled tiers reach it through
+    /// `KnownFn::KwargsMap` / `rt_kwargs_map`.  A divergence here is issue
+    /// #368.
+    ///
+    /// - Zero or one argument: the lone value *is* the map, returned verbatim.
+    ///   `(f {:a 1})` therefore keeps the caller's map identity — a sorted map
+    ///   stays sorted, metadata stays attached — and `(f)` / `(f nil)` bind
+    ///   `nil`, which reads like an empty map for every `:keys` lookup.
+    /// - Otherwise the arguments are alternating key/value pairs, optionally
+    ///   followed by a trailing map whose entries win over the pairs before it
+    ///   (Clojure 1.11's keyword-argument calling convention).
+    ///
+    /// An odd argument count with no trailing map is a caller error, reported
+    /// the way Clojure reports it rather than dropping the dangling key.
+    pub fn from_kwargs_rest(mut entries: Vec<Value>) -> Result<Value, ValueError> {
+        if entries.len() < 2 {
+            return Ok(entries.pop().unwrap_or(Value::Nil));
+        }
+
+        // A trailing map is only a trailing map when what precedes it pairs up
+        // evenly; `(f :a {:x 1})` passes a map as `:a`'s *value*.  Match through
+        // any `WithMeta` wrapper — a map carrying metadata is still a map.
+        let trailing = match entries.last().map(Value::unwrap_meta) {
+            Some(Value::Map(_)) if !entries.len().is_multiple_of(2) => entries.pop(),
+            _ => None,
+        };
+
+        if !entries.len().is_multiple_of(2) {
+            let key = entries.last().expect("odd length implies a last entry");
+            return Err(ValueError::Other(format!(
+                "No value supplied for key: {}",
+                PrintValue(key)
+            )));
+        }
+
+        let mut result = MapValue::from_flat_entries(entries);
+        if let Some(Value::Map(map)) = trailing.as_ref().map(Value::unwrap_meta) {
+            for (key, value) in map.iter() {
+                result = result.assoc(key.clone(), value.clone());
+            }
+        }
+        Ok(Value::Map(result))
+    }
+}
+
 // ── Metadata helpers ─────────────────────────────────────────────────────────
 
 impl Value {
@@ -1508,6 +1540,91 @@ mod tests {
         assert_eq!(Value::Double(f64::INFINITY).to_string(), "##Inf");
         assert_eq!(Value::Double(f64::NEG_INFINITY).to_string(), "##-Inf");
         assert_eq!(Value::Double(f64::NAN).to_string(), "##NaN");
+    }
+
+    // ── Keyword-argument rest normalization ──────────────────────────────────
+
+    fn kwargs(entries: Vec<Value>) -> Value {
+        Value::from_kwargs_rest(entries).expect("well-formed kwargs")
+    }
+
+    fn map_of(entries: Vec<Value>) -> Value {
+        Value::Map(MapValue::from_flat_entries(entries))
+    }
+
+    #[test]
+    fn kwargs_rest_empty_and_lone_values_pass_through() {
+        // `(f)` and `(f nil)` both bind nil, as in Clojure — `:as` sees the
+        // rest value itself, so an empty map here would be observable.
+        assert_eq!(kwargs(vec![]), Value::Nil);
+        assert_eq!(kwargs(vec![Value::Nil]), Value::Nil);
+        // A lone argument is the map verbatim, whatever it is: no rebuild, so
+        // map identity (and with it sortedness and metadata) survives, and a
+        // non-map is handed on for `get` to return nil against.
+        assert_eq!(kwargs(vec![kw("a")]), kw("a"));
+        let sorted = Value::Map(MapValue::Sorted(GcPtr::new(SortedMap::from_pairs(vec![
+            (kw("b"), int(1)),
+            (kw("a"), int(2)),
+        ]))));
+        assert!(matches!(
+            kwargs(vec![sorted.clone()]),
+            Value::Map(MapValue::Sorted(_))
+        ));
+        let with_meta = map_of(vec![kw("a"), int(1)]).with_meta(map_of(vec![kw("t"), int(1)]));
+        assert_eq!(kwargs(vec![with_meta.clone()]), with_meta);
+    }
+
+    #[test]
+    fn kwargs_rest_pairs_build_a_map() {
+        assert_eq!(
+            kwargs(vec![kw("a"), int(1), kw("b"), int(2)]),
+            map_of(vec![kw("a"), int(1), kw("b"), int(2)])
+        );
+        // Duplicate keys: last wins, as for a map literal built by assoc.
+        assert_eq!(
+            kwargs(vec![kw("a"), int(1), kw("a"), int(2)]),
+            map_of(vec![kw("a"), int(2)])
+        );
+    }
+
+    #[test]
+    fn kwargs_rest_trailing_map_merges_and_wins() {
+        // `(f :a 1 {:b 2})` — the trailing map's entries join the pairs...
+        assert_eq!(
+            kwargs(vec![kw("a"), int(1), map_of(vec![kw("b"), int(2)])]),
+            map_of(vec![kw("a"), int(1), kw("b"), int(2)])
+        );
+        // ...and beat them on a clash.
+        assert_eq!(
+            kwargs(vec![kw("a"), int(1), map_of(vec![kw("a"), int(9)])]),
+            map_of(vec![kw("a"), int(9)])
+        );
+        // A map carrying metadata is still a trailing map: `with_meta` wraps
+        // rather than annotates, so matching the raw `Value` would miss it.
+        let meta_map = map_of(vec![kw("b"), int(2)]).with_meta(map_of(vec![kw("t"), int(1)]));
+        assert_eq!(
+            kwargs(vec![kw("a"), int(1), meta_map]),
+            map_of(vec![kw("a"), int(1), kw("b"), int(2)])
+        );
+    }
+
+    #[test]
+    fn kwargs_rest_map_in_value_position_is_not_a_trailing_map() {
+        // Even arity: the map is `:a`'s value, not a trailing map to merge.
+        let inner = map_of(vec![kw("x"), int(1)]);
+        assert_eq!(
+            kwargs(vec![kw("a"), inner.clone()]),
+            map_of(vec![kw("a"), inner])
+        );
+    }
+
+    #[test]
+    fn kwargs_rest_dangling_key_is_an_error() {
+        // Clojure's message, and an error rather than the silently dropped
+        // argument a bare `chunks(2)` would produce.
+        let err = Value::from_kwargs_rest(vec![kw("a"), int(1), kw("b")])
+            .expect_err("odd arity with no trailing map");
+        assert_eq!(err.to_string(), "No value supplied for key: :b");
     }
 }
 
