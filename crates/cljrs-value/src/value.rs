@@ -1303,6 +1303,8 @@ impl cljrs_gc::Trace for Value {
             Value::Agent(p) => visitor.visit(p),
             Value::TypeInstance(p) => visitor.visit(p),
             Value::ObjectArray(p) => visitor.visit(p),
+            // Primitive arrays have no child Values, but their boxes live on
+            // the GC heap and must themselves be marked.
             Value::BooleanArray(p) => visitor.visit(p),
             Value::ByteArray(p) => visitor.visit(p),
             Value::ShortArray(p) => visitor.visit(p),
