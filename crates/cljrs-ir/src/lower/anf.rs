@@ -242,16 +242,27 @@ pub fn lower_fn_body(
 /// (`cljrs_runtime::tiered::lower::core_shadows_for`), so a namespace that
 /// `def`s, `:refer`s, or `:refer-clojure :exclude`s a core name does not get
 /// core's semantics inlined at its call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_fn_body_shadowed(
     name: Option<&str>,
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
 ) -> Result<IrFunction, LowerError> {
-    lower_fn_body_impl(name, ns, params, destructures, body, is_async, shadows)
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        rest_index,
+        body,
+        is_async,
+        shadows,
+    )
 }
 
 /// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
@@ -278,6 +289,7 @@ pub fn lower_fn_body_destructured(
         ns,
         params,
         destructures,
+        None,
         body,
         is_async,
         &CoreShadows::none(),
@@ -290,6 +302,7 @@ fn lower_fn_body_impl(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
@@ -319,7 +332,12 @@ fn lower_fn_body_impl(
     // Expand any destructuring patterns into explicit bindings in the prologue,
     // before the body is lowered, so the body sees the pattern's names.
     for (idx, pattern) in destructures {
-        let var = bound_params[*idx].1;
+        let mut var = bound_params[*idx].1;
+        if rest_index == Some(*idx) && cljrs_reader::is_kwargs_rest_pattern(pattern) {
+            let normalized = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(normalized, KnownFn::KwargsMap, vec![var]));
+            var = normalized;
+        }
         lower_destructure_binding(&mut ctx, pattern, var)?;
     }
 
@@ -1705,7 +1723,16 @@ fn lower_fn_arity(
     if let Some(ref ri) = rest_info
         && let Some(ref pat) = ri.pattern
     {
-        let gensym_var = sub.lookup_local(&ri.name).unwrap();
+        let mut gensym_var = sub.lookup_local(&ri.name).unwrap();
+        if cljrs_reader::is_kwargs_rest_pattern(pat) {
+            let normalized = sub.fresh_var();
+            sub.emit(Inst::CallKnown(
+                normalized,
+                KnownFn::KwargsMap,
+                vec![gensym_var],
+            ));
+            gensym_var = normalized;
+        }
         lower_destructure_binding(&mut sub, pat, gensym_var)?;
     }
 

@@ -202,6 +202,36 @@ impl MapValue {
         Self::from_pairs(pairs)
     }
 
+    /// Build the map used by a map-shaped variadic rest binding. A trailing
+    /// map is accepted in addition to alternating key/value arguments, as in
+    /// Clojure's keyword-argument convention.
+    pub fn from_kwargs_entries(mut entries: Vec<Value>) -> Result<Value, Value> {
+        let trailing = if !entries.len().is_multiple_of(2) {
+            match entries.last().map(Value::unwrap_meta) {
+                Some(Value::Map(_)) => Some(entries.pop().expect("last entry exists")),
+                Some(Value::Nil) if entries.len() == 1 => return Ok(Value::Nil),
+                _ => return Err(entries.pop().expect("odd entry count is non-empty")),
+            }
+        } else {
+            None
+        };
+        if entries.is_empty()
+            && let Some(map) = trailing
+        {
+            return Ok(map);
+        }
+        let mut result = Self::from_flat_entries(entries);
+        if let Some(map) = trailing {
+            let Value::Map(map) = map.unwrap_meta() else {
+                unreachable!("trailing entry was checked as a map")
+            };
+            for (key, value) in map.iter() {
+                result = result.assoc(key.clone(), value.clone());
+            }
+        }
+        Ok(Value::Map(result))
+    }
+
     pub fn get(&self, key: &Value) -> Option<Value> {
         match self {
             MapValue::Array(m) => m.get().get(key).cloned(),

@@ -10,3 +10,9 @@ pub use lexer::Lexer;
 pub use namespaced_map::MapNs;
 pub use parser::Parser;
 pub use token::Token;
+
+/// Whether a variadic rest binding uses Clojure's keyword-argument map form.
+#[inline]
+pub fn is_kwargs_rest_pattern(pattern: &Form) -> bool {
+    matches!(pattern.unmeta().kind, FormKind::Map(_))
+}

@@ -292,6 +292,7 @@ pub fn lower_expanded_arity(
         ns,
         &all_params,
         &destructures,
+        rest_param.map(|_| params.len()),
         expanded_body,
         is_async,
         shadows,

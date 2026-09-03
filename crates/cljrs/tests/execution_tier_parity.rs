@@ -25,6 +25,18 @@ const PROGRAM: &str = r#"
 (defn parity-add [a b] (+ a b))
 (defn parity-sub [a b] (- a b))
 (defn parity-mul [a b] (* a b))
+(defn parity-kwargs [& {:keys [a b] :or {b 5}}] [a b])
+(defn parity-kwargs-fixed [x & {:keys [a]}] [x a])
+(defn parity-seq-rest [& [a b]] [a b])
+(defn parity-kwargs-odd []
+  (try
+    (str "value|" (pr-str (parity-kwargs :a 1 :b)))
+    (catch Exception e
+      (str "error|" (ex-message e)))))
+(defn parity-kwargs-meta-map []
+  (parity-kwargs (with-meta {:a 6} {:tag true})))
+(defn parity-kwargs-meta-mixed []
+  (parity-kwargs :a 1 (with-meta {:b 9} {:tag true})))
 (def parity-or-default-count (atom 0))
 (defn parity-or-default
   ;; An `:or` default is an ordinary argument of `(get m :k default)`, so it is
@@ -44,6 +56,10 @@ const PROGRAM: &str = r#"
   (parity-add 1 2)
   (parity-sub 2 1)
   (parity-mul 2 3)
+  (parity-kwargs :a 1)
+  (parity-kwargs-fixed 0 :a 3)
+  (parity-kwargs {:a 2 :b 4})
+  (parity-seq-rest 1 2)
   ;; 50 calls that all supply `:x`; each still evaluates the default.
   (parity-or-default {:x 7})
   ;; Keeping allocation-heavy results reachable also prevents AOT's region
@@ -70,6 +86,17 @@ const PROGRAM: &str = r#"
 (println (str "or-default-hit|value|" (pr-str (parity-or-default {:x 7}))))
 (println (str "or-default-miss|value|" (pr-str (parity-or-default {}))))
 (println (str "or-default-effects|value|" (pr-str @parity-or-default-count)))
+(println (str "kwargs|value|" (pr-str (parity-kwargs :a 1))))
+(println (str "kwargs-fixed|value|" (pr-str (parity-kwargs-fixed 0 :a 3))))
+(println (str "kwargs-map|value|" (pr-str (parity-kwargs {:a 2 :b 4}))))
+(println (str "seq-rest|value|" (pr-str (parity-seq-rest 1 2))))
+(println (str "kwargs-nil|value|" (pr-str (parity-kwargs nil))))
+(println (str "kwargs-meta-map|value|"
+              (pr-str (parity-kwargs-meta-map))))
+(println (str "kwargs-meta-mixed|value|"
+              (pr-str (parity-kwargs-meta-mixed))))
+(println
+  (str "kwargs-odd|" (parity-kwargs-odd)))
 (println
   (str "arithmetic-error|"
        (try
@@ -241,7 +268,7 @@ fn parse_records(tier: Tier, output: &Output) -> BTreeMap<String, Outcome> {
             tier.name()
         );
     }
-    assert_eq!(records.len(), 13, "{} stdout:\n{stdout}", tier.name());
+    assert_eq!(records.len(), 21, "{} stdout:\n{stdout}", tier.name());
     records
 }
 
@@ -274,6 +301,20 @@ fn values_and_errors_match_across_all_execution_tiers() {
     assert_eq!(tree["or-default-miss"], Outcome::Value("1".to_string()));
     assert_eq!(tree["or-default-effects"], Outcome::Value("52".to_string()));
     assert_eq!(tree["seq-loop"], Outcome::Value("[1 2 3 4]".to_string()));
+    assert_eq!(tree["kwargs"], Outcome::Value("[1 5]".to_string()));
+    assert_eq!(tree["kwargs-fixed"], Outcome::Value("[0 3]".to_string()));
+    assert_eq!(tree["kwargs-map"], Outcome::Value("[2 4]".to_string()));
+    assert_eq!(tree["seq-rest"], Outcome::Value("[1 2]".to_string()));
+    assert_eq!(tree["kwargs-nil"], Outcome::Value("[nil 5]".to_string()));
+    assert_eq!(tree["kwargs-meta-map"], Outcome::Value("[6 5]".to_string()));
+    assert_eq!(
+        tree["kwargs-meta-mixed"],
+        Outcome::Value("[1 9]".to_string())
+    );
+    assert_eq!(
+        tree["kwargs-odd"],
+        Outcome::Error("No value supplied for key: :b".to_string())
+    );
     assert_eq!(
         tree["overflow-add"],
         Outcome::Value("9223372036854775808N".to_string())

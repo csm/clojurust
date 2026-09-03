@@ -4,11 +4,11 @@ use crate::builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{Keyword, PersistentList, Symbol, Value};
+use cljrs_value::{Keyword, MapValue, PersistentList, Symbol, Value, ValueError};
 use std::sync::Arc;
 
 use crate::env::env::Env;
-use crate::env::error::{EvalError, EvalResult};
+use crate::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 
 /// Bind a destructuring pattern `pattern` against `val` in `env`.
 ///
@@ -138,6 +138,16 @@ pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
         }
         _ => vec![],
     }
+}
+
+/// Normalize variadic keyword arguments for a map-shaped rest binding.
+pub fn kwargs_map_value(items: Vec<Value>) -> EvalResult<Value> {
+    MapValue::from_kwargs_entries(items).map_err(|key| {
+        value_error_to_eval_error(ValueError::Other(format!(
+            "No value supplied for key: {}",
+            cljrs_value::value::PrintValue(&key)
+        )))
+    })
 }
 
 // ── Associative destructuring ─────────────────────────────────────────────────

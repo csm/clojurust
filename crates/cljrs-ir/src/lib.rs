@@ -127,6 +127,9 @@ pub enum KnownFn {
     /// Emitted only by destructuring lowering; user-level `(nth v i)` stays
     /// [`KnownFn::Nth`], which throws on out-of-bounds.
     NthLenient,
+    /// Convert a variadic argument seq to the map consumed by a map-shaped
+    /// rest destructuring pattern.
+    KwargsMap,
     Count,
     Contains,
 
@@ -1046,6 +1049,7 @@ impl KnownFn {
             | KnownFn::HashMap
             | KnownFn::HashSet
             | KnownFn::List
+            | KnownFn::KwargsMap
             | KnownFn::Assoc
             | KnownFn::Dissoc
             | KnownFn::Conj

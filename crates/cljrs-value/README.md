@@ -48,6 +48,11 @@ src/
       node.rs                    — Node<V> enum (Leaf, Branch, Collision); HAMT trie operations
 ```
 
+`MapValue::from_kwargs_entries` implements variadic keyword-argument
+normalization for map-shaped rest bindings. It accepts alternating key/value
+entries or a trailing (possibly metadata-wrapped) map, preserves a lone
+trailing map, treats a lone `nil` as `nil`, and reports an unmatched key.
+
 ---
 
 ## Public API

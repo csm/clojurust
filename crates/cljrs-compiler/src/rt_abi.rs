@@ -2905,6 +2905,24 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
     }
 }
 
+/// Normalize a variadic rest seq for map destructuring.
+///
+/// # Safety
+/// `rest` must be a valid pointer to a live `Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_kwargs_map(rest: *const Value) -> *const Value {
+    let items = cljrs_runtime::interp::destructure::value_to_seq_vec(unsafe { val_ref(rest) });
+    match cljrs_runtime::interp::destructure::kwargs_map_value(items) {
+        Ok(value) => box_val(value),
+        Err(error) => throw_str(
+            error
+                .to_string()
+                .trim_start_matches("runtime error: ")
+                .to_string(),
+        ),
+    }
+}
+
 /// `(contains? coll key)`.
 ///
 /// # Safety
@@ -4286,6 +4304,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_dissoc as *const () as usize);
     std::hint::black_box(rt_disj as *const () as usize);
     std::hint::black_box(rt_nth as *const () as usize);
+    std::hint::black_box(rt_kwargs_map as *const () as usize);
     std::hint::black_box(rt_contains as *const () as usize);
     std::hint::black_box(rt_seq as *const () as usize);
     std::hint::black_box(rt_lazy_seq as *const () as usize);
