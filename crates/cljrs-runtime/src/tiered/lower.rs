@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cljrs_ir::lower::CoreShadows;
 use cljrs_ir::{IrFunction, Repr};
-use cljrs_reader::Form;
+use cljrs_reader::{Form, FormKind};
 use cljrs_value::TypeHint;
 
 use crate::builtins::form::resolve_auto_forms;
@@ -287,11 +287,15 @@ pub fn lower_expanded_arity(
         destructures.push((params.len(), rest_pat.clone()));
     }
 
-    let ir = cljrs_ir::lower::lower_fn_body_shadowed(
+    let kwargs_rest_index = destructure_rest
+        .filter(|pat| matches!(pat.kind, FormKind::Map(_)))
+        .map(|_| params.len());
+    let ir = cljrs_ir::lower::lower_fn_body_shadowed_kwargs(
         name,
         ns,
         &all_params,
         &destructures,
+        kwargs_rest_index,
         expanded_body,
         is_async,
         shadows,

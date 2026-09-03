@@ -704,7 +704,7 @@ fn bind_fn_params_impl(
             // matching Clojure's keyword-arguments convention.
             let destructure_val = if matches!(pattern.kind, FormKind::Map(_)) {
                 let items = value_to_seq_vec(&rest_val);
-                Value::Map(MapValue::from_flat_entries(items))
+                Value::Map(MapValue::from_kwargs_entries(items))
             } else {
                 rest_val
             };
