@@ -2906,6 +2906,9 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
 }
 
 /// Normalize a variadic rest seq for map destructuring.
+///
+/// # Safety
+/// `rest` must point to a valid, live [`Value`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_kwargs_map(rest: *const Value) -> *const Value {
     let items = cljrs_runtime::interp::destructure::value_to_seq_vec(unsafe { val_ref(rest) });
