@@ -2905,6 +2905,27 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
     }
 }
 
+/// Normalize a variadic rest seq into the value a map-shaped rest pattern
+/// destructures against — the compiled tiers' half of `KnownFn::KwargsMap`.
+///
+/// An odd argument list with no trailing map raises through the pending-
+/// exception slot, so a bad kwargs call is catchable here exactly as it is in
+/// the tree-walker rather than unwinding out of an `extern "C"` frame.
+///
+/// # Safety
+/// `rest` must point to a valid, live [`Value`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_kwargs_map(rest: *const Value) -> *const Value {
+    let items = cljrs_runtime::interp::destructure::value_to_seq_vec(unsafe { val_ref(rest) });
+    match Value::from_kwargs_rest(items) {
+        // The result is a map the caller just built, or — for a single trailing
+        // argument — that argument passed through, which may be any value
+        // (including `nil`), so it goes through the scalar-aware boxer.
+        Ok(v) => box_or_intern_val(v),
+        Err(e) => throw_str(e.to_string()),
+    }
+}
+
 /// `(contains? coll key)`.
 ///
 /// # Safety
@@ -4286,6 +4307,7 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_dissoc as *const () as usize);
     std::hint::black_box(rt_disj as *const () as usize);
     std::hint::black_box(rt_nth as *const () as usize);
+    std::hint::black_box(rt_kwargs_map as *const () as usize);
     std::hint::black_box(rt_contains as *const () as usize);
     std::hint::black_box(rt_seq as *const () as usize);
     std::hint::black_box(rt_lazy_seq as *const () as usize);

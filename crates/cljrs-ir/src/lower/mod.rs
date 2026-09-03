@@ -12,7 +12,10 @@ pub mod known;
 pub mod optimize;
 pub mod regionalize;
 
-pub use anf::{LowerError, lower_fn_body, lower_fn_body_destructured, lower_fn_body_shadowed};
+pub use anf::{
+    LowerError, lower_fn_body, lower_fn_body_destructured, lower_fn_body_shadowed,
+    lower_fn_body_shadowed_kwargs,
+};
 pub use async_lower::{AsyncLowerError, AsyncLowering, lower_async};
 pub use escape::{
     AnalysisResult, EscapeContext, EscapeState, ExternalDefn, UseInfo, UseKind, analyze,

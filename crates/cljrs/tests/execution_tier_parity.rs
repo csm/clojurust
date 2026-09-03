@@ -25,6 +25,13 @@ const PROGRAM: &str = r#"
 (defn parity-add [a b] (+ a b))
 (defn parity-sub [a b] (- a b))
 (defn parity-mul [a b] (* a b))
+(defn parity-kwargs [& {:keys [a b] :or {b 5}}] [a b])
+(defn parity-kwargs-fixed [x & {:keys [a]}] [x a])
+;; `:as` observes the normalized rest value itself, so it pins the cases where
+;; that value is not a freshly built map: no arguments and a lone `nil` both
+;; bind `nil`, and a lone trailing map is handed back as-is (issue #368).
+(defn parity-kwargs-as [& {:keys [a] :or {a 0} :as m}] [a m])
+(defn parity-seq-rest [& [a b]] [a b])
 (def parity-or-default-count (atom 0))
 (defn parity-or-default
   ;; An `:or` default is an ordinary argument of `(get m :k default)`, so it is
@@ -46,6 +53,19 @@ const PROGRAM: &str = r#"
   (parity-mul 2 3)
   ;; 50 calls that all supply `:x`; each still evaluates the default.
   (parity-or-default {:x 7})
+  ;; The kwargs arities have to go native too, or the JIT tier below silently
+  ;; compares eager-IR output for them and `rt_kwargs_map`'s JIT symbol
+  ;; registration goes untested.  Both call shapes are exercised: alternating
+  ;; key/value arguments and a trailing map.
+  (parity-kwargs :a 1)
+  (parity-kwargs {:a 2 :b 4})
+  (parity-kwargs :a 1 {:b 9})
+  (parity-kwargs-fixed 0 :a 3)
+  (parity-kwargs-as)
+  (parity-kwargs-as nil)
+  (parity-kwargs-as {:a 3})
+  (try (parity-kwargs :a 1 :b) (catch Exception e nil))
+  (parity-seq-rest 1 2)
   ;; Keeping allocation-heavy results reachable also prevents AOT's region
   ;; optimizer from turning the JIT warm-up into an allocation stress test.
   (def parity-literal-sink (parity-literals))
@@ -70,6 +90,24 @@ const PROGRAM: &str = r#"
 (println (str "or-default-hit|value|" (pr-str (parity-or-default {:x 7}))))
 (println (str "or-default-miss|value|" (pr-str (parity-or-default {}))))
 (println (str "or-default-effects|value|" (pr-str @parity-or-default-count)))
+(println (str "kwargs|value|" (pr-str (parity-kwargs :a 1))))
+(println (str "kwargs-fixed|value|" (pr-str (parity-kwargs-fixed 0 :a 3))))
+(println (str "kwargs-map|value|" (pr-str (parity-kwargs {:a 2 :b 4}))))
+;; A trailing map merges over the key/value pairs before it, and wins on a
+;; clash — Clojure 1.11's calling convention.
+(println (str "kwargs-mixed|value|" (pr-str (parity-kwargs :a 1 {:b 9}))))
+(println (str "kwargs-none|value|" (pr-str (parity-kwargs-as))))
+(println (str "kwargs-nil|value|" (pr-str (parity-kwargs-as nil))))
+(println (str "kwargs-as-map|value|" (pr-str (parity-kwargs-as {:a 3}))))
+;; A dangling key is a caller error on every tier, not a panic and not a
+;; silently dropped argument.
+(println
+  (str "kwargs-odd|"
+       (try
+         (str "value|" (pr-str (parity-kwargs :a 1 :b)))
+         (catch Exception e
+           (str "error|" (ex-message e))))))
+(println (str "seq-rest|value|" (pr-str (parity-seq-rest 1 2))))
 (println
   (str "arithmetic-error|"
        (try
@@ -241,7 +279,7 @@ fn parse_records(tier: Tier, output: &Output) -> BTreeMap<String, Outcome> {
             tier.name()
         );
     }
-    assert_eq!(records.len(), 13, "{} stdout:\n{stdout}", tier.name());
+    assert_eq!(records.len(), 22, "{} stdout:\n{stdout}", tier.name());
     records
 }
 
@@ -274,6 +312,23 @@ fn values_and_errors_match_across_all_execution_tiers() {
     assert_eq!(tree["or-default-miss"], Outcome::Value("1".to_string()));
     assert_eq!(tree["or-default-effects"], Outcome::Value("52".to_string()));
     assert_eq!(tree["seq-loop"], Outcome::Value("[1 2 3 4]".to_string()));
+    assert_eq!(tree["kwargs"], Outcome::Value("[1 5]".to_string()));
+    assert_eq!(tree["kwargs-fixed"], Outcome::Value("[0 3]".to_string()));
+    assert_eq!(tree["kwargs-map"], Outcome::Value("[2 4]".to_string()));
+    assert_eq!(tree["kwargs-mixed"], Outcome::Value("[1 9]".to_string()));
+    // No arguments and a lone `nil` both normalize to `nil`, so `:as` binds
+    // `nil` rather than an empty map, matching Clojure.
+    assert_eq!(tree["kwargs-none"], Outcome::Value("[0 nil]".to_string()));
+    assert_eq!(tree["kwargs-nil"], Outcome::Value("[0 nil]".to_string()));
+    assert_eq!(
+        tree["kwargs-as-map"],
+        Outcome::Value("[3 {:a 3}]".to_string())
+    );
+    assert_eq!(
+        tree["kwargs-odd"],
+        Outcome::Error("No value supplied for key: :b".to_string())
+    );
+    assert_eq!(tree["seq-rest"], Outcome::Value("[1 2]".to_string()));
     assert_eq!(
         tree["overflow-add"],
         Outcome::Value("9223372036854775808N".to_string())

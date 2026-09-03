@@ -251,7 +251,41 @@ pub fn lower_fn_body_shadowed(
     is_async: bool,
     shadows: &CoreShadows,
 ) -> Result<IrFunction, LowerError> {
-    lower_fn_body_impl(name, ns, params, destructures, body, is_async, shadows)
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        None,
+        body,
+        is_async,
+        shadows,
+    )
+}
+
+/// Lower a body whose variadic rest slot requires keyword-argument map
+/// normalization before its destructuring prologue.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_fn_body_shadowed_kwargs(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
+    kwargs_rest_index: Option<usize>,
+    body: &[Form],
+    is_async: bool,
+    shadows: &CoreShadows,
+) -> Result<IrFunction, LowerError> {
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        kwargs_rest_index,
+        body,
+        is_async,
+        shadows,
+    )
 }
 
 /// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
@@ -278,6 +312,7 @@ pub fn lower_fn_body_destructured(
         ns,
         params,
         destructures,
+        None,
         body,
         is_async,
         &CoreShadows::none(),
@@ -290,6 +325,7 @@ fn lower_fn_body_impl(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    kwargs_rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
@@ -319,7 +355,12 @@ fn lower_fn_body_impl(
     // Expand any destructuring patterns into explicit bindings in the prologue,
     // before the body is lowered, so the body sees the pattern's names.
     for (idx, pattern) in destructures {
-        let var = bound_params[*idx].1;
+        let mut var = bound_params[*idx].1;
+        if kwargs_rest_index == Some(*idx) {
+            let normalized = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(normalized, KnownFn::KwargsMap, vec![var]));
+            var = normalized;
+        }
         lower_destructure_binding(&mut ctx, pattern, var)?;
     }
 
@@ -1705,7 +1746,16 @@ fn lower_fn_arity(
     if let Some(ref ri) = rest_info
         && let Some(ref pat) = ri.pattern
     {
-        let gensym_var = sub.lookup_local(&ri.name).unwrap();
+        let mut gensym_var = sub.lookup_local(&ri.name).unwrap();
+        if pat.is_kwargs_rest_pattern() {
+            let normalized = sub.fresh_var();
+            sub.emit(Inst::CallKnown(
+                normalized,
+                KnownFn::KwargsMap,
+                vec![gensym_var],
+            ));
+            gensym_var = normalized;
+        }
         lower_destructure_binding(&mut sub, pat, gensym_var)?;
     }
 
