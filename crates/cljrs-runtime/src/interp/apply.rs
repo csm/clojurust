@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult};
-use crate::interp::destructure::value_to_seq_vec;
+use crate::interp::destructure::{kwargs_map_value, value_to_seq_vec};
 use crate::interp::eval::eval;
 
 /// Convert an EvalError to a Value for storage (e.g. agent errors).
@@ -702,9 +702,9 @@ fn bind_fn_params_impl(
             // When the rest pattern is a map destructure (e.g. `& {:keys [bar]}`),
             // convert the rest args list into a map of alternating key-value pairs,
             // matching Clojure's keyword-arguments convention.
-            let destructure_val = if matches!(pattern.kind, FormKind::Map(_)) {
+            let destructure_val = if cljrs_reader::is_kwargs_rest_pattern(pattern) {
                 let items = value_to_seq_vec(&rest_val);
-                Value::Map(MapValue::from_flat_entries(items))
+                kwargs_map_value(items)?
             } else {
                 rest_val
             };

@@ -27,7 +27,8 @@ src/
              live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
     mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured,
-                  lower_fn_body_shadowed, CoreShadows, analyze, inline,
+                  lower_fn_body_shadowed (including its optional variadic-rest
+                  index), CoreShadows, analyze, inline,
                   optimize, EscapeContext …
     async_lower.rs — async state-machine lowering (Phase H): rewrites an
                   `^:async` IrFunction into a non-async poll function
@@ -215,6 +216,11 @@ for `[a b c]` patterns — a short collection binds the missing positions to
 `nil` rather than throwing.  Both compile to the `rt_nth` bridge (already
 nil-on-OOB); the IR interpreter appends the nil default for `NthLenient`.
 
+`KwargsMap` is the other lowering-only operation. Before a map-shaped variadic
+rest pattern is destructured, it normalizes the rest seq's alternating
+key/value arguments (and optional trailing map) into the associative value the
+pattern expects. User source cannot resolve or invoke this operation directly.
+
 ### `:or` destructuring defaults are eager
 
 `destructure` expands a symbol carrying an `:or` entry to `(get m :k default)`,
@@ -299,6 +305,7 @@ pub fn lower_fn_body_shadowed(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,

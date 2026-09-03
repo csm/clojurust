@@ -254,6 +254,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
         sym!(rt_dissoc),
         sym!(rt_disj),
         sym!(rt_nth),
+        sym!(rt_kwargs_map),
         sym!(rt_contains),
         sym!(rt_seq),
         sym!(rt_lazy_seq),

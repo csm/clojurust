@@ -126,6 +126,7 @@ pub fn lower_via_rust(
         &ns_arc,
         params,
         &[],
+        None,
         compilable_forms,
         false,
         &shadows,
