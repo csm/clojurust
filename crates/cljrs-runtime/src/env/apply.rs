@@ -1,6 +1,6 @@
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult};
-use cljrs_value::{Arity, Value};
+use cljrs_value::{Arity, MapValue, Value};
 use std::sync::Arc;
 
 fn check_arity(arity: &Arity, argc: usize, name: &str) -> EvalResult<()> {
@@ -24,18 +24,32 @@ fn check_arity(arity: &Arity, argc: usize, name: &str) -> EvalResult<()> {
 ///
 /// Answers `child == parent` when the var is absent or malformed.
 pub fn isa_in_global_hierarchy(child: &Value, parent: &Value, env: &Env) -> bool {
-    if child == parent {
-        return true;
-    }
-    let ancestors = env
-        .globals
+    let ancestors = global_hierarchy_ancestors(env);
+    isa_with_ancestors(child, parent, ancestors.as_ref())
+}
+
+/// Take one snapshot of the global hierarchy's ancestor table.  A hierarchy
+/// method-cache miss shares this snapshot across every candidate and every
+/// recursive vector element.
+fn global_hierarchy_ancestors(env: &Env) -> Option<MapValue> {
+    env.globals
         .lookup_var("clojure.core", "global-hierarchy")
         .and_then(|v| v.get().deref())
         .and_then(|h| match h {
             Value::Map(m) => m.get(&Value::keyword(cljrs_value::Keyword::simple("ancestors"))),
             _ => None,
-        });
-    if let Some(Value::Map(ancestors)) = &ancestors
+        })
+        .and_then(|v| match v {
+            Value::Map(m) => Some(m),
+            _ => None,
+        })
+}
+
+fn isa_with_ancestors(child: &Value, parent: &Value, ancestors: Option<&MapValue>) -> bool {
+    if child == parent {
+        return true;
+    }
+    if let Some(ancestors) = ancestors
         && let Some(Value::Set(of_child)) = ancestors.get(child)
         && of_child.contains(parent)
     {
@@ -45,7 +59,7 @@ pub fn isa_in_global_hierarchy(child: &Value, parent: &Value, env: &Env) -> bool
         let (c, p) = (c.get(), p.get());
         return c.count() == p.count()
             && (0..c.count()).all(|i| match (c.nth(i), p.nth(i)) {
-                (Some(cv), Some(pv)) => isa_in_global_hierarchy(cv, pv, env),
+                (Some(cv), Some(pv)) => isa_with_ancestors(cv, pv, ancestors),
                 _ => false,
             });
     }
@@ -62,14 +76,18 @@ fn hierarchy_method_key(
     dispatch_val: &Value,
     env: &Env,
 ) -> EvalResult<Option<String>> {
+    let ancestors = global_hierarchy_ancestors(env);
     let dispatch_vals = mf.dispatch_vals.lock().unwrap();
-    let matches: Vec<(String, Value)> = dispatch_vals
+    let mut matches: Vec<(String, Value)> = dispatch_vals
         .iter()
         .filter(|(k, v)| {
-            k.as_str() != mf.default_dispatch && isa_in_global_hierarchy(dispatch_val, v, env)
+            k.as_str() != mf.default_dispatch
+                && isa_with_ancestors(dispatch_val, v, ancestors.as_ref())
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    drop(dispatch_vals);
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
     if matches.len() <= 1 {
         return Ok(matches.into_iter().next().map(|(k, _)| k));
     }
@@ -77,7 +95,7 @@ fn hierarchy_method_key(
     let prefers = mf.prefers.lock().unwrap();
     let dominates = |a: &(String, Value), b: &(String, Value)| {
         prefers.get(&a.0).is_some_and(|over| over.contains(&b.0))
-            || isa_in_global_hierarchy(&a.1, &b.1, env)
+            || isa_with_ancestors(&a.1, &b.1, ancestors.as_ref())
     };
     let best: Vec<&(String, Value)> = matches
         .iter()
@@ -86,14 +104,19 @@ fn hierarchy_method_key(
     match best.as_slice() {
         [only] => Ok(Some(only.0.clone())),
         _ => Err(EvalError::Runtime(format!(
-            "Multiple methods in multimethod '{}' match dispatch value {}: {}, and neither is preferred",
+            "Multiple methods in multimethod '{}' match dispatch value {}: {}, and {} is preferred",
             mf.name,
             dispatch_val,
             matches
                 .iter()
                 .map(|(k, _)| k.as_str())
                 .collect::<Vec<_>>()
-                .join(" and ")
+                .join(" and "),
+            if matches.len() == 2 {
+                "neither"
+            } else {
+                "none"
+            }
         ))),
     }
 }
@@ -297,29 +320,53 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             let _dispatch_root = crate::env::gc_roots::root_value(&dispatch_val);
             cljrs_gc::safepoint();
             let key = format!("{}", dispatch_val);
-            let methods = mf_ref.methods.lock().unwrap();
-            let exact = methods.get(&key).cloned();
+            let exact = mf_ref.methods.lock().unwrap().get(&key).cloned();
             let impl_fn = match exact {
                 Some(f) => f,
                 None => {
-                    let inherited = hierarchy_method_key(mf_ref, &dispatch_val, env)?;
-                    match inherited.and_then(|k| methods.get(&k).cloned()) {
-                        Some(f) => f,
+                    let generation = cljrs_value::multifn_generation();
+                    let cached = mf_ref.cached_method(&key, generation);
+                    let method_key = match cached {
+                        Some(cached) => cached,
                         None => {
-                            methods
-                                .get(&mf_ref.default_dispatch)
-                                .cloned()
-                                .ok_or_else(|| {
-                                    EvalError::Runtime(format!(
+                            let inherited = hierarchy_method_key(mf_ref, &dispatch_val, env)?;
+                            let resolved = match inherited {
+                                Some(k) => k,
+                                None if mf_ref
+                                    .methods
+                                    .lock()
+                                    .unwrap()
+                                    .contains_key(&mf_ref.default_dispatch) =>
+                                {
+                                    mf_ref.default_dispatch.clone()
+                                }
+                                None => {
+                                    return Err(EvalError::Runtime(format!(
                                         "No method in multimethod '{}' for dispatch value {}",
                                         mf_ref.name, key
-                                    ))
-                                })?
+                                    )));
+                                }
+                            };
+                            if cljrs_value::multifn_generation() == generation {
+                                mf_ref.cache_method(key.clone(), resolved.clone(), generation);
+                            }
+                            resolved
                         }
-                    }
+                    };
+                    mf_ref
+                        .methods
+                        .lock()
+                        .unwrap()
+                        .get(&method_key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            EvalError::Runtime(format!(
+                                "No method in multimethod '{}' for dispatch value {}",
+                                mf_ref.name, key
+                            ))
+                        })?
                 }
             };
-            drop(methods);
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }

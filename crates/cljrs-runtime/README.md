@@ -533,12 +533,16 @@ Phase 10.6 inline caches:
 - `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
 
 Multimethod dispatch tries the exact `pr_str(dispatch-val)` key first, then the
-ad-hoc hierarchy, then `:default`. Hierarchy dispatch uses:
+generation-tagged method cache, the ad-hoc hierarchy, and finally `:default`.
+`derive`/`underive`, `defmethod`, `remove-method`, and `prefer-method` bump the
+generation so cached inherited and default resolutions cannot survive a
+relevant mutation. Hierarchy dispatch uses:
 
 - `isa_in_global_hierarchy(child, parent, env) -> bool` — `(isa? child parent)`
   against `clojure.core/global-hierarchy` (defined in `bootstrap.cljrs`),
   including element-wise vector matching; falls back to `child == parent` when
-  the var is absent
+  the var is absent. A cache miss snapshots its ancestor table once for the
+  complete candidate scan, including recursive vector comparisons.
 
 When several registered dispatch values match and none dominates the others —
 by `prefer-method` or by being a descendant of them — dispatch errors with
@@ -735,7 +739,9 @@ on it is pure data manipulation. The 3-arity forms are pure functions of that
 value; the 2-arity forms read and `alter-var-root`
 `clojure.core/global-hierarchy`. `make-hierarchy` stays native
 (`builtin_make_hierarchy`). Multimethod dispatch consults the same var — see
-`env::apply::isa_in_global_hierarchy`.
+`env::apply::isa_in_global_hierarchy`. The hierarchy value and its private
+helper functions carry `:private true`, so automatic core refers do not expose
+them in application namespaces.
 
 ### Host clock (`time.rs`)
 

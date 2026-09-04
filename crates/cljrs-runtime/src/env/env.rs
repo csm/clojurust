@@ -10,7 +10,7 @@ use crate::env::error::EvalResult;
 use crate::mode::{ExecutionMode, TierState};
 use cljrs_gc::{GcConfig, GcPtr};
 use cljrs_reader::Form;
-use cljrs_value::{CljxFn, Namespace, ReferClojureFilter, Value, Var};
+use cljrs_value::{CljxFn, Keyword, Namespace, ReferClojureFilter, Value, Var};
 // ── RequireSpec / RequireRefer ─────────────────────────────────────────────────
 
 /// How symbols should be referred into the requiring namespace.
@@ -207,6 +207,17 @@ impl std::fmt::Debug for GlobalEnv {
 }
 
 impl GlobalEnv {
+    fn var_is_private(var: &Var) -> bool {
+        matches!(
+            var.get_meta(),
+            Some(Value::Map(meta))
+                if matches!(
+                    meta.get(&Value::keyword(Keyword::simple("private"))),
+                    Some(Value::Bool(true))
+                )
+        )
+    }
+
     /// Create an empty global environment for the given execution mode.
     ///
     /// This is the *raw* constructor: no builtins, no bootstrap, no source
@@ -426,6 +437,9 @@ impl GlobalEnv {
         let src_interns = src.get().interns.lock().unwrap();
         let mut dst_refers = dst.get().refers.lock().unwrap();
         for (name, var) in src_interns.iter() {
+            if Self::var_is_private(var.get()) {
+                continue;
+            }
             dst_refers.insert(name.clone(), var.clone());
         }
     }
@@ -460,6 +474,9 @@ impl GlobalEnv {
         match filter.as_ref() {
             Some(f) => {
                 for (name, var) in src_interns.iter() {
+                    if Self::var_is_private(var.get()) {
+                        continue;
+                    }
                     if let Some(local) = f.local_name(name) {
                         dst_refers.insert(local, var.clone());
                     }
@@ -467,6 +484,9 @@ impl GlobalEnv {
             }
             None => {
                 for (name, var) in src_interns.iter() {
+                    if Self::var_is_private(var.get()) {
+                        continue;
+                    }
                     dst_refers.insert(name.clone(), var.clone());
                 }
             }

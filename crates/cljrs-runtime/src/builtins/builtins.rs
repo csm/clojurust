@@ -533,6 +533,7 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
         "methods",
         "Returns a map of dispatch-value -> method for a multimethod.",
     ),
+    ("prefers", "Returns the preference table for a multimethod."),
     (
         "prefer-method",
         "Causes a multimethod to prefer matches of dispatch-val-x over dispatch-val-y when both match.",
@@ -1549,6 +1550,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
+        ("prefers", Arity::Fixed(1), builtin_prefers),
         // Records / reify
         (
             "make-type-instance",
@@ -7927,7 +7929,27 @@ fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
     let preferred = format!("{}", args[1]);
     let over = format!("{}", args[2]);
     let mut prefers = mf.get().prefers.lock().unwrap();
-    prefers.entry(preferred).or_default().push(over);
+    if prefers
+        .get(&over)
+        .is_some_and(|preferred_over| preferred_over.contains(&preferred))
+    {
+        return Err(ValueError::Other(format!(
+            "Preference conflict in multimethod '{}': {} is already preferred to {}",
+            mf.get().name,
+            args[2],
+            args[1]
+        )));
+    }
+    let over_values = prefers.entry(preferred).or_default();
+    if !over_values.contains(&over) {
+        over_values.push(over);
+        drop(prefers);
+        let mut preference_vals = mf.get().preference_vals.lock().unwrap();
+        preference_vals.insert(format!("{}", args[1]), args[1].clone());
+        preference_vals.insert(format!("{}", args[2]), args[2].clone());
+        drop(preference_vals);
+        cljrs_value::bump_multifn_generation();
+    }
     Ok(Value::MultiFn(mf.clone()))
 }
 
@@ -7944,6 +7966,7 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
     let key = format!("{}", args[1]);
     mf.get().methods.lock().unwrap().remove(&key);
     mf.get().dispatch_vals.lock().unwrap().remove(&key);
+    cljrs_value::bump_multifn_generation();
     Ok(Value::MultiFn(mf.clone()))
 }
 
@@ -7958,11 +7981,45 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let methods = mf.get().methods.lock().unwrap();
+    let dispatch_vals = mf.get().dispatch_vals.lock().unwrap();
     let mut m = cljrs_value::MapValue::empty();
     for (k, v) in methods.iter() {
-        m = m.assoc(Value::string(k.clone()), v.clone());
+        let dispatch_val = dispatch_vals
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| Value::string(k.clone()));
+        m = m.assoc(dispatch_val, v.clone());
     }
     Ok(Value::Map(m))
+}
+
+fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
+    let mf = match &args[0] {
+        Value::MultiFn(m) => m.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "multimethod",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let prefers = mf.get().prefers.lock().unwrap();
+    let preference_vals = mf.get().preference_vals.lock().unwrap();
+    let original_value = |key: &String| {
+        preference_vals
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| Value::string(key.clone()))
+    };
+    let mut result = cljrs_value::MapValue::empty();
+    for (preferred, over) in prefers.iter() {
+        let mut values = cljrs_value::SetValue::empty();
+        for key in over {
+            values = values.conj(original_value(key));
+        }
+        result = result.assoc(original_value(preferred), Value::Set(values));
+    }
+    Ok(Value::Map(result))
 }
 
 // ── Phase 7 — Concurrency primitives ─────────────────────────────────────────

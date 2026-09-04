@@ -1400,7 +1400,7 @@
   (when (and namespaced? (nil? (namespace tag)))
     (throw (ex-info (str "Tag must be namespaced: " (pr-str tag)) {:tag tag}))))
 
-(def global-hierarchy
+(def ^:private global-hierarchy
   "The hierarchy `derive`, `isa?`, `parents`, `ancestors` and `descendants`
   use when called without an explicit hierarchy."
   (make-hierarchy))
@@ -1417,9 +1417,10 @@
           (cons source (get sources source))))
 
 (defn derive
-  "Establishes a parent/child relationship between parent and tag. Both must
-  be namespaced keywords or symbols. With a hierarchy h, returns the modified
-  hierarchy; without one, alters the global hierarchy and returns nil."
+  "Establishes a parent/child relationship between parent and tag. The
+  two-argument form requires namespaced keywords or symbols. With an explicit
+  hierarchy h, unqualified tags are accepted and the modified hierarchy is
+  returned; without one, alters the global hierarchy and returns nil."
   ([tag parent]
    (check-tag! tag true)
    (check-tag! parent true)

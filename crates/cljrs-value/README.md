@@ -578,7 +578,10 @@ pub struct MultiFn {
     pub dispatch_vals: Mutex<HashMap<String, Value>>,
     /// pr_str(preferred) → pr_str(over), from `prefer-method`
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    /// pr_str(preference value) → original value, for `prefers`
+    pub preference_vals: Mutex<HashMap<String, Value>>,
     pub default_dispatch: String,  // normally ":default"
+    method_cache: Mutex<MultiFnMethodCache>, // generation-tagged resolved keys
 }
 
 /// Phase 10.6 — protocol-dispatch inline-cache invalidation.
@@ -588,6 +591,11 @@ pub struct MultiFn {
 /// generation observed at fill time and re-resolves on mismatch.
 pub fn protocol_generation() -> u64;
 pub fn bump_protocol_generation();
+
+/// Hierarchy multimethod-cache invalidation. The generation is bumped after
+/// hierarchy, method-table, and preference-table mutations.
+pub fn multifn_generation() -> u64;
+pub fn bump_multifn_generation();
 ```
 
 When `Protocol::extend_via_metadata` is set, `apply_value`'s `ProtocolFn` arm

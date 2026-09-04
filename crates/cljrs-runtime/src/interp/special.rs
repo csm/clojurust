@@ -37,7 +37,8 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "set!" => eval_set_bang(args, env),
         "throw" => eval_throw(args, env),
         "try" => eval_try(args, env),
-        "defn" | "defn-" => eval_defn(args, env),
+        "defn" => eval_defn(args, env, false),
+        "defn-" => eval_defn(args, env, true),
         "defmacro" => eval_defmacro(args, env),
         "defonce" => eval_defonce(args, env),
         "and" => eval_and(args, env),
@@ -103,6 +104,12 @@ fn doc_meta(doc: &str) -> Value {
         Value::keyword(Keyword::parse("doc")),
         Value::string(doc.to_string()),
     ))
+}
+
+fn private_meta() -> Value {
+    Value::Map(
+        MapValue::empty().assoc(Value::keyword(Keyword::parse("private")), Value::Bool(true)),
+    )
 }
 
 /// Build a `{:arglists ([x] [x y & more])}` metadata fragment from a
@@ -1087,7 +1094,7 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
 
 // ── defn ──────────────────────────────────────────────────────────────────────
 
-pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
+pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
     // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
     let name_form = args
         .first()
@@ -1137,6 +1144,9 @@ pub fn eval_defn(args: &[Form], env: &mut Env) -> EvalResult {
         meta = merge_meta(meta, Some(doc_meta(doc)));
     }
     meta = merge_meta(meta, arglists_meta(&fn_val, 0));
+    if private {
+        meta = merge_meta(meta, Some(private_meta()));
+    }
     if let Some(meta_val) = meta {
         var.get().set_meta(meta_val);
     }
@@ -2135,6 +2145,7 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
         .lock()
         .unwrap()
         .insert(key, dispatch_val);
+    cljrs_value::bump_multifn_generation();
 
     Ok(Value::MultiFn(mf_ptr))
 }

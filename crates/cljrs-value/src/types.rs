@@ -155,6 +155,23 @@ pub fn bump_protocol_generation() {
     PROTOCOL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
+/// Global multimethod generation, bumped whenever hierarchy dispatch could
+/// resolve differently.  A single generation intentionally covers every
+/// runtime: an unrelated mutation may cause an extra cache miss, but can
+/// never leave a stale method cached.
+static MULTIFN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current multimethod-dispatch generation.
+pub fn multifn_generation() -> u64 {
+    MULTIFN_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Invalidate hierarchy method caches after a hierarchy, method table, or
+/// preference-table mutation.
+pub fn bump_multifn_generation() {
+    MULTIFN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 impl cljrs_gc::Trace for Protocol {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
@@ -211,8 +228,18 @@ pub struct MultiFn {
     pub dispatch_vals: Mutex<HashMap<String, Value>>,
     /// recorded preferences: pr_str(preferred) → pr_str(over)
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    /// pr_str(preference dispatch value) → original value, including values
+    /// which do not currently have a method.
+    pub preference_vals: Mutex<HashMap<String, Value>>,
     /// normally ":default"
     pub default_dispatch: String,
+    method_cache: Mutex<MultiFnMethodCache>,
+}
+
+#[derive(Debug, Default)]
+struct MultiFnMethodCache {
+    generation: u64,
+    methods: HashMap<String, String>,
 }
 
 impl MultiFn {
@@ -223,8 +250,37 @@ impl MultiFn {
             methods: Mutex::new(HashMap::new()),
             dispatch_vals: Mutex::new(HashMap::new()),
             prefers: Mutex::new(HashMap::new()),
+            preference_vals: Mutex::new(HashMap::new()),
             default_dispatch,
+            method_cache: Mutex::new(MultiFnMethodCache::default()),
         }
+    }
+
+    /// Return a cached resolved method key when it belongs to `generation`.
+    /// Observing a new generation lazily discards every stale entry at once.
+    pub fn cached_method(&self, dispatch_key: &str, generation: u64) -> Option<String> {
+        let mut cache = self.method_cache.lock().unwrap();
+        if cache.generation != generation {
+            cache.generation = generation;
+            cache.methods.clear();
+        }
+        cache.methods.get(dispatch_key).cloned()
+    }
+
+    /// Cache `dispatch_key -> method_key` for a generation already validated
+    /// by the caller.
+    pub fn cache_method(&self, dispatch_key: String, method_key: String, generation: u64) {
+        let mut cache = self.method_cache.lock().unwrap();
+        if cache.generation != generation {
+            cache.generation = generation;
+            cache.methods.clear();
+        }
+        cache.methods.insert(dispatch_key, method_key);
+    }
+
+    /// Number of entries in the current cache, exposed for regression tests.
+    pub fn cached_method_count(&self) -> usize {
+        self.method_cache.lock().unwrap().methods.len()
     }
 }
 
@@ -240,6 +296,12 @@ impl cljrs_gc::Trace for MultiFn {
         {
             let dispatch_vals = self.dispatch_vals.lock().unwrap();
             for v in dispatch_vals.values() {
+                v.trace(visitor);
+            }
+        }
+        {
+            let preference_vals = self.preference_vals.lock().unwrap();
+            for v in preference_vals.values() {
                 v.trace(visitor);
             }
         }
@@ -382,6 +444,9 @@ impl Var {
         self.shared_root.store(Arc::new(shared));
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
+        }
+        if self.namespace.as_ref() == "clojure.core" && self.name.as_ref() == "global-hierarchy" {
+            bump_multifn_generation();
         }
     }
 

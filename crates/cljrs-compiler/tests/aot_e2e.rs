@@ -1026,6 +1026,25 @@ fn test_defmulti_basic() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_hierarchy_multimethod_cache_and_value_keys() {
+    assert_output(
+        "hierarchy_multimethod_cache",
+        r#"
+(defmulti classify identity)
+(defmethod classify ::parent [_] :inherited)
+(defmethod classify :default [_] :fallback)
+(println (classify ::child))
+(derive ::child ::parent)
+(println (classify ::child))
+(println (= (isa? ::child ::parent) (= :inherited (classify ::child))))
+(println (contains? (methods classify) ::parent))
+"#,
+        ":fallback\n:inherited\ntrue\ntrue",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_in_defn() {
     assert_output(
         "protocol_in_defn",
