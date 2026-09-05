@@ -23,7 +23,8 @@ use cljrs_value::{
 
 use crate::env::apply::apply_value;
 use crate::env::env::{Env, GlobalEnv};
-use crate::env::error::{EvalError, EvalResult};
+use crate::env::error::{EvalError, EvalResult, value_error_to_eval_error};
+use crate::interp::destructure::value_to_seq_vec;
 use crate::tiered::jit_state::{OsrPoll, OsrSlot};
 
 // ── Register file ───────────────────────────────────────────────────────────
@@ -1269,6 +1270,11 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let mut args = args;
             args.push(Value::Nil);
             builtin_call_native("nth", &args)
+        }
+        KnownFn::KwargsMap => {
+            let rest = args.into_iter().next().unwrap_or(Value::Nil);
+            let items = value_to_seq_vec(&rest);
+            Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)
         }
         KnownFn::Aget => builtin_call_native("aget", &args),
         KnownFn::Aset => builtin_call_native("aset", &args),

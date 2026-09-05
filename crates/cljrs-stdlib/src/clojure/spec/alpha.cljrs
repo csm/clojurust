@@ -1596,10 +1596,9 @@
 ;; dispatch branch, then delegate. A dispatch miss throws in this runtime
 ;; (`crates/cljrs-runtime/src/env/apply.rs`: "No method in multimethod ... for
 ;; dispatch value ..."), caught here via `(catch Exception ...)` — same
-;; pattern already used for predicate-spec calls above. We deliberately do
-;; NOT enumerate `(methods mm)` — its keys are Display strings in this
-;; runtime, not the original dispatch values, so it can't be used to
-;; reconstruct or validate the dispatch table.
+;; pattern already used for predicate-spec calls above. `(methods mm)` now
+;; preserves the original dispatch values as its keys; this implementation
+;; still dispatches directly because it needs only the selected branch.
 ;;
 ;; SIMPLIFICATION vs upstream: real clojure.spec.alpha's `retag` re-tags the
 ;; conformed value with the dispatch value before unforming, so unform can

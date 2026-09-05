@@ -1034,12 +1034,18 @@ fn test_hierarchy_multimethod_cache_and_value_keys() {
 (defmethod classify ::parent [_] :inherited)
 (defmethod classify :default [_] :fallback)
 (println (classify ::child))
-(derive ::child ::parent)
+(derive ::child ::middle)
+(derive ::middle ::parent)
 (println (classify ::child))
-(println (= (isa? ::child ::parent) (= :inherited (classify ::child))))
+(defmulti hierarchy-match identity)
+(defmethod hierarchy-match ::parent [_] true)
+(defmethod hierarchy-match :default [_] false)
+(println [(isa? ::child ::parent) (hierarchy-match ::child)
+          (isa? ::unrelated ::parent) (hierarchy-match ::unrelated)
+          (isa? [::child] [::parent ::parent]) (hierarchy-match [::child])])
 (println (contains? (methods classify) ::parent))
 "#,
-        ":fallback\n:inherited\ntrue\ntrue",
+        ":fallback\n:inherited\n[true true false false false false]\ntrue",
     );
 }
 

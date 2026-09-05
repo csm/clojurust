@@ -202,6 +202,18 @@ impl RuntimeBuilder {
         globals.refer_core("user");
         globals.mark_loaded("clojure.core");
 
+        // Experimental namespace: natives first, then the Clojure source that
+        // builds on them. Not referred into `user` — an explicit `require` is
+        // the only way in, so a feature probe for `clojure.core/future` and
+        // friends still (correctly) finds nothing.
+        builtins::register_experimental(&globals, builtins::EXPERIMENTAL_NS);
+        eval_embedded(
+            &globals,
+            builtins::EXPERIMENTAL_SOURCE,
+            "<cljrs.core.experimental>",
+        )?;
+        globals.mark_loaded(builtins::EXPERIMENTAL_NS);
+
         for (ns, src) in &self.builtin_sources {
             globals.register_builtin_source(ns, src);
         }

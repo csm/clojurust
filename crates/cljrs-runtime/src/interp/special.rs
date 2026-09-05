@@ -17,7 +17,7 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
-    CljxFn, CljxFnArity, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
+    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
     ProtocolMethod, ReferClojureFilter, TypeHint, TypeInstance, Value, ValueError,
 };
 
@@ -55,6 +55,7 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "defmulti" => eval_defmulti(args, env),
         "defmethod" => eval_defmethod(args, env),
         "defrecord" => eval_defrecord(args, env),
+        "deftype" => eval_deftype(args, env),
         "reify" => eval_reify(args, env),
         "load-file" => eval_load_file(args, env),
         "binding" => eval_binding(args, env),
@@ -885,25 +886,98 @@ fn eval_var(args: &[Form], env: &mut Env) -> EvalResult {
 // ── set! ──────────────────────────────────────────────────────────────────────
 
 fn eval_set_bang(args: &[Form], env: &mut Env) -> EvalResult {
-    let sym = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Symbol(s)) => s.clone(),
-        _ => return Err(EvalError::Runtime("set! requires a symbol".into())),
-    };
+    let target = args
+        .first()
+        .ok_or_else(|| EvalError::Runtime("set! requires a target".into()))?;
     let val = if args.len() > 1 {
         eval(&args[1], env)?
     } else {
         Value::Nil
     };
-    let parsed = cljrs_value::Symbol::parse(&sym);
-    let ns = parsed.namespace.as_deref().unwrap_or(&env.current_ns);
-    let var = env
-        .globals
-        .lookup_var_in_ns(ns, &parsed.name)
-        .ok_or_else(|| EvalError::UnboundSymbol(sym))?;
-    // Prefer updating the thread-local binding if one exists.
-    if !crate::env::dynamics::set_thread_local(&var, val.clone()) {
-        var.get().bind(val.clone());
+    match &target.kind {
+        FormKind::Symbol(sym) => {
+            // A bare unqualified name inside a deftype method may be one of its
+            // mutable fields; only if not does it fall through to var logic.
+            if !sym.contains('/')
+                && let Some(v) = try_set_mutable_field(env, sym, &val)?
+            {
+                return Ok(v);
+            }
+            let parsed = cljrs_value::Symbol::parse(sym);
+            let ns = parsed.namespace.as_deref().unwrap_or(&env.current_ns);
+            let var = env
+                .globals
+                .lookup_var_in_ns(ns, &parsed.name)
+                .ok_or_else(|| EvalError::UnboundSymbol(sym.clone()))?;
+            // Prefer updating the thread-local binding if one exists.
+            if !crate::env::dynamics::set_thread_local(&var, val.clone()) {
+                var.get().bind(val.clone());
+            }
+            Ok(val)
+        }
+        // `(set! (.-field inst) v)` — a mutable field on an explicit instance.
+        FormKind::List(parts)
+            if parts.len() == 2
+                && matches!(&parts[0].kind, FormKind::Symbol(op) if op.starts_with(".-")) =>
+        {
+            let FormKind::Symbol(op) = &parts[0].kind else {
+                unreachable!()
+            };
+            let field = &op[2..];
+            let inst = eval(&parts[1], env)?;
+            set_type_instance_field(&inst, field, val)
+        }
+        _ => Err(EvalError::Runtime(
+            "set! requires a symbol or (.-field inst) target".into(),
+        )),
     }
+}
+
+/// If `sym` names a mutable field of the `__deftype_self__` instance in scope,
+/// update its cell AND refresh the in-scope local snapshot, returning the new
+/// value. `None` when `sym` is not such a field, so `set!` falls through to var
+/// logic.
+fn try_set_mutable_field(env: &mut Env, sym: &str, val: &Value) -> EvalResult<Option<Value>> {
+    let Some(Value::TypeInstance(ti)) = env.lookup_local_frames(DEFTYPE_SELF) else {
+        return Ok(None);
+    };
+    let Some(atom) = ti.get().mutable.clone() else {
+        return Ok(None);
+    };
+    let key = Value::keyword(cljrs_value::Keyword::simple(sym));
+    let Value::Map(map) = atom.get().deref() else {
+        return Ok(None);
+    };
+    if map.get(&key).is_none() {
+        return Ok(None);
+    }
+    atom.get().reset(Value::Map(map.assoc(key, val.clone())));
+    // Keep the method's local snapshot consistent for later reads.
+    env.bind(Arc::from(sym), val.clone());
+    Ok(Some(val.clone()))
+}
+
+/// Set a mutable field on an explicit instance: `(set! (.-field inst) v)`.
+fn set_type_instance_field(inst: &Value, field: &str, val: Value) -> EvalResult {
+    let Value::TypeInstance(ti) = inst else {
+        return Err(EvalError::Runtime(format!(
+            "set! (.-{field} …): target is not a type instance"
+        )));
+    };
+    let atom = ti.get().mutable.clone().ok_or_else(|| {
+        EvalError::Runtime(format!("set! (.-{field} …): type has no mutable fields"))
+    })?;
+    let key = Value::keyword(cljrs_value::Keyword::simple(field));
+    let map = match atom.get().deref() {
+        Value::Map(m) => m,
+        _ => MapValue::empty(),
+    };
+    if map.get(&key).is_none() {
+        return Err(EvalError::Runtime(format!(
+            "set!: {field} is not a mutable field"
+        )));
+    }
+    atom.get().reset(Value::Map(map.assoc(key, val.clone())));
     Ok(val)
 }
 
@@ -1709,6 +1783,13 @@ fn eval_load_file(args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
     // (letfn [(f [params] body...) ...] body...)
+    //
+    // Three passes, because a closure here captures VALUES, not cells:
+    // `eval_fn` snapshots `env.all_local_bindings()`, so a name bound after the
+    // closure was built is invisible to it forever. Binding each fn as it was
+    // built therefore gave letfn `let`-like sequential scope — a backward
+    // reference resolved, a forward one or a mutual pair raised "unbound
+    // symbol", which defeats the only reason letfn exists.
     let bindings = match args.first().and_then(|f| f.as_vector()) {
         Some(v) => expand_reader_conds_cow(v).into_owned(),
         None => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
@@ -1716,14 +1797,33 @@ fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
 
     env.push_frame();
 
+    // Pass 1: bind every name to nil, so the pass-2 snapshot CONTAINS all of
+    // them. A capture list cannot grow after the fact; it can only be corrected.
     for binding in &bindings {
         if let Some(parts) = binding.as_list() {
             if parts.is_empty() {
                 continue;
             }
-            // parts[0] = name, parts[1] = params, parts[2..] = body
-            // Reuse eval_fn: it expects (optional-name params body...)
-            // We pass parts directly since parts[0] is the function name symbol.
+            let Some(name) = parts[0].as_symbol() else {
+                env.pop_frame();
+                return Err(EvalError::Runtime(
+                    "letfn binding name must be a symbol".into(),
+                ));
+            };
+            env.bind(Arc::from(name), Value::Nil);
+        }
+    }
+
+    // Pass 2: build the closures. Each captures the real value of any sibling
+    // already built and nil for the rest.
+    let mut built: Vec<(Arc<str>, Value)> = Vec::new();
+    for binding in &bindings {
+        if let Some(parts) = binding.as_list() {
+            if parts.is_empty() {
+                continue;
+            }
+            // parts[0] is the name, so eval_fn sees this as a NAMED fn and wires
+            // up its self-reference; pass 3 handles every other direction.
             let fn_val = match eval_fn(parts, env) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1731,13 +1831,29 @@ fn eval_letfn(args: &[Form], env: &mut Env) -> EvalResult {
                     return Err(e);
                 }
             };
-            let Some(name) = parts[0].as_symbol() else {
-                env.pop_frame();
-                return Err(EvalError::Runtime(
-                    "letfn binding name must be a symbol".into(),
-                ));
+            let name: Arc<str> = match parts[0].as_symbol() {
+                Some(s) => Arc::from(s),
+                None => unreachable!("pass 1 rejected every non-symbol name"),
             };
-            env.bind(Arc::from(name), fn_val);
+            env.bind(Arc::clone(&name), fn_val.clone());
+            built.push((name, fn_val));
+        }
+    }
+
+    // Pass 3: replace the nil placeholders each closure captured with the
+    // sibling it actually names. This is what makes the scope MUTUAL rather
+    // than sequential, and it necessarily builds a reference cycle between
+    // co-recursive fns — which is inherent to letfn, not an artifact here.
+    for (_, fn_val) in &built {
+        if let Value::Fn(ptr) = fn_val {
+            let mut ptr = ptr.clone();
+            let f = ptr.get_mut();
+            for i in 0..f.closed_over_names.len() {
+                let captured = f.closed_over_names[i].clone();
+                if let Some((_, real)) = built.iter().find(|(n, _)| *n == captured) {
+                    f.closed_over_vals[i] = real.clone();
+                }
+            }
         }
     }
 
@@ -1916,21 +2032,15 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
 
     for form in &args[1..] {
         match &form.unmeta().kind {
-            FormKind::Symbol(s) => {
-                // Look up protocol in env.
-                let val = env.globals.lookup_in_ns(&env.current_ns, s);
-                match val {
-                    Some(Value::Protocol(p)) => {
-                        current_proto = Some(p);
-                    }
-                    _ => {
-                        return Err(EvalError::Runtime(format!(
-                            "extend-type: {} is not a protocol",
-                            s
-                        )));
-                    }
+            FormKind::Symbol(s) => match resolve_protocol_sym(env, s) {
+                Some(p) => current_proto = Some(p),
+                None => {
+                    return Err(EvalError::Runtime(format!(
+                        "extend-type: {} is not a protocol",
+                        s
+                    )));
                 }
-            }
+            },
             FormKind::List(parts) => {
                 // (method-name [params] body...)
                 let proto = current_proto.as_ref().ok_or_else(|| {
@@ -1943,7 +2053,7 @@ fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
                     Some(s) => Arc::from(s),
                     None => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, &[], &[], env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
@@ -1973,10 +2083,9 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
             "extend-protocol: first arg must be a protocol symbol".into(),
         ));
     };
-    let proto_val = env.globals.lookup_in_ns(&env.current_ns, proto_sym);
-    let proto_ptr = match proto_val {
-        Some(Value::Protocol(p)) => p,
-        _ => {
+    let proto_ptr = match resolve_protocol_sym(env, proto_sym) {
+        Some(p) => p,
+        None => {
             return Err(EvalError::Runtime(format!(
                 "extend-protocol: {} is not a protocol",
                 proto_sym
@@ -2002,7 +2111,7 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
                     Some(s) => Arc::from(s),
                     None => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, &[], &[], env)?;
                 let mut impls = proto_ptr.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
@@ -2022,7 +2131,92 @@ fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
 /// `parts[0]` is the method name symbol (ignored here — caller handles it).
 /// `parts[1]` is the params vector.
 /// `parts[2..]` is the body.
-fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
+/// Bring a defrecord's FIELDS into scope in a method body, as
+/// `(let* [f (:f this) ...] body...)`.
+///
+/// The bare field symbol is the idiomatic form — `(mutable? [_] (valid-sha? sha))`
+/// — and it read as an unbound symbol, because a method impl is built as an
+/// ordinary fn whose only bindings are its own params. Clojure compiles the
+/// fields as instance fields of the generated class, so they are simply in
+/// scope.
+///
+/// A field whose name a PARAM already takes is skipped: the param shadows the
+/// field in Clojure, and binding it here would shadow the param instead.
+/// Returns None when there is nothing to bind, or when the first param is not
+/// a plain symbol (a destructured `this` has no name to read the fields from).
+fn synth_field_scope(
+    params_form: &Form,
+    fields: &[Arc<str>],
+    mutable_fields: &[Arc<str>],
+    body: &[Form],
+) -> Option<Vec<Form>> {
+    let param_forms = match &params_form.kind {
+        FormKind::Vector(v) => v,
+        _ => return None,
+    };
+    let this_name = match param_forms.first().map(|f| &f.kind) {
+        Some(FormKind::Symbol(s)) => s.clone(),
+        _ => return None,
+    };
+    let param_names: Vec<&str> = param_forms
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FormKind::Symbol(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let span = params_form.span.clone();
+    let is_mut = |name: &str| mutable_fields.iter().any(|m| m.as_ref() == name);
+    let mut bindings: Vec<Form> = Vec::new();
+    for field in fields {
+        if param_names.contains(&field.as_ref()) {
+            continue;
+        }
+        bindings.push(Form::new(FormKind::Symbol(field.to_string()), span.clone()));
+        // A mutable field reads through `(.-field this)` — the live cell; an
+        // immutable one through `(:field this)` — the field map. Both snapshot
+        // at method entry; `set!` refreshes the local for later reads.
+        let accessor = if is_mut(field) {
+            FormKind::List(vec![
+                Form::new(FormKind::Symbol(format!(".-{field}")), span.clone()),
+                Form::new(FormKind::Symbol(this_name.clone()), span.clone()),
+            ])
+        } else {
+            FormKind::List(vec![
+                Form::new(FormKind::Keyword(field.to_string()), span.clone()),
+                Form::new(FormKind::Symbol(this_name.clone()), span.clone()),
+            ])
+        };
+        bindings.push(Form::new(accessor, span.clone()));
+    }
+    // With mutable fields present, bind a hidden handle to `this` so `set!` can
+    // find the instance whose cell to update.
+    if !mutable_fields.is_empty() {
+        bindings.push(Form::new(
+            FormKind::Symbol(DEFTYPE_SELF.to_string()),
+            span.clone(),
+        ));
+        bindings.push(Form::new(FormKind::Symbol(this_name.clone()), span.clone()));
+    }
+    if bindings.is_empty() {
+        return None;
+    }
+
+    let mut let_forms = vec![
+        Form::new(FormKind::Symbol("let*".to_string()), span.clone()),
+        Form::new(FormKind::Vector(bindings), span.clone()),
+    ];
+    let_forms.extend_from_slice(body);
+    Some(vec![Form::new(FormKind::List(let_forms), span)])
+}
+
+fn build_impl_fn(
+    parts: &[Form],
+    fields: &[Arc<str>],
+    mutable_fields: &[Arc<str>],
+    env: &mut Env,
+) -> EvalResult<Value> {
     if parts.len() < 2 {
         return Err(EvalError::Runtime(
             "protocol method impl requires params and body".into(),
@@ -2031,6 +2225,18 @@ fn build_impl_fn(parts: &[Form], env: &mut Env) -> EvalResult<Value> {
     // parts[1] should be the params vector.
     let params_form = &parts[1];
     let body = &parts[2..];
+    let scoped;
+    let body: &[Form] = if fields.is_empty() {
+        body
+    } else {
+        match synth_field_scope(params_form, fields, mutable_fields, body) {
+            Some(v) => {
+                scoped = v;
+                &scoped
+            }
+            None => body,
+        }
+    };
     let arity = parse_arity(params_form, body)?;
     let (closed_over_names, closed_over_vals) = env.all_local_bindings();
     let fn_name: Option<Arc<str>> = parts[0].as_symbol().map(Arc::from);
@@ -2145,7 +2351,7 @@ fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
         .lock()
         .unwrap()
         .insert(key, dispatch_val);
-    cljrs_value::bump_multifn_generation();
+    mf_ptr.get().bump_method_generation();
 
     Ok(Value::MultiFn(mf_ptr))
 }
@@ -2189,6 +2395,181 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
     // _guard drops here → pop_frame()
 }
 
+// ── deftype / defrecord shared construction ─────────────────────────────────────
+
+/// Hidden `let*` binding a `deftype` method body carries when the type has
+/// mutable fields: a handle to `this`, so `set!` can locate the instance whose
+/// interior-mutable cell to update.
+const DEFTYPE_SELF: &str = "__deftype_self__";
+
+/// Does a field's `^meta` mark it `^:unsynchronized-mutable` or
+/// `^:volatile-mutable`? Instances are single-threaded here, so the two are
+/// treated identically — only whether the field is mutable at all matters.
+fn meta_form_is_mutable(meta: &Form) -> bool {
+    let is_mut_kw = |k: &str| k == "unsynchronized-mutable" || k == "volatile-mutable";
+    match &meta.kind {
+        FormKind::Keyword(k) => is_mut_kw(k),
+        FormKind::Map(entries) => entries.chunks(2).any(|kv| {
+            matches!(&kv[0].kind, FormKind::Keyword(k) if is_mut_kw(k))
+                && !matches!(
+                    kv.get(1).map(|f| &f.kind),
+                    None | Some(FormKind::Bool(false)) | Some(FormKind::Nil)
+                )
+        }),
+        _ => false,
+    }
+}
+
+/// A single field spec: its name and whether it is mutable.
+fn field_spec_of(form: &Form) -> Option<(Arc<str>, bool)> {
+    match &form.kind {
+        FormKind::Symbol(s) => Some((Arc::from(s.as_str()), false)),
+        FormKind::Meta(meta, inner) => {
+            let here = meta_form_is_mutable(meta);
+            field_spec_of(inner).map(|(name, inner_mut)| (name, inner_mut || here))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a `deftype` `[field ...]` vector into `(name, mutable?)` specs.
+fn parse_field_specs(form: &Form, ctx: &str) -> EvalResult<Vec<(Arc<str>, bool)>> {
+    // `as_vector` reports the shape under any `^meta`, so a marker on the
+    // vector itself — `(defrecord R ^:marker [x])` — stays transparent.
+    let Some(fields) = form.as_vector() else {
+        return Err(EvalError::Runtime(format!(
+            "{ctx} requires a field vector as second arg"
+        )));
+    };
+    fields
+        .iter()
+        .map(|f| {
+            field_spec_of(f)
+                .ok_or_else(|| EvalError::Runtime(format!("{ctx} field names must be symbols")))
+        })
+        .collect()
+}
+
+/// Intern `->TypeName`, the positional constructor, in the current namespace.
+/// For an all-immutable type the body is
+/// `(make-type-instance "T" {:f1 f1 …})`; when `mutable_names` is non-empty the
+/// mutable fields are split into a second map and the body becomes
+/// `(make-type-instance-mut "T" {imm…} {mut…})`. Shared by `deftype` and
+/// `defrecord` (which always passes an empty `mutable_names`).
+fn build_positional_ctor(
+    type_name: &str,
+    type_tag: &Arc<str>,
+    field_names: &[Arc<str>],
+    mutable_names: &[Arc<str>],
+    env: &mut Env,
+) {
+    use cljrs_reader::form::FormKind as FK;
+    let ns = env.current_ns.clone();
+    let globals = env.globals.clone();
+    let dummy_span =
+        cljrs_types::span::Span::new(std::sync::Arc::new("<deftype>".into()), 0, 0, 1, 1);
+    let make_form = |kind: FK| Form {
+        kind,
+        span: dummy_span.clone(),
+    };
+    let is_mut = |name: &str| mutable_names.iter().any(|m| m.as_ref() == name);
+    let mut imm_kv: Vec<Form> = Vec::new();
+    let mut mut_kv: Vec<Form> = Vec::new();
+    for f in field_names {
+        let target = if is_mut(f) { &mut mut_kv } else { &mut imm_kv };
+        target.push(make_form(FK::Keyword(f.as_ref().to_string())));
+        target.push(make_form(FK::Symbol(f.as_ref().to_string())));
+    }
+    let ctor_call = if mutable_names.is_empty() {
+        vec![
+            make_form(FK::Symbol("make-type-instance".into())),
+            make_form(FK::Str(type_tag.as_ref().to_string())),
+            make_form(FK::Map(imm_kv)),
+        ]
+    } else {
+        vec![
+            make_form(FK::Symbol("make-type-instance-mut".into())),
+            make_form(FK::Str(type_tag.as_ref().to_string())),
+            make_form(FK::Map(imm_kv)),
+            make_form(FK::Map(mut_kv)),
+        ]
+    };
+    let body = vec![make_form(FK::List(ctor_call))];
+    let arity = CljxFnArity {
+        params: field_names.to_vec(),
+        rest_param: None,
+        body,
+        destructure_params: vec![],
+        destructure_rest: None,
+        ir_arity_id: crate::interp::arity::fresh_arity_id(),
+        param_hints: vec![],
+        rest_hint: None,
+    };
+    let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
+    let ctor = CljxFn::new(
+        Some(fn_name.clone()),
+        vec![arity],
+        vec![],
+        vec![],
+        false,
+        Arc::clone(&ns),
+    );
+    globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
+}
+
+/// Intern `map->TypeName`, the map constructor — `defrecord` only, as `deftype`
+/// has no map constructor in Clojure.
+fn build_map_ctor(type_name: &str, type_tag: &Arc<str>, env: &mut Env) {
+    use cljrs_reader::form::FormKind as FK;
+    let ns = env.current_ns.clone();
+    let globals = env.globals.clone();
+    let dummy_span =
+        cljrs_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
+    let make_form = |kind: FK| Form {
+        kind,
+        span: dummy_span.clone(),
+    };
+    let m_sym: Arc<str> = Arc::from("m__");
+    let body = vec![make_form(FK::List(vec![
+        make_form(FK::Symbol("make-type-instance".into())),
+        make_form(FK::Str(type_tag.as_ref().to_string())),
+        make_form(FK::Symbol(m_sym.as_ref().to_string())),
+    ]))];
+    let arity = CljxFnArity {
+        params: vec![m_sym],
+        rest_param: None,
+        body,
+        destructure_params: vec![],
+        destructure_rest: None,
+        ir_arity_id: crate::interp::arity::fresh_arity_id(),
+        param_hints: vec![],
+        rest_hint: None,
+    };
+    let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
+    let ctor = CljxFn::new(
+        Some(fn_name.clone()),
+        vec![arity],
+        vec![],
+        vec![],
+        false,
+        Arc::clone(&ns),
+    );
+    globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
+}
+
+/// Intern the type NAME as a Symbol value so `(instance? TypeName x)` and other
+/// name references resolve to the type tag.
+fn intern_type_symbol(type_name: &str, env: &mut Env) {
+    let ns = env.current_ns.clone();
+    let globals = env.globals.clone();
+    let type_sym = cljrs_value::Symbol::simple(type_name.to_string());
+    globals.intern(
+        &ns,
+        Arc::from(type_name),
+        Value::Symbol(GcPtr::new(type_sym)),
+    );
+}
+
 // ── defrecord ─────────────────────────────────────────────────────────────────
 
 fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
@@ -2204,120 +2585,57 @@ fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
     let (type_name, _) = require_sym_meta(args, 0, "defrecord", env)?;
     let type_tag: Arc<str> = Arc::from(type_name.as_str());
 
-    // Parse field names from the vector.
-    let Some(fields) = args[1].as_vector() else {
-        return Err(EvalError::Runtime(
-            "defrecord requires a field vector as second arg".into(),
-        ));
-    };
-    let field_names: Vec<Arc<str>> = fields
-        .iter()
-        .map(|f| {
-            f.as_symbol()
-                .map(Arc::from)
-                .ok_or_else(|| EvalError::Runtime("defrecord field names must be symbols".into()))
-        })
-        .collect::<EvalResult<_>>()?;
+    // Parse field names from the vector, peeling any per-field metadata.
+    // (A defrecord field is always immutable, so the mutability flag is dropped.)
+    let field_names: Vec<Arc<str>> = parse_field_specs(&args[1], "defrecord")?
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
 
     // Register protocol implementations (same as extend-type inner logic).
-    register_impls_for_tag(&type_tag, &args[2..], env)?;
+    // The field names go with them: a defrecord method body may name its fields
+    // directly, which reify has no equivalent of.
+    register_impls_for_tag(&type_tag, &args[2..], &field_names, &[], env)?;
 
-    // Generate constructors in clojure.core.
-    // ->TypeName: positional constructor
-    // map->TypeName: map constructor
-    let ns = env.current_ns.clone();
-    let globals = env.globals.clone();
-    let type_tag2 = type_tag.clone();
+    // Generate constructors in the current namespace: the positional `->T` and
+    // the map `map->T`; then intern the type name so `(instance? T x)` resolves.
+    build_positional_ctor(&type_name, &type_tag, &field_names, &[], env);
+    build_map_ctor(&type_name, &type_tag, env);
+    intern_type_symbol(&type_name, env);
+    Ok(Value::Nil)
+}
 
-    // Build `->TypeName` as a native-Clojure fn: (fn [f1 f2 ...] (make-type-instance "T" {:f1 f1 :f2 f2 ...}))
-    {
-        let params: Vec<Arc<str>> = field_names.clone();
-        let rest_param = None;
-        // Build body forms manually: (make-type-instance "TypeName" {:field1 field1 ...})
-        use cljrs_reader::form::FormKind as FK;
-        let dummy_span =
-            cljrs_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
-        let make_form = |kind: FK| Form {
-            kind,
-            span: dummy_span.clone(),
-        };
-        let mut kv_forms: Vec<Form> = Vec::new();
-        for f in &field_names {
-            kv_forms.push(make_form(FK::Keyword(f.as_ref().to_string())));
-            kv_forms.push(make_form(FK::Symbol(f.as_ref().to_string())));
-        }
-        let map_form = make_form(FK::Map(kv_forms));
-        let body = vec![make_form(FK::List(vec![
-            make_form(FK::Symbol("make-type-instance".into())),
-            make_form(FK::Str(type_tag.as_ref().to_string())),
-            map_form,
-        ]))];
-        let arity = CljxFnArity {
-            params,
-            rest_param,
-            body,
-            destructure_params: vec![],
-            destructure_rest: None,
-            ir_arity_id: crate::interp::arity::fresh_arity_id(),
-            param_hints: vec![],
-            rest_hint: None,
-        };
-        let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
-        let ctor = CljxFn::new(
-            Some(fn_name.clone()),
-            vec![arity],
-            vec![],
-            vec![],
-            false,
-            Arc::clone(&ns),
-        );
-        globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
+// ── deftype ──────────────────────────────────────────────────────────────────
+
+fn eval_deftype(args: &[Form], env: &mut Env) -> EvalResult {
+    // (deftype TypeName [field ...] Proto (method [this] body) ...)
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(
+            "deftype requires a name and field vector".into(),
+        ));
     }
+    // Type metadata (e.g. ^:private) has no var to hold it; unwrapped so the
+    // name reads, and deliberately not applied anywhere it would not belong.
+    let (type_name, _) = require_sym_meta(args, 0, "deftype", env)?;
+    let type_tag: Arc<str> = Arc::from(type_name.as_str());
 
-    // Build `map->TypeName`: (fn [m] (make-type-instance "TypeName" m))
-    {
-        use cljrs_reader::form::FormKind as FK;
-        let dummy_span =
-            cljrs_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
-        let make_form = |kind: FK| Form {
-            kind,
-            span: dummy_span.clone(),
-        };
-        let m_sym: Arc<str> = Arc::from("m__");
-        let body = vec![make_form(FK::List(vec![
-            make_form(FK::Symbol("make-type-instance".into())),
-            make_form(FK::Str(type_tag2.as_ref().to_string())),
-            make_form(FK::Symbol(m_sym.as_ref().to_string())),
-        ]))];
-        let arity = CljxFnArity {
-            params: vec![m_sym],
-            rest_param: None,
-            body,
-            destructure_params: vec![],
-            destructure_rest: None,
-            ir_arity_id: crate::interp::arity::fresh_arity_id(),
-            param_hints: vec![],
-            rest_hint: None,
-        };
-        let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
-        let ctor = CljxFn::new(
-            Some(fn_name.clone()),
-            vec![arity],
-            vec![],
-            vec![],
-            false,
-            Arc::clone(&ns),
-        );
-        globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
-    }
+    let specs = parse_field_specs(&args[1], "deftype")?;
+    let field_names: Vec<Arc<str>> = specs.iter().map(|(n, _)| n.clone()).collect();
+    let mutable_names: Vec<Arc<str>> = specs
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(n, _)| n.clone())
+        .collect();
 
-    // Intern the type name as a Symbol value so `(instance? TypeName x)` works.
-    let type_sym = cljrs_value::Symbol::simple(type_name.clone());
-    globals.intern(
-        &ns,
-        Arc::from(type_name),
-        Value::Symbol(GcPtr::new(type_sym)),
-    );
+    // Register protocol/interface method impls, with the fields in scope in
+    // each body — same machinery as defrecord/reify. Mutable fields read
+    // through the live cell and are writable with `set!`.
+    register_impls_for_tag(&type_tag, &args[2..], &field_names, &mutable_names, env)?;
+
+    // deftype gets a positional `->T` constructor and its type symbol, but no
+    // `map->T` (Clojure reserves that for defrecord).
+    build_positional_ctor(&type_name, &type_tag, &field_names, &mutable_names, env);
+    intern_type_symbol(&type_name, env);
     Ok(Value::Nil)
 }
 
@@ -2330,39 +2648,69 @@ fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
 
-    // Register protocol implementations.
-    register_impls_for_tag(&type_tag, args, env)?;
+    // Register protocol implementations. reify has no fields.
+    register_impls_for_tag(&type_tag, args, &[], &[], env)?;
 
     // Return an empty TypeInstance with the unique tag.
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
         type_tag,
         fields: MapValue::empty(),
+        mutable: None,
     })))
 }
 
 // ── register_impls_for_tag ────────────────────────────────────────────────────
 
+/// Resolve a protocol NAME symbol in an impl position (extend-type, extend-protocol,
+/// reify/defrecord), honouring the current namespace's `:require :as` aliases and
+/// fully-qualified names — not just an unqualified lookup in the current ns.
+///
+/// `(defrecord R [] mp/IThing (-do [_] ...))` failed with "mp/IThing is not a
+/// protocol" even though the protocol was loaded and (resolve 'mini.proto/IThing)
+/// was truthy: the old code looked up the whole string "mp/IThing" as an intern of
+/// the CURRENT ns, where it is neither interned nor referred. A qualified protocol
+/// symbol must resolve through its own namespace, exactly as `eval` resolves any
+/// other qualified symbol.
+fn resolve_protocol_sym(env: &Env, s: &str) -> Option<GcPtr<Protocol>> {
+    let parsed = cljrs_value::Symbol::parse(s);
+    let val = match parsed.namespace.as_deref() {
+        Some(ns_part) => {
+            let ns = env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part));
+            env.globals.lookup_in_ns(&ns, &parsed.name)
+        }
+        None => env.globals.lookup_in_ns(&env.current_ns, s),
+    };
+    match val {
+        Some(Value::Protocol(p)) => Some(p),
+        _ => None,
+    }
+}
+
 /// Parse `Proto (method [params] body) ...` segments and register them under `type_tag`.
 /// Shared by `defrecord` and `reify`.
-fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) -> EvalResult<()> {
+fn register_impls_for_tag(
+    type_tag: &Arc<str>,
+    forms: &[Form],
+    fields: &[Arc<str>],
+    mutable_fields: &[Arc<str>],
+    env: &mut Env,
+) -> EvalResult<()> {
     let mut current_proto: Option<GcPtr<cljrs_value::Protocol>> = None;
 
     for form in forms {
         match &form.unmeta().kind {
-            FormKind::Symbol(s) => {
-                let val = env.globals.lookup_in_ns(&env.current_ns, s);
-                match val {
-                    Some(Value::Protocol(p)) => {
-                        current_proto = Some(p);
-                    }
-                    _ => {
-                        return Err(EvalError::Runtime(format!(
-                            "reify/defrecord: {} is not a protocol",
-                            s
-                        )));
-                    }
+            FormKind::Symbol(s) => match resolve_protocol_sym(env, s) {
+                Some(p) => current_proto = Some(p),
+                None => {
+                    return Err(EvalError::Runtime(format!(
+                        "reify/defrecord: {} is not a protocol",
+                        s
+                    )));
                 }
-            }
+            },
             FormKind::List(parts) => {
                 let proto = current_proto.as_ref().ok_or_else(|| {
                     EvalError::Runtime("reify/defrecord: method impl before protocol name".into())
@@ -2374,7 +2722,7 @@ fn register_impls_for_tag(type_tag: &Arc<str>, forms: &[Form], env: &mut Env) ->
                     Some(s) => Arc::from(s),
                     None => continue,
                 };
-                let fn_val = build_impl_fn(parts, env)?;
+                let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())
@@ -2482,7 +2830,7 @@ fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
                         return Err(EvalError::GasExhausted);
                     }
                     FutureState::Cancelled => {
-                        return Err(EvalError::Runtime("future was cancelled".into()));
+                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
                     }
                     FutureState::Running => {
                         guard = f.get().cond.wait(guard).unwrap();

@@ -211,7 +211,9 @@ fn at_deref_of_future_in_async_fn_errors() {
 }
 
 #[test]
-#[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
+#[ignore = "no thread-based future exists to deref: clojure.core/future is \
+             undefined by design, and a sync deref of the cooperative \
+             cljrs.core.experimental/future deadlocks"]
 fn deref_of_future_in_sync_context_still_works() {
     // With the async runtime registered, a *sync* (non-^:async) deref of a
     // thread-based future must still block-and-return, not error.

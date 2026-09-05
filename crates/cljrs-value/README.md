@@ -271,11 +271,13 @@ A var's *root* binding uses the **same** cross-isolate mechanism as
 pub struct Var {
     pub value: Mutex<Option<Value>>,                          // isolate-local fast path
     pub shared_root: Arc<ArcSwap<Option<SharedValue>>>,       // cross-isolate mirror (B3)
+    binding_generation: AtomicU64,                            // local root revision
     // …namespace, name, is_macro, meta, watches
 }
 
 impl Var {
     pub fn deref(&self) -> Option<Value>          // reads the local fast path
+    pub fn binding_generation(&self) -> u64       // revision for dependent caches
     pub fn deref_shared(&self) -> Option<Value>   // demotes the shared cell
     pub fn bind(&self, v: Value)                  // promote-on-def: updates both slots
     pub fn from_shared_root(ns, name, is_macro, shared_root) -> Self  // receiver side
@@ -288,8 +290,10 @@ impl Var {
   regression).
 - **`bind` promotes-on-write.** `def` / `alter-var-root` / `set!` all funnel
   through `Var::bind`, which mirrors the new root into `shared_root` when it is
-  promotable, and clears it to `None` otherwise.  `def` is rare, so this
-  write-path cost is acceptable.
+  promotable, clears it to `None` otherwise, and then advances
+  `binding_generation`. Dependent caches can therefore track one Var without
+  process-global invalidation. `def` is rare, so this write-path cost is
+  acceptable.
 - **Crossing isolates.** `clone::serialize` passes the `shared_root` `Arc`
   through (both isolates share the same cell); the receiver rebuilds the var
   with `from_shared_root`, seeding its local slot from the demoted snapshot.
@@ -322,6 +326,25 @@ Whole-number doubles hash like their `Long` equivalent.
 `PersistentArrayMap::assoc` returns `AssocResult::Array(Self)` while under the
 threshold, or `AssocResult::Promote(Vec<(Value, Value)>)` when the map is full.
 `MapValue::assoc` handles the transparent promotion to `PersistentHashMap`.
+
+### Keyword-argument rest normalization
+
+```rust
+pub fn Value::from_kwargs_rest(entries: Vec<Value>) -> Result<Value, ValueError>;
+```
+
+Clojure's `seq-to-map-for-destructuring`: the value a *map-shaped* variadic
+rest pattern (`[& {:keys [a b]}]`) destructures against, given the trailing
+arguments as a flat vector. Zero or one argument returns that argument
+verbatim — so `(f {:a 1})` binds the caller's own map (sortedness and metadata
+intact) and `(f)` / `(f nil)` bind `nil`; two or more are alternating
+key/value pairs, optionally closed by a trailing map whose entries merge over
+and beat them. A dangling key is a `ValueError`, not a dropped argument.
+
+This lives here rather than in a tier because every tier has to agree on it:
+the tree-walker calls it from `bind_fn_params`, and the IR interpreter and
+compiled code reach it through `KnownFn::KwargsMap` / `rt_kwargs_map`. Issue
+#368 was those paths disagreeing.
 
 All collections implement `PartialEq`, `Debug`, `Clone`, and `cljrs_gc::Trace`.
 `PersistentList`, `PersistentVector`, and `PersistentHashSet` implement
@@ -503,18 +526,30 @@ pub struct CljxCons {
 `cljrs-value` stays free of evaluator dependencies while `LazySeq` can still
 call back through the trait object.
 
-### `TypeInstance` (Phase 6-ext — defrecord/reify)
+### `TypeInstance` (Phase 6-ext — defrecord/deftype/reify)
 
 ```rust
 pub struct TypeInstance {
-    pub type_tag: Arc<str>,  // record name (defrecord) or gensym (reify)
-    pub fields: MapValue,    // keyword → value
+    pub type_tag: Arc<str>,                        // type name, or a gensym for reify
+    pub fields: MapValue,                          // keyword → value (immutable fields)
+    pub mutable: Option<GcPtr<crate::types::Atom>>, // keyword → value, deftype only
 }
 ```
 
-Used by `defrecord` (named type_tag, generates `->Name`/`map->Name` constructors) and
-`reify` (gensym'd type_tag, no constructors).  Supports keyword field access `(:field rec)`,
-`get`, `assoc` (returns new TypeInstance), and `count`.
+Used by `defrecord` (named type_tag, generates `->Name`/`map->Name` constructors),
+`deftype` (named type_tag, `->Name` only), and `reify` (gensym'd type_tag, no
+constructors).  Supports keyword field access `(:field rec)`, `get`, `assoc`
+(returns new TypeInstance), and `count`.
+
+`mutable` holds a `deftype`'s `^:unsynchronized-mutable` / `^:volatile-mutable`
+fields in one interior-mutable cell — an `Atom` over a keyword→value map — so
+`set!` updates them in place and every clone of the instance sees the write.
+It is `None` for `defrecord`, `reify`, and an all-immutable `deftype`.
+Instances are `!Send`, so one shared cell needs no stronger volatility than an
+`Atom`, and the two mutability markers behave identically.  `assoc`/`assoc-in`
+and `with-meta` carry the cell through; `serialize` folds the slot *values*
+into the field map and `deserialize` restores `mutable: None`, since mutability
+itself is runtime state that does not cross a clone boundary.
 
 ### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
 
@@ -532,6 +567,19 @@ pub struct CljxFuture {
     pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Cancelled
     pub cond: Condvar,
 }
+
+impl CljxFuture {
+    pub fn is_done(&self) -> bool;
+    pub fn is_cancelled(&self) -> bool;
+    /// Running -> Cancelled, waking waiters; false if it had already settled.
+    pub fn cancel(&self) -> bool;
+    /// The catchable `Value::Error` every reader of a cancelled future raises.
+    pub fn cancelled_error() -> Value;
+    pub fn mark_observed(&self);
+}
+
+/// Message carried by `CljxFuture::cancelled_error()`.
+pub const FUTURE_CANCELLED_MSG: &str = "future was cancelled";
 
 pub struct Agent {
     pub state: Arc<Mutex<Value>>,
@@ -584,6 +632,27 @@ pub struct MultiFn {
     method_cache: Mutex<MultiFnMethodCache>, // generation-tagged resolved keys
 }
 
+impl MultiFn {
+    pub fn new(name: Arc<str>, dispatch_fn: Value, default_dispatch: String) -> Self;
+    pub fn method_generation(&self) -> u64;
+    pub fn bump_method_generation(&self);
+    pub fn cached_method(
+        &self,
+        dispatch_key: &str,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) -> Option<String>;
+    pub fn cache_method(
+        &self,
+        dispatch_key: String,
+        method_key: String,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    );
+    /// Test instrumentation; number of physically stored cache entries.
+    pub fn cached_method_count(&self) -> usize;
+}
+
 /// Phase 10.6 — protocol-dispatch inline-cache invalidation.
 /// `bump_protocol_generation()` must follow every mutation of any
 /// `Protocol::impls` map (extend-type / extend-protocol / inline impls);
@@ -592,11 +661,12 @@ pub struct MultiFn {
 pub fn protocol_generation() -> u64;
 pub fn bump_protocol_generation();
 
-/// Hierarchy multimethod-cache invalidation. The generation is bumped after
-/// hierarchy, method-table, and preference-table mutations.
-pub fn multifn_generation() -> u64;
-pub fn bump_multifn_generation();
 ```
+
+Each method-cache entry is tagged with `Var::binding_generation()` for the
+specific hierarchy root and `MultiFn::method_generation()` for the specific
+multimethod. A concurrent mutation can leave an entry under an old tag, but
+the next lookup clears it before use.
 
 When `Protocol::extend_via_metadata` is set, `apply_value`'s `ProtocolFn` arm
 (`cljrs-runtime/src/env/apply.rs`) checks the dispatch value's metadata for an entry

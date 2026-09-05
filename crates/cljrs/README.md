@@ -59,6 +59,10 @@ tests/
                       name) must answer the same before and after a function
                       crosses the IR promotion threshold, and once more when
                       the file is AOT-compiled (issue #337)
+  self_name_shadowing_tiers.rs — a parameter sharing the function's OWN name
+                      (`(defn text [text] ...)`, plus rest, multi-arity and
+                      hot-loop forms) must shadow it, and tree-walk and eager
+                      IR must agree (PR #353)
 ```
 
 ---

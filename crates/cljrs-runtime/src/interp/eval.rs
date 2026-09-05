@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::builtins::form::{expand_pairs, expand_reader_conds, expand_reader_conds_cow};
 use crate::builtins::special::SPECIAL_FORMS;
-use crate::env::env::Env;
+use crate::env::env::{Env, GlobalEnv};
 use crate::env::error::{EvalError, EvalResult};
 use crate::interp::apply::eval_call;
 use crate::interp::special::eval_special;
@@ -15,8 +15,8 @@ use cljrs_reader::form::FormKind;
 use cljrs_value::regex::Pattern;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    FutureState, Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol,
-    Value,
+    CljxFuture, FutureState, Keyword, MapValue, PersistentHashSet, PersistentList,
+    PersistentVector, Symbol, Value,
 };
 
 /// Evaluate a `Form` in the given `Env`.
@@ -279,6 +279,15 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
         } else {
             resolved
         };
+        if resolved.as_ref() != env.current_ns.as_ref()
+            && let Some(var) = env.globals.lookup_var(&resolved, &sym.name)
+            && GlobalEnv::var_is_private(var.get())
+        {
+            return Err(EvalError::Runtime(format!(
+                "var: {}/{} is not public",
+                resolved, sym.name
+            )));
+        }
         return env
             .globals
             .lookup_in_ns(&resolved, &sym.name)
@@ -372,7 +381,7 @@ pub fn deref_value(v: Value) -> EvalResult {
                         return Err(EvalError::GasExhausted);
                     }
                     FutureState::Cancelled => {
-                        return Err(EvalError::Runtime("future was cancelled".into()));
+                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
                     }
                     FutureState::Running => {
                         guard = f.get().cond.wait(guard).unwrap();
@@ -1270,6 +1279,73 @@ mod tests {
         );
     }
 
+    // letfn scope is MUTUAL, not sequential: every binding is visible to every
+    // other one regardless of order. These pin the three-pass construction in
+    // `eval_letfn` — a closure captures values rather than cells, so without the
+    // pass-3 back-patch a forward reference silently sees the nil placeholder
+    // pass 1 left behind.
+
+    #[test]
+    fn test_letfn_forward_reference() {
+        assert_eq!(
+            eval_str("(letfn [(f [n] (g n)) (g [n] (* n 2))] (f 21))").unwrap(),
+            long(42)
+        );
+    }
+
+    #[test]
+    fn test_letfn_mutual_recursion() {
+        // `my-even?` names `my-odd?` before it is built — the direction that was
+        // broken — and `my-odd?` names `my-even?` backwards.
+        let defs = "(letfn [(my-even? [n] (if (= n 0) true (my-odd? (dec n))))
+                            (my-odd? [n] (if (= n 0) false (my-even? (dec n))))]";
+        assert_eq!(
+            eval_str(&format!("{defs} (my-even? 10))")).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_str(&format!("{defs} (my-odd? 10))")).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_letfn_three_way_mutual_recursion() {
+        let defs = "(letfn [(a [n] (if (= n 0) 1 (b (dec n))))
+                            (b [n] (if (= n 0) 2 (c (dec n))))
+                            (c [n] (if (= n 0) 3 (a (dec n))))]";
+        for (arg, want) in [(0, 1), (1, 2), (2, 3), (3, 1)] {
+            assert_eq!(
+                eval_str(&format!("{defs} (a {arg}))")).unwrap(),
+                long(want),
+                "(a {arg})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_letfn_closes_over_outer_local() {
+        assert_eq!(
+            eval_str("(let [start 10] (letfn [(step [n] (+ n start))] (step 5)))").unwrap(),
+            long(15)
+        );
+    }
+
+    #[test]
+    fn test_letfn_shadows_enclosing_binding() {
+        // The letfn binding wins over the `let` of the same name, and siblings
+        // that name it see the fn, not the shadowed value.
+        assert_eq!(
+            eval_str("(let [f 1] (letfn [(g [] (f)) (f [] 7)] (g)))").unwrap(),
+            long(7)
+        );
+    }
+
+    #[test]
+    fn test_letfn_binding_name_must_be_a_symbol() {
+        assert!(eval_str("(letfn [(42 [n] n)] 1)").is_err());
+    }
+
     // ── Phase 5: namespace ops ────────────────────────────────────────────
 
     #[test]
@@ -1704,7 +1780,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
+    #[ignore = "clojure.core/future is undefined by design: @f deadlocks the one \
+                thread the task needs (GcPtr: !Send). cljrs.core.experimental/future \
+                is the cooperative stand-in, read with (await f)"]
     fn test_future() {
         let result = eval_str(
             r#"
@@ -2145,7 +2223,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "future/thread spawn not yet implemented (Phase A1 — GcPtr: !Send)"]
+    #[ignore = "clojure.core/future is undefined by design; the experimental \
+                stand-in does not convey dynamic bindings to its task"]
     fn test_binding_conveyance() {
         let (_, mut env) = make_env();
         eval_src("(def ^:dynamic *x* 10)", &mut env).unwrap();

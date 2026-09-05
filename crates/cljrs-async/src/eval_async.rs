@@ -80,6 +80,14 @@ where
 /// Write a completed result into a future and wake blocking `deref` waiters.
 pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     let mut state = future.get().state.lock().unwrap();
+    // Cancellation is sticky. `future-cancel` does not interrupt the task, so a
+    // task cancelled mid-body still runs to completion and lands here; letting
+    // it write its result would flip `future-cancelled?` back to false and hand
+    // `await` a value it had already promised to raise on. Cancel wins: the
+    // side effects happened, the result is discarded.
+    if matches!(&*state, FutureState::Cancelled) {
+        return;
+    }
     *state = match result {
         Ok(v) => FutureState::Done(v),
         // Preserve the thrown value (and any non-Thrown error as a fresh
@@ -263,7 +271,7 @@ pub async fn await_value(val: Value) -> EvalResult {
                             return Err(EvalError::GasExhausted);
                         }
                         FutureState::Cancelled => {
-                            return Err(EvalError::Runtime("future was cancelled".into()));
+                            return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
                         }
                         FutureState::Running => {}
                     }

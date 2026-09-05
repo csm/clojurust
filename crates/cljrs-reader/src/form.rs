@@ -22,6 +22,20 @@ impl Form {
         mem::size_of::<FormKind>() + self.kind.heap_size()
     }
 
+    /// True when this form, used as a variadic `&` rest pattern, selects
+    /// Clojure's keyword-argument convention.
+    ///
+    /// A map-shaped rest pattern (`[& {:keys [a b]}]`) does not destructure the
+    /// rest *sequence*; the trailing arguments are first normalized into a map
+    /// (`Value::from_kwargs_rest`) and the pattern is applied to that.  Every
+    /// execution tier has to make this call the same way — the tree-walker in
+    /// `bind_fn_params`, and both lowerers on their way to `KnownFn::KwargsMap`
+    /// — so they share this predicate rather than three copies of the match.
+    /// Issue #368 was those copies disagreeing.
+    pub fn is_kwargs_rest_pattern(&self) -> bool {
+        matches!(self.kind, FormKind::Map(_))
+    }
+
     /// The annotated form with every `^meta` wrapper removed.
     ///
     /// Returns `self` when the form carries no metadata. Stacked metadata

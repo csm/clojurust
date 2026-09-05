@@ -995,6 +995,32 @@
       (assoc m k (apply update-in (get m k {}) ks f args))
       (assoc m k (apply f (get m k) args)))))
 
+(defn merge-with
+  "Returns a map that consists of the rest of the maps conj-ed onto the
+  first. If a key occurs in more than one map, the mapping(s) from the
+  latter (left-to-right) will be combined with the mapping in the result
+  by calling (f val-in-result val-in-latter)."
+  [f & maps]
+  (when (some identity maps)
+    (let [merge-entry (fn [m e]
+                        (let [k (key e) v (val e)]
+                          (if (contains? m k)
+                            (assoc m k (f (get m k) v))
+                            (assoc m k v))))
+          merge2 (fn [m1 m2] (reduce merge-entry (or m1 {}) (seq m2)))]
+      (reduce merge2 (filter identity maps)))))
+
+(defn update-keys
+  "Returns a map with the keys mapped by f, values unchanged. f must
+  return a distinct key for each key of m, or entries are lost."
+  [m f]
+  (reduce-kv (fn [acc k v] (assoc acc (f k) v)) {} m))
+
+(defn update-vals
+  "Returns a map with the values mapped by f, keys unchanged."
+  [m f]
+  (reduce-kv (fn [acc k v] (assoc acc k (f v))) {} m))
+
 (defn juxt
   "Takes a set of functions and returns a fn that is the juxtaposition of
   those fns. The returned fn takes a variable number of args, and returns

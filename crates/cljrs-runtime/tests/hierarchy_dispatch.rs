@@ -113,8 +113,22 @@ fn ambiguity_lists_three_matches_stably_and_grammatically() {
     )
     .expect_err("three unrelated matching methods must be ambiguous");
     assert!(
-        err.contains(":user/b and :user/c and :user/e, and none is preferred"),
+        err.contains(":user/b, :user/c, and :user/e, and none is preferred"),
         "expected sorted keys and plural wording, got: {err}"
+    );
+}
+
+#[test]
+fn ambiguity_reports_only_the_undominated_frontier() {
+    let err = eval_fresh(
+        "(derive ::c ::b) (derive ::d ::c) (derive ::d ::x) (defmulti g identity) \
+         (defmethod g ::b [_] :b) (defmethod g ::c [_] :c) (defmethod g ::x [_] :x) (g ::d)",
+    )
+    .expect_err("the unrelated maximal matches must be ambiguous");
+    assert!(
+        err.contains(":user/c and :user/x, and neither is preferred")
+            && !err.contains(":user/b and"),
+        "expected only the conflicting frontier, got: {err}"
     );
 }
 
@@ -191,6 +205,33 @@ fn inherited_resolution_populates_and_reuses_the_method_cache() {
 }
 
 #[test]
+fn unrelated_runtimes_and_multimethods_do_not_invalidate_the_cache() {
+    let (globals, mut env) = make_env();
+    eval_in_env(
+        "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] :parent) (f ::a)",
+        &mut env,
+    )
+    .expect("populate cache");
+    let Value::MultiFn(mf) = globals.lookup_in_ns("user", "f").expect("multifn") else {
+        panic!("f was not a multimethod")
+    };
+    let generation = mf.get().method_generation();
+
+    eval_fresh(
+        "(derive ::x ::y) (defmulti other identity) \
+         (defmethod other ::y [_] :other) (prefer-method other ::y ::z) (other ::x)",
+    )
+    .expect("mutate an unrelated runtime and multimethod");
+
+    assert_eq!(mf.get().method_generation(), generation);
+    assert_eq!(mf.get().cached_method_count(), 1);
+    assert_eq!(
+        eval_in_env("(f ::a)", &mut env).expect("cached dispatch"),
+        Value::keyword(cljrs_value::Keyword::parse("parent"))
+    );
+}
+
+#[test]
 fn methods_and_prefers_keep_dispatch_values_as_keys() {
     let v = eval_ok(
         "(defmulti f identity) (defmethod f ::b [_] :b) \
@@ -217,12 +258,36 @@ fn prefer_method_rejects_the_reverse_preference() {
 }
 
 #[test]
+fn preferences_are_inherited_through_hierarchy_parents() {
+    let v = eval_ok(
+        "(derive ::c ::c-parent) (derive ::d ::c) (derive ::d ::b) \
+         (defmulti f identity) (defmethod f ::c [_] :c) (defmethod f ::b [_] :b) \
+         (prefer-method f ::c-parent ::b) (f ::d)",
+    );
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("c")));
+
+    let err = eval_fresh(
+        "(derive ::c ::c-parent) (defmulti f identity) \
+         (prefer-method f ::c-parent ::b) (prefer-method f ::b ::c)",
+    )
+    .expect_err("an inherited reverse preference must conflict");
+    assert!(
+        err.contains("Preference conflict")
+            && err.contains(":user/c is already preferred to :user/b"),
+        "unexpected inherited conflict error: {err}"
+    );
+}
+
+#[test]
 fn clojure_isa_and_multimethod_dispatch_share_hierarchy_semantics() {
     let v = eval_ok(
-        "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] true) \
-         (= (isa? [::a ::a] [::b ::b]) (f ::a))",
+        "(derive ::a ::middle) (derive ::middle ::root) \
+         (defmulti f identity) (defmethod f ::root [_] true) (defmethod f :default [_] false) \
+         [(isa? ::a ::root) (f ::a) \
+          (isa? ::unrelated ::root) (f ::unrelated) \
+          (isa? [::a] [::root ::root]) (f [::a])]",
     );
-    assert_eq!(v, Value::Bool(true));
+    assert_eq!(format!("{v}"), "[true true false false false false]");
 }
 
 #[test]
@@ -253,5 +318,16 @@ fn defn_private_vars_are_not_referred_by_refer_all() {
     assert!(
         globals.lookup_in_ns("private-client", "secret").is_none(),
         "refer-all exposed a defn- var"
+    );
+    globals.refer_named("private-client", "private-source", &[Arc::from("secret")]);
+    assert!(
+        globals.lookup_in_ns("private-client", "secret").is_none(),
+        "named refer exposed a defn- var"
+    );
+    let err = eval_in_env("(in-ns 'private-client) private-source/secret", &mut env)
+        .expect_err("qualified access to another namespace's private var must fail");
+    assert!(
+        err.contains("is not public"),
+        "unexpected privacy error: {err}"
     );
 }

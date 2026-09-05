@@ -1,0 +1,31 @@
+;; cljrs.core.experimental — APIs that exist for integrators but cannot honour
+;; the contract their Clojure namesakes carry, and so are kept out of
+;; clojure.core.
+;;
+;; Nothing here is referred into `user`; reach it with an explicit
+;; (require '[cljrs.core.experimental :as x]).
+
+(ns cljrs.core.experimental)
+
+(defmacro future
+  "Runs body as a task on this isolate's executor and returns a future.
+
+  NOT clojure.core/future, and deliberately not interchangeable with it. This
+  runtime is one thread per isolate, so of the four guarantees the JVM's
+  `future` makes, this keeps one:
+
+    - the body does NOT run in parallel — it is cooperative, and advances only
+      while this thread is awaiting something
+    - (deref f) / @f does NOT work — it blocks the one thread the task needs in
+      order to finish, deadlocking. Read the result with (await f) from an
+      ^:async fn
+    - dynamic bindings are NOT conveyed to the task; bind inside body if it
+      needs them
+    - (future-cancel f) does not interrupt the task, which runs to completion;
+      what is cancelled is the result, as for a JVM future already past its
+      interruption point
+
+  For work that must actually run in parallel, spawn an isolate and pass values
+  over an isolate channel."
+  [& body]
+  (list 'cljrs.core.experimental/future-call (list 'fn [] (cons 'do body))))

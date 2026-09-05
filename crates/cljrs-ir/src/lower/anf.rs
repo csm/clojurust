@@ -251,7 +251,41 @@ pub fn lower_fn_body_shadowed(
     is_async: bool,
     shadows: &CoreShadows,
 ) -> Result<IrFunction, LowerError> {
-    lower_fn_body_impl(name, ns, params, destructures, body, is_async, shadows)
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        None,
+        body,
+        is_async,
+        shadows,
+    )
+}
+
+/// Lower a body whose variadic rest slot requires keyword-argument map
+/// normalization before its destructuring prologue.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_fn_body_shadowed_kwargs(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
+    kwargs_rest_index: Option<usize>,
+    body: &[Form],
+    is_async: bool,
+    shadows: &CoreShadows,
+) -> Result<IrFunction, LowerError> {
+    lower_fn_body_impl(
+        name,
+        ns,
+        params,
+        destructures,
+        kwargs_rest_index,
+        body,
+        is_async,
+        shadows,
+    )
 }
 
 /// Like [`lower_fn_body`], but expands destructuring patterns on the parameters
@@ -278,6 +312,7 @@ pub fn lower_fn_body_destructured(
         ns,
         params,
         destructures,
+        None,
         body,
         is_async,
         &CoreShadows::none(),
@@ -290,6 +325,7 @@ fn lower_fn_body_impl(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    kwargs_rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,
@@ -319,7 +355,12 @@ fn lower_fn_body_impl(
     // Expand any destructuring patterns into explicit bindings in the prologue,
     // before the body is lowered, so the body sees the pattern's names.
     for (idx, pattern) in destructures {
-        let var = bound_params[*idx].1;
+        let mut var = bound_params[*idx].1;
+        if kwargs_rest_index == Some(*idx) {
+            let normalized = ctx.fresh_var();
+            ctx.emit(Inst::CallKnown(normalized, KnownFn::KwargsMap, vec![var]));
+            var = normalized;
+        }
         lower_destructure_binding(&mut ctx, pattern, var)?;
     }
 
@@ -1037,9 +1078,22 @@ fn apply_default_if_nil(
 }
 
 fn lower_with_default(ctx: &mut LowerCtx, got: VarId, default_form: &Form) -> R {
+    // `destructure` expands an `:or` entry to `(get m :k default)`, and `get`
+    // is an ordinary function: its third argument is evaluated whether or not
+    // the key is present.  So the default is lowered into the *current* block —
+    // straight-line, unconditional — and the nil check only selects between the
+    // two already-computed values.  Lowering it into the `then` block instead
+    // would make a side-effecting or throwing default fire only on a miss,
+    // which is what the tree-walker does not do (see
+    // `cljrs-runtime/src/interp/destructure.rs`); with tier-up mid-program that
+    // divergence is observable as a behaviour change partway through a run.
+    let default_var = lower_form(ctx, default_form)?;
+
     let nil_check = ctx.fresh_var();
     ctx.emit(Inst::CallKnown(nil_check, KnownFn::IsNil, vec![got]));
 
+    // The select: both arms are empty, so no evaluation is conditional.  The
+    // phi picks `default_var` when the looked-up value was nil, `got` otherwise.
     let then_block = ctx.fresh_block();
     let else_block = ctx.fresh_block();
     let merge_block = ctx.fresh_block();
@@ -1051,7 +1105,6 @@ fn lower_with_default(ctx: &mut LowerCtx, got: VarId, default_form: &Form) -> R 
     });
 
     ctx.start_block(then_block);
-    let default_var = lower_form(ctx, default_form)?;
     let then_exit = ctx.current_block_id();
     ctx.finish_block(Terminator::Jump(merge_block));
 
@@ -1693,7 +1746,16 @@ fn lower_fn_arity(
     if let Some(ref ri) = rest_info
         && let Some(ref pat) = ri.pattern
     {
-        let gensym_var = sub.lookup_local(&ri.name).unwrap();
+        let mut gensym_var = sub.lookup_local(&ri.name).unwrap();
+        if pat.is_kwargs_rest_pattern() {
+            let normalized = sub.fresh_var();
+            sub.emit(Inst::CallKnown(
+                normalized,
+                KnownFn::KwargsMap,
+                vec![gensym_var],
+            ));
+            gensym_var = normalized;
+        }
         lower_destructure_binding(&mut sub, pat, gensym_var)?;
     }
 
@@ -2176,10 +2238,22 @@ fn lower_set_bang(ctx: &mut LowerCtx, args: &[Form]) -> R {
         ));
     }
     let FormKind::Symbol(sym_str) = &args[0].kind else {
-        return Err(LowerError::MalformedSpecialForm(
-            "set! target must be a symbol".into(),
+        // A non-symbol target, e.g. `(set! (.-field inst) v)` — a deftype
+        // mutable-field write. The IR var-store path cannot express it; decline
+        // to lower so the method tree-walks (eval_set_bang handles it).
+        return Err(LowerError::UnsupportedForm(
+            "set! on a non-symbol target (deftype mutable field)".into(),
         ));
     };
+    // A set! whose target is a LOCAL binding is a deftype mutable-field write
+    // (the field is bound as a let* local in the synthesized method body). The
+    // var-store path would silently target a global var; decline to lower so
+    // the method tree-walks, where eval_set_bang updates the interior cell.
+    if ctx.lookup_local(sym_str).is_some() {
+        return Err(LowerError::UnsupportedForm(
+            "set! on a local binding (deftype mutable field)".into(),
+        ));
+    }
     let (var_ns, var_name) = split_sym(sym_str, ctx.ns());
     let var_dst = ctx.fresh_var();
     ctx.emit(Inst::LoadVar(var_dst, var_ns, var_name));

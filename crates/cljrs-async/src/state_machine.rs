@@ -45,7 +45,7 @@ use std::task::{Context, Poll};
 use cljrs_runtime::env::env::GlobalEnv;
 use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::env::gc_roots::{ValueRootGuard, root_value, root_values};
-use cljrs_value::{FutureState, Value};
+use cljrs_value::{CljxFuture, FutureState, Value};
 
 use crate::eval_async::spawn_future;
 
@@ -140,9 +140,10 @@ pub fn check_ready(val: &Value) -> Readiness {
                 f.get().mark_observed();
                 Readiness::GasExhausted
             }
-            FutureState::Cancelled => Readiness::Failed(Value::Str(cljrs_gc::GcPtr::new(
-                "future was cancelled".into(),
-            ))),
+            // Same catchable error the tree-walking `await` raises, so a
+            // `catch` around `(await f)` sees one shape whether or not the
+            // enclosing fn was async-JIT-compiled.
+            FutureState::Cancelled => Readiness::Failed(CljxFuture::cancelled_error()),
             FutureState::Running => Readiness::Pending,
         },
         Value::Promise(p) => match p.get().value.lock().unwrap().as_ref() {

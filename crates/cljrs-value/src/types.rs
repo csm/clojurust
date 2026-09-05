@@ -155,23 +155,6 @@ pub fn bump_protocol_generation() {
     PROTOCOL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Global multimethod generation, bumped whenever hierarchy dispatch could
-/// resolve differently.  A single generation intentionally covers every
-/// runtime: an unrelated mutation may cause an extra cache miss, but can
-/// never leave a stale method cached.
-static MULTIFN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Current multimethod-dispatch generation.
-pub fn multifn_generation() -> u64 {
-    MULTIFN_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Invalidate hierarchy method caches after a hierarchy, method table, or
-/// preference-table mutation.
-pub fn bump_multifn_generation() {
-    MULTIFN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-}
-
 impl cljrs_gc::Trace for Protocol {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
@@ -233,12 +216,14 @@ pub struct MultiFn {
     pub preference_vals: Mutex<HashMap<String, Value>>,
     /// normally ":default"
     pub default_dispatch: String,
+    method_generation: std::sync::atomic::AtomicU64,
     method_cache: Mutex<MultiFnMethodCache>,
 }
 
 #[derive(Debug, Default)]
 struct MultiFnMethodCache {
-    generation: u64,
+    hierarchy_generation: u64,
+    method_generation: u64,
     methods: HashMap<String, String>,
 }
 
@@ -252,27 +237,58 @@ impl MultiFn {
             prefers: Mutex::new(HashMap::new()),
             preference_vals: Mutex::new(HashMap::new()),
             default_dispatch,
+            method_generation: std::sync::atomic::AtomicU64::new(0),
             method_cache: Mutex::new(MultiFnMethodCache::default()),
         }
     }
 
-    /// Return a cached resolved method key when it belongs to `generation`.
-    /// Observing a new generation lazily discards every stale entry at once.
-    pub fn cached_method(&self, dispatch_key: &str, generation: u64) -> Option<String> {
+    /// Current generation of this multimethod's method and preference tables.
+    pub fn method_generation(&self) -> u64 {
+        self.method_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Invalidate this multimethod's cached inherited/default resolutions.
+    pub fn bump_method_generation(&self) {
+        self.method_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Return a cached resolved method key when both source generations match.
+    /// Observing either new generation lazily discards stale entries at once.
+    pub fn cached_method(
+        &self,
+        dispatch_key: &str,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) -> Option<String> {
         let mut cache = self.method_cache.lock().unwrap();
-        if cache.generation != generation {
-            cache.generation = generation;
+        if cache.hierarchy_generation != hierarchy_generation
+            || cache.method_generation != method_generation
+        {
+            cache.hierarchy_generation = hierarchy_generation;
+            cache.method_generation = method_generation;
             cache.methods.clear();
         }
         cache.methods.get(dispatch_key).cloned()
     }
 
-    /// Cache `dispatch_key -> method_key` for a generation already validated
-    /// by the caller.
-    pub fn cache_method(&self, dispatch_key: String, method_key: String, generation: u64) {
+    /// Cache `dispatch_key -> method_key` under the source generations used to
+    /// resolve it. A concurrent mutation makes the entry stale, so the next
+    /// lookup discards it; the write itself never needs to be suppressed.
+    pub fn cache_method(
+        &self,
+        dispatch_key: String,
+        method_key: String,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) {
         let mut cache = self.method_cache.lock().unwrap();
-        if cache.generation != generation {
-            cache.generation = generation;
+        if cache.hierarchy_generation != hierarchy_generation
+            || cache.method_generation != method_generation
+        {
+            cache.hierarchy_generation = hierarchy_generation;
+            cache.method_generation = method_generation;
             cache.methods.clear();
         }
         cache.methods.insert(dispatch_key, method_key);
@@ -346,6 +362,7 @@ pub struct Var {
     /// Metadata map (e.g. `{:dynamic true}`).
     pub meta: Mutex<Option<Value>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
+    binding_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Var {
@@ -358,6 +375,7 @@ impl Var {
             is_macro: false,
             meta: Mutex::new(None),
             watches: Mutex::new(Vec::new()),
+            binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -386,6 +404,7 @@ impl Var {
             is_macro,
             meta: Mutex::new(None),
             watches: Mutex::new(Vec::new()),
+            binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -395,6 +414,13 @@ impl Var {
 
     pub fn deref(&self) -> Option<Value> {
         self.value.lock().unwrap().clone()
+    }
+
+    /// Generation of the isolate-local root binding, incremented after each
+    /// completed [`Var::bind`].
+    pub fn binding_generation(&self) -> u64 {
+        self.binding_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Read the cross-isolate root by demoting the shared cell, ignoring the
@@ -442,11 +468,10 @@ impl Var {
         // path (and the JIT) never touch the shared cell.
         let shared = crate::shared::promote(&v).ok();
         self.shared_root.store(Arc::new(shared));
+        self.binding_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
-        }
-        if self.namespace.as_ref() == "clojure.core" && self.name.as_ref() == "global-hierarchy" {
-            bump_multifn_generation();
         }
     }
 
@@ -1222,6 +1247,9 @@ pub enum FutureState {
     Cancelled,
 }
 
+/// The message carried by the error raised when reading a cancelled future.
+pub const FUTURE_CANCELLED_MSG: &str = "future was cancelled";
+
 /// A future value computed asynchronously on another thread.
 pub struct CljxFuture {
     pub state: Mutex<FutureState>,
@@ -1249,6 +1277,36 @@ impl CljxFuture {
     /// True if explicitly cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(&*self.state.lock().unwrap(), FutureState::Cancelled)
+    }
+
+    /// Mark a still-running future cancelled, waking anyone waiting on it.
+    ///
+    /// Returns false when it had already settled. The task itself is not
+    /// interrupted; what is cancelled is the result.
+    pub fn cancel(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(&*state, FutureState::Running) {
+            *state = FutureState::Cancelled;
+            self.cond.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The catchable value every reader of a cancelled future raises.
+    ///
+    /// One shape for every path — the sync tree-walker's `await`/`deref`, the
+    /// async tree-walker, and the compiled state machine all hand user code
+    /// the same `ex-info`-like error, so a `catch` behaves the same whether or
+    /// not the enclosing fn happened to be async-JIT-compiled.
+    pub fn cancelled_error() -> Value {
+        Value::Error(GcPtr::new(crate::ExceptionInfo::new(
+            crate::ValueError::Other(FUTURE_CANCELLED_MSG.to_string()),
+            FUTURE_CANCELLED_MSG.to_string(),
+            None,
+            None,
+        )))
     }
 
     /// Mark this future's result as observed. Call when a consumer reads the

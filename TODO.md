@@ -112,7 +112,7 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [ ] `derive` / full `isa?` hierarchy
 - [x] `defrecord` — backed by `TypeInstance` (type_tag + MapValue fields); generates `->Name` and `map->Name` constructors; supports inline protocol impls
 - [x] `reify` — creates a unique-tagged `TypeInstance`; supports inline protocol impls
-- [ ] `deftype` — blocked by `.` interop (field access via `(.field obj)` not yet implemented; Phase 9); mutable fields require `set!`-on-field semantic that needs interop dot special form; low priority until Phase 9
+- [x] `deftype` — positional `->Name` constructor, inline protocol impls with fields in scope, `.-field` access, and mutable fields (`^:unsynchronized-mutable` / `^:volatile-mutable`) written with `set!` (bare-symbol form inside a method and `(set! (.-field inst) v)` outside); no `map->Name` constructor, matching Clojure. Host-class method calls on an instance still await `.` interop (Phase 9)
 
 ---
 

@@ -27,8 +27,8 @@ src/
              live-in values (loop φs + pre-loop defs) arriving as parameters
   lower/
     mod.rs      — re-exports: lower_fn_body, lower_fn_body_destructured,
-                  lower_fn_body_shadowed, CoreShadows, analyze, inline,
-                  optimize, EscapeContext …
+                  lower_fn_body_shadowed, lower_fn_body_shadowed_kwargs,
+                  CoreShadows, analyze, inline, optimize, EscapeContext …
     async_lower.rs — async state-machine lowering (Phase H): rewrites an
                   `^:async` IrFunction into a non-async poll function
                   (is_async_poll_fn) whose control flow is an explicit resumable
@@ -159,6 +159,14 @@ form.  Interpreter-only special forms with no IR equivalent (`defprotocol`,
 them as generic calls would resolve their clojure.core stub vars, which
 return nil and silently corrupt the promoted function.
 
+`set!` lowers to `SetBang` only for a global var target.  A `deftype` mutable
+field write — `(set! (.-field inst) v)`, or the bare `(set! field v)` inside a
+method body, where the field is bound as a `let*` local — is likewise
+**rejected**, because the `LoadVar`/`SetBang` pair would target a global var
+of that name rather than the instance's interior-mutable cell: the write would
+be lost and a stray var defined.  The method tree-walks instead, where
+`eval_set_bang` updates the cell.
+
 `Const`, `LoadLocal`, `LoadGlobal`, `LoadVar`, `AllocVector`, `AllocMap`,
 `AllocSet`, `AllocList`, `AllocCons`, `AllocClosure`, `CallKnown`, `Call`,
 `CallDirect`, `Deref`, `DefVar`, `SetBang`, `Throw`, `Phi`, `Recur`,
@@ -206,6 +214,36 @@ sequential-destructuring nth (`(nth coll idx nil)`) emitted by the lowerer
 for `[a b c]` patterns — a short collection binds the missing positions to
 `nil` rather than throwing.  Both compile to the `rt_nth` bridge (already
 nil-on-OOB); the IR interpreter appends the nil default for `NthLenient`.
+
+`KwargsMap` is the other lowering-only variant, and like `NthLenient` it is
+absent from `known.rs` so no user call site can reach it.  Both lowerers emit
+it for a *map-shaped* rest pattern (`[& {:keys [a b]}]`), which does not
+destructure the rest seq at all: the trailing arguments are first normalized
+into the map Clojure's keyword-argument convention describes, and the pattern
+is applied to that.  It compiles to the `rt_kwargs_map` bridge; the IR
+interpreter and the tree-walker call the same `Value::from_kwargs_rest`, which
+is the single definition of the convention (a lone argument passes through
+verbatim, so `(f {:a 1})` keeps the caller's map and `(f)` binds `nil`; a
+trailing map merges over the pairs before it and wins on a clash; a dangling
+key raises).  Three copies of that rule disagreeing was issue #368.
+
+Because the lone-argument case hands back an element of its input,
+`KwargsMap` joins the element extractors that block deep region co-promotion
+in `regionalize.rs` — its result can alias the rest seq's storage.
+
+### `:or` destructuring defaults are eager
+
+`destructure` expands a symbol carrying an `:or` entry to `(get m :k default)`,
+and `get` is an ordinary function: its third argument is evaluated whether or
+not the key is present.  `lower_with_default` therefore lowers the default into
+the *current* block — straight-line and unconditional — and uses the `IsNil`
+check only to select between the default and the looked-up value (an `IsNil`
+branch over two empty arms, joined by a `Phi`).  Lowering the default into the
+branch's `then` arm instead would fire a side-effecting or throwing default only
+on a miss, diverging from the tree-walker (`cljrs-runtime`'s
+`interp/destructure.rs`) — and, because a function tiers up partway through a
+run, changing a program's behaviour mid-execution.  See issue #363; both tiers
+are pinned by `cljrs-runtime/tests/destructure_or_default_eager.rs`.
 
 Some `KnownFn` variants exist purely for analysis precision — the
 codegen and IR interpreter dispatch them through the dynamic builtin
@@ -277,6 +315,21 @@ pub fn lower_fn_body_shadowed(
     ns: &str,
     params: &[Arc<str>],
     destructures: &[(usize, Form)],
+    body: &[Form],
+    is_async: bool,
+    shadows: &CoreShadows,
+) -> Result<IrFunction, LowerError>;
+
+/// As above, plus the index of a rest parameter whose pattern is map-shaped.
+/// That slot gets a `KnownFn::KwargsMap` call in front of its destructuring
+/// prologue, so the pattern is applied to the normalized map rather than to
+/// the raw rest seq (issue #368).
+pub fn lower_fn_body_shadowed_kwargs(
+    name: Option<&str>,
+    ns: &str,
+    params: &[Arc<str>],
+    destructures: &[(usize, Form)],
+    kwargs_rest_index: Option<usize>,
     body: &[Form],
     is_async: bool,
     shadows: &CoreShadows,

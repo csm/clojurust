@@ -76,6 +76,7 @@ src/
     time.rs             — clock and duration builtins
     bootstrap.cljrs     — Clojure source evaluated into clojure.core at startup
     clojure_test.cljrs  — embedded clojure.test source
+    experimental.cljrs  — embedded cljrs.core.experimental source (the future macro)
 
   interp/
     mod.rs              — module declarations
@@ -113,6 +114,13 @@ tests/
   core_shadows.rs                  — core_shadowed_names: what a namespace binds
                                      instead of clojure.core (issue #337)
   declare_macro.rs, doc.rs, gas_meter.rs, into_seq_target.rs, map_entry.rs,
+  defrecord_method_fields.rs       — defrecord fields in scope in an inline
+                                     protocol method body; params shadow them
+  deftype_types.rs                 — deftype: positional ctor, `.-field`, protocol
+                                     impls, and mutable fields written with `set!`
+  qualified_protocol_impl.rs       — a qualified protocol name in an impl position
+                                     (defrecord/deftype/reify/extend-*) resolves
+                                     through its own namespace
   named_fn_identity.rs, ns_metadata.rs, partition_arities.rs, shared_atom.rs,
   symbolic_nan.rs, threading_macros.rs, auto_gensym.rs, auto_keyword_macro.rs,
   assoc_in_metadata.rs, empty_metadata.rs, into_metadata.rs, vec_metadata.rs,
@@ -120,6 +128,14 @@ tests/
   auto_resolution_properties.rs   — tree-walker behavior
   gas_meter_ir.rs, versioned_ir.rs, partition_ir.rs, destructure_lowering.rs,
   osr_transfer.rs, region_phi_uaf.rs — tiered behavior
+  deftype_mutable_tiered.rs        — deftype mutable-field writes under forced
+                                     eager IR lowering: the lowerer must decline
+                                     a `set!` on a local (own binary — it flips
+                                     the process-wide eager-lowering switch)
+  destructure_or_default_eager.rs  — `:or` destructuring defaults are evaluated
+                                     eagerly (`(get m :k default)`), identically
+                                     in the tree-walker and the IR tier (own
+                                     binary — forced eager lowering; issue #363)
 ```
 
 ---
@@ -171,7 +187,8 @@ pub fn build(self) -> Result<Runtime, BuildError>;
 ```
 
 `build` registers native `clojure.core`, evaluates `bootstrap.cljrs`, sets up
-the `user` namespace, applies GC and source-path configuration, and finally
+the `user` namespace, registers and evaluates `cljrs.core.experimental` (not
+referred into `user`), applies GC and source-path configuration, and finally
 raises the tier state — the bootstrap itself always tree-walks, because nothing
 can be lowered before `clojure.core` exists. `BuildError::EmbeddedSource` is
 returned when an embedded source fails to *parse* (the binary's own text is
@@ -534,19 +551,23 @@ Phase 10.6 inline caches:
 
 Multimethod dispatch tries the exact `pr_str(dispatch-val)` key first, then the
 generation-tagged method cache, the ad-hoc hierarchy, and finally `:default`.
-`derive`/`underive`, `defmethod`, `remove-method`, and `prefer-method` bump the
-generation so cached inherited and default resolutions cannot survive a
-relevant mutation. Hierarchy dispatch uses:
+The cache is tagged with the root-binding generation of
+`clojure.core/global-hierarchy` plus the target `MultiFn`'s own method-table
+generation. `Var::bind` advances the former after `derive`/`underive` replace
+the hierarchy root; `defmethod`, `remove-method`, and `prefer-method` advance
+the latter. Mutations in unrelated runtimes or multimethods therefore do not
+invalidate this cache.
 
-- `isa_in_global_hierarchy(child, parent, env) -> bool` — `(isa? child parent)`
-  against `clojure.core/global-hierarchy` (defined in `bootstrap.cljrs`),
-  including element-wise vector matching; falls back to `child == parent` when
-  the var is absent. A cache miss snapshots its ancestor table once for the
-  complete candidate scan, including recursive vector comparisons.
+On a miss, `global_hierarchy_snapshot` reads the hierarchy root and generation
+once. `hierarchy_method_key` shares its ancestor table across the complete
+candidate scan and recursive vector comparisons; `isa_with_ancestors` is the
+non-public comparison helper. The native dispatch seam deliberately reads the
+Var root, while the Clojure `isa?` function uses normal symbol resolution.
+`global-hierarchy` is private and non-dynamic, so both observe the same value.
 
-When several registered dispatch values match and none dominates the others —
-by `prefer-method` or by being a descendant of them — dispatch errors with
-`Multiple methods in multimethod ...`, as on the JVM.
+Inherited preferences and hierarchy specificity remove dominated candidates.
+If several maximal candidates remain, dispatch reports only that sorted
+conflicting frontier in a `Multiple methods in multimethod ...` error.
 
 ### `callback` submodule
 
@@ -572,6 +593,18 @@ The `clojure.core`-equivalent runtime implemented in Rust, registered into a
 name → fn dispatch table by `builtins::register_all(&globals, ns)`.
 `BOOTSTRAP_SOURCE` (`bootstrap.cljrs`) and `CLOJURE_TEST_SOURCE`
 (`clojure_test.cljrs`) are the embedded Clojure sources evaluated on top of it.
+
+```rust
+pub const EXPERIMENTAL_NS: &str;                                  // "cljrs.core.experimental"
+pub const EXPERIMENTAL_SOURCE: &str;                              // experimental.cljrs
+pub fn register_experimental(globals: &Arc<GlobalEnv>, ns: &str); // the future family
+```
+
+`register_experimental` interns the future family (`future-call`, `future?`,
+`future-done?`, `future-cancelled?`, `future-cancel`) into `EXPERIMENTAL_NS`
+rather than `clojure.core`; `EXPERIMENTAL_SOURCE` adds the `future` macro over
+them. See [`cljrs.core.experimental/future`](#cljrscoreexperimentalfuture--cooperative-not-parallel)
+for why they are not in `clojure.core`.
 
 ### Map entries
 
@@ -739,9 +772,11 @@ on it is pure data manipulation. The 3-arity forms are pure functions of that
 value; the 2-arity forms read and `alter-var-root`
 `clojure.core/global-hierarchy`. `make-hierarchy` stays native
 (`builtin_make_hierarchy`). Multimethod dispatch consults the same var — see
-`env::apply::isa_in_global_hierarchy`. The hierarchy value and its private
-helper functions carry `:private true`, so automatic core refers do not expose
-them in application namespaces.
+`env::apply::global_hierarchy_snapshot`. Every `Var::bind` advances that Var's
+root-binding generation, which makes `derive`/`underive` cache invalidation an
+ordinary consequence of replacing the hierarchy root. The hierarchy value and
+its private helper functions carry `:private true`, so core refers do not
+expose them in application namespaces.
 
 ### Host clock (`time.rs`)
 
@@ -766,6 +801,65 @@ the async tree-walker). It converts the form *value* back into a `Form`
 (`interp::macros::value_to_form`) and evaluates it in a fresh top-level
 environment of the current namespace, so it sees vars but not the caller's
 locals.
+
+### `cljrs.core.experimental/future` — cooperative, not parallel
+
+**`clojure.core/future` is deliberately undefined**, along with `future-call`,
+`future?`, `future-done?`, `future-cancelled?` and `future-cancel`. A one-thread
+-per-isolate runtime cannot honour that namespace's contract (see below), and
+`clojure.core` is where callers are entitled to assume it holds. Feature probes
+such as the standard test suite's `(when-var-exists future …)` therefore keep
+seeing nothing there, and skip, as they do on any runtime without futures.
+
+The cooperative stand-in lives in `cljrs.core.experimental`, for integrators who
+want it within its real limits:
+
+```clojure
+(require '[cljrs.core.experimental :as x])
+(defn ^:async fetch-both [] [(await (x/future (load-a))) (await (x/future (load-b)))])
+```
+
+That namespace is registered by `Runtime::build` (natives via
+`builtins::register_experimental`, the `future` macro from
+`builtins/experimental.cljrs`) and is *not* referred into `user`: an explicit
+`require` is the only way in. `(x/future body…)` expands to
+`(cljrs.core.experimental/future-call (fn [] body…))`, which hands the thunk to
+the installed async runtime's executor and returns a `Value::Future`
+immediately. `realized?` stays in `clojure.core` and answers for futures.
+
+**How this differs from the JVM, and why.** Every Clojure value is `!Send` —
+`GcPtr` cannot cross a thread, which is what makes per-isolate heaps collectable
+without cross-thread coordination. A future therefore cannot run on another OS
+thread; it is a task on the *caller's* executor. Consequences:
+
+- The body does not start until the caller yields. `(let [f (x/future (f!))] …)`
+  runs nothing until something awaits.
+- **Read a future with `(await f)`, never `@f`.** `deref` blocks the one thread
+  the task needs in order to finish, so it hangs. This is the same rule Phase C
+  already enforces inside `^:async` bodies, where `@future` is a runtime error;
+  in sync code it is a hang. `(await f)` has the same shape outside an `^:async`
+  fn: it works at a top-level form (the CLI drives those through the async
+  tree-walker) and hangs from inside an ordinary `defn`. This is the sharp edge
+  that keeps the family out of `clojure.core`.
+- `future-cancel` marks the result cancelled (awaiting it raises) but does not
+  interrupt a task already running, like a JVM future past its interrupt point.
+  Cancellation is *sticky*: a task cancelled mid-body still runs to completion,
+  so its side effects happen, but its result is discarded — `future-cancelled?`
+  never un-becomes true and `await` keeps raising. Every reader of a cancelled
+  future (sync `await`/`deref`, the async tree-walker, the compiled state
+  machine) raises the same catchable error, message `future was cancelled`.
+- **Dynamic bindings are not conveyed.** `binding` is a thread-local stack with
+  an RAII guard, and `future-call` builds a fresh `Env` for the task, so
+  `(binding [*foo* 1] (x/future *foo*))` sees the *root* binding — unlike the JVM,
+  which conveys the caller's frame. The converse also holds: because the stack
+  is per-thread and tasks share the thread, a task polled while another task
+  holds a binding frame across a yield can observe that frame. This is a
+  property of the async substrate rather than of `future` itself, but `future`
+  is what makes it reachable from ordinary code; bind inside the body if the
+  task needs a binding.
+
+Genuine parallelism across threads is the isolate boundary
+(`cljrs-async`'s `Isolate` + `isolate-chan`), where values cross by copy.
 
 ## Module `interp`
 
@@ -875,6 +969,23 @@ Each handler evaluates its key expressions under the correct allocation context:
 | `handle_alter_var_root` | function return value |
 | `handle_intern` | value expression (3-arg form) |
 
+### Parameter binding: `bind_fn_params` vs `bind_fn_params_positional`
+
+```rust
+pub fn bind_fn_params(arity: &CljxFnArity, args: &[Value], env: &mut Env) -> EvalResult<()>;
+pub fn bind_fn_params_positional(arity: &CljxFnArity, args: &[Value], env: &mut Env) -> EvalResult<()>;
+```
+
+Both bind an arity's positional params and its rest list into the current frame.
+`bind_fn_params` additionally expands the arity's destructuring patterns, and is
+what the tree-walker (and `cljrs-async`) calls.  `bind_fn_params_positional`
+stops short of that, and is what `tiered::apply::execute_ir` calls: the lowered
+prologue already binds the destructured names as IR registers, and the ANF
+lowerer never emits `LoadLocal`, so the env copy is never read.  Producing it
+anyway would evaluate each `:or` default twice per call — destructuring defaults
+are eager, so a side-effecting one would fire once here and once in the prologue
+(issue #363).
+
 ### Value-level special form helpers (IR interpreter API)
 
 The IR interpreter receives already-evaluated `Vec<Value>` arguments rather than
@@ -895,7 +1006,7 @@ implement sentinel operations without hitting the stub errors registered in
 | `eval_eval(args, env)` | `eval` — convert a form value back to a `Form` and evaluate it at top level of the current namespace (vars visible, caller's locals not) |
 | `eval_with_bindings_star(args, env)` | `with-bindings*` — push binding frame, call f |
 | `eval_send_to_agent(args, env)` | `send` / `send-off` — dispatch action to agent |
-| `dispatch_method(method, target, args)` | `(.method target args…)` — interop method dispatch on an evaluated target (strings, vectors, seqs) |
+| `dispatch_method(method, target, args)` | `(.method target args…)` — interop method dispatch on an evaluated target (strings, vectors, seqs); on a `TypeInstance` only `.-field` reads are supported (mutable cell first, then the field map) |
 
 `make_lazy_seq_from_fn(f, globals, ns)` (already public) creates a `LazySeq`
 from a zero-arg callable; the above `make_delay_from_fn` is the analogous
@@ -911,6 +1022,20 @@ the return value in `:post` conditions); `spec_element` resolves a reader
 conditional in ANY slot of an `ns` require spec, namespace included, so
 `[#?(:clj clojure.core :cljs cljs.core) :as core]` reads — an option selecting
 no branch is dropped, a namespace selecting none is an error.
+
+`deftype` and `defrecord` share `parse_field_specs` (field name + mutability,
+metadata-transparent), `build_positional_ctor` (`->Name`, routed to the
+`make-type-instance-mut` builtin when the type declares mutable fields) and
+`intern_type_symbol` (so `(instance? Name x)` resolves); only `defrecord` also
+gets `build_map_ctor`. `synth_field_scope` wraps a method body in a `let*`
+binding each field a param does not shadow — a mutable field through
+`(.-field this)` (the live cell) and an immutable one through `(:field this)` —
+plus a hidden `__deftype_self__` handle when any field is mutable, which is how
+`eval_set_bang` finds the instance whose cell a bare `(set! field v)` updates.
+`resolve_protocol_sym` resolves a protocol named in an impl position
+(`extend-type`, `extend-protocol`, `reify`/`defrecord`/`deftype`) through the
+current ns's `:require :as` aliases and through its own namespace when
+qualified — not as a literal intern of the current ns.
 
 ---
 

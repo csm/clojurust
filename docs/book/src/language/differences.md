@@ -39,8 +39,18 @@ implemented.
 
 ## `deftype`
 
-`deftype` is not implemented. Use `defrecord` (which is fully supported) or
-`reify` for most cases.
+`deftype` is implemented: a positional `->Name` constructor, inline
+protocol/interface method bodies with the fields in scope, `.-field` access,
+and mutable fields (`^:unsynchronized-mutable` / `^:volatile-mutable`) written
+with `set!` — both `(set! field v)` inside a method and
+`(set! (.-field inst) v)` from outside.
+
+Instances are single-threaded here, so `^:volatile-mutable` and
+`^:unsynchronized-mutable` behave identically. Unlike `defrecord`, `deftype`
+generates no `map->Name` constructor and no map behaviour on the instance —
+that matches Clojure. Host-class method calls (`(.someMethod inst)`) on an
+instance are not supported; protocol methods are called as
+`(proto-fn inst)`.
 
 ## Metadata on collections
 

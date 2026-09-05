@@ -207,7 +207,7 @@ impl std::fmt::Debug for GlobalEnv {
 }
 
 impl GlobalEnv {
-    fn var_is_private(var: &Var) -> bool {
+    pub(crate) fn var_is_private(var: &Var) -> bool {
         matches!(
             var.get_meta(),
             Some(Value::Map(meta))
@@ -667,6 +667,11 @@ impl GlobalEnv {
         let mut dst_refers = dst.get().refers.lock().unwrap();
         for name in names {
             if let Some(var) = src_interns.get(name) {
+                // Private vars are never referable, whether selected by
+                // `:refer :all` or named explicitly with `:refer [name]`.
+                if Self::var_is_private(var.get()) {
+                    continue;
+                }
                 // Use insert (not or_insert_with) so that an explicit
                 // `require :refer [name]` always overrides a previous refer
                 // (e.g. one inherited from clojure.core via refer-all).

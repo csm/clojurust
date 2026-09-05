@@ -75,3 +75,47 @@ fn defn_self_ref_identity() {
     let result = eval_in("(= self-ref (self-ref))", &mut env);
     assert_eq!(result, Value::Bool(true));
 }
+
+// ── A param shadows the function's own name (PR #353) ────────────────────────
+//
+// The self-reference and the params bind into the SAME frame, and the
+// self-reference used to be bound last — so it overwrote a param that shared
+// the function's name. `(defn text [text] {:text text})` returned the function
+// as its own `:text`. Binding the self-reference first lets the param shadow
+// it, as Clojure does, while the name stays visible in a body that does not
+// shadow it (the tests above).
+
+#[test]
+fn param_shadows_the_fns_own_name() {
+    let (_, mut env) = make_env();
+    eval_in("(defn text [text] {:text text})", &mut env);
+    let result = eval_in(r#"(= "hi" (:text (text "hi")))"#, &mut env);
+    assert_eq!(
+        result,
+        Value::Bool(true),
+        "the param, not the fn itself, should be the :text"
+    );
+}
+
+#[test]
+fn param_shadows_the_fns_own_name_in_a_named_anon_fn() {
+    let result = eval_str("(let [f (fn g [g] g)] (= 7 (f 7)))");
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn param_shadows_the_fns_own_name_in_a_rest_param() {
+    let (_, mut env) = make_env();
+    eval_in("(defn xs [& xs] xs)", &mut env);
+    let result = eval_in("(= '(1 2) (xs 1 2))", &mut env);
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn param_shadows_the_fns_own_name_in_one_arity_only() {
+    // Arity 1 shadows the name; arity 0 does not and must still see the fn.
+    let (_, mut env) = make_env();
+    eval_in("(defn f ([] f) ([f] f))", &mut env);
+    assert_eq!(eval_in("(= f (f))", &mut env), Value::Bool(true));
+    assert_eq!(eval_in("(= 3 (f 3))", &mut env), Value::Bool(true));
+}
