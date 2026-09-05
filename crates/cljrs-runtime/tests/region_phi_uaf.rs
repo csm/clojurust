@@ -3,11 +3,9 @@
 //! ## What this test documents
 //!
 //! `RegionStart` / `RegionAlloc` / `RegionEnd` instructions in the IR
-//! interpreter implement a region whose lifetime is exactly one basic
-//! block — `RegionStart` at the head, `RegionEnd` immediately before the
-//! terminator.  Any `GcPtr` allocated through that region is invalid the
-//! moment the producing block hands off control, because the `Drop` impl
-//! on the popped `RegionEntry` releases the chunk.
+//! interpreter give every allocation an explicit lifetime ending at its
+//! matching `RegionEnd`. Any register holding a direct result from that
+//! region is invalid after the region closes.
 //!
 //! The optimizer pass (`cljrs.compiler.optimize`) used to produce IR that
 //! violated this constraint — it would wrap any non-escaping allocation in
@@ -19,13 +17,10 @@
 //! whenever any transitive use lives in a different block from the
 //! definition, so the optimizer never produces this shape from real code.
 //!
-//! This Rust test bypasses the optimizer and hand-builds the dangerous
-//! shape directly.  The fix at the optimizer level does not — and cannot —
-//! help here: the IR interpreter still cannot safely execute IR with
-//! cross-block region scoping, and this test exists to (a) make that
-//! constraint explicit and (b) trip whoever later teaches the interpreter
-//! to merge / extend regions across control flow.  When that happens, flip
-//! the assertion to expect `Ok(Value::Long(1))`.
+//! This Rust test bypasses the optimizer and hand-builds the dangerous shape
+//! directly. The interpreter must reject the expired register before touching
+//! its freed allocation. This keeps the diagnostic deterministic across host
+//! allocators and prevents the test itself from performing an undefined read.
 //!
 //! ## The hand-rolled IR
 //!
@@ -52,10 +47,8 @@
 //!     return %7
 //! ```
 //!
-//! In `debug_assertions` builds the panic comes from `GcPtr::get()`'s
-//! magic-word check; in release builds the same defective IR may segfault,
-//! return a stale value, or appear to succeed — none of which is a clean
-//! `should_panic` signal.  The test is therefore gated to debug builds.
+//! The assertion is independent of GC mode and build profile: register
+//! invalidation happens before the region's backing memory is released.
 
 use std::sync::Arc;
 
@@ -146,30 +139,10 @@ fn build_phi_over_regions_ir() -> IrFunction {
 }
 
 /// Run the synthetic IR with `cond=true`, which steers control through
-/// block 1 and triggers the use-after-free on the `[42]` vector.
-///
-/// The expected behaviour, *if the bug were fixed*, is `Ok(Value::Long(1))`
-/// — a one-element vector has count 1.  Today the call panics inside
-/// `GcPtr::get()`'s magic-word assertion (debug builds) or returns
-/// garbage / segfaults (release).
-///
-/// Gated to `debug_assertions` because the panic message we match on is
-/// emitted only by the `GcPtr::get()` magic-word check, which is compiled
-/// out in release builds.  In release the same defective IR may segfault,
-/// return a stale value, or appear to succeed — none of which is a clean
-/// `should_panic` signal.
-///
-/// Gated off `no-gc` for the same reason one level down: the magic-word
-/// poison lives in the GC build's `GcPtr::get()`, and the `no-gc` region
-/// allocator has no equivalent.  The identical defective IR reads the freed
-/// slot there and returns garbage (an address observed as a `Long`) instead
-/// of panicking, so `should_panic` cannot express the constraint under that
-/// feature.  The constraint itself still holds in both builds; only the
-/// detection differs.  That `no-gc` has no use-after-free poison at all is a
-/// real gap, tracked in TODO.md rather than papered over here.
-#[cfg(all(debug_assertions, not(feature = "no-gc")))]
+/// block 1 and verifies that the expired register is rejected before the
+/// `[42]` vector can be read.
 #[test]
-#[should_panic(expected = "GcPtr::get() on freed object")]
+#[should_panic(expected = "outlived region")]
 fn region_phi_uaf_reproduces_under_interpreter() {
     let _mutator = cljrs_gc::register_mutator();
 

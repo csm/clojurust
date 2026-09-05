@@ -37,25 +37,42 @@ use crate::tiered::jit_state::{OsrPoll, OsrSlot};
 /// invalidating the stored raw pointer.
 struct Registers {
     values: Box<[Option<Value>]>,
+    /// Region handle that invalidated a register, when applicable.  Keeping
+    /// this state separate from `values` lets malformed IR fail before it can
+    /// dereference a pointer whose region has already been released.
+    expired_in: Box<[Option<VarId>]>,
 }
 
 impl Registers {
     fn new(capacity: u32) -> Self {
         Self {
             values: vec![None; capacity as usize].into_boxed_slice(),
+            expired_in: vec![None; capacity as usize].into_boxed_slice(),
         }
     }
 
     fn get(&self, id: VarId) -> &Value {
-        self.values[id.0 as usize]
-            .as_ref()
-            .unwrap_or_else(|| panic!("IR interpreter: uninitialized register {id}"))
+        let index = id.0 as usize;
+        self.values[index].as_ref().unwrap_or_else(|| {
+            if let Some(region) = self.expired_in[index] {
+                panic!("IR interpreter: register {id} outlived region {region}");
+            }
+            panic!("IR interpreter: uninitialized register {id}");
+        })
     }
 
     fn set(&mut self, id: VarId, val: Value) {
         // Bounds check: VarIds are allocated sequentially up to ir_func.next_var,
         // so any out-of-range access indicates malformed IR.
-        self.values[id.0 as usize] = Some(val);
+        let index = id.0 as usize;
+        self.values[index] = Some(val);
+        self.expired_in[index] = None;
+    }
+
+    fn expire(&mut self, id: VarId, region: VarId) {
+        let index = id.0 as usize;
+        self.values[index] = None;
+        self.expired_in[index] = Some(region);
     }
 
     fn get_cloned(&self, id: VarId) -> Value {
@@ -67,6 +84,8 @@ impl Registers {
 
 /// A region entry in the interpreter's local region stack.
 struct RegionEntry {
+    handle: VarId,
+    allocations: Vec<VarId>,
     /// `Some` until closed; taken by `Drop`.  The region is also pushed onto
     /// the cljrs_gc thread-local REGION_STACK via `push_region_raw`.
     region: Option<Box<cljrs_gc::region::Region>>,
@@ -114,6 +133,31 @@ impl RegionFrame {
             .rev()
             .find(|(v, _)| *v == var)
             .map(|&(_, r)| r)
+    }
+
+    fn record_allocation(&mut self, region: VarId, dst: VarId) {
+        if let Some(entry) = self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.handle == region)
+        {
+            entry.allocations.push(dst);
+        }
+    }
+
+    fn close(&mut self, region: VarId) -> RegionEntry {
+        let entry = self
+            .stack
+            .pop()
+            .unwrap_or_else(|| panic!("IR interpreter: RegionEnd for unopened region {region}"));
+        assert_eq!(
+            entry.handle, region,
+            "IR interpreter: RegionEnd closed {region} while {} was active",
+            entry.handle
+        );
+        self.handles.retain(|(handle, _)| *handle != region);
+        entry
     }
 }
 
@@ -622,6 +666,8 @@ fn execute_inst(
             let region_ptr: *mut cljrs_gc::region::Region = &mut *region;
             unsafe { cljrs_gc::region::push_region_raw(region_ptr) };
             regions.stack.push(RegionEntry {
+                handle: *dst,
+                allocations: Vec::new(),
                 region: Some(region),
             });
             regions.bind(*dst, region_ptr);
@@ -630,12 +676,19 @@ fn execute_inst(
 
         Inst::RegionAlloc(dst, region, kind, operands) => {
             let val = alloc_in_region(*kind, operands, regs, regions.lookup(*region))?;
+            regions.record_allocation(*region, *dst);
             regs.set(*dst, val);
         }
 
-        Inst::RegionEnd(_region) => {
-            // Pop and drop the region entry (Drop impl handles cleanup).
-            regions.stack.pop();
+        Inst::RegionEnd(region) => {
+            // Invalidate direct results before dropping the backing region.
+            // This makes malformed IR fail deterministically at the next use
+            // instead of relying on allocator-specific freed-memory contents.
+            let entry = regions.close(*region);
+            for &allocation in &entry.allocations {
+                regs.expire(allocation, *region);
+            }
+            drop(entry);
         }
 
         Inst::RegionParam(dst) => {
@@ -673,6 +726,7 @@ fn execute_inst(
                 None,
                 regions.lookup(*region),
             )?;
+            regions.record_allocation(*region, *dst);
             regs.set(*dst, result);
         }
 
