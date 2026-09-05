@@ -211,8 +211,20 @@ pub struct MultiFn {
     pub dispatch_vals: Mutex<HashMap<String, Value>>,
     /// recorded preferences: pr_str(preferred) → pr_str(over)
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    /// pr_str(preference dispatch value) → original value, including values
+    /// which do not currently have a method.
+    pub preference_vals: Mutex<HashMap<String, Value>>,
     /// normally ":default"
     pub default_dispatch: String,
+    method_generation: std::sync::atomic::AtomicU64,
+    method_cache: Mutex<MultiFnMethodCache>,
+}
+
+#[derive(Debug, Default)]
+struct MultiFnMethodCache {
+    hierarchy_generation: u64,
+    method_generation: u64,
+    methods: HashMap<String, String>,
 }
 
 impl MultiFn {
@@ -223,8 +235,68 @@ impl MultiFn {
             methods: Mutex::new(HashMap::new()),
             dispatch_vals: Mutex::new(HashMap::new()),
             prefers: Mutex::new(HashMap::new()),
+            preference_vals: Mutex::new(HashMap::new()),
             default_dispatch,
+            method_generation: std::sync::atomic::AtomicU64::new(0),
+            method_cache: Mutex::new(MultiFnMethodCache::default()),
         }
+    }
+
+    /// Current generation of this multimethod's method and preference tables.
+    pub fn method_generation(&self) -> u64 {
+        self.method_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Invalidate this multimethod's cached inherited/default resolutions.
+    pub fn bump_method_generation(&self) {
+        self.method_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Return a cached resolved method key when both source generations match.
+    /// Observing either new generation lazily discards stale entries at once.
+    pub fn cached_method(
+        &self,
+        dispatch_key: &str,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) -> Option<String> {
+        let mut cache = self.method_cache.lock().unwrap();
+        if cache.hierarchy_generation != hierarchy_generation
+            || cache.method_generation != method_generation
+        {
+            cache.hierarchy_generation = hierarchy_generation;
+            cache.method_generation = method_generation;
+            cache.methods.clear();
+        }
+        cache.methods.get(dispatch_key).cloned()
+    }
+
+    /// Cache `dispatch_key -> method_key` under the source generations used to
+    /// resolve it. A concurrent mutation makes the entry stale, so the next
+    /// lookup discards it; the write itself never needs to be suppressed.
+    pub fn cache_method(
+        &self,
+        dispatch_key: String,
+        method_key: String,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) {
+        let mut cache = self.method_cache.lock().unwrap();
+        if cache.hierarchy_generation != hierarchy_generation
+            || cache.method_generation != method_generation
+        {
+            cache.hierarchy_generation = hierarchy_generation;
+            cache.method_generation = method_generation;
+            cache.methods.clear();
+        }
+        cache.methods.insert(dispatch_key, method_key);
+    }
+
+    /// Number of entries in the current cache, exposed for regression tests.
+    pub fn cached_method_count(&self) -> usize {
+        self.method_cache.lock().unwrap().methods.len()
     }
 }
 
@@ -240,6 +312,12 @@ impl cljrs_gc::Trace for MultiFn {
         {
             let dispatch_vals = self.dispatch_vals.lock().unwrap();
             for v in dispatch_vals.values() {
+                v.trace(visitor);
+            }
+        }
+        {
+            let preference_vals = self.preference_vals.lock().unwrap();
+            for v in preference_vals.values() {
                 v.trace(visitor);
             }
         }
@@ -284,6 +362,7 @@ pub struct Var {
     /// Metadata map (e.g. `{:dynamic true}`).
     pub meta: Mutex<Option<Value>>,
     pub watches: Mutex<Vec<(Value, Value)>>,
+    binding_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Var {
@@ -296,6 +375,7 @@ impl Var {
             is_macro: false,
             meta: Mutex::new(None),
             watches: Mutex::new(Vec::new()),
+            binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -324,6 +404,7 @@ impl Var {
             is_macro,
             meta: Mutex::new(None),
             watches: Mutex::new(Vec::new()),
+            binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -333,6 +414,13 @@ impl Var {
 
     pub fn deref(&self) -> Option<Value> {
         self.value.lock().unwrap().clone()
+    }
+
+    /// Generation of the isolate-local root binding, incremented after each
+    /// completed [`Var::bind`].
+    pub fn binding_generation(&self) -> u64 {
+        self.binding_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Read the cross-isolate root by demoting the shared cell, ignoring the
@@ -380,6 +468,8 @@ impl Var {
         // path (and the JIT) never touch the shared cell.
         let shared = crate::shared::promote(&v).ok();
         self.shared_root.store(Arc::new(shared));
+        self.binding_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
         }

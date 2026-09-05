@@ -550,16 +550,24 @@ Phase 10.6 inline caches:
 - `dispatch_if_async(callee, args, env)` — spawn `^:async` callees on the async runtime
 
 Multimethod dispatch tries the exact `pr_str(dispatch-val)` key first, then the
-ad-hoc hierarchy, then `:default`. Hierarchy dispatch uses:
+generation-tagged method cache, the ad-hoc hierarchy, and finally `:default`.
+The cache is tagged with the root-binding generation of
+`clojure.core/global-hierarchy` plus the target `MultiFn`'s own method-table
+generation. `Var::bind` advances the former after `derive`/`underive` replace
+the hierarchy root; `defmethod`, `remove-method`, and `prefer-method` advance
+the latter. Mutations in unrelated runtimes or multimethods therefore do not
+invalidate this cache.
 
-- `isa_in_global_hierarchy(child, parent, env) -> bool` — `(isa? child parent)`
-  against `clojure.core/global-hierarchy` (defined in `bootstrap.cljrs`),
-  including element-wise vector matching; falls back to `child == parent` when
-  the var is absent
+On a miss, `global_hierarchy_snapshot` reads the hierarchy root and generation
+once. `hierarchy_method_key` shares its ancestor table across the complete
+candidate scan and recursive vector comparisons; `isa_with_ancestors` is the
+non-public comparison helper. The native dispatch seam deliberately reads the
+Var root, while the Clojure `isa?` function uses normal symbol resolution.
+`global-hierarchy` is private and non-dynamic, so both observe the same value.
 
-When several registered dispatch values match and none dominates the others —
-by `prefer-method` or by being a descendant of them — dispatch errors with
-`Multiple methods in multimethod ...`, as on the JVM.
+Inherited preferences and hierarchy specificity remove dominated candidates.
+If several maximal candidates remain, dispatch reports only that sorted
+conflicting frontier in a `Multiple methods in multimethod ...` error.
 
 ### `callback` submodule
 
@@ -764,7 +772,11 @@ on it is pure data manipulation. The 3-arity forms are pure functions of that
 value; the 2-arity forms read and `alter-var-root`
 `clojure.core/global-hierarchy`. `make-hierarchy` stays native
 (`builtin_make_hierarchy`). Multimethod dispatch consults the same var — see
-`env::apply::isa_in_global_hierarchy`.
+`env::apply::global_hierarchy_snapshot`. Every `Var::bind` advances that Var's
+root-binding generation, which makes `derive`/`underive` cache invalidation an
+ordinary consequence of replacing the hierarchy root. The hierarchy value and
+its private helper functions carry `:private true`, so core refers do not
+expose them in application namespaces.
 
 ### Host clock (`time.rs`)
 

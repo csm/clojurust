@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::builtins::form::{expand_pairs, expand_reader_conds, expand_reader_conds_cow};
 use crate::builtins::special::SPECIAL_FORMS;
-use crate::env::env::Env;
+use crate::env::env::{Env, GlobalEnv};
 use crate::env::error::{EvalError, EvalResult};
 use crate::interp::apply::eval_call;
 use crate::interp::special::eval_special;
@@ -279,6 +279,15 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
         } else {
             resolved
         };
+        if resolved.as_ref() != env.current_ns.as_ref()
+            && let Some(var) = env.globals.lookup_var(&resolved, &sym.name)
+            && GlobalEnv::var_is_private(var.get())
+        {
+            return Err(EvalError::Runtime(format!(
+                "var: {}/{} is not public",
+                resolved, sym.name
+            )));
+        }
         return env
             .globals
             .lookup_in_ns(&resolved, &sym.name)

@@ -271,11 +271,13 @@ A var's *root* binding uses the **same** cross-isolate mechanism as
 pub struct Var {
     pub value: Mutex<Option<Value>>,                          // isolate-local fast path
     pub shared_root: Arc<ArcSwap<Option<SharedValue>>>,       // cross-isolate mirror (B3)
+    binding_generation: AtomicU64,                            // local root revision
     // …namespace, name, is_macro, meta, watches
 }
 
 impl Var {
     pub fn deref(&self) -> Option<Value>          // reads the local fast path
+    pub fn binding_generation(&self) -> u64       // revision for dependent caches
     pub fn deref_shared(&self) -> Option<Value>   // demotes the shared cell
     pub fn bind(&self, v: Value)                  // promote-on-def: updates both slots
     pub fn from_shared_root(ns, name, is_macro, shared_root) -> Self  // receiver side
@@ -288,8 +290,10 @@ impl Var {
   regression).
 - **`bind` promotes-on-write.** `def` / `alter-var-root` / `set!` all funnel
   through `Var::bind`, which mirrors the new root into `shared_root` when it is
-  promotable, and clears it to `None` otherwise.  `def` is rare, so this
-  write-path cost is acceptable.
+  promotable, clears it to `None` otherwise, and then advances
+  `binding_generation`. Dependent caches can therefore track one Var without
+  process-global invalidation. `def` is rare, so this write-path cost is
+  acceptable.
 - **Crossing isolates.** `clone::serialize` passes the `shared_root` `Arc`
   through (both isolates share the same cell); the receiver rebuilds the var
   with `from_shared_root`, seeding its local slot from the demoted snapshot.
@@ -622,7 +626,31 @@ pub struct MultiFn {
     pub dispatch_vals: Mutex<HashMap<String, Value>>,
     /// pr_str(preferred) → pr_str(over), from `prefer-method`
     pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    /// pr_str(preference value) → original value, for `prefers`
+    pub preference_vals: Mutex<HashMap<String, Value>>,
     pub default_dispatch: String,  // normally ":default"
+    method_cache: Mutex<MultiFnMethodCache>, // generation-tagged resolved keys
+}
+
+impl MultiFn {
+    pub fn new(name: Arc<str>, dispatch_fn: Value, default_dispatch: String) -> Self;
+    pub fn method_generation(&self) -> u64;
+    pub fn bump_method_generation(&self);
+    pub fn cached_method(
+        &self,
+        dispatch_key: &str,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    ) -> Option<String>;
+    pub fn cache_method(
+        &self,
+        dispatch_key: String,
+        method_key: String,
+        hierarchy_generation: u64,
+        method_generation: u64,
+    );
+    /// Test instrumentation; number of physically stored cache entries.
+    pub fn cached_method_count(&self) -> usize;
 }
 
 /// Phase 10.6 — protocol-dispatch inline-cache invalidation.
@@ -632,7 +660,13 @@ pub struct MultiFn {
 /// generation observed at fill time and re-resolves on mismatch.
 pub fn protocol_generation() -> u64;
 pub fn bump_protocol_generation();
+
 ```
+
+Each method-cache entry is tagged with `Var::binding_generation()` for the
+specific hierarchy root and `MultiFn::method_generation()` for the specific
+multimethod. A concurrent mutation can leave an entry under an old tag, but
+the next lookup clears it before use.
 
 When `Protocol::extend_via_metadata` is set, `apply_value`'s `ProtocolFn` arm
 (`cljrs-runtime/src/env/apply.rs`) checks the dispatch value's metadata for an entry

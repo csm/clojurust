@@ -23,12 +23,16 @@ fn make_env() -> (Arc<GlobalEnv>, Env) {
 
 fn eval_fresh(src: &str) -> Result<Value, String> {
     let (_, mut env) = make_env();
+    eval_in_env(src, &mut env)
+}
+
+fn eval_in_env(src: &str, env: &mut Env) -> Result<Value, String> {
     let mut parser = Parser::new(src.to_string(), "<test>".to_string());
     let forms = parser.parse_all().map_err(|e| format!("parse: {e:?}"))?;
     let mut result = Value::Nil;
     for form in forms {
-        result = cljrs_runtime::interp::eval::eval(&form, &mut env)
-            .map_err(|e| format!("eval: {e:?}"))?;
+        result =
+            cljrs_runtime::interp::eval::eval(&form, env).map_err(|e| format!("eval: {e:?}"))?;
     }
     Ok(result)
 }
@@ -87,8 +91,11 @@ fn unrelated_matches_are_ambiguous_until_preferred() {
     )
     .expect_err("two unrelated matching methods must not silently pick one");
     assert!(
-        err.contains("Multiple methods"),
-        "expected an ambiguity error, got: {err}"
+        err.contains(
+            "Multiple methods in multimethod 'g' match dispatch value :user/d: \
+             :user/b and :user/c, and neither is preferred"
+        ),
+        "expected a stable ambiguity error, got: {err}"
     );
 
     let v = eval_ok(
@@ -96,6 +103,33 @@ fn unrelated_matches_are_ambiguous_until_preferred() {
          (defmethod g ::b [_] :b) (defmethod g ::c [_] :c) (prefer-method g ::b ::c) (g ::d)",
     );
     assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("b")));
+}
+
+#[test]
+fn ambiguity_lists_three_matches_stably_and_grammatically() {
+    let err = eval_fresh(
+        "(derive ::d ::b) (derive ::d ::c) (derive ::d ::e) (defmulti g identity) \
+         (defmethod g ::e [_] :e) (defmethod g ::c [_] :c) (defmethod g ::b [_] :b) (g ::d)",
+    )
+    .expect_err("three unrelated matching methods must be ambiguous");
+    assert!(
+        err.contains(":user/b, :user/c, and :user/e, and none is preferred"),
+        "expected sorted keys and plural wording, got: {err}"
+    );
+}
+
+#[test]
+fn ambiguity_reports_only_the_undominated_frontier() {
+    let err = eval_fresh(
+        "(derive ::c ::b) (derive ::d ::c) (derive ::d ::x) (defmulti g identity) \
+         (defmethod g ::b [_] :b) (defmethod g ::c [_] :c) (defmethod g ::x [_] :x) (g ::d)",
+    )
+    .expect_err("the unrelated maximal matches must be ambiguous");
+    assert!(
+        err.contains(":user/c and :user/x, and neither is preferred")
+            && !err.contains(":user/b and"),
+        "expected only the conflicting frontier, got: {err}"
+    );
 }
 
 #[test]
@@ -111,7 +145,7 @@ fn vector_dispatch_values_match_element_wise() {
 fn remove_method_drops_the_inherited_match() {
     let err = eval_fresh(
         "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] :parent) \
-         (remove-method f ::b) (f ::a)",
+         (f ::a) (remove-method f ::b) (f ::a)",
     )
     .expect_err("a removed method must not keep answering through the hierarchy");
     assert!(
@@ -124,11 +158,176 @@ fn remove_method_drops_the_inherited_match() {
 fn underive_retracts_the_inherited_match() {
     let err = eval_fresh(
         "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] :parent) \
-         (underive ::a ::b) (f ::a)",
+         (f ::a) (underive ::a ::b) (f ::a)",
     )
     .expect_err("underive must break the dispatch path it created");
     assert!(
         err.contains("No method in multimethod"),
         "expected a no-method error, got: {err}"
+    );
+}
+
+#[test]
+fn derive_invalidates_a_cached_default_method() {
+    let v = eval_ok(
+        "(defmulti f identity) (defmethod f ::b [_] :parent) \
+         (defmethod f :default [_] :fallback) (f ::a) (derive ::a ::b) (f ::a)",
+    );
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("parent")));
+}
+
+#[test]
+fn defmethod_invalidates_a_cached_inherited_method() {
+    let v = eval_ok(
+        "(derive ::a ::c) (derive ::c ::b) (defmulti f identity) \
+         (defmethod f ::b [_] :b) (f ::a) (defmethod f ::c [_] :c) (f ::a)",
+    );
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("c")));
+}
+
+#[test]
+fn inherited_resolution_populates_and_reuses_the_method_cache() {
+    let (globals, mut env) = make_env();
+    let v = eval_in_env(
+        "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] :parent) (f ::a)",
+        &mut env,
+    )
+    .expect("first dispatch");
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("parent")));
+    let Value::MultiFn(mf) = globals.lookup_in_ns("user", "f").expect("multifn") else {
+        panic!("f was not a multimethod")
+    };
+    assert_eq!(mf.get().cached_method_count(), 1);
+
+    let v = eval_in_env("(f ::a)", &mut env).expect("cached dispatch");
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("parent")));
+    assert_eq!(mf.get().cached_method_count(), 1);
+}
+
+#[test]
+fn unrelated_runtimes_and_multimethods_do_not_invalidate_the_cache() {
+    let (globals, mut env) = make_env();
+    eval_in_env(
+        "(derive ::a ::b) (defmulti f identity) (defmethod f ::b [_] :parent) (f ::a)",
+        &mut env,
+    )
+    .expect("populate cache");
+    let Value::MultiFn(mf) = globals.lookup_in_ns("user", "f").expect("multifn") else {
+        panic!("f was not a multimethod")
+    };
+    let generation = mf.get().method_generation();
+
+    eval_fresh(
+        "(derive ::x ::y) (defmulti other identity) \
+         (defmethod other ::y [_] :other) (prefer-method other ::y ::z) (other ::x)",
+    )
+    .expect("mutate an unrelated runtime and multimethod");
+
+    assert_eq!(mf.get().method_generation(), generation);
+    assert_eq!(mf.get().cached_method_count(), 1);
+    assert_eq!(
+        eval_in_env("(f ::a)", &mut env).expect("cached dispatch"),
+        Value::keyword(cljrs_value::Keyword::parse("parent"))
+    );
+}
+
+#[test]
+fn methods_and_prefers_keep_dispatch_values_as_keys() {
+    let v = eval_ok(
+        "(defmulti f identity) (defmethod f ::b [_] :b) \
+         (prefer-method f ::b ::c) \
+         [(contains? (methods f) ::b) \
+          (contains? (methods f) (str ::b)) \
+          (contains? (prefers f) ::b) \
+          (contains? (get (prefers f) ::b) ::c)]",
+    );
+    assert_eq!(format!("{v}"), "[true false true true]");
+}
+
+#[test]
+fn prefer_method_rejects_the_reverse_preference() {
+    let err = eval_fresh(
+        "(defmulti f identity) (defmethod f ::b [_] :b) (defmethod f ::c [_] :c) \
+         (prefer-method f ::b ::c) (prefer-method f ::c ::b)",
+    )
+    .expect_err("reverse preferences must conflict");
+    assert!(
+        err.contains("Preference conflict") && err.contains(":user/b is already preferred"),
+        "unexpected conflict error: {err}"
+    );
+}
+
+#[test]
+fn preferences_are_inherited_through_hierarchy_parents() {
+    let v = eval_ok(
+        "(derive ::c ::c-parent) (derive ::d ::c) (derive ::d ::b) \
+         (defmulti f identity) (defmethod f ::c [_] :c) (defmethod f ::b [_] :b) \
+         (prefer-method f ::c-parent ::b) (f ::d)",
+    );
+    assert_eq!(v, Value::keyword(cljrs_value::Keyword::parse("c")));
+
+    let err = eval_fresh(
+        "(derive ::c ::c-parent) (defmulti f identity) \
+         (prefer-method f ::c-parent ::b) (prefer-method f ::b ::c)",
+    )
+    .expect_err("an inherited reverse preference must conflict");
+    assert!(
+        err.contains("Preference conflict")
+            && err.contains(":user/c is already preferred to :user/b"),
+        "unexpected inherited conflict error: {err}"
+    );
+}
+
+#[test]
+fn clojure_isa_and_multimethod_dispatch_share_hierarchy_semantics() {
+    let v = eval_ok(
+        "(derive ::a ::middle) (derive ::middle ::root) \
+         (defmulti f identity) (defmethod f ::root [_] true) (defmethod f :default [_] false) \
+         [(isa? ::a ::root) (f ::a) \
+          (isa? ::unrelated ::root) (f ::unrelated) \
+          (isa? [::a] [::root ::root]) (f [::a])]",
+    );
+    assert_eq!(format!("{v}"), "[true true false false false false]");
+}
+
+#[test]
+fn hierarchy_helpers_are_private_and_not_auto_referred() {
+    for name in [
+        "named?",
+        "hierarchy?",
+        "check-hierarchy!",
+        "check-tag!",
+        "extend-relation",
+        "global-hierarchy",
+    ] {
+        let src = format!("(resolve '{name})");
+        assert_eq!(eval_ok(&src), Value::Nil, "{name} leaked into user");
+    }
+}
+
+#[test]
+fn defn_private_vars_are_not_referred_by_refer_all() {
+    let (globals, mut env) = make_env();
+    eval_in_env(
+        "(in-ns 'private-source) (defn- secret [] :secret)",
+        &mut env,
+    )
+    .expect("define private var");
+    globals.get_or_create_ns("private-client");
+    globals.refer_all("private-client", "private-source");
+    assert!(
+        globals.lookup_in_ns("private-client", "secret").is_none(),
+        "refer-all exposed a defn- var"
+    );
+    globals.refer_named("private-client", "private-source", &[Arc::from("secret")]);
+    assert!(
+        globals.lookup_in_ns("private-client", "secret").is_none(),
+        "named refer exposed a defn- var"
+    );
+    let err = eval_in_env("(in-ns 'private-client) private-source/secret", &mut env)
+        .expect_err("qualified access to another namespace's private var must fail");
+    assert!(
+        err.contains("is not public"),
+        "unexpected privacy error: {err}"
     );
 }
