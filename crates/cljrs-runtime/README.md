@@ -121,6 +121,11 @@ tests/
   qualified_protocol_impl.rs       — a qualified protocol name in an impl position
                                      (defrecord/deftype/reify/extend-*) resolves
                                      through its own namespace
+  defmulti_attr_map.rs             — `defmulti`'s four head shapes (docstring
+                                     and/or attr map before the dispatch fn),
+                                     and the metadata precedence between them:
+                                     docstring beats attr map beats `^` marks
+                                     on the name
   defmethod_cross_ns.rs            — `defmethod` on a multimethod owned by
                                      another namespace, named through a
                                      `:require :as` alias, in full, or via
