@@ -392,6 +392,16 @@ mod tests {
         assert!(matches!(error, TxError::ForbiddenEffect(name) if name == "spit"));
     }
 
+    /// The environment is process-global state the transaction was not handed,
+    /// and it can change under a retry, so reading it is denied like any other
+    /// ambient effect.
+    #[test]
+    fn rejects_reading_the_environment() {
+        let program = TxProgram::parse("(fn [] (System/getenv \"HOME\"))").unwrap();
+        let error = execute(&program, vec![], TxLimits::default()).unwrap_err();
+        assert!(matches!(error, TxError::ForbiddenEffect(name) if name == "System/getenv"));
+    }
+
     #[test]
     fn enforces_gas_limit() {
         let program = TxProgram::parse("(fn [] (loop [x 0] (recur (inc x))))").unwrap();

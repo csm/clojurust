@@ -1536,6 +1536,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("Math/cosh", Arity::Fixed(1), builtin_cosh),
         ("Math/tanh", Arity::Fixed(1), builtin_tanh),
         ("Math/hypot", Arity::Fixed(2), builtin_hypot),
+        ("System/getenv", Arity::Variadic { min: 0 }, builtin_getenv),
         ("log10", Arity::Fixed(1), builtin_log10),
         ("sin", Arity::Fixed(1), builtin_sin),
         ("cos", Arity::Fixed(1), builtin_cos),
@@ -6373,6 +6374,39 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
     };
     let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::string(content))
+}
+
+/// `(System/getenv)` → a map of the whole environment;
+/// `(System/getenv "NAME")` → that variable's value, or `nil` when unset.
+///
+/// Mirrors `java.lang.System/getenv`, nil-for-unset included, so `.cljc` that
+/// reads an environment variable behaves the same here as on the JVM.
+///
+/// Reads the environment through the OS-string API and skips what is not valid
+/// UTF-8: `std::env::vars()` *panics* on a non-UTF-8 entry, and one stray
+/// variable in the caller's environment must not take the runtime down. The
+/// one-arg form reports such a variable as unset, which is `std::env::var`'s
+/// own answer rather than a guess at an encoding.
+fn builtin_getenv(args: &[Value]) -> ValueResult<Value> {
+    match args.first() {
+        None => {
+            let mut m = PersistentHashMap::empty();
+            for (k, v) in std::env::vars_os() {
+                if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
+                    m = m.assoc(Value::string(k.to_string()), Value::string(v.to_string()));
+                }
+            }
+            Ok(Value::Map(MapValue::Hash(GcPtr::new(m))))
+        }
+        Some(Value::Str(s)) => match std::env::var(s.get().as_str()) {
+            Ok(v) => Ok(Value::string(v)),
+            Err(_) => Ok(Value::Nil),
+        },
+        Some(v) => Err(ValueError::WrongType {
+            expected: "string",
+            got: v.type_name().to_string(),
+        }),
+    }
 }
 
 fn builtin_close(args: &[Value]) -> ValueResult<Value> {

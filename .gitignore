@@ -14,3 +14,7 @@ docs/book/book/
 # cargo-mutants working directory
 /mutants.out/
 /mutants.out.old/
+# local scratch: agent WIP diffs, perf/PR sandboxes
+/.dev/
+# nREPL server port file, written on every `cljrs nrepl`
+/.nrepl-port

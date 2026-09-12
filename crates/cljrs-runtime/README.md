@@ -806,6 +806,25 @@ The `System/…` and `Thread/…` names follow the existing `Math/…` conventio
 JVM static's name registered as an ordinary builtin, so portable code that
 reaches for a clock resolves without a reader conditional.
 
+### Process environment (`builtins.rs`)
+
+- `(System/getenv)` — the whole environment, as a map of string to string.
+- `(System/getenv "NAME")` — that variable's value, or `nil` when unset.
+
+Same convention as the clock above, and the same nil-for-unset answer as
+`java.lang.System/getenv`, so `.cljc` that reads an environment variable needs
+no reader conditional.
+
+Reads through `std::env::vars_os` and skips what is not valid UTF-8:
+`std::env::vars()` *panics* on a non-UTF-8 entry, and one stray variable in the
+caller's environment must not take the runtime down. The one-arg form reports
+such a variable as unset, which is `std::env::var`'s own answer rather than a
+guess at an encoding.
+
+`System/getenv` is **denied inside a transaction function** (`env::policy`):
+the environment is process-global state the transaction was not handed as an
+argument, and it can change under it between retries.
+
 ### `eval`
 
 `eval` is registered as a sentinel and intercepted where the environment is
