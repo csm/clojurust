@@ -33,6 +33,7 @@ src/
   aot.rs        — AOT driver: source → parse → expand → lower → codegen → cargo build → binary
   escape.rs     — (no-gc only) blacklist analysis: 4 checks that reject no-gc–unsafe IR patterns
   extensions.rs — Extension / ExtensionSet descriptors + CompileSession: what the *host* supplies
+  native_dep.rs — how the harness depends on a project's Rust crate: crate identifier vs package name
   jit/          — in-process JIT tier (Cranelift `JITModule`) over the same codegen
     mod.rs        — `Jit` (the runtime's `JitBackend`) + `install`; `on_var_rebind` stales superseded code
     jit_compiler.rs — `compile_jit` / `compile_jit_poll`: build a `JITModule`, register rt_abi symbols, call shared codegen
@@ -376,6 +377,30 @@ Environment: `CLJRS_JIT_THRESHOLD` (Tier-1 calls before compiling, default
 `CLJRS_JIT_NO_SPEC=1` (compile generically), `CLJRS_JIT_DEOPT_LIMIT` (entry-guard
 failures tolerated before a specialization is discarded).
 
+### Depending on a project's Rust crate (`native_dep.rs`)
+
+Two different names meet at the harness's dependency line on a project's
+extension crate, and they are not the same string: the **crate identifier**
+(`cljrs_base64`), which generated Rust source uses and which comes from the
+first `::` segment of `:rust :init`; and the **package name**
+(`cljrs-base64`), which Cargo resolves the dependency by.
+
+Cargo reads a dependency key as the package name unless `package = "..."` says
+otherwise, so emitting the identifier as the key makes every hyphenated package
+unresolvable — including both in-tree extensions. This module keeps the two
+apart:
+
+```rust
+pub fn package_name(cargo_toml: &str) -> Option<&str>;   // `[package] name`, parsed
+pub fn dep_line(ident: &str, crate_dir: &str, package: Option<&str>) -> String;
+pub fn read_package_name(crate_dir: &Path) -> Option<String>;  // the one file read
+```
+
+`dep_line` spells out `package` only when it differs from the identifier, and
+an unknown package name yields exactly the line the harness emitted before this
+module existed. `tests/aot_native_init_e2e.rs` compiles and runs a real binary
+against a deliberately hyphenated fixture crate.
+
 ### Extensions and the compile session (`extensions.rs`)
 
 The compiler does not decide what a compiled program contains.  A host — the
@@ -460,6 +485,18 @@ impl BundleAudit {
 pub enum OmissionKind { Namespace, EntryForm }
 pub enum OpacityVerdict { Clean, Tolerated, Rejected }
 ```
+
+**The `:rust :init` call is emitted inside `unsafe`** (`native_init_code`, and
+`tests/harness_init_shape.rs`).  An extension's entry point takes a
+`*mut Registry` and dereferences it, so the honest signature is
+`unsafe extern "C" fn` and that is what this workspace's plugin crates declare.
+A bare call to one does not compile (`expected safe fn, found unsafe fn`), which
+made those crates un-AOT-compilable and went unnoticed because no test compiles a
+program with a `:rust :init`.  A safe `extern "C" fn`, the spelling the book
+teaches, is equally accepted: calling it inside `unsafe` is merely redundant, and
+`allow(unused_unsafe)` keeps the generated crate from warning.
+`harness_init_shape.rs` is that emitted shape, compiled against both spellings,
+so it fails to build if either stops working.
 
 ### Source-embedding audit (`--require-fully-compiled`)
 
