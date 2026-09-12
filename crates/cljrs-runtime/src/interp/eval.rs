@@ -127,13 +127,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         FormKind::Var(inner) => {
             if let FormKind::Symbol(s) = &inner.kind {
                 let parsed = Symbol::parse(s);
-                let ns: Arc<str> = match parsed.namespace.as_deref() {
-                    Some(ns_part) => env
-                        .globals
-                        .resolve_alias(&env.current_ns, ns_part)
-                        .unwrap_or_else(|| Arc::from(ns_part)),
-                    None => env.current_ns.clone(),
-                };
+                let ns: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
                 env.globals
                     .lookup_var_in_ns(&ns, &parsed.name)
                     .map(Value::Var)
@@ -264,10 +258,7 @@ fn eval_symbol(s: &str, env: &mut Env) -> EvalResult {
         && !s.starts_with('/')
         && let Some(ns_part) = &sym.namespace
     {
-        let resolved: Arc<str> = env
-            .globals
-            .resolve_alias(&env.current_ns, ns_part)
-            .unwrap_or_else(|| Arc::from(ns_part.as_ref()));
+        let resolved: Arc<str> = env.resolve_ns_part(ns_part);
         // Qualified self-reference inside a versioned namespace: `mylib/x`
         // written in `mylib@hash`'s own source resolves at the pinned commit,
         // i.e. inside the versioned namespace itself.

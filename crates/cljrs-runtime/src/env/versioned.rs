@@ -60,9 +60,9 @@ pub fn resolve_versioned_value(
     //    a qualified self-reference inside an already-versioned namespace).
     let base_ns: Arc<str> = match ns_part {
         Some(p) => {
-            let resolved = globals
-                .resolve_alias(defining_ns, p)
-                .unwrap_or_else(|| Arc::from(p));
+            // Relative to the DEFINING namespace, which is what a versioned
+            // source's own aliases are registered against.
+            let resolved = globals.resolve_ns_part_in(defining_ns, p);
             Arc::from(base_ns_name(&resolved))
         }
         None => Arc::from(base_ns_name(defining_ns)),

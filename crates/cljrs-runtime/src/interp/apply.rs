@@ -1879,10 +1879,9 @@ fn handle_resolve(arg_forms: &[Form], env: &mut Env) -> EvalResult {
             let sym = s.get();
             // If qualified (ns/name), use the given ns; otherwise current ns.
             if let Some(ns) = &sym.namespace {
-                let full_ns = env
-                    .globals
-                    .resolve_alias(&resolve_ns, ns.as_ref())
-                    .unwrap_or_else(|| ns.clone());
+                // Relative to `*ns*`, not to `env.current_ns` — `resolve` is
+                // defined in terms of the dynamic var.
+                let full_ns = env.globals.resolve_ns_part_in(&resolve_ns, ns.as_ref());
                 return Ok(
                     match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
                         Some(var_ptr) => Value::Var(var_ptr),

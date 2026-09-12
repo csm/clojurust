@@ -869,13 +869,7 @@ fn eval_var(args: &[Form], env: &mut Env) -> EvalResult {
         _ => return Err(EvalError::Runtime("var requires a symbol".into())),
     };
     let parsed = cljrs_value::Symbol::parse(&sym);
-    let ns: Arc<str> = match parsed.namespace.as_deref() {
-        Some(ns_part) => env
-            .globals
-            .resolve_alias(&env.current_ns, ns_part)
-            .unwrap_or_else(|| Arc::from(ns_part)),
-        None => env.current_ns.clone(),
-    };
+    let ns: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
     let name = parsed.name.as_ref();
     env.globals
         .lookup_var_in_ns(&ns, name)
@@ -2467,16 +2461,7 @@ fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
             return Err(EvalError::Runtime("binding targets must be symbols".into()));
         };
         let parsed = cljrs_value::Symbol::parse(sym_str);
-        let ns_part: Arc<str> = match parsed.namespace.as_deref() {
-            // Resolve `alias/*var*` through the current ns's `:require :as`
-            // aliases, same as ordinary qualified-symbol lookup (`eval_symbol`)
-            // — otherwise `(binding [alias/*x* v] ...)` never finds the var.
-            Some(ns_part) => env
-                .globals
-                .resolve_alias(&env.current_ns, ns_part)
-                .unwrap_or_else(|| Arc::from(ns_part)),
-            None => env.current_ns.clone(),
-        };
+        let ns_part: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
         let var_ptr = env
             .globals
             .lookup_var_in_ns(&ns_part, &parsed.name)
@@ -2770,10 +2755,7 @@ fn resolve_protocol_sym(env: &Env, s: &str) -> Option<GcPtr<Protocol>> {
     let parsed = cljrs_value::Symbol::parse(s);
     let val = match parsed.namespace.as_deref() {
         Some(ns_part) => {
-            let ns = env
-                .globals
-                .resolve_alias(&env.current_ns, ns_part)
-                .unwrap_or_else(|| Arc::from(ns_part));
+            let ns = env.resolve_ns_part(ns_part);
             env.globals.lookup_in_ns(&ns, &parsed.name)
         }
         None => env.globals.lookup_in_ns(&env.current_ns, s),

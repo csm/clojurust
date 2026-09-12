@@ -536,9 +536,7 @@ fn execute_inst(
         }
 
         Inst::LoadVar(dst, gns, name) => {
-            let resolved_ns = globals
-                .resolve_alias(ns, gns)
-                .unwrap_or_else(|| Arc::from(&**gns));
+            let resolved_ns = globals.resolve_ns_part_in(ns, gns);
             let var = globals
                 .lookup_var_in_ns(&resolved_ns, name)
                 .ok_or_else(|| {
@@ -841,10 +839,9 @@ fn load_global_value(
         );
     }
 
-    // Try direct namespace lookup first, then resolve as alias.
-    let resolved_ns = globals
-        .resolve_alias(defining_ns, ns)
-        .unwrap_or_else(|| Arc::from(ns));
+    // Relative to the defining namespace, whose alias table a lowered
+    // function's qualified names were written against.
+    let resolved_ns = globals.resolve_ns_part_in(defining_ns, ns);
 
     if let Some(var) = globals.lookup_var_in_ns(&resolved_ns, name) {
         if let Some(val) = crate::env::dynamics::deref_var(&var) {

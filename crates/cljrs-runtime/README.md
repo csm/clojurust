@@ -118,6 +118,12 @@ tests/
                                      protocol method body; params shadow them
   deftype_types.rs                 — deftype: positional ctor, `.-field`, protocol
                                      impls, and mutable fields written with `set!`
+  ns_part_resolution.rs            — one alias-resolution rule: an alias and
+                                     a full namespace name agree for symbols,
+                                     `var`, macros, syntax-quote, `binding`
+                                     and protocol names, and an absent ns part
+                                     means the current namespace (each test
+                                     fails when the arm it names is stubbed)
   qualified_protocol_impl.rs       — a qualified protocol name in an impl position
                                      (defrecord/deftype/reify/extend-*) resolves
                                      through its own namespace
@@ -318,6 +324,19 @@ pub fn ir_cache(&self) -> &Arc<tiered::ir_cache::IrCache>;
 pub fn eval(&self, form: &Form, env: &mut Env) -> EvalResult;
 pub fn call_cljrs_fn(&self, f: &CljxFn, args: &[Value], env: &mut Env) -> EvalResult;
 pub fn on_fn_defined(&self, f: &CljxFn, env: &mut Env);
+
+/// The namespace a qualified symbol's `ns` part names: a `:require … :as`
+/// alias wins, anything else is taken literally.  This is the ONE definition
+/// of that rule; every construct that resolves a qualified name reads it.
+/// `Env::resolve_ns_part` is the same rule relative to that env's
+/// `current_ns`, and `Env::resolve_ns_or_current` adds the absent-ns-part
+/// case.  Callers relative to something else — `resolve`, which follows the
+/// `*ns*` dynamic var, and versioned resolution, which follows a defining
+/// namespace — name it here instead of open-coding the lookup.
+///
+/// Note what this is NOT: `eval_symbol`'s privacy check and versioned-symbol
+/// routing sit *after* its call to this, and remain its own.
+pub fn resolve_ns_part_in(&self, current_ns: &str, ns_part: &str) -> Arc<str>;
 
 /// Copy `src_ns`'s interns into `dst_ns` as refers.  Both are *explicit*
 /// refers (`(:require [x :refer :all])` / `:refer [...]`) and are never

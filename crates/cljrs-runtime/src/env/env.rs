@@ -313,6 +313,20 @@ impl GlobalEnv {
         aliases.get(alias).cloned()
     }
 
+    /// The namespace a qualified symbol's `ns` part names, read from
+    /// `current_ns`'s alias table.
+    ///
+    /// A `:require … :as` alias wins; anything else is taken literally. This
+    /// is the whole rule, and the only place it is written: callers that
+    /// resolve relative to something other than an `Env`'s `current_ns` —
+    /// `resolve`, which is relative to the `*ns*` dynamic var, and versioned
+    /// resolution, which is relative to a defining namespace — name that
+    /// namespace here rather than open-coding the lookup.
+    pub fn resolve_ns_part_in(&self, current_ns: &str, ns_part: &str) -> Arc<str> {
+        self.resolve_alias(current_ns, ns_part)
+            .unwrap_or_else(|| Arc::from(ns_part))
+    }
+
     /// Resolve an auto-resolved keyword name (the text after `::`) to its
     /// fully-qualified `ns/name` form.
     ///
@@ -1028,6 +1042,29 @@ impl Env {
             globals,
             versioned_eval_commit: None,
             is_async: false,
+        }
+    }
+
+    /// The namespace a qualified symbol's `ns` part names, here.
+    ///
+    /// `ns_part` may be a `:require … :as` alias or a namespace name; an alias
+    /// wins, and anything else is taken literally. This is what makes
+    /// `(m/f x)` and `(my.lib/f x)` mean the same thing after
+    /// `(:require [my.lib :as m])`.
+    ///
+    /// Relative to THIS env's `current_ns`. A caller resolving relative to
+    /// some other namespace wants [`GlobalEnv::resolve_ns_part_in`], which
+    /// this delegates to.
+    pub fn resolve_ns_part(&self, ns_part: &str) -> Arc<str> {
+        self.globals.resolve_ns_part_in(&self.current_ns, ns_part)
+    }
+
+    /// The namespace a symbol belongs to: [`Self::resolve_ns_part`] when it
+    /// carries one, and the current namespace when it does not.
+    pub fn resolve_ns_or_current(&self, ns_part: Option<&str>) -> Arc<str> {
+        match ns_part {
+            Some(ns_part) => self.resolve_ns_part(ns_part),
+            None => self.current_ns.clone(),
         }
     }
 

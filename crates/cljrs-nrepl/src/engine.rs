@@ -386,10 +386,7 @@ impl Engine {
 
         if let Some((alias, name_prefix)) = prefix.split_once('/') {
             // Qualified prefix: complete interns of the aliased/named namespace.
-            let full = self
-                .globals
-                .resolve_alias(&context_ns, alias)
-                .unwrap_or_else(|| Arc::from(alias));
+            let full = self.globals.resolve_ns_part_in(&context_ns, alias);
             if let Some(ns) = namespaces.get(&full) {
                 for (name, var) in ns.get().interns.lock().unwrap().iter() {
                     if name.starts_with(name_prefix) {
@@ -461,10 +458,7 @@ impl Engine {
         let sym = req.sym.clone().unwrap_or_default();
         let var = match sym.split_once('/') {
             Some((ns_part, name)) => {
-                let full = self
-                    .globals
-                    .resolve_alias(&context_ns, ns_part)
-                    .unwrap_or_else(|| Arc::from(ns_part));
+                let full = self.globals.resolve_ns_part_in(&context_ns, ns_part);
                 self.globals.lookup_var_in_ns(&full, name)
             }
             None => self.globals.lookup_var_in_ns(&context_ns, &sym),

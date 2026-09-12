@@ -231,10 +231,7 @@ fn qualify_symbol(
     if let Some(idx) = s.find('/') {
         if idx > 0 && idx < s.len() - 1 {
             let (ns_part, name_part) = (&s[..idx], &s[idx + 1..]);
-            let resolved_ns = env
-                .globals
-                .resolve_alias(&env.current_ns, ns_part)
-                .unwrap_or_else(|| Arc::from(ns_part));
+            let resolved_ns = env.resolve_ns_part(ns_part);
             return format!("{resolved_ns}/{name_part}");
         }
         return s.to_string();

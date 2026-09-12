@@ -1468,10 +1468,7 @@ fn pin_versioned_references(
     for (ns_part, commit) in pins {
         let base: Arc<str> = match &ns_part {
             Some(p) => {
-                let resolved = env
-                    .globals
-                    .resolve_alias(&env.current_ns, p)
-                    .unwrap_or_else(|| Arc::from(p.as_str()));
+                let resolved = env.globals.resolve_ns_part_in(&env.current_ns, p);
                 Arc::from(cljrs_runtime::env::versioned::base_ns_name(&resolved))
             }
             None => Arc::from(cljrs_runtime::env::versioned::base_ns_name(&env.current_ns)),

@@ -198,16 +198,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
 /// If `sym` resolves to a macro in the current env, return its CljxFn.
 fn resolve_macro(sym: &str, env: &Env) -> Option<cljrs_value::CljxFn> {
     let parsed = Symbol::parse(sym);
-    // A namespace part may be an alias (`:require [... :as m]`), not a real
-    // namespace name — resolve it the same way `eval_symbol`/`(var ...)` do,
-    // falling back to the literal text only if it isn't a known alias.
-    let ns: Arc<str> = match parsed.namespace.as_deref() {
-        Some(ns_part) => env
-            .globals
-            .resolve_alias(&env.current_ns, ns_part)
-            .unwrap_or_else(|| Arc::from(ns_part)),
-        None => env.current_ns.clone(),
-    };
+    let ns: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
     let name = parsed.name.as_ref();
 
     let v = env.globals.lookup_in_ns(&ns, name)?;
