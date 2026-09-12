@@ -57,6 +57,47 @@ fn run_warm(src: &str, extra_args: &[&str], extra_env: &[(&str, &str)]) -> (Stri
     )
 }
 
+/// Run a program that must reach Tier 1, escalating its workload until the
+/// background worker actually publishes.
+///
+/// Publication is inherently asynchronous: the mutator enqueues at the warm
+/// threshold and a separate worker lowers and publishes. A short program can
+/// therefore finish before the worker is ever scheduled, and asserting on
+/// whatever happened to land by exit is a race, not a property. Under
+/// full-suite parallelism that race loses often enough to fail CI, and the
+/// failure is indistinguishable from a genuine tier-up regression — which is
+/// the expensive part.
+///
+/// `make_src` receives an iteration count so the same program can be made
+/// arbitrarily longer-running. The happy path stays as fast as before: the
+/// first, smallest attempt is the old workload, and the larger ones only run
+/// on a machine too loaded to have scheduled the worker yet.
+///
+/// This widens the window rather than closing it. The deterministic fix is
+/// runtime-side — drain pending background lowering at shutdown, which would
+/// also stop a human debugging a short program from seeing an empty ir log.
+/// Until that exists, an escalating budget is the honest test-side answer:
+/// still a real failure when publication never happens at all.
+fn run_until_published(
+    make_src: impl Fn(usize) -> String,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (String, String) {
+    const BUDGETS: [usize; 3] = [200, 5_000, 50_000];
+    let mut last = (String::new(), String::new());
+    for n in BUDGETS {
+        let (stdout, stderr) = run_warm(&make_src(n), extra_args, extra_env);
+        if stderr.contains("background lower published") {
+            return (stdout, stderr);
+        }
+        last = (stdout, stderr);
+    }
+    panic!(
+        "worker never published across {BUDGETS:?} iterations\nstdout:\n{}\nstderr:\n{}",
+        last.0, last.1
+    );
+}
+
 /// Tier-up correctness: a hot function runs far past both the warm threshold
 /// (10) and a low JIT threshold (50), so a single run exercises
 /// tree-walk → background-lowered IR → JIT-native, asserting every iteration.
@@ -87,15 +128,27 @@ fn tiering_up_mid_run_keeps_results_correct() {
 /// function reached Tier 1 via the background path, not eager lowering.
 #[test]
 fn background_lowering_publishes_ir() {
-    let src = r#"
+    // The program checks its own arithmetic against the closed form for
+    // sum(i^2), so the correctness assertion holds at whatever workload the
+    // escalating budget settles on.
+    let (stdout, stderr) = run_until_published(
+        |n| {
+            format!(
+                r#"
         (defn warm-me [x] (* x x))
-        (loop [i 0 acc 0]
-          (if (< i 200)
-            (recur (+ i 1) (+ acc (warm-me i)))
-            (println "sum:" acc)))
-    "#;
-    let (stdout, stderr) = run_warm(src, &[], &[]);
-    assert!(stdout.contains("sum: 2646700"), "stdout:\n{stdout}");
+        (let [n {n}
+              acc (loop [i 0 acc 0]
+                    (if (< i n) (recur (+ i 1) (+ acc (warm-me i))) acc))
+              want (quot (* (- n 1) n (- (* 2 n) 1)) 6)]
+          (println (if (= acc want) "sum-ok" (str "WRONG " acc " != " want))))
+    "#
+            )
+        },
+        &[],
+        &[],
+    );
+    assert!(!stdout.contains("WRONG"), "stdout:\n{stdout}");
+    assert!(stdout.contains("sum-ok"), "stdout:\n{stdout}");
     assert!(
         stderr.contains("background lower published"),
         "no background publish in stderr:\n{stderr}"
@@ -156,18 +209,28 @@ fn rebind_during_warm_window_takes_effect_immediately() {
 /// disabled: functions still tier up from tree-walk to the IR interpreter.
 #[test]
 fn background_lowering_works_without_jit() {
-    let src = r#"
+    let (stdout, stderr) = run_until_published(
+        |n| {
+            format!(
+                r#"
         (defn no-jit-fn [x] (- (* 2 x) 3))
-        (loop [i 0 acc 0]
-          (if (< i 200)
-            (do
-              (when (not= (no-jit-fn i) (- (* 2 i) 3)) (println "WRONG at" i))
-              (recur (+ i 1) (+ acc (no-jit-fn i))))
-            (println "sum:" acc)))
-    "#;
-    let (stdout, stderr) = run_warm(src, &[], &[("CLJRS_NO_JIT", "1")]);
+        (let [n {n}
+              acc (loop [i 0 acc 0]
+                    (if (< i n)
+                      (do
+                        (when (not= (no-jit-fn i) (- (* 2 i) 3)) (println "WRONG at" i))
+                        (recur (+ i 1) (+ acc (no-jit-fn i))))
+                      acc))
+              want (- (* n (- n 1)) (* 3 n))]
+          (println (if (= acc want) "sum-ok" (str "WRONG " acc " != " want))))
+    "#
+            )
+        },
+        &[],
+        &[("CLJRS_NO_JIT", "1")],
+    );
     assert!(!stdout.contains("WRONG"), "stdout:\n{stdout}");
-    assert!(stdout.contains("sum: 39200"), "stdout:\n{stdout}");
+    assert!(stdout.contains("sum-ok"), "stdout:\n{stdout}");
     assert!(
         stderr.contains("background lower published"),
         "worker did not run without JIT:\n{stderr}"
