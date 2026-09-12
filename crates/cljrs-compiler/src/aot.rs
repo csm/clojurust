@@ -2448,10 +2448,43 @@ fn link_with_cargo_test_harness(
     let built = harness_bin_from_cargo_stdout(&stdout)?;
     std::fs::copy(&built, out_path)?;
 
-    // Keep the harness directory for debugging
+    // Kept on purpose: `tests/test_harness_e2e.rs` inspects the generated
+    // project.  The ordinary compile path (`link_with_cargo`) discards its
+    // harness instead.
     eprintln!("[aot] harness directory kept at {}", harness_dir.display());
 
     Ok(())
+}
+
+/// Where harness builds put their intermediate artifacts.
+///
+/// One directory for every harness, so the cljrs dependency tree is compiled
+/// once rather than once per link. `CLJRS_AOT_TARGET_DIR` overrides it;
+/// otherwise `~/.cljrs/cache/aot-target`, or the harness's own `target/` when
+/// there is no home directory to cache under.
+///
+/// Cargo locks a target directory, so concurrent harness builds queue rather
+/// than corrupt one another.
+fn harness_target_dir() -> Option<PathBuf> {
+    harness_target_dir_from(
+        std::env::var_os("CLJRS_AOT_TARGET_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// [`harness_target_dir`] as a function of its inputs, so the rule can be
+/// exercised without mutating process environment (`set_var` is UB once a
+/// second thread exists, and libtest runs tests on many).
+fn harness_target_dir_from(
+    explicit: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = explicit.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
+    home.filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".cljrs").join("cache").join("aot-target"))
 }
 
 /// Run `cargo build --release --message-format=json` in the harness directory.
@@ -2465,6 +2498,9 @@ fn cargo_build_harness_release(
         .arg("--message-format=json");
     if offline {
         cmd.arg("--offline");
+    }
+    if let Some(target_dir) = harness_target_dir() {
+        cmd.env("CARGO_TARGET_DIR", target_dir);
     }
     let output = cmd.current_dir(harness_dir).output()?;
 
@@ -3208,6 +3244,48 @@ edition = "2024"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Harness target directory ──────────────────────────────────────────
+
+    #[test]
+    fn harness_builds_share_one_target_dir_under_home() {
+        // The point of the shared directory: two harnesses resolve to the
+        // SAME path, so the cljrs dependency tree is compiled once rather
+        // than once per link.
+        let home = Some(std::ffi::OsString::from("/home/someone"));
+        let first = harness_target_dir_from(None, home.clone());
+        let second = harness_target_dir_from(None, home);
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            Some(PathBuf::from("/home/someone/.cljrs/cache/aot-target"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_target_dir_wins_over_home() {
+        assert_eq!(
+            harness_target_dir_from(
+                Some(std::ffi::OsString::from("/build/shared")),
+                Some(std::ffi::OsString::from("/home/someone")),
+            ),
+            Some(PathBuf::from("/build/shared"))
+        );
+    }
+
+    #[test]
+    fn with_nothing_to_resolve_the_harness_keeps_its_own_target_dir() {
+        // `None` leaves CARGO_TARGET_DIR unset, which is the pre-existing
+        // behaviour — correct, just not shared.
+        assert_eq!(harness_target_dir_from(None, None), None);
+        assert_eq!(
+            harness_target_dir_from(
+                Some(std::ffi::OsString::new()),
+                Some(std::ffi::OsString::new())
+            ),
+            None
+        );
+    }
 
     fn parse_one(src: &str) -> cljrs_reader::Form {
         cljrs_reader::Parser::new(src.to_string(), "<test>".to_string())
