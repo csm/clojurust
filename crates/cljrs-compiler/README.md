@@ -461,6 +461,18 @@ pub enum OmissionKind { Namespace, EntryForm }
 pub enum OpacityVerdict { Clean, Tolerated, Rejected }
 ```
 
+**The `:rust :init` call is emitted inside `unsafe`** (`native_init_code`, and
+`tests/harness_init_shape.rs`).  An extension's entry point takes a
+`*mut Registry` and dereferences it, so the honest signature is
+`unsafe extern "C" fn` and that is what this workspace's plugin crates declare.
+A bare call to one does not compile (`expected safe fn, found unsafe fn`), which
+made those crates un-AOT-compilable and went unnoticed because no test compiles a
+program with a `:rust :init`.  A safe `extern "C" fn`, the spelling the book
+teaches, is equally accepted: calling it inside `unsafe` is merely redundant, and
+`allow(unused_unsafe)` keeps the generated crate from warning.
+`harness_init_shape.rs` is that emitted shape, compiled against both spellings,
+so it fails to build if either stops working.
+
 ### Source-embedding audit (`--require-fully-compiled`)
 
 Only plain `defn` bodies reach machine code. Forms that `needs_interpreter`

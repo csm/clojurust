@@ -2012,6 +2012,42 @@ struct HarnessInputs<'a> {
     async_polls: &'a [AsyncPollEntry],
 }
 
+/// The harness source that calls an extension's `:rust :init` hook, or nothing
+/// when the project configures none.
+///
+/// The call runs before the preamble so native functions are visible to
+/// macro-expanded code at startup.
+///
+/// **The call is wrapped in `unsafe`, and it has to be.** An entry point takes a
+/// `*mut Registry` and dereferences it, so the honest signature is
+/// `unsafe extern "C" fn`, which is what the extension crates in this workspace
+/// declare. Emitting a bare call to one does not compile:
+///
+/// ```text
+/// error[E0308]: mismatched types
+///   expected safe fn, found unsafe fn
+///   found fn item `unsafe extern "C" fn(_) {cljrs_init}`
+/// ```
+///
+/// The book teaches a *safe* `extern "C" fn`, and that spelling still works:
+/// calling a safe fn inside `unsafe` is merely redundant, which the
+/// `allow(unused_unsafe)` silences. Wrapping therefore accepts both, where
+/// demanding a safe fn would reject the plugins this repo ships.
+///
+/// Kept apart from [`build_harness`] so the emitted shape can be asserted
+/// without compiling a whole program; nothing else here is testable that way.
+fn native_init_code(init_fn: Option<&str>) -> String {
+    match init_fn {
+        Some(init_fn) => format!(
+            "\n    // Register native Rust functions via the user crate's init hook.\n    \
+             let mut __registry = cljrs_interop::Registry::new(globals.clone());\n    \
+             #[allow(unused_unsafe)]\n    \
+             unsafe {{\n        {init_fn}(&mut __registry);\n    }}\n"
+        ),
+        None => String::new(),
+    }
+}
+
 fn build_harness(
     out_path: &Path,
     inputs: HarnessInputs<'_>,
@@ -2240,18 +2276,7 @@ edition = "2024"
         ""
     };
 
-    // Emit the native init call when :rust :init is configured.  The init
-    // function has the signature `fn cljrs_init(registry: &mut Registry)`
-    // and is called before the preamble so native functions are visible to
-    // macro-expanded code at startup.
-    let native_init_code = match rust_config.and_then(|rc| rc.init_fn.as_deref()) {
-        Some(init_fn) => format!(
-            "\n    // Register native Rust functions via the user crate's init hook.\n    \
-             let mut __registry = cljrs_interop::Registry::new(globals.clone());\n    \
-             {init_fn}(&mut __registry);\n"
-        ),
-        None => String::new(),
-    };
+    let native_init_code = native_init_code(rust_config.and_then(|rc| rc.init_fn.as_deref()));
 
     // Register AOT-compiled async poll functions: declare each as an external
     // symbol (defined in the linked object), then register it by ns/name/arity
@@ -3214,6 +3239,29 @@ mod tests {
             .parse_all()
             .expect("parse")
             .remove(0)
+    }
+
+    #[test]
+    fn no_rust_init_emits_nothing() {
+        assert_eq!(native_init_code(None), "");
+    }
+
+    /// An extension entry point takes a `*mut Registry` and dereferences it, so
+    /// the honest signature is `unsafe extern "C" fn` and a bare call to one
+    /// does not compile. The emitted call must therefore be wrapped.
+    #[test]
+    fn the_init_call_is_wrapped_in_unsafe() {
+        let emitted = native_init_code(Some("my_project::cljrs_init"));
+        assert!(
+            emitted.contains("unsafe {\n        my_project::cljrs_init(&mut __registry);\n    }"),
+            "init call must be inside an unsafe block, got:\n{emitted}"
+        );
+        // The book teaches a SAFE `extern "C" fn`, which is still accepted; the
+        // allow is what keeps that spelling from warning in the generated crate.
+        assert!(
+            emitted.contains("#[allow(unused_unsafe)]"),
+            "a safe entry point would warn without the allow, got:\n{emitted}"
+        );
     }
 
     #[test]
