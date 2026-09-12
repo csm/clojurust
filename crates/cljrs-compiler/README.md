@@ -412,6 +412,15 @@ impl CompileSession {
 }
 ```
 
+**Extension init symbols must be unique per crate** (`tests/extension_init_symbols.rs`).
+A plugin crate's C-ABI entry point is `#[no_mangle]`, so two crates that both
+name it `cljrs_init` export the same symbol.  Linking both into one AOT binary
+does *not* fail: the linker resolves every reference to a single definition, so
+`crate_a::cljrs_init` and `crate_b::cljrs_init` become the same address and one
+crate's registration silently replaces the other's.  The convention is therefore
+`cljrs_init_<crate>`, and that test is the only place two plugin crates share a
+binary, which is why `cljrs-blake3` is a dev-dependency here.
+
 `compile_file` and `compile_file_to_wasm` take a `&CompileSession` and call
 `register_all` on the bootstrap environment (so `require` resolves during
 macro expansion) and `harness_init_code` when generating the harness (so the

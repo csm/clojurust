@@ -1,7 +1,7 @@
 # Project Setup
 
 A mixed Rust/Clojure project needs three things: a `cljrs.edn` that points to
-the Rust crate, a `Cargo.toml` with the right crate type, and a `cljrs_init`
+the Rust crate, a `Cargo.toml` with the right crate type, and an init
 entry point.
 
 ## Directory layout
@@ -11,7 +11,7 @@ my-project/
 ├── cljrs.edn          # Clojure project config (source paths, :rust key)
 ├── Cargo.toml         # Rust crate manifest
 ├── src/
-│   ├── lib.rs         # Rust source — defines cljrs_init and native fns
+│   ├── lib.rs         # Rust source — defines the init fn and native fns
 │   └── main.cljrs     # Clojure entry point
 ```
 
@@ -26,14 +26,14 @@ Add a `:rust` map to the top-level config:
 {:paths ["src"]
 
  :rust {:crate "."                       ; path to Cargo.toml directory
-        :init  "my_project::cljrs_init"} ; Rust path to the init function
+        :init  "my_project::cljrs_init_my_project"} ; Rust path to the init function
 }
 ```
 
 | Key | Required | Description |
 |---|---|---|
 | `:crate` | yes | Path to the directory containing the user's `Cargo.toml`. Relative to `cljrs.edn`. |
-| `:init` | yes | Fully-qualified Rust path to the init function, e.g. `"my_crate::cljrs_init"`. The first `::` segment is used as the crate name. |
+| `:init` | yes | Fully-qualified Rust path to the init function, e.g. `"my_crate::cljrs_init_my_crate"`. The first `::` segment is used as the crate name. |
 
 ## `Cargo.toml`
 
@@ -57,7 +57,7 @@ cljrs-interop = { path = "/path/to/cljrs/crates/cljrs-interop" }
 > `rlib` allows `cljrs compile` to link the crate statically into the AOT
 > binary. Both can coexist in `crate-type`.
 
-## The `cljrs_init` entry point
+## The init entry point
 
 The init function receives a `*mut Registry` pointer and registers all native
 functions. It must have C linkage so the dynamic linker can find it by name:
@@ -66,7 +66,7 @@ functions. It must have C linkage so the dynamic linker can find it by name:
 use cljrs_interop::{Registry, wrap_fn1, wrap_fn2};
 
 #[no_mangle]
-pub extern "C" fn cljrs_init(registry: *mut Registry) {
+pub extern "C" fn cljrs_init_my_project(registry: *mut Registry) {
     let r = unsafe { &mut *registry };
 
     r.define("my.project/greet",
@@ -79,10 +79,30 @@ pub extern "C" fn cljrs_init(registry: *mut Registry) {
 }
 ```
 
-The function name in `:rust :init` (`"my_project::cljrs_init"`) must match the
-Rust function name used in `#[no_mangle]` (`cljrs_init`). The crate prefix
-(`my_project`) is used when generating the AOT harness; it must match the
-`[package] name` in `Cargo.toml` with hyphens replaced by underscores.
+The function name in `:rust :init` (`"my_project::cljrs_init_my_project"`) must
+match the Rust function name used in `#[no_mangle]`
+(`cljrs_init_my_project`). The crate prefix (`my_project`) is used when
+generating the AOT harness; it must match the `[package] name` in `Cargo.toml`
+with hyphens replaced by underscores.
+
+### Name the symbol after your crate
+
+The convention is `cljrs_init_<crate>`, and the reason is `#[no_mangle]`. An
+unmangled symbol is global to the whole process image, so two extension crates
+that both call theirs `cljrs_init` export the *same* symbol.
+
+That does not fail to link, which is what makes it worth a rule. When `cljrs
+compile` links two such extensions into one AOT binary, the linker resolves
+every reference to a single definition: `crate_a::cljrs_init` and
+`crate_b::cljrs_init` become the same address, one crate's registration
+silently replaces the other's, and the second namespace is simply never
+defined. There is no error at build time and none at run time, only a missing
+namespace.
+
+Nothing in cljrs hardcodes the name. The loader takes the last `::` segment of
+`:rust :init` and looks that up, so the symbol name is data: any spelling works
+as long as it is unique across every extension that might share a binary.
+Deriving it from the crate name is the cheapest way to guarantee that.
 
 ## Calling native functions from Clojure
 
@@ -100,5 +120,5 @@ as `my.project/greet`. No `require` is needed unless you want a namespace alias:
 (native/add 3 4)                 ; => 7
 ```
 
-The namespace `my.project` is created automatically when `cljrs_init` is called;
+The namespace `my.project` is created automatically when the init function runs;
 you do not need to create or load a Clojure file for it.

@@ -119,7 +119,7 @@ pub enum TrustedSigner {
 pub struct RustConfig {
     /// Directory containing the user's Cargo.toml (resolved from cljrs.edn dir).
     pub crate_dir: PathBuf,
-    /// Fully-qualified init fn, e.g. "my_project::cljrs_init". Optional.
+    /// Fully-qualified init fn, e.g. "my_project::cljrs_init_my_project". Optional.
     pub init_fn:   Option<Arc<str>>,
 }
 
@@ -227,7 +227,7 @@ pub type VcsResult<T> = Result<T, VcsError>;
   ;; Native dep with opt-in pinned native code (the CLI's `native` module):
   my.native.lib {:git/url   "https://github.com/user/my-native-lib"
                  :git/sha   "abc1234ef"
-                 :rust/init "my_native_lib::cljrs_init"
+                 :rust/init "my_native_lib::cljrs_init_my_native_lib"
                  :rust/load :dylib}}
 
  ;; Optional: embed a Rust crate in this project.
@@ -238,7 +238,7 @@ pub type VcsResult<T> = Result<T, VcsError>;
  :main my.app.core
 
  :rust {:crate "."
-        :init  "my_project::cljrs_init"}
+        :init  "my_project::cljrs_init_my_project"}
 
  :aliases
  {:dev  {:extra-paths ["dev"]}

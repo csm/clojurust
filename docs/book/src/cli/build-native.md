@@ -24,7 +24,7 @@ mode. Use this when profiling or shipping.
 2. Reads `:rust :crate` (the directory containing the user's `Cargo.toml`)
    and `:rust :init` (the fully-qualified Rust path to the init function).
 3. Derives the crate name from the first `::` segment of the init path —
-   e.g. `"my_project::cljrs_init"` → `my_project`.
+   e.g. `"my_project::cljrs_init_my_project"` → `my_project`.
 4. Runs `cargo build [--release]` in the crate directory.
 5. Prints the output library path on success:
    - Linux: `target/debug/libmy_project.so`

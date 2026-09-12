@@ -88,5 +88,5 @@ the compiled program.
 ## Native Rust code
 
 If `cljrs.edn` contains a `:rust` key, `cljrs compile` links the declared Rust
-crate into the binary and calls its `cljrs_init` function before any Clojure
+crate into the binary and calls its init function before any Clojure
 code runs. See [AOT mode](../rust-interop/aot.md) for details.

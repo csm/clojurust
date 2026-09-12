@@ -63,6 +63,9 @@ cljrs-io      = { workspace = true }
 cljrs-net     = { workspace = true }
 cljrs-charset = { workspace = true }
 cljrs-base64  = { workspace = true }
+# Linked alongside cljrs-base64 by `extension_init_symbols_are_unique_per_crate`,
+# which is the only place two plugin crates share one binary.
+cljrs-blake3  = { workspace = true }
 tempfile = "3"
 wasmparser = "0.244"
 proptest = "1"

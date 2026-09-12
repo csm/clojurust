@@ -152,7 +152,7 @@ pub enum Commands {
     ///
     /// The user crate must declare `crate-type = ["cdylib"]` (or
     /// `["cdylib", "rlib"]`) and export a `#[no_mangle] pub extern "C" fn
-    /// cljrs_init(registry: *mut cljrs_interop::Registry)` entry point.
+    /// cljrs_init_<crate>(registry: *mut cljrs_interop::Registry)` entry point.
     BuildNative(commands::build_native::Args),
     /// Run the clojurust language server (LSP) over stdio.
     ///

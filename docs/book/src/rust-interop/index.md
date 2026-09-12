@@ -42,7 +42,7 @@ That is the [Embedding](../embedding/index.md) chapter, and it uses the same
 ```clojure
 {:paths ["src"]
  :rust  {:crate "."
-         :init  "my_project::cljrs_init"}}
+         :init  "my_project::cljrs_init_my_project"}}
 ```
 
 **`Cargo.toml` (user crate):**
@@ -59,7 +59,7 @@ cljrs-interop = { path = "/path/to/cljrs/crates/cljrs-interop" }
 use cljrs_interop::{Registry, wrap_fn2};
 
 #[no_mangle]
-pub extern "C" fn cljrs_init(registry: *mut Registry) {
+pub extern "C" fn cljrs_init_my_project(registry: *mut Registry) {
     let r = unsafe { &mut *registry };
     r.define("my.project/add",
         wrap_fn2("add", |a: i64, b: i64| Ok::<i64, String>(a + b)));

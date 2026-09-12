@@ -88,7 +88,7 @@ and anything that depends on a spawned task will not complete.
 
 The `Registry` is the same object described in [Rust
 interop](../rust-interop/registry.md), but an embedding host constructs it
-directly rather than exporting a `cljrs_init` symbol for a dylib to be loaded
+directly rather than exporting a `cljrs_init_<crate>` symbol for a dylib to be loaded
 through:
 
 ```rust

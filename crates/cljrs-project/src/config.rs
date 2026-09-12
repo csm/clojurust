@@ -43,7 +43,7 @@ pub struct GitDep {
     pub url: Arc<str>,
     pub sha: Arc<str>,
     /// `:rust/init` — fully-qualified path to the dep's native init function
-    /// (e.g. `"my_crate::cljrs_init"`), when the dep ships Rust code.
+    /// (e.g. `"my_crate::cljrs_init_my_crate"`), when the dep ships Rust code.
     pub rust_init: Option<Arc<str>>,
     /// `:rust/crate` — directory of the dep's Cargo.toml relative to its
     /// repository root (defaults to the root).
@@ -100,7 +100,7 @@ pub struct Alias {
 
 /// Rust-crate configuration for mixed Rust/Clojure projects.
 ///
-/// The `:init` value is a Rust path like `"my_project::cljrs_init"`. The
+/// The `:init` value is a Rust path like `"my_project::cljrs_init_my_project"`. The
 /// first `::` segment is the crate name used in `Cargo.toml` and when
 /// looking for the compiled shared library on disk.
 ///
@@ -108,7 +108,7 @@ pub struct Alias {
 ///
 /// ```edn
 /// :rust {:crate "."                        ; path to directory with Cargo.toml
-///        :init  "my_project::cljrs_init"}  ; optional hook-registration fn
+///        :init  "my_project::cljrs_init_my_project"}  ; optional hook-registration fn
 /// ```
 #[derive(Debug, Clone)]
 pub struct RustConfig {
@@ -116,7 +116,7 @@ pub struct RustConfig {
     /// `cljrs.edn` file.  Defaults to the `cljrs.edn` directory (`"."`).
     pub crate_dir: PathBuf,
     /// Fully-qualified Rust path to the init function, e.g.
-    /// `"my_project::cljrs_init"`.  When present, `cljrs compile` emits a
+    /// `"my_project::cljrs_init_my_project"`.  When present, `cljrs compile` emits a
     /// call to this function in the generated `main.rs` before loading any
     /// Clojure source.  Omit if you rely solely on `#[cljrs::export]`
     /// inventory-based registration (future feature).
@@ -126,7 +126,7 @@ pub struct RustConfig {
 impl RustConfig {
     /// Derive the Rust crate name from the init function path.
     ///
-    /// `"my_project::cljrs_init"` → `Some("my_project")`.
+    /// `"my_project::cljrs_init_my_project"` → `Some("my_project")`.
     /// Returns `None` when `init_fn` is absent.
     pub fn crate_name(&self) -> Option<&str> {
         self.init_fn

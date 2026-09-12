@@ -3,4 +3,4 @@
  :paths ["src"]
  :test-paths ["test"]
  :rust {:crate "."
-        :init "cljrs_base64::cljrs_init"}}
+        :init "cljrs_base64::cljrs_init_cljrs_base64"}}

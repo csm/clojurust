@@ -32,7 +32,7 @@ When `cljrs run` (or `repl`) starts:
    - macOS: `<crate_dir>/target/debug/lib<crate_name>.dylib`
    - Windows: `<crate_dir>/target/debug/<crate_name>.dll`
 3. It opens the library with `dlopen` and looks up the symbol named after the
-   last `::` segment of `:rust :init` (e.g. `"cljrs_init"`).
+   last `::` segment of `:rust :init` (e.g. `"cljrs_init_my_project"`).
 4. It calls the symbol with a `*mut Registry`, which registers all native
    functions into the global namespace table.
 5. The library is kept loaded for the lifetime of the process.

@@ -2241,7 +2241,7 @@ edition = "2024"
     };
 
     // Emit the native init call when :rust :init is configured.  The init
-    // function has the signature `fn cljrs_init(registry: &mut Registry)`
+    // function has the signature `fn cljrs_init_<crate>(registry: &mut Registry)`
     // and is called before the preamble so native functions are visible to
     // macro-expanded code at startup.
     let native_init_code = match rust_config.and_then(|rc| rc.init_fn.as_deref()) {

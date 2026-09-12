@@ -4,12 +4,12 @@
 //! # Usage
 //!
 //! User crates that embed Rust code alongside Clojure sources implement a
-//! `cljrs_init` function matching the [`InitFn`] signature:
+//! `cljrs_init_<crate>` function matching the [`InitFn`] signature:
 //!
 //! ```rust,ignore
 //! use cljrs_interop::{Registry, wrap_fn1};
 //!
-//! pub fn cljrs_init(registry: &mut Registry) {
+//! pub fn cljrs_init_my_project(registry: &mut Registry) {
 //!     registry.define("my.project/greet", wrap_fn1("greet", |name: String| {
 //!         Ok::<String, String>(format!("Hello, {name}!"))
 //!     }));
@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The `cljrs compile` toolchain reads the `:rust :init` key from `cljrs.edn`
-//! (e.g. `"my_project::cljrs_init"`) and emits a generated `main.rs` that calls
+//! (e.g. `"my_project::cljrs_init_my_project"`) and emits a generated `main.rs` that calls
 //! it before loading any Clojure source.
 
 use std::sync::Arc;
@@ -32,12 +32,12 @@ use crate::exports::register_exports;
 
 /// The expected signature of a Rust-side hook-registration function.
 ///
-/// Name your function `cljrs_init` and list it under `:rust :init` in
+/// Name your function `cljrs_init_<crate>` and list it under `:rust :init` in
 /// `cljrs.edn` so the build toolchain can wire it up automatically:
 ///
 /// ```edn
 /// :rust {:crate "."
-///        :init  "my_crate::cljrs_init"}
+///        :init  "my_crate::cljrs_init_my_crate"}
 /// ```
 pub type InitFn = fn(&mut Registry);
 

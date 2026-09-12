@@ -94,7 +94,7 @@ valid clojurust EDN:
 
  ; Optional: embed a Rust crate for native interop
  :rust {:crate "."
-        :init  "my_project::cljrs_init"}}
+        :init  "my_project::cljrs_init_my_project"}}
 ```
 
 ### Keys
@@ -121,7 +121,7 @@ are rejected.
 
 ```clojure
 :rust {:crate "."                       ; path to Cargo.toml directory
-       :init  "my_project::cljrs_init"} ; Rust path to the init function
+       :init  "my_project::cljrs_init_my_project"} ; Rust path to the init function
 ```
 
 | Sub-key | Description |

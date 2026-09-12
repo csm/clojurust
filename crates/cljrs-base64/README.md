@@ -8,13 +8,13 @@ Exposes standard and URL-safe Base64 encode/decode functions to Clojure code und
 
 ## Status
 
-Phase 1 — implemented. Linked statically into the `cljrs` binary via the `base64` feature (enabled by default) and also loadable as a dynamic plugin via the `cljrs_init` FFI entry point.
+Phase 1 — implemented. Linked statically into the `cljrs` binary via the `base64` feature (enabled by default) and also loadable as a dynamic plugin via the `cljrs_init_cljrs_base64` FFI entry point.
 
 ## File layout
 
 | File | Description |
 |---|---|
-| `src/lib.rs` | All implementation: byte-conversion helpers, `init`, `register`, and the `cljrs_init` FFI entry point |
+| `src/lib.rs` | All implementation: byte-conversion helpers, `init`, `register`, and the `cljrs_init_cljrs_base64` FFI entry point |
 
 ## Public API
 
@@ -30,7 +30,7 @@ pub fn register(registry: &mut Registry);
 
 /// C-ABI entry point for dynamic plugin loading.
 #[no_mangle]
-pub unsafe extern "C" fn cljrs_init(registry: *mut Registry);
+pub unsafe extern "C" fn cljrs_init_cljrs_base64(registry: *mut Registry);
 ```
 
 ### Clojure functions

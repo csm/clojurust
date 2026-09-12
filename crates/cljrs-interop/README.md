@@ -19,7 +19,7 @@ src/
                  register_provenance! macro
   marshal.rs   — FromValue / IntoValue traits with impls for common Rust types
   register.rs  — wrap_fn0..wrap_fn3, wrap_fn_variadic: auto-marshalling function wrappers
-  registry.rs  — Registry struct and InitFn type alias for cljrs_init convention
+  registry.rs  — Registry struct and InitFn type alias for the cljrs_init_<crate> convention
 ```
 
 The `NativeObject` trait and `NativeObjectBox` wrapper live in `cljrs-value::native_object`
@@ -77,7 +77,7 @@ These accept closures (not just bare `fn` pointers) since `NativeFnFunc` is now
 ### `#[export]` proc-macro and `register_exports`
 
 Annotate any free Rust function with `#[export(ns = "...")]` to register it
-automatically. Then call `register_exports` once inside `cljrs_init`:
+automatically. Then call `register_exports` once inside the init function:
 
 ```rust
 use cljrs_interop::{export, register_exports, Registry};
@@ -88,7 +88,7 @@ pub fn add(a: i64, b: i64) -> Result<i64, String> { Ok(a + b) }
 #[export(ns = "math")]
 pub fn pi() -> f64 { std::f64::consts::PI }
 
-pub fn cljrs_init(registry: &mut Registry) {
+pub fn cljrs_init_my_project(registry: &mut Registry) {
     register_exports(registry);
 }
 ```
@@ -120,14 +120,14 @@ pub struct ProvenanceEntry { pub ns: &'static str, pub commit: &'static str }
 // Declare once per exported namespace (commit typically from build.rs):
 cljrs_interop::register_provenance!("math", env!("CLJRS_PKG_COMMIT"));
 
-// Or imperatively inside cljrs_init:
+// Or imperatively inside the init function:
 registry.set_provenance("math", commit);
 ```
 
 ### Registry and InitFn
 
 The entry point for mixed Rust/Clojure projects.  User crates implement a
-`cljrs_init` function and list it under `:rust :init` in `cljrs.edn`; the
+`cljrs_init_<crate>` function and list it under `:rust :init` in `cljrs.edn`; the
 build toolchain calls it before loading any Clojure source.
 
 ```rust
@@ -171,7 +171,7 @@ impl Registry {
 // user's lib.rs
 use cljrs_interop::{Registry, wrap_fn1, wrap_fn2};
 
-pub fn cljrs_init(registry: &mut Registry) {
+pub fn cljrs_init_my_project(registry: &mut Registry) {
     registry.define("my.project/greet",
         wrap_fn1("greet", |name: String| Ok::<String, String>(format!("Hello, {name}!"))));
     registry.define("my.project/add",
@@ -183,7 +183,7 @@ pub fn cljrs_init(registry: &mut Registry) {
 ;; cljrs.edn
 {:paths ["src"]
  :rust  {:crate "."
-         :init  "my_project::cljrs_init"}}
+         :init  "my_project::cljrs_init_my_project"}}
 ```
 
 ### Versioned symbols and native functions

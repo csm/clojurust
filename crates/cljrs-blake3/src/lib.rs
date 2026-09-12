@@ -110,14 +110,14 @@ fn hash_to_byte_vec(hash: &blake3::Hash) -> Vec<Value> {
         .collect()
 }
 
-// ── cljrs_init ────────────────────────────────────────────────────────────────
+// ── init entry points ─────────────────────────────────────────────────────────
 
 /// Register all `blake3` namespace functions into the Clojure runtime.
 ///
 /// Use this when calling from another Rust crate that holds a `Registry`
 /// directly (e.g. integration tests, AOT-compiled binaries). The dynamic
-/// `cljrs build-native` loader uses the `extern "C"` `cljrs_init` wrapper
-/// below instead.
+/// `cljrs build-native` loader uses the `extern "C"` `cljrs_init_cljrs_blake3`
+/// wrapper below instead.
 pub fn register(registry: &mut Registry) {
     // blake3/hash — one-shot hash of a string or byte vector → 64-char hex
     registry.define(
@@ -232,8 +232,11 @@ pub fn register(registry: &mut Registry) {
 /// `cljrs.edn`:
 /// ```edn
 /// {:rust {:crate "."
-///         :init  "cljrs_blake3::cljrs_init"}}
+///         :init  "cljrs_blake3::cljrs_init_cljrs_blake3"}}
 /// ```
+///
+/// The name carries the crate on purpose; see `cljrs_base64::cljrs_init_cljrs_base64`
+/// for why a shared `cljrs_init` silently collides instead of failing to link.
 ///
 /// # Safety
 /// `registry` must be a valid, non-null `*mut Registry` and must remain
@@ -241,6 +244,6 @@ pub fn register(registry: &mut Registry) {
 /// both: it allocates the `Registry` on its stack and hands the only pointer
 /// to it across the FFI boundary.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cljrs_init(registry: *mut Registry) {
+pub unsafe extern "C" fn cljrs_init_cljrs_blake3(registry: *mut Registry) {
     register(unsafe { &mut *registry });
 }

@@ -126,12 +126,33 @@ pub fn register(registry: &mut Registry) {
     registry.env().mark_loaded("cljrs.base64");
 }
 
+/// C-ABI entry point, loaded dynamically by `cljrs build-native` / `cljrs run`.
+///
+/// `cljrs.edn`:
+/// ```edn
+/// {:rust {:crate "."
+///         :init  "cljrs_base64::cljrs_init_cljrs_base64"}}
+/// ```
+///
+/// The name carries the crate, and that is the whole point of it. This symbol
+/// is `no_mangle`, so every extension crate that spelled it `cljrs_init` would
+/// export the SAME symbol. Two such crates link into one binary without any
+/// error: the linker resolves both references to a single definition, so
+/// `other_crate::cljrs_init` and this one become the same address and one
+/// plugin's registration silently replaces the other's. Naming the symbol after
+/// the crate makes that collision impossible to express rather than merely
+/// unlikely.
+///
+/// Nothing in the loader hardcodes the name: it takes the last `::` segment of
+/// `:rust :init`, so the name is data and an extension may choose any unique
+/// spelling.
+///
 /// # Safety
 /// `registry` must be a valid, non-null `*mut Registry` and must remain
 /// uniquely borrowed for the duration of the call. The cljrs CLI satisfies
 /// both: it allocates the `Registry` on its stack and hands the only pointer
 /// to it across the FFI boundary.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cljrs_init(registry: *mut Registry) {
+pub unsafe extern "C" fn cljrs_init_cljrs_base64(registry: *mut Registry) {
     register(unsafe { &mut *registry });
 }

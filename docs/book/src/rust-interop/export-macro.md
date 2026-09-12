@@ -17,8 +17,8 @@ pub fn add(a: i64, b: i64) -> Result<i64, String> {
 ```
 
 `add` is now visible in Clojure as `math/add` as soon as the shared library is
-loaded or the AOT binary starts. No `cljrs_init` is required unless you have
-other setup to perform (see [When `cljrs_init` is still needed](#when-cljrs_init-is-still-needed)).
+loaded or the AOT binary starts. No init function is required unless you have
+other setup to perform (see [When an init function is still needed](#when-an-init-function-is-still-needed)).
 
 ## Attribute options
 
@@ -118,9 +118,9 @@ pub fn sum(args: &[Value]) -> Result<Value, String> {
 (math/sum 1 2 3 4 5)   ; => 15
 ```
 
-## When `cljrs_init` is still needed
+## When an init function is still needed
 
-`#[export]` handles function registration. A `cljrs_init` is still required when
+`#[export]` handles function registration. An init function is still required when
 you need to:
 
 - Call `mark_loaded` so `require` treats a namespace as built-in rather than
@@ -132,7 +132,7 @@ you need to:
 use cljrs_interop::Registry;
 
 #[no_mangle]
-pub extern "C" fn cljrs_init(registry: *mut Registry) {
+pub extern "C" fn cljrs_init_my_project(registry: *mut Registry) {
     let r = unsafe { &mut *registry };
     // #[export] functions are already registered — Registry::new ran first.
     r.env().mark_loaded("math");
@@ -140,9 +140,9 @@ pub extern "C" fn cljrs_init(registry: *mut Registry) {
 }
 ```
 
-> **Note:** The `*mut Registry` passed to `cljrs_init` is the same `Registry`
+> **Note:** The `*mut Registry` passed to the init function is the same `Registry`
 > created by the runtime before calling your function. All `#[export]` entries
-> are already interned when `cljrs_init` is invoked.
+> are already interned when the init function is invoked.
 
 ## Mixing `#[export]` with manual `define`
 
@@ -161,7 +161,7 @@ pub fn increment(n: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn cljrs_init(registry: *mut Registry) {
+pub extern "C" fn cljrs_init_my_project(registry: *mut Registry) {
     let r = unsafe { &mut *registry };
 
     // Stateful closure that captures a value created at init time.

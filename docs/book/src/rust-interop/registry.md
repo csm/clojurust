@@ -1,6 +1,6 @@
 # Registry API
 
-The `Registry` type (from `cljrs_interop`) is the handle passed to `cljrs_init`
+The `Registry` type (from `cljrs_interop`) is the handle passed to the init function
 for registering Rust functions as Clojure-visible values.
 
 ## `Registry` methods

@@ -172,7 +172,7 @@ impl CompileSession {
         }
     }
 
-    /// Depend on the user's Rust crate and call its `cljrs_init` hook before
+    /// Depend on the user's Rust crate and call its `cljrs_init_<crate>` hook before
     /// loading any Clojure code (`:rust` in `cljrs.edn`).
     pub fn rust_config(mut self, config: Option<cljrs_project::config::RustConfig>) -> Self {
         self.rust_config = config;

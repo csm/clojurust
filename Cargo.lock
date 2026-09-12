@@ -825,6 +825,7 @@ version = "0.1.0"
 dependencies = [
  "cljrs-async",
  "cljrs-base64",
+ "cljrs-blake3",
  "cljrs-charset",
  "cljrs-gc",
  "cljrs-io",

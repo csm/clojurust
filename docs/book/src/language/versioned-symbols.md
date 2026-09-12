@@ -89,7 +89,7 @@ Rust toolchain at runtime):
 {:deps
  {my.native.lib {:git/url   "https://github.com/user/my-native-lib"
                  :git/sha   "abc1234ef"
-                 :rust/init "my_native_lib::cljrs_init"
+                 :rust/init "my_native_lib::cljrs_init_my_native_lib"
                  :rust/load :dylib}}}
 ```
 

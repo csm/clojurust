@@ -75,7 +75,7 @@ fn target_dir_from_metadata(json: &str) -> Option<PathBuf> {
 }
 
 /// Load the shared library declared by the project's `:rust` config and call
-/// its `cljrs_init`
+/// its `cljrs_init_<crate>`
 /// entry point to register native functions into `globals`.
 ///
 /// A missing library emits a warning and returns — callers of unregistered
@@ -88,7 +88,7 @@ pub fn load_project_lib(rust_config: &cljrs_project::config::RustConfig, globals
     let Some(crate_name) = rust_config.crate_name() else {
         return;
     };
-    // Symbol name is the last segment of the Rust path, e.g. "cljrs_init".
+    // Symbol name is the last segment of the Rust path, e.g. "cljrs_init_my_project".
     let sym_name = init_fn.rsplit("::").next().unwrap_or(init_fn);
 
     let lib_path = native_lib_path(&rust_config.crate_dir, crate_name, false);

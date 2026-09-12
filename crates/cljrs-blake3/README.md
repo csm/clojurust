@@ -12,7 +12,7 @@ crate and registers the `blake3` Clojure namespace.
 
 ```
 src/
-  lib.rs                          — NativeObject impl, helper fns, cljrs_init
+  lib.rs                          — NativeObject impl, helper fns, cljrs_init_cljrs_blake3
 test/
   cljrs/
     blake3_test.cljrs             — clojure.test suite (known vectors + properties)
@@ -35,7 +35,7 @@ pub fn register(registry: &mut cljrs_interop::Registry);
 /// C-ABI entry point looked up by `cljrs build-native` / `cljrs run`. Calls
 /// `register` internally.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cljrs_init(registry: *mut cljrs_interop::Registry);
+pub unsafe extern "C" fn cljrs_init_cljrs_blake3(registry: *mut cljrs_interop::Registry);
 ```
 
 ### Clojure namespace: `blake3`
@@ -90,13 +90,13 @@ Add to your `cljrs.edn`:
 ```edn
 {:paths ["src"]
  :rust  {:crate "path/to/cljrs-blake3"
-         :init  "cljrs_blake3::cljrs_init"}}
+         :init  "cljrs_blake3::cljrs_init_cljrs_blake3"}}
 ```
 
 Or call `register` directly from your own init hook:
 
 ```rust
-pub fn cljrs_init(registry: &mut Registry) {
+pub fn cljrs_init_cljrs_blake3(registry: &mut Registry) {
     cljrs_blake3::register(registry);
     // … your own registrations …
 }
