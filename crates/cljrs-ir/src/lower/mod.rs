@@ -8,6 +8,7 @@ pub mod async_lower;
 pub mod context;
 pub mod escape;
 pub mod inline;
+pub mod interop;
 pub mod known;
 pub mod optimize;
 pub mod regionalize;
@@ -21,6 +22,7 @@ pub use escape::{
     AnalysisResult, EscapeContext, EscapeState, ExternalDefn, UseInfo, UseKind, analyze,
 };
 pub use inline::inline;
+pub use interop::is_method_sugar;
 pub use known::CoreShadows;
 pub use optimize::{optimize, optimize_with_externals};
 

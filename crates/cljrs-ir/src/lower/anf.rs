@@ -742,7 +742,7 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
         // these to the tree-walker's method dispatch; Cranelift/wasm codegen
         // reject the unknown name, so such functions decline JIT compilation
         // instead of miscompiling to a nil call.
-        _ if sym.starts_with('.') && sym.len() > 1 && sym != ".." => {
+        _ if crate::lower::is_method_sugar(sym) => {
             if args.is_empty() {
                 return Err(LowerError::MalformedSpecialForm(format!(
                     "{sym} requires a target object"

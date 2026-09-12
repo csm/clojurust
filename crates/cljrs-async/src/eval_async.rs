@@ -470,6 +470,27 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// special spreading/atom handling those builtins require. Such calls do not
 /// yield on awaits inside their arguments in Phase B.
 async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env) -> EvalResult {
+    // Interop: `(.method target args…)` / `(.-field target)`. The head names a
+    // method, not a value, so it must be routed before the callee is
+    // evaluated — `eval` on it raises `UnboundSymbol`. Mirrors `eval_call`;
+    // the target and arguments still take the yielding path, so an `await`
+    // inside either cooperates.
+    if let FormKind::Symbol(s) = &head.kind
+        && cljrs_runtime::interp::apply::is_method_sugar(s)
+    {
+        let Some((target_form, arg_forms)) = args.split_first() else {
+            return Err(EvalError::Runtime(format!("{s} requires a target object")));
+        };
+        let target = Box::pin(eval_async(target_form, env)).await?;
+        let _target_root = cljrs_runtime::env::gc_roots::root_value(&target);
+        let mut argv: Vec<Value> = Vec::with_capacity(arg_forms.len());
+        for a in arg_forms {
+            let _args_root = cljrs_runtime::env::gc_roots::root_values(&argv);
+            argv.push(Box::pin(eval_async(a, env)).await?);
+        }
+        return cljrs_runtime::interp::apply::dispatch_method(&s[1..], &target, &argv);
+    }
+
     let callee = eval(head, env)?;
     match &callee {
         Value::NativeFunction(nf)

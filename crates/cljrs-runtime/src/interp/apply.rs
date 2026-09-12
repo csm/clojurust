@@ -226,11 +226,9 @@ pub fn is_form_intercepted(name: &str) -> bool {
 pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalResult {
     // Interop: (.methodName target args...) — method call syntax.
     if let FormKind::Symbol(s) = &func_form.kind
-        && let Some(method) = s.strip_prefix('.')
-        && !method.is_empty()
-        && method != "."
+        && is_method_sugar(s)
     {
-        return eval_method_call(method, arg_forms, env);
+        return eval_method_call(&s[1..], arg_forms, env);
     }
 
     // Evaluate the callee first.
@@ -331,6 +329,12 @@ fn eval_method_call(method: &str, arg_forms: &[Form], env: &mut Env) -> EvalResu
 
     dispatch_method(method, &target, &args)
 }
+
+/// The `.method` / `.-field` head predicate.
+///
+/// Re-exported from `cljrs_ir::lower` so the evaluator, the async evaluator,
+/// the ANF lowerer and the AOT driver all read one definition.
+pub use cljrs_ir::lower::is_method_sugar;
 
 /// Dispatch `(.method target args…)` on an already-evaluated target.
 ///

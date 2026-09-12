@@ -54,6 +54,9 @@ src/
                   whether a head symbol really is a clojure.core name
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites
+    interop.rs  — `is_method_sugar`: the one definition of the `.method` /
+                  `.-field` head predicate, read by anf.rs, by cljrs-runtime's
+                  evaluator and async evaluator, and by the AOT driver
     known.rs    — symbol → KnownFn resolution, the `clojure.core` qualifier
                   check (core_name) and CoreShadows (what the lowering
                   namespace binds instead of core)

@@ -1403,7 +1403,7 @@ fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
                 // either dot-marks them as `CallDirect`s codegen cannot
                 // resolve or rejects them outright.  Run any form
                 // containing one in the interpreted preamble.
-                if (s.len() > 1 && s != ".." && s.starts_with('.'))
+                if cljrs_ir::lower::is_method_sugar(s.as_str())
                     || matches!(s.as_str(), "." | "reify" | "deftype" | "defn-")
                 {
                     return true;

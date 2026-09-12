@@ -1020,6 +1020,7 @@ implement sentinel operations without hitting the stub errors registered in
 | `eval_with_bindings_star(args, env)` | `with-bindings*` — push binding frame, call f |
 | `eval_send_to_agent(args, env)` | `send` / `send-off` — dispatch action to agent |
 | `dispatch_method(method, target, args)` | `(.method target args…)` — interop method dispatch on an evaluated target (strings, vectors, seqs); on a `TypeInstance` only `.-field` reads are supported (mutable cell first, then the field map) |
+| `is_method_sugar(head)` | re-exported from `cljrs_ir::lower`: whether a head symbol is the `.method` / `.-field` sugar (`..` and a bare `.` are not). One definition, read by `eval_call`, `cljrs-async`'s `eval_call_async`, the ANF lowerer and the AOT driver |
 
 `make_lazy_seq_from_fn(f, globals, ns)` (already public) creates a `LazySeq`
 from a zero-arg callable; the above `make_delay_from_fn` is the analogous
