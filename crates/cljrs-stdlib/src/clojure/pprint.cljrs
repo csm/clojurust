@@ -1,0 +1,130 @@
+;; clojure.pprint — pretty printing for data.
+;;
+;; The namespace did not exist, so any library that pretty-prints anything
+;; failed at `(:require [clojure.pprint ...])` rather than degrading. That is
+;; the gap this closes.
+;;
+;; WHAT THIS IS: a data pretty-printer. `pprint` renders a value so that
+;; anything fitting inside `*print-right-margin*` stays on one line, and
+;; anything longer breaks one element per line, aligned under the opening
+;; delimiter. That is the behaviour people actually reach for `pprint` for.
+;;
+;; WHAT THIS IS NOT, stated plainly so nobody discovers it the hard way:
+;;
+;;   - `cl-format` and the `~` directive language are absent.
+;;   - the *code* dispatch (`*print-pprint-dispatch*`, `code-dispatch`,
+;;     `with-pprint-dispatch`) is absent; this always uses data dispatch.
+;;   - `pprint-logical-block`, `pprint-newline` and the rest of the public
+;;     pretty-printer construction API are absent.
+;;   - `*print-miser-width*`, `*print-suppress-namespaces*` and the other
+;;     dial vars are absent rather than accepted-and-ignored, so code that
+;;     sets one fails loudly instead of silently printing something else.
+;;
+;; The layout algorithm is the classic "fits, or break": measure the flat
+;; rendering, print it if it fits in the remaining width, otherwise break the
+;; collection and lay the children out at the deeper indent. It is not
+;; Waterman's algorithm and makes no attempt at miser mode or fill mode.
+
+(ns clojure.pprint
+  (:require [clojure.string :as str]))
+
+(def ^:dynamic *print-right-margin*
+  "Right margin, in columns, that `pprint` tries to keep output within.
+
+  A value wider than this is broken across lines; a value that fits is left
+  alone. Rebind it with `binding`."
+  72)
+
+(defn- breakable?
+  "Whether `x` is something `pprint` may split across lines.
+
+  Records are tested separately from `coll?` on purpose: in this runtime
+  `(coll? some-record)` is false while `(map? some-record)` is true, so a
+  record would otherwise never break no matter how wide it printed."
+  [x]
+  (or (coll? x) (record? x)))
+
+(defn- delims
+  "The opening and closing delimiters to wrap `x`'s children in.
+
+  A record's opener carries its printed tag (`#Person{`) so that a broken
+  record still reads back the way `pr-str` wrote it."
+  [x]
+  (cond
+    (record? x) (let [flat (pr-str x)]
+                  [(subs flat 0 (inc (str/index-of flat "{"))) "}"])
+    (map? x) ["{" "}"]
+    (set? x) ["#{" "}"]
+    (vector? x) ["[" "]"]
+    :else ["(" ")"]))
+
+(defn- layout
+  "Render `x` starting at column `indent`, breaking only where it must.
+
+  Children are aligned under the opening delimiter, and a map's value is
+  aligned after its key, which is what makes a nested map read as a column
+  rather than a staircase."
+  [x indent]
+  (let [flat (pr-str x)]
+    (if (or (not (breakable? x))
+            (<= (+ indent (count flat)) *print-right-margin*))
+      flat
+      (let [[open close] (delims x)
+            inner (+ indent (count open))
+            pad (apply str (repeat inner " "))
+            parts (if (map? x)
+                    (map (fn [pair]
+                           (let [k (first pair)
+                                 v (second pair)
+                                 ks (pr-str k)]
+                             (str ks " " (layout v (+ inner (count ks) 1)))))
+                         (seq x))
+                    (map (fn [child] (layout child inner)) (seq x)))]
+        (str open (str/join (str "\n" pad) parts) close)))))
+
+(defn pprint
+  "Pretty print `x` to `*out*`, followed by a newline.
+
+  Output stays within `*print-right-margin*` where the value allows it."
+  [x]
+  (println (layout x 0)))
+
+(defn pprint-str
+  "The string `pprint` would print, without printing it.
+
+  Not part of Clojure's API. It is here because the alternative in this
+  runtime is `with-out-str` around `pprint`, and every caller writing that
+  wrapper by hand is a caller who can get the margin handling subtly wrong."
+  [x]
+  (layout x 0))
+
+(defn print-table
+  "Print `rows` as a table, one row per map, columns in `ks` order.
+
+  Mirrors Clojure's layout: a header row, a `|---+---|` separator, then the
+  data, each cell right-aligned in a column as wide as its widest member.
+  With one argument the columns are the keys of the first row, so a ragged
+  later row simply renders blanks for keys the header did not name."
+  ([rows] (print-table (keys (first rows)) rows))
+  ([ks rows]
+   (when (seq rows)
+     (let [widths (map (fn [k]
+                         (apply max
+                                (count (str k))
+                                (map (fn [row] (count (str (get row k)))) rows)))
+                       ks)
+           spacers (map (fn [w] (apply str (repeat w "-"))) widths)
+           fmts (map (fn [w] (str "%" w "s")) widths)
+           fmt-row (fn [leader divider trailer row]
+                     (str leader
+                          (apply str
+                                 (interpose divider
+                                            (map (fn [k f] (format f (str (get row k))))
+                                                 ks
+                                                 fmts)))
+                          trailer))]
+       (println)
+       (println (fmt-row "| " " | " " |" (zipmap ks ks)))
+       (println (fmt-row "|-" "-+-" "-|" (zipmap ks spacers)))
+       (doseq [row rows]
+         (println (fmt-row "| " " | " " |" row)))))))

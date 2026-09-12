@@ -47,6 +47,7 @@ const CLOJURE_RUST_IO_SRC: &str = include_str!("clojure/rust/io.cljrs");
 #[cfg(not(target_arch = "wasm32"))]
 const CLOJURE_EDN_SRC: &str = include_str!("clojure/edn.cljrs");
 const CLOJURE_WALK_SRC: &str = include_str!("clojure/walk.cljrs");
+const CLOJURE_PPRINT_SRC: &str = include_str!("clojure/pprint.cljrs");
 const CLOJURE_DATA_SRC: &str = include_str!("clojure/data.cljrs");
 const COLJURE_ZIP_SRC: &str = include_str!("clojure/zip.cljrs");
 const CLOJURE_SPEC_ALPHA_SRC: &str = include_str!("clojure/spec/alpha.cljrs");
@@ -112,6 +113,9 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 
     // clojure.data ─ pure Clojure, no native helpers.
     globals.register_builtin_source("clojure.data", CLOJURE_DATA_SRC);
+
+    // clojure.pprint ─ pure Clojure; data dispatch only, no cl-format.
+    globals.register_builtin_source("clojure.pprint", CLOJURE_PPRINT_SRC);
 
     // clojure.zip
     globals.register_builtin_source("clojure.zip", COLJURE_ZIP_SRC);
