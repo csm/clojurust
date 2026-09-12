@@ -768,24 +768,32 @@ pub fn select_arity(f: &CljxFn, argc: usize) -> EvalResult<&CljxFnArity> {
             return Ok(arity);
         }
     }
-    // Build expected string.
+    // Build expected string.  A macro's params carry the two implicit leading
+    // arguments `&form` and `&env` (see `macro_apply`); the caller never wrote
+    // them, so both the expected arities and the count reported back are the
+    // ones a reader of the source can see.
+    let implicit = if f.is_macro { IMPLICIT_MACRO_ARGS } else { 0 };
     let expected: Vec<String> = f
         .arities
         .iter()
         .map(|a| {
+            let fixed = a.params.len().saturating_sub(implicit);
             if a.rest_param.is_some() {
-                format!("{}+", a.params.len())
+                format!("{fixed}+")
             } else {
-                a.params.len().to_string()
+                fixed.to_string()
             }
         })
         .collect();
     Err(EvalError::Arity {
         name: name.to_string(),
         expected: expected.join(" or "),
-        got: argc,
+        got: argc.saturating_sub(implicit),
     })
 }
+
+/// `&form` and `&env`, prepended to every macro call by `macro_apply`.
+const IMPLICIT_MACRO_ARGS: usize = 2;
 
 /// Expand a macro: convert unevaluated arg forms to values, call the macro fn,
 /// then convert the resulting Value back to a Form.

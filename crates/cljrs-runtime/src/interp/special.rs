@@ -7,7 +7,7 @@ use crate::builtins::form::{
     expand_pairs, expand_reader_conds, expand_reader_conds_cow, form_to_value, resolve_auto_forms,
     select_reader_cond,
 };
-use crate::env::env::{Env, GlobalEnv, RequireRefer, RequireSpec};
+use crate::env::env::{Env, RequireRefer, RequireSpec};
 use crate::env::error::{EvalError, EvalResult};
 use crate::env::loader::load_ns;
 use crate::interp::destructure::bind_pattern;
@@ -17,8 +17,8 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, MultiFn, Protocol, ProtocolFn,
-    ProtocolMethod, ReferClojureFilter, TypeHint, TypeInstance, Value, ValueError,
+    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, Protocol, ProtocolMethod,
+    ReferClojureFilter, TypeHint, Value, ValueError,
 };
 
 /// Dispatch to the right special-form handler.
@@ -49,14 +49,8 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
         "letfn" => eval_letfn(args, env),
         "in-ns" => eval_in_ns(args, env),
         "alias" => eval_alias(args, env),
-        "defprotocol" => eval_defprotocol(args, env),
-        "extend-type" => eval_extend_type(args, env),
-        "extend-protocol" => eval_extend_protocol(args, env),
-        "defmulti" => eval_defmulti(args, env),
-        "defmethod" => eval_defmethod(args, env),
-        "defrecord" => eval_defrecord(args, env),
-        "deftype" => eval_deftype(args, env),
-        "reify" => eval_reify(args, env),
+        "protocol*" => eval_protocol_star(args, env),
+        "deftype*" => eval_deftype_star(args, env),
         "load-file" => eval_load_file(args, env),
         "binding" => eval_binding(args, env),
         "with-out-str" => eval_with_out_str(args, env),
@@ -1917,214 +1911,87 @@ fn extract_ns_name(v: &Value) -> EvalResult<String> {
     }
 }
 
-// ── defprotocol ───────────────────────────────────────────────────────────────
+// ── protocol* ─────────────────────────────────────────────────────────────────
 
-fn eval_defprotocol(args: &[Form], env: &mut Env) -> EvalResult {
-    // (defprotocol Name "doc?" (method [this & args] "doc?") ...)
-    let (name, name_meta) = require_sym_meta(args, 0, "defprotocol", env)?;
-    let proto_name: Arc<str> = Arc::from(name.as_str());
-
-    // Skip optional docstring.
-    let methods_start = if args.len() > 1 && args[1].as_string().is_some() {
-        2
-    } else {
-        1
+/// Read a `{:name "m" :min-arity n :variadic b}` map into a `ProtocolMethod`.
+fn protocol_method_of(spec: &Value) -> EvalResult<ProtocolMethod> {
+    let Value::Map(m) = spec.unwrap_meta() else {
+        return Err(EvalError::Runtime(format!(
+            "protocol* method spec must be a map, got {}",
+            spec.type_name()
+        )));
     };
-
-    let mut methods: Vec<ProtocolMethod> = Vec::new();
-    let mut extend_via_metadata = false;
-
-    let rest = &args[methods_start..];
-    let mut i = 0;
-    while i < rest.len() {
-        // Protocol options are flat `:keyword value` pairs interspersed
-        // among the method signatures, e.g. `:extend-via-metadata true`.
-        if let Some(kw) = rest[i].as_keyword() {
-            if kw == "extend-via-metadata" {
-                extend_via_metadata = matches!(
-                    rest.get(i + 1).map(|f| &f.unmeta().kind),
-                    Some(FormKind::Bool(true))
-                );
-            }
-            i += 2;
-            continue;
+    let field = |k: &str| m.get(&Value::keyword(Keyword::simple(k)));
+    let name: Arc<str> = match field("name") {
+        Some(Value::Str(s)) => Arc::from(s.get().as_str()),
+        Some(Value::Symbol(s)) => Arc::from(s.get().name.as_ref()),
+        Some(Value::Keyword(k)) => Arc::from(k.get().name.as_ref()),
+        _ => {
+            return Err(EvalError::Runtime(
+                "protocol* method spec needs a :name".into(),
+            ));
         }
-        let form = &rest[i];
-        i += 1;
-        // Each method spec is (method-name [params...] "doc"?)
-        let parts = match form.as_list() {
-            Some(parts) => parts,
-            None => continue, // skip unknown forms
-        };
-        if parts.is_empty() {
-            continue;
-        }
-        let method_name: Arc<str> = match parts[0].as_symbol() {
-            Some(s) => Arc::from(s),
-            None => continue,
-        };
-        // Find the parameter vector (first vector in parts).
-        let (min_arity, variadic) = match parts.iter().find_map(|f| f.as_vector()) {
-            Some(param_forms) => {
-                let is_amp = |p: &Form| p.as_symbol() == Some("&");
-                let variadic = param_forms.iter().any(is_amp);
-                let fixed = param_forms.iter().filter(|p| !is_amp(p)).count();
-                (fixed, variadic)
-            }
-            None => (1, false),
-        };
-        methods.push(ProtocolMethod {
-            name: method_name,
-            min_arity,
-            variadic,
-        });
-    }
-
-    let ns: Arc<str> = env.current_ns.clone();
-    let proto = Protocol::new(proto_name.clone(), ns, methods.clone(), extend_via_metadata);
-    let proto_ptr = GcPtr::new(proto);
-
-    // Intern the protocol itself.
-    let proto_var = env.globals.intern(
-        &env.current_ns,
-        proto_name.clone(),
-        Value::Protocol(proto_ptr.clone()),
+    };
+    let min_arity = match field("min-arity") {
+        Some(Value::Long(n)) if n >= 0 => n as usize,
+        _ => 1,
+    };
+    let variadic = !matches!(
+        field("variadic"),
+        None | Some(Value::Nil) | Some(Value::Bool(false))
     );
-    if let Some(meta_val) = name_meta {
-        proto_var.get().set_meta(meta_val);
-    }
-
-    // Create and intern a ProtocolFn for each method.
-    for method in &methods {
-        let pf = ProtocolFn {
-            protocol: proto_ptr.clone(),
-            method_name: method.name.clone(),
-            min_arity: method.min_arity,
-            variadic: method.variadic,
-        };
-        env.globals.intern(
-            &env.current_ns,
-            method.name.clone(),
-            Value::ProtocolFn(GcPtr::new(pf)),
-        );
-    }
-
-    Ok(Value::Var(proto_var))
+    Ok(ProtocolMethod {
+        name,
+        min_arity,
+        variadic,
+    })
 }
 
-// ── extend-type ───────────────────────────────────────────────────────────────
-
-fn eval_extend_type(args: &[Form], env: &mut Env) -> EvalResult {
-    // (extend-type TypeSym Proto1 (m [this] body) ... Proto2 ...)
-    if args.is_empty() {
+/// `(protocol* Name method-specs extend-via-metadata?)` — mint a protocol.
+///
+/// `method-specs` evaluates to a sequence of `{:name :min-arity :variadic}`
+/// maps. The protocol is created in the CURRENT namespace, which is the whole
+/// reason this stays a special form: `Protocol.ns` is what qualifies a method
+/// name for extend-via-metadata dispatch, and a builtin fn cannot see the
+/// environment. The protocol is returned, not interned — `defprotocol` is the
+/// Clojure macro that `def`s it along with a dispatch fn per method.
+fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
         return Err(EvalError::Runtime(
-            "extend-type requires a type symbol".into(),
+            "protocol* requires a name and method specs".into(),
         ));
     }
-    let Some(type_sym) = args[0].as_symbol() else {
-        return Err(EvalError::Runtime(
-            "extend-type: first arg must be a type symbol".into(),
-        ));
-    };
-    let type_tag = crate::interp::apply::resolve_type_tag(type_sym);
-
-    let mut current_proto: Option<GcPtr<Protocol>> = None;
-
-    for form in &args[1..] {
-        match &form.unmeta().kind {
-            FormKind::Symbol(s) => match resolve_protocol_sym(env, s) {
-                Some(p) => current_proto = Some(p),
-                None => {
-                    return Err(EvalError::Runtime(format!(
-                        "extend-type: {} is not a protocol",
-                        s
-                    )));
-                }
-            },
-            FormKind::List(parts) => {
-                // (method-name [params] body...)
-                let proto = current_proto.as_ref().ok_or_else(|| {
-                    EvalError::Runtime("extend-type: method before protocol name".into())
-                })?;
-                if parts.is_empty() {
-                    continue;
-                }
-                let method_name: Arc<str> = match parts[0].as_symbol() {
-                    Some(s) => Arc::from(s),
-                    None => continue,
-                };
-                let fn_val = build_impl_fn(parts, &[], &[], env)?;
-                let mut impls = proto.get().impls.lock().unwrap();
-                impls
-                    .entry(type_tag.clone())
-                    .or_default()
-                    .insert(method_name, fn_val);
-                drop(impls);
-                cljrs_value::bump_protocol_generation();
-            }
-            _ => {}
-        }
-    }
-
-    Ok(Value::Nil)
-}
-
-// ── extend-protocol ───────────────────────────────────────────────────────────
-
-fn eval_extend_protocol(args: &[Form], env: &mut Env) -> EvalResult {
-    // (extend-protocol Proto Type1 (m [this] body) ... Type2 ...)
-    if args.is_empty() {
-        return Err(EvalError::Runtime(
-            "extend-protocol requires a protocol".into(),
-        ));
-    }
-    let Some(proto_sym) = args[0].as_symbol() else {
-        return Err(EvalError::Runtime(
-            "extend-protocol: first arg must be a protocol symbol".into(),
-        ));
-    };
-    let proto_ptr = match resolve_protocol_sym(env, proto_sym) {
-        Some(p) => p,
-        None => {
+    // Name metadata belongs on the var `defprotocol` binds, not here.
+    let (name, _) = require_sym_meta(args, 0, "protocol*", env)?;
+    let specs = crate::interp::eval::eval(&args[1], env)?;
+    let specs: Vec<Value> = match specs.unwrap_meta() {
+        Value::Vector(v) => v.get().iter().cloned().collect(),
+        Value::Nil => Vec::new(),
+        v => {
             return Err(EvalError::Runtime(format!(
-                "extend-protocol: {} is not a protocol",
-                proto_sym
+                "protocol* method specs must be a vector, got {}",
+                v.type_name()
             )));
         }
     };
-
-    let mut current_type: Option<Arc<str>> = None;
-
-    for form in &args[1..] {
-        match &form.unmeta().kind {
-            FormKind::Symbol(s) => {
-                current_type = Some(crate::interp::apply::resolve_type_tag(s));
-            }
-            FormKind::List(parts) => {
-                let type_tag = current_type.as_ref().ok_or_else(|| {
-                    EvalError::Runtime("extend-protocol: method before type name".into())
-                })?;
-                if parts.is_empty() {
-                    continue;
-                }
-                let method_name: Arc<str> = match parts[0].as_symbol() {
-                    Some(s) => Arc::from(s),
-                    None => continue,
-                };
-                let fn_val = build_impl_fn(parts, &[], &[], env)?;
-                let mut impls = proto_ptr.get().impls.lock().unwrap();
-                impls
-                    .entry(type_tag.clone())
-                    .or_default()
-                    .insert(method_name, fn_val);
-                drop(impls);
-                cljrs_value::bump_protocol_generation();
-            }
-            _ => {}
-        }
-    }
-
-    Ok(Value::Nil)
+    let methods = specs
+        .iter()
+        .map(protocol_method_of)
+        .collect::<EvalResult<Vec<_>>>()?;
+    let extend_via_metadata = match args.get(2) {
+        Some(f) => !matches!(
+            crate::interp::eval::eval(f, env)?,
+            Value::Nil | Value::Bool(false)
+        ),
+        None => false,
+    };
+    let proto = Protocol::new(
+        Arc::from(name.as_str()),
+        env.current_ns.clone(),
+        methods,
+        extend_via_metadata,
+    );
+    Ok(Value::Protocol(GcPtr::new(proto)))
 }
 
 /// Build a `CljxFn` from the tail of a method-impl list: `(name [params] body...)`.
@@ -2251,206 +2118,6 @@ fn build_impl_fn(
     Ok(Value::Fn(GcPtr::new(cljrs_fn)))
 }
 
-// ── defmulti ──────────────────────────────────────────────────────────────────
-
-/// The parsed head of a `defmulti` form.
-///
-/// `(defmulti name docstring? attr-map? dispatch-fn & options)` — the two
-/// optional parts sit between the name and the dispatch function, and each is
-/// only taken as such when a form still follows it, so the dispatch function
-/// is never mistaken for one of them.
-struct DefmultiHead<'a> {
-    docstring: Option<String>,
-    attr_map: Option<&'a Form>,
-    /// Index of the dispatch-fn form; `args[dispatch_idx + 1..]` are options.
-    dispatch_idx: usize,
-}
-
-/// Split a `defmulti`'s arguments into its head parts. Pure: reads shapes only.
-fn parse_defmulti_head<'a>(args: &'a [Form]) -> EvalResult<DefmultiHead<'a>> {
-    let mut i = 1;
-    let mut docstring = None;
-    let mut attr_map = None;
-
-    if i < args.len()
-        && let Some(s) = args[i].as_string()
-    {
-        docstring = Some(s.to_string());
-        i += 1;
-    }
-    if i + 1 < args.len() && matches!(args[i].kind, FormKind::Map(_)) {
-        attr_map = Some(&args[i]);
-        i += 1;
-    }
-    if i >= args.len() {
-        return Err(EvalError::Runtime(
-            "defmulti requires a dispatch function".into(),
-        ));
-    }
-    Ok(DefmultiHead {
-        docstring,
-        attr_map,
-        dispatch_idx: i,
-    })
-}
-
-fn eval_defmulti(args: &[Form], env: &mut Env) -> EvalResult {
-    let (name, name_meta) = require_sym_meta(args, 0, "defmulti", env)?;
-    let name_arc: Arc<str> = Arc::from(name.as_str());
-    let head = parse_defmulti_head(args)?;
-
-    let dispatch_fn = eval(&args[head.dispatch_idx], env)?;
-
-    // Parse optional :default val.
-    let mut default_dispatch = ":default".to_string();
-    let mut i = head.dispatch_idx + 1;
-    while i + 1 < args.len() {
-        if let FormKind::Keyword(k) = &args[i].kind
-            && k == "default"
-        {
-            let dv = eval(&args[i + 1], env)?;
-            default_dispatch = format!("{}", dv);
-        }
-        i += 2;
-    }
-
-    // Metadata sources, weakest first: `^` marks on the name, then the attr
-    // map, then the docstring.  Clojure builds the same order in
-    // `clojure.core/defmulti` -- `(conj (meta mm-name) m)` puts the attr map,
-    // docstring already merged into it, on top of the name's metadata.
-    let attr_meta = match head.attr_map {
-        Some(form) => Some(eval(form, env)?),
-        None => None,
-    };
-    let meta = merge_meta(name_meta, attr_meta);
-    let meta = merge_meta(meta, head.docstring.as_deref().map(doc_meta));
-
-    let mfn = MultiFn::new(name_arc.clone(), dispatch_fn, default_dispatch);
-    let var = env
-        .globals
-        .intern(&env.current_ns, name_arc, Value::MultiFn(GcPtr::new(mfn)));
-    if let Some(meta_val) = meta {
-        var.get().set_meta(meta_val);
-    }
-    Ok(Value::Var(var))
-}
-
-// ── defmethod ─────────────────────────────────────────────────────────────────
-
-fn eval_defmethod(args: &[Form], env: &mut Env) -> EvalResult {
-    // (defmethod multi-name dispatch-val [params] body...)
-    if args.len() < 3 {
-        return Err(EvalError::Runtime(
-            "defmethod requires name, dispatch-val, params, and body".into(),
-        ));
-    }
-    // The name here RESOLVES an existing multimethod rather than defining one, so
-    // any metadata on it is inert — unwrapped so the form still reads, discarded
-    // because there is no new var to carry it.
-    let (multi_name, _) = require_sym_meta(args, 0, "defmethod", env)?;
-    let multi_name = multi_name.as_str();
-
-    // The multimethod may live in another namespace, which is the normal case
-    // for an open dispatch: one namespace owns the `defmulti`, others extend
-    // it. Resolve `alias/name` and `fully.qualified.ns/name` the way ordinary
-    // qualified symbols resolve (`eval_symbol`, `binding`), instead of looking
-    // only in the current ns — otherwise `(defmethod other/render :x ...)`
-    // reports that a perfectly good multimethod "is not a multimethod".
-    let parsed = cljrs_value::Symbol::parse(multi_name);
-    // A pinned name (`mylib/render@abc1234`) refers to an immutable past
-    // version, which is not a thing a method can be installed into. `parse`
-    // splits the suffix off into `version`, so without this guard the pin is
-    // dropped and HEAD is extended instead.
-    if parsed.version.is_some() {
-        return Err(EvalError::Runtime(format!(
-            "defmethod: {multi_name} is versioned; extend the multimethod at HEAD"
-        )));
-    }
-    let owner_ns: Arc<str> = match parsed.namespace.as_deref() {
-        Some(ns_part) => env
-            .globals
-            .resolve_alias(&env.current_ns, ns_part)
-            .unwrap_or_else(|| Arc::from(ns_part)),
-        None => env.current_ns.clone(),
-    };
-    // A pin can also live in the NAMESPACE half. `(require '[mylib@abc1234 :as
-    // v1])` registers the namespace under its literal versioned name, so the
-    // alias resolves straight to it and `parsed.version` is None; the guard
-    // above never sees it. Gated on the boundary like the privacy check below,
-    // so a versioned namespace's own source can still extend its own
-    // multimethods while it loads.
-    if owner_ns.as_ref() != env.current_ns.as_ref()
-        && cljrs_value::symbol::split_version(&owner_ns).1.is_some()
-    {
-        return Err(EvalError::Runtime(format!(
-            "defmethod: {multi_name} resolves to the versioned namespace {owner_ns}; \
-             extend the multimethod at HEAD"
-        )));
-    }
-    // Reaching into another namespace respects privacy the way `eval_symbol`
-    // does: refusing to extend a private multimethod from outside is what
-    // `^:private` on a `defmulti` is for.
-    if owner_ns.as_ref() != env.current_ns.as_ref()
-        && let Some(var) = env.globals.lookup_var(&owner_ns, &parsed.name)
-        && GlobalEnv::var_is_private(var.get())
-    {
-        return Err(EvalError::Runtime(format!(
-            "defmethod: var {owner_ns}/{} is not public",
-            parsed.name
-        )));
-    }
-
-    let mf_ptr = match env.globals.lookup_in_ns(&owner_ns, &parsed.name) {
-        Some(Value::MultiFn(mf)) => mf,
-        Some(other) => {
-            return Err(EvalError::Runtime(format!(
-                "defmethod: {multi_name} is bound to a {}, not a multimethod",
-                other.type_name()
-            )));
-        }
-        None => {
-            return Err(EvalError::Runtime(format!(
-                "defmethod: {multi_name} is not defined (no multimethod to extend)"
-            )));
-        }
-    };
-
-    let dispatch_val = eval(&args[1], env)?;
-    let key = format!("{}", dispatch_val);
-
-    // Build CljxFn from ([params] body...).
-    let params_form = &args[2];
-    let body = &args[3..];
-    let arity = parse_arity(params_form, body)?;
-    let (closed_over_names, closed_over_vals) = env.all_local_bindings();
-    let fn_name = Some(Arc::from(multi_name));
-    let cljrs_fn = CljxFn::new(
-        fn_name,
-        vec![arity],
-        closed_over_names,
-        closed_over_vals,
-        false,
-        Arc::clone(&env.current_ns),
-    );
-    let fn_val = Value::Fn(GcPtr::new(cljrs_fn));
-
-    mf_ptr
-        .get()
-        .methods
-        .lock()
-        .unwrap()
-        .insert(key.clone(), fn_val);
-    mf_ptr
-        .get()
-        .dispatch_vals
-        .lock()
-        .unwrap()
-        .insert(key, dispatch_val);
-    mf_ptr.get().bump_method_generation();
-
-    Ok(Value::MultiFn(mf_ptr))
-}
-
 // ── binding ───────────────────────────────────────────────────────────────────
 
 fn eval_binding(args: &[Form], env: &mut Env) -> EvalResult {
@@ -2511,6 +2178,12 @@ fn meta_form_is_mutable(meta: &Form) -> bool {
                     None | Some(FormKind::Bool(false)) | Some(FormKind::Nil)
                 )
         }),
+        // Metadata that reached this form through a macro is QUOTED: it is
+        // already a value, and re-analysing it would resolve its contents as
+        // code (see `value_to_form`). A field vector written in source arrives
+        // unquoted; one a macro emitted arrives quoted. Both describe the same
+        // field, so both have to be read.
+        FormKind::Quote(inner) => meta_form_is_mutable(inner),
         _ => false,
     }
 }
@@ -2545,176 +2218,26 @@ fn parse_field_specs(form: &Form, ctx: &str) -> EvalResult<Vec<(Arc<str>, bool)>
         .collect()
 }
 
-/// Intern `->TypeName`, the positional constructor, in the current namespace.
-/// For an all-immutable type the body is
-/// `(make-type-instance "T" {:f1 f1 …})`; when `mutable_names` is non-empty the
-/// mutable fields are split into a second map and the body becomes
-/// `(make-type-instance-mut "T" {imm…} {mut…})`. Shared by `deftype` and
-/// `defrecord` (which always passes an empty `mutable_names`).
-fn build_positional_ctor(
-    type_name: &str,
-    type_tag: &Arc<str>,
-    field_names: &[Arc<str>],
-    mutable_names: &[Arc<str>],
-    env: &mut Env,
-) {
-    use cljrs_reader::form::FormKind as FK;
-    let ns = env.current_ns.clone();
-    let globals = env.globals.clone();
-    let dummy_span =
-        cljrs_types::span::Span::new(std::sync::Arc::new("<deftype>".into()), 0, 0, 1, 1);
-    let make_form = |kind: FK| Form {
-        kind,
-        span: dummy_span.clone(),
-    };
-    let is_mut = |name: &str| mutable_names.iter().any(|m| m.as_ref() == name);
-    let mut imm_kv: Vec<Form> = Vec::new();
-    let mut mut_kv: Vec<Form> = Vec::new();
-    for f in field_names {
-        let target = if is_mut(f) { &mut mut_kv } else { &mut imm_kv };
-        target.push(make_form(FK::Keyword(f.as_ref().to_string())));
-        target.push(make_form(FK::Symbol(f.as_ref().to_string())));
-    }
-    let ctor_call = if mutable_names.is_empty() {
-        vec![
-            make_form(FK::Symbol("make-type-instance".into())),
-            make_form(FK::Str(type_tag.as_ref().to_string())),
-            make_form(FK::Map(imm_kv)),
-        ]
-    } else {
-        vec![
-            make_form(FK::Symbol("make-type-instance-mut".into())),
-            make_form(FK::Str(type_tag.as_ref().to_string())),
-            make_form(FK::Map(imm_kv)),
-            make_form(FK::Map(mut_kv)),
-        ]
-    };
-    let body = vec![make_form(FK::List(ctor_call))];
-    let arity = CljxFnArity {
-        params: field_names.to_vec(),
-        rest_param: None,
-        body,
-        destructure_params: vec![],
-        destructure_rest: None,
-        ir_arity_id: crate::interp::arity::fresh_arity_id(),
-        param_hints: vec![],
-        rest_hint: None,
-    };
-    let fn_name: Arc<str> = Arc::from(format!("->{}", type_name));
-    let ctor = CljxFn::new(
-        Some(fn_name.clone()),
-        vec![arity],
-        vec![],
-        vec![],
-        false,
-        Arc::clone(&ns),
-    );
-    globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
-}
+// ── deftype* (defrecord / deftype are bootstrap macros over it) ─────────────────
 
-/// Intern `map->TypeName`, the map constructor — `defrecord` only, as `deftype`
-/// has no map constructor in Clojure.
-fn build_map_ctor(type_name: &str, type_tag: &Arc<str>, env: &mut Env) {
-    use cljrs_reader::form::FormKind as FK;
-    let ns = env.current_ns.clone();
-    let globals = env.globals.clone();
-    let dummy_span =
-        cljrs_types::span::Span::new(std::sync::Arc::new("<defrecord>".into()), 0, 0, 1, 1);
-    let make_form = |kind: FK| Form {
-        kind,
-        span: dummy_span.clone(),
-    };
-    let m_sym: Arc<str> = Arc::from("m__");
-    let body = vec![make_form(FK::List(vec![
-        make_form(FK::Symbol("make-type-instance".into())),
-        make_form(FK::Str(type_tag.as_ref().to_string())),
-        make_form(FK::Symbol(m_sym.as_ref().to_string())),
-    ]))];
-    let arity = CljxFnArity {
-        params: vec![m_sym],
-        rest_param: None,
-        body,
-        destructure_params: vec![],
-        destructure_rest: None,
-        ir_arity_id: crate::interp::arity::fresh_arity_id(),
-        param_hints: vec![],
-        rest_hint: None,
-    };
-    let fn_name: Arc<str> = Arc::from(format!("map->{}", type_name));
-    let ctor = CljxFn::new(
-        Some(fn_name.clone()),
-        vec![arity],
-        vec![],
-        vec![],
-        false,
-        Arc::clone(&ns),
-    );
-    globals.intern(&ns, fn_name, Value::Fn(GcPtr::new(ctor)));
-}
-
-/// Intern the type NAME as a Symbol value so `(instance? TypeName x)` and other
-/// name references resolve to the type tag.
-fn intern_type_symbol(type_name: &str, env: &mut Env) {
-    let ns = env.current_ns.clone();
-    let globals = env.globals.clone();
-    let type_sym = cljrs_value::Symbol::simple(type_name.to_string());
-    globals.intern(
-        &ns,
-        Arc::from(type_name),
-        Value::Symbol(GcPtr::new(type_sym)),
-    );
-}
-
-// ── defrecord ─────────────────────────────────────────────────────────────────
-
-fn eval_defrecord(args: &[Form], env: &mut Env) -> EvalResult {
-    // (defrecord TypeName [field1 field2 ...] Proto1 (method [this] body) ...)
+/// The irreducible datatype primitive: mint a type tag and register method impls
+/// against it, with the fields in scope in each body and mutable fields backed by
+/// live cells. It does NOT synthesise constructors or intern the type symbol —
+/// that sugar lives in the `deftype` bootstrap macro (`->T`, `(def T 'T)`), which
+/// is what makes deftype a particular case of a Clojure macro over this form.
+fn eval_deftype_star(args: &[Form], env: &mut Env) -> EvalResult {
+    // (deftype* TypeName [field ...] Proto (method [this] body) ...)
     if args.len() < 2 {
         return Err(EvalError::Runtime(
-            "defrecord requires a name and field vector".into(),
-        ));
-    }
-    // Record metadata belongs to the generated type, which has no var to hold it
-    // here; unwrapped so the form reads, and deliberately not silently applied
-    // somewhere it would not belong.
-    let (type_name, _) = require_sym_meta(args, 0, "defrecord", env)?;
-    let type_tag: Arc<str> = Arc::from(type_name.as_str());
-
-    // Parse field names from the vector, peeling any per-field metadata.
-    // (A defrecord field is always immutable, so the mutability flag is dropped.)
-    let field_names: Vec<Arc<str>> = parse_field_specs(&args[1], "defrecord")?
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
-
-    // Register protocol implementations (same as extend-type inner logic).
-    // The field names go with them: a defrecord method body may name its fields
-    // directly, which reify has no equivalent of.
-    register_impls_for_tag(&type_tag, &args[2..], &field_names, &[], env)?;
-
-    // Generate constructors in the current namespace: the positional `->T` and
-    // the map `map->T`; then intern the type name so `(instance? T x)` resolves.
-    build_positional_ctor(&type_name, &type_tag, &field_names, &[], env);
-    build_map_ctor(&type_name, &type_tag, env);
-    intern_type_symbol(&type_name, env);
-    Ok(Value::Nil)
-}
-
-// ── deftype ──────────────────────────────────────────────────────────────────
-
-fn eval_deftype(args: &[Form], env: &mut Env) -> EvalResult {
-    // (deftype TypeName [field ...] Proto (method [this] body) ...)
-    if args.len() < 2 {
-        return Err(EvalError::Runtime(
-            "deftype requires a name and field vector".into(),
+            "deftype* requires a name and field vector".into(),
         ));
     }
     // Type metadata (e.g. ^:private) has no var to hold it; unwrapped so the
     // name reads, and deliberately not applied anywhere it would not belong.
-    let (type_name, _) = require_sym_meta(args, 0, "deftype", env)?;
+    let (type_name, _) = require_sym_meta(args, 0, "deftype*", env)?;
     let type_tag: Arc<str> = Arc::from(type_name.as_str());
 
-    let specs = parse_field_specs(&args[1], "deftype")?;
+    let specs = parse_field_specs(&args[1], "deftype*")?;
     let field_names: Vec<Arc<str>> = specs.iter().map(|(n, _)| n.clone()).collect();
     let mutable_names: Vec<Arc<str>> = specs
         .iter()
@@ -2726,32 +2249,10 @@ fn eval_deftype(args: &[Form], env: &mut Env) -> EvalResult {
     // each body — same machinery as defrecord/reify. Mutable fields read
     // through the live cell and are writable with `set!`.
     register_impls_for_tag(&type_tag, &args[2..], &field_names, &mutable_names, env)?;
-
-    // deftype gets a positional `->T` constructor and its type symbol, but no
-    // `map->T` (Clojure reserves that for defrecord).
-    build_positional_ctor(&type_name, &type_tag, &field_names, &mutable_names, env);
-    intern_type_symbol(&type_name, env);
-    Ok(Value::Nil)
-}
-
-// ── reify ─────────────────────────────────────────────────────────────────────
-
-fn eval_reify(args: &[Form], env: &mut Env) -> EvalResult {
-    // (reify Proto1 (method [this] body) ...)
-    // Generate a unique type tag for this instance.
-    let n = crate::builtins::builtins::GENSYM_COUNTER
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let type_tag: Arc<str> = Arc::from(format!("reify__{}", n));
-
-    // Register protocol implementations. reify has no fields.
-    register_impls_for_tag(&type_tag, args, &[], &[], env)?;
-
-    // Return an empty TypeInstance with the unique tag.
-    Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
-        type_tag,
-        fields: MapValue::empty(),
-        mutable: None,
-    })))
+    // Return the minted tag so a caller (e.g. the `reify` macro) can feed it
+    // straight to `make-type-instance` — a single dataflow source for the tag,
+    // rather than a second textual reference that a gensym could desync.
+    Ok(Value::string(type_name))
 }
 
 // ── register_impls_for_tag ────────────────────────────────────────────────────

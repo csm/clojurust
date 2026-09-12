@@ -464,12 +464,23 @@ pub enum OpacityVerdict { Clean, Tolerated, Rejected }
 ### Source-embedding audit (`--require-fully-compiled`)
 
 Only plain `defn` bodies reach machine code. Forms that `needs_interpreter`
-reports - `ns`, `require`, `defmacro`, `defonce`, `defprotocol`, `defrecord`,
-`defmulti`, `defmethod`, `extend-type`, `extend-protocol` - are written to the
+reports - `ns`, `require`, `defmacro`, `defonce`, `defprotocol`, `protocol*`,
+`defrecord`, `deftype*`, `defmulti`, `defmethod`, `extend-type`,
+`extend-protocol` - are written to the
 harness as `.cljrs` files and pulled in with `include_str!`, method bodies
 included, even when the enclosing namespace compiles successfully. A namespace
 that fails lowering or codegen falls back to source the same way, and pinned
 versioned dependencies always do.
+
+`needs_interpreter` reads the form as written; `expanded_needs_interpreter`
+reads it again after macroexpansion and recurses, so a form that only *contains*
+an interpreter-only construct is caught too. Neither spells the datatype,
+protocol and multimethod family out: both call
+`cljrs_ir::lower::in_dispatch_family`, the same predicate the ANF lowerer
+rejects on, so a member cannot be known to one pass and not the other. The
+family holds surface names and the `*` primitives alike — `deftype`,
+`defrecord` and `reify` are macros in `bootstrap.cljrs` that all expand to
+`deftype*`, and the post-expansion pass only ever sees the primitive.
 
 Four steps, each usable on its own:
 

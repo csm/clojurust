@@ -655,7 +655,7 @@ impl MultiFn {
 
 /// Phase 10.6 — protocol-dispatch inline-cache invalidation.
 /// `bump_protocol_generation()` must follow every mutation of any
-/// `Protocol::impls` map (extend-type / extend-protocol / inline impls);
+/// `Protocol::impls` map (the `extend` builtin / `deftype*` inline impls);
 /// `rt_call_ic` (cljrs-compiler) tags each cached dispatch with the
 /// generation observed at fill time and re-resolves on mismatch.
 pub fn protocol_generation() -> u64;

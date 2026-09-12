@@ -52,6 +52,12 @@ src/
     context.rs  — LowerCtx builder state used by anf.rs; also
                   `core_call_name`, the call-position check that decides
                   whether a head symbol really is a clojure.core name
+    dispatch_family.rs
+                — `DISPATCH_FAMILY` / `in_dispatch_family`: the one definition
+                  of the datatype, protocol and multimethod family (surface
+                  names AND the `*` primitives they expand to).  Read by
+                  anf.rs and by cljrs-compiler's `needs_interpreter` /
+                  `expanded_needs_interpreter`
     escape.rs   — worklist-based escape analysis; inter-procedural via EscapeContext
     inline.rs   — inlining pass: splices small callees into call sites
     known.rs    — symbol → KnownFn resolution, the `clojure.core` qualifier
@@ -152,12 +158,16 @@ the name is the marker.  The IR interpreter routes these to the tree-walker's
 `dispatch_method`; Cranelift/wasm codegen reject the unknown name, so
 interop-bearing functions decline JIT compilation instead of miscompiling to
 a nil call.  `(var sym)` lowers to `LoadVar` exactly like the `#'sym` reader
-form.  Interpreter-only special forms with no IR equivalent (`defprotocol`,
-`extend-type`, `extend-protocol`, `defmulti`, `defmethod`, `defrecord`,
-`deftype`, `reify`, `defn-`, bare `.`) are **rejected**
+form.  Interpreter-only forms with no IR equivalent are **rejected**
 (`LowerError::UnsupportedForm`) so the function stays at tree-walk — lowering
 them as generic calls would resolve their clojure.core stub vars, which
-return nil and silently corrupt the promoted function.
+return nil and silently corrupt the promoted function.  Two rejection sources:
+`defn-` and bare `.` are named in `anf.rs` itself; the datatype, protocol and
+multimethod family comes from `dispatch_family::DISPATCH_FAMILY`, which is
+also what the AOT compiler reads, so the two passes cannot drift apart.  That
+list holds the surface names as well as the `*` primitives they expand to —
+lowering runs on the EXPANDED body, so `deftype*` is the name that actually
+has to be there, while a pre-expansion caller only ever sees `deftype`.
 
 `set!` lowers to `SetBang` only for a global var target.  A `deftype` mutable
 field write — `(set! (.-field inst) v)`, or the bare `(set! field v)` inside a

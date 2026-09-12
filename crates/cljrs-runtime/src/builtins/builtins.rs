@@ -27,9 +27,9 @@ use cljrs_gc::GcPtr;
 use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
     Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq,
-    MapValue, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentQueue, PersistentVector, SharedAtom, SortedSet, Symbol, Thunk,
-    TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
+    MapValue, MultiFn, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
+    PersistentList, PersistentQueue, PersistentVector, ProtocolFn, SharedAtom, SortedSet, Symbol,
+    Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -1442,21 +1442,11 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("letfn", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("in-ns", Arity::Fixed(1), builtin_stub_nil),
         ("alias", Arity::Fixed(2), builtin_stub_nil),
-        ("defprotocol", Arity::Variadic { min: 1 }, builtin_stub_nil),
-        ("extend-type", Arity::Variadic { min: 1 }, builtin_stub_nil),
-        (
-            "extend-protocol",
-            Arity::Variadic { min: 1 },
-            builtin_stub_nil,
-        ),
-        ("defmulti", Arity::Variadic { min: 1 }, builtin_stub_nil),
-        ("defmethod", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("defrecord", Arity::Variadic { min: 2 }, builtin_stub_nil),
-        ("reify", Arity::Variadic { min: 0 }, builtin_stub_nil),
+        ("protocol*", Arity::Variadic { min: 2 }, builtin_stub_nil),
+        ("deftype*", Arity::Variadic { min: 2 }, builtin_stub_nil),
         ("load-file", Arity::Fixed(1), builtin_stub_nil),
         ("binding", Arity::Variadic { min: 1 }, builtin_stub_nil),
         ("with-out-str", Arity::Variadic { min: 0 }, builtin_stub_nil),
-        ("deftype", Arity::Variadic { min: 2 }, builtin_stub_nil),
         // Hierarchy — derive/underive/isa?/parents/ancestors/descendants are
         // defined in bootstrap.cljrs and documented there.
         ("make-hierarchy", Arity::Fixed(0), builtin_make_hierarchy),
@@ -1547,10 +1537,15 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         // Protocols & Multimethods
         ("satisfies?", Arity::Fixed(2), builtin_satisfies_q),
         ("extends?", Arity::Fixed(2), builtin_extends_q),
+        ("multi-fn", Arity::Variadic { min: 2 }, builtin_multi_fn),
+        ("add-method", Arity::Fixed(3), builtin_add_method),
         ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
         ("prefers", Arity::Fixed(1), builtin_prefers),
+        // Protocols
+        ("protocol-fn", Arity::Fixed(2), builtin_protocol_fn),
+        ("extend", Arity::Variadic { min: 1 }, builtin_extend),
         // Records / reify
         (
             "make-type-instance",
@@ -8265,6 +8260,183 @@ fn builtin_make_delay_sentinel(_args: &[Value]) -> ValueResult<Value> {
     Err(ValueError::Other(
         "make-delay must be invoked through the evaluator".into(),
     ))
+}
+
+// ── Multimethods ─────────────────────────────────────────────────────────────
+
+/// `(multi-fn name dispatch-fn)` / `(multi-fn name dispatch-fn default-val)` —
+/// mint a multimethod with no methods registered.
+///
+/// `defmulti` is the Clojure macro that `def`s the result. The default dispatch
+/// value is stored the way every other dispatch key is, as its printed form.
+fn builtin_multi_fn(args: &[Value]) -> ValueResult<Value> {
+    let name: Arc<str> = match args[0].unwrap_meta() {
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "name symbol or string",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let default_dispatch = match args.get(2) {
+        Some(v) => format!("{v}"),
+        None => ":default".to_string(),
+    };
+    Ok(Value::MultiFn(GcPtr::new(MultiFn::new(
+        name,
+        args[1].clone(),
+        default_dispatch,
+    ))))
+}
+
+/// `(add-method multifn dispatch-val f)` — register `f` under `dispatch-val`.
+///
+/// The inverse of `remove-method`, and keyed identically: the printed form of
+/// the dispatch value, with the value itself kept alongside for `isa?` lookups.
+/// Returns the multimethod.
+fn builtin_add_method(args: &[Value]) -> ValueResult<Value> {
+    let mf = match args[0].unwrap_meta() {
+        Value::MultiFn(m) => m.clone(),
+        // `defmethod` is the only caller that reaches here with the wrong kind
+        // of value, and by then the name it was given has been evaluated away.
+        // Say what the value is NOT, so the message still tells "the wrong kind
+        // of var" apart from "no such var" without knowing which name it was.
+        v => {
+            return Err(ValueError::Other(format!(
+                "add-method: not a multimethod, got {}",
+                v.type_name()
+            )));
+        }
+    };
+    let key = format!("{}", args[1]);
+    mf.get()
+        .methods
+        .lock()
+        .unwrap()
+        .insert(key.clone(), args[2].clone());
+    mf.get()
+        .dispatch_vals
+        .lock()
+        .unwrap()
+        .insert(key, args[1].clone());
+    mf.get().bump_method_generation();
+    Ok(Value::MultiFn(mf))
+}
+
+// ── Protocols ────────────────────────────────────────────────────────────────
+
+/// `(protocol-fn proto "method-name")` — the dispatch fn for one of `proto`'s
+/// methods.
+///
+/// Arity comes from the method spec the protocol already holds rather than from
+/// a second argument: the arity is stated once, in `protocol*`'s spec vector,
+/// and every projection of it reads that one definition.
+fn builtin_protocol_fn(args: &[Value]) -> ValueResult<Value> {
+    let Value::Protocol(proto) = args[0].unwrap_meta() else {
+        return Err(ValueError::WrongType {
+            expected: "protocol",
+            got: args[0].type_name().to_string(),
+        });
+    };
+    let wanted: Arc<str> = match args[1].unwrap_meta() {
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        Value::Keyword(k) => Arc::from(k.get().name.as_ref()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "method name",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let method = proto
+        .get()
+        .methods
+        .iter()
+        .find(|m| m.name == wanted)
+        .ok_or_else(|| {
+            ValueError::Other(format!(
+                "protocol {} has no method {}",
+                proto.get().name,
+                wanted
+            ))
+        })?
+        .clone();
+    Ok(Value::ProtocolFn(GcPtr::new(ProtocolFn {
+        protocol: proto.clone(),
+        method_name: method.name,
+        min_arity: method.min_arity,
+        variadic: method.variadic,
+    })))
+}
+
+// ── Protocol extension ───────────────────────────────────────────────────────
+
+/// `(extend type-tag proto method-map & more-proto+method-map)` — register
+/// protocol implementations for a type tag.
+///
+/// `type-tag` is a symbol or string naming the type; each `method-map` maps a
+/// method name (keyword, symbol or string) to the function implementing it.
+/// A later registration for the same type and method replaces the earlier one.
+/// Returns nil.
+fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
+    let type_tag: Arc<str> = match args[0].unwrap_meta() {
+        Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+        Value::Str(s) => Arc::from(s.get().as_str()),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "type symbol or string",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let pairs = &args[1..];
+    if !pairs.len().is_multiple_of(2) {
+        return Err(ValueError::ArityError {
+            name: "extend".to_string(),
+            expected: "a type tag followed by protocol/method-map pairs".to_string(),
+            got: args.len(),
+        });
+    }
+    for pair in pairs.chunks(2) {
+        let Value::Protocol(proto) = pair[0].unwrap_meta() else {
+            return Err(ValueError::WrongType {
+                expected: "protocol",
+                got: pair[0].type_name().to_string(),
+            });
+        };
+        let methods = match pair[1].unwrap_meta() {
+            Value::Map(m) => m.clone(),
+            Value::Nil => MapValue::empty(),
+            v => {
+                return Err(ValueError::WrongType {
+                    expected: "method map",
+                    got: v.type_name().to_string(),
+                });
+            }
+        };
+        let proto = proto.get();
+        let mut impls = proto.impls.lock().unwrap();
+        let table = impls.entry(type_tag.clone()).or_default();
+        for (k, f) in methods.iter() {
+            let method_name: Arc<str> = match k.unwrap_meta() {
+                Value::Keyword(kw) => Arc::from(kw.get().name.as_ref()),
+                Value::Symbol(s) => Arc::from(s.get().name.as_ref()),
+                Value::Str(s) => Arc::from(s.get().as_str()),
+                v => {
+                    return Err(ValueError::WrongType {
+                        expected: "method name",
+                        got: v.type_name().to_string(),
+                    });
+                }
+            };
+            table.insert(method_name, f.clone());
+        }
+    }
+    cljrs_value::bump_protocol_generation();
+    Ok(Value::Nil)
 }
 
 // ── Records / reify ──────────────────────────────────────────────────────────

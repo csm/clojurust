@@ -1110,6 +1110,39 @@ fn test_defrecord_with_protocol() {
 
 #[test]
 #[cfg(feature = "aot_full_test")]
+fn test_deftype() {
+    // `deftype` is a macro over the `deftype*` primitive, so the name that has
+    // to appear in `expanded_needs_interpreter` is the *expanded* one. Miss it
+    // and the form compiles natively into a nil-returning stub: exit 0, wrong
+    // answer, no diagnostic. `defrecord` is caught before expansion and so does
+    // not cover this path.
+    assert_output(
+        "deftype",
+        r#"
+(defprotocol P (pval [x]))
+(deftype Box [n] P (pval [_] n))
+(println (pval (->Box 9)))
+"#,
+        "9",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
+fn test_reify() {
+    assert_output(
+        "reify",
+        r#"
+(defprotocol P (pval [x]))
+(def r (reify P (pval [_] 7)))
+(println (pval r))
+"#,
+        "7",
+    );
+}
+
+#[test]
+#[cfg(feature = "aot_full_test")]
 fn test_protocol_with_defn_impl() {
     // Protocol function called from a compiled defn, with the impl also
     // calling other compiled functions

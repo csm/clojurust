@@ -14,3 +14,5 @@ docs/book/book/
 # cargo-mutants working directory
 /mutants.out/
 /mutants.out.old/
+.dev/
+.nrepl-port

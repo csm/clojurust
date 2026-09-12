@@ -1235,6 +1235,205 @@
 (defn delay? [x] (= (type x) 'Delay))
 (defn promise? [x] (= (type x) 'Promise))
 
+;; ── multimethods: defmulti/defmethod over multi-fn and add-method ────────────
+;; Neither surface form needs the interpreter. `multi-fn` mints a MultiFn and
+;; `def` binds it; `add-method` writes one entry into the method table, keyed
+;; the same way `remove-method` reads it. Naming the multimethod by SYMBOL in
+;; the expansion is what makes `(defmethod other.ns/m ...)` work: the symbol
+;; resolves through the ordinary rules, aliases included, where the old special
+;; form looked the whole string up as an intern of the current namespace.
+
+(defmacro defmulti [mname & body]
+  ;; (defmulti name docstring? attr-map? dispatch-fn & options)
+  ;;
+  ;; A leading string is ALWAYS the docstring, even with nothing after it, so
+  ;; `(defmulti area "Area.")` reports a missing dispatch function instead of
+  ;; deferring the error to the first call, where a string is not callable.
+  ;;
+  ;; A map is the attr-map only when a form still FOLLOWS it. A map is itself
+  ;; callable, so `(defmulti lookup {:a :first})` is a legitimate map-valued
+  ;; dispatch function and must not be read as an attr-map with no dispatch.
+  ;; That asymmetry is the whole subtlety here: the string case is decided by
+  ;; the type alone, the map case needs the lookahead.
+  (let [docstring (when (string? (first body)) (first body))
+        after-doc (if docstring (next body) body)
+        attr-map  (when (and (map? (first after-doc)) (next after-doc))
+                    (first after-doc))
+        tail      (if attr-map (next after-doc) after-doc)
+        dispatch  (first tail)
+        ;; A one-element vector marks PRESENCE, so `:default nil` still counts.
+        default   (loop [o (next tail)]
+                    (cond
+                      (nil? o)               nil
+                      (= (first o) :default) [(second o)]
+                      :else                  (recur (next (next o)))))
+        ;; Precedence, not merely presence: the attr map sits on top of the
+        ;; name's own `^` marks, and an explicit docstring beats a :doc the
+        ;; attr map carries.
+        marks     (merge (meta mname) attr-map)
+        merged    (if docstring (assoc (or marks {}) :doc docstring) marks)
+        ;; The metadata belongs on the var `def` binds, so it rides on the
+        ;; name symbol; `nsym` is the bare name the multi-fn reports.
+        bare      (with-meta (symbol (name mname)) (or merged {}))
+        nsym      (list 'quote (symbol (name mname)))]
+    (if (nil? tail)
+      (throw (ex-info "defmulti requires a dispatch function"
+                      {:name (symbol (name mname))}))
+      (list 'def bare
+            (if default
+              (list 'multi-fn nsym dispatch (first default))
+              (list 'multi-fn nsym dispatch))))))
+
+(defn defmethod-pin
+  "The version pin on a `defmethod` target, or nil.
+
+  Two spellings, and only one of them is visible as an `@`. `f@abc1234` keeps
+  the version in a field of its own that `name` does not report, so the symbol
+  prints longer than `ns/name` rebuilds it. `v1/render` carries no `@` at all:
+  the require registered the namespace under its literal versioned name and
+  pointed the alias straight at it, so the pin sits in the namespace the alias
+  resolves to."
+  [sym]
+  (let [bare  (if (namespace sym)
+                (str (namespace sym) "/" (name sym))
+                (name sym))
+        owner (when-let [a (namespace sym)]
+                (when-let [n (get (ns-aliases *ns*) (symbol a))]
+                  (str (ns-name n))))]
+    (cond
+      ;; `name` drops a version wherever it appears, so a name that survives
+      ;; the round trip unchanged carried no pin. Core only: this runs during
+      ;; macroexpansion in whatever namespace the caller is in, which need not
+      ;; have clojure.string loaded.
+      (not= (str sym) bare)                     [:name (str sym)]
+      (and owner (not= owner (name (symbol owner)))) [:namespace owner]
+      :else                                     nil)))
+
+(defmacro defmethod [mname dispatch-val params & body]
+  ;; A pin is a promise that the thing behind it does not change. Extending a
+  ;; pinned multimethod would break that promise for every other holder of the
+  ;; same pin, so it is refused rather than silently unpinned. The refusal is
+  ;; here, before `add-method`, which is handed the resolved MultiFn and can no
+  ;; longer tell how it was named.
+  (let [pin (defmethod-pin mname)]
+    (cond
+      (= (first pin) :name)
+      (throw (ex-info (str "defmethod cannot extend the versioned name "
+                           (second pin))
+                      {:target (second pin)}))
+
+      (= (first pin) :namespace)
+      (throw (ex-info (str "defmethod cannot extend a multimethod owned by the "
+                           "versioned namespace " (second pin))
+                      {:namespace (second pin)}))
+
+      ;; No `resolve` check on the target here, deliberately. It would read the
+      ;; namespace off `*ns*`, and the expansion resolves the symbol against the
+      ;; namespace the form was WRITTEN in, which is not the same thing: inside
+      ;; a `deftest` body `*ns*` is `user`, so a check would call every target
+      ;; undefined. Letting the emitted symbol resolve is what keeps the alias,
+      ;; refer and privacy rules in one place.
+      :else
+      (list 'add-method mname dispatch-val
+            (cons 'fn (cons (symbol (name mname)) (cons params body)))))))
+
+;; ── protocols: defprotocol as a macro over the protocol* primitive ───────────
+;; `protocol*` mints the protocol object in the CURRENT namespace, and that is
+;; the one part a Clojure macro cannot do for itself: `Protocol.ns` is what
+;; qualifies a method name for extend-via-metadata dispatch. The rest is
+;; grammar - dropping the docstring, reading the option pairs, deriving each
+;; method's arity from its parameter vector, and interning the protocol plus one
+;; dispatch fn per method - so it lives here.
+
+(defn protocol-method-spec
+  "Read a (method-name [params] \"doc\"?) form into
+  {:name \"method-name\" :min-arity n :variadic bool}. The arity comes from the
+  FIRST parameter vector; a spec carrying none counts as one fixed argument."
+  [form]
+  (let [amp?   (fn [p] (= p '&))
+        params (first (filter vector? form))]
+    {:name      (name (first form))
+     :min-arity (if params (count (remove amp? params)) 1)
+     :variadic  (boolean (some amp? params))}))
+
+(defn protocol-body
+  "Split a defprotocol body (everything after the name) into [opts specs]. A
+  leading docstring is dropped, flat :keyword value pairs collect into opts, and
+  every remaining list is read as a method spec."
+  [body]
+  (loop [b (seq (if (string? (first body)) (rest body) body)) opts {} specs []]
+    (cond
+      (nil? b)             [opts specs]
+      (keyword? (first b)) (recur (next (next b))
+                                  (assoc opts (first b) (second b))
+                                  specs)
+      (seq? (first b))     (recur (next b) opts
+                                  (conj specs (protocol-method-spec (first b))))
+      :else                (recur (next b) opts specs))))
+
+(defmacro defprotocol [psym & body]
+  ;; `bare` drops any annotation on the name before it is REFERRED to: the
+  ;; metadata belongs on the var `def` binds, and `(var ^:marker P)` is not a
+  ;; var reference.
+  (let [parts (protocol-body body)
+        opts  (first parts)
+        specs (second parts)
+        bare  (symbol (name psym))]
+    (cons 'do
+          (concat
+            [(list 'def psym
+                   (list 'protocol* bare specs
+                         (boolean (:extend-via-metadata opts))))]
+            (map (fn [s]
+                   (list 'def (symbol (:name s))
+                         (list 'protocol-fn bare (:name s))))
+                 specs)
+            [(list 'var bare)]))))
+
+;; ── protocol extension: extend-type/extend-protocol over the `extend` primitive
+;; The irreducible operation is `extend`: bind {method-name -> fn} into a
+;; protocol's impl table under a type tag. Both surface forms are the same
+;; regrouping of one flat spec list — they differ only in which side is the
+;; constant and which side repeats — so they are Clojure macros over that single
+;; primitive rather than two bespoke Rust special forms.
+
+(defn extend-spec-groups
+  "Split a flat extend spec list into ([head impls] ...). Each head is a symbol
+  and impls are the method forms that follow it, in source order."
+  [specs]
+  (loop [s (seq specs) head nil acc [] out []]
+    (cond
+      (nil? s)            (if head (conj out [head acc]) out)
+      (symbol? (first s)) (recur (next s) (first s) []
+                                 (if head (conj out [head acc]) out))
+      :else               (recur (next s) head (conj acc (first s)) out))))
+
+(defn extend-impl-map
+  "Collapse method forms ((m [a] ...) (m [a b] ...)) into
+  {:m (fn ([a] ...) ([a b] ...))} — one entry per method name, arities in
+  source order."
+  [impls]
+  (let [mname (fn [i] (name (first i)))
+        names (distinct (map mname impls))]
+    (zipmap (map keyword names)
+            (map (fn [n]
+                   (cons 'fn (map rest (filter (fn [i] (= n (mname i))) impls))))
+                 names))))
+
+(defmacro extend-type [tsym & specs]
+  (cons 'do
+        (map (fn [g]
+               (list 'extend (list 'quote tsym) (first g)
+                     (extend-impl-map (second g))))
+             (extend-spec-groups specs))))
+
+(defmacro extend-protocol [psym & specs]
+  (cons 'do
+        (map (fn [g]
+               (list 'extend (list 'quote (first g)) psym
+                     (extend-impl-map (second g))))
+             (extend-spec-groups specs))))
+
 ;; ── Phase 6 (built-in protocols): ICounted, ILookup, ISeqable ────────────────
 
 (defprotocol ICounted
@@ -1477,7 +1676,6 @@
      (:doc (doc-data (var ~sym)))
      (catch Exception e# nil)))
 
-
 ;; ── Ad-hoc hierarchies ───────────────────────────────────────────────────────
 ;; A hierarchy is the value {:parents {} :descendants {} :ancestors {}}.
 ;; The 3-arity fns below are pure functions of such a value; the 2-arity fns
@@ -1614,3 +1812,57 @@
   "Returns the immediate and indirect children of tag, or nil if it has none."
   ([tag] (descendants global-hierarchy tag))
   ([h tag] (not-empty (get (:descendants h) tag))))
+
+;; ── datatypes: deftype as a macro over the deftype* primitive ────────────────
+;; The irreducible `deftype*` special form mints the type tag and registers the
+;; method impls (with fields in scope, mutable fields on live cells). The sugar —
+;; the positional `->T` constructor and the `T` type symbol — is a Clojure macro,
+;; so `deftype` is a particular case of an ordinary macro rather than a bespoke
+;; Rust form. Field mutability is read from each field's metadata (survives
+;; macroexpansion), splitting the constructor between immutable and mutable maps.
+(defmacro deftype [tsym fields & impls]
+  (let [tname (str tsym)
+        ctor  (symbol (str "->" tsym))
+        mut?  (fn [f] (let [m (meta f)]
+                        (boolean (or (:unsynchronized-mutable m)
+                                     (:volatile-mutable m)))))
+        bare  (fn [f] (symbol (name f)))
+        kw    (fn [f] (keyword (name f)))
+        plain (mapv bare fields)
+        imm   (remove mut? fields)
+        mut   (filter mut? fields)
+        immm  (zipmap (map kw imm) (map bare imm))
+        mutm  (zipmap (map kw mut) (map bare mut))]
+    `(do
+       (deftype* ~tsym ~fields ~@impls)
+       (defn ~ctor [~@plain]
+         ~(if (seq mut)
+            `(make-type-instance-mut ~tname ~immm ~mutm)
+            `(make-type-instance ~tname ~immm)))
+       (def ~tsym (quote ~tsym))
+       ~tsym)))
+
+;; defrecord: like deftype but fields are always immutable and it also gets the
+;; map constructor `map->T`. Same macro-over-deftype* shape.
+(defmacro defrecord [tsym fields & impls]
+  (let [tname (str tsym)
+        pos   (symbol (str "->" tsym))
+        mapc  (symbol (str "map->" tsym))
+        bare  (fn [f] (symbol (name f)))
+        kw    (fn [f] (keyword (name f)))
+        plain (mapv bare fields)
+        fmap  (zipmap (map kw fields) (map bare fields))]
+    `(do
+       (deftype* ~tsym ~plain ~@impls)
+       (defn ~pos [~@plain] (make-type-instance ~tname ~fmap))
+       (defn ~mapc [m#] (make-type-instance ~tname m#))
+       (def ~tsym (quote ~tsym))
+       ~tsym)))
+
+;; reify: an anonymous, field-less instance whose methods close over the
+;; surrounding lexical scope. One gensym'd tag per reify FORM (Clojure semantics:
+;; one anonymous type per form, a fresh instance each time the form evaluates).
+;; The impl fns capture locals because deftype* registers them at the call site.
+(defmacro reify [& impls]
+  `(make-type-instance (deftype* ~(gensym "reify__") [] ~@impls) {}))
+

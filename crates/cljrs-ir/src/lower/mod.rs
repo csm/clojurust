@@ -6,6 +6,7 @@
 pub mod anf;
 pub mod async_lower;
 pub mod context;
+pub mod dispatch_family;
 pub mod escape;
 pub mod inline;
 pub mod known;
@@ -17,6 +18,7 @@ pub use anf::{
     lower_fn_body_shadowed_kwargs,
 };
 pub use async_lower::{AsyncLowerError, AsyncLowering, lower_async};
+pub use dispatch_family::{DISPATCH_FAMILY, in_dispatch_family};
 pub use escape::{
     AnalysisResult, EscapeContext, EscapeState, ExternalDefn, UseInfo, UseKind, analyze,
 };

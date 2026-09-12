@@ -1349,21 +1349,11 @@ fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
             {
                 // defmacro/defonce need the interpreter (macros must be
                 // available at compile time). ns/require are module-level.
-                // Protocol/multimethod forms modify global dispatch tables
-                // and are best handled by the interpreter at startup.
-                return matches!(
-                    s.as_str(),
-                    "defmacro"
-                        | "defonce"
-                        | "ns"
-                        | "require"
-                        | "defprotocol"
-                        | "extend-type"
-                        | "extend-protocol"
-                        | "defmulti"
-                        | "defmethod"
-                        | "defrecord"
-                );
+                // The datatype/protocol/multimethod family modifies global
+                // dispatch tables and is handled by the interpreter at
+                // startup; its membership is named once, in `dispatch_family`.
+                return matches!(s.as_str(), "defmacro" | "defonce" | "ns" | "require")
+                    || cljrs_ir::lower::in_dispatch_family(s.as_str());
             }
             false
         }
@@ -1404,7 +1394,8 @@ fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
                 // resolve or rejects them outright.  Run any form
                 // containing one in the interpreted preamble.
                 if (s.len() > 1 && s != ".." && s.starts_with('.'))
-                    || matches!(s.as_str(), "." | "reify" | "deftype" | "defn-")
+                    || matches!(s.as_str(), "." | "defn-")
+                    || cljrs_ir::lower::in_dispatch_family(s.as_str())
                 {
                     return true;
                 }

@@ -732,11 +732,14 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
         // for.  These MUST be rejected (falling back to tree-walking):
         // lowering them as generic calls would resolve their clojure.core
         // stub vars, which return nil — silently corrupting the function
-        // once it is IR-promoted.
-        "defprotocol" | "extend-type" | "extend-protocol" | "defmulti" | "defmethod"
-        | "defrecord" | "deftype" | "reify" | "defn-" | "." => Err(LowerError::UnsupportedForm(
-            format!("{sym} is interpreter-only and cannot be lowered to IR"),
-        )),
+        // once it is IR-promoted.  The datatype/protocol/multimethod family
+        // is named once, in `dispatch_family`.
+        "defn-" | "." => Err(LowerError::UnsupportedForm(format!(
+            "{sym} is interpreter-only and cannot be lowered to IR"
+        ))),
+        _ if crate::lower::in_dispatch_family(sym) => Err(LowerError::UnsupportedForm(format!(
+            "{sym} is interpreter-only and cannot be lowered to IR"
+        ))),
         // `(.method target args…)` interop — lower to a name-marked direct
         // call (the leading dot is the marker).  The IR interpreter routes
         // these to the tree-walker's method dispatch; Cranelift/wasm codegen
@@ -753,8 +756,7 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
             ctx.emit(Inst::CallDirect(dst, Arc::from(sym.as_str()), arg_vars?));
             Ok(dst)
         }
-        // Protocol/record forms and other constructs fall through to a
-        // generic function call.
+        // Everything else is a generic function call.
         _ => lower_call(ctx, head, args),
     }
 }
