@@ -375,6 +375,10 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
     ),
     ("satisfies?", "Returns true if x extends protocol."),
     ("extends?", "Returns true if atype extends protocol."),
+    (
+        "extenders",
+        "Returns a seq of the types extending protocol, or nil if none do.",
+    ),
     ("uuid?", "Returns true if x is a UUID."),
     (
         "native-object?",
@@ -1547,6 +1551,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         // Protocols & Multimethods
         ("satisfies?", Arity::Fixed(2), builtin_satisfies_q),
         ("extends?", Arity::Fixed(2), builtin_extends_q),
+        ("extenders", Arity::Fixed(1), builtin_extenders),
         ("prefer-method", Arity::Fixed(3), builtin_prefer_method),
         ("remove-method", Arity::Fixed(2), builtin_remove_method),
         ("methods", Arity::Fixed(1), builtin_methods),
@@ -7983,6 +7988,46 @@ fn builtin_extends_q(args: &[Value]) -> ValueResult<Value> {
     };
     let impls = proto.get().impls.lock().unwrap();
     Ok(Value::Bool(impls.contains_key(type_tag.as_ref())))
+}
+
+/// `(extenders protocol)` — the types that extend `protocol`, as symbols.
+///
+/// Mirrors Clojure's `(keys (:impls protocol))`, including its `nil` for a
+/// protocol nothing has extended yet: `keys` of an empty map is `nil`, not an
+/// empty seq, and code that threads the result through `seq`/`when-let`
+/// depends on that.
+///
+/// The tags are sorted. The registry behind them is a `HashMap`, so the
+/// natural iteration order differs between runs of the same program, and a
+/// caller printing or diffing this would see spurious churn. Clojure promises
+/// no particular order either, which makes sorting free to choose and the only
+/// reproducible choice.
+///
+/// A type extended through `:extend-via-metadata` is deliberately absent: it
+/// never enters `impls`, and the metadata carrier is the value, not the type.
+/// Clojure's `extenders` reports the impls map only, for the same reason.
+fn builtin_extenders(args: &[Value]) -> ValueResult<Value> {
+    let proto = match &args[0] {
+        Value::Protocol(p) => p.clone(),
+        v => {
+            return Err(ValueError::WrongType {
+                expected: "protocol",
+                got: v.type_name().to_string(),
+            });
+        }
+    };
+    let mut tags: Vec<Arc<str>> = {
+        let impls = proto.get().impls.lock().unwrap();
+        impls.keys().cloned().collect()
+    };
+    if tags.is_empty() {
+        return Ok(Value::Nil);
+    }
+    tags.sort_unstable();
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(
+        tags.into_iter()
+            .map(|t| Value::symbol(Symbol::simple(t.as_ref()))),
+    ))))
 }
 
 fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
