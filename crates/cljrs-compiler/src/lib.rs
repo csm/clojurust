@@ -30,6 +30,7 @@ pub mod codegen;
 pub mod escape;
 pub mod extensions;
 pub mod jit;
+pub mod native_dep;
 pub mod rt_abi;
 pub mod typeinfer;
 #[cfg(feature = "wasm-aot")]

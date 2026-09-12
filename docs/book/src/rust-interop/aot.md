@@ -32,7 +32,10 @@ fn main() {
 
     // Native init — registered before any Clojure code runs
     let mut registry = cljrs_interop::Registry::new(globals.clone());
-    my_project::cljrs_init(&mut registry);
+    #[allow(unused_unsafe)]
+    unsafe {
+        my_project::cljrs_init(&mut registry);
+    }
 
     let mut env = cljrs_runtime::tiered::Env::new(globals, "user");
     cljrs_runtime::env::callback::push_eval_context(&env);
@@ -44,6 +47,12 @@ fn main() {
     unsafe { __cljrs_main() };
 }
 ```
+
+The init call is wrapped in `unsafe` because an entry point takes a
+`*mut Registry` and dereferences it, so the honest signature is
+`unsafe extern "C" fn`. A safe `extern "C" fn`, which is what
+[Project Setup](project-setup.md) shows, is equally accepted: calling it inside
+`unsafe` is merely redundant, and the `allow` keeps that from warning.
 
 ## Crate type requirement
 

@@ -21,7 +21,7 @@ mod common;
 static AOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Compile a `.cljrs` source string to a binary, run it, and return stdout.
-#[allow(dead_code, clippy::result_large_err)]
+#[allow(dead_code)]
 fn compile_and_run(name: &str, source: &str) -> String {
     let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -2697,7 +2697,6 @@ fn test_auto_kw_qualified_keyword_aot() {
 }
 
 /// Compile `source` with the opacity gate on, returning the compile result.
-#[allow(clippy::result_large_err)]
 fn compile_gated(name: &str, source: &str) -> cljrs_compiler::aot::AotResult<()> {
     let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
