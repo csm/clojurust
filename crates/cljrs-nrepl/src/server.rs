@@ -200,6 +200,15 @@ const OPS: &[&str] = &[
     "ls-sessions",
 ];
 
+/// The Clojure language level this dialect implements, as reported to nREPL
+/// clients.
+///
+/// 1.11 is what the core actually provides: `update-keys`, `update-vals`,
+/// `abs`, `parse-long`, `parse-double` and `random-uuid` are all present, and
+/// no 1.12 addition (`partitionv`, `splitv-at`, …) is. `iteration` is the one
+/// 1.11 name still missing; raise this only when the level below it is whole.
+const CLOJURE_LEVEL: &str = "1.11.0";
+
 fn describe_response(req: &Request) -> Bencode {
     let ops: BTreeMap<Vec<u8>, Bencode> = OPS
         .iter()
@@ -219,6 +228,12 @@ fn describe_response(req: &Request) -> Bencode {
     let mut versions = BTreeMap::new();
     versions.insert(b"cljrs".to_vec(), version(env!("CARGO_PKG_VERSION")));
     versions.insert(b"nrepl".to_vec(), version("1.0.0"));
+    // The Clojure language level this dialect implements. Clients read
+    // `versions.clojure` to decide which version-gated features to enable;
+    // without it CIDER reports "Can't determine Clojure version" and turns
+    // parts of itself off. It answers "which Clojure does this speak", not
+    // "which implementation is this" — that is what `cljrs` above is for.
+    versions.insert(b"clojure".to_vec(), version(CLOJURE_LEVEL));
 
     Response::for_request(&req.clone(), req.session.as_deref().unwrap_or("none"))
         .field("ops", Bencode::Dict(ops))

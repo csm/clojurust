@@ -138,6 +138,31 @@ fn client_scenario(port: u16) {
         assert!(ops.contains_key(op.as_bytes()), "missing op {op}");
     }
 
+    // describe: advertises a Clojure language level as well as its own
+    // version. Clients gate features on `versions.clojure`; without it CIDER
+    // reports "Can't determine Clojure version" and turns part of itself off
+    // against a server that otherwise works.
+    let versions = resp[0]
+        .get(b"versions".as_slice())
+        .and_then(|v| v.as_dict())
+        .expect("describe has versions");
+    for key in ["cljrs", "nrepl", "clojure"] {
+        assert!(
+            versions.contains_key(key.as_bytes()),
+            "describe omits versions.{key}"
+        );
+    }
+    let clojure = versions
+        .get(b"clojure".as_slice())
+        .and_then(|v| v.as_dict())
+        .expect("versions.clojure is a dict");
+    for key in ["major", "minor", "incremental", "version-string"] {
+        assert!(
+            clojure.contains_key(key.as_bytes()),
+            "versions.clojure omits {key}"
+        );
+    }
+
     // clone: two independent sessions.
     let resp = c.request(&[("op", "clone")]);
     let session_a = field(&resp, "new-session")
