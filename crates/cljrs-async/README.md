@@ -32,7 +32,8 @@ Done (Phases A–H, A2, B1):
   a collection and closes it; `to-chan!` does the same but returns the channel before seeding
   finishes (background task). `mult` broadcasts a source channel to all registered tap channels
   (`tap!`/`untap!`/`untap-all!`). Clojure-level: `async-pmap`, `thread` macro, `merge`,
-  `reduce`, `into`. `eval_loop_async` enables proper `await` yielding inside `loop/recur`.
+  `reduce`, `into`. `eval_loop_async` and `eval_recur_async` enable proper `await` yielding
+  inside `loop`/`recur`, including in a `recur` *argument*.
 - Phase G: GC safepoints at async yield points via `cljrs_runtime::env::gc_roots::async_gc_collect()`,
   called before each `yield_now().await` in `await_value`. Background GC-service task spawned
   by `init()`. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
@@ -162,11 +163,14 @@ user-level catch. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.
 
-**Known limitation:** `eval_async` does not yet evaluate `try`/`catch` with *yielding* — it
-delegates them to the synchronous evaluator — so an `await`/`<?` inside a `try` (and therefore
-inside a `go-try` body) takes the synchronous `await` path. That resolves an already-ready value
-but is fragile when the awaited value is not yet available. Yielding `try`/`catch` in
-`eval_async` is the remaining follow-up.
+**Which forms yield:** `eval_async` has a yielding arm for `await`, `do`, `if`, `let`/`let*`,
+`loop`/`loop*`, `recur`, `try` (body, `catch` handlers and `finally`), collection literals, and
+function-call arguments. Every *other* special form is delegated to the synchronous evaluator,
+which evaluates its sub-expressions on the blocking `await` path. On the single-threaded
+`LocalSet` that deadlocks as soon as the awaited future is not already settled, because the task
+that would settle it cannot run while the executor thread is parked. So a special form that can
+carry an `await` anywhere inside it needs its own arm here; a fallthrough is a latent hang, not a
+slow path. `binding`, `and`/`or` and `throw` are the remaining delegated forms.
 
 ### `await` and the single-thread executor
 
