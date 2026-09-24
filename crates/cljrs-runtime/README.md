@@ -1014,12 +1014,18 @@ for `defmacro` the implicit `&form`/`&env` params are elided from the shown
 signature.  This is what `clojure.core/doc` and `doc-data` (in the `builtins`
 module) read back, and what `cljrs-nrepl`'s `op_lookup` surfaces to editors.
 
-### `meta_form_is_async(meta: &Form) -> bool`
+### Recognising `:async`
 
-Returns true when a `^meta` form (or attr-map literal) requests `:async` — either
-the keyword shorthand `^:async` or an explicit `{:async true}` map.  `fn`/`defn`
-use it to set `CljxFn::is_async`, which `env::apply::dispatch_if_async`
-checks at call time to route through the async runtime.
+`fn`/`defn` set `CljxFn::is_async` when a `^meta` form (or attr-map literal)
+requests `:async`, as decided by `Form::requests_async` in `cljrs-reader` — the
+same predicate IR lowering uses.  `env::apply::dispatch_if_async` checks the
+flag at call time to route through the async runtime.  The `^:async` may sit on
+the fn's first argument (`(fn ^:async [..] ..)`, peeled by `eval_fn`) or on the
+whole form (`^:async (fn [..] ..)`, handled by `eval`'s `FormKind::Meta` arm,
+which also attaches `{:async true}` as metadata since an `fn` form takes runtime
+metadata).  IR lowering refuses any body containing such an anonymous async fn
+(`Form::is_async_fn_form`), so it is always built here and calling it returns a
+`Future` in every tier.
 
 ### Which natives need form-level interception
 

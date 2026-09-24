@@ -145,14 +145,30 @@ impl Form {
     pub fn unmeta(&self) -> &Form
     /// The `^meta` forms attached here, outermost first, plus the annotated form.
     pub fn peel_meta(&self) -> (Vec<&Form>, &Form)
+    /// True when the value this form denotes *as data* (inside `quote`) can
+    /// carry metadata: collections, symbols, and the reader macros, which
+    /// denote lists. Mirrors `supports_meta` in `cljrs-runtime`.
+    pub fn quoted_value_supports_meta(&self) -> bool
     /// True when an evaluated-position `^meta` annotation on this form becomes
-    /// runtime metadata on the value it produces — a collection literal or a
+    /// runtime metadata on the value it produces — a collection literal (the
+    /// empty list `()` included; it has no head, so it is not a call) or a
     /// function. Every other form takes the annotation as a compile-time hint,
     /// so `(meta ^{:a 1} (list 1))` is `nil`. Consulted by every execution
     /// tier (`interp::eval` and `lower::anf`), which is what keeps `meta` from
     /// depending on how hot the code got. Does not apply inside `quote`, where
     /// the annotation is data.
     pub fn takes_runtime_meta(&self) -> bool
+    /// True for a list headed by `fn` or `fn*`.
+    pub fn is_fn_form(&self) -> bool
+    /// True when this form, as a `^meta` annotation or `defn` attr-map,
+    /// requests `:async` (`^:async`, or a map with a non-`false`/`nil`
+    /// `:async`). Shared by the tree-walker and IR lowering.
+    pub fn requests_async(&self) -> bool
+    /// True for an anonymous fn asking to be async, in either spelling:
+    /// `^:async (fn …)` or `(fn ^:async […] …)`. IR lowering refuses a body
+    /// containing one (a lowered closure cannot be dispatched as async), so the
+    /// tree-walker builds it in every tier.
+    pub fn is_async_fn_form(&self) -> bool
 
     // ── Structural views ──
     // Each reports the shape of `unmeta()`, so `^m form` has the same shape as

@@ -87,6 +87,32 @@ fn assert_same_in_every_tier(expr: &str, expected: &str) {
     assert_eq!(walked, expected, "`{expr}` in tree-walk");
 }
 
+/// Evaluate `expr` inside a function body in both tiers, asserting the IR tier
+/// *refused* to lower it and that the results agree on `expected`.
+///
+/// For a form only the tree-walker can build faithfully (an anonymous
+/// `^:async` fn), agreement comes from staying off the IR tier; a body that
+/// did lower would build a synchronous closure.
+fn assert_kept_on_tree_walker(expr: &str, expected: &str) {
+    let defn = format!("(defn probe [] (pr-str {expr}))");
+
+    let (_g, mut tree_walk) = make_env(cljrs_runtime::ExecutionMode::TreeWalk);
+    eval_all(&defn, &mut tree_walk);
+    let walked = pr_str_content(&eval_all("(probe)", &mut tree_walk), expr);
+
+    cljrs_runtime::tiered::force_eager_lowering();
+    let (globals, mut tiered) = make_env(cljrs_runtime::ExecutionMode::Tiered);
+    eval_all(&defn, &mut tiered);
+    let tiered_result = pr_str_content(&eval_all("(probe)", &mut tiered), expr);
+    assert!(
+        lowered_ir(&globals, "probe").is_none(),
+        "`{expr}` was lowered — its closure would be synchronous once promoted"
+    );
+
+    assert_eq!(walked, tiered_result, "`{expr}` disagreed between tiers");
+    assert_eq!(walked, expected, "`{expr}` in tree-walk");
+}
+
 /// The probe returns `(pr-str …)`, so its result is always a string; compare
 /// its contents rather than its own printed form.
 fn pr_str_content(value: &Value, expr: &str) -> String {
@@ -141,6 +167,31 @@ fn quote_keeps_the_annotation_as_data_in_both_tiers() {
     assert_same_in_every_tier("(meta '^{:a 1} [1])", "{:a 1}");
     assert_same_in_every_tier("(meta '^:dyn sym)", "{:dyn true}");
     assert_same_in_every_tier("(meta '^{:x (+ 1 2)} [1])", "{:x (+ 1 2)}");
+}
+
+#[test]
+fn an_empty_list_keeps_its_annotation() {
+    // `()` is the empty-list literal, not a call, so it attaches like `[]` —
+    // and like the quoted position already did.
+    assert_same_in_every_tier("(meta ^{:a 1} ())", "{:a 1}");
+    assert_same_in_every_tier("(meta '^{:a 1} ())", "{:a 1}");
+    assert_same_in_every_tier("^{:a 1} ()", "()");
+}
+
+// ── `^:async (fn …)` ─────────────────────────────────────────────────────────
+
+#[test]
+fn an_async_fn_keeps_its_annotation_in_every_tier() {
+    // Issue #359: the IR tier consumed `:async` and dropped the annotation, so
+    // this answered `{:async true}` cold and `nil` once promoted.
+    assert_kept_on_tree_walker("(meta ^:async (fn [] 1))", "{:async true}");
+    assert_kept_on_tree_walker("(meta ^:async ^:a (fn [] 1))", "{:a true, :async true}");
+    assert_kept_on_tree_walker("(meta (fn ^:async [] 1))", "nil");
+}
+
+#[test]
+fn a_false_async_annotation_is_plain_metadata() {
+    assert_same_in_every_tier("(meta ^{:async false} (fn [] 1))", "{:async false}");
 }
 
 // ── Forms that take the annotation as a hint ────────────────────────────────

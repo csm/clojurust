@@ -22,6 +22,7 @@
 ## quoted
 
 quoted | (meta '^:kw [1 2]) => {:kw true}
+quoted | (meta '^:kw ()) => {:kw true}
 quoted | (meta '^:kw {:k 1}) => {:kw true}
 quoted | (meta '^:kw #{1}) => {:kw true}
 quoted | (meta '^:kw (fn [] 1)) => {:kw true}
@@ -37,7 +38,25 @@ quoted | (meta '^:kw "s") => nil
 quoted | (meta '^:kw :kw) => nil
 quoted | (meta '^:kw nil) => nil
 
+quoted | (meta '^:async [1 2]) => {:async true}
+quoted | (meta '^:async ()) => {:async true}
+quoted | (meta '^:async {:k 1}) => {:async true}
+quoted | (meta '^:async #{1}) => {:async true}
+quoted | (meta '^:async (fn [] 1)) => {:async true}
+quoted | (meta '^:async #(inc %)) => {:async true}
+quoted | (meta '^:async (list 1)) => {:async true}
+quoted | (meta '^:async (vector 1)) => {:async true}
+quoted | (meta '^:async (if true [1] [2])) => {:async true}
+quoted | (meta '^:async (do [1])) => {:async true}
+quoted | (meta '^:async '(1 2)) => {:async true}
+quoted | (meta '^:async 'sym) => {:async true}
+quoted | (meta '^:async 42) => nil
+quoted | (meta '^:async "s") => nil
+quoted | (meta '^:async :kw) => nil
+quoted | (meta '^:async nil) => nil
+
 quoted | (meta '^::kw [1 2]) => {:user/kw true}
+quoted | (meta '^::kw ()) => {:user/kw true}
 quoted | (meta '^::kw {:k 1}) => {:user/kw true}
 quoted | (meta '^::kw #{1}) => {:user/kw true}
 quoted | (meta '^::kw (fn [] 1)) => {:user/kw true}
@@ -54,6 +73,7 @@ quoted | (meta '^::kw :kw) => nil
 quoted | (meta '^::kw nil) => nil
 
 quoted | (meta '^Sym [1 2]) => {:tag Sym}
+quoted | (meta '^Sym ()) => {:tag Sym}
 quoted | (meta '^Sym {:k 1}) => {:tag Sym}
 quoted | (meta '^Sym #{1}) => {:tag Sym}
 quoted | (meta '^Sym (fn [] 1)) => {:tag Sym}
@@ -70,6 +90,7 @@ quoted | (meta '^Sym :kw) => nil
 quoted | (meta '^Sym nil) => nil
 
 quoted | (meta '^ns.q/Sym [1 2]) => {:tag ns.q/Sym}
+quoted | (meta '^ns.q/Sym ()) => {:tag ns.q/Sym}
 quoted | (meta '^ns.q/Sym {:k 1}) => {:tag ns.q/Sym}
 quoted | (meta '^ns.q/Sym #{1}) => {:tag ns.q/Sym}
 quoted | (meta '^ns.q/Sym (fn [] 1)) => {:tag ns.q/Sym}
@@ -86,6 +107,7 @@ quoted | (meta '^ns.q/Sym :kw) => nil
 quoted | (meta '^ns.q/Sym nil) => nil
 
 quoted | (meta '^"Str" [1 2]) => {:tag "Str"}
+quoted | (meta '^"Str" ()) => {:tag "Str"}
 quoted | (meta '^"Str" {:k 1}) => {:tag "Str"}
 quoted | (meta '^"Str" #{1}) => {:tag "Str"}
 quoted | (meta '^"Str" (fn [] 1)) => {:tag "Str"}
@@ -102,6 +124,7 @@ quoted | (meta '^"Str" :kw) => nil
 quoted | (meta '^"Str" nil) => nil
 
 quoted | (meta '^{:a 1} [1 2]) => {:a 1}
+quoted | (meta '^{:a 1} ()) => {:a 1}
 quoted | (meta '^{:a 1} {:k 1}) => {:a 1}
 quoted | (meta '^{:a 1} #{1}) => {:a 1}
 quoted | (meta '^{:a 1} (fn [] 1)) => {:a 1}
@@ -118,6 +141,7 @@ quoted | (meta '^{:a 1} :kw) => nil
 quoted | (meta '^{:a 1} nil) => nil
 
 quoted | (meta '^{:a (+ 1 2)} [1 2]) => {:a (+ 1 2)}
+quoted | (meta '^{:a (+ 1 2)} ()) => {:a (+ 1 2)}
 quoted | (meta '^{:a (+ 1 2)} {:k 1}) => {:a (+ 1 2)}
 quoted | (meta '^{:a (+ 1 2)} #{1}) => {:a (+ 1 2)}
 quoted | (meta '^{:a (+ 1 2)} (fn [] 1)) => {:a (+ 1 2)}
@@ -134,6 +158,7 @@ quoted | (meta '^{:a (+ 1 2)} :kw) => nil
 quoted | (meta '^{:a (+ 1 2)} nil) => nil
 
 quoted | (meta '^{:tag 'String} [1 2]) => {:tag (quote String)}
+quoted | (meta '^{:tag 'String} ()) => {:tag (quote String)}
 quoted | (meta '^{:tag 'String} {:k 1}) => {:tag (quote String)}
 quoted | (meta '^{:tag 'String} #{1}) => {:tag (quote String)}
 quoted | (meta '^{:tag 'String} (fn [] 1)) => {:tag (quote String)}
@@ -150,6 +175,7 @@ quoted | (meta '^{:tag 'String} :kw) => nil
 quoted | (meta '^{:tag 'String} nil) => nil
 
 quoted | (meta '^nil [1 2]) => nil
+quoted | (meta '^nil ()) => nil
 quoted | (meta '^nil {:k 1}) => nil
 quoted | (meta '^nil #{1}) => nil
 quoted | (meta '^nil (fn [] 1)) => nil
@@ -166,6 +192,7 @@ quoted | (meta '^nil :kw) => nil
 quoted | (meta '^nil nil) => nil
 
 quoted | (meta '^42 [1 2]) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
+quoted | (meta '^42 ()) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 quoted | (meta '^42 {:k 1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 quoted | (meta '^42 #{1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 quoted | (meta '^42 (fn [] 1)) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
@@ -184,6 +211,7 @@ quoted | (meta '^42 nil) => ERROR Metadata must be Symbol, Keyword, String or Ma
 ## evaluated
 
 evaluated | (meta ^:kw [1 2]) => {:kw true}
+evaluated | (meta ^:kw ()) => {:kw true}
 evaluated | (meta ^:kw {:k 1}) => {:kw true}
 evaluated | (meta ^:kw #{1}) => {:kw true}
 evaluated | (meta ^:kw (fn [] 1)) => {:kw true}
@@ -199,7 +227,25 @@ evaluated | (meta ^:kw "s") => nil
 evaluated | (meta ^:kw :kw) => nil
 evaluated | (meta ^:kw nil) => nil
 
+evaluated | (meta ^:async [1 2]) => {:async true}
+evaluated | (meta ^:async ()) => {:async true}
+evaluated | (meta ^:async {:k 1}) => {:async true}
+evaluated | (meta ^:async #{1}) => {:async true}
+evaluated | (meta ^:async (fn [] 1)) => {:async true}
+evaluated | (meta ^:async #(inc %)) => {:async true}
+evaluated | (meta ^:async (list 1)) => nil
+evaluated | (meta ^:async (vector 1)) => nil
+evaluated | (meta ^:async (if true [1] [2])) => nil
+evaluated | (meta ^:async (do [1])) => nil
+evaluated | (meta ^:async '(1 2)) => nil
+evaluated | (meta ^:async 'sym) => nil
+evaluated | (meta ^:async 42) => nil
+evaluated | (meta ^:async "s") => nil
+evaluated | (meta ^:async :kw) => nil
+evaluated | (meta ^:async nil) => nil
+
 evaluated | (meta ^::kw [1 2]) => {:user/kw true}
+evaluated | (meta ^::kw ()) => {:user/kw true}
 evaluated | (meta ^::kw {:k 1}) => {:user/kw true}
 evaluated | (meta ^::kw #{1}) => {:user/kw true}
 evaluated | (meta ^::kw (fn [] 1)) => {:user/kw true}
@@ -216,6 +262,7 @@ evaluated | (meta ^::kw :kw) => nil
 evaluated | (meta ^::kw nil) => nil
 
 evaluated | (meta ^Sym [1 2]) => {:tag Sym}
+evaluated | (meta ^Sym ()) => {:tag Sym}
 evaluated | (meta ^Sym {:k 1}) => {:tag Sym}
 evaluated | (meta ^Sym #{1}) => {:tag Sym}
 evaluated | (meta ^Sym (fn [] 1)) => {:tag Sym}
@@ -232,6 +279,7 @@ evaluated | (meta ^Sym :kw) => nil
 evaluated | (meta ^Sym nil) => nil
 
 evaluated | (meta ^ns.q/Sym [1 2]) => {:tag ns.q/Sym}
+evaluated | (meta ^ns.q/Sym ()) => {:tag ns.q/Sym}
 evaluated | (meta ^ns.q/Sym {:k 1}) => {:tag ns.q/Sym}
 evaluated | (meta ^ns.q/Sym #{1}) => {:tag ns.q/Sym}
 evaluated | (meta ^ns.q/Sym (fn [] 1)) => {:tag ns.q/Sym}
@@ -248,6 +296,7 @@ evaluated | (meta ^ns.q/Sym :kw) => nil
 evaluated | (meta ^ns.q/Sym nil) => nil
 
 evaluated | (meta ^"Str" [1 2]) => {:tag "Str"}
+evaluated | (meta ^"Str" ()) => {:tag "Str"}
 evaluated | (meta ^"Str" {:k 1}) => {:tag "Str"}
 evaluated | (meta ^"Str" #{1}) => {:tag "Str"}
 evaluated | (meta ^"Str" (fn [] 1)) => {:tag "Str"}
@@ -264,6 +313,7 @@ evaluated | (meta ^"Str" :kw) => nil
 evaluated | (meta ^"Str" nil) => nil
 
 evaluated | (meta ^{:a 1} [1 2]) => {:a 1}
+evaluated | (meta ^{:a 1} ()) => {:a 1}
 evaluated | (meta ^{:a 1} {:k 1}) => {:a 1}
 evaluated | (meta ^{:a 1} #{1}) => {:a 1}
 evaluated | (meta ^{:a 1} (fn [] 1)) => {:a 1}
@@ -280,6 +330,7 @@ evaluated | (meta ^{:a 1} :kw) => nil
 evaluated | (meta ^{:a 1} nil) => nil
 
 evaluated | (meta ^{:a (+ 1 2)} [1 2]) => {:a 3}
+evaluated | (meta ^{:a (+ 1 2)} ()) => {:a 3}
 evaluated | (meta ^{:a (+ 1 2)} {:k 1}) => {:a 3}
 evaluated | (meta ^{:a (+ 1 2)} #{1}) => {:a 3}
 evaluated | (meta ^{:a (+ 1 2)} (fn [] 1)) => {:a 3}
@@ -296,6 +347,7 @@ evaluated | (meta ^{:a (+ 1 2)} :kw) => nil
 evaluated | (meta ^{:a (+ 1 2)} nil) => nil
 
 evaluated | (meta ^{:tag 'String} [1 2]) => {:tag String}
+evaluated | (meta ^{:tag 'String} ()) => {:tag String}
 evaluated | (meta ^{:tag 'String} {:k 1}) => {:tag String}
 evaluated | (meta ^{:tag 'String} #{1}) => {:tag String}
 evaluated | (meta ^{:tag 'String} (fn [] 1)) => {:tag String}
@@ -312,6 +364,7 @@ evaluated | (meta ^{:tag 'String} :kw) => nil
 evaluated | (meta ^{:tag 'String} nil) => nil
 
 evaluated | (meta ^nil [1 2]) => nil
+evaluated | (meta ^nil ()) => nil
 evaluated | (meta ^nil {:k 1}) => nil
 evaluated | (meta ^nil #{1}) => nil
 evaluated | (meta ^nil (fn [] 1)) => nil
@@ -328,6 +381,7 @@ evaluated | (meta ^nil :kw) => nil
 evaluated | (meta ^nil nil) => nil
 
 evaluated | (meta ^42 [1 2]) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
+evaluated | (meta ^42 ()) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 evaluated | (meta ^42 {:k 1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 evaluated | (meta ^42 #{1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 evaluated | (meta ^42 (fn [] 1)) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
@@ -346,6 +400,7 @@ evaluated | (meta ^42 nil) => nil
 ## syntaxq
 
 syntaxq | (meta `^:kw [1 2]) => {:kw true}
+syntaxq | (meta `^:kw ()) => {:kw true}
 syntaxq | (meta `^:kw {:k 1}) => {:kw true}
 syntaxq | (meta `^:kw #{1}) => {:kw true}
 syntaxq | (meta `^:kw (fn [] 1)) => {:kw true}
@@ -361,7 +416,25 @@ syntaxq | (meta `^:kw "s") => nil
 syntaxq | (meta `^:kw :kw) => nil
 syntaxq | (meta `^:kw nil) => nil
 
+syntaxq | (meta `^:async [1 2]) => {:async true}
+syntaxq | (meta `^:async ()) => {:async true}
+syntaxq | (meta `^:async {:k 1}) => {:async true}
+syntaxq | (meta `^:async #{1}) => {:async true}
+syntaxq | (meta `^:async (fn [] 1)) => {:async true}
+syntaxq | (meta `^:async #(inc %)) => {:async true}
+syntaxq | (meta `^:async (list 1)) => {:async true}
+syntaxq | (meta `^:async (vector 1)) => {:async true}
+syntaxq | (meta `^:async (if true [1] [2])) => {:async true}
+syntaxq | (meta `^:async (do [1])) => {:async true}
+syntaxq | (meta `^:async '(1 2)) => {:async true}
+syntaxq | (meta `^:async 'sym) => {:async true}
+syntaxq | (meta `^:async 42) => nil
+syntaxq | (meta `^:async "s") => nil
+syntaxq | (meta `^:async :kw) => nil
+syntaxq | (meta `^:async nil) => nil
+
 syntaxq | (meta `^::kw [1 2]) => {:user/kw true}
+syntaxq | (meta `^::kw ()) => {:user/kw true}
 syntaxq | (meta `^::kw {:k 1}) => {:user/kw true}
 syntaxq | (meta `^::kw #{1}) => {:user/kw true}
 syntaxq | (meta `^::kw (fn [] 1)) => {:user/kw true}
@@ -378,6 +451,7 @@ syntaxq | (meta `^::kw :kw) => nil
 syntaxq | (meta `^::kw nil) => nil
 
 syntaxq | (meta `^Sym [1 2]) => {:tag Sym}
+syntaxq | (meta `^Sym ()) => {:tag Sym}
 syntaxq | (meta `^Sym {:k 1}) => {:tag Sym}
 syntaxq | (meta `^Sym #{1}) => {:tag Sym}
 syntaxq | (meta `^Sym (fn [] 1)) => {:tag Sym}
@@ -394,6 +468,7 @@ syntaxq | (meta `^Sym :kw) => nil
 syntaxq | (meta `^Sym nil) => nil
 
 syntaxq | (meta `^ns.q/Sym [1 2]) => {:tag ns.q/Sym}
+syntaxq | (meta `^ns.q/Sym ()) => {:tag ns.q/Sym}
 syntaxq | (meta `^ns.q/Sym {:k 1}) => {:tag ns.q/Sym}
 syntaxq | (meta `^ns.q/Sym #{1}) => {:tag ns.q/Sym}
 syntaxq | (meta `^ns.q/Sym (fn [] 1)) => {:tag ns.q/Sym}
@@ -410,6 +485,7 @@ syntaxq | (meta `^ns.q/Sym :kw) => nil
 syntaxq | (meta `^ns.q/Sym nil) => nil
 
 syntaxq | (meta `^"Str" [1 2]) => {:tag "Str"}
+syntaxq | (meta `^"Str" ()) => {:tag "Str"}
 syntaxq | (meta `^"Str" {:k 1}) => {:tag "Str"}
 syntaxq | (meta `^"Str" #{1}) => {:tag "Str"}
 syntaxq | (meta `^"Str" (fn [] 1)) => {:tag "Str"}
@@ -426,6 +502,7 @@ syntaxq | (meta `^"Str" :kw) => nil
 syntaxq | (meta `^"Str" nil) => nil
 
 syntaxq | (meta `^{:a 1} [1 2]) => {:a 1}
+syntaxq | (meta `^{:a 1} ()) => {:a 1}
 syntaxq | (meta `^{:a 1} {:k 1}) => {:a 1}
 syntaxq | (meta `^{:a 1} #{1}) => {:a 1}
 syntaxq | (meta `^{:a 1} (fn [] 1)) => {:a 1}
@@ -442,6 +519,7 @@ syntaxq | (meta `^{:a 1} :kw) => nil
 syntaxq | (meta `^{:a 1} nil) => nil
 
 syntaxq | (meta `^{:a (+ 1 2)} [1 2]) => {:a (clojure.core/+ 1 2)}
+syntaxq | (meta `^{:a (+ 1 2)} ()) => {:a (clojure.core/+ 1 2)}
 syntaxq | (meta `^{:a (+ 1 2)} {:k 1}) => {:a (clojure.core/+ 1 2)}
 syntaxq | (meta `^{:a (+ 1 2)} #{1}) => {:a (clojure.core/+ 1 2)}
 syntaxq | (meta `^{:a (+ 1 2)} (fn [] 1)) => {:a (clojure.core/+ 1 2)}
@@ -458,6 +536,7 @@ syntaxq | (meta `^{:a (+ 1 2)} :kw) => nil
 syntaxq | (meta `^{:a (+ 1 2)} nil) => nil
 
 syntaxq | (meta `^{:tag 'String} [1 2]) => {:tag (quote user/String)}
+syntaxq | (meta `^{:tag 'String} ()) => {:tag (quote user/String)}
 syntaxq | (meta `^{:tag 'String} {:k 1}) => {:tag (quote user/String)}
 syntaxq | (meta `^{:tag 'String} #{1}) => {:tag (quote user/String)}
 syntaxq | (meta `^{:tag 'String} (fn [] 1)) => {:tag (quote user/String)}
@@ -474,6 +553,7 @@ syntaxq | (meta `^{:tag 'String} :kw) => nil
 syntaxq | (meta `^{:tag 'String} nil) => nil
 
 syntaxq | (meta `^nil [1 2]) => nil
+syntaxq | (meta `^nil ()) => nil
 syntaxq | (meta `^nil {:k 1}) => nil
 syntaxq | (meta `^nil #{1}) => nil
 syntaxq | (meta `^nil (fn [] 1)) => nil
@@ -490,6 +570,7 @@ syntaxq | (meta `^nil :kw) => nil
 syntaxq | (meta `^nil nil) => nil
 
 syntaxq | (meta `^42 [1 2]) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
+syntaxq | (meta `^42 ()) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 syntaxq | (meta `^42 {:k 1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 syntaxq | (meta `^42 #{1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 syntaxq | (meta `^42 (fn [] 1)) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
@@ -508,6 +589,7 @@ syntaxq | (meta `^42 nil) => ERROR Metadata must be Symbol, Keyword, String or M
 ## value-is-unchanged
 
 value | ^{:a 1} [1 2] => "[1 2]" | bare => "[1 2]"
+value | ^{:a 1} () => "()" | bare => "()"
 value | ^{:a 1} {:k 1} => "{:k 1}" | bare => "{:k 1}"
 value | ^{:a 1} #{1} => "#{1}" | bare => "#{1}"
 value | ^{:a 1} (fn [] 1) => "#<Fn>" | bare => "#<Fn>"
@@ -526,6 +608,7 @@ value | ^{:a 1} nil => "nil" | bare => "nil"
 ## tier-parity (evaluated position, IR tier)
 
 ir-evaluated | (meta ^:kw [1 2]) => {:kw true}
+ir-evaluated | (meta ^:kw ()) => {:kw true}
 ir-evaluated | (meta ^:kw {:k 1}) => {:kw true}
 ir-evaluated | (meta ^:kw #{1}) => {:kw true}
 ir-evaluated | (meta ^:kw (fn [] 1)) => {:kw true}
@@ -541,7 +624,25 @@ ir-evaluated | (meta ^:kw "s") => nil
 ir-evaluated | (meta ^:kw :kw) => nil
 ir-evaluated | (meta ^:kw nil) => nil
 
+ir-evaluated | (meta ^:async [1 2]) => {:async true}
+ir-evaluated | (meta ^:async ()) => {:async true}
+ir-evaluated | (meta ^:async {:k 1}) => {:async true}
+ir-evaluated | (meta ^:async #{1}) => {:async true}
+ir-evaluated | (meta ^:async (fn [] 1)) => {:async true}
+ir-evaluated | (meta ^:async #(inc %)) => {:async true}
+ir-evaluated | (meta ^:async (list 1)) => nil
+ir-evaluated | (meta ^:async (vector 1)) => nil
+ir-evaluated | (meta ^:async (if true [1] [2])) => nil
+ir-evaluated | (meta ^:async (do [1])) => nil
+ir-evaluated | (meta ^:async '(1 2)) => nil
+ir-evaluated | (meta ^:async 'sym) => nil
+ir-evaluated | (meta ^:async 42) => nil
+ir-evaluated | (meta ^:async "s") => nil
+ir-evaluated | (meta ^:async :kw) => nil
+ir-evaluated | (meta ^:async nil) => nil
+
 ir-evaluated | (meta ^::kw [1 2]) => {:user/kw true}
+ir-evaluated | (meta ^::kw ()) => {:user/kw true}
 ir-evaluated | (meta ^::kw {:k 1}) => {:user/kw true}
 ir-evaluated | (meta ^::kw #{1}) => {:user/kw true}
 ir-evaluated | (meta ^::kw (fn [] 1)) => {:user/kw true}
@@ -558,6 +659,7 @@ ir-evaluated | (meta ^::kw :kw) => nil
 ir-evaluated | (meta ^::kw nil) => nil
 
 ir-evaluated | (meta ^Sym [1 2]) => {:tag Sym}
+ir-evaluated | (meta ^Sym ()) => {:tag Sym}
 ir-evaluated | (meta ^Sym {:k 1}) => {:tag Sym}
 ir-evaluated | (meta ^Sym #{1}) => {:tag Sym}
 ir-evaluated | (meta ^Sym (fn [] 1)) => {:tag Sym}
@@ -574,6 +676,7 @@ ir-evaluated | (meta ^Sym :kw) => nil
 ir-evaluated | (meta ^Sym nil) => nil
 
 ir-evaluated | (meta ^ns.q/Sym [1 2]) => {:tag ns.q/Sym}
+ir-evaluated | (meta ^ns.q/Sym ()) => {:tag ns.q/Sym}
 ir-evaluated | (meta ^ns.q/Sym {:k 1}) => {:tag ns.q/Sym}
 ir-evaluated | (meta ^ns.q/Sym #{1}) => {:tag ns.q/Sym}
 ir-evaluated | (meta ^ns.q/Sym (fn [] 1)) => {:tag ns.q/Sym}
@@ -590,6 +693,7 @@ ir-evaluated | (meta ^ns.q/Sym :kw) => nil
 ir-evaluated | (meta ^ns.q/Sym nil) => nil
 
 ir-evaluated | (meta ^"Str" [1 2]) => {:tag "Str"}
+ir-evaluated | (meta ^"Str" ()) => {:tag "Str"}
 ir-evaluated | (meta ^"Str" {:k 1}) => {:tag "Str"}
 ir-evaluated | (meta ^"Str" #{1}) => {:tag "Str"}
 ir-evaluated | (meta ^"Str" (fn [] 1)) => {:tag "Str"}
@@ -606,6 +710,7 @@ ir-evaluated | (meta ^"Str" :kw) => nil
 ir-evaluated | (meta ^"Str" nil) => nil
 
 ir-evaluated | (meta ^{:a 1} [1 2]) => {:a 1}
+ir-evaluated | (meta ^{:a 1} ()) => {:a 1}
 ir-evaluated | (meta ^{:a 1} {:k 1}) => {:a 1}
 ir-evaluated | (meta ^{:a 1} #{1}) => {:a 1}
 ir-evaluated | (meta ^{:a 1} (fn [] 1)) => {:a 1}
@@ -622,6 +727,7 @@ ir-evaluated | (meta ^{:a 1} :kw) => nil
 ir-evaluated | (meta ^{:a 1} nil) => nil
 
 ir-evaluated | (meta ^{:a (+ 1 2)} [1 2]) => {:a 3}
+ir-evaluated | (meta ^{:a (+ 1 2)} ()) => {:a 3}
 ir-evaluated | (meta ^{:a (+ 1 2)} {:k 1}) => {:a 3}
 ir-evaluated | (meta ^{:a (+ 1 2)} #{1}) => {:a 3}
 ir-evaluated | (meta ^{:a (+ 1 2)} (fn [] 1)) => {:a 3}
@@ -638,6 +744,7 @@ ir-evaluated | (meta ^{:a (+ 1 2)} :kw) => nil
 ir-evaluated | (meta ^{:a (+ 1 2)} nil) => nil
 
 ir-evaluated | (meta ^{:tag 'String} [1 2]) => {:tag String}
+ir-evaluated | (meta ^{:tag 'String} ()) => {:tag String}
 ir-evaluated | (meta ^{:tag 'String} {:k 1}) => {:tag String}
 ir-evaluated | (meta ^{:tag 'String} #{1}) => {:tag String}
 ir-evaluated | (meta ^{:tag 'String} (fn [] 1)) => {:tag String}
@@ -654,6 +761,7 @@ ir-evaluated | (meta ^{:tag 'String} :kw) => nil
 ir-evaluated | (meta ^{:tag 'String} nil) => nil
 
 ir-evaluated | (meta ^nil [1 2]) => nil
+ir-evaluated | (meta ^nil ()) => nil
 ir-evaluated | (meta ^nil {:k 1}) => nil
 ir-evaluated | (meta ^nil #{1}) => nil
 ir-evaluated | (meta ^nil (fn [] 1)) => nil
@@ -670,6 +778,7 @@ ir-evaluated | (meta ^nil :kw) => nil
 ir-evaluated | (meta ^nil nil) => nil
 
 ir-evaluated | (meta ^42 [1 2]) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
+ir-evaluated | (meta ^42 ()) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-evaluated | (meta ^42 {:k 1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-evaluated | (meta ^42 #{1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-evaluated | (meta ^42 (fn [] 1)) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
@@ -688,6 +797,7 @@ ir-evaluated | (meta ^42 nil) => nil
 ## tier-parity (quoted position, IR tier)
 
 ir-quoted | (meta '^:kw [1 2]) => {:kw true}
+ir-quoted | (meta '^:kw ()) => {:kw true}
 ir-quoted | (meta '^:kw {:k 1}) => {:kw true}
 ir-quoted | (meta '^:kw #{1}) => {:kw true}
 ir-quoted | (meta '^:kw (fn [] 1)) => {:kw true}
@@ -703,7 +813,25 @@ ir-quoted | (meta '^:kw "s") => nil
 ir-quoted | (meta '^:kw :kw) => nil
 ir-quoted | (meta '^:kw nil) => nil
 
+ir-quoted | (meta '^:async [1 2]) => {:async true}
+ir-quoted | (meta '^:async ()) => {:async true}
+ir-quoted | (meta '^:async {:k 1}) => {:async true}
+ir-quoted | (meta '^:async #{1}) => {:async true}
+ir-quoted | (meta '^:async (fn [] 1)) => {:async true}
+ir-quoted | (meta '^:async #(inc %)) => {:async true}
+ir-quoted | (meta '^:async (list 1)) => {:async true}
+ir-quoted | (meta '^:async (vector 1)) => {:async true}
+ir-quoted | (meta '^:async (if true [1] [2])) => {:async true}
+ir-quoted | (meta '^:async (do [1])) => {:async true}
+ir-quoted | (meta '^:async '(1 2)) => {:async true}
+ir-quoted | (meta '^:async 'sym) => {:async true}
+ir-quoted | (meta '^:async 42) => nil
+ir-quoted | (meta '^:async "s") => nil
+ir-quoted | (meta '^:async :kw) => nil
+ir-quoted | (meta '^:async nil) => nil
+
 ir-quoted | (meta '^::kw [1 2]) => {:user/kw true}
+ir-quoted | (meta '^::kw ()) => {:user/kw true}
 ir-quoted | (meta '^::kw {:k 1}) => {:user/kw true}
 ir-quoted | (meta '^::kw #{1}) => {:user/kw true}
 ir-quoted | (meta '^::kw (fn [] 1)) => {:user/kw true}
@@ -720,6 +848,7 @@ ir-quoted | (meta '^::kw :kw) => nil
 ir-quoted | (meta '^::kw nil) => nil
 
 ir-quoted | (meta '^Sym [1 2]) => {:tag Sym}
+ir-quoted | (meta '^Sym ()) => {:tag Sym}
 ir-quoted | (meta '^Sym {:k 1}) => {:tag Sym}
 ir-quoted | (meta '^Sym #{1}) => {:tag Sym}
 ir-quoted | (meta '^Sym (fn [] 1)) => {:tag Sym}
@@ -736,6 +865,7 @@ ir-quoted | (meta '^Sym :kw) => nil
 ir-quoted | (meta '^Sym nil) => nil
 
 ir-quoted | (meta '^ns.q/Sym [1 2]) => {:tag ns.q/Sym}
+ir-quoted | (meta '^ns.q/Sym ()) => {:tag ns.q/Sym}
 ir-quoted | (meta '^ns.q/Sym {:k 1}) => {:tag ns.q/Sym}
 ir-quoted | (meta '^ns.q/Sym #{1}) => {:tag ns.q/Sym}
 ir-quoted | (meta '^ns.q/Sym (fn [] 1)) => {:tag ns.q/Sym}
@@ -752,6 +882,7 @@ ir-quoted | (meta '^ns.q/Sym :kw) => nil
 ir-quoted | (meta '^ns.q/Sym nil) => nil
 
 ir-quoted | (meta '^"Str" [1 2]) => {:tag "Str"}
+ir-quoted | (meta '^"Str" ()) => {:tag "Str"}
 ir-quoted | (meta '^"Str" {:k 1}) => {:tag "Str"}
 ir-quoted | (meta '^"Str" #{1}) => {:tag "Str"}
 ir-quoted | (meta '^"Str" (fn [] 1)) => {:tag "Str"}
@@ -768,6 +899,7 @@ ir-quoted | (meta '^"Str" :kw) => nil
 ir-quoted | (meta '^"Str" nil) => nil
 
 ir-quoted | (meta '^{:a 1} [1 2]) => {:a 1}
+ir-quoted | (meta '^{:a 1} ()) => {:a 1}
 ir-quoted | (meta '^{:a 1} {:k 1}) => {:a 1}
 ir-quoted | (meta '^{:a 1} #{1}) => {:a 1}
 ir-quoted | (meta '^{:a 1} (fn [] 1)) => {:a 1}
@@ -784,6 +916,7 @@ ir-quoted | (meta '^{:a 1} :kw) => nil
 ir-quoted | (meta '^{:a 1} nil) => nil
 
 ir-quoted | (meta '^{:a (+ 1 2)} [1 2]) => {:a (+ 1 2)}
+ir-quoted | (meta '^{:a (+ 1 2)} ()) => {:a (+ 1 2)}
 ir-quoted | (meta '^{:a (+ 1 2)} {:k 1}) => {:a (+ 1 2)}
 ir-quoted | (meta '^{:a (+ 1 2)} #{1}) => {:a (+ 1 2)}
 ir-quoted | (meta '^{:a (+ 1 2)} (fn [] 1)) => {:a (+ 1 2)}
@@ -800,6 +933,7 @@ ir-quoted | (meta '^{:a (+ 1 2)} :kw) => nil
 ir-quoted | (meta '^{:a (+ 1 2)} nil) => nil
 
 ir-quoted | (meta '^{:tag 'String} [1 2]) => {:tag (quote String)}
+ir-quoted | (meta '^{:tag 'String} ()) => {:tag (quote String)}
 ir-quoted | (meta '^{:tag 'String} {:k 1}) => {:tag (quote String)}
 ir-quoted | (meta '^{:tag 'String} #{1}) => {:tag (quote String)}
 ir-quoted | (meta '^{:tag 'String} (fn [] 1)) => {:tag (quote String)}
@@ -816,6 +950,7 @@ ir-quoted | (meta '^{:tag 'String} :kw) => nil
 ir-quoted | (meta '^{:tag 'String} nil) => nil
 
 ir-quoted | (meta '^nil [1 2]) => nil
+ir-quoted | (meta '^nil ()) => nil
 ir-quoted | (meta '^nil {:k 1}) => nil
 ir-quoted | (meta '^nil #{1}) => nil
 ir-quoted | (meta '^nil (fn [] 1)) => nil
@@ -832,6 +967,7 @@ ir-quoted | (meta '^nil :kw) => nil
 ir-quoted | (meta '^nil nil) => nil
 
 ir-quoted | (meta '^42 [1 2]) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
+ir-quoted | (meta '^42 ()) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-quoted | (meta '^42 {:k 1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-quoted | (meta '^42 #{1}) => ERROR Metadata must be Symbol, Keyword, String or Map, got long
 ir-quoted | (meta '^42 (fn [] 1)) => ERROR Metadata must be Symbol, Keyword, String or Map, got long

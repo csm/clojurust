@@ -147,13 +147,20 @@ Reader metadata needs no dedicated instruction either.  `^m form` lowers to
 `meta` → `merge` → `with-meta` on `clojure.core`, through the ordinary
 `LoadGlobal` + `Call` path every backend already supports; merging rather than
 replacing is what keeps both layers of a stacked `^:a ^:b [1]` alive with the
-outer one winning.  The attach is emitted only when
-`Form::takes_runtime_meta` (in `cljrs-reader`) holds — a collection literal or
-a function — which is the same predicate the tree-walker consults, so `meta`
+outer one winning.  Because the three are resolved as vars at run time,
+redefining `clojure.core/meta`, `merge` or `with-meta` changes what an
+annotation does in lowered code but not in the tree-walker, which attaches
+natively; that is accepted as the cost of needing no new instruction.  The attach is emitted only when
+`Form::takes_runtime_meta` (in `cljrs-reader`) holds — a collection literal
+(`()` included) or a function — which is the same predicate the tree-walker consults, so `meta`
 cannot answer one way interpreted and another once promoted.  Everywhere else
 the annotation is a compile-time hint: it is dropped, and not evaluated, so
-`(f ^long n)` costs nothing.  `^:async (fn …)` keeps its own arm ahead of this
-and is consumed by `lower_fn`.
+`(f ^long n)` costs nothing.  An anonymous async fn — `^:async (fn …)` or
+`(fn ^:async […] …)`, per `Form::is_async_fn_form` — is refused with
+`UnsupportedForm`: a lowered closure is a plain `NativeFunction` (or native
+closure) that the async runtime cannot dispatch, so lowering it would make
+calling it synchronous once the enclosing body was promoted.  The body stays on
+the tree-walker, which builds a real async fn and attaches `{:async true}`.
 
 Method interop needs no dedicated instruction either: `(.method target args…)`
 lowers to `CallDirect(dst, ".method", [target, args…])` — the leading dot in

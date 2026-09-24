@@ -99,3 +99,95 @@ fn the_gate_can_fail() {
         "the control was not flagged — the gate cannot detect a difference"
     );
 }
+
+// ── The IR tier's copies ────────────────────────────────────────────────────
+//
+// The gate above calls each predicate as a value, `(f v)`, which always reaches
+// the builtin. A *direct* call in a lowered body, `(vector? v)`, can instead
+// lower to a `KnownFn` whose implementation lives in `tiered::ir_interp` — a
+// second copy of the predicate, and the one the original drift came from. So
+// the same `ns-publics`-driven sweep is repeated with every predicate spelled
+// as a direct call inside a function the IR tier has actually lowered.
+
+/// The IR the tier-1 interpreter would run for `user/<name>`'s only arity.
+fn lowered_ir(globals: &Arc<GlobalEnv>, name: &str) -> Option<Arc<cljrs_ir::IrFunction>> {
+    let var = globals.lookup_var_in_ns("user", name)?;
+    let value = var.get().value.lock().unwrap().clone()?;
+    let Value::Fn(f) = value.unwrap_meta() else {
+        return None;
+    };
+    let id = f.get().arities.first()?.ir_arity_id;
+    globals.ir_cache().get(id)
+}
+
+#[test]
+fn every_core_predicate_is_metadata_transparent_as_a_direct_call_once_lowered() {
+    let names = eval_str(&format!(
+        "{PRELUDE} (apply str (interpose \" \" (map (comp str first) (predicate-vars))))"
+    ));
+    let names: Vec<&str> = names.trim_matches('"').split_whitespace().collect();
+    assert!(names.len() >= 50, "only {} predicates found", names.len());
+
+    cljrs_runtime::tiered::force_eager_lowering();
+    let globals = cljrs_runtime::Runtime::builder()
+        .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
+        .eager_clojure_test(true)
+        .build()
+        .expect("runtime")
+        .into_globals();
+    let mut env = Env::new(globals.clone(), "user");
+    let eval_here = |src: &str, env: &mut Env| -> String {
+        let mut parser = Parser::new(src.to_string(), "<test>".to_string());
+        let mut result = Value::Nil;
+        for form in parser.parse_all().expect("parse error") {
+            result = cljrs_runtime::tiered::eval(&form, env)
+                .unwrap_or_else(|e| panic!("{src}\neval: {e:?}"));
+        }
+        format!("{result}")
+    };
+    eval_here(PRELUDE, &mut env);
+
+    let mut offenders = Vec::new();
+    let mut lowered = 0;
+    for (i, name) in names.iter().enumerate() {
+        let probe = format!("probe-{i}");
+        eval_here(
+            &format!(
+                "(defn {probe} [v]
+                   (try [:ok (pr-str ({name} v))]
+                        (catch Throwable e [:err (str (ex-message e))])))"
+            ),
+            &mut env,
+        );
+        if lowered_ir(&globals, &probe).is_some() {
+            lowered += 1;
+        }
+        let found = eval_here(
+            &format!(
+                "(pr-str (vec (filter some?
+                   (map (fn [s]
+                          (let [bare ({probe} s)
+                                ann  ({probe} (with-meta s {{:probe 1}}))]
+                            (when (not= bare ann) [(pr-str s) bare ann])))
+                        samples))))"
+            ),
+            &mut env,
+        );
+        if found != "\"[]\"" && found != "[]" {
+            offenders.push(format!("{name}: {found}"));
+        }
+    }
+
+    // Without this the sweep could pass by never leaving the tree-walker.
+    assert!(
+        lowered * 2 >= names.len(),
+        "only {lowered} of {} probes reached the IR tier — the sweep is not testing it",
+        names.len()
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} predicates answer differently for an annotated value as a lowered direct call:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}

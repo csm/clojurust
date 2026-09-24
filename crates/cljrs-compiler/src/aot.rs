@@ -1382,8 +1382,13 @@ fn is_interpreter_only_sym(s: &str) -> bool {
 /// into the form tree so that e.g. `(do (def x ...) (alter-meta! ...))` is caught.
 /// `await` and `async-spawn` are async special forms only the interpreter understands;
 /// any top-level form whose expansion tree contains them must stay interpreted.
+/// So must one containing an anonymous `^:async` fn, which lowering refuses
+/// because a compiled closure cannot be dispatched as async.
 fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
     use cljrs_reader::form::FormKind;
+    if form.is_async_fn_form() {
+        return true;
+    }
     match &form.kind {
         FormKind::List(parts) => {
             if let Some(head) = parts.first()
@@ -1413,6 +1418,7 @@ fn expanded_needs_interpreter(form: &cljrs_reader::Form) -> bool {
             elems.iter().any(expanded_needs_interpreter)
         }
         FormKind::Map(elems) => elems.iter().any(expanded_needs_interpreter),
+        FormKind::Meta(_, inner) => expanded_needs_interpreter(inner),
         _ => false,
     }
 }
@@ -3320,6 +3326,23 @@ mod tests {
             .parse_all()
             .expect("parse")
             .remove(0)
+    }
+
+    /// Lowering refuses an anonymous `^:async` fn (a compiled closure cannot
+    /// be dispatched as async), so a top-level form containing one has to be
+    /// interpreted rather than fail `__cljrs_main`'s lowering.
+    #[test]
+    fn a_form_building_an_async_fn_is_interpreted() {
+        for src in [
+            "(def f ^:async (fn [] 1))",
+            "(def f (fn ^:async [] 1))",
+            "(def f ^:a (fn* ^:async [] 1))",
+        ] {
+            assert!(expanded_needs_interpreter(&parse_one(src)), "`{src}`");
+        }
+        assert!(!expanded_needs_interpreter(&parse_one(
+            "(def f ^:a (fn [] 1))"
+        )));
     }
 
     #[test]

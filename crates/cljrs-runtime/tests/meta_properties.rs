@@ -115,6 +115,7 @@ fn annotation_strategy() -> impl Strategy<Value = Annotation> {
 fn constructing_form_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("[]".to_string()),
+        Just("()".to_string()),
         Just("[1 2 3]".to_string()),
         Just("{:k 1}".to_string()),
         Just("#{1 2}".to_string()),
