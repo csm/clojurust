@@ -34,6 +34,8 @@ use cljrs_runtime::env::env::GlobalEnv;
 mod edn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod io;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod process;
 mod set;
 mod string;
 // ── Embedded sources ──────────────────────────────────────────────────────────
@@ -46,6 +48,8 @@ const CLOJURE_TEMPLATE_SRC: &str = include_str!("clojure/template.cljrs");
 const CLOJURE_RUST_IO_SRC: &str = include_str!("clojure/rust/io.cljrs");
 #[cfg(not(target_arch = "wasm32"))]
 const CLOJURE_EDN_SRC: &str = include_str!("clojure/edn.cljrs");
+#[cfg(not(target_arch = "wasm32"))]
+const CLOJURE_JAVA_SHELL_SRC: &str = include_str!("clojure/java/shell.cljrs");
 const CLOJURE_WALK_SRC: &str = include_str!("clojure/walk.cljrs");
 const CLOJURE_PPRINT_SRC: &str = include_str!("clojure/pprint.cljrs");
 const CLOJURE_DATA_SRC: &str = include_str!("clojure/data.cljrs");
@@ -106,6 +110,11 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 
         edn::register(globals, "clojure.edn");
         globals.register_builtin_source("clojure.edn", CLOJURE_EDN_SRC);
+
+        // clojure.java.shell ─ `sh` over the native clojure.rust.process/run,
+        // which is also a transaction-policy denied capability.
+        process::register(globals, "clojure.rust.process");
+        globals.register_builtin_source("clojure.java.shell", CLOJURE_JAVA_SHELL_SRC);
     }
 
     // clojure.walk ─ pure Clojure, no native helpers.
@@ -1475,5 +1484,117 @@ mod tests {
                 assert!(run(src, &mut env).is_err(), "expected {src} to throw");
             }
         });
+    }
+
+    // ── clojure.java.shell ────────────────────────────────────────────────────
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shell_env() -> Env {
+        let (_, mut env) = make_env();
+        run(
+            "(require '[clojure.java.shell :refer [sh with-sh-dir with-sh-env]])",
+            &mut env,
+        )
+        .unwrap();
+        // A string of at least n chars, doubled rather than built from a lazy
+        // `repeat`, which costs ~0.2 ms per element in the interpreter.
+        run(
+            "(defn big [s n] (loop [s s] (if (>= (count s) n) s (recur (str s s)))))",
+            &mut env,
+        )
+        .unwrap();
+        env
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn truthy(src: &str, env: &mut Env) {
+        assert_eq!(run(src, env).unwrap(), Value::Bool(true), "{src}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sh_exit_is_data() {
+        let mut env = shell_env();
+        truthy(
+            "(= {:exit 0 :out \"hi\" :err \"\"} (sh \"printf\" \"hi\"))",
+            &mut env,
+        );
+        truthy(
+            "(= {:exit 3 :out \"\" :err \"e\"} (sh \"sh\" \"-c\" \"printf e >&2; exit 3\"))",
+            &mut env,
+        );
+        truthy(
+            "(= 137 (:exit (sh \"sh\" \"-c\" \"kill -9 $$\")))",
+            &mut env,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sh_in_dir_env() {
+        let mut env = shell_env();
+        truthy("(= \"piped\" (:out (sh \"cat\" :in \"piped\")))", &mut env);
+        truthy(
+            "(= 262144 (count (:out (sh \"cat\" :in (big \"x\" 262144)))))",
+            &mut env,
+        );
+        truthy("(= \"/\\n\" (:out (sh \"pwd\" :dir \"/\")))", &mut env);
+        truthy(
+            "(= \"/\\n\" (:out (with-sh-dir \"/\" (sh \"pwd\"))))",
+            &mut env,
+        );
+        truthy(
+            "(= \"FOO=bar\\n\" (:out (sh \"/usr/bin/env\" :env {\"FOO\" \"bar\"})))",
+            &mut env,
+        );
+        truthy(
+            "(= \"A=1=2\\n\" (:out (with-sh-env [\"A=1=2\"] (sh \"/usr/bin/env\"))))",
+            &mut env,
+        );
+        // The program is found on the parent's PATH although :env replaces it.
+        truthy(
+            "(= \"x\" (:out (sh \"printf\" \"x\" :env {\"X\" \"1\"})))",
+            &mut env,
+        );
+        // A child that exits without reading a large :in does not kill us.
+        truthy(
+            "(= 0 (:exit (sh \"true\" :in (big \"y\" 1048576))))",
+            &mut env,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sh_out_bytes() {
+        let mut env = shell_env();
+        truthy(
+            "(= [97 98] (vec (:out (sh \"printf\" \"ab\" :out-enc :bytes))))",
+            &mut env,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_sh_refusals() {
+        let mut env = shell_env();
+        for src in [
+            "(sh \"cljrs-no-such-program-x\")",
+            "(sh \"pwd\" :dir \"/no/such/dir\")",
+            "(sh \"printf\" \"x\" :env {\"A=B\" \"1\"})",
+            "(sh \"printf\" \"x\" :out-enc \"latin1\")",
+            "(sh :in \"x\")",
+            "(clojure.rust.process/run [])",
+        ] {
+            assert!(run(src, &mut env).is_err(), "expected {src} to throw");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_process_run_denied_under_transaction_policy() {
+        use cljrs_runtime::env::policy::{TransactionPolicyGuard, check_native};
+        assert!(check_native(process::RUN_NAME).is_ok());
+        let _guard = TransactionPolicyGuard::install();
+        assert!(check_native(process::RUN_NAME).is_err());
     }
 }

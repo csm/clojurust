@@ -95,6 +95,9 @@ pub fn check_native(name: &str) -> EvalResult<()> {
         // Reads process-global state the transaction did not receive as an
         // argument, and which can change under it between calls.
         "System/getenv",
+        // clojure.java.shell's substrate: a child process reaches everything
+        // this policy exists to forbid.
+        "clojure.rust.process/run",
     ];
     if DENIED.contains(&name) {
         Err(forbidden(name))
