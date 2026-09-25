@@ -1,9 +1,8 @@
 //! An evaluated-position `^meta` annotation must lower to the same runtime
 //! attach the tree-walker performs.
 //!
-//! Before the fix `lower_form`'s `FormKind::Meta` arm sniffed for
-//! `^:async (fn …)` and otherwise recursed into the annotated form, discarding
-//! the annotation. `ExecutionMode::Tiered` is the default, so
+//! Before the fix `lower_form`'s `FormKind::Meta` arm recursed into the
+//! annotated form, discarding the annotation. `ExecutionMode::Tiered` is the default, so
 //! `(defn f [] (meta ^{:a 1} [1]))` answered `{:a 1}` until the function was
 //! promoted and `nil` afterwards — a result that depended on how hot the code
 //! got — and AOT, which lowers through the same path, answered `nil` always.
@@ -114,13 +113,36 @@ fn a_type_hint_on_a_call_costs_nothing() {
 }
 
 #[test]
-fn an_async_fn_still_lowers_as_async() {
-    // `^:async (fn …)` keeps its dedicated arm rather than becoming an attach.
-    let ir = lower("^:async (fn [] 1)");
-    assert!(
-        !attaches_meta(&ir),
-        "`^:async` is consumed by lower_fn, not attached as metadata"
-    );
+fn an_empty_list_attaches_like_an_empty_vector() {
+    // `()` has no head, so it is the empty-list literal, not a call.
+    assert!(attaches_meta(&lower("^{:a 1} ()")));
+    assert!(attaches_meta(&lower("^{:a 1} []")));
+}
+
+#[test]
+fn an_anonymous_async_fn_is_not_lowered() {
+    // A lowered closure cannot be dispatched as async, so lowering one would
+    // make calling it synchronous once the body was promoted. Both spellings
+    // are refused, which keeps the enclosing body on the tree-walker.
+    for src in [
+        "^:async (fn [] 1)",
+        "^{:async true} (fn* [] 1)",
+        "^:async ^:a (fn [] 1)",
+        "^:a (fn ^:async [] 1)",
+        "(fn ^:async [] 1)",
+        "(fn ^:async named [] 1)",
+        "(let [f ^:async (fn [] 1)] f)",
+    ] {
+        let result = lower_fn_body(Some("test"), "user", &[], &parse(src), false);
+        assert!(result.is_err(), "`{src}` lowered to a synchronous closure");
+    }
+}
+
+#[test]
+fn a_non_async_annotation_on_a_fn_still_lowers() {
+    for src in ["^{:async false} (fn [] 1)", "^:a (fn [] 1)"] {
+        assert!(attaches_meta(&lower(src)), "`{src}`");
+    }
 }
 
 // ── The annotation itself ───────────────────────────────────────────────────

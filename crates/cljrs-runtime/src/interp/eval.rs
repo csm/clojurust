@@ -144,7 +144,20 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             //
             // `lower::anf` applies the same rule, so a promoted or AOT-compiled
             // body answers `meta` the same way an interpreted one does.
-            let value = eval(form, env)?;
+            let mut value = eval(form, env)?;
+            // `^:async (fn …)` is both: it makes the fn async, and — an `fn`
+            // taking runtime metadata — lands `{:async true}` on it.
+            // A stacked annotation (`^:async ^:a (fn …)`) has already wrapped
+            // the fresh fn.
+            if meta.requests_async() && form.unmeta().is_fn_form() {
+                let target = match &mut value {
+                    Value::WithMeta(inner, _) => inner.as_mut(),
+                    other => other,
+                };
+                if let Value::Fn(f) = target {
+                    f.get_mut().is_async = true;
+                }
+            }
             if !form.takes_runtime_meta() {
                 return Ok(value);
             }

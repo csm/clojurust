@@ -203,24 +203,6 @@ pub fn compile_meta_form(meta: &Form, env: &mut Env) -> EvalResult<Value> {
 
 // ── fn* ───────────────────────────────────────────────────────────────────────
 
-/// Does a `^meta` form (or metadata map literal) request `:async`?
-///
-/// Handles the keyword shorthand `^:async` (a bare `:async` keyword form) and
-/// an explicit map such as `^{:async true}` or a `defn` attr-map `{:async true}`.
-pub fn meta_form_is_async(meta: &Form) -> bool {
-    match &meta.kind {
-        FormKind::Keyword(k) => k == "async",
-        FormKind::Map(entries) => entries.chunks(2).any(|kv| {
-            matches!(&kv[0].kind, FormKind::Keyword(k) if k == "async")
-                && !matches!(
-                    kv.get(1).map(|f| &f.kind),
-                    None | Some(FormKind::Bool(false)) | Some(FormKind::Nil)
-                )
-        }),
-        _ => false,
-    }
-}
-
 fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Peel any leading `^meta` wrappers, e.g. `(fn ^:async [..] ..)` or
     // `(fn ^:async name [..] ..)`, recording whether `:async` was requested.
@@ -228,7 +210,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     let peeled: Vec<Form>;
     let args: &[Form] = if matches!(args.first().map(|f| &f.kind), Some(FormKind::Meta(..))) {
         let (metas, head) = args[0].peel_meta();
-        is_async |= metas.iter().any(|m| meta_form_is_async(m));
+        is_async |= metas.iter().any(|m| m.requests_async());
         peeled = std::iter::once(head.clone())
             .chain(args[1..].iter().cloned())
             .collect();
@@ -1220,7 +1202,7 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
         .ok_or_else(|| EvalError::Runtime("defn requires a symbol name".into()))?;
     let (name_metas, name_sym) = name_form.peel_meta();
     let (name, mut is_async) = match &name_sym.kind {
-        FormKind::Symbol(s) => (s.clone(), name_metas.iter().any(|m| meta_form_is_async(m))),
+        FormKind::Symbol(s) => (s.clone(), name_metas.iter().any(|m| m.requests_async())),
         _ => return Err(EvalError::Runtime("defn name must be a symbol".into())),
     };
     // Optional docstring and/or metadata map after the name.
@@ -1237,7 +1219,7 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
     let mut attr_meta: Option<Value> = None;
     if rest_start < args.len() && args[rest_start].as_map().is_some() {
         // An attr-map such as `{:async true}` can also request async dispatch.
-        is_async |= meta_form_is_async(&args[rest_start]);
+        is_async |= args[rest_start].requests_async();
         attr_meta = Some(eval(&args[rest_start], env)?);
         rest_start += 1;
     }

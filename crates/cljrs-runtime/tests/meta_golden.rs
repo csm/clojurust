@@ -75,6 +75,7 @@ fn outcome(env: &mut Env, src: &str) -> String {
 /// Annotations, written without the leading `^`.
 const ANNOTATIONS: &[&str] = &[
     ":kw",
+    ":async",
     "::kw",
     "Sym",
     "ns.q/Sym",
@@ -89,6 +90,7 @@ const ANNOTATIONS: &[&str] = &[
 /// Annotated forms, one per shape the attach rule distinguishes.
 const FORMS: &[&str] = &[
     "[1 2]",
+    "()",
     "{:k 1}",
     "#{1}",
     "(fn [] 1)",

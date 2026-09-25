@@ -48,20 +48,6 @@ impl Form {
         form
     }
 
-    /// True when an evaluated-position `^meta` annotation on this form becomes
-    /// *runtime* metadata on the value it produces.
-    ///
-    /// Only a form that constructs an `IObj` qualifies — a collection literal
-    /// or a function. Every other form (a call, a symbol, `quote`, `if`, `do`)
-    /// takes the annotation as a compile-time hint and evaluates to an
-    /// unannotated value, so `(meta ^{:a 1} (list 1))` and `(meta ^{:a 1} x)`
-    /// are both `nil`.
-    ///
-    /// Every execution tier consults this one predicate: the tree-walker in
-    /// `interp::eval`, and IR lowering in `lower::anf` for the JIT and AOT
-    /// paths. A tier that disagreed would make `meta` depend on how hot the
-    /// code got.
-    ///
     /// True when the value this form denotes *as data* can carry metadata.
     ///
     /// Inside `quote` every form is a literal, so whether an annotation lands
@@ -90,20 +76,91 @@ impl Form {
         }
     }
 
+    /// True when an evaluated-position `^meta` annotation on this form becomes
+    /// *runtime* metadata on the value it produces.
+    ///
+    /// Only a form that constructs an `IObj` qualifies — a collection literal
+    /// (the empty list `()` included) or a function. Every other form (a call,
+    /// a symbol, `quote`, `if`, `do`) takes the annotation as a compile-time
+    /// hint and evaluates to an unannotated value, so `(meta ^{:a 1} (list 1))`
+    /// and `(meta ^{:a 1} x)` are both `nil`.
+    ///
+    /// Every execution tier consults this one predicate: the tree-walker in
+    /// `interp::eval`, and IR lowering in `lower::anf` for the JIT and AOT
+    /// paths. A tier that disagreed would make `meta` depend on how hot the
+    /// code got.
+    ///
     /// Inside `quote` the rule does not apply: there the annotation is data and
-    /// lands on any value that can carry it.
+    /// lands on any value that can carry it (see
+    /// [`Form::quoted_value_supports_meta`]).
     pub fn takes_runtime_meta(&self) -> bool {
         match &self.kind {
             FormKind::Vector(_) | FormKind::Map(_) | FormKind::Set(_) | FormKind::AnonFn(_) => true,
-            // A list is a call, except when it *is* a function form.
-            FormKind::List(parts) => matches!(
-                parts.first().map(|f| &f.kind),
-                Some(FormKind::Symbol(s)) if s == "fn" || s == "fn*"
-            ),
+            // `()` has no head, so it is not a call: it is the empty-list
+            // literal, and attaches exactly as `[]`, `{}` and `#{}` do.
+            FormKind::List(parts) if parts.is_empty() => true,
+            // Any other list is a call, except when it *is* a function form.
+            FormKind::List(_) => self.is_fn_form(),
             // Metadata stacks: `^:a ^:b [1]` annotates the vector twice.
             FormKind::Meta(_, inner) => inner.takes_runtime_meta(),
             _ => false,
         }
+    }
+
+    /// True when this form is a function form: a list headed by `fn` or `fn*`.
+    pub fn is_fn_form(&self) -> bool {
+        match &self.kind {
+            FormKind::List(parts) => matches!(
+                parts.first().map(|f| &f.kind),
+                Some(FormKind::Symbol(s)) if s == "fn" || s == "fn*"
+            ),
+            _ => false,
+        }
+    }
+
+    /// True when this form, used as a `^meta` annotation or a `defn` attr-map,
+    /// requests `:async`.
+    ///
+    /// Handles the keyword shorthand `^:async` and an explicit map such as
+    /// `^{:async true}` or `{:async true}`; a `false` or `nil` value does not
+    /// request it.
+    pub fn requests_async(&self) -> bool {
+        match &self.kind {
+            FormKind::Keyword(k) => k == "async",
+            FormKind::Map(entries) => entries.chunks(2).any(|kv| {
+                matches!(&kv[0].kind, FormKind::Keyword(k) if k == "async")
+                    && !matches!(
+                        kv.get(1).map(|f| &f.kind),
+                        None | Some(FormKind::Bool(false)) | Some(FormKind::Nil)
+                    )
+            }),
+            _ => false,
+        }
+    }
+
+    /// True when this form is an anonymous function that asks to be `^:async`,
+    /// in either spelling: an annotation on the whole form,
+    /// `^:async (fn [..] ..)`, or on its first argument, `(fn ^:async [..] ..)`
+    /// / `(fn ^:async name [..] ..)`. Stacked annotations are searched in
+    /// full.
+    ///
+    /// Only the tree-walker can build an async closure; IR lowering refuses a
+    /// body containing one of these, so every tier agrees on what calling it
+    /// returns.
+    pub fn is_async_fn_form(&self) -> bool {
+        let (metas, inner) = self.peel_meta();
+        if !inner.is_fn_form() {
+            return false;
+        }
+        if metas.iter().any(|m| m.requests_async()) {
+            return true;
+        }
+        let FormKind::List(parts) = &inner.kind else {
+            return false;
+        };
+        parts
+            .get(1)
+            .is_some_and(|first| first.peel_meta().0.iter().any(|m| m.requests_async()))
     }
 
     /// The `^meta` forms attached to this form, outermost first, together with

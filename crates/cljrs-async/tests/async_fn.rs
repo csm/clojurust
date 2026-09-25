@@ -126,6 +126,51 @@ fn anonymous_fn_async_metadata_is_detected() {
 }
 
 #[test]
+fn outer_async_annotation_on_anonymous_fn_is_detected() {
+    // `^:async (fn …)` — the annotation on the whole form, not on its params.
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        let r = eval_async(
+            &parse_one("(let [f ^:async (fn [x] (* x 2))] (await (f 5)))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Value::Long(10));
+    });
+}
+
+#[test]
+fn anonymous_async_fn_stays_async_once_its_builder_is_promoted() {
+    // A closure built by an IR-lowered body cannot be dispatched as async, so
+    // lowering refuses a body that builds one; both spellings must still
+    // return a Future with eager lowering on.
+    cljrs_runtime::tiered::force_eager_lowering();
+    let globals = cljrs_runtime::Runtime::builder()
+        .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
+        .eager_clojure_test(true)
+        .build()
+        .expect("runtime")
+        .into_globals();
+    cljrs_async::init(&globals);
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(
+            "(defn outer [] (type (^:async (fn [] 1)))) \
+             (defn inner [] (type ((fn ^:async [] 1))))",
+            &mut env,
+        );
+        for _ in 0..3 {
+            let outer = eval_sync("(str (outer))", &mut env);
+            let inner = eval_sync("(str (inner))", &mut env);
+            assert_eq!(outer, Value::string("Future"));
+            assert_eq!(inner, Value::string("Future"));
+        }
+    });
+}
+
+#[test]
 fn await_in_if_branch_yields() {
     let globals = async_env();
     block_on_local(async move {

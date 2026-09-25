@@ -521,7 +521,10 @@ versioned dependencies always do.
 
 `needs_interpreter` reads the form as written; `expanded_needs_interpreter`
 reads it again after macroexpansion and recurses, so a form that only *contains*
-an interpreter-only construct is caught too. Neither spells the datatype,
+an interpreter-only construct is caught too. That includes an anonymous async fn
+(`^:async (fn …)` or `(fn ^:async […] …)`, per `Form::is_async_fn_form`),
+which lowering refuses because a compiled closure cannot be dispatched as
+async. Neither spells the datatype,
 protocol and multimethod family out: both call
 `cljrs_ir::lower::in_dispatch_family`, the same predicate the ANF lowerer
 rejects on, so a member cannot be known to one pass and not the other. The
