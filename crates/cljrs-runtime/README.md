@@ -1197,7 +1197,10 @@ extended: defined there, referred, or imported. `ns` honours `(:import [my.ns
 Point])`, `(:import (my.ns Point))` and `(:import my.ns.Point)` by referring the
 var of each named type that is loaded (`import_types` in `special.rs`; the
 package is also tried with `_` read as `-`), and ignores names that are not
-loaded types, such as host classes in a `.cljc` file. A type symbol that does
+loaded types, such as host classes in a `.cljc` file. Importing a name the
+namespace already binds to something else (its own definition, or an earlier
+refer or import from a namespace other than `clojure.core`) is an error, as on
+the JVM: `Point already refers to: #'b/Point in namespace: b`. A type symbol that does
 not resolve cannot be told from a native type's tag (`String`, a
 `NativeObject`'s `type_tag`), so it registers under the bare name; when a call
 then finds no implementation for `my.ns.Point` while one sits under bare
