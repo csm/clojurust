@@ -204,13 +204,14 @@ pub fn compile_meta_form(meta: &Form, env: &mut Env) -> EvalResult<Value> {
 // ── fn* ───────────────────────────────────────────────────────────────────────
 
 fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
-    // Peel any leading `^meta` wrappers, e.g. `(fn ^:async [..] ..)` or
-    // `(fn ^:async name [..] ..)`, recording whether `:async` was requested.
-    let mut is_async = false;
+    // `:async` may be requested on the first argument, `(fn ^:async [..] ..)`
+    // / `(fn ^:async name [..] ..)`, or on the params vector after a name,
+    // `(fn name ^:async [..] ..)` (also how `defn name ^:async [..]` arrives).
+    let is_async = Form::fn_args_request_async(args);
+    // Peel any leading `^meta` wrappers off the first argument.
     let peeled: Vec<Form>;
     let args: &[Form] = if matches!(args.first().map(|f| &f.kind), Some(FormKind::Meta(..))) {
-        let (metas, head) = args[0].peel_meta();
-        is_async |= metas.iter().any(|m| m.requests_async());
+        let (_, head) = args[0].peel_meta();
         peeled = std::iter::once(head.clone())
             .chain(args[1..].iter().cloned())
             .collect();

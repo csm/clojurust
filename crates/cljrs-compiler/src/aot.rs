@@ -3340,6 +3340,7 @@ mod tests {
             "(def f ^:async (fn [] 1))",
             "(def f (fn ^:async [] 1))",
             "(def f ^:a (fn* ^:async [] 1))",
+            "(def f (fn f ^:async [] 1))",
         ] {
             assert!(expanded_needs_interpreter(&parse_one(src)), "`{src}`");
         }

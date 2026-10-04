@@ -156,7 +156,7 @@ natively; that is accepted as the cost of needing no new instruction.  The attac
 cannot answer one way interpreted and another once promoted.  Everywhere else
 the annotation is a compile-time hint: it is dropped, and not evaluated, so
 `(f ^long n)` costs nothing.  An anonymous async fn — `^:async (fn …)` or
-`(fn ^:async […] …)`, per `Form::is_async_fn_form` — is refused with
+`(fn ^:async […] …)` or `(fn name ^:async […] …)`, per `Form::is_async_fn_form` — is refused with
 `UnsupportedForm`: a lowered closure is a plain `NativeFunction` (or native
 closure) that the async runtime cannot dispatch, so lowering it would make
 calling it synchronous once the enclosing body was promoted.  The body stays on

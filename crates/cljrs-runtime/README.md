@@ -1006,8 +1006,9 @@ value).
 
 ### `eval_defn(args, env) -> EvalResult`
 
-Evaluate a `defn` form.  Accepts metadata on the name (`(defn ^:async f …)`) and
-an attr-map (`(defn f {:async true} …)`); `^:async` marks the resulting `CljxFn`
+Evaluate a `defn` form.  Accepts metadata on the name (`(defn ^:async f …)`),
+an attr-map (`(defn f {:async true} …)`), or the params vector
+(`(defn f ^:async [..] …)`, detected by `eval_fn`); `^:async` marks the resulting `CljxFn`
 as async.  Under `no-gc`, wraps fn creation in `StaticCtxGuard` so the `CljxFn`
 object lands in the `StaticArena`.
 
@@ -1029,7 +1030,9 @@ module) read back, and what `cljrs-nrepl`'s `op_lookup` surfaces to editors.
 requests `:async`, as decided by `Form::requests_async` in `cljrs-reader` — the
 same predicate IR lowering uses.  `env::apply::dispatch_if_async` checks the
 flag at call time to route through the async runtime.  The `^:async` may sit on
-the fn's first argument (`(fn ^:async [..] ..)`, peeled by `eval_fn`) or on the
+the fn's first argument (`(fn ^:async [..] ..)`, peeled by `eval_fn`), on the
+params vector after a name (`(fn name ^:async [..] ..)`; both per
+`Form::fn_args_request_async`, which `eval_fn` and IR lowering share), or on the
 whole form (`^:async (fn [..] ..)`, handled by `eval`'s `FormKind::Meta` arm,
 which also attaches `{:async true}` as metadata since an `fn` form takes runtime
 metadata).  IR lowering refuses any body containing such an anonymous async fn
@@ -1046,8 +1049,9 @@ The spellings that request async, exhaustively (`^{:async true}` works wherever
 | `(fn ^:async name [..] ..)` | yes |
 | `(defn ^:async name [..] ..)` | yes |
 | `(defn name {:async true} [..] ..)` | yes |
-| `(fn name ^:async [..] ..)` | **no** — metadata on a params vector after a name is a hint |
-| `(defn name ^:async [..] ..)` | **no** — same |
+| `(fn name ^:async [..] ..)` | yes |
+| `(defn name ^:async [..] ..)` | yes (also after a docstring / attr-map) |
+| `(fn name (^:async [..] ..))` | **no** — metadata on a multi-arity clause's params is a hint |
 
 ### Which natives need form-level interception
 

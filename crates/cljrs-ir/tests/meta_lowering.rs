@@ -131,6 +131,9 @@ fn an_anonymous_async_fn_is_not_lowered() {
         "^:a (fn ^:async [] 1)",
         "(fn ^:async [] 1)",
         "(fn ^:async named [] 1)",
+        "(fn named ^:async [] 1)",
+        "(fn* named ^{:async true} [] 1)",
+        "(fn named ^:a ^:async [] 1)",
         "(let [f ^:async (fn [] 1)] f)",
     ] {
         let result = lower_fn_body(Some("test"), "user", &[], &parse(src), false);
@@ -142,6 +145,11 @@ fn an_anonymous_async_fn_is_not_lowered() {
 fn a_non_async_annotation_on_a_fn_still_lowers() {
     for src in ["^{:async false} (fn [] 1)", "^:a (fn [] 1)"] {
         assert!(attaches_meta(&lower(src)), "`{src}`");
+    }
+    // A non-async hint on the params vector after a name is still just a hint.
+    for src in ["(fn named ^:a [] 1)", "(fn named ^{:async false} [] 1)"] {
+        let result = lower_fn_body(Some("test"), "user", &[], &parse(src), false);
+        assert!(result.is_ok(), "`{src}` was refused");
     }
 }
 

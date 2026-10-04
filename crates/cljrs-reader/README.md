@@ -164,11 +164,16 @@ impl Form {
     /// requests `:async` (`^:async`, or a map with a non-`false`/`nil`
     /// `:async`). Shared by the tree-walker and IR lowering.
     pub fn requests_async(&self) -> bool
-    /// True for an anonymous fn asking to be async, in either spelling:
-    /// `^:async (fn …)` or `(fn ^:async […] …)`. IR lowering refuses a body
-    /// containing one (a lowered closure cannot be dispatched as async), so the
-    /// tree-walker builds it in every tier.
+    /// True for an anonymous fn asking to be async, in any spelling:
+    /// `^:async (fn …)`, or one `fn_args_request_async` accepts. IR lowering
+    /// refuses a body containing one (a lowered closure cannot be dispatched
+    /// as async), so the tree-walker builds it in every tier.
     pub fn is_async_fn_form(&self) -> bool
+    /// True when an `fn`'s arguments (after the head) request `:async`:
+    /// `(fn ^:async […] …)`, `(fn ^:async name […] …)`, or
+    /// `(fn name ^:async […] …)`. Shared by `eval_fn`, IR lowering's `fn`
+    /// guard and `defn` lowering.
+    pub fn fn_args_request_async(args: &[Form]) -> bool
 
     // ── Structural views ──
     // Each reports the shape of `unmeta()`, so `^m form` has the same shape as

@@ -139,10 +139,9 @@ impl Form {
     }
 
     /// True when this form is an anonymous function that asks to be `^:async`,
-    /// in either spelling: an annotation on the whole form,
-    /// `^:async (fn [..] ..)`, or on its first argument, `(fn ^:async [..] ..)`
-    /// / `(fn ^:async name [..] ..)`. Stacked annotations are searched in
-    /// full.
+    /// in any spelling: an annotation on the whole form,
+    /// `^:async (fn [..] ..)`, or one accepted by [`Form::fn_args_request_async`]
+    /// on its arguments. Stacked annotations are searched in full.
     ///
     /// Only the tree-walker can build an async closure; IR lowering refuses a
     /// body containing one of these, so every tier agrees on what calling it
@@ -158,9 +157,24 @@ impl Form {
         let FormKind::List(parts) = &inner.kind else {
             return false;
         };
-        parts
-            .get(1)
-            .is_some_and(|first| first.peel_meta().0.iter().any(|m| m.requests_async()))
+        Form::fn_args_request_async(&parts[1..])
+    }
+
+    /// True when the arguments of an `fn`/`fn*` form (everything after the
+    /// head) request `:async` through metadata on the first argument,
+    /// `(fn ^:async [..] ..)` / `(fn ^:async name [..] ..)`, or on a single-arity
+    /// params vector that follows a name, `(fn name ^:async [..] ..)`. The last
+    /// is also what `(defn name ^:async [..] ..)` becomes once `defn` rebuilds
+    /// its `fn` arguments. Stacked annotations are searched in full.
+    pub fn fn_args_request_async(args: &[Form]) -> bool {
+        let requests = |f: &Form| f.peel_meta().0.iter().any(|m| m.requests_async());
+        let Some(first) = args.first() else {
+            return false;
+        };
+        if requests(first) {
+            return true;
+        }
+        first.as_symbol().is_some() && args.get(1).is_some_and(requests)
     }
 
     /// The `^meta` forms attached to this form, outermost first, together with

@@ -669,14 +669,9 @@ fn lower_list(ctx: &mut LowerCtx, parts: &[Form]) -> R {
         "loop" | "loop*" => lower_loop(ctx, args),
         "recur" => lower_recur(ctx, args),
         "def" => lower_def(ctx, args),
-        // `(fn ^:async [..] ..)` — see `async_closure_unsupported`.
-        "fn" | "fn*"
-            if args
-                .first()
-                .is_some_and(|a| a.peel_meta().0.iter().any(|m| m.requests_async())) =>
-        {
-            Err(async_closure_unsupported())
-        }
+        // `(fn ^:async [..] ..)` / `(fn name ^:async [..] ..)` — see
+        // `async_closure_unsupported`.
+        "fn" | "fn*" if Form::fn_args_request_async(args) => Err(async_closure_unsupported()),
         "fn" | "fn*" => lower_fn(ctx, args, false),
         "defn" => lower_defn(ctx, args),
         "quote" => {
@@ -1315,6 +1310,8 @@ fn lower_defn(ctx: &mut LowerCtx, args: &[Form]) -> R {
     let fn_args: Vec<Form> = std::iter::once(plain_name_form)
         .chain(args[rest_start..].iter().cloned())
         .collect();
+    // `(defn name ^:async [..] ..)` — the annotation on the params vector.
+    let is_async = is_async || Form::fn_args_request_async(&fn_args);
 
     let fn_val = lower_fn(ctx, &fn_args, is_async)?;
     let ns = ctx.ns().clone();
