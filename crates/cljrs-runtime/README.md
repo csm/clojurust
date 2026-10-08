@@ -85,7 +85,10 @@ src/
     apply.rs            — eval_call: macro expansion, native dispatch, recur trampoline
     arity.rs            — fresh arity ID generator
     destructure.rs      — pattern destructuring (vector, map, & rest)
-    macros.rs           — macro expansion helpers
+    macros.rs           — macro expansion helpers: macroexpand_1 / macroexpand check the
+                          call head against the evaluating frames, macroexpand_all /
+                          macroexpand_all_in against the form's own lexical scope (a local
+                          shadows a macro); binding_names lists what a pattern binds
     syntax_quote.rs     — syntax-quote (backtick) expansion
     virtualize.rs       — let-chain virtualization: assoc/conj chains → transients
     versioned.rs        — (non-WASM) tree-walker entry point for versioned resolution
@@ -1292,7 +1295,15 @@ pub mod lower {
 
     // Phase 10.7 — the two halves of lowering, split for background use:
     /// Macro-expand a body on the calling thread (macros need the interpreter).
-    pub fn macroexpand_body(body: &[Form], env: &mut Env) -> Vec<Form>;
+    /// `locals` are the names bound around the body: a call to one of them is
+    /// a call to the local, whatever macro shares its name.  `env`'s frames
+    /// belong to whoever triggered the lowering and are not consulted.
+    pub fn macroexpand_body(body: &[Form], env: &mut Env, locals: &[Arc<str>]) -> Vec<Form>;
+    /// The names in scope throughout one arity's body: the function's name,
+    /// its parameters, and what its destructuring patterns bind.  A closure's
+    /// captured names are the caller's to append.
+    pub fn arity_locals(name, params, rest, destructure_params, destructure_rest)
+        -> Vec<Arc<str>>;
     /// Env-free lowering of an already-expanded body; callable off-thread.
     /// `arity_id: Some(id)` uses defn_registry::snapshot_externals (atomic
     /// dependent recording, required off the mutator thread); `None` uses the

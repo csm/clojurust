@@ -186,7 +186,14 @@ fn lower_arity_inner(
     // Temporarily set current_ns to the function's defining namespace so that
     // ::kw resolution in macroexpand_body uses the correct namespace.
     let prev_ns = std::mem::replace(&mut env.current_ns, ns.clone());
-    let expanded_body = macroexpand_body(body, env);
+    let locals = arity_locals(
+        name,
+        params,
+        rest_param,
+        destructure_params,
+        destructure_rest,
+    );
+    let expanded_body = macroexpand_body(body, env, &locals);
     // Auto-resolved identifiers are qualified here, the last boundary holding
     // an Env; the lowerer refuses any that survive. An unresolvable one is left
     // in place for the lowerer to refuse, so the tree-walker reports it.
@@ -219,7 +226,12 @@ fn lower_arity_inner(
 /// the interpreter with a live `Env` — this is the only part of lowering that
 /// cannot move to the background worker.  Forms that fail to expand are kept
 /// unexpanded (lowering will reject them if they matter).
-pub fn macroexpand_body(body: &[Form], env: &mut Env) -> Vec<Form> {
+///
+/// `locals` are the names bound around the body (see [`arity_locals`]); a
+/// call to one of them is a call to the local, whatever macro shares its
+/// name. `env`'s own frames are those of whoever triggered the lowering, not
+/// the body's, and are not consulted.
+pub fn macroexpand_body(body: &[Form], env: &mut Env, locals: &[Arc<str>]) -> Vec<Form> {
     // Guard against re-entrant lowering during macro expansion.
     use crate::tiered::apply::IR_LOWERING_ACTIVE;
     let was_active = IR_LOWERING_ACTIVE.get();
@@ -227,11 +239,35 @@ pub fn macroexpand_body(body: &[Form], env: &mut Env) -> Vec<Form> {
 
     let expanded_body: Vec<Form> = body
         .iter()
-        .map(|f| crate::interp::macros::macroexpand_all(f, env).unwrap_or_else(|_| f.clone()))
+        .map(|f| {
+            crate::interp::macros::macroexpand_all_in(f, env, locals).unwrap_or_else(|_| f.clone())
+        })
         .collect();
 
     IR_LOWERING_ACTIVE.with(|c| c.set(was_active));
     expanded_body
+}
+
+/// The names in scope throughout one arity's body: the function's own name,
+/// its parameters, and whatever its destructuring patterns bind. A closure's
+/// captured names are in scope too; the caller appends those.
+pub fn arity_locals(
+    name: Option<&str>,
+    params: &[Arc<str>],
+    rest_param: Option<&Arc<str>>,
+    destructure_params: &[(usize, Form)],
+    destructure_rest: Option<&Form>,
+) -> Vec<Arc<str>> {
+    let mut locals: Vec<Arc<str>> = name.map(Arc::from).into_iter().collect();
+    locals.extend(params.iter().chain(rest_param).cloned());
+    for pattern in destructure_params
+        .iter()
+        .map(|(_, p)| p)
+        .chain(destructure_rest)
+    {
+        crate::interp::macros::binding_names(pattern, &mut locals);
+    }
+    locals
 }
 
 /// Lower an already macro-expanded arity body to (optionally optimized) IR.
