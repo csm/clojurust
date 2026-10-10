@@ -31,7 +31,7 @@ implemented.
 
 ## Extensions
 
-- [Reader conditionals](reader-conditionals.md) — the `:rust` platform key.
+- [Reader conditionals](reader-conditionals.md) — the `:cljrs` platform key.
 - [Versioned symbols](versioned-symbols.md) — `my-fn@abc1234` syntax.
 - A small set of [new built-in functions](builtins.md) with no Clojure
   equivalent.

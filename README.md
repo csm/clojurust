@@ -12,7 +12,8 @@ A Rust-hosted dialect of the Clojure programming language.
 
 clojurust runs a Clojure dialect natively on Rust. Source files use the
 `.cljrs` extension (native) or `.cljc` (cross-platform, with reader
-conditionals). The runtime platform key is `:rust`.
+conditionals). The runtime platform key is `:cljrs` (`:rust` is accepted as a
+legacy alias).
 
 A program flows through a tiered execution pipeline: the reader and
 tree-walking interpreter give immediate startup, hot functions are lowered to
@@ -33,7 +34,7 @@ Current capabilities:
 - **AOT compilation** — `cljrs compile <file> -o <bin>` produces a standalone
   native binary; end-to-end for multi-file programs (variadic fns, protocols,
   escape-analysis region allocation, HOFs, sequence/collection ops)
-- **Reader conditionals** — `.cljc` files use `#?(:rust ... :clj ... :default ...)` (`:cljrs` selects the same branch as `:rust`)
+- **Reader conditionals** — `.cljc` files use `#?(:cljrs ... :clj ... :default ...)` (the legacy key `:rust` selects the same branch)
 - **Persistent collections** — HAMT-backed maps/sets, RRB vectors, sorted maps/sets (via rpds)
 - **Tracing GC** — non-moving mark-and-sweep garbage collector with `GcPtr<T>`,
   conservative scanning of JIT frames, and escape-analysis scratch regions

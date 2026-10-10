@@ -18,12 +18,13 @@ have limited implementations:
 
 Code that uses `(System/nanoTime)`, `(Thread/sleep n)`, or any other Java
 static method must use [reader conditionals](reader-conditionals.md) to supply
-a `:rust` alternative, or use the clojurust built-ins `nanotime` and `sleep`
+a `:cljrs` alternative, or use the clojurust built-ins `nanotime` and `sleep`
 respectively.
 
 ## Platform key
 
-The reader-conditional platform key is `:rust`, not `:clj`. See
+The reader-conditional platform key is `:cljrs`, not `:clj`. The older key
+`:rust` is still accepted as an alias. See
 [Reader conditionals](reader-conditionals.md).
 
 ## Missing concurrency features

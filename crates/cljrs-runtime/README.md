@@ -124,7 +124,7 @@ tests/
                                      cache invalidation on provider/trust-set change
                                      (passes with and without the `deps` feature)
   require_spec_reader_conditional.rs — reader conditionals in ns require specs
-  reader_cond_cljrs_feature.rs     — `:cljrs` selects like `:rust`; clause order
+  reader_cond_cljrs_feature.rs     — `:cljrs` (canonical) and `:rust` (alias) select alike; clause order
                                      decides against `:default`; deftype field
                                      vector from a conditional (malli shape)
   refer_clojure.rs                 — `(:refer-clojure ...)` narrowing of the core refer
@@ -731,8 +731,9 @@ instead of throwing, and returns just the `:doc` string.
 The reader is platform-agnostic: it parses every branch of `#?(...)` / `#?@(...)`
 and hands back a `FormKind::ReaderCond` node. Selecting the platform branch is
 therefore the job of each form-consuming boundary, and this module holds the
-calculations they share. This runtime answers to two feature keys, `:rust` and
-`:cljrs` (the dialect's own name, which portable libraries such as malli use).
+calculations they share. This runtime answers to two feature keys: `:cljrs`, the canonical
+key (the dialect's own name, which portable libraries such as malli use), and
+`:rust`, a legacy alias that selects the same branch.
 Clauses are tried in source order and the first match wins, as in Clojure;
 `:default` always matches, so `#?(:default :a :cljrs :b)` selects `:a`.
 The tree-walk evaluator, quoted data, syntax-quote, `ns` require specs, catch
@@ -740,7 +741,7 @@ targets and AOT all go through `select_reader_cond`.
 
 ```rust
 /// Whether `k` (a keyword name, no colon) is a feature key of this runtime:
-/// `"rust"` or `"cljrs"`.
+/// `"cljrs"` (canonical) or `"rust"` (legacy alias).
 pub fn is_platform_feature(k: &str) -> bool;
 
 /// The first clause whose key is a platform feature or `:default`, in

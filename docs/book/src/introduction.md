@@ -7,7 +7,7 @@ can AOT-compile programs to standalone native binaries.
 ## Goals
 
 - **Interpreter** — read and execute `.cljrs` (native) and `.cljc` (cross-platform) source files.
-- **Reader conditionals** — `.cljc` files use `#?(:rust ... :clj ... :default ...)` to branch on platform; the platform key for clojurust is `:rust`.
+- **Reader conditionals** — `.cljc` files use `#?(:cljrs ... :clj ... :default ...)` to branch on platform; the platform key for clojurust is `:cljrs` (`:rust` is accepted as a legacy alias).
 - **Rust interop** — Clojure code can call Rust functions through a defined set of conventions and type-marshalling primitives.
 - **Garbage collector** — a tracing GC manages all Clojure values; an optional region-based allocator is available for allocation-heavy code paths.
 - **AOT compilation** — `cljrs compile` produces a standalone native binary via Cranelift, or a WebAssembly module with `--target wasm`. See the [WebAssembly](wasm/index.md) chapter.
@@ -18,8 +18,8 @@ can AOT-compile programs to standalone native binaries.
 
 | Extension | Meaning |
 |---|---|
-| `.cljrs` | Native clojurust source. Always evaluated under the `:rust` platform. |
-| `.cljc` | Cross-platform source. Reader conditionals select the active branch; clojurust evaluates `:rust` branches. |
+| `.cljrs` | Native clojurust source. Always evaluated under the `:cljrs` platform. |
+| `.cljc` | Cross-platform source. Reader conditionals select the active branch; clojurust evaluates `:cljrs` branches. |
 
 ## Quick start
 
