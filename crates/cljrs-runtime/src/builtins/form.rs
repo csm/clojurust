@@ -446,16 +446,16 @@ fn map_literal_arity_error() -> EvalError {
     EvalError::Runtime("map literal must have an even number of forms".into())
 }
 
-/// The reader-conditional feature keys this runtime answers to. `:rust` is
-/// the historical key; `:cljrs` is the dialect's own name, the one portable
-/// libraries write alongside `:clj`, `:cljs`, `:cljr` and `:lpy` (malli keys
-/// its branches `:cljrs`). Both select the same platform branch.
+/// The reader-conditional feature keys this runtime answers to. `:cljrs` is
+/// the canonical key: the dialect's own name, the one portable libraries write
+/// alongside `:clj`, `:cljs`, `:cljr` and `:lpy` (malli keys its branches
+/// `:cljrs`). `:rust` is the legacy alias. Both select the same platform branch.
 pub fn is_platform_feature(k: &str) -> bool {
     k == "rust" || k == "cljrs"
 }
 
 /// Resolve a `#?(...)` reader conditional to the selected branch form, or
-/// `None` if no platform (`:rust` / `:cljrs`) or `:default` clause is present.
+/// `None` if no platform (`:cljrs` / `:rust`) or `:default` clause is present.
 ///
 /// Clauses are tried in source order and the first match wins, as in
 /// Clojure: `:default` always matches, so `#?(:default :a :cljrs :b)` selects

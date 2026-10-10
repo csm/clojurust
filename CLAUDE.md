@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `clojurust` is a Rust-hosted dialect of the Clojure programming language. Goals:
 
 - **Interpreter**: read and execute `.cljrs` (native extension) and `.cljc` (cross-platform) source files
-- **Reader conditionals**: `.cljc` files use `#?(:rust ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:rust` (`:cljrs` is accepted as an alias, as portable libraries such as malli write it)
+- **Reader conditionals**: `.cljc` files use `#?(:cljrs ... :clj ... :cljs ... :default ...)` — the canonical platform key for this runtime is `:cljrs`, the dialect's name (as portable libraries such as malli write it); `:rust` is still accepted as a legacy alias that selects the same branch
 - **Rust interop**: Clojure code can call into Rust functions with defined conventions and type-marshalling
 - **Garbage collector**: a tracing GC manages all Clojure values; Rust owns the GC root
 - **AOT compilation**: `cljrs compile` produces a standalone native binary
@@ -84,4 +84,4 @@ The project is a library crate (`src/lib.rs`) with a binary entry point (`src/ma
 - **All Clojure values live behind `GcPtr<Value>`** — never store `Value` directly on the Rust stack across a GC safepoint
 - **Persistent collections are the default** — mutability only via `atom`/`ref`/`agent` or transients
 - **Rust interop is safe-by-default** — unsafe Rust APIs accessible only through an explicit `cljx.rust/unsafe` boundary
-- **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:rust`
+- **Reader is platform-agnostic** — it parses all branches of `#?(...)` and returns them; the evaluator filters by `:cljrs` (or its legacy alias `:rust`)

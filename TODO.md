@@ -1,6 +1,6 @@
 # clojurust TODO
 
-Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension is `.cljrs`; also supports `.cljc` with reader conditional `:rust`.
+Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension is `.cljrs`; also supports `.cljc` with reader conditional `:cljrs` (legacy alias `:rust`).
 
 ---
 
@@ -30,8 +30,8 @@ Implementation roadmap for a Rust-hosted Clojure dialect. Native file extension 
 - [x] Character literals (`\a`, `\newline`, `\u0041`, etc.)
 - [x] Line/column source-location tracking on all forms
 - [x] Reader conditionals (`.cljc` / `.cljrs`)
-  - [x] `#?(:rust ... :clj ... :cljs ... :default ...)` splicing and non-splicing forms
-  - [x] Platform key `:rust` selects Rust-dialect branch (evaluator filters; reader stores all branches)
+  - [x] `#?(:cljrs ... :clj ... :cljs ... :default ...)` splicing and non-splicing forms
+  - [x] Platform key `:cljrs` (legacy alias `:rust`) selects Rust-dialect branch (evaluator filters; reader stores all branches)
 - [ ] File extension dispatch: treat `.cljrs` as always-Rust-dialect, `.cljc` as cross-platform with conditionals
 
 ---
@@ -541,7 +541,7 @@ inference, `typeinfer`, the `rt_abi` contract) are reused unchanged.
 
 - [ ] Define and document clojurust/Clojure compatibility surface (what is intentionally different)
 - [ ] Run a representative subset of `clojure.test` suite against clojurust
-- [ ] Reader compatibility: verify `.cljc` files with `:rust` conditionals behave correctly alongside `:clj`/`:cljs`
+- [ ] Reader compatibility: verify `.cljc` files with `:cljrs` conditionals behave correctly alongside `:clj`/`:cljs`
 - [ ] Numeric tower parity with Clojure (promotion, overflow to BigInt, etc.)
 - [ ] `*clojure-version*` / `*cljx-version*` vars
 - [x] `*print-dup*`, `*print-readably*`, `*print-length*`, `*print-level*` dynamic vars (defined in Phase 8-ext-2)

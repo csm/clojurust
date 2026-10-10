@@ -1,4 +1,4 @@
-# `cljrs.dom` requirements for a Replicant `:rust` backend
+# `cljrs.dom` requirements for a Replicant `:cljrs` backend
 
 This document specifies the additions needed in **clojurust**'s
 [`cljrs-wasm::dom`](https://github.com/csm/clojurust) module (the `cljrs.dom` namespace)
@@ -45,7 +45,7 @@ Replicant performs **all** DOM mutation through a single protocol,
 ```
 
 The browser implementation of this protocol lives in
-`src/replicant/dom.cljc` (the `reify` at lines 53–191). The `:rust` backend will
+`src/replicant/dom.cljc` (the `reify` at lines 53–191). The `:cljrs` backend will
 be a parallel `reify` calling `cljrs.dom`. `replicant.core` (the reconciliation
 engine) only ever calls the protocol via its `r/` alias
 (`[replicant.protocols :as r]`) and never touches the host DOM directly, so the
@@ -224,7 +224,7 @@ needs it. Names are suggestions following the existing cljrs.dom conventions
 - **Unblocks:** `IMemory/remember` and `recall` (`dom.cljc:48, 186-191`), plus the
   public `replicant.dom/recall` (`dom.cljc:50-51`).
 - **Why:** Replicant stores per-node state (e.g. for `replicant.dom/recall` and
-  internal bookkeeping) in a `js/WeakMap` keyed by the DOM node. The `:rust`
+  internal bookkeeping) in a `js/WeakMap` keyed by the DOM node. The `:cljrs`
   backend needs an equivalent. Two acceptable shapes:
   - **(a)** cljrs.dom exposes `remember!`/`recall` backed by a host-side weak map
     keyed by node identity (preferred — mirrors the browser semantics and avoids
@@ -247,18 +247,18 @@ step — a multi-file cljrs project compiled to a wasm-bindgen module with
 `cljrs.dom` available and an exported entry function the host page calls. The
 remaining blockers are the `cljrs.dom` API additions listed above.
 
-## Notes for the eventual Replicant `:rust` backend
+## Notes for the eventual Replicant `:cljrs` backend
 
 (Context only — no Replicant changes are made until the above land.)
 
-- The renderer is a new `#?(:rust ...)` `reify` of `IRender`/`IMemory` mirroring
+- The renderer is a new `#?(:cljrs ...)` `reify` of `IRender`/`IMemory` mirroring
   `dom.cljc:53-191`, calling the `cljrs.dom` functions above.
 - cljrs.dom delivers events as Clojure maps (`:type`, `:target`, `:key`, …), so
   Replicant's event interop (`core.cljc:298` `(.-target e)`) becomes `(:target e)`
-  under `:rust`.
+  under `:cljrs`.
 - Replicant's native-array fast path (`hiccup_headers.cljc`, `vdom.cljc`) is gated
   on the cljs analyzer env and falls back to persistent vectors/maps for non-cljs
-  targets, which a `:rust` target inherits automatically — so no native
+  targets, which a `:cljrs` target inherits automatically — so no native
   collection primitives are required from cljrs for correctness.
 - The pure-data test oracle `mutation_log.cljc` needs no DOM and is the cheapest
   way to validate the port under the cljrs interpreter before wasm integration.

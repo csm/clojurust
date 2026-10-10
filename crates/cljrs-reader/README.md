@@ -240,7 +240,7 @@ pub enum FormKind {
     AnonFn(Vec<Form>),                   // #(...)
     TaggedLiteral(String, Box<Form>),    // #tag form
 
-    // Reader conditionals — all branches kept; evaluator filters by :rust
+    // Reader conditionals — all branches kept; evaluator filters by :cljrs (or legacy :rust)
     // clauses is flat: [keyword, form, keyword, form, …]
     ReaderCond { splicing: bool, clauses: Vec<Form> },
 }
@@ -287,7 +287,8 @@ outer `#_` consumes `2`).
 
 All branches of `#?(…)` and `#?@(…)` are parsed and stored as
 `FormKind::ReaderCond { splicing, clauses }` with a flat `clauses` vec.  The
-evaluator is responsible for filtering by `:rust`.
+evaluator is responsible for filtering by the platform key `:cljrs` (or its
+legacy alias `:rust`).
 
 ---
 

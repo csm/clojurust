@@ -1,28 +1,33 @@
 # Reader conditionals
 
 Reader conditionals allow a single source file to contain code for multiple
-Clojure platforms. clojurust evaluates the `:rust` branch.
+Clojure platforms. clojurust evaluates the `:cljrs` branch.
+
+`:cljrs` is the canonical platform key. The older key `:rust` is still
+accepted as an alias and selects the same branch, but new code should use
+`:cljrs`.
 
 ## Syntax
 
 ### Non-splicing form
 
 ```clojure
-#?(:rust   expr-rust
+#?(:cljrs  expr-cljrs
    :clj    expr-jvm
    :cljs   expr-clojurescript
    :default expr-fallback)
 ```
 
-Exactly one branch is selected at read time based on the current platform. For
-clojurust, `:rust` is matched first. If no `:rust` key is present, `:default`
-is used. If neither is present, the entire form is skipped (reads as nothing).
+Exactly one branch is selected based on the current platform. Clauses are
+tried left to right and the first one whose key is `:cljrs` (or its alias
+`:rust`) or `:default` wins, as in Clojure. If no clause matches, the entire
+form is skipped (reads as nothing).
 
 The selected branch is a single expression; the whole `#?(...)` form evaluates
 to that expression.
 
 ```clojure
-(def platform #?(:rust   "clojurust"
+(def platform #?(:cljrs  "clojurust"
                  :clj    "JVM Clojure"
                  :cljs   "ClojureScript"
                  :default "unknown"))
@@ -31,7 +36,7 @@ to that expression.
 ### Splicing form
 
 ```clojure
-#?@(:rust   [a b c]
+#?@(:cljrs  [a b c]
     :clj    [x y z]
     :default [])
 ```
@@ -42,7 +47,7 @@ vector, map, or set literal.
 
 ```clojure
 ;; Adds platform-specific items to a vector
-(def features [#?@(:rust   [:gc :cranelift]
+(def features [#?@(:cljrs  [:gc :cranelift]
                    :clj    [:jvm :hotspot]
                    :default [])])
 ; => [:gc :cranelift]  (on clojurust)
@@ -52,16 +57,16 @@ vector, map, or set literal.
 ;; Platform-specific require in an ns form
 (ns myapp.core
   (:require [clojure.string :as str]
-            #?@(:rust [[:clojurust.system :as sys]]
-                :clj  [[:java.lang.System :as sys]])))
+            #?@(:cljrs [[:clojurust.system :as sys]]
+                :clj   [[:java.lang.System :as sys]])))
 ```
 
 ## File-extension behaviour
 
 | Extension | Platform dispatch |
 |---|---|
-| `.cljrs` | Always `:rust`. Reader conditionals are still supported but `:rust` is always the active branch. |
-| `.cljc` | Cross-platform. Reader conditional branches are stored as-is; the evaluator selects `:rust`. |
+| `.cljrs` | Always `:cljrs`. Reader conditionals are still supported but `:cljrs` is always the active platform. |
+| `.cljc` | Cross-platform. Reader conditional branches are stored as-is; the evaluator selects `:cljrs`. |
 
 ## Notes
 
@@ -70,5 +75,6 @@ vector, map, or set literal.
   inspected programmatically without losing the other branches.
 - Order within a reader conditional matters: keys are checked left-to-right.
   `:default` should come last.
-- Unlike Clojure, there is no `:cljr` (ClojureCLR) platform; the clojurust key
-  is `:rust`.
+- `:cljr` is ClojureCLR's key, not clojurust's; the clojurust key is `:cljrs`.
+- `:rust` is a legacy alias for `:cljrs`. Both keys match, so a form that
+  lists both selects whichever comes first. Prefer `:cljrs` in new code.

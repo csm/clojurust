@@ -354,7 +354,7 @@ pub enum FormKind {
     // ── Reader conditionals ───────────────────────────────────────────────────
     /// All branches are kept; the runtime picks one with
     /// `cljrs_runtime::builtins::form::select_reader_cond` (feature keys
-    /// `:rust`/`:cljrs`, then `:default`, first match in clause order).
+    /// `:cljrs`/legacy `:rust`, then `:default`, first match in clause order).
     /// Never compare the feature keyword by hand.
     /// `clauses` is flat: `[keyword, form, keyword, form, …]`.
     ReaderCond {
