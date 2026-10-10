@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `clojurust` is a Rust-hosted dialect of the Clojure programming language. Goals:
 
 - **Interpreter**: read and execute `.cljrs` (native extension) and `.cljc` (cross-platform) source files
-- **Reader conditionals**: `.cljc` files use `#?(:rust ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:rust`
+- **Reader conditionals**: `.cljc` files use `#?(:rust ... :clj ... :cljs ... :default ...)` — the platform key for this runtime is `:rust` (`:cljrs` is accepted as an alias, as portable libraries such as malli write it)
 - **Rust interop**: Clojure code can call into Rust functions with defined conventions and type-marshalling
 - **Garbage collector**: a tracing GC manages all Clojure values; Rust owns the GC root
 - **AOT compilation**: `cljrs compile` produces a standalone native binary

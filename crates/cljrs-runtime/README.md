@@ -124,6 +124,9 @@ tests/
                                      cache invalidation on provider/trust-set change
                                      (passes with and without the `deps` feature)
   require_spec_reader_conditional.rs — reader conditionals in ns require specs
+  reader_cond_cljrs_feature.rs     — `:cljrs` selects like `:rust`; clause order
+                                     decides against `:default`; deftype field
+                                     vector from a conditional (malli shape)
   refer_clojure.rs                 — `(:refer-clojure ...)` narrowing of the core refer
   core_shadows.rs                  — core_shadowed_names: what a namespace binds
                                      instead of clojure.core (issue #337)
@@ -726,12 +729,22 @@ instead of throwing, and returns just the `:doc` string.
 ### Reader-conditional resolution (`form.rs`)
 
 The reader is platform-agnostic: it parses every branch of `#?(...)` / `#?@(...)`
-and hands back a `FormKind::ReaderCond` node. Selecting the `:rust` branch is
+and hands back a `FormKind::ReaderCond` node. Selecting the platform branch is
 therefore the job of each form-consuming boundary, and this module holds the
-calculations they share.
+calculations they share. This runtime answers to two feature keys, `:rust` and
+`:cljrs` (the dialect's own name, which portable libraries such as malli use).
+Clauses are tried in source order and the first match wins, as in Clojure;
+`:default` always matches, so `#?(:default :a :cljrs :b)` selects `:a`.
+The tree-walk evaluator, quoted data, syntax-quote, `ns` require specs, catch
+targets and AOT all go through `select_reader_cond`.
 
 ```rust
-/// The `:rust` branch of a conditional's clauses, or the `:default` branch.
+/// Whether `k` (a keyword name, no colon) is a feature key of this runtime:
+/// `"rust"` or `"cljrs"`.
+pub fn is_platform_feature(k: &str) -> bool;
+
+/// The first clause whose key is a platform feature or `:default`, in
+/// clause order; `None` when no clause matches.
 pub fn select_reader_cond(clauses: &[Form]) -> Option<&Form>;
 
 /// Expand `#?`/`#?@` across a sibling slice: a non-splicing conditional

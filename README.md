@@ -33,7 +33,7 @@ Current capabilities:
 - **AOT compilation** — `cljrs compile <file> -o <bin>` produces a standalone
   native binary; end-to-end for multi-file programs (variadic fns, protocols,
   escape-analysis region allocation, HOFs, sequence/collection ops)
-- **Reader conditionals** — `.cljc` files use `#?(:rust ... :clj ... :default ...)`
+- **Reader conditionals** — `.cljc` files use `#?(:rust ... :clj ... :default ...)` (`:cljrs` selects the same branch as `:rust`)
 - **Persistent collections** — HAMT-backed maps/sets, RRB vectors, sorted maps/sets (via rpds)
 - **Tracing GC** — non-moving mark-and-sweep garbage collector with `GcPtr<T>`,
   conservative scanning of JIT frames, and escape-analysis scratch regions
