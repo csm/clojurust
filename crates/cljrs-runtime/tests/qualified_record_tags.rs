@@ -135,6 +135,51 @@ fn importing_a_name_that_is_no_loaded_type_is_ignored() {
     assert_eq!(eval_printed(src), "d.four");
 }
 
+/// Evaluate `src` and return the first error, rendered.
+fn eval_error(src: &str) -> String {
+    let (_, mut env) = make_env();
+    let mut parser = Parser::new(src.to_string(), "<test>".to_string());
+    let err = parser
+        .parse_all()
+        .expect("parse error")
+        .iter()
+        .find_map(|form| cljrs_runtime::interp::eval::eval(form, &mut env).err())
+        .expect("evaluation should fail");
+    format!("{err:?}")
+}
+
+#[test]
+fn importing_over_a_local_definition_is_an_error() {
+    let src = format!("{TWO_POINTS}(ns b.two (:import [a.one Point]))");
+    let msg = eval_error(&src);
+    assert!(
+        msg.contains("Point already refers to: #'b.two/Point in namespace: b.two"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn importing_two_types_of_one_name_is_an_error() {
+    let src = format!("{TWO_POINTS}(ns e.five (:import [a.one Point] [b.two Point]))");
+    let msg = eval_error(&src);
+    assert!(
+        msg.contains("Point already refers to: #'a.one/Point in namespace: e.five"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn an_import_can_be_evaluated_again() {
+    let src = format!(
+        "{TWO_POINTS}\
+         (ns e.six (:import [a.one Point]))\
+         (ns e.six (:import [a.one Point] a.one.Point))\
+         (ns a.one (:import [a.one Point]))\
+         (pr-str (ns-name *ns*))"
+    );
+    assert_eq!(eval_printed(&src), "a.one");
+}
+
 #[test]
 fn an_unresolved_type_name_is_named_by_the_dispatch_error() {
     let (_, mut env) = make_env();
