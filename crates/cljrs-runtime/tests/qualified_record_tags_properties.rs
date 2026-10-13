@@ -166,4 +166,68 @@ proptest! {
         );
         prop_assert_eq!(result.map(|v| format!("{v}")), Ok("true".to_string()), "{}", clause);
     }
+
+    /// A namespace that already binds the name, by its own definition or by
+    /// an earlier import, cannot import another type under it: the error
+    /// names the var the name is bound to.
+    #[test]
+    fn importing_over_another_binding_is_an_error(
+        a in ns_tail(),
+        b in ns_tail(),
+        name in type_name(),
+        import_a in import(),
+        import_b in import(),
+        local in any::<bool>(),
+    ) {
+        let prefix = case_prefix();
+        let (ns_a, ns_b) = (format!("{prefix}.a.{a}"), format!("{prefix}.b.{b}"));
+        let consumer = format!("{prefix}.consumer");
+        let (bind, bound_ns) = if local {
+            (format!("(ns {consumer}) (defrecord {name} [x])"), consumer.clone())
+        } else {
+            (format!("(ns {consumer} {})", import_a.clause(&ns_a, &name)), ns_a.clone())
+        };
+        let src = format!(
+            "(ns {ns_a})
+             (defrecord {name} [x])
+             (ns {ns_b})
+             (defrecord {name} [x])
+             {bind}
+             (ns {consumer} {clause_b})",
+            clause_b = import_b.clause(&ns_b, &name),
+        );
+        let (_g, mut env) = fresh_env();
+        let err = eval_in(&mut env, &src).expect_err("the name is already bound");
+        prop_assert!(
+            err.contains(&format!(
+                "{name} already refers to: #'{bound_ns}/{name} in namespace: {consumer}"
+            )),
+            "{}", err
+        );
+    }
+
+    /// Importing the same type again, in any spelling, is not a conflict.
+    #[test]
+    fn importing_the_same_type_again_is_accepted(
+        tail in ns_tail(),
+        name in type_name(),
+        first in import(),
+        again in import(),
+    ) {
+        let prefix = case_prefix();
+        let ns = format!("{prefix}.{tail}");
+        let src = format!(
+            "(ns {ns})
+             (defrecord {name} [x])
+             (ns {prefix}.consumer {first})
+             (ns {prefix}.consumer {again})
+             (ns {ns} {again})
+             (some? (resolve '{name}))",
+            first = first.clause(&ns, &name),
+            again = again.clause(&ns, &name),
+        );
+        let (_g, mut env) = fresh_env();
+        let result = eval_in(&mut env, &src);
+        prop_assert_eq!(result.map(|v| format!("{v}")), Ok("true".to_string()));
+    }
 }
