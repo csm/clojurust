@@ -214,14 +214,25 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
     let arities: Vec<crate::tiered::lower_worker::LowerArityRequest> = f
         .arities
         .iter()
-        .map(|a| crate::tiered::lower_worker::LowerArityRequest {
-            arity_id: a.ir_arity_id,
-            params: a.params.clone(),
-            rest_param: a.rest_param.clone(),
-            destructure_params: a.destructure_params.clone(),
-            destructure_rest: a.destructure_rest.clone(),
-            expanded_body: crate::tiered::lower::macroexpand_body(&a.body, caller_env),
-            param_hints: a.param_hints.clone(),
+        .map(|a| {
+            // The body's locals are the function's, not the caller's.
+            let mut locals = crate::tiered::lower::arity_locals(
+                f.name.as_deref(),
+                &a.params,
+                a.rest_param.as_ref(),
+                &a.destructure_params,
+                a.destructure_rest.as_ref(),
+            );
+            locals.extend(f.closed_over_names.iter().cloned());
+            crate::tiered::lower_worker::LowerArityRequest {
+                arity_id: a.ir_arity_id,
+                params: a.params.clone(),
+                rest_param: a.rest_param.clone(),
+                destructure_params: a.destructure_params.clone(),
+                destructure_rest: a.destructure_rest.clone(),
+                expanded_body: crate::tiered::lower::macroexpand_body(&a.body, caller_env, &locals),
+                param_hints: a.param_hints.clone(),
+            }
         })
         .collect();
 

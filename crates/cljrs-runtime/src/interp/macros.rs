@@ -12,10 +12,14 @@ use crate::env::error::{EvalError, EvalResult};
 
 /// Expand a form one step.  Returns the same form if it is not a macro call.
 pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    macroexpand_1_in(form, env, Locals::Frames)
+}
+
+fn macroexpand_1_in(form: &Form, env: &mut Env, locals: Locals) -> EvalResult<Form> {
     // Only expand list forms whose head is a macro symbol.
     if let FormKind::List(parts) = &form.kind
         && let Some(FormKind::Symbol(s)) = parts.first().map(|f| &f.kind)
-        && let Some(macro_fn) = resolve_macro(s, env)
+        && let Some(macro_fn) = resolve_macro(s, env, locals)
     {
         // Resolve ::keywords using the caller's namespace before the macro sees
         // them.  In Clojure, ::kw is resolved at READ time; since cljrs keeps
@@ -81,6 +85,10 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
 
 /// Fully expand a form until the head is no longer a macro.
 pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    macroexpand_in(form, env, Locals::Frames)
+}
+
+fn macroexpand_in(form: &Form, env: &mut Env, locals: Locals) -> EvalResult<Form> {
     let mut current = form.clone();
     loop {
         // `macroexpand_1` returns an unchanged clone for non-macro forms.  Do
@@ -90,13 +98,13 @@ pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
         let is_macro_call = matches!(
             &current.kind,
             FormKind::List(parts)
-                if matches!(parts.first().map(|f| &f.kind), Some(FormKind::Symbol(s)) if resolve_macro(s, env).is_some())
+                if matches!(parts.first().map(|f| &f.kind), Some(FormKind::Symbol(s)) if resolve_macro(s, env, locals).is_some())
         );
         if !is_macro_call {
             return Ok(current);
         }
 
-        let expanded = macroexpand_1(&current, env)?;
+        let expanded = macroexpand_1_in(&current, env, locals)?;
         if expanded == current {
             return Ok(current);
         }
@@ -108,9 +116,25 @@ pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
 ///
 /// First expands the top-level form, then walks into sub-forms.
 /// Special forms like `quote` are not walked into.
+///
+/// The form is taken to stand at the top level: the only locals that shadow
+/// a macro in it are the ones its own binding forms introduce. `env`'s frames
+/// are not consulted, since they are not the form's lexical scope.
 pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    macroexpand_all_in(form, env, &[])
+}
+
+/// [`macroexpand_all`] for a form that stands inside the bindings `locals`,
+/// such as the body of a function with those parameters.
+pub fn macroexpand_all_in(form: &Form, env: &mut Env, locals: &[Arc<str>]) -> EvalResult<Form> {
+    expand_all(form, env, &mut locals.to_vec())
+}
+
+/// Expand `form` and its sub-forms; `scope` holds the locals in scope at
+/// `form` and is left as it was found.
+fn expand_all(form: &Form, env: &mut Env, scope: &mut Vec<Arc<str>>) -> EvalResult<Form> {
     // First, expand the top level.
-    let expanded = macroexpand(form, env)?;
+    let expanded = macroexpand_in(form, env, Locals::Lexical(scope))?;
 
     let span = expanded.span.clone();
     let kind = match &expanded.kind {
@@ -120,101 +144,117 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                 FormKind::Symbol(s) => Some(s.as_str()),
                 _ => None,
             };
+            // Each binding form below puts its names in scope for the forms
+            // they are visible to, and takes them out again when it ends.
+            let outer = scope.len();
+            let mut new_parts = vec![parts[0].clone()];
             match head_name {
                 // quote: don't expand inside quoted forms
                 Some("quote") => return Ok(expanded),
-                // fn*: expand body forms but not the param vector
-                Some("fn*") => {
-                    let mut new_parts = vec![parts[0].clone()];
-                    // fn* can have multiple arities: (fn* ([x] body) ([x y] body2))
-                    // or single arity: (fn* [x] body)
-                    if parts.len() > 1 {
-                        if let FormKind::Vector(_) = &parts[1].kind {
-                            // Single arity: (fn* [params] body...)
-                            new_parts.push(parts[1].clone()); // params
-                            for p in &parts[2..] {
-                                new_parts.push(macroexpand_all(p, env)?);
-                            }
-                        } else {
-                            // Multi-arity: (fn* ([params] body) ...)
-                            for arity in &parts[1..] {
-                                if let FormKind::List(arity_parts) = &arity.kind {
-                                    let mut new_arity = Vec::new();
-                                    if let Some(params) = arity_parts.first() {
-                                        new_arity.push(params.clone()); // param vector
-                                    }
-                                    for p in arity_parts.iter().skip(1) {
-                                        new_arity.push(macroexpand_all(p, env)?);
-                                    }
-                                    new_parts.push(Form::new(
-                                        FormKind::List(new_arity),
-                                        arity.span.clone(),
-                                    ));
-                                } else {
-                                    // Name or other token before arities
-                                    new_parts.push(arity.clone());
-                                }
-                            }
-                        }
-                    }
-                    FormKind::List(new_parts)
+                // (fn name? [params] body...) or (fn name? ([params] body...) ...),
+                // and the `def` forms that take the same tail.
+                Some("fn*" | "fn" | "defn" | "defn-" | "defmacro") => {
+                    expand_fn_tail(&parts[1..], env, scope, &mut new_parts)?;
                 }
-                // let*, loop*: expand bindings values and body, but not binding names
-                Some("let*") | Some("loop*") => {
-                    let mut new_parts = vec![parts[0].clone()];
-                    if parts.len() > 1 {
-                        // Expand binding values (every other form in the vector)
-                        if let FormKind::Vector(bindings) = &parts[1].kind {
-                            let mut new_bindings = Vec::new();
-                            for (i, b) in bindings.iter().enumerate() {
-                                if i % 2 == 0 {
-                                    new_bindings.push(b.clone()); // binding name
-                                } else {
-                                    new_bindings.push(macroexpand_all(b, env)?);
-                                }
+                // Each binding's value sees the names bound before it; the
+                // body sees them all.
+                Some("let*" | "let" | "loop*" | "loop") => {
+                    if let Some(bindings) = parts.get(1) {
+                        if let FormKind::Vector(pairs) = &bindings.kind {
+                            let mut new_pairs = Vec::with_capacity(pairs.len());
+                            for pair in pairs.chunks(2) {
+                                let value = match pair.get(1) {
+                                    Some(v) => Some(expand_all(v, env, scope)?),
+                                    None => None,
+                                };
+                                new_pairs.push(expand_all(&pair[0], env, scope)?);
+                                new_pairs.extend(value);
+                                binding_names(&pair[0], scope);
                             }
                             new_parts.push(Form::new(
-                                FormKind::Vector(new_bindings),
-                                parts[1].span.clone(),
+                                FormKind::Vector(new_pairs),
+                                bindings.span.clone(),
                             ));
                         } else {
-                            new_parts.push(parts[1].clone());
+                            new_parts.push(bindings.clone());
                         }
                         for p in &parts[2..] {
-                            new_parts.push(macroexpand_all(p, env)?);
+                            new_parts.push(expand_all(p, env, scope)?);
                         }
                     }
-                    FormKind::List(new_parts)
                 }
-                // catch/finally inside try: handled naturally by walking
+                // (letfn [(name [params] body...) ...] body...): every name is
+                // in scope in every function, and in the body.
+                Some("letfn") => {
+                    if let Some(specs) = parts.get(1) {
+                        if let FormKind::Vector(fns) = &specs.kind {
+                            scope.extend(fns.iter().filter_map(|f| match &f.kind {
+                                FormKind::List(spec) => {
+                                    spec.first().and_then(Form::as_symbol).map(Arc::from)
+                                }
+                                _ => None,
+                            }));
+                            let mut new_fns = Vec::with_capacity(fns.len());
+                            for f in fns {
+                                match &f.kind {
+                                    FormKind::List(spec) if !spec.is_empty() => {
+                                        let mut new_spec = vec![spec[0].clone()];
+                                        expand_fn_tail(&spec[1..], env, scope, &mut new_spec)?;
+                                        new_fns.push(Form::new(
+                                            FormKind::List(new_spec),
+                                            f.span.clone(),
+                                        ));
+                                    }
+                                    _ => new_fns.push(f.clone()),
+                                }
+                            }
+                            new_parts
+                                .push(Form::new(FormKind::Vector(new_fns), specs.span.clone()));
+                        } else {
+                            new_parts.push(specs.clone());
+                        }
+                        for p in &parts[2..] {
+                            new_parts.push(expand_all(p, env, scope)?);
+                        }
+                    }
+                }
+                // (catch Type name body...)
+                Some("catch") if parts.len() > 2 => {
+                    new_parts.extend([parts[1].clone(), parts[2].clone()]);
+                    binding_names(&parts[2], scope);
+                    for p in &parts[3..] {
+                        new_parts.push(expand_all(p, env, scope)?);
+                    }
+                }
                 _ => {
                     // Generic: expand all sub-forms
-                    let new_parts = parts
-                        .iter()
-                        .map(|p| macroexpand_all(p, env))
-                        .collect::<EvalResult<Vec<_>>>()?;
-                    FormKind::List(new_parts)
+                    new_parts.clear();
+                    for p in parts {
+                        new_parts.push(expand_all(p, env, scope)?);
+                    }
                 }
             }
+            scope.truncate(outer);
+            FormKind::List(new_parts)
         }
         FormKind::Vector(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| expand_all(i, env, scope))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Vector(new_items)
         }
         FormKind::Map(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| expand_all(i, env, scope))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Map(new_items)
         }
         FormKind::Set(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| expand_all(i, env, scope))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Set(new_items)
         }
@@ -224,11 +264,122 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
     Ok(Form::new(kind, span))
 }
 
+/// Expand what follows the head of a `fn`: an optional name, then one arity
+/// written `[params] body...` or several written `([params] body...)`. A
+/// docstring or attribute map among them (`defn`) is expanded as data.
+fn expand_fn_tail(
+    tail: &[Form],
+    env: &mut Env,
+    scope: &mut Vec<Arc<str>>,
+    out: &mut Vec<Form>,
+) -> EvalResult<()> {
+    for (i, part) in tail.iter().enumerate() {
+        match &part.unmeta().kind {
+            // The function's own name, which its bodies can call.
+            FormKind::Symbol(name) => {
+                scope.push(Arc::from(name.as_str()));
+                out.push(part.clone());
+            }
+            FormKind::Vector(_) => return expand_arity(&tail[i..], env, scope, out),
+            FormKind::List(arity)
+                if matches!(
+                    arity.first().map(|f| &f.unmeta().kind),
+                    Some(FormKind::Vector(_))
+                ) =>
+            {
+                let mut new_arity = Vec::with_capacity(arity.len());
+                expand_arity(arity, env, scope, &mut new_arity)?;
+                out.push(Form::new(FormKind::List(new_arity), part.span.clone()));
+            }
+            _ => out.push(expand_all(part, env, scope)?),
+        }
+    }
+    Ok(())
+}
+
+/// Expand one arity, `arity[0]` being its parameter vector: the parameters
+/// are in scope in the body and nowhere else.
+fn expand_arity(
+    arity: &[Form],
+    env: &mut Env,
+    scope: &mut Vec<Arc<str>>,
+    out: &mut Vec<Form>,
+) -> EvalResult<()> {
+    let outer = scope.len();
+    out.push(expand_all(&arity[0], env, scope)?);
+    binding_names(&arity[0], scope);
+    for p in &arity[1..] {
+        out.push(expand_all(p, env, scope)?);
+    }
+    scope.truncate(outer);
+    Ok(())
+}
+
+/// Append the names a binding form introduces: a symbol, or every symbol a
+/// destructuring pattern binds (`[a & more :as all]`, `{a :a :keys [b]
+/// :as m}`). The default expressions under `:or` bind nothing.
+pub fn binding_names(pattern: &Form, out: &mut Vec<Arc<str>>) {
+    // `:keys [ns/a]` and `:keys [:ns/a]` both bind `a`.
+    let local = |s: &str| Arc::from(s.rsplit('/').next().unwrap_or(s));
+    match &pattern.unmeta().kind {
+        FormKind::Symbol(s) if s != "&" => out.push(local(s)),
+        FormKind::Vector(items) => items.iter().for_each(|i| binding_names(i, out)),
+        FormKind::Map(items) => {
+            for pair in items.chunks(2) {
+                let [key, value] = pair else { continue };
+                match key.as_keyword().map(|k| k.rsplit('/').next().unwrap_or(k)) {
+                    Some("keys" | "strs" | "syms") => {
+                        if let FormKind::Vector(names) = &value.unmeta().kind {
+                            for name in names {
+                                if let FormKind::Symbol(s) | FormKind::Keyword(s) =
+                                    &name.unmeta().kind
+                                {
+                                    out.push(local(s));
+                                }
+                            }
+                        }
+                    }
+                    Some("as") => binding_names(value, out),
+                    Some(_) => {}
+                    None => binding_names(key, out),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The local bindings a call's head symbol is checked against. A local
+/// shadows a macro: `(let [doc (fn [x] x)] (doc 1))` calls the local, it does
+/// not expand `clojure.core/doc`.
+#[derive(Clone, Copy)]
+enum Locals<'a> {
+    /// The frames of the environment evaluating the form.
+    Frames,
+    /// The names bound lexically around a form that is expanded ahead of its
+    /// evaluation. The environment's frames say nothing about such a form:
+    /// they belong to whoever asked for the expansion.
+    Lexical(&'a [Arc<str>]),
+}
+
+impl Locals<'_> {
+    fn binds(self, name: &str, env: &Env) -> bool {
+        match self {
+            Locals::Frames => env.lookup_local_frames(name).is_some(),
+            Locals::Lexical(names) => names.iter().any(|n| n.as_ref() == name),
+        }
+    }
+}
+
 /// If `sym` resolves to a macro in the current env, return its CljxFn.
-fn resolve_macro(sym: &str, env: &Env) -> Option<cljrs_value::CljxFn> {
+fn resolve_macro(sym: &str, env: &Env, locals: Locals) -> Option<cljrs_value::CljxFn> {
     let parsed = Symbol::parse(sym);
-    let ns: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
     let name = parsed.name.as_ref();
+    // Only unqualified symbols can be locals.
+    if parsed.namespace.is_none() && locals.binds(name, env) {
+        return None;
+    }
+    let ns: Arc<str> = env.resolve_ns_or_current(parsed.namespace.as_deref());
 
     let v = env.globals.lookup_in_ns(&ns, name)?;
     if let Value::Macro(f) = v {
