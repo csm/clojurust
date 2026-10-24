@@ -5005,6 +5005,15 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
             2
         }
         Readiness::GasExhausted => cljrs_async::state_machine::POLL_GAS_EXHAUSTED,
+        // The poll ABI has no memory-fault code: report a throw and confirm
+        // the fault in its slot, which the async task checks after every
+        // poll before it looks at the code.
+        Readiness::MemoryLimitExceeded(fault) => {
+            cljrs_gc::governor::confirm_runtime_fault(fault);
+            sm.pending =
+                cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault).to_error_value();
+            cljrs_async::state_machine::POLL_THREW
+        }
     }
 }
 

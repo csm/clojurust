@@ -14,6 +14,7 @@ use cljrs_value::{Keyword, Value};
 
 const MIB: usize = 1024 * 1024;
 
+#[allow(clippy::result_large_err)]
 fn eval(src: &str, env: &mut Env) -> Result<Value, EvalError> {
     let form = Parser::new(src.to_owned(), "<memory-limit>".to_owned())
         .parse_all()

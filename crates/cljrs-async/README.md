@@ -173,7 +173,12 @@ an in-band error value, so a pipeline of channels propagates errors automaticall
 `ex-message`/`ex-data`/`ex-cause` survive across an `await` boundary (and through `<?`/`go-try`).
 Gas exhaustion uses the distinct `FutureState::GasExhausted` state and is
 re-raised as `EvalError::GasExhausted`, so it cannot be intercepted by a
-user-level catch. Every `spawn_future` captures the complete active meter stack
+user-level catch. A memory-limit fault (strict governor mode) likewise settles as
+`FutureState::MemoryLimitExceeded` and is re-raised as
+`EvalError::MemoryLimitExceeded`; `check_ready` reports it as
+`Readiness::MemoryLimitExceeded`, and a compiled poll that sees it confirms
+the fault in the runtime-fault slot, which `CompiledAsyncTask::poll` checks
+after every poll. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.
 

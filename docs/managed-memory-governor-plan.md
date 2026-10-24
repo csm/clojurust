@@ -695,8 +695,10 @@ Phase 4 is complete:
 - Fallible paths: `GcPtr::try_new` returns `AllocError<T>`, which owns the value.
   `IsolateAccount::try_reserve_credit` and `try_charge`, `reserve_shared`, `reserve_critical`, `try_charge_permanent`, and `try_static_alloc` return `MemoryLimitExceeded`.
   `ByteBlob::try_new` and `try_with`, `SharedSlot::try_new`, and `SharedAtom::try_new`, `try_reset`, and `try_compare_and_set` reserve before they build or publish, so a refusal leaves the old shared value unchanged.
+  The infallible `ByteBlob::new` and `SharedSlot::new` use `ProcessMemoryGovernor::reserve_infallible`, which always returns a charge for the full size (a counted reserve overrun once the reserve is exhausted).
 - `ValueError::MemoryLimitExceeded`, `EvalError::MemoryLimitExceeded`, `CloneError::MemoryLimitExceeded`, and `SerializedErrorKind::MemoryLimitExceeded` carry the fixed-size `MemoryLimitExceeded`.
   `try`/`catch` and `rt_try` do not intercept it, like `GasExhausted`.
+  A future whose body fails with it settles as `FutureState::MemoryLimitExceeded`, so `await` and `deref` re-raise the fault rather than a catchable thrown value; compiled async polls see `Readiness::MemoryLimitExceeded` and report it through the fault slot.
 - Runtime faults: an infallible allocation (`GcPtr::new`, a region chunk, `charge_permanent`, `ByteBlob::new`, `SharedSlot::new`) that strict admission refuses raises the thread's pending runtime fault.
   The fault slot is a thread-local holding fixed-size data, separate from the compiled-code pending-exception slot.
   The allocation then takes its exact shortfall from the critical reserve and requests collection.
@@ -734,7 +736,7 @@ Phase 4 decisions that later phases must keep or replace:
   A fault raised in compiled code is reported at the entry seam, after the native call returns.
 - A fault that no safepoint resolves before an evaluation returns is resolved at the next evaluation's first safepoint.
 - `Yellow` and `Red` collection requests are unchanged; a refusal latches `Red` only while a normal chunk does not fit.
-- In `no-gc` builds `try_new` and `try_static_alloc` reserve `size_of::<GcBox<T>>()` (or `size_of::<T>()`) of credit before the region or arena allocation; region and arena chunks still charge through the infallible path.
+- In `no-gc` builds `try_new` and `try_static_alloc` ask the governor only when the active region or the static arena must add a chunk (`Region::chunk_needed`, `StaticArena::try_alloc`); an object that fits in memory already charged is never refused.
 - The final Clojure representation of `MemoryLimitExceeded` remains deferred; Clojure code cannot catch it.
 - `PersistentVector::gc_size_extra` (and similar persistent-collection estimates) charges every element for each new version, ignoring structural sharing.
   Under strict mode a growing persistent vector therefore reaches the limit with much less real data, and each `conj` near the limit is a large refused allocation followed by a collection.

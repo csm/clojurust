@@ -102,6 +102,7 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
         // Preserve the thrown value (and any non-Thrown error as a fresh
         // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
         Err(EvalError::GasExhausted) => FutureState::GasExhausted,
+        Err(EvalError::MemoryLimitExceeded(fault)) => FutureState::MemoryLimitExceeded(fault),
         Err(e) => FutureState::Failed(e.to_error_value()),
     };
     drop(state);
@@ -295,6 +296,10 @@ pub async fn await_value(val: Value) -> EvalResult {
                         FutureState::GasExhausted => {
                             f.get().mark_observed();
                             return Err(EvalError::GasExhausted);
+                        }
+                        FutureState::MemoryLimitExceeded(fault) => {
+                            f.get().mark_observed();
+                            return Err(EvalError::MemoryLimitExceeded(*fault));
                         }
                         FutureState::Cancelled => {
                             return Err(EvalError::Thrown(CljxFuture::cancelled_error()));

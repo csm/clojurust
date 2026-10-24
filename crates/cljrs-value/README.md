@@ -654,7 +654,8 @@ pub struct CljxPromise {
 }
 
 pub struct CljxFuture {
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Cancelled
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted
+                                    // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
 

@@ -162,17 +162,10 @@ const fn arc_bytes<T>() -> usize {
 
 /// Reserve `bytes` of shared-value memory for an infallible constructor.
 /// A strict-mode refusal raises the thread's runtime fault and charges the
-/// critical reserve instead, like `GcPtr::new`.
-fn reserve(bytes: usize) -> Option<MemoryCharge> {
-    match governor().reserve_shared(MemoryClass::SharedValue, bytes) {
-        Ok(charge) => Some(charge),
-        Err(refused) => {
-            cljrs_gc::governor::raise_runtime_fault(refused);
-            governor()
-                .reserve_critical(MemoryClass::SharedValue, bytes)
-                .ok()
-        }
-    }
+/// critical reserve (or past it, as a counted overrun) instead, like
+/// `GcPtr::new`; the returned charge always covers `bytes`.
+fn reserve(bytes: usize) -> MemoryCharge {
+    governor().reserve_infallible(MemoryClass::SharedValue, bytes)
 }
 
 /// Immutable byte buffer shared across isolates by `Arc` (`Value::ByteBlob`).
@@ -181,7 +174,7 @@ fn reserve(bytes: usize) -> Option<MemoryCharge> {
 /// isolates hold a reference.
 pub struct ByteBlob {
     bytes: Box<[u8]>,
-    charge: Option<MemoryCharge>,
+    charge: MemoryCharge,
 }
 
 impl ByteBlob {
@@ -202,10 +195,7 @@ impl ByteBlob {
             MemoryClass::SharedValue,
             arc_bytes::<ByteBlob>() + bytes.len(),
         )?;
-        Ok(Self {
-            bytes,
-            charge: Some(charge),
-        })
+        Ok(Self { bytes, charge })
     }
 
     /// Reserve a `len`-byte blob's charge before building its buffer, so a
@@ -218,7 +208,7 @@ impl ByteBlob {
             governor().reserve_shared(MemoryClass::SharedValue, arc_bytes::<ByteBlob>() + len)?;
         Ok(Self {
             bytes: fill(),
-            charge: Some(charge),
+            charge,
         })
     }
 
@@ -229,7 +219,7 @@ impl ByteBlob {
 
     /// Bytes charged to the governor for this blob.
     pub fn charged_bytes(&self) -> usize {
-        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+        self.charge.bytes()
     }
 }
 
@@ -269,7 +259,7 @@ impl std::fmt::Debug for ByteBlob {
 /// string it owns.  Byte-blob payloads are charged by the blob.
 pub struct SharedSlot {
     value: SharedValue,
-    charge: Option<MemoryCharge>,
+    charge: MemoryCharge,
 }
 
 impl SharedSlot {
@@ -285,10 +275,7 @@ impl SharedSlot {
     pub fn try_new(value: SharedValue) -> Result<Self, MemoryLimitExceeded> {
         let charge =
             governor().reserve_shared(MemoryClass::SharedValue, Self::bytes_for(&value))?;
-        Ok(Self {
-            value,
-            charge: Some(charge),
-        })
+        Ok(Self { value, charge })
     }
 
     fn bytes_for(value: &SharedValue) -> usize {
@@ -306,7 +293,7 @@ impl SharedSlot {
 
     /// Bytes charged to the governor for this slot.
     pub fn charged_bytes(&self) -> usize {
-        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+        self.charge.bytes()
     }
 }
 

@@ -2517,6 +2517,10 @@ fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
                         f.get().mark_observed();
                         return Err(EvalError::GasExhausted);
                     }
+                    FutureState::MemoryLimitExceeded(fault) => {
+                        f.get().mark_observed();
+                        return Err(EvalError::MemoryLimitExceeded(*fault));
+                    }
                     FutureState::Cancelled => {
                         return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
                     }

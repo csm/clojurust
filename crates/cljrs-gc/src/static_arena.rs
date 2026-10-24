@@ -20,7 +20,8 @@ use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{GcBox, GcPtr, Trace};
+use crate::governor::MemoryLimitExceeded;
+use crate::{AllocError, GcBox, GcPtr, Trace};
 
 /// Default chunk size: 256 KiB.
 const CHUNK_SIZE: usize = 256 * 1024;
@@ -75,15 +76,39 @@ impl Inner {
         self.grow(layout)
     }
 
+    /// [`Self::alloc_raw`], but a new chunk must first be admitted by the
+    /// governor; on refusal nothing is allocated or charged.
+    fn try_alloc_raw(&mut self, layout: Layout) -> Result<*mut u8, MemoryLimitExceeded> {
+        let aligned = (self.ptr + layout.align() - 1) & !(layout.align() - 1);
+        if aligned + layout.size() <= self.end {
+            self.ptr = aligned + layout.size();
+            return Ok(aligned as *mut u8);
+        }
+        crate::governor::governor().try_charge_permanent(
+            crate::governor::MemoryClass::Static,
+            Self::chunk_size(layout),
+        )?;
+        Ok(self.grow_charged(layout))
+    }
+
+    fn chunk_size(layout: Layout) -> usize {
+        CHUNK_SIZE.max(layout.size() * 2)
+    }
+
     fn grow(&mut self, layout: Layout) -> *mut u8 {
-        let chunk_size = CHUNK_SIZE.max(layout.size() * 2);
+        charge_chunk(Self::chunk_size(layout));
+        self.grow_charged(layout)
+    }
+
+    /// Add a chunk whose bytes the governor has already charged.
+    fn grow_charged(&mut self, layout: Layout) -> *mut u8 {
+        let chunk_size = Self::chunk_size(layout);
         let cl = Layout::from_size_align(chunk_size, layout.align().max(16)).unwrap();
         // SAFETY: non-zero size, valid layout.
         let data = unsafe {
             NonNull::new(alloc::alloc(cl)).expect("StaticArena: chunk allocation failed")
         };
         let base = data.as_ptr() as usize;
-        charge_chunk(chunk_size);
         let aligned = (base + layout.align() - 1) & !(layout.align() - 1);
         self.ptr = aligned + layout.size();
         self.end = base + chunk_size;
@@ -143,6 +168,35 @@ impl StaticArena {
         // SAFETY: raw is properly aligned and sized for T.
         unsafe { std::ptr::write(raw, value) };
         crate::StaticGcPtr(unsafe { NonNull::new_unchecked(raw) })
+    }
+
+    /// Fallible [`Self::alloc`]: the governor is asked only when the arena
+    /// needs a new chunk, and a refusal returns the value.
+    pub fn try_alloc<T: Trace + 'static>(&self, value: T) -> Result<GcPtr<T>, AllocError<T>> {
+        let layout = Layout::new::<GcBox<T>>();
+        let raw = match self.inner.lock().unwrap().try_alloc_raw(layout) {
+            Ok(raw) => raw,
+            Err(error) => return Err(AllocError { value, error }),
+        };
+        let gc_box = raw as *mut GcBox<T>;
+        // SAFETY: raw is properly aligned and sized for GcBox<T>.
+        unsafe { std::ptr::write(gc_box, GcBox { value }) };
+        Ok(GcPtr(unsafe { NonNull::new_unchecked(gc_box) }))
+    }
+
+    /// Fallible [`Self::alloc_val`].
+    pub fn try_alloc_val<T: 'static>(
+        &self,
+        value: T,
+    ) -> Result<crate::StaticGcPtr<T>, AllocError<T>> {
+        let layout = Layout::new::<T>();
+        let raw = match self.inner.lock().unwrap().try_alloc_raw(layout) {
+            Ok(raw) => raw as *mut T,
+            Err(error) => return Err(AllocError { value, error }),
+        };
+        // SAFETY: raw is properly aligned and sized for T.
+        unsafe { std::ptr::write(raw, value) };
+        Ok(crate::StaticGcPtr(unsafe { NonNull::new_unchecked(raw) }))
     }
 
     /// Return `true` if `addr` was allocated by this arena.

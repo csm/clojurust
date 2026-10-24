@@ -395,14 +395,22 @@ impl<T: Trace + 'static> GcPtr<T> {
     /// governor cannot admit its bytes.  The governor is consulted before
     /// the object exists; a refusal changes no counter.  Observe-only mode
     /// never refuses.
+    ///
+    /// In `no-gc` builds the governor is asked only when the active region
+    /// or the static arena must add a chunk; an object that fits in memory
+    /// already charged is never refused.
     pub fn try_new(value: T) -> Result<Self, AllocError<T>> {
         #[cfg(not(feature = "no-gc"))]
-        let bytes = std::mem::size_of::<GcBox<T>>() + value.gc_size_extra();
+        {
+            let bytes = std::mem::size_of::<GcBox<T>>() + value.gc_size_extra();
+            match governor::try_reserve_current(bytes) {
+                Ok(()) => Ok(Self::new(value)),
+                Err(error) => Err(AllocError { value, error }),
+            }
+        }
         #[cfg(feature = "no-gc")]
-        let bytes = std::mem::size_of::<GcBox<T>>();
-        match governor::try_reserve_current(bytes) {
-            Ok(()) => Ok(Self::new(value)),
-            Err(error) => Err(AllocError { value, error }),
+        {
+            alloc_ctx::try_alloc_in_ctx(value)
         }
     }
 
@@ -568,8 +576,8 @@ pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
 }
 
 /// Fallible [`static_alloc`]: return the value with the refusal if the
-/// governor cannot admit it.  In `no-gc` builds the check covers
-/// `size_of::<T>()`; the arena charges whole chunks as before.
+/// governor cannot admit it.  In `no-gc` builds the governor is asked only
+/// when the arena must add a chunk.
 pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>> {
     #[cfg(not(feature = "no-gc"))]
     {
@@ -582,10 +590,7 @@ pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocErr
     }
     #[cfg(feature = "no-gc")]
     {
-        match governor::try_reserve_current(std::mem::size_of::<T>()) {
-            Ok(()) => Ok(static_alloc_inner(value)),
-            Err(error) => Err(AllocError { value, error }),
-        }
+        static_arena::static_arena().try_alloc_val(value)
     }
 }
 

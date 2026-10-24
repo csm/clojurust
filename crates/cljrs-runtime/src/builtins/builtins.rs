@@ -6312,6 +6312,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                         f.get().mark_observed();
                         Err(ValueError::GasExhausted)
                     }
+                    FutureState::MemoryLimitExceeded(fault) => {
+                        f.get().mark_observed();
+                        Err(ValueError::MemoryLimitExceeded(*fault))
+                    }
                     FutureState::Cancelled => {
                         Err(ValueError::Thrown(CljxFuture::cancelled_error()))
                     }
@@ -6333,6 +6337,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             FutureState::GasExhausted => {
                                 f.get().mark_observed();
                                 Err(ValueError::GasExhausted)
+                            }
+                            FutureState::MemoryLimitExceeded(fault) => {
+                                f.get().mark_observed();
+                                Err(ValueError::MemoryLimitExceeded(*fault))
                             }
                             FutureState::Cancelled => {
                                 Err(ValueError::Thrown(CljxFuture::cancelled_error()))
@@ -6356,6 +6364,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                         FutureState::GasExhausted => {
                             f.get().mark_observed();
                             return Err(ValueError::GasExhausted);
+                        }
+                        FutureState::MemoryLimitExceeded(fault) => {
+                            f.get().mark_observed();
+                            return Err(ValueError::MemoryLimitExceeded(*fault));
                         }
                         FutureState::Cancelled => {
                             return Err(ValueError::Thrown(CljxFuture::cancelled_error()));

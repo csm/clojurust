@@ -1244,6 +1244,9 @@ pub enum FutureState {
     /// The future exhausted the evaluation budget. Kept distinct from a
     /// thrown value so user-level catch clauses cannot intercept it.
     GasExhausted,
+    /// The future's body failed with a managed-memory limit fault (strict
+    /// governor mode). Kept distinct for the same reason as `GasExhausted`.
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     Cancelled,
 }
 

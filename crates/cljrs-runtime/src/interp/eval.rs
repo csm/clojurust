@@ -385,6 +385,10 @@ pub fn deref_value(v: Value) -> EvalResult {
                         f.get().mark_observed();
                         return Err(EvalError::GasExhausted);
                     }
+                    FutureState::MemoryLimitExceeded(fault) => {
+                        f.get().mark_observed();
+                        return Err(EvalError::MemoryLimitExceeded(*fault));
+                    }
                     FutureState::Cancelled => {
                         return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
                     }

@@ -1668,6 +1668,21 @@ impl ProcessMemoryGovernor {
         self.reserve(class, bytes, Admission::Critical)
     }
 
+    /// Reserve `bytes` of `class` for a constructor that cannot fail.
+    /// Always returns a charge for the full size: a strict-mode refusal
+    /// raises the thread's runtime fault (outside a [`CriticalSection`]) and
+    /// takes the bytes from the critical reserve, or past it as a counted
+    /// reserve overrun, like [`IsolateAccount::charge`].
+    pub fn reserve_infallible(&'static self, class: MemoryClass, bytes: usize) -> MemoryCharge {
+        self.admit_infallible(class, bytes);
+        self.evaluate(None, bytes > 0);
+        MemoryCharge {
+            governor: self,
+            class,
+            bytes,
+        }
+    }
+
     /// Report `bytes` of `class` that the governor does not deny (JIT code).
     /// Always succeeds, even in strict mode.
     pub fn reserve_reported(&'static self, class: MemoryClass, bytes: usize) -> MemoryCharge {
@@ -1706,6 +1721,15 @@ impl ProcessMemoryGovernor {
         if bytes == 0 {
             return;
         }
+        self.admit_infallible(class, bytes);
+        self.evaluate(None, false);
+    }
+
+    /// Commit bytes whose allocation cannot be refused.  Application
+    /// admission first; on a strict refusal, record it and raise the
+    /// thread's runtime fault (outside a critical section), then commit
+    /// through [`Self::admit_or_overrun`].
+    fn admit_infallible(&'static self, class: MemoryClass, bytes: usize) {
         let admission = current_admission();
         if let Err(refused) = self.admit(class, bytes, admission) {
             if admission == Admission::Application {
@@ -1714,7 +1738,6 @@ impl ProcessMemoryGovernor {
             }
             self.admit_or_overrun(class, bytes);
         }
-        self.evaluate(None, false);
     }
 
     /// Fallible [`Self::charge_permanent`]: a refusal changes no counter.
@@ -2997,6 +3020,26 @@ mod tests {
             acc.try_charge(64 * KIB).is_err(),
             "outside, the limit applies"
         );
+    }
+
+    #[test]
+    fn infallible_reservation_always_charges() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let reserve = g.config().critical_reserve;
+        let held = g.reserve_shared(MemoryClass::SharedValue, MIB).unwrap();
+        let critical = g
+            .reserve_critical(MemoryClass::SharedValue, reserve)
+            .unwrap();
+        assert_eq!(g.committed_bytes(), MIB + reserve, "limit and reserve full");
+        let charge = g.reserve_infallible(MemoryClass::SharedValue, 4 * KIB);
+        assert_eq!(charge.bytes(), 4 * KIB, "the charge is never dropped");
+        assert_eq!(g.committed_bytes(), MIB + reserve + 4 * KIB);
+        let snap = g.snapshot();
+        assert_eq!(snap.reserve_overruns, 1);
+        assert_eq!(snap.reserve_overrun_bytes, 4 * KIB as u64);
+        assert!(take_runtime_fault().is_some());
+        drop((held, critical, charge));
+        assert_eq!(g.committed_bytes(), 0);
     }
 
     #[test]

@@ -93,6 +93,8 @@ tests/
                     collection requests, credit returned by collection
                     and thread exit, idle capacity borrowed by an active
                     isolate
+  no_gc_strict.rs — (no-gc mode) strict admission: fallible allocation uses
+                    charged chunks at the hard limit and refuses new ones
   no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
                     ScratchGuard, StaticCtxGuard, InvocationGuard,
                     pop_for_return protocol, nested guards, destructor ordering
@@ -181,7 +183,10 @@ impl<T> AllocError<T> {
 ```
 
 `try_new` asks the thread's account for the object's bytes before the object
-exists (`governor::try_reserve_current`).  `new` cannot refuse: in strict
+exists (`governor::try_reserve_current`).  In `no-gc` builds it asks only when
+the active region or the static arena must add a chunk
+(`Region::chunk_needed`, `StaticArena::try_alloc` / `try_alloc_val`), so an
+object that fits in memory already charged is never refused.  `new` cannot refuse: in strict
 mode a refused allocation takes the critical reserve and raises the thread's
 runtime fault, which the interpreter resolves at its next safepoint.
 
@@ -407,6 +412,9 @@ impl ProcessMemoryGovernor {
         -> Result<MemoryCharge, MemoryLimitExceeded>;   // may use the critical reserve
     pub fn reserve_reported(&'static self, class: MemoryClass, bytes: usize)
         -> MemoryCharge;                                // never refused (JIT code)
+    pub fn reserve_infallible(&'static self, class: MemoryClass, bytes: usize)
+        -> MemoryCharge;   // always the full size; a strict refusal raises a fault and
+                           // uses the reserve, or overruns it (counted)
     pub fn charge_permanent(&'static self, class: MemoryClass, bytes: usize);  // never returned;
                                                         // a strict refusal raises a fault
     pub fn try_charge_permanent(&'static self, class: MemoryClass, bytes: usize)
