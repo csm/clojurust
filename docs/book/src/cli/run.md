@@ -51,7 +51,10 @@ if the soft limit is larger).
 Process-wide managed-memory hard limit in megabytes. It is **not enforced
 yet**: the memory governor runs in observe-only mode, and allocations above the
 limit succeed. `--gc-stats` reports how many allocations went over it. The
-governor's soft limit is 75% of this value. The flag takes precedence over
+governor's soft limit is 75% of this value. Managed memory covers isolate GC
+heaps, region chunks, shared byte blobs and `shared-atom` values, queued
+isolate-channel messages, static data, and JIT code; it is not the process
+resident set. The flag takes precedence over
 `CLJRS_MEMORY_HARD_LIMIT_MB` and `CLJRS_MEMORY_SOFT_LIMIT_MB`.
 
 A zero hard limit, or a soft limit above the hard limit, is rejected.

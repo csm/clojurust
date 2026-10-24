@@ -3,10 +3,10 @@
 //! A cross-isolate channel transfers `Value`s between two isolates by
 //! **structured-cloning** them at the boundary:
 //!
-//! 1. The sender calls `IsolateSender::send`, which calls `serialize` to produce
-//!    a `SerializedValue` (a `Send + Sync` owned intermediate).
-//! 2. The serialized form travels over a `tokio::sync::mpsc` channel (which is
-//!    `Send` when the item type is `Send`).
+//! 1. The sender calls `IsolateSender::send` (or `send_async`), which calls
+//!    `serialize` to produce a `SerializedValue` (a `Send + Sync` owned
+//!    intermediate).
+//! 2. The serialized form waits in a byte-bounded queue shared by both ends.
 //! 3. The receiver calls `IsolateReceiver::recv` (async) or
 //!    `IsolateReceiver::try_recv` (non-blocking), which calls `deserialize` to
 //!    allocate a fresh `Value` in the *current* isolate's GC heap.
@@ -16,6 +16,17 @@
 //!
 //! Non-shareable values (`Resource`, `Atom`, mutable state, closures) are
 //! rejected at `send` time with a [`CloneError`] rather than a panic.
+//!
+//! # Memory accounting
+//!
+//! Each queued message holds a process-governor charge
+//! (`MemoryClass::MessageQueue`) for its [`SerializedValue::wire_size`].  The
+//! charge is taken before the message is enqueued and returned after the
+//! receiver deserializes it, or when the channel closes.  The channel also
+//! bounds its queued bytes: [`IsolateSender::send`] returns
+//! [`CloneError::Full`] when a message does not fit, and
+//! [`IsolateSender::send_async`] waits for room.  The default limit is the
+//! governor's `queue_limit` (`CLJRS_ISOLATE_QUEUE_LIMIT_MB`).
 //!
 //! # Usage
 //!
@@ -30,22 +41,66 @@
 //! assert_eq!(v, Value::Long(42));
 //! ```
 
+use std::collections::VecDeque;
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use cljrs_gc::{MemoryCharge, MemoryClass, governor};
 use cljrs_value::Value;
 use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
+use tokio::sync::Notify;
+
+/// A queued message and the governor charge for its wire bytes.
+struct AccountedMessage {
+    value: SerializedValue,
+    charge: MemoryCharge,
+}
+
+struct State {
+    queue: VecDeque<AccountedMessage>,
+    /// Wire bytes of queued messages plus the message being deserialized.
+    queued_bytes: usize,
+    /// Live `IsolateSender` handles.
+    senders: usize,
+    /// The receiver closed or dropped the channel.
+    closed: bool,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    limit: usize,
+    /// Signalled on each enqueue and when the last sender goes away.
+    recv_ready: Notify,
+    /// Signalled when queued bytes fall or the channel closes.
+    space_ready: Notify,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Release `bytes` of queue capacity and wake waiting senders.
+    fn release(&self, bytes: usize) {
+        let mut st = self.lock();
+        st.queued_bytes = st.queued_bytes.saturating_sub(bytes);
+        drop(st);
+        self.space_ready.notify_waiters();
+    }
+}
 
 /// Sending end of a cross-isolate channel. Cloneable — multiple senders are
-/// allowed. All methods are synchronous and cheap (just serialization + channel
-/// push).
-#[derive(Clone, Debug)]
+/// allowed.
 pub struct IsolateSender {
-    tx: tokio::sync::mpsc::UnboundedSender<SerializedValue>,
+    shared: Arc<Shared>,
 }
 
 /// Receiving end of a cross-isolate channel. Must live on the destination
 /// isolate's thread so that `deserialize` allocates into the right GC heap.
-#[derive(Debug)]
+/// Dropping it closes the channel and releases every queued message.
 pub struct IsolateReceiver {
-    rx: tokio::sync::mpsc::UnboundedReceiver<SerializedValue>,
+    shared: Arc<Shared>,
 }
 
 /// Outcome of a non-blocking [`IsolateReceiver::try_recv_status`].
@@ -54,39 +109,187 @@ pub enum IsolateRecv {
     Value(Value),
     /// The channel is currently empty but at least one sender is still alive.
     Empty,
-    /// All senders have been dropped and the queue is drained.
+    /// All senders have been dropped (or the channel was closed) and the
+    /// queue is drained.
     Disconnected,
 }
 
-// IsolateSender is Send because SerializedValue: Send.
-// IsolateReceiver is also Send (tokio guarantees this when the item is Send);
-// it must be moved to the destination thread before use.
+// Both ends hold only `Arc<Shared>`, whose contents are `Send + Sync`
+// (`SerializedValue` and `MemoryCharge` are), so either end may move to the
+// destination thread.
 
-/// Create a linked `(IsolateSender, IsolateReceiver)` pair.
+/// Create a linked `(IsolateSender, IsolateReceiver)` pair whose byte limit is
+/// the governor's default per-channel queue limit.
 ///
 /// The sender may be cloned and used from any thread or isolate. The receiver
 /// must be moved to the destination isolate *before* any `recv` call so that
 /// deserialized `GcPtr`s are allocated in the correct heap.
 pub fn isolate_channel() -> (IsolateSender, IsolateReceiver) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    (IsolateSender { tx }, IsolateReceiver { rx })
+    isolate_channel_with_limit(governor().config().queue_limit)
+}
+
+/// Create a channel that holds at most `limit` wire bytes of queued messages.
+///
+/// # Panics
+/// Panics if `limit` is zero.
+pub fn isolate_channel_with_limit(limit: usize) -> (IsolateSender, IsolateReceiver) {
+    assert!(limit > 0, "isolate channel byte limit must be non-zero");
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            senders: 1,
+            closed: false,
+        }),
+        limit,
+        recv_ready: Notify::new(),
+        space_ready: Notify::new(),
+    });
+    (
+        IsolateSender {
+            shared: shared.clone(),
+        },
+        IsolateReceiver { shared },
+    )
 }
 
 impl IsolateSender {
-    /// Serialize `v` and enqueue it for the receiving isolate.
+    /// Serialize `v` and enqueue it without waiting.
+    ///
+    /// This is the compatibility form of the original unbounded send; it is
+    /// the same operation as [`Self::try_send`].
     ///
     /// Returns `Err(CloneError::NotShareable { .. })` if `v` contains a
-    /// non-shareable type (mutable state, closures, native resources).
-    /// Returns `Err(CloneError::Disconnected)` if the receiver has been dropped.
+    /// non-shareable type (mutable state, closures, native resources),
+    /// `Err(CloneError::Disconnected)` if the receiver has been dropped, and
+    /// `Err(CloneError::Full { .. })` if the message does not fit.
     pub fn send(&self, v: &Value) -> Result<(), CloneError> {
-        let start = std::time::Instant::now();
-        let sv = serialize(v)?;
-        // Meter the crossing (bytes copied + serialize time) into the shared
-        // GC stats so a silent fan-out copy is observable rather than mystery
-        // latency. The error path above is intentionally *not* metered — a
-        // rejected value never crosses, so it copies nothing.
-        cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
-        self.tx.send(sv).map_err(|_| CloneError::Disconnected)
+        self.try_send(v)
+    }
+
+    /// Serialize `v` and enqueue it, or return `CloneError::Full` when the
+    /// channel's byte limit (or the process governor) has no room for it.
+    pub fn try_send(&self, v: &Value) -> Result<(), CloneError> {
+        let sv = serialize_metered(v)?;
+        self.enqueue(sv).map_err(|(_, e)| {
+            if matches!(e, CloneError::Full { .. }) {
+                governor().record_queue_rejection();
+            }
+            e
+        })
+    }
+
+    /// Serialize `v` and enqueue it, waiting while the channel is full.
+    ///
+    /// A message larger than the channel's whole limit can never fit, so it
+    /// returns `CloneError::Full` at once.
+    pub async fn send_async(&self, v: &Value) -> Result<(), CloneError> {
+        let mut sv = serialize_metered(v)?;
+        let mut waiting_since: Option<Instant> = None;
+        loop {
+            // Register for the wakeup before checking, so a release between
+            // the check and the await is not lost.
+            let notified = self.shared.space_ready.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            match self.enqueue(sv) {
+                Ok(()) => {
+                    if let Some(start) = waiting_since {
+                        governor().record_queue_wait(start.elapsed());
+                    }
+                    return Ok(());
+                }
+                Err((back, CloneError::Full { bytes, .. })) if bytes <= self.shared.limit => {
+                    sv = back;
+                    waiting_since.get_or_insert_with(Instant::now);
+                    notified.await;
+                }
+                Err((_, e)) => {
+                    if matches!(e, CloneError::Full { .. }) {
+                        governor().record_queue_rejection();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// The channel's byte limit.
+    pub fn limit(&self) -> usize {
+        self.shared.limit
+    }
+
+    /// Wire bytes currently queued (including a message being received).
+    pub fn queued_bytes(&self) -> usize {
+        self.shared.lock().queued_bytes
+    }
+
+    /// Reserve the message's wire bytes and enqueue it.  On failure, return
+    /// the message so an async sender can retry.
+    fn enqueue(&self, sv: SerializedValue) -> Result<(), (SerializedValue, CloneError)> {
+        let bytes = sv.wire_size();
+        let mut st = self.shared.lock();
+        if st.closed {
+            return Err((sv, CloneError::Disconnected));
+        }
+        let full = CloneError::Full {
+            bytes,
+            queued: st.queued_bytes,
+            limit: self.shared.limit,
+        };
+        if st.queued_bytes.saturating_add(bytes) > self.shared.limit {
+            return Err((sv, full));
+        }
+        let charge = match governor().reserve_shared(MemoryClass::MessageQueue, bytes) {
+            Ok(charge) => charge,
+            Err(_) => return Err((sv, full)),
+        };
+        st.queued_bytes += bytes;
+        st.queue.push_back(AccountedMessage { value: sv, charge });
+        drop(st);
+        self.shared.recv_ready.notify_one();
+        Ok(())
+    }
+}
+
+/// Serialize `v`, metering the crossing (bytes copied + serialize time) into
+/// the shared GC stats so a silent fan-out copy is observable rather than
+/// mystery latency. The error path is intentionally *not* metered — a
+/// rejected value never crosses, so it copies nothing.
+fn serialize_metered(v: &Value) -> Result<SerializedValue, CloneError> {
+    let start = Instant::now();
+    let sv = serialize(v)?;
+    cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
+    Ok(sv)
+}
+
+impl Clone for IsolateSender {
+    fn clone(&self) -> Self {
+        self.shared.lock().senders += 1;
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for IsolateSender {
+    fn drop(&mut self) {
+        let mut st = self.shared.lock();
+        st.senders -= 1;
+        let last = st.senders == 0;
+        drop(st);
+        if last {
+            self.shared.recv_ready.notify_one();
+        }
+    }
+}
+
+impl fmt::Debug for IsolateSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsolateSender")
+            .field("limit", &self.shared.limit)
+            .field("queued_bytes", &self.queued_bytes())
+            .finish()
     }
 }
 
@@ -94,25 +297,102 @@ impl IsolateReceiver {
     /// Asynchronously receive the next value, deserializing it into the current
     /// isolate's GC heap. Returns `None` when all senders have been dropped.
     pub async fn recv(&mut self) -> Option<Value> {
-        self.rx.recv().await.map(deserialize)
+        loop {
+            match self.try_recv_status() {
+                IsolateRecv::Value(v) => return Some(v),
+                IsolateRecv::Disconnected => return None,
+                // `notify_one` stores a permit when no task waits, so a send
+                // between the check and this await still wakes us.
+                IsolateRecv::Empty => self.shared.recv_ready.notified().await,
+            }
+        }
     }
 
     /// Non-blocking receive attempt. Returns `None` if the channel is currently
     /// empty or all senders have been dropped.
     pub fn try_recv(&mut self) -> Option<Value> {
-        self.rx.try_recv().ok().map(deserialize)
+        match self.try_recv_status() {
+            IsolateRecv::Value(v) => Some(v),
+            IsolateRecv::Empty | IsolateRecv::Disconnected => None,
+        }
     }
 
     /// Non-blocking receive that distinguishes "empty" from "disconnected" —
     /// the Clojure-level `isolate-take!`/`isolate-poll!` builtins need to tell a
     /// transient empty queue (keep waiting) from a closed channel (yield `nil`).
     pub fn try_recv_status(&mut self) -> IsolateRecv {
-        use tokio::sync::mpsc::error::TryRecvError;
-        match self.rx.try_recv() {
-            Ok(sv) => IsolateRecv::Value(deserialize(sv)),
-            Err(TryRecvError::Empty) => IsolateRecv::Empty,
-            Err(TryRecvError::Disconnected) => IsolateRecv::Disconnected,
-        }
+        let msg = {
+            let mut st = self.shared.lock();
+            match st.queue.pop_front() {
+                Some(msg) => msg,
+                None if st.closed || st.senders == 0 => return IsolateRecv::Disconnected,
+                None => return IsolateRecv::Empty,
+            }
+        };
+        // The charge and the queue capacity stay held until deserialization
+        // finishes (or unwinds): the wire form and the new heap objects
+        // coexist until then.
+        let _release = Dequeued {
+            shared: &self.shared,
+            bytes: msg.charge.bytes(),
+            charge: Some(msg.charge),
+        };
+        IsolateRecv::Value(deserialize(msg.value))
+    }
+
+    /// Close the channel: drop every queued message (returning its charge)
+    /// and make later sends fail with `CloneError::Disconnected`.
+    pub fn close(&mut self) {
+        let drained = {
+            let mut st = self.shared.lock();
+            st.closed = true;
+            let drained = std::mem::take(&mut st.queue);
+            let bytes: usize = drained.iter().map(|m| m.charge.bytes()).sum();
+            st.queued_bytes = st.queued_bytes.saturating_sub(bytes);
+            drained
+        };
+        // Drop outside the lock: each charge returns its bytes to the governor.
+        drop(drained);
+        self.shared.space_ready.notify_waiters();
+    }
+
+    /// The channel's byte limit.
+    pub fn limit(&self) -> usize {
+        self.shared.limit
+    }
+
+    /// Wire bytes currently queued.
+    pub fn queued_bytes(&self) -> usize {
+        self.shared.lock().queued_bytes
+    }
+}
+
+impl Drop for IsolateReceiver {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl fmt::Debug for IsolateReceiver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsolateReceiver")
+            .field("limit", &self.shared.limit)
+            .field("queued_bytes", &self.queued_bytes())
+            .finish()
+    }
+}
+
+/// Returns a dequeued message's charge and queue capacity on drop.
+struct Dequeued<'a> {
+    shared: &'a Shared,
+    bytes: usize,
+    charge: Option<MemoryCharge>,
+}
+
+impl Drop for Dequeued<'_> {
+    fn drop(&mut self) {
+        drop(self.charge.take());
+        self.shared.release(self.bytes);
     }
 }
 
@@ -366,6 +646,112 @@ mod tests {
             assert!(after.boundary_bytes_copied > before.boundary_bytes_copied);
         });
         h.join().unwrap();
+    }
+
+    fn run_local<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, f)
+    }
+
+    fn payload(n: usize) -> Value {
+        Value::string("x".repeat(n))
+    }
+
+    #[test]
+    fn bounded_channel_rejects_and_recovers() {
+        let one = serialize(&payload(100)).unwrap().wire_size();
+        let (tx, mut rx) = isolate_channel_with_limit(one * 2);
+        tx.send(&payload(100)).unwrap();
+        tx.send(&payload(100)).unwrap();
+        assert_eq!(tx.queued_bytes(), one * 2);
+        assert!(
+            cljrs_gc::governor().class_bytes(MemoryClass::MessageQueue) >= one * 2,
+            "queued messages are charged"
+        );
+        match tx.send(&payload(100)) {
+            Err(CloneError::Full {
+                bytes,
+                queued,
+                limit,
+            }) => {
+                assert_eq!((bytes, queued, limit), (one, one * 2, one * 2));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        assert_eq!(rx.try_recv(), Some(payload(100)));
+        assert_eq!(rx.queued_bytes(), one, "receive returns capacity");
+        tx.send(&payload(100)).unwrap();
+    }
+
+    #[test]
+    fn oversized_message_is_full_even_for_async_send() {
+        let (tx, _rx) = isolate_channel_with_limit(64);
+        let err = run_local(async { tx.send_async(&payload(1000)).await }).unwrap_err();
+        assert!(matches!(err, CloneError::Full { .. }));
+        assert_eq!(tx.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn dropping_receiver_releases_queued_messages() {
+        let (tx, rx) = isolate_channel_with_limit(1 << 20);
+        for _ in 0..10 {
+            tx.send(&payload(1000)).unwrap();
+        }
+        assert!(tx.queued_bytes() > 10_000);
+        drop(rx);
+        assert_eq!(tx.queued_bytes(), 0);
+        assert!(matches!(
+            tx.send(&Value::Nil),
+            Err(CloneError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn close_releases_queued_messages() {
+        let (tx, mut rx) = isolate_channel_with_limit(1 << 20);
+        tx.send(&payload(10)).unwrap();
+        rx.close();
+        assert_eq!(rx.queued_bytes(), 0);
+        assert!(matches!(rx.try_recv_status(), IsolateRecv::Disconnected));
+        assert!(matches!(
+            tx.send(&Value::Nil),
+            Err(CloneError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn async_send_waits_for_capacity() {
+        let one = serialize(&payload(100)).unwrap().wire_size();
+        let (tx, mut rx) = isolate_channel_with_limit(one);
+        let waits_before = cljrs_gc::governor().snapshot().queue_waits;
+        let got = run_local(async move {
+            let sender = tokio::task::spawn_local(async move {
+                for _ in 0..3 {
+                    tx.send_async(&payload(100)).await.unwrap();
+                }
+            });
+            let mut got = Vec::new();
+            while let Some(v) = rx.recv().await {
+                got.push(v);
+            }
+            sender.await.unwrap();
+            got
+        });
+        assert_eq!(got, vec![payload(100), payload(100), payload(100)]);
+        assert!(cljrs_gc::governor().snapshot().queue_waits > waits_before);
+    }
+
+    #[test]
+    fn last_sender_drop_disconnects() {
+        let (tx, mut rx) = isolate_channel_with_limit(1 << 20);
+        let tx2 = tx.clone();
+        drop(tx);
+        tx2.send(&Value::Long(1)).unwrap();
+        drop(tx2);
+        let got = run_local(async move { (rx.recv().await, rx.recv().await) });
+        assert_eq!(got, (Some(Value::Long(1)), None));
     }
 
     /// Two isolates allocate independently; the receiver's heap is unaffected

@@ -189,7 +189,7 @@ one. Clone it freely to hand to extension `install` functions.
 | `CLJRS_MEMORY_HARD_LIMIT_MB` | same | Process-wide managed-memory hard limit (default: the cgroup limit, else half of physical memory). Observed, not yet enforced. |
 | `CLJRS_MEMORY_CRITICAL_RESERVE_MB` | same | Reserve for runtime control operations (default: max(4 MiB, 1% of the hard limit), at most 256 MiB). |
 | `CLJRS_MEMORY_CREDIT_KB` | same | Allocation credit chunk an isolate takes from the governor at a time (default: 64). |
-| `CLJRS_ISOLATE_QUEUE_LIMIT_MB` | same | Default byte limit for one isolate channel (default: 64, at most the hard limit). Not yet applied. |
+| `CLJRS_ISOLATE_QUEUE_LIMIT_MB` | same | Default byte limit for one isolate channel (default: 64, at most the hard limit). `(isolate-chan limit-bytes)` overrides it per channel. |
 | `CLJRS_NO_IR` | `build()` | Pins the runtime at `TierState::TreeWalk` regardless of the execution mode. |
 | `CLJRS_GC_STATS` | `cljrs_gc::dump_stats_from_env()` | Where to write a `GC_STATS` snapshot — unset does nothing, empty or `-` means stdout, anything else is a file path. Nothing reads it on its own; call `dump_stats_from_env()` at exit if you want the behaviour the CLI's `--gc-stats` flag gives. |
 

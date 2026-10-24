@@ -61,6 +61,15 @@ Done (Phases A–H, A2, B1):
   latency — one of the four visibility guarantees in
   `docs/isolate-boundary-plan.md`. Rejected (non-shareable) sends copy nothing
   and are not metered.
+- Managed-memory governor Phase 3 (`docs/managed-memory-governor-plan.md`): the
+  channel is **byte-bounded**. Each queued message holds a governor
+  `MemoryCharge` (`MemoryClass::MessageQueue`) for its
+  `SerializedValue::wire_size`, taken before enqueue and returned after the
+  receiver deserializes it. `send`/`try_send` return `CloneError::Full` when the
+  message does not fit; `send_async` waits for room (recorded as a queue wait in
+  the governor snapshot). The default limit is the governor's `queue_limit`
+  (`CLJRS_ISOLATE_QUEUE_LIMIT_MB`); `isolate_channel_with_limit` sets one per
+  channel. Dropping or closing the receiver releases every queued charge.
 - Phase B2 (Clojure surface): `isolate_builtins` exposes the copy boundary to
   Clojure as a **distinct constructor** (`(isolate-chan) → [tx rx]`), honoring
   the plan's "distinct-at-construction, not per-message" rule — you know a send
@@ -128,8 +137,10 @@ atom, native resource, …) that cannot cross. Every accepted send is metered
 into `--gc-stats` (bytes copied + time). The sender is multi-producer
 (value-copyable); the receiver is single-consumer and deserializes into the
 heap of whichever isolate holds it. Until the parallel primitive lands, both
-ends usually live on one isolate, so this behaves as an unbounded queue that
-still pays — and meters — the honest deep copy.
+ends usually live on one isolate, so this behaves as a byte-bounded queue that
+still pays — and meters — the honest deep copy. `(isolate-chan limit-bytes)`
+sets the channel's byte limit; `isolate-put!` throws when a message does not
+fit.
 
 ### Error propagation: the `<?` family
 
@@ -215,13 +226,13 @@ where values cross by copy.
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
 | `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
-| `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a tokio unbounded MPSC channel; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |
-| `src/isolate_builtins.rs` | Clojure-level surface for the copy boundary: `CljIsolateTx`/`CljIsolateRx` native objects and the `isolate-chan` / `isolate-put!` / `isolate-poll!` / `isolate-take!` builtins |
+| `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a byte-bounded queue whose messages hold governor `MessageQueue` charges; `isolate_channel_with_limit`, `try_send`/`send_async`, `IsolateReceiver::close`; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |
+| `src/isolate_builtins.rs` | Clojure-level surface for the copy boundary: `CljIsolateTx`/`CljIsolateRx` native objects and the `isolate-chan` (optional byte limit) / `isolate-put!` / `isolate-poll!` / `isolate-take!` builtins |
 | `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
-| `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!` |
+| `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
 | `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under `eval_async` — the path every top-level form takes when the async driver is installed |
 | `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically in `eval_async` and the sync evaluator (containers, `let*`/`loop*` binding vectors) |
@@ -286,9 +297,20 @@ pub mod isolate_channel {
     pub struct IsolateSender;
     impl IsolateSender {
         /// Serialize `v`, meter the crossing (bytes + time into GC_STATS), and
-        /// enqueue it. Returns CloneError for non-shareable values (located at
-        /// the send site) or if the receiver has been dropped.
+        /// enqueue it without waiting. Returns CloneError for non-shareable
+        /// values (located at the send site), `Disconnected` if the receiver
+        /// has been dropped, or `Full` if the message does not fit.
+        /// Compatibility form of `try_send`.
         pub fn send(&self, v: &Value) -> Result<(), CloneError>;
+        /// Same as `send`.
+        pub fn try_send(&self, v: &Value) -> Result<(), CloneError>;
+        /// Enqueue, waiting while the channel is full. A message larger than
+        /// the whole limit returns `Full` at once.
+        pub async fn send_async(&self, v: &Value) -> Result<(), CloneError>;
+        /// The channel's byte limit.
+        pub fn limit(&self) -> usize;
+        /// Wire bytes currently queued.
+        pub fn queued_bytes(&self) -> usize;
     }
 
     /// Receiving end of a cross-isolate channel. Must remain on the destination
@@ -303,13 +325,21 @@ pub mod isolate_channel {
         /// Non-blocking receive that distinguishes `Empty` (keep waiting) from
         /// `Disconnected` (all senders gone). Backs the Clojure builtins.
         pub fn try_recv_status(&mut self) -> IsolateRecv;
+        /// Close the channel and release every queued message's charge.
+        /// Dropping the receiver does the same.
+        pub fn close(&mut self);
+        pub fn limit(&self) -> usize;
+        pub fn queued_bytes(&self) -> usize;
     }
 
     /// Outcome of `try_recv_status`: `Value(v)`, `Empty`, or `Disconnected`.
     pub enum IsolateRecv { Value(Value), Empty, Disconnected }
 
-    /// Create a linked `(IsolateSender, IsolateReceiver)` pair.
+    /// Create a linked `(IsolateSender, IsolateReceiver)` pair with the
+    /// governor's default queue limit.
     pub fn isolate_channel() -> (IsolateSender, IsolateReceiver);
+    /// Create a pair that holds at most `limit` wire bytes (panics on zero).
+    pub fn isolate_channel_with_limit(limit: usize) -> (IsolateSender, IsolateReceiver);
 }
 
 pub mod eval_async {

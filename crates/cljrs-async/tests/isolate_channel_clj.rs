@@ -159,3 +159,32 @@ fn isolate_take_resolves_a_put_value() {
         assert_eq!(r, expected);
     });
 }
+
+#[test]
+fn byte_limited_channel_reports_full_at_put_site() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = user_env(globals);
+        let err = try_eval(
+            "(let [[tx _] (isolate-chan 300)]
+               (isolate-put! tx (apply str (repeat 200 \"x\")))
+               (isolate-put! tx (apply str (repeat 200 \"x\"))))",
+            &mut env,
+        )
+        .expect_err("the second message does not fit");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("isolate channel is full"), "got: {msg}");
+
+        let v = eval_sync(
+            "(let [[tx rx] (isolate-chan 300)]
+               (isolate-put! tx (apply str (repeat 200 \"x\")))
+               (isolate-poll! rx)
+               (isolate-put! tx 1))",
+            &mut env,
+        );
+        assert_eq!(v, Value::Bool(true), "a receive frees capacity");
+
+        let err = try_eval("(isolate-chan 0)", &mut env).expect_err("zero limit");
+        assert!(format!("{err:?}").contains("must be positive"));
+    });
+}

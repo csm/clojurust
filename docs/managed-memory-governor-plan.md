@@ -1,6 +1,6 @@
 # Process-Wide Managed-Memory Governor
 
-Status: Phases 0 through 2 implemented (observe-only accounting with chunked allocation credit). Phases 3 through 5 are open.
+Status: Phases 0 through 3 implemented (observe-only accounting with chunked allocation credit and non-heap memory classes). Phases 4 and 5 are open.
 See [Implementation status](#implementation-status).
 
 This document defines a process-wide governor for memory that clojurust manages.
@@ -648,6 +648,39 @@ Phase 2 decisions that later phases must keep or replace:
 - The heap shutdown pass is not assigned to a phase yet.
   Completion criterion 7 requires it.
 
+Phase 3 is complete:
+
+- Region chunks consume the isolate's local credit (`IsolateAccount::charge_region`) and return it when freed (`release_region`).
+  Each publish moves the account's region bytes from the governor's `GcHeap` class to its `Region` class; committed bytes do not change.
+  A retired region keeps its charge under a separate retired count (`retire_region`).
+  `MemorySnapshot` and `IsolateSnapshot` report active and retired region bytes separately.
+- `ByteBlob` (`cljrs-value`) owns one `MemoryCharge` for its buffer; `Value::ByteBlob` holds `Arc<ByteBlob>` instead of `Arc<[u8]>`.
+- `SharedAtom` stores `SharedSlot` values; each slot owns one `MemoryCharge` for its `Arc` allocation and string payload.
+  Cloning an `Arc` does not add a charge.
+- Isolate channels (`cljrs-async`) are byte-bounded queues of `AccountedMessage { value, charge }`.
+  The charge is `SerializedValue::wire_size`, reserved before enqueue and returned after the receiver deserializes the message.
+  `send`/`try_send` return `CloneError::Full`; `send_async` waits for capacity; `IsolateReceiver::close` (and drop) releases every queued charge.
+  The default limit is `MemoryConfig::queue_limit`; `isolate_channel_with_limit` and `(isolate-chan limit-bytes)` set one per channel.
+  `MemorySnapshot` reports queue waits, total wait time, and rejections.
+- JIT modules hold a `MemoryClass::Code` charge for their code size until reclamation frees them.
+- `static_alloc` records `size_of::<T>()` under `MemoryClass::Static` in GC builds; the `no-gc` static arena records each chunk.
+  These use `ProcessMemoryGovernor::charge_permanent`, which never returns the bytes.
+
+Phase 3 decisions that later phases must keep or replace:
+
+- Region chunks use isolate credit rather than direct reservations, so a region scope performs no process-wide atomic operation.
+  `crates/cljrs-gc/examples/region_bench.rs` measured about 5 ns (5%) more per region scope (create, four allocations, drop) on one thread.
+  A freed chunk's bytes become free credit; credit above the retained limit returns to the governor at once, because a `no-gc` isolate has no collection to trim it.
+- The `Region` class value lags each isolate's region use by at most its free credit, because the class split moves only when the account publishes.
+- A region chunk freed after its thread's account is dropped is not released again; the account returned it at drop.
+- Shared-value, queue, and code charges never fail while the governor is observe-only.
+  `ByteBlob::new`, `SharedSlot::new`, and code registration keep an `Option<MemoryCharge>` so Phase 4 can add fallible variants.
+- The compatibility `send` is the nonblocking send.
+  A message larger than the channel limit is rejected with `Full` even by `send_async`, because it can never fit.
+- Var shared roots (`Var::shared_root`), `SharedAtom` metadata, and the intern tables' `Arc<str>` names are not charged.
+  Static charges count only `size_of::<T>()` in GC builds, not memory the value owns.
+- `isolate-take!` still polls with `yield_now`; it does not use the channel's wakeup.
+
 #### Phase 2 benchmark
 
 Measured on a 4-core Linux container, release builds, Phase 1 (`main` at `80cde63`) against Phase 2.
@@ -858,7 +891,7 @@ The first implementation uses 64 KiB and measures both costs.
 
 ## Deferred decisions
 
-The following decisions do not block Phases 0 through 3:
+The following decisions do not block Phases 0 through 3 (Phase 3 is implemented):
 
 - The final Clojure representation of `MemoryLimitExceeded`
 - Runtime-specific sub-budgets for embedding applications

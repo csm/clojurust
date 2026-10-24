@@ -37,7 +37,7 @@ pub use jit_hooks::set_var_rebind_hook;
 pub use keyword::Keyword;
 pub use native_object::{NativeObject, NativeObjectBox, gc_native_object};
 pub use resource::{Resource, ResourceHandle};
-pub use shared::{PromoteError, SharedAtom, SharedValue, demote, promote};
+pub use shared::{ByteBlob, PromoteError, SharedAtom, SharedSlot, SharedValue, demote, promote};
 pub use symbol::Symbol;
 pub use type_hint::TypeHint;
 pub use types::{

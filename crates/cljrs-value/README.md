@@ -20,14 +20,14 @@ plus all persistent (immutable, structurally shared) collection types.  The
 ```
 src/
   lib.rs                         — module declarations and re-exports
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
   error.rs                       — ValueError enum, ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
   publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
-  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
+  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
   symbol.rs                      — Symbol { namespace, name }
   type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
@@ -86,7 +86,7 @@ pub enum Value {
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
     SharedAtom(Arc<SharedAtom>),       // cross-isolate mutable ref (Phase B3)
-    ByteBlob(Arc<[u8]>),               // refcounted immutable byte buffer (Phase B3)
+    ByteBlob(Arc<ByteBlob>),           // refcounted immutable byte buffer (Phase B3)
     Namespace(GcPtr<Namespace>),
     NativeFn(GcPtr<NativeFn>),
     CljxFn(GcPtr<CljxFn>),
@@ -242,20 +242,40 @@ pub enum SharedValue {
     Str(Arc<str>),
     Keyword(StaticGcPtr<Keyword>),
     Symbol(StaticGcPtr<Symbol>),
-    ByteBlob(Arc<[u8]>),              // BEAM off-heap-binary trick
+    ByteBlob(Arc<ByteBlob>),          // BEAM off-heap-binary trick
 }
 
+/// Immutable shared byte buffer.  Owns one governor charge
+/// (`MemoryClass::SharedValue`) for its bytes, however many `Arc`s exist.
+pub struct ByteBlob { /* Box<[u8]>, Option<MemoryCharge> */ }
+impl ByteBlob {
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self
+    pub fn as_bytes(&self) -> &[u8]
+    pub fn charged_bytes(&self) -> usize
+}
+impl Deref<Target = [u8]> + AsRef<[u8]> + From<Vec<u8>> + From<&[u8]> for ByteBlob
+
+/// One value stored in a `SharedAtom`; owns the governor charge for its
+/// `Arc` allocation and string payload.
+pub struct SharedSlot { /* SharedValue, Option<MemoryCharge> */ }
+impl SharedSlot {
+    pub fn new(value: SharedValue) -> Self
+    pub fn value(&self) -> &SharedValue
+    pub fn charged_bytes(&self) -> usize
+}
+impl Deref<Target = SharedValue> + AsRef<SharedValue> for SharedSlot
+
 pub struct SharedAtom {
-    pub cell: Arc<ArcSwap<SharedValue>>,
+    pub cell: Arc<ArcSwap<SharedSlot>>,
     pub meta: Mutex<Option<SharedValue>>,
 }
 
 impl SharedAtom {
     pub fn new(val: SharedValue) -> Self
-    pub fn deref_val(&self) -> Arc<SharedValue>     // atomic load
-    pub fn reset(&self, val: SharedValue) -> Arc<SharedValue>
-    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry (closure form)
-    pub fn compare_and_set(&self, current: &Arc<SharedValue>, new: SharedValue) -> bool
+    pub fn deref_val(&self) -> Arc<SharedSlot>      // atomic load
+    pub fn reset(&self, val: SharedValue) -> Arc<SharedSlot>
+    pub fn swap<F>(&self, f: F) -> Arc<SharedSlot>  // CAS-retry (closure form)
+    pub fn compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue) -> bool
 }
 
 pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
@@ -736,12 +756,18 @@ impl SerializedValue {
     /// receiver. Telemetry approximation for the metered boundary seam
     /// (`docs/isolate-boundary-plan.md`); Arc-shared payloads count as zero.
     pub fn byte_size(&self) -> usize;
+    /// Bytes the serialized message owns while queued (root node plus owned
+    /// buffers); the isolate channel's governor charge.  Arc-shared payloads
+    /// (SharedAtom, ByteBlob, a var's root cell) count as zero.
+    pub fn wire_size(&self) -> usize;
 }
 
 /// Reason a value cannot cross an isolate boundary.
 pub enum CloneError {
     NotShareable { type_name: &'static str },
     Disconnected,
+    /// A byte-bounded isolate channel has no room for the message.
+    Full { bytes: usize, queued: usize, limit: usize },
 }
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
