@@ -670,16 +670,15 @@ mod tests {
             cljrs_gc::governor().class_bytes(MemoryClass::MessageQueue) >= one * 2,
             "queued messages are charged"
         );
-        match tx.send(&payload(100)) {
-            Err(CloneError::Full {
-                bytes,
-                queued,
-                limit,
-            }) => {
-                assert_eq!((bytes, queued, limit), (one, one * 2, one * 2));
-            }
-            other => panic!("expected Full, got {other:?}"),
-        }
+        let full = tx.send(&payload(100));
+        assert!(
+            matches!(
+                full,
+                Err(CloneError::Full { bytes, queued, limit })
+                    if (bytes, queued, limit) == (one, one * 2, one * 2)
+            ),
+            "the third message must be refused as Full"
+        );
         assert_eq!(rx.try_recv(), Some(payload(100)));
         assert_eq!(rx.queued_bytes(), one, "receive returns capacity");
         tx.send(&payload(100)).unwrap();
