@@ -13,7 +13,7 @@ use crate::hash::{
 use crate::keyword::Keyword;
 use crate::regex::{Matcher, Pattern};
 use crate::resource::ResourceHandle;
-use crate::shared::SharedAtom;
+use crate::shared::{ByteBlob, SharedAtom};
 use crate::symbol::Symbol;
 use crate::types::{
     Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
@@ -118,14 +118,14 @@ pub enum Value {
     // ── Mutable state ─────────────────────────────────────────────────────────
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
-    /// Cross-isolate mutable reference backed by `Arc<ArcSwap<SharedValue>>`.
+    /// Cross-isolate mutable reference backed by `Arc<ArcSwap<SharedSlot>>`.
     /// Unlike `Atom`, a `SharedAtom` can cross the isolate boundary (the `Arc`
     /// is cloned, not deep-copied) and its contents are lock-free CAS-swapped.
     SharedAtom(std::sync::Arc<SharedAtom>),
     /// Immutable refcounted byte buffer (the BEAM off-heap-binary trick).
     /// Shared without copy across the isolate boundary; refcount drops to zero
     /// only when every isolate releases its reference.
-    ByteBlob(std::sync::Arc<[u8]>),
+    ByteBlob(std::sync::Arc<ByteBlob>),
 
     // ── Reduced (early termination sentinel for reduce/transduce) ───────────
     Reduced(Box<Value>),

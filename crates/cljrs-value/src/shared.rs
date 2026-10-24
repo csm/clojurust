@@ -22,15 +22,23 @@
 //! - Scalars (stored inline, no allocation)
 //! - Strings (`Arc<str>`, immutable, refcounted)
 //! - Keywords / symbols (`StaticGcPtr<T>`, interned, program-lifetime)
-//! - Large byte buffers (`Arc<[u8]>`, the BEAM off-heap-binary trick)
+//! - Large byte buffers (`Arc<ByteBlob>`, the BEAM off-heap-binary trick)
 //!
 //! Closures, native resources, and isolate-bound GC objects are not
 //! promotable.  This restriction is enforced at publish time via `promote`.
+//!
+//! ## Memory accounting
+//!
+//! Shared allocations live outside every isolate heap, so each one owns a
+//! governor [`MemoryCharge`] (`MemoryClass::SharedValue`): one per
+//! [`ByteBlob`] and one per stored [`SharedSlot`].  Cloning the `Arc` does
+//! not add a charge; dropping the last reference returns it.
 
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use cljrs_gc::{GcPtr, StaticGcPtr};
+use cljrs_gc::{GcPtr, MemoryCharge, MemoryClass, StaticGcPtr, governor};
 
 use crate::intern::{intern_keyword, intern_symbol};
 use crate::keyword::Keyword;
@@ -92,7 +100,7 @@ pub enum SharedValue {
     /// Large refcounted byte buffer (the BEAM off-heap-binary trick).
     /// Shared without copy across the isolate boundary; freed when the last
     /// reference is dropped.
-    ByteBlob(Arc<[u8]>),
+    ByteBlob(Arc<ByteBlob>),
 }
 
 // SAFETY: all variants are either value types or `Arc`/`StaticGcPtr` wrappers
@@ -114,6 +122,130 @@ impl SharedValue {
             SharedValue::Symbol(_) => "symbol",
             SharedValue::ByteBlob(_) => "byte-blob",
         }
+    }
+}
+
+// ── Shared allocations ────────────────────────────────────────────────────────
+
+/// Bytes of an `Arc<T>` allocation: two reference counts plus `T`.
+const fn arc_bytes<T>() -> usize {
+    2 * std::mem::size_of::<usize>() + std::mem::size_of::<T>()
+}
+
+/// Reserve `bytes` of shared-value memory.  The governor is observe-only
+/// until strict mode exists, so the reservation does not fail; `None` keeps
+/// the type ready for a refused reservation.
+fn reserve(bytes: usize) -> Option<MemoryCharge> {
+    governor()
+        .reserve_shared(MemoryClass::SharedValue, bytes)
+        .ok()
+}
+
+/// Immutable byte buffer shared across isolates by `Arc` (`Value::ByteBlob`).
+///
+/// Owns one governor charge for its buffer and `Arc` allocation, however many
+/// isolates hold a reference.
+pub struct ByteBlob {
+    bytes: Box<[u8]>,
+    charge: Option<MemoryCharge>,
+}
+
+impl ByteBlob {
+    /// Take ownership of `bytes` and charge them to the governor.
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self {
+        let bytes = bytes.into();
+        let charge = reserve(arc_bytes::<ByteBlob>() + bytes.len());
+        Self { bytes, charge }
+    }
+
+    /// The buffer contents.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Bytes charged to the governor for this blob.
+    pub fn charged_bytes(&self) -> usize {
+        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+    }
+}
+
+impl Deref for ByteBlob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for ByteBlob {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<Vec<u8>> for ByteBlob {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl From<&[u8]> for ByteBlob {
+    fn from(bytes: &[u8]) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl std::fmt::Debug for ByteBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ByteBlob({} bytes)", self.bytes.len())
+    }
+}
+
+/// One value stored in a [`SharedAtom`].  Each `reset!`/`swap!` stores a new
+/// slot; the slot owns the governor charge for its `Arc` allocation and any
+/// string it owns.  Byte-blob payloads are charged by the blob.
+pub struct SharedSlot {
+    value: SharedValue,
+    charge: Option<MemoryCharge>,
+}
+
+impl SharedSlot {
+    /// Wrap `value` and charge its storage to the governor.
+    pub fn new(value: SharedValue) -> Self {
+        let payload = match &value {
+            SharedValue::Str(s) => s.len(),
+            _ => 0,
+        };
+        let charge = reserve(arc_bytes::<SharedSlot>() + payload);
+        Self { value, charge }
+    }
+
+    /// The stored value.
+    pub fn value(&self) -> &SharedValue {
+        &self.value
+    }
+
+    /// Bytes charged to the governor for this slot.
+    pub fn charged_bytes(&self) -> usize {
+        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+    }
+}
+
+impl Deref for SharedSlot {
+    type Target = SharedValue;
+    fn deref(&self) -> &SharedValue {
+        &self.value
+    }
+}
+
+impl AsRef<SharedValue> for SharedSlot {
+    fn as_ref(&self) -> &SharedValue {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for SharedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
     }
 }
 
@@ -146,8 +278,8 @@ pub fn promote(value: &Value) -> Result<SharedValue, PromoteError> {
         }
         Value::ByteArray(arr) => {
             let bytes = arr.get().lock().unwrap();
-            let blob: Arc<[u8]> = bytes.iter().map(|&b| b as u8).collect::<Vec<_>>().into();
-            Ok(SharedValue::ByteBlob(blob))
+            let blob = ByteBlob::new(bytes.iter().map(|&b| b as u8).collect::<Vec<_>>());
+            Ok(SharedValue::ByteBlob(Arc::new(blob)))
         }
         Value::ByteBlob(blob) => Ok(SharedValue::ByteBlob(blob.clone())),
         other => Err(PromoteError::not_promotable(other.type_name())),
@@ -187,39 +319,42 @@ pub fn demote(sv: &SharedValue) -> Value {
 /// Wrapped in `Value::SharedAtom(Arc<SharedAtom>)`.  The `Arc` gives the atom
 /// identity (pointer equality) and allows any number of isolates to hold a
 /// reference.
+///
+/// Each stored value is a [`SharedSlot`] that carries its own governor
+/// charge; a replaced slot returns its charge when the last reader drops it.
 #[derive(Debug)]
 pub struct SharedAtom {
-    pub cell: Arc<ArcSwap<SharedValue>>,
+    pub cell: Arc<ArcSwap<SharedSlot>>,
     pub meta: Mutex<Option<SharedValue>>,
 }
 
 impl SharedAtom {
     pub fn new(val: SharedValue) -> Self {
         Self {
-            cell: Arc::new(ArcSwap::new(Arc::new(val))),
+            cell: Arc::new(ArcSwap::new(Arc::new(SharedSlot::new(val)))),
             meta: Mutex::new(None),
         }
     }
 
     /// Load the current value.  Lock-free atomic load + refcount bump.
-    pub fn deref_val(&self) -> Arc<SharedValue> {
+    pub fn deref_val(&self) -> Arc<SharedSlot> {
         self.cell.load_full()
     }
 
     /// Atomically replace the value and return the new `Arc`.
-    pub fn reset(&self, val: SharedValue) -> Arc<SharedValue> {
-        let arc = Arc::new(val);
+    pub fn reset(&self, val: SharedValue) -> Arc<SharedSlot> {
+        let arc = Arc::new(SharedSlot::new(val));
         self.cell.store(arc.clone());
         arc
     }
 
     /// CAS-retry swap: apply `f` to the current value and store the result.
     /// Returns the new value.  Retries automatically if another writer races.
-    pub fn swap<F>(&self, mut f: F) -> Arc<SharedValue>
+    pub fn swap<F>(&self, mut f: F) -> Arc<SharedSlot>
     where
         F: FnMut(&SharedValue) -> SharedValue,
     {
-        self.cell.rcu(|old| Arc::new(f(old)))
+        self.cell.rcu(|old| Arc::new(SharedSlot::new(f(old))))
     }
 
     /// Single lock-free compare-and-set.  Atomically stores `new` iff the cell
@@ -230,8 +365,10 @@ impl SharedAtom {
     /// (interpreter) code between the load and the store cannot use the closure
     /// form of [`swap`], so it loads via [`deref_val`](Self::deref_val), computes
     /// the next value, then commits with this method, retrying on contention.
-    pub fn compare_and_set(&self, current: &Arc<SharedValue>, new: SharedValue) -> bool {
-        let prev = self.cell.compare_and_swap(current, Arc::new(new));
+    pub fn compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue) -> bool {
+        let prev = self
+            .cell
+            .compare_and_swap(current, Arc::new(SharedSlot::new(new)));
         // The swap committed iff the value we replaced is the one we expected.
         std::ptr::eq(Arc::as_ptr(current), Arc::as_ptr(&prev))
     }
@@ -317,7 +454,7 @@ mod tests {
         let atom = SharedAtom::new(SharedValue::Long(0));
         atom.reset(SharedValue::Long(42));
         let val = atom.deref_val();
-        assert!(matches!(val.as_ref(), SharedValue::Long(42)));
+        assert!(matches!(val.value(), SharedValue::Long(42)));
     }
 
     #[test]
@@ -331,7 +468,7 @@ mod tests {
             }
         });
         let val = atom.deref_val();
-        assert!(matches!(val.as_ref(), SharedValue::Long(2)));
+        assert!(matches!(val.value(), SharedValue::Long(2)));
     }
 
     #[test]
@@ -340,10 +477,10 @@ mod tests {
         let cur = atom.deref_val();
         // Stale expectation succeeds while no one races us.
         assert!(atom.compare_and_set(&cur, SharedValue::Long(2)));
-        assert!(matches!(atom.deref_val().as_ref(), SharedValue::Long(2)));
+        assert!(matches!(atom.deref_val().value(), SharedValue::Long(2)));
         // `cur` is now stale: a second CAS against it must fail and not write.
         assert!(!atom.compare_and_set(&cur, SharedValue::Long(99)));
-        assert!(matches!(atom.deref_val().as_ref(), SharedValue::Long(2)));
+        assert!(matches!(atom.deref_val().value(), SharedValue::Long(2)));
     }
 
     #[test]
@@ -355,12 +492,40 @@ mod tests {
 
     #[test]
     fn byte_blob_shared_across_clone() {
-        let blob: Arc<[u8]> = vec![10u8, 20, 30].into();
+        let blob = Arc::new(ByteBlob::new(vec![10u8, 20, 30]));
         let v1 = Value::ByteBlob(blob.clone());
         let v2 = Value::ByteBlob(blob.clone());
         // Same underlying buffer
         if let (Value::ByteBlob(a), Value::ByteBlob(b)) = (&v1, &v2) {
             assert!(Arc::ptr_eq(a, b));
         }
+    }
+
+    // Other tests charge the process governor concurrently, so these tests
+    // check each value's own charge rather than the class total.
+
+    #[test]
+    fn byte_blob_holds_one_charge() {
+        let blob = Arc::new(ByteBlob::new(vec![0u8; 4096]));
+        assert!(blob.charged_bytes() >= 4096);
+        let clone = blob.clone();
+        assert_eq!(clone.charged_bytes(), blob.charged_bytes());
+        assert_eq!(&clone[..3], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn shared_slot_charges_string_payload() {
+        let short = SharedSlot::new(SharedValue::Long(1));
+        let long = SharedSlot::new(SharedValue::Str(Arc::from("x".repeat(1000))));
+        assert!(short.charged_bytes() > 0);
+        assert_eq!(long.charged_bytes(), short.charged_bytes() + 1000);
+    }
+
+    #[test]
+    fn shared_value_class_reports_live_charges() {
+        let blob = ByteBlob::new(vec![1u8; 1 << 20]);
+        // Concurrent tests only add their own small charges, and this blob
+        // stays alive across the read.
+        assert!(governor().class_bytes(MemoryClass::SharedValue) >= blob.charged_bytes());
     }
 }

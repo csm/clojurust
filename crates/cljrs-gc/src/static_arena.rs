@@ -41,6 +41,11 @@ struct Inner {
     end: usize,
 }
 
+/// Report an arena chunk to the governor.  Arena chunks are never freed.
+fn charge_chunk(bytes: usize) {
+    crate::governor::governor().charge_permanent(crate::governor::MemoryClass::Static, bytes);
+}
+
 impl Inner {
     fn new() -> Self {
         let layout = Layout::from_size_align(CHUNK_SIZE, 16).unwrap();
@@ -50,6 +55,7 @@ impl Inner {
                 .expect("StaticArena: initial chunk allocation failed")
         };
         let base = data.as_ptr() as usize;
+        charge_chunk(CHUNK_SIZE);
         Self {
             chunks: vec![Chunk { data, layout }],
             ptr: base,
@@ -77,6 +83,7 @@ impl Inner {
             NonNull::new(alloc::alloc(cl)).expect("StaticArena: chunk allocation failed")
         };
         let base = data.as_ptr() as usize;
+        charge_chunk(chunk_size);
         let aligned = (base + layout.align() - 1) & !(layout.align() - 1);
         self.ptr = aligned + layout.size();
         self.end = base + chunk_size;

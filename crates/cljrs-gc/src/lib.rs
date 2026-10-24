@@ -487,6 +487,8 @@ impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
 /// In `no-gc` builds the allocation comes from the global bump-allocated
 /// `StaticArena` (never freed, no GC header overhead).  In GC builds
 /// `Box::leak` is used instead — the memory lives until the process exits.
+/// Either way the governor records the bytes under `MemoryClass::Static`
+/// (arena chunks in `no-gc` builds; `size_of::<T>()` in GC builds).
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
     #[cfg(feature = "no-gc")]
     {
@@ -494,6 +496,8 @@ pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
     }
     #[cfg(not(feature = "no-gc"))]
     {
+        governor::governor()
+            .charge_permanent(governor::MemoryClass::Static, std::mem::size_of::<T>());
         StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))
     }
 }

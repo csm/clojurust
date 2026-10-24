@@ -38,7 +38,7 @@ src/
     mod.rs        — `Jit` (the runtime's `JitBackend`) + `install`; `on_var_rebind` stales superseded code
     jit_compiler.rs — `compile_jit` / `compile_jit_poll`: build a `JITModule`, register rt_abi symbols, call shared codegen
     jit_worker.rs   — background compile thread; maps Tier-1 type profiles to per-parameter specializations
-    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints
+    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints; each module holds a governor `MemoryClass::Code` charge for its machine code until it is reclaimed
     async_jit.rs    — `^:async` arity activation: lower → state machine → native poll fn
     osr_integration.rs — (test-only) end-to-end OSR entry compile + call
   wasm/         — (feature `wasm-aot`) AOT Clojure → WebAssembly backend (second backend over the same IR)

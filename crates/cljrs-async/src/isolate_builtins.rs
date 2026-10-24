@@ -14,12 +14,14 @@
 //!
 //! ## API
 //!
-//! - `(isolate-chan)` → `[tx rx]` — a sender/receiver pair. The sender is
-//!   cloneable (multi-producer); the receiver is single-consumer and must be
-//!   used from the isolate that will deserialize into its heap.
+//! - `(isolate-chan)` / `(isolate-chan limit-bytes)` → `[tx rx]` — a
+//!   sender/receiver pair. The sender is cloneable (multi-producer); the
+//!   receiver is single-consumer and must be used from the isolate that will
+//!   deserialize into its heap. The channel holds at most `limit-bytes` of
+//!   queued wire bytes (default: `CLJRS_ISOLATE_QUEUE_LIMIT_MB`).
 //! - `(isolate-put! tx v)` → `true` once `v` is copied and enqueued; `false` if
 //!   the receiver is gone. Throws if `v` holds isolate-local state (a closure,
-//!   atom, native resource, …) that cannot cross.
+//!   atom, native resource, …) that cannot cross, or if the channel is full.
 //! - `(isolate-poll! rx)` → the next value (independently deep-copied into this
 //!   isolate's heap), or `nil` if the channel is empty or closed. Never parks.
 //! - `(isolate-take! rx)` → a `Future` resolving to the next value, or `nil`
@@ -27,7 +29,7 @@
 //!
 //! Until a Clojure-level isolate-spawn primitive exists (deferred with the
 //! `pfuture`/`spawn` parallel primitive), both ends typically live on the same
-//! isolate, so the channel behaves as an unbounded queue that still pays — and
+//! isolate, so the channel behaves as a byte-bounded queue that still pays — and
 //! meters — the deep copy. That makes the boundary observable from Clojure today.
 
 use std::any::Any;
@@ -42,7 +44,9 @@ use cljrs_value::{
 };
 
 use crate::eval_async::spawn_future;
-use crate::isolate_channel::{IsolateReceiver, IsolateRecv, IsolateSender, isolate_channel};
+use crate::isolate_channel::{
+    IsolateReceiver, IsolateRecv, IsolateSender, isolate_channel, isolate_channel_with_limit,
+};
 
 /// Native type tag for the sending end of a cross-isolate channel.
 pub(crate) const ISOLATE_TX_TAG: &str = "IsolateSender";
@@ -94,7 +98,11 @@ impl NativeObject for CljIsolateRx {
 /// Register the cross-isolate channel builtins into `ns`.
 pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
-        ("isolate-chan", Arity::Fixed(0), builtin_isolate_chan),
+        (
+            "isolate-chan",
+            Arity::Variadic { min: 0 },
+            builtin_isolate_chan,
+        ),
         ("isolate-put!", Arity::Fixed(2), builtin_isolate_put),
         ("isolate-poll!", Arity::Fixed(1), builtin_isolate_poll),
         ("isolate-take!", Arity::Fixed(1), builtin_isolate_take),
@@ -137,9 +145,31 @@ fn rx_ref(obj: &NativeObjectBox) -> &CljIsolateRx {
         .expect("isolate-receiver native object holds a CljIsolateRx")
 }
 
-/// `(isolate-chan)` — create a cross-isolate channel and return `[tx rx]`.
-fn builtin_isolate_chan(_args: &[Value]) -> ValueResult<Value> {
-    let (tx, rx) = isolate_channel();
+/// `(isolate-chan)` / `(isolate-chan limit-bytes)` — create a cross-isolate
+/// channel and return `[tx rx]`.
+fn builtin_isolate_chan(args: &[Value]) -> ValueResult<Value> {
+    let (tx, rx) = match args {
+        [] => isolate_channel(),
+        [Value::Long(n)] if *n > 0 => isolate_channel_with_limit(*n as usize),
+        [Value::Long(n)] => {
+            return Err(ValueError::Other(format!(
+                "isolate-chan: the byte limit must be positive, got {n}"
+            )));
+        }
+        [other] => {
+            return Err(ValueError::WrongType {
+                expected: "long",
+                got: other.type_name().to_string(),
+            });
+        }
+        _ => {
+            return Err(ValueError::ArityError {
+                name: "isolate-chan".to_string(),
+                expected: "0 or 1".to_string(),
+                got: args.len(),
+            });
+        }
+    };
     let tx_obj = Value::NativeObject(gc_native_object(CljIsolateTx { tx }));
     let rx_obj = Value::NativeObject(gc_native_object(CljIsolateRx { rx: Mutex::new(rx) }));
     Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
@@ -161,6 +191,7 @@ fn builtin_isolate_put(args: &[Value]) -> ValueResult<Value> {
             "isolate-put!: {e}; the value holds isolate-local state and cannot \
              cross an isolate boundary"
         ))),
+        Err(e @ CloneError::Full { .. }) => Err(ValueError::Other(format!("isolate-put!: {e}"))),
     }
 }
 

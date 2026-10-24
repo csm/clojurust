@@ -109,8 +109,8 @@ in source.
 
 | Operation | Meaning |
 |---|---|
-| `(isolate-chan)` | create a channel, returning `[tx rx]`. `tx` is multi-producer (cloneable); `rx` is single-consumer. |
-| `(isolate-put! tx v)` | deep-copy `v` across the boundary and enqueue it. `true` on success, `false` if the receiver is gone, **throws** if `v` can't cross. |
+| `(isolate-chan)` / `(isolate-chan limit-bytes)` | create a channel, returning `[tx rx]`. `tx` is multi-producer (cloneable); `rx` is single-consumer. The channel holds at most `limit-bytes` of queued messages (default: `CLJRS_ISOLATE_QUEUE_LIMIT_MB`, 64 MiB at most). |
+| `(isolate-put! tx v)` | deep-copy `v` across the boundary and enqueue it. `true` on success, `false` if the receiver is gone, **throws** if `v` can't cross or the channel is full. |
 | `(isolate-poll! rx)` | non-blocking take: the next value (copied into *this* isolate's heap), or `nil` if empty/closed. |
 | `(isolate-take! rx)` | a `Future` resolving to the next value, or `nil` once closed and drained. Use with `await` in a `go`/`^:async` body. |
 

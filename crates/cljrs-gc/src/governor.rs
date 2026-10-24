@@ -4,9 +4,13 @@
 //! heap and collects it independently; the governor owns only counters,
 //! pressure policy, and thread-safe [`IsolateControl`] handles.
 //!
-//! **Status: Phase 2 (chunked credit, observe-only).**  Each isolate
-//! allocates from local credit that the governor grants in chunks of
-//! [`MemoryConfig::credit_chunk`]; granted credit counts as committed memory.
+//! **Status: Phase 3 (chunked credit, non-heap classes, observe-only).**
+//! Each isolate allocates from local credit that the governor grants in
+//! chunks of [`MemoryConfig::credit_chunk`]; granted credit counts as
+//! committed memory.  Region chunks draw from the same local credit and are
+//! reported under [`MemoryClass::Region`].  Shared values, queued messages,
+//! and JIT code hold a [`MemoryCharge`]; static allocations are recorded with
+//! [`ProcessMemoryGovernor::charge_permanent`].
 //! The governor derives a process [`PressureLevel`] from committed bytes and
 //! requests collection from isolates at `Yellow`/`Red`.  It never rejects a
 //! grant: a grant that leaves committed bytes above the hard limit is recorded
@@ -193,6 +197,8 @@ pub enum MemoryConfigError {
     },
     /// The credit chunk is zero.
     ZeroCreditChunk,
+    /// The queue limit is zero.
+    ZeroQueueLimit,
     /// The queue limit is greater than the application budget.
     QueueAboveBudget {
         queue_limit: usize,
@@ -221,6 +227,9 @@ impl fmt::Display for MemoryConfigError {
                 "the critical reserve ({critical_reserve} bytes) is greater than the hard limit ({hard_limit} bytes)"
             ),
             MemoryConfigError::ZeroCreditChunk => write!(f, "the credit chunk must be non-zero"),
+            MemoryConfigError::ZeroQueueLimit => {
+                write!(f, "the isolate queue limit must be non-zero")
+            }
             MemoryConfigError::QueueAboveBudget {
                 queue_limit,
                 hard_limit,
@@ -297,6 +306,9 @@ impl MemoryConfig {
         }
         if self.credit_chunk == 0 {
             return Err(MemoryConfigError::ZeroCreditChunk);
+        }
+        if self.queue_limit == 0 {
+            return Err(MemoryConfigError::ZeroQueueLimit);
         }
         if self.queue_limit > self.hard_limit {
             return Err(MemoryConfigError::QueueAboveBudget {
@@ -451,6 +463,10 @@ pub struct IsolateControl {
     used_bytes: AtomicUsize,
     peak_used_bytes: AtomicUsize,
     free_credit_bytes: AtomicUsize,
+    /// Active region chunk bytes.
+    region_bytes: AtomicUsize,
+    /// Retired (poisoned) region chunk bytes.
+    retired_region_bytes: AtomicUsize,
     /// Number of completed collections; the collection epoch.
     last_collection_epoch: AtomicU64,
     /// Epoch at which the governor last requested collection (`u64::MAX`: never).
@@ -476,6 +492,8 @@ impl IsolateControl {
             used_bytes: AtomicUsize::new(0),
             peak_used_bytes: AtomicUsize::new(0),
             free_credit_bytes: AtomicUsize::new(0),
+            region_bytes: AtomicUsize::new(0),
+            retired_region_bytes: AtomicUsize::new(0),
             last_collection_epoch: AtomicU64::new(0),
             requested_epoch: AtomicU64::new(u64::MAX),
             collection_target: AtomicUsize::new(0),
@@ -541,6 +559,16 @@ impl IsolateControl {
         self.free_credit_bytes.load(Ordering::Relaxed)
     }
 
+    /// Last published active region chunk bytes.
+    pub fn region_bytes(&self) -> usize {
+        self.region_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Last published retired region chunk bytes.
+    pub fn retired_region_bytes(&self) -> usize {
+        self.retired_region_bytes.load(Ordering::Relaxed)
+    }
+
     /// Used bytes below which the governor does not request collection at
     /// `Yellow`.
     pub fn collection_target(&self) -> usize {
@@ -595,6 +623,8 @@ impl IsolateControl {
             name: self.name(),
             used_bytes: self.used_bytes(),
             free_credit_bytes: self.free_credit_bytes(),
+            region_bytes: self.region_bytes(),
+            retired_region_bytes: self.retired_region_bytes(),
             peak_used_bytes: self.peak_used_bytes.load(Ordering::Relaxed),
             collection_target: self.collection_target(),
             collections: self.collection_epoch(),
@@ -637,9 +667,12 @@ pub struct CollectionReport {
 
 /// One isolate's single-threaded view of the governor.
 ///
-/// The account holds `used` bytes (live objects and retained garbage) and
-/// `credit` (committed capacity it has not used yet).  Their sum is exactly
-/// what the governor has committed for this isolate.
+/// The account holds `used` heap bytes (live objects and retained garbage),
+/// region chunk bytes (active and retired), and `credit` (committed capacity
+/// it has not used yet).  Their sum is exactly what the governor has
+/// committed for this isolate.  The governor counts the region part under
+/// [`MemoryClass::Region`] and the rest under [`MemoryClass::GcHeap`]; the
+/// split is updated whenever the account publishes.
 ///
 /// The counters are `Cell`s, so the account is `!Sync`: only one thread
 /// uses it at a time.  It is `Send`, so nothing stops moving it to another
@@ -652,8 +685,18 @@ pub struct IsolateAccount {
     control: Arc<IsolateControl>,
     used: Cell<usize>,
     credit: Cell<usize>,
+    /// Active region chunk bytes.
+    region: Cell<usize>,
+    /// Retired region chunk bytes (poisoned regions kept for the process
+    /// lifetime).
+    retired: Cell<usize>,
     /// Free credit last added to the governor's free-credit counter.
     published_credit: Cell<usize>,
+    /// Region bytes (active plus retired) last moved to the governor's
+    /// `Region` class.
+    published_region: Cell<usize>,
+    /// Retired region bytes last added to the governor's retired counter.
+    published_retired: Cell<usize>,
     /// Allocations not yet added to [`crate::stats::GC_STATS`].
     pending_allocs: Cell<u64>,
     pending_alloc_bytes: Cell<u64>,
@@ -675,10 +718,20 @@ impl IsolateAccount {
         self.credit.get()
     }
 
-    /// Bytes the governor has committed for this isolate: used plus free
-    /// credit.
+    /// Exact local active region chunk bytes.
+    pub fn region_bytes(&self) -> usize {
+        self.region.get()
+    }
+
+    /// Exact local retired region chunk bytes.
+    pub fn retired_region_bytes(&self) -> usize {
+        self.retired.get()
+    }
+
+    /// Bytes the governor has committed for this isolate: heap used, region
+    /// chunks, and free credit.
     pub fn committed_bytes(&self) -> usize {
-        self.used.get() + self.credit.get()
+        self.used.get() + self.region.get() + self.retired.get() + self.credit.get()
     }
 
     /// Account `bytes` of new heap allocation.  Thread-local unless local
@@ -690,6 +743,67 @@ impl IsolateAccount {
         self.pending_allocs.set(self.pending_allocs.get() + 1);
         self.pending_alloc_bytes
             .set(self.pending_alloc_bytes.get() + bytes as u64);
+        self.take_credit(bytes);
+    }
+
+    /// Account a new region chunk of `bytes`.  Like [`Self::charge`], it
+    /// uses local credit and refills only when that runs out.
+    #[inline]
+    pub fn charge_region(&self, bytes: usize) {
+        self.region.set(self.region.get() + bytes);
+        self.take_credit(bytes);
+    }
+
+    /// Move `bytes` of active region chunks to the retired count.  A retired
+    /// region keeps its charge until it is released.
+    pub fn retire_region(&self, bytes: usize) {
+        let region = self.region.get();
+        debug_assert!(
+            bytes <= region,
+            "isolate {} retired {bytes} region bytes with only {region} charged",
+            self.control.id
+        );
+        let bytes = bytes.min(region);
+        self.region.set(region - bytes);
+        self.retired.set(self.retired.get() + bytes);
+    }
+
+    /// Return a freed region chunk of `bytes`.  The bytes become free credit;
+    /// credit above the retained limit goes back to the governor at once,
+    /// because a no-GC isolate has no collection to trim it.
+    #[inline]
+    pub fn release_region(&self, bytes: usize, retired: bool) {
+        let cell = if retired { &self.retired } else { &self.region };
+        let held = cell.get();
+        debug_assert!(
+            bytes <= held,
+            "isolate {} released {bytes} region bytes with only {held} charged",
+            self.control.id
+        );
+        let bytes = bytes.min(held);
+        cell.set(held - bytes);
+        let credit = self.credit.get() + bytes;
+        self.credit.set(credit);
+        // The account's first charge refilled through `credit_chunk()`, so
+        // the governor is configured; read the chunk size directly.
+        if credit > self.governor.credit_chunk.load(Ordering::Relaxed) {
+            self.trim_after_release();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_after_release(&self) {
+        let before = self.credit.get();
+        self.trim_credit();
+        if self.credit.get() != before {
+            self.sync();
+            self.governor.evaluate(None, false);
+        }
+    }
+
+    #[inline]
+    fn take_credit(&self, bytes: usize) {
         match self.credit.get().checked_sub(bytes) {
             Some(rest) => self.credit.set(rest),
             None => self.refill(bytes),
@@ -767,6 +881,9 @@ impl IsolateAccount {
     /// Return the free credit above the retained limit for the current
     /// pressure level.
     fn trim_credit(&self) {
+        // Returned credit leaves the `GcHeap` class, so that class must
+        // first hold this account's current non-region bytes.
+        self.publish_region();
         let limit = self.governor.retained_credit(self.governor.pressure());
         let credit = self.credit.get();
         if credit > limit {
@@ -793,7 +910,33 @@ impl IsolateAccount {
         } else {
             self.governor.sub_free_credit(prev - credit);
         }
+        self.publish_region();
         self.flush_alloc_stats();
+    }
+
+    /// Publish the region counters and move the governor's class split to
+    /// match them.
+    fn publish_region(&self) {
+        let region = self.region.get();
+        let retired = self.retired.get();
+        self.control.region_bytes.store(region, Ordering::Relaxed);
+        self.control
+            .retired_region_bytes
+            .store(retired, Ordering::Relaxed);
+        let prev = self.published_region.replace(region + retired);
+        self.governor.shift_region(prev, region + retired);
+        let prev = self.published_retired.replace(retired);
+        if retired >= prev {
+            self.governor
+                .retired_region
+                .fetch_add(retired - prev, Ordering::Relaxed);
+        } else {
+            checked_sub(
+                &self.governor.retired_region,
+                prev - retired,
+                "retired-region",
+            );
+        }
     }
 
     fn flush_alloc_stats(&self) {
@@ -843,13 +986,32 @@ impl Drop for IsolateAccount {
     fn drop(&mut self) {
         // The isolate heap is not torn down at thread exit yet, so this
         // stops counting bytes that remain allocated until process exit.
-        let committed = self.used.replace(0) + self.credit.replace(0);
+        // Region chunks freed after this point find no account and are not
+        // released again.
+        let committed = self.used.replace(0)
+            + self.region.replace(0)
+            + self.retired.replace(0)
+            + self.credit.replace(0);
         let published = self.published_credit.replace(0);
+        let published_region = self.published_region.replace(0);
+        let published_retired = self.published_retired.replace(0);
         self.control.used_bytes.store(0, Ordering::Relaxed);
         self.control.free_credit_bytes.store(0, Ordering::Relaxed);
+        self.control.region_bytes.store(0, Ordering::Relaxed);
+        self.control
+            .retired_region_bytes
+            .store(0, Ordering::Relaxed);
         self.flush_alloc_stats();
         self.governor.sub_free_credit(published);
-        self.governor.return_credit(committed);
+        checked_sub(
+            &self.governor.retired_region,
+            published_retired,
+            "retired-region",
+        );
+        // `published_region` sits in the `Region` class; the rest of the
+        // committed bytes sit in `GcHeap`.
+        self.governor.sub(MemoryClass::Region, published_region);
+        self.governor.return_credit(committed - published_region);
         self.governor.unregister(&self.control);
         self.governor.evaluate(None, false);
     }
@@ -948,6 +1110,11 @@ pub struct ProcessMemoryGovernor {
     credit_recalls: AtomicU64,
     over_limit_events: AtomicU64,
     over_limit_bytes: AtomicU64,
+    /// Retired region bytes (a subset of the `Region` class).
+    retired_region: AtomicUsize,
+    queue_waits: AtomicU64,
+    queue_wait_nanos: AtomicU64,
+    queue_rejections: AtomicU64,
     registry: Mutex<Vec<Weak<IsolateControl>>>,
     next_isolate_id: AtomicU64,
     isolates_registered: AtomicU64,
@@ -976,6 +1143,10 @@ impl ProcessMemoryGovernor {
             credit_recalls: AtomicU64::new(0),
             over_limit_events: AtomicU64::new(0),
             over_limit_bytes: AtomicU64::new(0),
+            retired_region: AtomicUsize::new(0),
+            queue_waits: AtomicU64::new(0),
+            queue_wait_nanos: AtomicU64::new(0),
+            queue_rejections: AtomicU64::new(0),
             registry: Mutex::new(Vec::new()),
             next_isolate_id: AtomicU64::new(1),
             isolates_registered: AtomicU64::new(0),
@@ -1075,7 +1246,11 @@ impl ProcessMemoryGovernor {
             control,
             used: Cell::new(0),
             credit: Cell::new(0),
+            region: Cell::new(0),
+            retired: Cell::new(0),
             published_credit: Cell::new(0),
+            published_region: Cell::new(0),
+            published_retired: Cell::new(0),
             pending_allocs: Cell::new(0),
             pending_alloc_bytes: Cell::new(0),
         }
@@ -1101,6 +1276,29 @@ impl ProcessMemoryGovernor {
             class,
             bytes,
         })
+    }
+
+    /// Record `bytes` of `class` that stay allocated for the process
+    /// lifetime (static data).  Observe-only and never returned.
+    pub fn charge_permanent(&self, class: MemoryClass, bytes: usize) {
+        if bytes > 0 {
+            self.add(class, bytes);
+            self.evaluate(None, false);
+        }
+    }
+
+    /// Record that a sender waited `waited` for queue capacity.
+    pub fn record_queue_wait(&self, waited: Duration) {
+        self.queue_waits.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_nanos.fetch_add(
+            waited.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record a message that a byte-bounded queue refused.
+    pub fn record_queue_rejection(&self) {
+        self.queue_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Commit `bytes` of isolate credit.  Observe-only: never refused.
@@ -1131,6 +1329,21 @@ impl ProcessMemoryGovernor {
         }
         checked_sub(&self.class_bytes[class.index()], bytes, class.name());
         checked_sub(&self.committed, bytes, "committed");
+    }
+
+    /// Move an isolate's published region bytes from `prev` to `now`
+    /// between the `GcHeap` class (where its credit was granted) and the
+    /// `Region` class.  Committed bytes do not change.
+    fn shift_region(&self, prev: usize, now: usize) {
+        let (from, to, bytes) = if now >= prev {
+            (MemoryClass::GcHeap, MemoryClass::Region, now - prev)
+        } else {
+            (MemoryClass::Region, MemoryClass::GcHeap, prev - now)
+        };
+        if bytes > 0 {
+            checked_sub(&self.class_bytes[from.index()], bytes, from.name());
+            self.class_bytes[to.index()].fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     fn add_free_credit(&self, bytes: usize) {
@@ -1285,6 +1498,10 @@ impl ProcessMemoryGovernor {
             credit_recalls: self.credit_recalls.load(Ordering::Relaxed),
             over_limit_events: self.over_limit_events.load(Ordering::Relaxed),
             over_limit_bytes: self.over_limit_bytes.load(Ordering::Relaxed),
+            retired_region_bytes: self.retired_region.load(Ordering::Relaxed),
+            queue_waits: self.queue_waits.load(Ordering::Relaxed),
+            queue_wait_time: Duration::from_nanos(self.queue_wait_nanos.load(Ordering::Relaxed)),
+            queue_rejections: self.queue_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -1335,6 +1552,10 @@ pub struct IsolateSnapshot {
     pub name: Arc<str>,
     pub used_bytes: usize,
     pub free_credit_bytes: usize,
+    /// Active region chunk bytes.
+    pub region_bytes: usize,
+    /// Retired region chunk bytes.
+    pub retired_region_bytes: usize,
     pub peak_used_bytes: usize,
     /// Used bytes at which the isolate requests its own collection.
     pub collection_target: usize,
@@ -1384,6 +1605,15 @@ pub struct MemorySnapshot {
     pub over_limit_events: u64,
     /// Sum of the overage at each over-limit event.
     pub over_limit_bytes: u64,
+    /// Retired region chunk bytes; part of the `Region` class.  The active
+    /// part is the class total minus this value.
+    pub retired_region_bytes: usize,
+    /// Sends that waited for queue capacity.
+    pub queue_waits: u64,
+    /// Total time senders waited for queue capacity.
+    pub queue_wait_time: Duration,
+    /// Messages a byte-bounded queue refused.
+    pub queue_rejections: u64,
 }
 
 impl MemorySnapshot {
@@ -1414,8 +1644,19 @@ impl fmt::Display for MemorySnapshot {
         )?;
         for class in MemoryClass::ALL {
             let bytes = self.class_bytes(class);
-            if bytes > 0 {
-                writeln!(f, "    {:<20} {bytes} bytes", format!("{}:", class.name()))?;
+            if bytes == 0 {
+                continue;
+            }
+            let label = format!("{}:", class.name());
+            if class == MemoryClass::Region {
+                writeln!(
+                    f,
+                    "    {label:<20} {bytes} bytes ({} active, {} retired)",
+                    bytes.saturating_sub(self.retired_region_bytes),
+                    self.retired_region_bytes
+                )?;
+            } else {
+                writeln!(f, "    {label:<20} {bytes} bytes")?;
             }
         }
         writeln!(
@@ -1427,12 +1668,14 @@ impl fmt::Display for MemorySnapshot {
         for iso in &self.isolates {
             writeln!(
                 f,
-                "    #{} {}: {} bytes (peak {}, target {}), {} free credit, {} refills, {} collections, {} requested",
+                "    #{} {}: {} bytes (peak {}, target {}), {} region ({} retired), {} free credit, {} refills, {} collections, {} requested",
                 iso.id,
                 iso.name,
                 iso.used_bytes,
                 iso.peak_used_bytes,
                 iso.collection_target,
+                iso.region_bytes + iso.retired_region_bytes,
+                iso.retired_region_bytes,
                 iso.free_credit_bytes,
                 iso.credit_refills,
                 iso.collections,
@@ -1445,6 +1688,11 @@ impl fmt::Display for MemorySnapshot {
             f,
             "  Credit:                {} refills, {} bytes returned, {} recalls",
             self.credit_refills, self.credit_returned_bytes, self.credit_recalls
+        )?;
+        writeln!(
+            f,
+            "  Queues:                {} waits ({:?}), {} rejected",
+            self.queue_waits, self.queue_wait_time, self.queue_rejections
         )?;
         write!(
             f,
@@ -1493,6 +1741,14 @@ pub fn with_current_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R
             |cell| f(cell.get_or_init(|| governor().register_isolate(default_isolate_name()))),
         )
         .ok()
+}
+
+/// Run `f` against the calling thread's account only if the thread already
+/// has one.  Unlike [`with_current_account`], this never registers the
+/// thread, so a release during thread teardown cannot create a new account.
+#[inline]
+pub fn with_registered_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R> {
+    CURRENT.try_with(|cell| cell.get().map(f)).ok().flatten()
 }
 
 /// The calling thread's control handle.
@@ -1550,6 +1806,13 @@ mod tests {
         let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
         c.credit_chunk = 0;
         assert_eq!(c.validate(), Err(MemoryConfigError::ZeroCreditChunk));
+        let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
+        c.queue_limit = 0;
+        assert_eq!(c.validate(), Err(MemoryConfigError::ZeroQueueLimit));
+        let err =
+            MemoryConfig::from_lookup(|k| (k == QUEUE_LIMIT_ENV).then(|| "0".to_string()), |_| {})
+                .unwrap_err();
+        assert_eq!(err, MemoryConfigError::ZeroQueueLimit);
         let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
         c.queue_limit = 3 * MIB;
         assert!(matches!(
@@ -1842,6 +2105,100 @@ mod tests {
     }
 
     #[test]
+    fn region_chunks_use_local_credit_and_report_their_class() {
+        let g = leaked(10 * MIB, 20 * MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge(KIB);
+        acc.charge_region(4 * KIB);
+        acc.charge_region(4 * KIB);
+        assert_eq!(acc.control().credit_refills(), 1, "regions stay local");
+        assert_eq!(acc.region_bytes(), 8 * KIB);
+        assert_eq!(acc.committed_bytes(), 64 * KIB);
+        acc.publish();
+        let snap = g.snapshot();
+        assert_eq!(snap.class_bytes(MemoryClass::Region), 8 * KIB);
+        assert_eq!(snap.class_bytes(MemoryClass::GcHeap), 56 * KIB);
+        assert_eq!(snap.committed_bytes, 64 * KIB);
+        assert_eq!(snap.isolates[0].region_bytes, 8 * KIB);
+
+        acc.release_region(4 * KIB, false);
+        acc.publish();
+        assert_eq!(g.class_bytes(MemoryClass::Region), 4 * KIB);
+        assert_eq!(g.committed_bytes(), 64 * KIB, "release becomes credit");
+    }
+
+    #[test]
+    fn region_release_returns_credit_above_the_retained_limit() {
+        let g = leaked(10 * MIB, 20 * MIB, 4 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge_region(40 * KIB);
+        assert_eq!(g.committed_bytes(), 40 * KIB);
+        acc.release_region(40 * KIB, false);
+        assert_eq!(acc.free_credit_bytes(), 8 * KIB, "keeps two chunks");
+        assert_eq!(g.committed_bytes(), 8 * KIB);
+        assert_eq!(g.class_bytes(MemoryClass::Region), 0);
+    }
+
+    #[test]
+    fn retired_region_keeps_its_charge() {
+        let g = leaked(10 * MIB, 20 * MIB, 4 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge_region(8 * KIB);
+        acc.retire_region(8 * KIB);
+        acc.record_collection(report(0, 0));
+        let snap = g.snapshot();
+        assert_eq!(snap.class_bytes(MemoryClass::Region), 8 * KIB);
+        assert_eq!(snap.retired_region_bytes, 8 * KIB);
+        assert_eq!(snap.isolates[0].retired_region_bytes, 8 * KIB);
+        assert_eq!(snap.isolates[0].region_bytes, 0);
+
+        acc.release_region(8 * KIB, true);
+        acc.publish();
+        assert_eq!(g.class_bytes(MemoryClass::Region), 0);
+        assert_eq!(g.snapshot().retired_region_bytes, 0);
+    }
+
+    #[test]
+    fn shutdown_returns_region_charges() {
+        let g = leaked(10 * MIB, 20 * MIB, 4 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge(KIB);
+        acc.charge_region(8 * KIB);
+        acc.charge_region(4 * KIB);
+        acc.retire_region(4 * KIB);
+        acc.publish();
+        acc.charge_region(4 * KIB); // not yet published
+        drop(acc);
+        let snap = g.snapshot();
+        assert_eq!(snap.committed_bytes, 0);
+        assert_eq!(snap.class_bytes(MemoryClass::Region), 0);
+        assert_eq!(snap.class_bytes(MemoryClass::GcHeap), 0);
+        assert_eq!(snap.retired_region_bytes, 0);
+    }
+
+    #[test]
+    fn permanent_charges_stay_committed() {
+        let g = leaked(10 * MIB, 20 * MIB, 4 * KIB);
+        g.charge_permanent(MemoryClass::Static, 1000);
+        g.charge_permanent(MemoryClass::Static, 0);
+        assert_eq!(g.class_bytes(MemoryClass::Static), 1000);
+        assert_eq!(g.committed_bytes(), 1000);
+    }
+
+    #[test]
+    fn queue_metrics_accumulate() {
+        let g = leaked(10 * MIB, 20 * MIB, 4 * KIB);
+        g.record_queue_wait(Duration::from_millis(2));
+        g.record_queue_wait(Duration::from_millis(3));
+        g.record_queue_rejection();
+        let snap = g.snapshot();
+        assert_eq!(snap.queue_waits, 2);
+        assert_eq!(snap.queue_wait_time, Duration::from_millis(5));
+        assert_eq!(snap.queue_rejections, 1);
+        assert!(snap.to_string().contains("2 waits"));
+    }
+
+    #[test]
     fn committed_equals_account_totals_across_threads() {
         use std::sync::Barrier;
         let g = leaked(512 * MIB, 1024 * MIB, 4 * KIB);
@@ -1858,6 +2215,12 @@ mod tests {
                         } else {
                             40 + n % 200
                         });
+                        if n % 50 == 0 {
+                            acc.charge_region(4 * KIB);
+                        }
+                        if n % 150 == 0 {
+                            acc.release_region(4 * KIB, false);
+                        }
                         if n % 500 == 499 {
                             acc.release(acc.used_bytes() / 2);
                             let used = acc.used_bytes();

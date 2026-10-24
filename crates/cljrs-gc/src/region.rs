@@ -43,19 +43,45 @@ pub struct RegionLimitExceeded {
 
 // ── Internal: chunk of raw memory ───────────────────────────────────────────
 
+/// A region chunk.  Each chunk is charged to the calling thread's isolate
+/// account (`MemoryClass::Region`) when it is allocated and released when it
+/// is freed.
 struct Chunk {
     data: NonNull<u8>,
     layout: Layout,
+    /// Whether the chunk was charged to an isolate account.  `false` only
+    /// when the thread's account was already torn down.
+    charged: bool,
 }
 
 impl Chunk {
     fn new(size: usize, align: usize) -> Self {
         let layout =
             Layout::from_size_align(size, align.max(16)).expect("Region: invalid chunk layout");
+        let charged =
+            crate::governor::with_current_account(|a| a.charge_region(layout.size())).is_some();
         // SAFETY: layout has non-zero size.
         let data =
             unsafe { NonNull::new(alloc::alloc(layout)).expect("Region: chunk allocation failed") };
-        Self { data, layout }
+        Self {
+            data,
+            layout,
+            charged,
+        }
+    }
+
+    /// Free the chunk's memory and return its charge.  `retired` selects the
+    /// account's retired-region count.
+    fn free(self, retired: bool) {
+        // SAFETY: `data` was allocated with `layout` in `Chunk::new`.
+        unsafe { alloc::dealloc(self.data.as_ptr(), self.layout) };
+        if self.charged {
+            // No account means it was dropped at thread exit, and it
+            // returned this charge then.
+            crate::governor::with_registered_account(|a| {
+                a.release_region(self.layout.size(), retired)
+            });
+        }
     }
 }
 
@@ -100,6 +126,9 @@ pub struct Region {
     byte_limit: Option<usize>,
     /// Number of objects allocated.
     object_count: usize,
+    /// Set when the region is retired; its chunks are then charged to the
+    /// account's retired-region count.
+    retired: bool,
 }
 
 impl Region {
@@ -122,6 +151,7 @@ impl Region {
             accounted_bytes: 0,
             byte_limit: None,
             object_count: 0,
+            retired: false,
         }
     }
 
@@ -146,6 +176,7 @@ impl Region {
             accounted_bytes: 0,
             byte_limit: Some(limit),
             object_count: 0,
+            retired: false,
         }
     }
 
@@ -222,8 +253,7 @@ impl Region {
 
         // Free all chunks except the first.
         while self.chunks.len() > 1 {
-            let chunk = self.chunks.pop().unwrap();
-            unsafe { alloc::dealloc(chunk.data.as_ptr(), chunk.layout) };
+            self.chunks.pop().unwrap().free(self.retired);
         }
 
         // Reset bump pointer to the start of the first chunk.
@@ -256,6 +286,28 @@ impl Region {
     /// Configured managed-memory limit, if this is a bounded region.
     pub fn byte_limit(&self) -> Option<usize> {
         self.byte_limit
+    }
+
+    /// Bytes of chunk memory this region holds (its governor charge).
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.layout.size()).sum()
+    }
+
+    /// Mark the region retired: move its chunk charge to the account's
+    /// retired-region count.  The charge stays until the region is dropped.
+    #[cfg_attr(feature = "no-gc", allow(dead_code))]
+    fn retire(&mut self) {
+        if self.retired {
+            return;
+        }
+        self.retired = true;
+        let bytes: usize = self
+            .chunks
+            .iter()
+            .filter(|c| c.charged)
+            .map(|c| c.layout.size())
+            .sum();
+        crate::governor::with_registered_account(|a| a.retire_region(bytes));
     }
 
     // ── internal ────────────────────────────────────────────────────────────
@@ -328,8 +380,9 @@ impl Drop for Region {
             unsafe { (entry.drop_fn)(entry.ptr) };
         }
         // Free all chunks.
+        let retired = self.retired;
         for chunk in self.chunks.drain(..) {
-            unsafe { alloc::dealloc(chunk.data.as_ptr(), chunk.layout) };
+            chunk.free(retired);
         }
     }
 }
@@ -421,7 +474,7 @@ pub fn poison_active_regions() {}
 /// interpreter, scratch guards) must close through here so the poison
 /// protocol is honoured.
 #[cfg(not(feature = "no-gc"))]
-pub fn close_region(region: Box<Region>) {
+pub fn close_region(mut region: Box<Region>) {
     let depth = region_stack_depth();
     pop_region_guard();
     let poisoned = POISON_WATERMARK.with(|w| {
@@ -439,6 +492,7 @@ pub fn close_region(region: Box<Region>) {
             region.object_count(),
             region.bytes_used()
         );
+        region.retire();
         RETIRED_REGIONS.with(|r| r.borrow_mut().push(*region));
     }
     // else: `region` drops here — destructors run, chunks are freed.
@@ -907,6 +961,42 @@ mod tests {
         unsafe { push_region_raw(region.as_mut() as *mut Region) };
         close_region(region);
         assert_eq!(*dropped.lock().unwrap(), vec![3]);
+    }
+
+    fn account_region_bytes() -> (usize, usize) {
+        crate::governor::with_current_account(|a| (a.region_bytes(), a.retired_region_bytes()))
+            .unwrap()
+    }
+
+    #[test]
+    fn region_chunks_are_charged_to_the_thread_account() {
+        let (before, _) = account_region_bytes();
+        let mut region = Region::with_capacity(128);
+        assert_eq!(account_region_bytes().0 - before, region.chunk_bytes());
+        for i in 0..100 {
+            region.alloc(i);
+        }
+        assert!(region.chunks.len() > 1);
+        assert_eq!(account_region_bytes().0 - before, region.chunk_bytes());
+        region.reset();
+        assert_eq!(region.chunks.len(), 1);
+        assert_eq!(account_region_bytes().0 - before, region.chunk_bytes());
+        drop(region);
+        assert_eq!(account_region_bytes().0, before);
+    }
+
+    #[test]
+    fn retired_region_keeps_its_charge_as_retired() {
+        let (active_before, retired_before) = account_region_bytes();
+        let mut region = Box::new(Region::new());
+        region.alloc(1i64);
+        let bytes = region.chunk_bytes();
+        unsafe { push_region_raw(region.as_mut() as *mut Region) };
+        poison_active_regions();
+        close_region(region);
+        let (active, retired) = account_region_bytes();
+        assert_eq!(active, active_before);
+        assert_eq!(retired - retired_before, bytes);
     }
 
     #[test]

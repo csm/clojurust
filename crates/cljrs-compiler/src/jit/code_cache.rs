@@ -50,6 +50,10 @@ struct CodeRecord {
     /// The arity this code was compiled for (diagnostics only).
     arity_id: u64,
     compiled: CompiledFn,
+    /// Governor charge (`MemoryClass::Code`) for the machine code; returned
+    /// when the record is dropped after reclamation.  Report-only: the
+    /// governor does not deny code publication.
+    _charge: Option<cljrs_gc::MemoryCharge>,
 }
 
 #[derive(Default)]
@@ -80,8 +84,18 @@ fn cache() -> &'static Mutex<CacheState> {
 /// pointer (see the worker), so a later [`mark_stale`] can find this module.
 pub(crate) fn register(arity_id: u64, compiled: CompiledFn) -> u64 {
     let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let charge = cljrs_gc::governor()
+        .reserve_shared(cljrs_gc::MemoryClass::Code, compiled.code_size as usize)
+        .ok();
     let mut state = cache().lock().unwrap();
-    state.live.insert(epoch, CodeRecord { arity_id, compiled });
+    state.live.insert(
+        epoch,
+        CodeRecord {
+            arity_id,
+            compiled,
+            _charge: charge,
+        },
+    );
     epoch
 }
 
