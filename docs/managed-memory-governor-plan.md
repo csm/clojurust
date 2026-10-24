@@ -509,6 +509,7 @@ The configuration parser must reject these states:
 - A soft limit greater than the hard limit
 - A critical reserve greater than the hard limit
 - A zero credit chunk
+- A zero queue limit
 - A queue limit greater than the application budget
 
 The default hard limit will use the applicable container or process memory limit.

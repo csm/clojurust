@@ -197,6 +197,8 @@ pub enum MemoryConfigError {
     },
     /// The credit chunk is zero.
     ZeroCreditChunk,
+    /// The queue limit is zero.
+    ZeroQueueLimit,
     /// The queue limit is greater than the application budget.
     QueueAboveBudget {
         queue_limit: usize,
@@ -225,6 +227,9 @@ impl fmt::Display for MemoryConfigError {
                 "the critical reserve ({critical_reserve} bytes) is greater than the hard limit ({hard_limit} bytes)"
             ),
             MemoryConfigError::ZeroCreditChunk => write!(f, "the credit chunk must be non-zero"),
+            MemoryConfigError::ZeroQueueLimit => {
+                write!(f, "the isolate queue limit must be non-zero")
+            }
             MemoryConfigError::QueueAboveBudget {
                 queue_limit,
                 hard_limit,
@@ -301,6 +306,9 @@ impl MemoryConfig {
         }
         if self.credit_chunk == 0 {
             return Err(MemoryConfigError::ZeroCreditChunk);
+        }
+        if self.queue_limit == 0 {
+            return Err(MemoryConfigError::ZeroQueueLimit);
         }
         if self.queue_limit > self.hard_limit {
             return Err(MemoryConfigError::QueueAboveBudget {
@@ -1798,6 +1806,13 @@ mod tests {
         let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
         c.credit_chunk = 0;
         assert_eq!(c.validate(), Err(MemoryConfigError::ZeroCreditChunk));
+        let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
+        c.queue_limit = 0;
+        assert_eq!(c.validate(), Err(MemoryConfigError::ZeroQueueLimit));
+        let err =
+            MemoryConfig::from_lookup(|k| (k == QUEUE_LIMIT_ENV).then(|| "0".to_string()), |_| {})
+                .unwrap_err();
+        assert_eq!(err, MemoryConfigError::ZeroQueueLimit);
         let mut c = MemoryConfig::with_limits(MIB, 2 * MIB).unwrap();
         c.queue_limit = 3 * MIB;
         assert!(matches!(

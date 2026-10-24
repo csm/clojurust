@@ -401,6 +401,7 @@ impl SerializedError {
                     .sum()
             })
             + self.cause.as_ref().map_or(0, |c| c.wire_size())
+            + self.kind.owned_bytes()
     }
 
     fn byte_size(&self) -> usize {
@@ -454,6 +455,28 @@ pub enum SerializedErrorKind {
     TransientAlreadyPersisted,
     Parse,
     Thrown(Box<SerializedValue>),
+}
+
+impl SerializedErrorKind {
+    /// Heap bytes this kind owns (strings and a thrown value).
+    fn owned_bytes(&self) -> usize {
+        match self {
+            SerializedErrorKind::WrongType { got, .. } => got.capacity(),
+            SerializedErrorKind::ArityError { name, expected, .. } => {
+                name.capacity() + expected.capacity()
+            }
+            SerializedErrorKind::NotCallable { value } => value.capacity(),
+            SerializedErrorKind::Other(msg) => msg.capacity(),
+            SerializedErrorKind::Thrown(v) => v.wire_size(),
+            SerializedErrorKind::IndexOutOfBounds { .. }
+            | SerializedErrorKind::OddMap { .. }
+            | SerializedErrorKind::Unsupported
+            | SerializedErrorKind::GasExhausted
+            | SerializedErrorKind::OutOfRange
+            | SerializedErrorKind::TransientAlreadyPersisted
+            | SerializedErrorKind::Parse => 0,
+        }
+    }
 }
 
 // ── serialize ─────────────────────────────────────────────────────────────────
@@ -1170,6 +1193,25 @@ mod tests {
         ]))))
         .unwrap();
         assert_eq!(v.wire_size(), 3 * NODE, "root plus two child slots");
+    }
+
+    #[test]
+    fn wire_size_counts_error_kind_payloads() {
+        let big = "x".repeat(1 << 20);
+        let thrown = SerializedValue::Error(Box::new(SerializedError {
+            kind: SerializedErrorKind::Thrown(Box::new(SerializedValue::Str(big.clone()))),
+            message: String::new(),
+            data: None,
+            cause: None,
+        }));
+        assert!(thrown.wire_size() >= 1 << 20);
+        let other = SerializedValue::Error(Box::new(SerializedError {
+            kind: SerializedErrorKind::Other(big),
+            message: String::new(),
+            data: None,
+            cause: None,
+        }));
+        assert!(other.wire_size() >= 1 << 20);
     }
 
     #[test]
