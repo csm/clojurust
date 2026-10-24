@@ -387,6 +387,14 @@ At `Red`, process pressure overrides local zero-yield suppression.
 GC heap accounting uses the size in `GcBoxHeader`.
 Allocation consumes isolate credit, and sweep returns it.
 
+Persistent vectors, hash maps, hash sets, sorted maps, and sorted sets share nodes between versions.
+A version derived by one update from a GC-allocated version is charged only its path-copied nodes, which is O(log n).
+A version built wholesale, cloned, or derived from a version that never reached the heap is charged its full size.
+A derived version is also charged in full when its count reaches twice that of its nearest fully charged ancestor.
+A loop of `conj` calls therefore charges O(n) element bytes in total plus O(log n) bytes per step.
+A surviving version whose fully charged ancestor was collected is under-counted by less than twice that ancestor's charge.
+`cljrs-value`'s `collections/share_charge.rs` holds the rule.
+
 The implementation must remove the unused hard-limit logic from `GcHeap`.
 The process governor becomes the only hard admission authority.
 

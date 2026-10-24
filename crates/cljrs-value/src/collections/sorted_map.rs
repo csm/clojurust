@@ -1,15 +1,22 @@
 use crate::Value;
+use crate::collections::share_charge::{ShareCharge, rb_path_bytes};
 
 /// An immutable sorted map backed by `rpds::RedBlackTreeMapSync`.
+///
+/// A map derived by `assoc` or `dissoc` from a GC-allocated map reports only
+/// its path-copied nodes from `gc_size_extra`; see
+/// `collections::share_charge` for the full rule.
 #[derive(Debug, Clone)]
 pub struct SortedMap {
     inner: rpds::RedBlackTreeMapSync<Value, Value>,
+    charge: ShareCharge,
 }
 
 impl SortedMap {
     pub fn empty() -> Self {
         Self {
             inner: rpds::RedBlackTreeMapSync::new_sync(),
+            charge: ShareCharge::full(),
         }
     }
 
@@ -30,15 +37,30 @@ impl SortedMap {
     }
 
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        Self {
-            inner: self.inner.insert(key, value),
-        }
+        self.derived(self.inner.insert(key, value))
     }
 
     pub fn dissoc(&self, key: &Value) -> Self {
+        self.derived(self.inner.remove(key))
+    }
+
+    /// Wrap `inner`, produced by one path-copying update of `self.inner`.
+    fn derived(&self, inner: rpds::RedBlackTreeMapSync<Value, Value>) -> Self {
+        let n = inner.size().max(self.inner.size());
         Self {
-            inner: self.inner.remove(key),
+            charge: self.charge.derive(
+                self.inner.size(),
+                inner.size(),
+                rb_path_bytes::<(Value, Value)>(n),
+            ),
+            inner,
         }
+    }
+
+    /// Estimated bytes owned by this map if it shared no nodes.
+    fn full_size_extra(&self) -> usize {
+        // Per entry: Arc<Node<K,V>> (16 overhead) + left/right ptrs (16) + color+pad (8).
+        self.inner.size() * (40 + 2 * std::mem::size_of::<Value>())
     }
 
     /// Iterate over all `(key, value)` pairs in sorted key order.
@@ -81,9 +103,7 @@ impl cljrs_gc::Trace for SortedMap {
     }
 
     fn gc_size_extra(&self) -> usize {
-        // Per entry: Arc<Node<K,V>> (16 overhead) + left/right ptrs (16) + color+pad (8).
-        let n = self.inner.size();
-        n * (40 + 2 * std::mem::size_of::<Value>())
+        self.charge.on_alloc(self.full_size_extra())
     }
 }
 
@@ -127,5 +147,18 @@ mod tests {
         assert_eq!(m2.count(), 1);
         assert_eq!(m2.get(&int(1)), None);
         assert_eq!(m2.get(&int(2)), Some(&int(20)));
+    }
+
+    #[test]
+    fn assoc_on_allocated_map_charges_path_bytes() {
+        use cljrs_gc::{GcPtr, Trace};
+
+        let m = GcPtr::new(SortedMap::from_pairs((0..10_000).map(|i| (int(i), int(i)))));
+        let added = m.get().assoc(int(-1), int(0));
+        assert_eq!(
+            added.gc_size_extra(),
+            rb_path_bytes::<(Value, Value)>(10_001)
+        );
+        assert!(added.gc_size_extra() * 100 < m.get().full_size_extra());
     }
 }

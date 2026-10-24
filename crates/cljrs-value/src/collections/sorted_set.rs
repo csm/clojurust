@@ -1,15 +1,22 @@
 use crate::Value;
+use crate::collections::share_charge::{ShareCharge, rb_path_bytes};
 
 /// An immutable sorted set backed by `rpds::RedBlackTreeSet`.
+///
+/// A set derived by `conj` or `disj` from a GC-allocated set reports only its
+/// path-copied nodes from `gc_size_extra`; see `collections::share_charge`
+/// for the full rule.
 #[derive(Debug, Clone)]
 pub struct SortedSet {
     inner: rpds::RedBlackTreeSetSync<Value>,
+    charge: ShareCharge,
 }
 
 impl SortedSet {
     pub fn empty() -> Self {
         Self {
             inner: rpds::RedBlackTreeSetSync::new_sync(),
+            charge: ShareCharge::full(),
         }
     }
 
@@ -27,21 +34,34 @@ impl SortedSet {
 
     /// Return a new set with `val` added.
     pub fn conj(&self, value: Value) -> Self {
-        Self {
-            inner: self.inner.insert(value),
-        }
+        self.derived(self.inner.insert(value))
     }
 
     pub fn conj_mut(&mut self, value: Value) -> &mut Self {
         self.inner.insert_mut(value);
+        self.charge = ShareCharge::full();
         self
     }
 
     /// Return a new set with `val` removed.
     pub fn disj(&self, value: &Value) -> Self {
+        self.derived(self.inner.remove(value))
+    }
+
+    /// Wrap `inner`, produced by one path-copying update of `self.inner`.
+    fn derived(&self, inner: rpds::RedBlackTreeSetSync<Value>) -> Self {
+        let n = inner.size().max(self.inner.size());
         Self {
-            inner: self.inner.remove(value),
+            charge: self
+                .charge
+                .derive(self.inner.size(), inner.size(), rb_path_bytes::<Value>(n)),
+            inner,
         }
+    }
+
+    /// Estimated bytes owned by this set if it shared no nodes.
+    fn full_size_extra(&self) -> usize {
+        self.inner.size() * (40 + std::mem::size_of::<Value>())
     }
 
     /// Iterate over all elements in sorted order
@@ -56,7 +76,10 @@ impl FromIterator<Value> for SortedSet {
         for v in iter {
             inner.insert_mut(v);
         }
-        SortedSet { inner }
+        SortedSet {
+            inner,
+            charge: ShareCharge::full(),
+        }
     }
 }
 
@@ -77,8 +100,7 @@ impl cljrs_gc::Trace for SortedSet {
     }
 
     fn gc_size_extra(&self) -> usize {
-        let n = self.inner.size();
-        n * (40 + std::mem::size_of::<Value>())
+        self.charge.on_alloc(self.full_size_extra())
     }
 }
 
@@ -133,5 +155,15 @@ mod tests {
         assert!(matches!(&v[0], Value::Long(1)));
         assert!(matches!(&v[1], Value::Long(2)));
         assert!(matches!(&v[2], Value::Long(3)));
+    }
+
+    #[test]
+    fn conj_on_allocated_set_charges_path_bytes() {
+        use cljrs_gc::{GcPtr, Trace};
+
+        let s = GcPtr::new(SortedSet::from_iter((0..10_000).map(int)));
+        let added = s.get().conj(int(-1));
+        assert_eq!(added.gc_size_extra(), rb_path_bytes::<Value>(10_001));
+        assert!(added.gc_size_extra() * 100 < s.get().full_size_extra());
     }
 }
