@@ -240,3 +240,53 @@ fn active_isolate_borrows_idle_capacity() {
         "active isolate committed {active} bytes"
     );
 }
+
+/// Phase 4: in strict mode `try_new` refuses past the hard limit and hands
+/// the value back, `new` takes the critical reserve and raises a runtime
+/// fault, and `new_critical` takes the reserve without a fault.
+#[test]
+fn strict_mode_refuses_try_new_and_faults_new() {
+    use cljrs_gc::GcPtr;
+
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::thread::spawn(|| {
+        let g = governor::governor();
+        let base = g.committed_bytes();
+        let hard = base + 8 * MIB;
+        let mut config = MemoryConfig::with_limits(hard / 2, hard).unwrap();
+        config.critical_reserve = 8 * MIB;
+        config.strict = true;
+        g.configure(config).unwrap();
+        let three_mib = || String::with_capacity(3 * MIB);
+
+        let a = GcPtr::try_new(three_mib()).expect("fits");
+        let b = GcPtr::try_new(three_mib()).expect("fits");
+        let before = g.committed_bytes();
+        let refused = GcPtr::try_new(three_mib()).unwrap_err();
+        assert_eq!(refused.error().class, MemoryClass::GcHeap);
+        assert_eq!(g.committed_bytes(), before, "a refusal commits nothing");
+        assert_eq!(refused.into_inner().capacity(), 3 * MIB, "value returned");
+        assert_eq!(governor::pending_runtime_fault(), None);
+        assert!(cljrs_gc::try_static_alloc([0u8; 4096]).is_ok());
+
+        let c = GcPtr::new(three_mib());
+        let fault = governor::pending_runtime_fault().expect("new raised a fault");
+        assert!(g.committed_bytes() > hard);
+        assert_eq!(g.pressure(), PressureLevel::Red);
+        assert_eq!(cljrs_gc::resolve_runtime_fault(), Some(fault), "still over");
+
+        let d = GcPtr::new_critical(three_mib());
+        assert_eq!(governor::pending_runtime_fault(), None);
+        let snap = g.snapshot();
+        assert!(snap.strict);
+        assert!(snap.critical_grants >= 2);
+        assert_eq!(snap.reserve_overruns, 0);
+        assert!(snap.to_string().contains("Managed memory (strict)"));
+        drop((a, b, c, d));
+
+        g.configure(MemoryConfig::with_limits(64 * MIB, 128 * MIB).unwrap())
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+}

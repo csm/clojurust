@@ -167,6 +167,13 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     result.map_err(|e| match e {
         crate::env::error::EvalError::Thrown(v) => ValueError::Thrown(v),
         crate::env::error::EvalError::GasExhausted => ValueError::GasExhausted,
+        crate::env::error::EvalError::MemoryLimitExceeded(fault) => {
+            // Compiled callers drop most errors on the floor; keep the
+            // fault in the runtime-fault slot so the compiled-code entry
+            // seam still reports it.
+            cljrs_gc::governor::confirm_runtime_fault(fault);
+            ValueError::MemoryLimitExceeded(fault)
+        }
         other => ValueError::Other(format!("{other}")),
     })
 }

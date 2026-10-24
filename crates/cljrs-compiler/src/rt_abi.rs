@@ -3825,7 +3825,13 @@ pub unsafe extern "C" fn rt_try(
                 // Unwind any regions opened inside the try body.
                 unwind_regions_to(region_depth, rt_region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
-                if matches!(&val_err, cljrs_value::ValueError::GasExhausted) {
+                // Neither gas exhaustion nor a memory-limit fault is
+                // catchable; the fault stays in its slot for the entry seam.
+                if matches!(
+                    &val_err,
+                    cljrs_value::ValueError::GasExhausted
+                        | cljrs_value::ValueError::MemoryLimitExceeded(_)
+                ) {
                     rt_const_nil()
                 } else if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {

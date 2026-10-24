@@ -290,7 +290,11 @@ fn try_osr_enter(slot: &OsrSlot, regs: &Registers, env: &mut Env) -> Option<Eval
     // Same as `call_jit_native`: an uncaught `(throw …)` inside native code
     // stashes the thrown value and returns the nil sentinel — surface it as an
     // error while the alloc frame still roots it.
-    if let Some(thrown) = env.globals.jit().take_pending_exception() {
+    let pending_exception = env.globals.jit().take_pending_exception();
+    if let Err(fault) = crate::env::gc_roots::check_memory_fault() {
+        return Some(Err(fault));
+    }
+    if let Some(thrown) = pending_exception {
         return Some(Err(crate::env::error::EvalError::Thrown(thrown)));
     }
     Some(Ok(result))
@@ -347,7 +351,7 @@ fn interpret_ir_inner(
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
     // GC safepoint at function entry.
-    crate::env::gc_roots::gc_safepoint(env);
+    crate::env::gc_roots::gc_safepoint(env)?;
 
     let mut regs = Registers::new(ir_func.next_var);
     // Keep all values in the register file alive across GC safepoints.
@@ -473,7 +477,7 @@ fn interpret_ir_inner(
             }
             Terminator::RecurJump { target, args: _ } => {
                 // GC safepoint at loop back-edge.
-                crate::env::gc_roots::gc_safepoint(env);
+                crate::env::gc_roots::gc_safepoint(env)?;
 
                 // Loop back-edge counter: a hot header triggers background OSR
                 // compilation; the transfer happens at the header entry above.
@@ -588,14 +592,14 @@ fn execute_inst(
 
         Inst::CallKnown(dst, known_fn, args) => {
             // GC safepoint before call.
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_known_fn(known_fn, arg_vals, env)?;
             regs.set(*dst, result);
         }
 
         Inst::Call(dst, callee, args) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_or_sentinel(callee_val, arg_vals, globals, ns, env)?;
@@ -603,7 +607,7 @@ fn execute_inst(
         }
 
         Inst::CallDirect(dst, name, args) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_sentinel_by_name(name, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
@@ -701,7 +705,7 @@ fn execute_inst(
         }
 
         Inst::CallWithRegion(dst, name, args, region) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let target = ir_func
                 .subfunctions
                 .iter()

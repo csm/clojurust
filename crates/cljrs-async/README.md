@@ -67,7 +67,10 @@ Done (Phases A–H, A2, B1):
   `SerializedValue::wire_size`, taken before enqueue and returned after the
   receiver deserializes it. `send`/`try_send` return `CloneError::Full` when the
   message does not fit; `send_async` waits for room (recorded as a queue wait in
-  the governor snapshot). The default limit is the governor's `queue_limit`
+  the governor snapshot). Phase 4: when the strict governor refuses the queue
+  charge, every send returns `CloneError::MemoryLimitExceeded` at once (the
+  governor has no capacity wakeup to wait on), and `isolate-put!` raises the
+  uncatchable `ValueError::MemoryLimitExceeded`. The default limit is the governor's `queue_limit`
   (`CLJRS_ISOLATE_QUEUE_LIMIT_MB`); `isolate_channel_with_limit` sets one per
   channel. Dropping or closing the receiver releases every queued charge.
 - Phase B2 (Clojure surface): `isolate_builtins` exposes the copy boundary to
@@ -299,7 +302,8 @@ pub mod isolate_channel {
         /// Serialize `v`, meter the crossing (bytes + time into GC_STATS), and
         /// enqueue it without waiting. Returns CloneError for non-shareable
         /// values (located at the send site), `Disconnected` if the receiver
-        /// has been dropped, or `Full` if the message does not fit.
+        /// has been dropped, `Full` if the message does not fit, or
+        /// `MemoryLimitExceeded` if the strict governor refuses its charge.
         /// Compatibility form of `try_send`.
         pub fn send(&self, v: &Value) -> Result<(), CloneError>;
         /// Same as `send`.
