@@ -1754,25 +1754,36 @@ impl ProcessMemoryGovernor {
                 hard.saturating_add(self.critical_reserve.load(Ordering::Relaxed))
             }
         };
-        match self
-            .committed
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                c.checked_add(bytes).filter(|&n| n <= limit)
-            }) {
-            Ok(prev) => {
-                self.class_bytes[class.index()].fetch_add(bytes, Ordering::Relaxed);
-                if prev + bytes > hard {
-                    self.critical_grants.fetch_add(1, Ordering::Relaxed);
+        // A compare-and-swap loop, so concurrent grants never commit past
+        // `limit`.
+        let mut prev = self.committed.load(Ordering::Relaxed);
+        loop {
+            let next = match prev.checked_add(bytes) {
+                Some(n) if n <= limit => n,
+                _ => {
+                    return Err(MemoryLimitExceeded {
+                        class,
+                        requested: bytes,
+                        committed: prev,
+                        hard_limit: hard,
+                    });
                 }
-                Ok(())
+            };
+            match self.committed.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
             }
-            Err(committed) => Err(MemoryLimitExceeded {
-                class,
-                requested: bytes,
-                committed,
-                hard_limit: hard,
-            }),
         }
+        self.class_bytes[class.index()].fetch_add(bytes, Ordering::Relaxed);
+        if prev + bytes > hard {
+            self.critical_grants.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Commit bytes that cannot be refused: within the critical reserve if
