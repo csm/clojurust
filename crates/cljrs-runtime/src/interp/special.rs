@@ -1764,7 +1764,7 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
                 }
                 Some(FormKind::Keyword(k)) if k == "import" => {
                     for spec in &expand_reader_conds(&items[1..]) {
-                        import_types(env, &name, spec);
+                        import_types(env, &name, spec)?;
                     }
                 }
                 // `:refer-clojure` was handled in the pass above; other clauses
@@ -1785,30 +1785,36 @@ fn eval_ns(args: &[Form], env: &mut Env) -> EvalResult {
 /// unqualified `Name` only reaches that tag through a var `dst_ns` can
 /// resolve; without the refer, `(extend-type Name ...)` in the importing
 /// namespace registers its methods under a tag no instance carries.
-fn import_types(env: &Env, dst_ns: &str, spec: &Form) {
+fn import_types(env: &Env, dst_ns: &str, spec: &Form) -> EvalResult<()> {
     match &spec.unmeta().kind {
         FormKind::Vector(items) | FormKind::List(items) => {
             let mut syms = items.iter().filter_map(Form::as_symbol);
             if let Some(pkg) = syms.next() {
                 for name in syms {
-                    import_type(env, dst_ns, pkg, name);
+                    import_type(env, dst_ns, pkg, name)?;
                 }
             }
         }
         FormKind::Symbol(s) => {
             if let Some((pkg, name)) = s.rsplit_once('.') {
-                import_type(env, dst_ns, pkg, name);
+                import_type(env, dst_ns, pkg, name)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Refer the type `name` defined in namespace `pkg` into `dst_ns`. `pkg` is
 /// also tried with `_` read as `-`, the JVM's package spelling of a namespace.
 /// Anything that is not a loaded record or deftype (a host class in a `.cljc`
 /// file, say) is left alone, as `:import` was before it referred anything.
-fn import_type(env: &Env, dst_ns: &str, pkg: &str, name: &str) {
+///
+/// It is an error for `dst_ns` to already bind `name` to something else, as
+/// it is on the JVM: the refer would otherwise be shadowed by a local
+/// definition, or silently replace an earlier refer. A name that only
+/// `clojure.core` supplies may be replaced, as with `(:require ... :refer)`.
+fn import_type(env: &Env, dst_ns: &str, pkg: &str, name: &str) -> EvalResult<()> {
     let demunged = pkg.replace('_', "-");
     for ns in [pkg, demunged.as_str()] {
         let tag = format!("{ns}.{name}");
@@ -1817,10 +1823,22 @@ fn import_type(env: &Env, dst_ns: &str, pkg: &str, name: &str) {
             Some(Value::Symbol(s)) if s.get().to_string() == tag
         );
         if names_type {
+            if let Some(bound) = env.globals.lookup_var_in_ns(dst_ns, name) {
+                let bound = bound.get();
+                let bound_ns = bound.namespace.as_ref();
+                let same = bound_ns == ns && bound.name.as_ref() == name;
+                if !same && bound_ns != "clojure.core" {
+                    return Err(EvalError::Runtime(format!(
+                        "{name} already refers to: #'{bound_ns}/{} in namespace: {dst_ns}",
+                        bound.name
+                    )));
+                }
+            }
             env.globals.refer_named(dst_ns, ns, &[Arc::from(name)]);
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 // ── load-file ─────────────────────────────────────────────────────────────────
