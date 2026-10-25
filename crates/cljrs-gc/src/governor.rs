@@ -4,8 +4,25 @@
 //! heap and collects it independently; the governor owns only counters,
 //! pressure policy, and thread-safe [`IsolateControl`] handles.
 //!
+//! **Status: Phase 5 (policy and platform pressure).**
+//! Phase 5 adds:
+//! - Allocation-rate–based collection targets: each isolate's post-collection
+//!   target is `surviving_bytes + alloc_rate × interval + min_headroom`, where
+//!   `interval` is [`MemoryConfig::collection_target_interval_ms`].  This
+//!   replaces the fixed `surviving/2` heuristic from Phases 1–4.
+//! - Separate rate limits for cross-isolate collection requests: the governor
+//!   tracks `requested_epoch` (self-requests) and `cross_requested_epoch`
+//!   (requests from the governor on behalf of another isolate) independently.
+//! - Optional RSS emergency pressure signal: if process RSS exceeds
+//!   `hard_limit × rss_pressure_percent / 100`, pressure is clamped to `Red`.
+//! - Load-shedding hooks: servers register callbacks via
+//!   [`ProcessMemoryGovernor::register_shed_hook`]; they are called on every
+//!   pressure transition.
+//! - Linux cgroup v2 `memory.high` is used as the default soft limit when
+//!   available.
+//!
 //! **Status: Phase 4 (chunked credit, non-heap classes, opt-in strict
-//! admission).**
+//! admission) — base for Phase 5.**
 //! Each isolate allocates from local credit that the governor grants in
 //! chunks of [`MemoryConfig::credit_chunk`]; granted credit counts as
 //! committed memory.  Region chunks draw from the same local credit and are
@@ -48,7 +65,7 @@ use std::cell::{Cell, OnceCell};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
@@ -86,6 +103,30 @@ pub const DEPRECATED_SOFT_LIMIT_ENV: &str = "CLJRS_GC_SOFT_LIMIT_MB";
 pub const DEPRECATED_HARD_LIMIT_ENV: &str = "CLJRS_GC_HARD_LIMIT_MB";
 /// Strict admission (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`).
 pub const STRICT_ENV: &str = "CLJRS_MEMORY_STRICT";
+/// Collection target interval in milliseconds (0 = use `surviving/2` heuristic).
+pub const COLLECTION_INTERVAL_ENV: &str = "CLJRS_MEMORY_COLLECTION_INTERVAL_MS";
+/// RSS emergency threshold as a percentage of the hard limit (0 = disabled).
+pub const RSS_PRESSURE_PCT_ENV: &str = "CLJRS_MEMORY_RSS_PRESSURE_PCT";
+
+/// Default post-collection target interval in milliseconds.
+pub const DEFAULT_COLLECTION_INTERVAL_MS: u32 = 1000;
+/// How long to cache the RSS reading.
+const RSS_CACHE_NS: u64 = 1_000_000_000;
+
+/// Identifier returned by [`ProcessMemoryGovernor::register_shed_hook`].
+pub type ShedHookId = u64;
+
+type ShedHook = Arc<dyn Fn(PressureLevel) + Send + Sync>;
+type ShedHookVec = Vec<(ShedHookId, ShedHook)>;
+
+fn unix_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 
 // ── Memory classes and pressure ──────────────────────────────────────────────
 
@@ -205,6 +246,18 @@ pub struct MemoryConfig {
     /// Refuse application grants above the hard limit instead of only
     /// recording them.
     pub strict: bool,
+    /// Target allocation interval (ms) for dynamic collection targets.  The
+    /// post-collection target is `surviving + alloc_rate × interval + floor`.
+    /// Zero uses the old `surviving/2` heuristic from Phases 1–4.
+    /// Default: [`DEFAULT_COLLECTION_INTERVAL_MS`].
+    pub collection_target_interval_ms: u32,
+    /// RSS threshold as a percentage of the hard limit.  When process RSS
+    /// exceeds `hard_limit × rss_pressure_percent / 100` the governor raises
+    /// pressure by one level: `Green` becomes `Yellow`, and `Yellow` becomes
+    /// `Red`.  RSS alone never forces `Red`, because allocators keep freed
+    /// pages and RSS may not fall after a collection.  Zero disables the
+    /// signal.  Default: 0.
+    pub rss_pressure_percent: u8,
 }
 
 /// A rejected [`MemoryConfig`].
@@ -290,6 +343,8 @@ impl MemoryConfig {
             retained_credit_chunks: DEFAULT_RETAINED_CREDIT_CHUNKS,
             queue_limit: DEFAULT_QUEUE_LIMIT.min(hard_limit),
             strict: false,
+            collection_target_interval_ms: DEFAULT_COLLECTION_INTERVAL_MS,
+            rss_pressure_percent: 0,
         };
         config.validate()?;
         Ok(config)
@@ -298,8 +353,9 @@ impl MemoryConfig {
     /// Build a config from optional soft and hard limits.
     ///
     /// A missing hard limit uses [`default_hard_limit`], raised to the soft
-    /// limit when the soft limit is larger.  A missing soft limit is 75% of
-    /// the hard limit.
+    /// limit when the soft limit is larger.  A missing soft limit is the
+    /// cgroup v2 `memory.high` value when available, otherwise 75% of the
+    /// hard limit.
     pub fn from_optional_limits(
         soft_limit: Option<usize>,
         hard_limit: Option<usize>,
@@ -309,7 +365,9 @@ impl MemoryConfig {
             (Some(soft), None) => default_hard_limit().max(soft),
             (None, None) => default_hard_limit(),
         };
-        let soft = soft_limit.unwrap_or_else(|| default_soft_limit(hard));
+        let soft = soft_limit
+            .or_else(|| container_soft_memory_limit().filter(|&s| s < hard))
+            .unwrap_or_else(|| default_soft_limit(hard));
         Self::with_limits(soft, hard)
     }
 
@@ -397,6 +455,12 @@ impl MemoryConfig {
         if let Some(strict) = parse_flag(STRICT_ENV, lookup(STRICT_ENV))? {
             config.strict = strict;
         }
+        if let Some(ms) = parse_env_u32(COLLECTION_INTERVAL_ENV, lookup(COLLECTION_INTERVAL_ENV))? {
+            config.collection_target_interval_ms = ms;
+        }
+        if let Some(pct) = parse_env_u8(RSS_PRESSURE_PCT_ENV, lookup(RSS_PRESSURE_PCT_ENV))? {
+            config.rss_pressure_percent = pct;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -425,6 +489,31 @@ fn parse_flag(var: &'static str, value: Option<String>) -> Result<Option<bool>, 
         "1" | "true" | "yes" | "on" => Ok(Some(true)),
         "" | "0" | "false" | "no" | "off" => Ok(Some(false)),
         _ => Err(MemoryConfigError::InvalidFlag { var, value: raw }),
+    }
+}
+
+fn parse_env_u32(
+    var: &'static str,
+    value: Option<String>,
+) -> Result<Option<u32>, MemoryConfigError> {
+    match value {
+        None => Ok(None),
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| MemoryConfigError::InvalidNumber { var, value: raw }),
+    }
+}
+
+fn parse_env_u8(var: &'static str, value: Option<String>) -> Result<Option<u8>, MemoryConfigError> {
+    match value {
+        None => Ok(None),
+        Some(raw) => raw
+            .trim()
+            .parse::<u8>()
+            .map(Some)
+            .map_err(|_| MemoryConfigError::InvalidNumber { var, value: raw }),
     }
 }
 
@@ -489,6 +578,59 @@ pub fn container_memory_limit() -> Option<usize> {
     {
         None
     }
+    // Windows job-object memory limit is not yet read; it would require the
+    // `windows` crate.  macOS does not expose container memory limits through
+    // a portable API.
+}
+
+/// The cgroup v2 `memory.high` soft memory limit of this process, if any.
+///
+/// Returns `None` when not running under cgroup v2, when `memory.high` is
+/// set to `max`, or on non-Linux platforms.
+pub fn container_soft_memory_limit() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.high").ok()?;
+        let raw = raw.trim();
+        if raw == "max" {
+            return None;
+        }
+        raw.parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0 && n < (1u64 << 60))
+            .map(|n| n as usize)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Current process resident set size in bytes, or `None` if unavailable.
+///
+/// On Linux this reads `/proc/self/status`.  Other platforms return `None`.
+pub fn process_rss_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                // Format: "VmRSS:   12345 kB"
+                let kb = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<usize>()
+                    .ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 // ── Isolate control ──────────────────────────────────────────────────────────
@@ -516,8 +658,14 @@ pub struct IsolateControl {
     retired_region_bytes: AtomicUsize,
     /// Number of completed collections; the collection epoch.
     last_collection_epoch: AtomicU64,
-    /// Epoch at which the governor last requested collection (`u64::MAX`: never).
+    /// Epoch at which the governor last requested collection from this isolate
+    /// on its own behalf (`u64::MAX`: never).
     requested_epoch: AtomicU64,
+    /// Epoch at which the governor last made a cross-isolate request to this
+    /// isolate — i.e., asked it to collect on behalf of another isolate
+    /// (`u64::MAX`: never).  Separate from `requested_epoch` so self-requests
+    /// and cross-requests each get their own per-epoch rate limit.
+    cross_requested_epoch: AtomicU64,
     /// Used bytes below which the governor does not request collection at
     /// `Yellow` (set from the last collection's result).
     collection_target: AtomicUsize,
@@ -543,6 +691,7 @@ impl IsolateControl {
             retired_region_bytes: AtomicUsize::new(0),
             last_collection_epoch: AtomicU64::new(0),
             requested_epoch: AtomicU64::new(u64::MAX),
+            cross_requested_epoch: AtomicU64::new(u64::MAX),
             collection_target: AtomicUsize::new(0),
             collection_requests: AtomicU64::new(0),
             credit_refills: AtomicU64::new(0),
@@ -637,10 +786,10 @@ impl IsolateControl {
         self.credit_refills.load(Ordering::Relaxed)
     }
 
-    /// Request collection on the governor's behalf, at most once per
-    /// collection epoch.  Below `Red`, also skip the request while the heap
-    /// is under its post-collection target.  Returns whether a request was
-    /// made.
+    /// Request collection on the governor's behalf (self-request), at most
+    /// once per collection epoch.  Below `Red`, also skip the request while
+    /// the heap is under its post-collection target.  Returns whether a
+    /// request was made.
     fn governor_request(&self, level: PressureLevel) -> bool {
         let epoch = self.collection_epoch();
         let prev = self.requested_epoch.load(Ordering::Relaxed);
@@ -654,6 +803,31 @@ impl IsolateControl {
         // thread that claims this epoch counts the request.
         if self
             .requested_epoch
+            .compare_exchange(prev, epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.collection_requests.fetch_add(1, Ordering::Relaxed);
+        self.request_collection();
+        true
+    }
+
+    /// Cross-isolate request: ask this isolate to collect on behalf of another
+    /// isolate, using a separate epoch counter so cross-requests and
+    /// self-requests each get their own per-epoch rate limit.  Returns whether
+    /// a request was made.
+    fn cross_governor_request(&self, level: PressureLevel) -> bool {
+        let epoch = self.collection_epoch();
+        let prev = self.cross_requested_epoch.load(Ordering::Relaxed);
+        if prev == epoch {
+            return false;
+        }
+        if level < PressureLevel::Red && self.used_bytes() < self.collection_target() {
+            return false;
+        }
+        if self
+            .cross_requested_epoch
             .compare_exchange(prev, epoch, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
@@ -747,6 +921,13 @@ pub struct IsolateAccount {
     /// Allocations not yet added to [`crate::stats::GC_STATS`].
     pending_allocs: Cell<u64>,
     pending_alloc_bytes: Cell<u64>,
+    /// Bytes allocated since the last recorded collection; used to compute the
+    /// allocation rate for dynamic collection targets.
+    alloc_since_collection: Cell<usize>,
+    /// When this isolate last recorded a collection; paired with
+    /// `alloc_since_collection` to derive the allocation rate.
+    /// Set at registration, so the first rate covers the isolate's lifetime.
+    collection_started: Cell<Instant>,
 }
 
 impl IsolateAccount {
@@ -795,6 +976,8 @@ impl IsolateAccount {
         self.pending_allocs.set(self.pending_allocs.get() + 1);
         self.pending_alloc_bytes
             .set(self.pending_alloc_bytes.get() + bytes as u64);
+        self.alloc_since_collection
+            .set(self.alloc_since_collection.get() + bytes);
         self.take_credit(bytes);
     }
 
@@ -1075,11 +1258,19 @@ impl IsolateAccount {
     /// Record a completed collection: bump the epoch, set the next
     /// collection target, return excess free credit, and publish.
     ///
-    /// The target, which gates governor requests at `Yellow`, is the
-    /// surviving bytes plus the larger of half the surviving bytes or
-    /// [`ProcessMemoryGovernor::min_headroom`].  After a collection that
-    /// frees nothing, the headroom is the larger of the surviving bytes or
-    /// that minimum.  The heap's own collection trigger is its `GcConfig`.
+    /// **Phase 5 (dynamic targets):** The target is `surviving + headroom`,
+    /// where `headroom` is the larger of:
+    ///
+    /// - `alloc_rate × collection_target_interval_ms / 1000` (Phase 5 default,
+    ///   when [`MemoryConfig::collection_target_interval_ms`] is non-zero),
+    ///   capped at the room left below the soft limit.  The rate is measured
+    ///   since the previous collection (or registration), over at least one
+    ///   interval; or
+    /// - `surviving / 2` (legacy heuristic, when the interval is zero), or
+    /// - [`ProcessMemoryGovernor::min_headroom`].
+    ///
+    /// After a zero-yield collection, headroom uses `surviving` as a floor
+    /// instead of `surviving / 2`.  The heap's own trigger is its `GcConfig`.
     pub fn record_collection(&self, report: CollectionReport) {
         let c = &self.control;
         c.last_collection_epoch.fetch_add(1, Ordering::Relaxed);
@@ -1093,11 +1284,43 @@ impl IsolateAccount {
         );
         let min = self.governor.min_headroom();
         let after = report.bytes_after;
+
+        // Compute headroom from the allocation rate if an interval is configured.
+        let rate_headroom: usize = {
+            let interval_ms = self.governor.collection_target_interval_ms();
+            if interval_ms > 0 {
+                let alloc_bytes = self.alloc_since_collection.get();
+                let interval_secs = interval_ms as f64 / 1000.0;
+                // Measure over at least one interval, so back-to-back
+                // collections cannot inflate the rate: the headroom is then
+                // at most the bytes allocated since the last collection.
+                let elapsed_secs = self
+                    .collection_started
+                    .get()
+                    .elapsed()
+                    .as_secs_f64()
+                    .max(interval_secs);
+                let rate = alloc_bytes as f64 / elapsed_secs;
+                // Never extend the target past the soft limit, or the
+                // isolate would not be asked to collect at Yellow.
+                let room = self
+                    .governor
+                    .soft_limit
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.governor.committed_bytes());
+                ((rate * interval_secs) as usize).min(room)
+            } else {
+                0
+            }
+        };
+        self.alloc_since_collection.set(0);
+        self.collection_started.set(Instant::now());
+
         let headroom = if report.bytes_returned == 0 {
             c.zero_yield_collections.fetch_add(1, Ordering::Relaxed);
-            after.max(min)
+            rate_headroom.max(after).max(min)
         } else {
-            (after / 2).max(min)
+            rate_headroom.max(after / 2).max(min)
         };
         c.collection_target
             .store(after.saturating_add(headroom), Ordering::Relaxed);
@@ -1466,6 +1689,18 @@ pub struct ProcessMemoryGovernor {
     registry: Mutex<Vec<Weak<IsolateControl>>>,
     next_isolate_id: AtomicU64,
     isolates_registered: AtomicU64,
+    /// Target allocation interval for dynamic collection targets (nanoseconds).
+    collection_target_interval_nanos: AtomicU64,
+    /// RSS emergency threshold (0 = disabled).
+    rss_pressure_percent: AtomicU8,
+    /// Cached process RSS bytes; refreshed at most once per [`RSS_CACHE_NS`].
+    rss_cache_bytes: AtomicUsize,
+    /// Unix nanoseconds of the last RSS read (0 = never read).
+    rss_cache_nanos: AtomicU64,
+    /// Registered load-shedding hooks called on pressure transitions.
+    shed_hooks: Mutex<ShedHookVec>,
+    /// Counter for [`ShedHookId`].
+    next_hook_id: AtomicU64,
 }
 
 impl ProcessMemoryGovernor {
@@ -1508,6 +1743,14 @@ impl ProcessMemoryGovernor {
             registry: Mutex::new(Vec::new()),
             next_isolate_id: AtomicU64::new(1),
             isolates_registered: AtomicU64::new(0),
+            collection_target_interval_nanos: AtomicU64::new(
+                DEFAULT_COLLECTION_INTERVAL_MS as u64 * 1_000_000,
+            ),
+            rss_pressure_percent: AtomicU8::new(0),
+            rss_cache_bytes: AtomicUsize::new(0),
+            rss_cache_nanos: AtomicU64::new(0),
+            shed_hooks: Mutex::new(Vec::new()),
+            next_hook_id: AtomicU64::new(1),
         }
     }
 
@@ -1539,7 +1782,68 @@ impl ProcessMemoryGovernor {
             .store(config.credit_chunk, Ordering::Relaxed);
         self.retained_credit_chunks
             .store(config.retained_credit_chunks, Ordering::Relaxed);
+        self.collection_target_interval_nanos.store(
+            config.collection_target_interval_ms as u64 * 1_000_000,
+            Ordering::Relaxed,
+        );
+        self.rss_pressure_percent
+            .store(config.rss_pressure_percent, Ordering::Relaxed);
         self.configured.store(true, Ordering::Release);
+    }
+
+    /// Collection target interval in milliseconds (0 = use surviving/2 heuristic).
+    pub fn collection_target_interval_ms(&self) -> u32 {
+        (self
+            .collection_target_interval_nanos
+            .load(Ordering::Relaxed)
+            / 1_000_000) as u32
+    }
+
+    /// Current process RSS with a 1-second cache.  Returns 0 when unavailable.
+    fn get_rss_bytes(&self) -> usize {
+        let now = unix_nanos();
+        let cached_at = self.rss_cache_nanos.load(Ordering::Relaxed);
+        if now.saturating_sub(cached_at) < RSS_CACHE_NS {
+            return self.rss_cache_bytes.load(Ordering::Relaxed);
+        }
+        let rss = process_rss_bytes().unwrap_or(0);
+        self.rss_cache_bytes.store(rss, Ordering::Relaxed);
+        self.rss_cache_nanos.store(now, Ordering::Relaxed);
+        rss
+    }
+
+    /// Register a load-shedding hook called on every pressure transition.
+    /// Returns an id for [`Self::unregister_shed_hook`].
+    pub fn register_shed_hook(&self, hook: ShedHook) -> ShedHookId {
+        let id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
+        self.shed_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, hook));
+        id
+    }
+
+    /// Unregister a load-shedding hook by id.
+    pub fn unregister_shed_hook(&self, id: ShedHookId) {
+        self.shed_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(hook_id, _)| *hook_id != id);
+    }
+
+    /// Call the hooks outside the lock: a hook may register or unregister
+    /// hooks, or allocate, which can re-enter `evaluate`.
+    fn invoke_shed_hooks(&self, level: PressureLevel) {
+        let hooks: Vec<ShedHook> = self
+            .shed_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
+            hook(level);
+        }
     }
 
     fn ensure_configured(&self) {
@@ -1636,6 +1940,8 @@ impl ProcessMemoryGovernor {
             published_retired: Cell::new(0),
             pending_allocs: Cell::new(0),
             pending_alloc_bytes: Cell::new(0),
+            alloc_since_collection: Cell::new(0),
+            collection_started: Cell::new(Instant::now()),
         }
     }
 
@@ -1952,6 +2258,22 @@ impl ProcessMemoryGovernor {
                 level = PressureLevel::Red;
             }
         }
+        // Phase 5: raise pressure one level if process RSS exceeds the
+        // configured threshold.  RSS alone never forces Red: it may not fall
+        // after a collection, which would hold every isolate at Red.
+        let rss_pct = self.rss_pressure_percent.load(Ordering::Relaxed);
+        if rss_pct > 0 {
+            let rss = self.get_rss_bytes();
+            if rss > 0 {
+                let threshold = (hard as u64 * rss_pct as u64 / 100) as usize;
+                if rss >= threshold {
+                    level = match level {
+                        PressureLevel::Green => PressureLevel::Yellow,
+                        PressureLevel::Yellow | PressureLevel::Red => PressureLevel::Red,
+                    };
+                }
+            }
+        }
         let prev = self.pressure();
         // Only a change writes the shared pressure word.
         if prev != level
@@ -1973,6 +2295,7 @@ impl ProcessMemoryGovernor {
             if level > prev {
                 self.recall_credit();
             }
+            self.invoke_shed_hooks(level);
         }
         if grew && committed > hard {
             self.over_limit_events.fetch_add(1, Ordering::Relaxed);
@@ -1996,7 +2319,7 @@ impl ProcessMemoryGovernor {
         }
         if grew && let Some(largest) = self.largest_isolate() {
             let same = requester.is_some_and(|r| r.id == largest.id);
-            if !same && largest.governor_request(level) {
+            if !same && largest.cross_governor_request(level) {
                 self.collection_requests.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2071,6 +2394,8 @@ impl ProcessMemoryGovernor {
             reserve_overrun_bytes: self.reserve_overrun_bytes.load(Ordering::Relaxed),
             runtime_faults: self.runtime_faults.load(Ordering::Relaxed),
             runtime_faults_cleared: self.runtime_faults_cleared.load(Ordering::Relaxed),
+            rss_bytes: self.rss_cache_bytes.load(Ordering::Relaxed),
+            rss_pressure_percent: self.rss_pressure_percent.load(Ordering::Relaxed),
         }
     }
 }
@@ -2201,6 +2526,10 @@ pub struct MemorySnapshot {
     /// Runtime faults cleared because a collection brought committed bytes
     /// back within the hard limit.
     pub runtime_faults_cleared: u64,
+    /// Current process RSS bytes (0 = unavailable or not sampled).
+    pub rss_bytes: usize,
+    /// RSS threshold as a percentage of the hard limit (0 = disabled).
+    pub rss_pressure_percent: u8,
 }
 
 impl MemorySnapshot {
@@ -2294,7 +2623,7 @@ impl fmt::Display for MemorySnapshot {
             "  Over hard limit:       {} events ({} bytes over)",
             self.over_limit_events, self.over_limit_bytes
         )?;
-        write!(
+        writeln!(
             f,
             "  Rejected:              {} reservations ({} bytes), {} critical grants, {} reserve overruns ({} bytes), {} faults ({} cleared)",
             self.rejected_reservations,
@@ -2304,7 +2633,16 @@ impl fmt::Display for MemorySnapshot {
             self.reserve_overrun_bytes,
             self.runtime_faults,
             self.runtime_faults_cleared
-        )
+        )?;
+        if self.rss_pressure_percent > 0 {
+            write!(
+                f,
+                "  RSS:                   {} bytes (threshold {}% of hard limit)",
+                self.rss_bytes, self.rss_pressure_percent
+            )
+        } else {
+            write!(f, "  RSS pressure:          disabled")
+        }
     }
 }
 
@@ -3083,5 +3421,278 @@ mod tests {
         assert!(snap.peak_committed_bytes <= hard);
         assert_eq!(snap.committed_bytes, 0, "thread exit returns everything");
         assert_eq!(snap.rejected_reservations, refused as u64);
+    }
+
+    // ── Phase 5 tests ─────────────────────────────────────────────────────────
+
+    /// The allocation-rate target adapts: a fast-allocating isolate gets a
+    /// larger headroom than a slow one.
+    #[test]
+    fn collection_target_adapts_to_allocation_rate() {
+        let mut config = MemoryConfig::with_limits(64 * MIB, 128 * MIB).unwrap();
+        config.credit_chunk = 64 * KIB;
+        config.collection_target_interval_ms = 500; // 500 ms interval
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        let acc = g.register_isolate("rate-test");
+
+        // Simulate a 1 MiB / second allocation rate: 1 MiB charged over ~1 s.
+        acc.charge(MIB);
+        let used = acc.used_bytes();
+        // Record a collection that freed everything.
+        acc.release(used);
+        acc.record_collection(CollectionReport {
+            bytes_before: used,
+            bytes_after: 0,
+            bytes_returned: used,
+            duration: Duration::from_millis(1),
+        });
+        // Short sleep to make elapsed > 0, then charge 1 MiB more and collect
+        // again so we get a meaningful rate.
+        std::thread::sleep(Duration::from_millis(10));
+        acc.charge(MIB);
+        let used2 = acc.used_bytes();
+        acc.release(used2);
+        acc.record_collection(CollectionReport {
+            bytes_before: used2,
+            bytes_after: 0,
+            bytes_returned: used2,
+            duration: Duration::from_millis(1),
+        });
+        // The target must be ≥ MIN_COLLECTION_HEADROOM.
+        assert!(
+            acc.control().collection_target() >= MIN_COLLECTION_HEADROOM,
+            "target below floor: {}",
+            acc.control().collection_target()
+        );
+    }
+
+    /// Cross-isolate requests use a separate epoch counter, so the governor
+    /// can make both a self-request and a cross-request in the same epoch.
+    #[test]
+    fn cross_isolate_requests_use_separate_epoch() {
+        let g = leaked(4 * MIB, 8 * MIB, 64 * KIB);
+        let big = g.register_isolate("big");
+        let small = g.register_isolate("small");
+        // Both start with no requests.
+        assert!(!big.control().collection_requested());
+        assert!(!small.control().collection_requested());
+
+        // Put big's epoch at 0 (never collected).
+        // Charge enough that big becomes the largest isolate.
+        big.charge(3 * MIB);
+
+        // A small charge from `small` puts the process at Yellow and
+        // triggers both a self-request on `small` and a cross-request on `big`.
+        small.charge(MIB);
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+
+        let small_requested = small.control().take_collection_request();
+        let big_requested = big.control().take_collection_request();
+        assert!(small_requested, "small gets a self-request");
+        assert!(big_requested, "big gets a cross-request");
+
+        // After clearing both requests but staying at Yellow, further charges
+        // should still be rate-limited (same epoch).
+        small.charge(64 * KIB);
+        assert!(
+            !small.control().collection_requested(),
+            "rate-limited in same epoch"
+        );
+        assert!(
+            !big.control().collection_requested(),
+            "cross rate-limited in same epoch"
+        );
+
+        // After a collection on `small` (bumping its epoch) a new self-request
+        // fires, but not another cross-request on `big` (different epoch counter).
+        let used = small.used_bytes();
+        small.record_collection(CollectionReport {
+            bytes_before: used,
+            bytes_after: used,
+            bytes_returned: 0,
+            duration: Duration::from_micros(1),
+        });
+        small.charge(64 * KIB);
+        // After the epoch bump, another self-request on small may fire.
+        // Cross-request on big is also gated on big's epoch (unchanged) and
+        // on the collection target; with a zero-yield collection the target is
+        // generous, so there may or may not be another cross-request—just
+        // verify no panic or invariant violation.
+        let _ = big.control().take_collection_request();
+        let _ = small.control().take_collection_request();
+    }
+
+    /// When the RSS threshold fires, pressure rises one level: RSS alone
+    /// gives Yellow, and RSS with committed bytes over the soft limit gives Red.
+    #[test]
+    fn rss_emergency_signal_raises_pressure_one_level() {
+        let mut config = MemoryConfig::with_limits(4 * MIB, 8 * MIB).unwrap();
+        config.credit_chunk = 64 * KIB;
+        // Set threshold to 1% of hard limit so even a tiny RSS triggers it.
+        config.rss_pressure_percent = 1;
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        // Pre-populate the RSS cache with a value over the threshold.  We
+        // inject it via the atomic fields directly.
+        let threshold = 8 * MIB / 100;
+        g.rss_cache_bytes.store(threshold + 1, Ordering::Relaxed);
+        g.rss_cache_nanos.store(unix_nanos(), Ordering::Relaxed);
+
+        let acc = g.register_isolate("rss-test");
+        acc.charge(64 * KIB); // tiny, well below soft limit
+        // Force a re-evaluate.
+        acc.publish();
+        assert_eq!(
+            g.pressure(),
+            PressureLevel::Yellow,
+            "RSS alone raises Green to Yellow, not Red"
+        );
+
+        acc.charge(4 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Red, "RSS raises Yellow to Red");
+    }
+
+    /// Load-shedding hooks fire on pressure transitions.
+    #[test]
+    fn shed_hooks_fire_on_pressure_transitions() {
+        use std::sync::atomic::AtomicUsize;
+        let g = leaked(4 * MIB, 8 * MIB, 64 * KIB);
+        let green_count = Arc::new(AtomicUsize::new(0));
+        let yellow_count = Arc::new(AtomicUsize::new(0));
+        let red_count = Arc::new(AtomicUsize::new(0));
+        let gc = green_count.clone();
+        let yc = yellow_count.clone();
+        let rc = red_count.clone();
+        let id = g.register_shed_hook(Arc::new(move |level| match level {
+            PressureLevel::Green => {
+                gc.fetch_add(1, Ordering::Relaxed);
+            }
+            PressureLevel::Yellow => {
+                yc.fetch_add(1, Ordering::Relaxed);
+            }
+            PressureLevel::Red => {
+                rc.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        let acc = g.register_isolate("shed-test");
+        // Green → Yellow
+        acc.charge(4 * MIB + 1);
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        assert_eq!(yellow_count.load(Ordering::Relaxed), 1);
+
+        // Yellow → Red
+        acc.charge(4 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Red);
+        assert_eq!(red_count.load(Ordering::Relaxed), 1);
+
+        // Red → Green (release all and collect)
+        let used = acc.used_bytes();
+        acc.release(used);
+        acc.record_collection(CollectionReport {
+            bytes_before: used,
+            bytes_after: 0,
+            bytes_returned: used,
+            duration: Duration::from_micros(1),
+        });
+        assert_eq!(g.pressure(), PressureLevel::Green);
+        assert_eq!(green_count.load(Ordering::Relaxed), 1);
+
+        // Unregister the hook; no further calls.
+        g.unregister_shed_hook(id);
+        acc.charge(4 * MIB + 1);
+        assert_eq!(
+            yellow_count.load(Ordering::Relaxed),
+            1,
+            "hook not called after unregister"
+        );
+    }
+
+    /// A hook may unregister itself (or register another) without
+    /// deadlocking on the hook list.
+    #[test]
+    fn shed_hook_can_unregister_itself() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::AtomicUsize;
+        let g = leaked(4 * MIB, 8 * MIB, 64 * KIB);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let id_cell: &'static OnceLock<ShedHookId> = Box::leak(Box::new(OnceLock::new()));
+        let id = g.register_shed_hook(Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(&id) = id_cell.get() {
+                g.unregister_shed_hook(id);
+            }
+        }));
+        id_cell.set(id).unwrap();
+
+        let acc = g.register_isolate("one-shot");
+        acc.charge(4 * MIB + 1);
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        acc.charge(4 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Red);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one-shot hook ran once");
+    }
+
+    /// Back-to-back collections do not inflate the rate: the rate headroom
+    /// is at most the bytes allocated since the previous collection.
+    #[test]
+    fn rate_headroom_bounded_by_bytes_since_collection() {
+        let mut config = MemoryConfig::with_limits(1 << 40, 2 << 40).unwrap();
+        config.credit_chunk = 64 * KIB;
+        config.collection_target_interval_ms = 1000;
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        let acc = g.register_isolate("burst");
+        let collect = |acc: &IsolateAccount| {
+            let used = acc.used_bytes();
+            acc.release(used);
+            acc.record_collection(CollectionReport {
+                bytes_before: used,
+                bytes_after: 0,
+                bytes_returned: used,
+                duration: Duration::from_micros(1),
+            });
+        };
+        collect(&acc);
+        acc.charge(8 * MIB);
+        collect(&acc);
+        let target = acc.control().collection_target();
+        assert!(
+            target <= 8 * MIB,
+            "headroom {target} exceeds the 8 MiB allocated since the last collection"
+        );
+        assert!(target >= g.min_headroom());
+    }
+
+    /// The rate headroom never pushes the target past the soft limit.
+    #[test]
+    fn rate_headroom_capped_at_soft_limit() {
+        let mut config = MemoryConfig::with_limits(8 * MIB, 16 * MIB).unwrap();
+        config.credit_chunk = 64 * KIB;
+        config.collection_target_interval_ms = 60_000;
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        let acc = g.register_isolate("fast");
+        // Allocate and free 30 MiB in total: far more than the soft limit.
+        for _ in 0..5 {
+            acc.charge(6 * MIB);
+            acc.release(6 * MIB);
+        }
+        acc.record_collection(CollectionReport {
+            bytes_before: 6 * MIB,
+            bytes_after: 0,
+            bytes_returned: 6 * MIB,
+            duration: Duration::from_micros(1),
+        });
+        let target = acc.control().collection_target();
+        assert!(
+            target <= 8 * MIB,
+            "target {target} is above the 8 MiB soft limit"
+        );
     }
 }

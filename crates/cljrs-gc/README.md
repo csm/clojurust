@@ -11,9 +11,11 @@ fixed **64 MB** soft limit instead of consulting total system RAM.
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
 `docs/archive/no-gc-plan.md`) — implemented.  B3 (`StaticGcPtr`, `static_alloc`) —
 implemented.  Process memory governor
-(`docs/managed-memory-governor-plan.md`) — Phases 0–4 (chunked allocation
+(`docs/managed-memory-governor-plan.md`) — Phases 0–5 (chunked allocation
 credit; region, shared-value, message-queue, static, and code memory;
-fallible allocation and opt-in strict hard-limit admission) implemented.
+fallible allocation and opt-in strict hard-limit admission; allocation-rate
+collection targets; separate cross-isolate request epoch; Linux cgroup v2
+soft-limit; RSS emergency pressure signal; load-shedding hooks) implemented.
 
 ---
 
@@ -83,7 +85,11 @@ src/
                     ProcessMemoryGovernor, IsolateAccount, IsolateControl,
                     strict admission, critical sections, runtime-fault slot,
                     MemoryCharge, MemorySnapshot, pressure policy; region
-                    chunk, permanent (static), and queue-wait accounting
+                    chunk, permanent (static), and queue-wait accounting;
+                    Phase 5: allocation-rate collection targets, separate
+                    cross-isolate request epoch, RSS emergency pressure signal,
+                    load-shedding hooks (ShedHookId, register_shed_hook,
+                    unregister_shed_hook), Linux cgroup v2 soft-limit
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects,
                     isolate-boundary crossings (bytes copied + serialize time)
@@ -383,8 +389,9 @@ pub const MIN_COLLECTION_HEADROOM: usize;          // 1 MiB
 pub const STRICT_ENV: &str;                         // "CLJRS_MEMORY_STRICT"
 
 pub struct MemoryConfig { pub soft_limit, pub hard_limit, pub critical_reserve,
-                          pub credit_chunk, pub retained_credit_chunks,
-                          pub queue_limit, pub strict }   // bytes, except the chunk count
+                          pub credit_chunk, pub retained_credit_chunks, pub queue_limit,
+                          pub strict, pub collection_target_interval_ms,
+                          pub rss_pressure_percent }
 impl MemoryConfig {
     pub fn with_limits(soft: usize, hard: usize) -> Result<Self, MemoryConfigError>;
     pub fn from_optional_limits(soft: Option<usize>, hard: Option<usize>)
@@ -394,10 +401,12 @@ impl MemoryConfig {
     pub fn from_lookup(lookup, warn) -> Result<Self, MemoryConfigError>;
     pub fn validate(&self) -> Result<(), MemoryConfigError>;
 }
-pub fn default_hard_limit() -> usize;                   // cgroup limit, else physical / 2
-pub fn default_soft_limit(hard: usize) -> usize;        // 75%
-pub fn default_critical_reserve(hard: usize) -> usize;  // max(4 MiB, 1%), <= 256 MiB
-pub fn container_memory_limit() -> Option<usize>;       // not on wasm32
+pub fn default_hard_limit() -> usize;                        // cgroup limit, else physical / 2
+pub fn default_soft_limit(hard: usize) -> usize;             // 75%
+pub fn default_critical_reserve(hard: usize) -> usize;       // max(4 MiB, 1%), <= 256 MiB
+pub fn container_memory_limit() -> Option<usize>;            // not on wasm32
+pub fn container_soft_memory_limit() -> Option<usize>;       // cgroup v2 memory.high; Linux only
+pub fn process_rss_bytes() -> Option<usize>;                 // /proc/self/status VmRSS; Linux only
 
 pub struct ProcessMemoryGovernor { /* atomics + weak isolate registry */ }
 impl ProcessMemoryGovernor {
@@ -427,9 +436,15 @@ impl ProcessMemoryGovernor {
     pub fn committed_bytes(&self) -> usize;     // exact: used + free credit
     pub fn free_credit_bytes(&self) -> usize;   // as last published by each isolate
     pub fn min_headroom(&self) -> usize;        // max(16 chunks, MIN_COLLECTION_HEADROOM)
+    pub fn collection_target_interval_ms(&self) -> u32;   // Phase 5: dynamic target interval
     pub fn pressure(&self) -> PressureLevel;
     pub fn snapshot(&self) -> MemorySnapshot;
+    // Phase 5 — load-shedding hooks (called on every pressure transition):
+    pub fn register_shed_hook(&self, hook: ShedHook) -> ShedHookId;
+    pub fn unregister_shed_hook(&self, id: ShedHookId);
 }
+pub type ShedHookId = u64;
+pub type ShedHook = Arc<dyn Fn(PressureLevel) + Send + Sync>;
 pub fn governor() -> &'static ProcessMemoryGovernor;   // the process instance
 
 pub struct IsolateAccount { /* single-threaded (!Sync) Cells */ }
