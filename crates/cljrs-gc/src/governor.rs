@@ -252,8 +252,10 @@ pub struct MemoryConfig {
     /// Default: [`DEFAULT_COLLECTION_INTERVAL_MS`].
     pub collection_target_interval_ms: u32,
     /// RSS threshold as a percentage of the hard limit.  When process RSS
-    /// exceeds `hard_limit × rss_pressure_percent / 100` the governor treats
-    /// pressure as `Red` regardless of committed bytes.  Zero disables the
+    /// exceeds `hard_limit × rss_pressure_percent / 100` the governor raises
+    /// pressure by one level: `Green` becomes `Yellow`, and `Yellow` becomes
+    /// `Red`.  RSS alone never forces `Red`, because allocators keep freed
+    /// pages and RSS may not fall after a collection.  Zero disables the
     /// signal.  Default: 0.
     pub rss_pressure_percent: u8,
 }
@@ -504,10 +506,7 @@ fn parse_env_u32(
     }
 }
 
-fn parse_env_u8(
-    var: &'static str,
-    value: Option<String>,
-) -> Result<Option<u8>, MemoryConfigError> {
+fn parse_env_u8(var: &'static str, value: Option<String>) -> Result<Option<u8>, MemoryConfigError> {
     match value {
         None => Ok(None),
         Some(raw) => raw
@@ -927,7 +926,8 @@ pub struct IsolateAccount {
     alloc_since_collection: Cell<usize>,
     /// When this isolate last recorded a collection; paired with
     /// `alloc_since_collection` to derive the allocation rate.
-    collection_started: Cell<Option<Instant>>,
+    /// Set at registration, so the first rate covers the isolate's lifetime.
+    collection_started: Cell<Instant>,
 }
 
 impl IsolateAccount {
@@ -1262,9 +1262,11 @@ impl IsolateAccount {
     /// where `headroom` is the larger of:
     ///
     /// - `alloc_rate × collection_target_interval_ms / 1000` (Phase 5 default,
-    ///   when [`MemoryConfig::collection_target_interval_ms`] is non-zero), or
-    /// - `surviving / 2` (legacy heuristic, when the interval is zero or no
-    ///   prior collection exists), or
+    ///   when [`MemoryConfig::collection_target_interval_ms`] is non-zero),
+    ///   capped at the room left below the soft limit.  The rate is measured
+    ///   since the previous collection (or registration), over at least one
+    ///   interval; or
+    /// - `surviving / 2` (legacy heuristic, when the interval is zero), or
     /// - [`ProcessMemoryGovernor::min_headroom`].
     ///
     /// After a zero-yield collection, headroom uses `surviving` as a floor
@@ -1288,19 +1290,31 @@ impl IsolateAccount {
             let interval_ms = self.governor.collection_target_interval_ms();
             if interval_ms > 0 {
                 let alloc_bytes = self.alloc_since_collection.get();
+                let interval_secs = interval_ms as f64 / 1000.0;
+                // Measure over at least one interval, so back-to-back
+                // collections cannot inflate the rate: the headroom is then
+                // at most the bytes allocated since the last collection.
                 let elapsed_secs = self
                     .collection_started
                     .get()
-                    .map(|t| t.elapsed().as_secs_f64().max(0.001))
-                    .unwrap_or(1.0);
+                    .elapsed()
+                    .as_secs_f64()
+                    .max(interval_secs);
                 let rate = alloc_bytes as f64 / elapsed_secs;
-                (rate * (interval_ms as f64 / 1000.0)) as usize
+                // Never extend the target past the soft limit, or the
+                // isolate would not be asked to collect at Yellow.
+                let room = self
+                    .governor
+                    .soft_limit
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.governor.committed_bytes());
+                ((rate * interval_secs) as usize).min(room)
             } else {
                 0
             }
         };
         self.alloc_since_collection.set(0);
-        self.collection_started.set(Some(Instant::now()));
+        self.collection_started.set(Instant::now());
 
         let headroom = if report.bytes_returned == 0 {
             c.zero_yield_collections.fetch_add(1, Ordering::Relaxed);
@@ -1779,7 +1793,10 @@ impl ProcessMemoryGovernor {
 
     /// Collection target interval in milliseconds (0 = use surviving/2 heuristic).
     pub fn collection_target_interval_ms(&self) -> u32 {
-        (self.collection_target_interval_nanos.load(Ordering::Relaxed) / 1_000_000) as u32
+        (self
+            .collection_target_interval_nanos
+            .load(Ordering::Relaxed)
+            / 1_000_000) as u32
     }
 
     /// Current process RSS with a 1-second cache.  Returns 0 when unavailable.
@@ -1814,12 +1831,17 @@ impl ProcessMemoryGovernor {
             .retain(|(hook_id, _)| *hook_id != id);
     }
 
+    /// Call the hooks outside the lock: a hook may register or unregister
+    /// hooks, or allocate, which can re-enter `evaluate`.
     fn invoke_shed_hooks(&self, level: PressureLevel) {
-        let hooks = self
+        let hooks: Vec<ShedHook> = self
             .shed_hooks
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for (_, hook) in hooks.iter() {
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
             hook(level);
         }
     }
@@ -1919,7 +1941,7 @@ impl ProcessMemoryGovernor {
             pending_allocs: Cell::new(0),
             pending_alloc_bytes: Cell::new(0),
             alloc_since_collection: Cell::new(0),
-            collection_started: Cell::new(None),
+            collection_started: Cell::new(Instant::now()),
         }
     }
 
@@ -2236,14 +2258,19 @@ impl ProcessMemoryGovernor {
                 level = PressureLevel::Red;
             }
         }
-        // Phase 5: clamp to Red if process RSS exceeds the configured threshold.
+        // Phase 5: raise pressure one level if process RSS exceeds the
+        // configured threshold.  RSS alone never forces Red: it may not fall
+        // after a collection, which would hold every isolate at Red.
         let rss_pct = self.rss_pressure_percent.load(Ordering::Relaxed);
         if rss_pct > 0 {
             let rss = self.get_rss_bytes();
             if rss > 0 {
                 let threshold = (hard as u64 * rss_pct as u64 / 100) as usize;
                 if rss >= threshold {
-                    level = PressureLevel::Red;
+                    level = match level {
+                        PressureLevel::Green => PressureLevel::Yellow,
+                        PressureLevel::Yellow | PressureLevel::Red => PressureLevel::Red,
+                    };
                 }
             }
         }
@@ -3497,18 +3524,20 @@ mod tests {
         let _ = small.control().take_collection_request();
     }
 
-    /// When the RSS threshold fires, pressure is clamped to Red.
+    /// When the RSS threshold fires, pressure rises one level: RSS alone
+    /// gives Yellow, and RSS with committed bytes over the soft limit gives Red.
     #[test]
-    fn rss_emergency_signal_clamps_to_red() {
-        let mut config = MemoryConfig::with_limits(512 * MIB, 1024 * MIB).unwrap();
+    fn rss_emergency_signal_raises_pressure_one_level() {
+        let mut config = MemoryConfig::with_limits(4 * MIB, 8 * MIB).unwrap();
+        config.credit_chunk = 64 * KIB;
         // Set threshold to 1% of hard limit so even a tiny RSS triggers it.
         config.rss_pressure_percent = 1;
         let g: &'static _ = Box::leak(Box::new(
             ProcessMemoryGovernor::with_config(config).unwrap(),
         ));
-        // Pre-populate the RSS cache with a value that exceeds 1% of 1 GiB
-        // (= 10 MiB).  We inject it via the atomic fields directly.
-        let threshold = 1024 * MIB / 100; // 10 MiB
+        // Pre-populate the RSS cache with a value over the threshold.  We
+        // inject it via the atomic fields directly.
+        let threshold = 8 * MIB / 100;
         g.rss_cache_bytes.store(threshold + 1, Ordering::Relaxed);
         g.rss_cache_nanos.store(unix_nanos(), Ordering::Relaxed);
 
@@ -3518,9 +3547,12 @@ mod tests {
         acc.publish();
         assert_eq!(
             g.pressure(),
-            PressureLevel::Red,
-            "RSS signal must clamp pressure to Red"
+            PressureLevel::Yellow,
+            "RSS alone raises Green to Yellow, not Red"
         );
+
+        acc.charge(4 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Red, "RSS raises Yellow to Red");
     }
 
     /// Load-shedding hooks fire on pressure transitions.
@@ -3572,6 +3604,95 @@ mod tests {
         // Unregister the hook; no further calls.
         g.unregister_shed_hook(id);
         acc.charge(4 * MIB + 1);
-        assert_eq!(yellow_count.load(Ordering::Relaxed), 1, "hook not called after unregister");
+        assert_eq!(
+            yellow_count.load(Ordering::Relaxed),
+            1,
+            "hook not called after unregister"
+        );
+    }
+
+    /// A hook may unregister itself (or register another) without
+    /// deadlocking on the hook list.
+    #[test]
+    fn shed_hook_can_unregister_itself() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::AtomicUsize;
+        let g = leaked(4 * MIB, 8 * MIB, 64 * KIB);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let id_cell: &'static OnceLock<ShedHookId> = Box::leak(Box::new(OnceLock::new()));
+        let id = g.register_shed_hook(Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(&id) = id_cell.get() {
+                g.unregister_shed_hook(id);
+            }
+        }));
+        id_cell.set(id).unwrap();
+
+        let acc = g.register_isolate("one-shot");
+        acc.charge(4 * MIB + 1);
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        acc.charge(4 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Red);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one-shot hook ran once");
+    }
+
+    /// Back-to-back collections do not inflate the rate: the rate headroom
+    /// is at most the bytes allocated since the previous collection.
+    #[test]
+    fn rate_headroom_bounded_by_bytes_since_collection() {
+        let mut config = MemoryConfig::with_limits(1 << 40, 2 << 40).unwrap();
+        config.credit_chunk = 64 * KIB;
+        config.collection_target_interval_ms = 1000;
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        let acc = g.register_isolate("burst");
+        let collect = |acc: &IsolateAccount| {
+            let used = acc.used_bytes();
+            acc.release(used);
+            acc.record_collection(CollectionReport {
+                bytes_before: used,
+                bytes_after: 0,
+                bytes_returned: used,
+                duration: Duration::from_micros(1),
+            });
+        };
+        collect(&acc);
+        acc.charge(8 * MIB);
+        collect(&acc);
+        let target = acc.control().collection_target();
+        assert!(
+            target <= 8 * MIB,
+            "headroom {target} exceeds the 8 MiB allocated since the last collection"
+        );
+        assert!(target >= g.min_headroom());
+    }
+
+    /// The rate headroom never pushes the target past the soft limit.
+    #[test]
+    fn rate_headroom_capped_at_soft_limit() {
+        let mut config = MemoryConfig::with_limits(8 * MIB, 16 * MIB).unwrap();
+        config.credit_chunk = 64 * KIB;
+        config.collection_target_interval_ms = 60_000;
+        let g: &'static _ = Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ));
+        let acc = g.register_isolate("fast");
+        // Allocate and free 30 MiB in total: far more than the soft limit.
+        for _ in 0..5 {
+            acc.charge(6 * MIB);
+            acc.release(6 * MIB);
+        }
+        acc.record_collection(CollectionReport {
+            bytes_before: 6 * MIB,
+            bytes_after: 0,
+            bytes_returned: 6 * MIB,
+            duration: Duration::from_micros(1),
+        });
+        let target = acc.control().collection_target();
+        assert!(
+            target <= 8 * MIB,
+            "target {target} is above the 8 MiB soft limit"
+        );
     }
 }
