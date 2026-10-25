@@ -346,7 +346,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
 
     // GC safepoint at function application boundary — blocks if collection is in progress,
     // and initiates collection if one was requested (memory pressure).
-    crate::env::gc_roots::gc_safepoint(env);
+    crate::env::gc_roots::gc_safepoint(env)?;
 
     match callee {
         Value::NativeFunction(nf) => {

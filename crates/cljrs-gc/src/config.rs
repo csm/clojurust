@@ -10,16 +10,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// times the soft limit.  Process-wide limits belong to
 /// [`crate::governor::MemoryConfig`].
 ///
-/// The hard limit is **not enforced**: no allocation path checks it.  It is
-/// validated and reported, and the CLI forwards it to the process governor,
-/// which observes (but does not yet reject) allocations above it.
+/// The hard limit is not a per-heap limit: no heap allocation path checks it.
+/// It is validated and reported, and the CLI forwards it to the process
+/// governor, the only hard admission authority, which rejects allocations
+/// above it in strict mode (`CLJRS_MEMORY_STRICT=1`) and records them
+/// otherwise.
 ///
 /// Default values:
 /// - Hard limit: 1/4 of available RAM (or 256MB minimum)
 /// - Soft limit: 75% of hard limit
 #[derive(Debug, Clone)]
 pub struct GcConfig {
-    /// Hard memory limit in bytes. GC will be forced when exceeded.
+    /// Hard memory limit in bytes; validated and forwarded to the governor.
     hard_limit: usize,
     /// Soft memory limit in bytes. GC is triggered when exceeded.
     soft_limit: usize,
@@ -103,12 +105,6 @@ impl GcConfig {
     pub fn soft_limit_exceeded(&self, used: usize) -> bool {
         used > self.soft_limit
     }
-
-    /// Check if memory usage has exceeded the hard limit.  No allocation path
-    /// calls this; the hard limit is not enforced.
-    pub fn hard_limit_exceeded(&self, used: usize) -> bool {
-        used > self.hard_limit
-    }
 }
 
 impl Default for GcConfig {
@@ -119,7 +115,7 @@ impl Default for GcConfig {
 
 /// Get default hard limit: 1/4 of available RAM or 256MB minimum.
 ///
-/// This is the per-heap default, which is not enforced.  The process-wide
+/// This is the per-heap default, which no heap enforces.  The process-wide
 /// budget has its own default (`governor::default_hard_limit`: cgroup limit,
 /// else ½ of RAM), so the two can differ for the same run.
 fn default_hard_limit() -> usize {

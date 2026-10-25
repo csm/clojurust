@@ -429,6 +429,20 @@ installed by `cljrs-tx`.
   the original variant and its plain message (no `runtime error:` prefix) so
   `(catch :default e ..)` / `ex-message` / `ex-data` behave the same as for a
   user `throw` / `ex-info`. A `ValueError::Thrown` re-surfaces the exact value.
+  `ValueError::GasExhausted` and `ValueError::MemoryLimitExceeded` map to their
+  uncatchable `EvalError` counterparts (the latter also clears the thread's
+  runtime-fault slot).
+
+`EvalError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` (governor
+Phase 4, strict mode) reports a governed allocation the process governor
+refused when a collection did not bring committed memory back within the hard
+limit.  It is fixed-size, `try`/`catch` does not intercept it, and the
+tree-walker, the Tier-1 IR interpreter, and the native-code entry seams
+(`tiered::apply`, OSR) all report it the same way.  `callback::invoke` maps it
+to `ValueError::MemoryLimitExceeded` and confirms it in the runtime-fault slot,
+so a compiled caller that drops the error still reports it at the seam.  The
+error-value helpers above allocate with `GcPtr::new_critical`, so building an
+error may use the critical reserve.
 
 ### `gas` submodule
 
@@ -589,7 +603,8 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `root_value(val: &Value) -> ValueRootGuard` — registers a single `Value` pointer as a GC root
 - `root_values(vals: &[Value]) -> ValueRootGuard` — registers a slice of `Value` pointers as GC roots
 - `root_option_values(vals: &[Option<Value>]) -> OptionValueRootGuard` — registers an `Option<Value>` slice (e.g. IR register file)
-- `gc_safepoint(env: &Env)` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure
+- `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  Under `no-gc` only the fault check runs
+- `check_memory_fault() -> EvalResult<()>` — the fault check alone (used at the native-code entry seams)
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
 - `set_stw_reclaim_hook(f)` — registers a stop-the-world reclaim hook; multiple hooks may be registered and each runs (in registration order) inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked.  Registrants: the compiler's JIT code cache frees superseded native code (Phase 10.2); the `tiered` lowering worker sweeps idle Tier-1 IR (Phase 10.7)

@@ -417,6 +417,10 @@ fn call_jit_native(
     if gas_exhausted {
         return Err(crate::env::error::EvalError::GasExhausted);
     }
+    // A memory fault raised inside native code (a refused allocation in an
+    // `rt_*` bridge, or an interpreter error a callback could not carry)
+    // waits in its own slot; report it the way Tier 1 would.
+    crate::env::gc_roots::check_memory_fault()?;
     if let Some(thrown) = pending_exception {
         return Err(crate::env::error::EvalError::Thrown(thrown));
     }

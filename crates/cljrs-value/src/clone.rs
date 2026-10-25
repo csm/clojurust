@@ -70,8 +70,10 @@ pub enum CloneError {
     },
     /// The channel's receiver side has been dropped.
     Disconnected,
-    /// A byte-bounded channel (or the process memory governor) has no
-    /// room for the message.
+    /// The process memory governor refused the message's queue charge
+    /// (strict mode).
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+    /// A byte-bounded channel has no room for the message.
     Full {
         /// Wire size of the refused message.
         bytes: usize,
@@ -92,6 +94,7 @@ impl std::fmt::Display for CloneError {
                 )
             }
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
+            CloneError::MemoryLimitExceeded(e) => e.fmt(f),
             CloneError::Full {
                 bytes,
                 queued,
@@ -451,6 +454,7 @@ pub enum SerializedErrorKind {
     Unsupported,
     Other(String),
     GasExhausted,
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     OutOfRange,
     TransientAlreadyPersisted,
     Parse,
@@ -472,6 +476,7 @@ impl SerializedErrorKind {
             | SerializedErrorKind::OddMap { .. }
             | SerializedErrorKind::Unsupported
             | SerializedErrorKind::GasExhausted
+            | SerializedErrorKind::MemoryLimitExceeded(_)
             | SerializedErrorKind::OutOfRange
             | SerializedErrorKind::TransientAlreadyPersisted
             | SerializedErrorKind::Parse => 0,
@@ -713,6 +718,7 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
         ValueError::Unsupported => SerializedErrorKind::Unsupported,
         ValueError::Other(s) => SerializedErrorKind::Other(s.clone()),
         ValueError::GasExhausted => SerializedErrorKind::GasExhausted,
+        ValueError::MemoryLimitExceeded(e) => SerializedErrorKind::MemoryLimitExceeded(*e),
         ValueError::OutOfRange => SerializedErrorKind::OutOfRange,
         ValueError::TransientAlreadyPersisted => SerializedErrorKind::TransientAlreadyPersisted,
         ValueError::Parse => SerializedErrorKind::Parse,
@@ -900,6 +906,7 @@ fn deserialize_error(se: SerializedError) -> crate::error::ExceptionInfo {
         SerializedErrorKind::Unsupported => ValueError::Unsupported,
         SerializedErrorKind::Other(s) => ValueError::Other(s),
         SerializedErrorKind::GasExhausted => ValueError::GasExhausted,
+        SerializedErrorKind::MemoryLimitExceeded(e) => ValueError::MemoryLimitExceeded(e),
         SerializedErrorKind::OutOfRange => ValueError::OutOfRange,
         SerializedErrorKind::TransientAlreadyPersisted => ValueError::TransientAlreadyPersisted,
         SerializedErrorKind::Parse => ValueError::Parse,

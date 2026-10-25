@@ -299,7 +299,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             return Ok(fut);
         }
         let _args_root = crate::env::gc_roots::root_values(&args);
-        crate::env::gc_roots::gc_safepoint(env);
+        crate::env::gc_roots::gc_safepoint(env)?;
         return env.call_cljrs_fn(f.get(), &args);
     }
 
@@ -578,7 +578,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         let _args_root = crate::env::gc_roots::root_values(&current_args);
 
         // GC safepoint before entering function body
-        crate::env::gc_roots::gc_safepoint(&env);
+        crate::env::gc_roots::gc_safepoint(&env)?;
 
         env.push_frame();
 
@@ -1123,9 +1123,18 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 /// `reset!` on a shared-atom: promote the new value and store it atomically.
 /// Returns the (isolate-local) value that was written.
 fn shared_atom_reset(sa: &Arc<cljrs_value::SharedAtom>, new_val: Value) -> EvalResult {
-    let promoted = cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
-    sa.reset(promoted);
+    let promoted = cljrs_value::promote(&new_val).map_err(promote_error)?;
+    sa.try_reset(promoted)
+        .map_err(EvalError::MemoryLimitExceeded)?;
     Ok(new_val)
+}
+
+/// A failed promotion as an evaluation error: a memory refusal stays one.
+fn promote_error(e: cljrs_value::PromoteError) -> EvalError {
+    match e.memory {
+        Some(fault) => EvalError::MemoryLimitExceeded(fault),
+        None => EvalError::Runtime(e.to_string()),
+    }
 }
 
 /// `swap!` on a shared-atom: CAS-retry loop.  Loads the current value, demotes
@@ -1145,9 +1154,11 @@ fn shared_atom_swap(
         call_args.push(old_val);
         call_args.extend(extra.iter().cloned());
         let new_val = crate::env::apply::apply_value(f, call_args, env)?;
-        let promoted =
-            cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
-        if sa.compare_and_set(&cur, promoted) {
+        let promoted = cljrs_value::promote(&new_val).map_err(promote_error)?;
+        if sa
+            .try_compare_and_set(&cur, promoted)
+            .map_err(EvalError::MemoryLimitExceeded)?
+        {
             return Ok(new_val);
         }
         // Lost the race; another writer committed first. Re-read and retry.

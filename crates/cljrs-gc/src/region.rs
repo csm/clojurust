@@ -310,6 +310,23 @@ impl Region {
         crate::governor::with_registered_account(|a| a.retire_region(bytes));
     }
 
+    /// Bytes of the new chunk that allocating `layout` would charge, or
+    /// `None` when the current chunk has room.  A bounded region charges no
+    /// chunk to the governor (it reports exhaustion itself), so it also
+    /// returns `None`.
+    #[cfg(feature = "no-gc")]
+    pub(crate) fn chunk_needed(&self, layout: Layout) -> Option<usize> {
+        if self.byte_limit.is_some() {
+            return None;
+        }
+        let aligned = (self.ptr + layout.align() - 1) & !(layout.align() - 1);
+        if aligned + layout.size() <= self.end {
+            None
+        } else {
+            Some(DEFAULT_CHUNK_SIZE.max(layout.size() * 2))
+        }
+    }
+
     // ── internal ────────────────────────────────────────────────────────────
 
     /// Bump-allocate `layout.size()` bytes with `layout.align()` alignment.

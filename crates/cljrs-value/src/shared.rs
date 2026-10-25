@@ -38,7 +38,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use cljrs_gc::{GcPtr, MemoryCharge, MemoryClass, StaticGcPtr, governor};
+use cljrs_gc::{GcPtr, MemoryCharge, MemoryClass, MemoryLimitExceeded, StaticGcPtr, governor};
 
 use crate::intern::{intern_keyword, intern_symbol};
 use crate::keyword::Keyword;
@@ -51,16 +51,44 @@ use crate::value::Value;
 #[derive(Debug, Clone)]
 pub struct PromoteError {
     pub type_name: &'static str,
+    /// Set when the value is promotable but the governor refused its shared
+    /// allocation (strict mode).
+    pub memory: Option<MemoryLimitExceeded>,
 }
 
 impl PromoteError {
     pub fn not_promotable(type_name: &'static str) -> Self {
-        Self { type_name }
+        Self {
+            type_name,
+            memory: None,
+        }
+    }
+
+    /// The governor refused the shared allocation for a `type_name` value.
+    pub fn memory_limit(type_name: &'static str, error: MemoryLimitExceeded) -> Self {
+        Self {
+            type_name,
+            memory: Some(error),
+        }
+    }
+}
+
+impl PromoteError {
+    /// The `ValueError` a builtin reports for this failure: the memory
+    /// refusal itself, or `Other` with the message.
+    pub fn into_value_error(self) -> crate::error::ValueError {
+        match self.memory {
+            Some(limit) => crate::error::ValueError::MemoryLimitExceeded(limit),
+            None => crate::error::ValueError::Other(self.to_string()),
+        }
     }
 }
 
 impl std::fmt::Display for PromoteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(limit) = &self.memory {
+            return limit.fmt(f);
+        }
         write!(
             f,
             "value of type '{}' cannot be promoted to a shared-atom: \
@@ -132,13 +160,12 @@ const fn arc_bytes<T>() -> usize {
     2 * std::mem::size_of::<usize>() + std::mem::size_of::<T>()
 }
 
-/// Reserve `bytes` of shared-value memory.  The governor is observe-only
-/// until strict mode exists, so the reservation does not fail; `None` keeps
-/// the type ready for a refused reservation.
-fn reserve(bytes: usize) -> Option<MemoryCharge> {
-    governor()
-        .reserve_shared(MemoryClass::SharedValue, bytes)
-        .ok()
+/// Reserve `bytes` of shared-value memory for an infallible constructor.
+/// A strict-mode refusal raises the thread's runtime fault and charges the
+/// critical reserve (or past it, as a counted overrun) instead, like
+/// `GcPtr::new`; the returned charge always covers `bytes`.
+fn reserve(bytes: usize) -> MemoryCharge {
+    governor().reserve_infallible(MemoryClass::SharedValue, bytes)
 }
 
 /// Immutable byte buffer shared across isolates by `Arc` (`Value::ByteBlob`).
@@ -147,15 +174,42 @@ fn reserve(bytes: usize) -> Option<MemoryCharge> {
 /// isolates hold a reference.
 pub struct ByteBlob {
     bytes: Box<[u8]>,
-    charge: Option<MemoryCharge>,
+    charge: MemoryCharge,
 }
 
 impl ByteBlob {
     /// Take ownership of `bytes` and charge them to the governor.
+    /// Infallible: a strict-mode refusal raises the thread's runtime fault
+    /// (see [`Self::try_new`]).
     pub fn new(bytes: impl Into<Box<[u8]>>) -> Self {
         let bytes = bytes.into();
         let charge = reserve(arc_bytes::<ByteBlob>() + bytes.len());
         Self { bytes, charge }
+    }
+
+    /// Take ownership of `bytes` if the governor admits their charge.  On
+    /// refusal the buffer is dropped and the error returned.
+    pub fn try_new(bytes: impl Into<Box<[u8]>>) -> Result<Self, MemoryLimitExceeded> {
+        let bytes = bytes.into();
+        let charge = governor().reserve_shared(
+            MemoryClass::SharedValue,
+            arc_bytes::<ByteBlob>() + bytes.len(),
+        )?;
+        Ok(Self { bytes, charge })
+    }
+
+    /// Reserve a `len`-byte blob's charge before building its buffer, so a
+    /// refused blob never allocates.  `fill` builds the buffer.
+    pub fn try_with(
+        len: usize,
+        fill: impl FnOnce() -> Box<[u8]>,
+    ) -> Result<Self, MemoryLimitExceeded> {
+        let charge =
+            governor().reserve_shared(MemoryClass::SharedValue, arc_bytes::<ByteBlob>() + len)?;
+        Ok(Self {
+            bytes: fill(),
+            charge,
+        })
     }
 
     /// The buffer contents.
@@ -165,7 +219,7 @@ impl ByteBlob {
 
     /// Bytes charged to the governor for this blob.
     pub fn charged_bytes(&self) -> usize {
-        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+        self.charge.bytes()
     }
 }
 
@@ -205,18 +259,31 @@ impl std::fmt::Debug for ByteBlob {
 /// string it owns.  Byte-blob payloads are charged by the blob.
 pub struct SharedSlot {
     value: SharedValue,
-    charge: Option<MemoryCharge>,
+    charge: MemoryCharge,
 }
 
 impl SharedSlot {
-    /// Wrap `value` and charge its storage to the governor.
+    /// Wrap `value` and charge its storage to the governor.  Infallible: a
+    /// strict-mode refusal raises the thread's runtime fault (see
+    /// [`Self::try_new`]).
     pub fn new(value: SharedValue) -> Self {
-        let payload = match &value {
+        let charge = reserve(Self::bytes_for(&value));
+        Self { value, charge }
+    }
+
+    /// Wrap `value` if the governor admits its storage charge.
+    pub fn try_new(value: SharedValue) -> Result<Self, MemoryLimitExceeded> {
+        let charge =
+            governor().reserve_shared(MemoryClass::SharedValue, Self::bytes_for(&value))?;
+        Ok(Self { value, charge })
+    }
+
+    fn bytes_for(value: &SharedValue) -> usize {
+        let payload = match value {
             SharedValue::Str(s) => s.len(),
             _ => 0,
         };
-        let charge = reserve(arc_bytes::<SharedSlot>() + payload);
-        Self { value, charge }
+        arc_bytes::<SharedSlot>() + payload
     }
 
     /// The stored value.
@@ -226,7 +293,7 @@ impl SharedSlot {
 
     /// Bytes charged to the governor for this slot.
     pub fn charged_bytes(&self) -> usize {
-        self.charge.as_ref().map_or(0, MemoryCharge::bytes)
+        self.charge.bytes()
     }
 }
 
@@ -278,7 +345,9 @@ pub fn promote(value: &Value) -> Result<SharedValue, PromoteError> {
         }
         Value::ByteArray(arr) => {
             let bytes = arr.get().lock().unwrap();
-            let blob = ByteBlob::new(bytes.iter().map(|&b| b as u8).collect::<Vec<_>>());
+            // Reserve before copying, so a refused promotion builds nothing.
+            let blob = ByteBlob::try_with(bytes.len(), || bytes.iter().map(|&b| b as u8).collect())
+                .map_err(|e| PromoteError::memory_limit("byte-array", e))?;
             Ok(SharedValue::ByteBlob(Arc::new(blob)))
         }
         Value::ByteBlob(blob) => Ok(SharedValue::ByteBlob(blob.clone())),
@@ -336,6 +405,14 @@ impl SharedAtom {
         }
     }
 
+    /// Fallible [`Self::new`]: refuse if the governor cannot admit the slot.
+    pub fn try_new(val: SharedValue) -> Result<Self, MemoryLimitExceeded> {
+        Ok(Self {
+            cell: Arc::new(ArcSwap::new(Arc::new(SharedSlot::try_new(val)?))),
+            meta: Mutex::new(None),
+        })
+    }
+
     /// Load the current value.  Lock-free atomic load + refcount bump.
     pub fn deref_val(&self) -> Arc<SharedSlot> {
         self.cell.load_full()
@@ -346,6 +423,14 @@ impl SharedAtom {
         let arc = Arc::new(SharedSlot::new(val));
         self.cell.store(arc.clone());
         arc
+    }
+
+    /// Fallible [`Self::reset`]: the slot is reserved before it is
+    /// published, so a refusal leaves the current value unchanged.
+    pub fn try_reset(&self, val: SharedValue) -> Result<Arc<SharedSlot>, MemoryLimitExceeded> {
+        let arc = Arc::new(SharedSlot::try_new(val)?);
+        self.cell.store(arc.clone());
+        Ok(arc)
     }
 
     /// CAS-retry swap: apply `f` to the current value and store the result.
@@ -371,6 +456,18 @@ impl SharedAtom {
             .compare_and_swap(current, Arc::new(SharedSlot::new(new)));
         // The swap committed iff the value we replaced is the one we expected.
         std::ptr::eq(Arc::as_ptr(current), Arc::as_ptr(&prev))
+    }
+
+    /// Fallible [`Self::compare_and_set`]: the new slot is reserved before
+    /// the swap, so a refusal leaves the current value unchanged.
+    pub fn try_compare_and_set(
+        &self,
+        current: &Arc<SharedSlot>,
+        new: SharedValue,
+    ) -> Result<bool, MemoryLimitExceeded> {
+        let slot = Arc::new(SharedSlot::try_new(new)?);
+        let prev = self.cell.compare_and_swap(current, slot);
+        Ok(std::ptr::eq(Arc::as_ptr(current), Arc::as_ptr(&prev)))
     }
 }
 

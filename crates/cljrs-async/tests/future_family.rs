@@ -212,8 +212,38 @@ fn both_await_paths_report_cancellation_the_same_way() {
                     cljrs_async::state_machine::Readiness::Pending => "Pending".to_string(),
                     cljrs_async::state_machine::Readiness::GasExhausted =>
                         "GasExhausted".to_string(),
+                    cljrs_async::state_machine::Readiness::MemoryLimitExceeded(f) =>
+                        format!("MemoryLimitExceeded({f})"),
                 }
             ),
         }
+    });
+}
+
+/// A future whose body fails with a memory-limit fault keeps the fault: both
+/// `await` and the compiled-poll readiness check report it as the
+/// uncatchable `MemoryLimitExceeded`, never as a catchable thrown value.
+#[test]
+fn memory_limit_fault_survives_future_settlement() {
+    use cljrs_runtime::env::error::EvalError;
+    let fault = cljrs_gc::MemoryLimitExceeded {
+        class: cljrs_gc::MemoryClass::GcHeap,
+        requested: 4096,
+        committed: 1 << 20,
+        hard_limit: 1 << 20,
+    };
+    block_on_local(async move {
+        let f = cljrs_async::eval_async::spawn_future(async move {
+            Err(EvalError::MemoryLimitExceeded(fault))
+        });
+        let awaited = cljrs_async::eval_async::await_value(f.clone()).await;
+        assert!(
+            matches!(awaited, Err(EvalError::MemoryLimitExceeded(got)) if got == fault),
+            "await: {awaited:?}"
+        );
+        assert!(matches!(
+            cljrs_async::state_machine::check_ready(&f),
+            cljrs_async::state_machine::Readiness::MemoryLimitExceeded(got) if got == fault
+        ));
     });
 }

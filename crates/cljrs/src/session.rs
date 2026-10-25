@@ -22,16 +22,20 @@ use crate::native;
 /// limit is only that per-heap trigger; it does not reach the process-wide
 /// memory governor (`cljrs_gc::governor`), whose soft limit would otherwise
 /// sit at Yellow whenever several isolates each approach it.  A hard limit
-/// also sets the governor's budget (soft limit 75% of it), which is
-/// reported, but not yet enforced.  Without a hard limit the governor keeps
-/// its `CLJRS_MEMORY_*` or platform defaults.  A zero hard limit or a soft limit above the hard limit is
+/// also sets the governor's budget (soft limit 75% of it).  That budget is
+/// enforced only in strict mode (`CLJRS_MEMORY_STRICT=1`, which a hard limit
+/// keeps).  Without a hard limit the governor keeps its `CLJRS_MEMORY_*` or
+/// platform defaults.  A zero hard limit or a soft limit above the hard limit is
 /// rejected.
 pub fn build_gc_config(
     soft_limit_mb: Option<usize>,
     hard_limit_mb: Option<usize>,
 ) -> miette::Result<Arc<GcConfig>> {
     let (config, memory) = gc_limits(soft_limit_mb, hard_limit_mb)?;
-    if let Some(memory) = memory {
+    if let Some(mut memory) = memory {
+        // The flag came from the environment; the CLI limits replace only
+        // the budget.
+        memory.strict = cljrs_gc::governor().config().strict;
         cljrs_gc::governor()
             .configure(memory)
             .map_err(|e| miette::miette!("invalid GC limits: {e}"))?;
@@ -495,6 +499,7 @@ pub fn format_eval_error(e: EvalError) -> miette::Report {
         EvalError::NotCallable(s) => miette::miette!("Not a function: {}", s),
         EvalError::Runtime(msg) => miette::miette!("{}", msg),
         EvalError::GasExhausted => miette::miette!("gas exhausted"),
+        EvalError::MemoryLimitExceeded(fault) => miette::miette!("{fault}"),
         EvalError::ForbiddenEffect(operation) => {
             miette::miette!("effect forbidden in transaction function: {operation}")
         }

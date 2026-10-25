@@ -21,7 +21,7 @@ plus all persistent (immutable, structurally shared) collection types.  The
 src/
   lib.rs                         — module declarations and re-exports
   clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
-  error.rs                       — ValueError enum, ValueResult<T> alias
+  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
@@ -249,7 +249,10 @@ pub enum SharedValue {
 /// (`MemoryClass::SharedValue`) for its bytes, however many `Arc`s exist.
 pub struct ByteBlob { /* Box<[u8]>, Option<MemoryCharge> */ }
 impl ByteBlob {
-    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self   // strict refusal raises a runtime fault
+    pub fn try_new(bytes: impl Into<Box<[u8]>>) -> Result<Self, MemoryLimitExceeded>
+    pub fn try_with(len: usize, fill: impl FnOnce() -> Box<[u8]>)
+        -> Result<Self, MemoryLimitExceeded>          // reserves before building the buffer
     pub fn as_bytes(&self) -> &[u8]
     pub fn charged_bytes(&self) -> usize
 }
@@ -259,7 +262,8 @@ impl Deref<Target = [u8]> + AsRef<[u8]> + From<Vec<u8>> + From<&[u8]> for ByteBl
 /// `Arc` allocation and string payload.
 pub struct SharedSlot { /* SharedValue, Option<MemoryCharge> */ }
 impl SharedSlot {
-    pub fn new(value: SharedValue) -> Self
+    pub fn new(value: SharedValue) -> Self              // strict refusal raises a runtime fault
+    pub fn try_new(value: SharedValue) -> Result<Self, MemoryLimitExceeded>
     pub fn value(&self) -> &SharedValue
     pub fn charged_bytes(&self) -> usize
 }
@@ -272,10 +276,22 @@ pub struct SharedAtom {
 
 impl SharedAtom {
     pub fn new(val: SharedValue) -> Self
+    pub fn try_new(val: SharedValue) -> Result<Self, MemoryLimitExceeded>
     pub fn deref_val(&self) -> Arc<SharedSlot>      // atomic load
     pub fn reset(&self, val: SharedValue) -> Arc<SharedSlot>
+    pub fn try_reset(&self, val: SharedValue) -> Result<Arc<SharedSlot>, MemoryLimitExceeded>
     pub fn swap<F>(&self, f: F) -> Arc<SharedSlot>  // CAS-retry (closure form)
     pub fn compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue) -> bool
+    pub fn try_compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue)
+        -> Result<bool, MemoryLimitExceeded>
+}
+
+/// `memory` is set when the governor refused the shared allocation.
+pub struct PromoteError { pub type_name: &'static str, pub memory: Option<MemoryLimitExceeded> }
+impl PromoteError {
+    pub fn not_promotable(type_name: &'static str) -> Self
+    pub fn memory_limit(type_name: &'static str, error: MemoryLimitExceeded) -> Self
+    pub fn into_value_error(self) -> ValueError   // MemoryLimitExceeded or Other(message)
 }
 
 pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
@@ -287,7 +303,10 @@ closures, resources, atoms, …).  `demote` converts back into a fresh
 isolate-local `Value`.  `compare_and_set` is the single lock-free CAS that
 backs the Clojure-level `compare-and-set!` and the `swap!` retry loop (callers
 that must run interpreter code between load and store use it instead of the
-closure-based `swap`).
+closure-based `swap`).  The `try_*` forms reserve the new slot before they
+publish it, so a strict-mode refusal leaves the atom's value unchanged; the
+runtime's `shared-atom`, `reset!`, `swap!`, and `compare-and-set!` use them.
+Promoting a byte array reserves its blob before copying the bytes.
 
 #### Var roots — two-tier, promote-on-`def` (issue #171)
 
@@ -635,7 +654,8 @@ pub struct CljxPromise {
 }
 
 pub struct CljxFuture {
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Cancelled
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted
+                                    // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
 
@@ -768,6 +788,8 @@ pub enum CloneError {
     Disconnected,
     /// A byte-bounded isolate channel has no room for the message.
     Full { bytes: usize, queued: usize, limit: usize },
+    /// The strict process governor refused the message's queue charge.
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,

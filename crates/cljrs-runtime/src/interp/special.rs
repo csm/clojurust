@@ -766,7 +766,7 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
 
         // GC safepoint on every loop iteration so tight recur loops
         // don't starve the collector.
-        crate::env::gc_roots::gc_safepoint(env);
+        crate::env::gc_roots::gc_safepoint(env)?;
 
         // Under no-gc: push a fresh scratch region for this iteration.
         // Intermediates allocated in the body land here and are freed
@@ -1092,6 +1092,10 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
         }
         Err(EvalError::GasExhausted) => {
             result = Err(EvalError::GasExhausted);
+            None
+        }
+        Err(EvalError::MemoryLimitExceeded(fault)) => {
+            result = Err(EvalError::MemoryLimitExceeded(fault));
             None
         }
         Err(other) => Some(other),
@@ -2512,6 +2516,10 @@ fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
                     FutureState::GasExhausted => {
                         f.get().mark_observed();
                         return Err(EvalError::GasExhausted);
+                    }
+                    FutureState::MemoryLimitExceeded(fault) => {
+                        f.get().mark_observed();
+                        return Err(EvalError::MemoryLimitExceeded(*fault));
                     }
                     FutureState::Cancelled => {
                         return Err(EvalError::Thrown(CljxFuture::cancelled_error()));

@@ -11,9 +11,9 @@ fixed **64 MB** soft limit instead of consulting total system RAM.
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
 `docs/archive/no-gc-plan.md`) — implemented.  B3 (`StaticGcPtr`, `static_alloc`) —
 implemented.  Process memory governor
-(`docs/managed-memory-governor-plan.md`) — Phases 0–3 (observe-only
-accounting with chunked allocation credit, plus region, shared-value,
-message-queue, static, and code memory) implemented.
+(`docs/managed-memory-governor-plan.md`) — Phases 0–4 (chunked allocation
+credit; region, shared-value, message-queue, static, and code memory;
+fallible allocation and opt-in strict hard-limit admission) implemented.
 
 ---
 
@@ -81,6 +81,7 @@ src/
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
   governor.rs     — process-wide managed-memory governor: MemoryConfig,
                     ProcessMemoryGovernor, IsolateAccount, IsolateControl,
+                    strict admission, critical sections, runtime-fault slot,
                     MemoryCharge, MemorySnapshot, pressure policy; region
                     chunk, permanent (static), and queue-wait accounting
   stats.rs        — process-global GcStats counters: GC allocations,
@@ -92,6 +93,8 @@ tests/
                     collection requests, credit returned by collection
                     and thread exit, idle capacity borrowed by an active
                     isolate
+  no_gc_strict.rs — (no-gc mode) strict admission: fallible allocation uses
+                    charged chunks at the hard limit and refuses new ones
   no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
                     ScratchGuard, StaticCtxGuard, InvocationGuard,
                     pop_for_return protocol, nested guards, destructor ordering
@@ -154,7 +157,9 @@ engine.
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
 impl<T: Trace + 'static> GcPtr<T> {
-    pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc)
+    pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc); infallible
+    pub fn try_new(value: T) -> Result<Self, AllocError<T>>  // strict governor may refuse
+    pub fn new_critical(value: T) -> Self  // may use the critical reserve; never faults
     pub fn get(&self) -> &T             // borrow; invalid after collect frees it
     pub fn ptr_eq(a: &Self, b: &Self) -> bool
 
@@ -166,7 +171,24 @@ impl<T: Trace + 'static> GcPtr<T> {
 }
 impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
+
+/// A refused allocation; owns the value that was not allocated.
+pub struct AllocError<T> { /* value, error */ }
+impl<T> AllocError<T> {
+    pub fn error(&self) -> MemoryLimitExceeded;
+    pub fn into_inner(self) -> T;
+    pub fn into_parts(self) -> (T, MemoryLimitExceeded);
+}
+// Debug, Display, Error; From<AllocError<T>> for MemoryLimitExceeded
 ```
+
+`try_new` asks the thread's account for the object's bytes before the object
+exists (`governor::try_reserve_current`).  In `no-gc` builds it asks only when
+the active region or the static arena must add a chunk
+(`Region::chunk_needed`, `StaticArena::try_alloc` / `try_alloc_val`), so an
+object that fits in memory already charged is never refused.  `new` cannot refuse: in strict
+mode a refused allocation takes the critical reserve and raises the thread's
+runtime fault, which the interpreter resolves at its next safepoint.
 
 ### `StaticGcPtr<T: 'static>` (always available — Phase B3)
 
@@ -187,6 +209,8 @@ impl<T: 'static> Clone for StaticGcPtr<T> { /* O(1) NonNull copy */ }
 /// Allocate `value` as program-lifetime memory.
 /// no-gc: StaticArena bump-alloc; GC: Box::leak.
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+/// Fallible form: the strict governor may refuse `size_of::<T>()`.
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>>;
 ```
 
 ### Free functions
@@ -194,6 +218,7 @@ pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
 ```rust
 // always:
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>>;
 
 // no-gc only:
 pub fn static_arena() -> &'static StaticArena;
@@ -337,24 +362,29 @@ dangle; `GcHeap::collect` traces them as roots alongside the active stack.
 Every isolate keeps its private heap; the governor owns counters, pressure
 policy, and thread-safe control handles.  Each isolate allocates from local
 credit that the governor grants in chunks; granted credit counts as committed.
-**Observe-only:** no grant is refused; a grant that ends above the hard limit
-is counted as an over-limit event.  Region chunks use the same local credit
+**Observe-only by default:** no grant is refused; a grant that ends above the
+hard limit is counted as an over-limit event.  **Strict mode**
+(`MemoryConfig::strict`, `CLJRS_MEMORY_STRICT=1`) refuses application grants
+that would take committed bytes above the hard limit; see *Strict admission*
+below.  Region chunks use the same local credit
 and are reported under `Region`.  Shared values (`cljrs-value`), queued
 isolate-channel messages (`cljrs-async`), and JIT code (`cljrs-compiler`) hold
 a `MemoryCharge`; static allocations are recorded with `charge_permanent`.
 
 ```rust
 pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime }
-pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard
+pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard (or strict refusal)
+pub enum Admission { Application, Critical }    // <= hard, <= hard + critical reserve
 
 pub const DEFAULT_CREDIT_CHUNK: usize;             // 64 KiB
 pub const DEFAULT_RETAINED_CREDIT_CHUNKS: usize;   // 2
 pub const ACCOUNTING_UNIT: usize;                  // 4 KiB; rounding for large grants
 pub const MIN_COLLECTION_HEADROOM: usize;          // 1 MiB
+pub const STRICT_ENV: &str;                         // "CLJRS_MEMORY_STRICT"
 
 pub struct MemoryConfig { pub soft_limit, pub hard_limit, pub critical_reserve,
                           pub credit_chunk, pub retained_credit_chunks,
-                          pub queue_limit }   // bytes, except the chunk count
+                          pub queue_limit, pub strict }   // bytes, except the chunk count
 impl MemoryConfig {
     pub fn with_limits(soft: usize, hard: usize) -> Result<Self, MemoryConfigError>;
     pub fn from_optional_limits(soft: Option<usize>, hard: Option<usize>)
@@ -377,8 +407,20 @@ impl ProcessMemoryGovernor {
     pub fn config(&self) -> MemoryConfig;
     pub fn register_isolate(&'static self, name: impl Into<Arc<str>>) -> IsolateAccount;
     pub fn reserve_shared(&'static self, class: MemoryClass, bytes: usize)
-        -> Result<MemoryCharge, MemoryLimitExceeded>;   // never Err while observe-only
-    pub fn charge_permanent(&self, class: MemoryClass, bytes: usize);  // never returned
+        -> Result<MemoryCharge, MemoryLimitExceeded>;   // Err only in strict mode
+    pub fn reserve_critical(&'static self, class: MemoryClass, bytes: usize)
+        -> Result<MemoryCharge, MemoryLimitExceeded>;   // may use the critical reserve
+    pub fn reserve_reported(&'static self, class: MemoryClass, bytes: usize)
+        -> MemoryCharge;                                // never refused (JIT code)
+    pub fn reserve_infallible(&'static self, class: MemoryClass, bytes: usize)
+        -> MemoryCharge;   // always the full size; a strict refusal raises a fault and
+                           // uses the reserve, or overruns it (counted)
+    pub fn charge_permanent(&'static self, class: MemoryClass, bytes: usize);  // never returned;
+                                                        // a strict refusal raises a fault
+    pub fn try_charge_permanent(&'static self, class: MemoryClass, bytes: usize)
+        -> Result<(), MemoryLimitExceeded>;
+    pub fn is_strict(&self) -> bool;
+    pub fn within_hard_limit(&self) -> bool;
     pub fn record_queue_wait(&self, waited: Duration);
     pub fn record_queue_rejection(&self);
     pub fn class_bytes(&self, class: MemoryClass) -> usize;
@@ -394,6 +436,8 @@ pub struct IsolateAccount { /* single-threaded (!Sync) Cells */ }
 // Drop: returns used bytes, region bytes, and free credit, unregisters.
 impl IsolateAccount {
     pub fn charge(&self, bytes: usize);   // thread-local until credit runs out, then refills
+    pub fn try_reserve_credit(&self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
+    pub fn try_charge(&self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
     pub fn release(&self, bytes: usize);  // sweep: used bytes become free credit
     pub fn charge_region(&self, bytes: usize);                  // new region chunk
     pub fn retire_region(&self, bytes: usize);                  // active -> retired
@@ -429,10 +473,12 @@ impl IsolateControl {
 pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub duration }
 pub struct MemoryCharge;   // RAII; Drop returns its bytes once
 pub struct MemoryLimitExceeded { pub class, pub requested, pub committed, pub hard_limit }
-pub struct MemorySnapshot { /* limits, pressure, committed/used/free credit and peaks,
-                               per class, per isolate, transitions, requests,
-                               refills, returned credit, recalls, over-limit events,
-                               retired region bytes, queue waits and rejections */ }
+pub struct MemorySnapshot { /* strict flag, limits, pressure, committed/used/free
+                               credit and peaks, per class, per isolate, transitions,
+                               requests, refills, returned credit, recalls, over-limit
+                               events, retired region bytes, queue waits and rejections,
+                               rejected reservations/bytes, critical grants, reserve
+                               overruns, runtime faults raised and cleared */ }
 pub struct IsolateSnapshot { /* per-isolate counters */ }
 
 // Calling thread:
@@ -441,6 +487,21 @@ pub fn with_current_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R
 pub fn with_registered_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R>;  // never registers
 pub fn current_control() -> Option<Arc<IsolateControl>>;
 pub fn snapshot() -> MemorySnapshot;   // flushes this thread's account first
+pub fn try_reserve_current(bytes: usize) -> Result<(), MemoryLimitExceeded>;
+
+// Critical sections (calling thread):
+pub struct CriticalSection;            // guard; !Send; nests
+pub fn enter_critical() -> CriticalSection;
+pub fn with_critical<R>(f: impl FnOnce() -> R) -> R;
+pub fn critical_active() -> bool;
+
+// Runtime-fault slot (calling thread; fixed-size, never allocates):
+pub fn raise_runtime_fault(fault: MemoryLimitExceeded);    // keeps the first; asks to collect
+pub fn confirm_runtime_fault(fault: MemoryLimitExceeded);  // delivered unconditionally
+pub fn runtime_fault_possible() -> bool;                    // one relaxed global load
+pub fn pending_runtime_fault() -> Option<MemoryLimitExceeded>;
+pub fn take_runtime_fault() -> Option<MemoryLimitExceeded>;
+pub fn resolve_runtime_fault() -> Option<MemoryLimitExceeded>;  // clears if back within limit
 ```
 
 `GcHeap::alloc` charges the thread's account; `GcHeap::collect` releases the
@@ -477,6 +538,21 @@ at once, because a `no-gc` isolate has no collection to trim it.
 
 Static: `static_alloc` records `size_of::<T>()` in GC builds; the `no-gc`
 `StaticArena` records each chunk.
+
+Strict admission: `admit` commits a grant with a compare-and-swap on the
+committed counter, so concurrent requests never commit past the bound.  An
+application grant must keep committed bytes at or below the hard limit; a
+critical one (inside a `CriticalSection`, `reserve_critical`, `new_critical`)
+at or below the hard limit plus the critical reserve.  A refused credit chunk
+is retried at the exact shortfall.  A refusal changes no counter, counts as a
+rejected reservation, logs at `info`, holds pressure at `Red` until a normal
+chunk fits again, and requests collection.  Fallible callers get the
+`MemoryLimitExceeded`.  An infallible charge (`GcPtr::new`, region chunks,
+`charge_permanent`) raises the thread's runtime fault and takes the shortfall
+from the critical reserve; if the reserve is exhausted too, it is admitted
+anyway and counted as a reserve overrun (logged at `warn`).  The runtime
+resolves the fault at its next safepoint: after collecting, it continues if
+committed bytes are within the hard limit and fails the evaluation otherwise.
 
 Gaps: the isolate heap is not torn down at thread exit, so
 `IsolateAccount::drop` stops counting bytes that stay allocated until process

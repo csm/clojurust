@@ -20,9 +20,10 @@ pub mod alloc_ctx;
 pub mod static_arena;
 
 pub use governor::{
-    IsolateAccount, IsolateControl, MemoryCharge, MemoryClass, MemoryConfig, MemoryConfigError,
-    MemoryLimitExceeded, MemorySnapshot, PressureLevel, ProcessMemoryGovernor, governor,
-    register_current_isolate,
+    Admission, CriticalSection, IsolateAccount, IsolateControl, MemoryCharge, MemoryClass,
+    MemoryConfig, MemoryConfigError, MemoryLimitExceeded, MemorySnapshot, PressureLevel,
+    ProcessMemoryGovernor, enter_critical, governor, register_current_isolate,
+    resolve_runtime_fault, with_critical,
 };
 pub use stats::{
     CLJRS_GC_STATS_ENV, GC_STATS, GcStats, GcStatsSnapshot, dump_stats_from_env,
@@ -329,7 +330,57 @@ pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 #[cfg(not(feature = "no-gc"))]
 pub(crate) const REGION_PTR_TAG: usize = 1;
 
+/// A governed allocation the process governor refused.  Returns ownership of
+/// the value, so dropping the error releases whatever memory it owns.
+pub struct AllocError<T> {
+    value: T,
+    error: MemoryLimitExceeded,
+}
+
+impl<T> AllocError<T> {
+    /// The refusal.
+    pub fn error(&self) -> MemoryLimitExceeded {
+        self.error
+    }
+
+    /// Take back the value that was not allocated.
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    /// Split into the value and the refusal.
+    pub fn into_parts(self) -> (T, MemoryLimitExceeded) {
+        (self.value, self.error)
+    }
+}
+
+impl<T> std::fmt::Debug for AllocError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> std::fmt::Display for AllocError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<T> std::error::Error for AllocError<T> {}
+
+impl<T> From<AllocError<T>> for MemoryLimitExceeded {
+    fn from(e: AllocError<T>) -> Self {
+        e.error
+    }
+}
+
 impl<T: Trace + 'static> GcPtr<T> {
+    /// Allocate `value`.  Infallible: in strict mode a refused allocation
+    /// uses the critical reserve and raises the thread's runtime fault,
+    /// which the next evaluation safepoint resolves (see
+    /// [`governor`](crate::governor) and [`Self::try_new`]).
     #[cfg(not(feature = "no-gc"))]
     pub fn new(value: T) -> Self {
         gc_full::HEAP.alloc(value)
@@ -338,6 +389,37 @@ impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(feature = "no-gc")]
     pub fn new(value: T) -> Self {
         alloc_ctx::alloc_in_ctx(value)
+    }
+
+    /// Allocate `value`, or return it with the refusal if the process
+    /// governor cannot admit its bytes.  The governor is consulted before
+    /// the object exists; a refusal changes no counter.  Observe-only mode
+    /// never refuses.
+    ///
+    /// In `no-gc` builds the governor is asked only when the active region
+    /// or the static arena must add a chunk; an object that fits in memory
+    /// already charged is never refused.
+    pub fn try_new(value: T) -> Result<Self, AllocError<T>> {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            let bytes = std::mem::size_of::<GcBox<T>>() + value.gc_size_extra();
+            match governor::try_reserve_current(bytes) {
+                Ok(()) => Ok(Self::new(value)),
+                Err(error) => Err(AllocError { value, error }),
+            }
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            alloc_ctx::try_alloc_in_ctx(value)
+        }
+    }
+
+    /// Allocate `value` for runtime control work (error reporting, shutdown):
+    /// the allocation may use the critical reserve and never raises a
+    /// runtime fault.
+    pub fn new_critical(value: T) -> Self {
+        let _section = governor::enter_critical();
+        Self::new(value)
     }
 
     /// The untagged `GcBox<T>` address.  In GC builds this masks off the
@@ -490,6 +572,29 @@ impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
 /// Either way the governor records the bytes under `MemoryClass::Static`
 /// (arena chunks in `no-gc` builds; `size_of::<T>()` in GC builds).
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
+    static_alloc_inner(value)
+}
+
+/// Fallible [`static_alloc`]: return the value with the refusal if the
+/// governor cannot admit it.  In `no-gc` builds the governor is asked only
+/// when the arena must add a chunk.
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>> {
+    #[cfg(not(feature = "no-gc"))]
+    {
+        match governor::governor()
+            .try_charge_permanent(governor::MemoryClass::Static, std::mem::size_of::<T>())
+        {
+            Ok(()) => Ok(StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))),
+            Err(error) => Err(AllocError { value, error }),
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    {
+        static_arena::static_arena().try_alloc_val(value)
+    }
+}
+
+fn static_alloc_inner<T: 'static>(value: T) -> StaticGcPtr<T> {
     #[cfg(feature = "no-gc")]
     {
         static_arena::static_alloc_val(value)

@@ -28,8 +28,9 @@ use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
     Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq,
     MapValue, MultiFn, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentQueue, PersistentVector, ProtocolFn, SharedAtom, SortedSet, Symbol,
-    Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
+    PersistentList, PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom,
+    SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote,
+    promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -6178,8 +6179,9 @@ fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
 /// promoted immediately; non-promotable values (closures, native resources,
 /// isolate-bound collections) are rejected here rather than at first write.
 fn builtin_shared_atom(args: &[Value]) -> ValueResult<Value> {
-    let sv = promote(&args[0]).map_err(|e| ValueError::Other(e.to_string()))?;
-    Ok(Value::SharedAtom(std::sync::Arc::new(SharedAtom::new(sv))))
+    let sv = promote(&args[0]).map_err(PromoteError::into_value_error)?;
+    let atom = SharedAtom::try_new(sv).map_err(ValueError::MemoryLimitExceeded)?;
+    Ok(Value::SharedAtom(std::sync::Arc::new(atom)))
 }
 
 /// `(shared-atom? x)` — true iff `x` is a `shared-atom`.
@@ -6310,6 +6312,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                         f.get().mark_observed();
                         Err(ValueError::GasExhausted)
                     }
+                    FutureState::MemoryLimitExceeded(fault) => {
+                        f.get().mark_observed();
+                        Err(ValueError::MemoryLimitExceeded(*fault))
+                    }
                     FutureState::Cancelled => {
                         Err(ValueError::Thrown(CljxFuture::cancelled_error()))
                     }
@@ -6331,6 +6337,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             FutureState::GasExhausted => {
                                 f.get().mark_observed();
                                 Err(ValueError::GasExhausted)
+                            }
+                            FutureState::MemoryLimitExceeded(fault) => {
+                                f.get().mark_observed();
+                                Err(ValueError::MemoryLimitExceeded(*fault))
                             }
                             FutureState::Cancelled => {
                                 Err(ValueError::Thrown(CljxFuture::cancelled_error()))
@@ -6355,6 +6365,10 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
                             f.get().mark_observed();
                             return Err(ValueError::GasExhausted);
                         }
+                        FutureState::MemoryLimitExceeded(fault) => {
+                            f.get().mark_observed();
+                            return Err(ValueError::MemoryLimitExceeded(*fault));
+                        }
                         FutureState::Cancelled => {
                             return Err(ValueError::Thrown(CljxFuture::cancelled_error()));
                         }
@@ -6378,8 +6392,8 @@ fn builtin_reset_bang(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().reset(args[1].clone())),
         Value::SharedAtom(sa) => {
-            let sv = promote(&args[1]).map_err(|e| ValueError::Other(e.to_string()))?;
-            sa.reset(sv);
+            let sv = promote(&args[1]).map_err(PromoteError::into_value_error)?;
+            sa.try_reset(sv).map_err(ValueError::MemoryLimitExceeded)?;
             Ok(args[1].clone())
         }
         v => Err(ValueError::WrongType {
@@ -8330,8 +8344,11 @@ fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
             if demote(&cur) != args[1] {
                 return Ok(Value::Bool(false));
             }
-            let sv = promote(&args[2]).map_err(|e| ValueError::Other(e.to_string()))?;
-            Ok(Value::Bool(sa.compare_and_set(&cur, sv)))
+            let sv = promote(&args[2]).map_err(PromoteError::into_value_error)?;
+            let swapped = sa
+                .try_compare_and_set(&cur, sv)
+                .map_err(ValueError::MemoryLimitExceeded)?;
+            Ok(Value::Bool(swapped))
         }
         v => Err(ValueError::WrongType {
             expected: "atom",

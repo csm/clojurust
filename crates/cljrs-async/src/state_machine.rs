@@ -119,6 +119,8 @@ pub enum Readiness {
     Failed(Value),
     /// The awaited computation exhausted its evaluation budget.
     GasExhausted,
+    /// The awaited computation failed with a managed-memory limit fault.
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
 
 /// Check whether an awaited value has resolved, without blocking.  Mirrors
@@ -139,6 +141,10 @@ pub fn check_ready(val: &Value) -> Readiness {
             FutureState::GasExhausted => {
                 f.get().mark_observed();
                 Readiness::GasExhausted
+            }
+            FutureState::MemoryLimitExceeded(fault) => {
+                f.get().mark_observed();
+                Readiness::MemoryLimitExceeded(*fault)
             }
             // Same catchable error the tree-walking `await` raises, so a
             // `catch` around `(await f)` sees one shape whether or not the
@@ -195,6 +201,11 @@ impl Future for CompiledAsyncTask {
             cljrs_runtime::env::callback::install_eval_context_guard(globals.clone(), ns.clone())
         });
         let code = (this.sm.poll_fn)(sm_ptr);
+        // A memory-limit fault (from an awaited future, or raised by the
+        // compiled body) waits in its own slot; it outranks the poll code.
+        if let Some(fault) = cljrs_gc::resolve_runtime_fault() {
+            return Poll::Ready(Err(EvalError::MemoryLimitExceeded(fault)));
+        }
         // The poll function reports its result in-band via `pending` (a plain,
         // GC-rooted `Value`), so completion is a safe field read — no raw
         // FFI-provenance pointer is dereferenced here.
@@ -359,6 +370,10 @@ mod tests {
                     POLL_THREW
                 }
                 Readiness::GasExhausted => POLL_GAS_EXHAUSTED,
+                Readiness::MemoryLimitExceeded(fault) => {
+                    cljrs_gc::governor::confirm_runtime_fault(fault);
+                    POLL_THREW
+                }
             },
             _ => POLL_PENDING,
         }
