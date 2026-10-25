@@ -3,6 +3,7 @@ pub mod hash_map;
 pub mod hash_set;
 pub mod list;
 pub mod queue;
+mod share_charge;
 pub mod sorted_map;
 pub mod sorted_set;
 pub mod transient_map;

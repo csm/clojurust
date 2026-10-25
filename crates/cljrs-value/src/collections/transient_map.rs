@@ -114,7 +114,7 @@ impl cljrs_gc::Trace for TransientMap {
 
     fn gc_size_extra(&self) -> usize {
         let map = self.map.lock().unwrap();
-        map.gc_size_extra()
+        map.full_size_extra()
     }
 }
 

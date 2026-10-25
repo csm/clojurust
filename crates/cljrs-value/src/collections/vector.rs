@@ -1,4 +1,5 @@
 use crate::Value;
+use crate::collections::share_charge::{ShareCharge, vector_path_bytes};
 
 /// An immutable persistent vector backed by `rpds::Vector`.
 ///
@@ -8,10 +9,15 @@ use crate::Value;
 /// exactly like vectors (equality, hashing, printing, indexing) — the tag
 /// only answers `map-entry?` — and, as in Clojure, any derived vector
 /// (`conj`, `assoc`, `pop`, ...) is a plain vector again.
+///
+/// A vector derived by `conj`, `assoc_nth`, or `pop` from a GC-allocated
+/// vector reports only its path-copied trie nodes from `gc_size_extra`; see
+/// `collections::share_charge` for the full rule.
 #[derive(Debug, Clone)]
 pub struct PersistentVector {
     inner: rpds::VectorSync<Value>,
     is_map_entry: bool,
+    charge: ShareCharge,
 }
 
 impl PersistentVector {
@@ -19,6 +25,7 @@ impl PersistentVector {
         Self {
             inner: rpds::VectorSync::new_sync(),
             is_map_entry: false,
+            charge: ShareCharge::full(),
         }
     }
 
@@ -26,6 +33,7 @@ impl PersistentVector {
         Self {
             inner: vector,
             is_map_entry: false,
+            charge: ShareCharge::full(),
         }
     }
 
@@ -37,6 +45,7 @@ impl PersistentVector {
         Self {
             inner,
             is_map_entry: true,
+            charge: ShareCharge::full(),
         }
     }
 
@@ -55,10 +64,7 @@ impl PersistentVector {
 
     /// Append a value. O(log n) amortized.
     pub fn conj(&self, val: Value) -> Self {
-        Self {
-            inner: self.inner.push_back(val),
-            is_map_entry: false,
-        }
+        self.derived(self.inner.push_back(val))
     }
 
     /// Return the element at `idx`, or `None` if out of bounds.
@@ -76,19 +82,40 @@ impl PersistentVector {
         if idx == self.inner.len() {
             Some(self.conj(val))
         } else {
-            Some(Self {
-                inner: self.inner.set(idx, val)?,
-                is_map_entry: false,
-            })
+            Some(self.derived(self.inner.set(idx, val)?))
         }
     }
 
     /// Remove the last element. Returns `None` if empty.
     pub fn pop(&self) -> Option<Self> {
-        Some(Self {
-            inner: self.inner.drop_last()?,
+        Some(self.derived(self.inner.drop_last()?))
+    }
+
+    /// Wrap `inner`, produced by one path-copying update of `self.inner`.
+    fn derived(&self, inner: rpds::VectorSync<Value>) -> Self {
+        let len = inner.len().max(self.inner.len());
+        Self {
+            charge: self.charge.derive(
+                self.inner.len(),
+                inner.len(),
+                vector_path_bytes::<Value>(len),
+            ),
+            inner,
             is_map_entry: false,
-        })
+        }
+    }
+
+    /// Estimated bytes owned by this vector if it shared no trie nodes.
+    fn full_size_extra(&self) -> usize {
+        // Per element: Arc<T> allocation (16 overhead) + thin ptr in leaf node (8).
+        self.inner.len() * (24 + std::mem::size_of::<Value>())
+    }
+
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
     }
 
     /// Iterate over elements in index order.
@@ -110,6 +137,7 @@ impl std::iter::FromIterator<Value> for PersistentVector {
         Self {
             inner: v,
             is_map_entry: false,
+            charge: ShareCharge::full(),
         }
     }
 }
@@ -131,9 +159,7 @@ impl cljrs_gc::Trace for PersistentVector {
     }
 
     fn gc_size_extra(&self) -> usize {
-        // Per element: Arc<T> allocation (16 overhead) + thin ptr in leaf node (8).
-        let n = self.inner.len();
-        n * (24 + std::mem::size_of::<Value>())
+        self.charge.on_alloc(self.full_size_extra())
     }
 }
 
@@ -238,5 +264,76 @@ mod tests {
         let v = PersistentVector::from_iter((0..10).map(|i| int(i as i64)));
         let items: Vec<_> = v.iter().cloned().collect();
         assert_eq!(items, (0..10).map(|i| int(i as i64)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn conj_on_allocated_vector_charges_log_n() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
+
+        let path = vector_path_bytes::<Value>;
+        let mut charges = Vec::new();
+        for n in [1_000usize, 100_000] {
+            let base = PersistentVector::from_iter((0..n as i64).map(int));
+            let full = base.full_size_extra();
+            let mut cur = GcPtr::new(base);
+            assert_eq!(cur.get().charged(), full);
+            // Stay below 2n so no step re-charges the whole vector.
+            for i in 0..500 {
+                let next = GcPtr::new(cur.get().conj(int(i)));
+                let charge = next.get().charged();
+                assert_eq!(charge, path(n + i as usize + 1));
+                assert!(charge * 50 < full, "n={n}: {charge} vs full {full}");
+                cur = next;
+            }
+            charges.push(cur.get().charged());
+        }
+        // 100x the elements costs one or two extra trie levels per step.
+        assert!(charges[1] <= 2 * charges[0], "{charges:?}");
+    }
+
+    #[test]
+    fn assoc_and_pop_on_allocated_vector_charge_log_n() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
+
+        let v = GcPtr::new(PersistentVector::from_iter((0..10_000).map(int)));
+        let set = v.get().assoc_nth(5, int(-1)).unwrap();
+        assert_eq!(set.charged(), vector_path_bytes::<Value>(10_000));
+        let popped = v.get().pop().unwrap();
+        assert_eq!(popped.charged(), vector_path_bytes::<Value>(10_000));
+    }
+
+    #[test]
+    fn conj_chain_recharges_in_full_on_doubling() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
+
+        let mut cur = GcPtr::new(PersistentVector::from_iter((0..100).map(int)));
+        let mut full_at = Vec::new();
+        for i in 100..1_000 {
+            let next = GcPtr::new(cur.get().conj(int(i)));
+            if next.get().charged() == next.get().full_size_extra() {
+                full_at.push(next.get().count());
+            }
+            cur = next;
+        }
+        assert_eq!(full_at, vec![200, 400, 800]);
+    }
+
+    #[test]
+    fn unallocated_builder_chain_is_charged_in_full() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        // A Rust-side loop whose intermediates never reach the GC heap owns
+        // every node of its result.
+        let mut v = PersistentVector::empty();
+        for i in 0..1_000 {
+            v = v.conj(int(i));
+        }
+        assert_eq!(v.charged(), v.full_size_extra());
+        // A clone shares its source's nodes and may outlive it.
+        let shared = cljrs_gc::GcPtr::new(v);
+        let copy = shared.get().clone();
+        assert_eq!(copy.charged(), copy.full_size_extra());
     }
 }

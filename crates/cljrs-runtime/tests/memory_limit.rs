@@ -57,10 +57,11 @@ fn exercise(mode: ExecutionMode) {
         Value::keyword(Keyword::simple("done"))
     );
 
-    // `cons` cells: a persistent vector's accounted size counts every element
-    // for each version, which would make each `conj` a large allocation.
-    let retained = "(loop* [acc nil i 0] \
-                      (if (< i 20000000) (recur (cons (str i) acc) (inc i)) i))";
+    // A growing vector: each `conj` is charged its path-copied trie nodes,
+    // not the whole vector, so the limit is reached by retained data rather
+    // than by one large refused allocation per step.
+    let retained = "(loop* [acc [] i 0] \
+                      (if (< i 20000000) (recur (conj acc (str i)) (inc i)) i))";
     match eval(retained, &mut env) {
         Err(EvalError::MemoryLimitExceeded(fault)) => {
             assert_eq!(fault.hard_limit, hard);

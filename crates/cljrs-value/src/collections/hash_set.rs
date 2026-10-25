@@ -1,4 +1,5 @@
 use crate::Value;
+use crate::collections::share_charge::{ShareCharge, hamt_path_bytes, rb_path_bytes};
 use rpds::{HashTrieMapSync, RedBlackTreeMapSync};
 
 /// An immutable hash set that preserves insertion order when iterated.
@@ -10,11 +11,16 @@ use rpds::{HashTrieMapSync, RedBlackTreeMapSync};
 /// rather than depending on hash-bucket layout — `rpds` seeds its hasher
 /// randomly per instance, so raw hash-order iteration would otherwise vary
 /// from run to run.
+///
+/// A set derived by `conj` or `disj` from a GC-allocated set reports only its
+/// path-copied nodes from `gc_size_extra`; see `collections::share_charge`
+/// for the full rule.
 #[derive(Debug, Clone)]
 pub struct PersistentHashSet {
     index: HashTrieMapSync<Value, u64>,
     order: RedBlackTreeMapSync<u64, Value>,
     next_seq: u64,
+    charge: ShareCharge,
 }
 
 impl PersistentHashSet {
@@ -23,6 +29,7 @@ impl PersistentHashSet {
             index: HashTrieMapSync::new_sync(),
             order: RedBlackTreeMapSync::new_sync(),
             next_seq: 0,
+            charge: ShareCharge::full(),
         }
     }
 
@@ -43,13 +50,15 @@ impl PersistentHashSet {
     /// If `val` is already present, its original insertion position is kept.
     pub fn conj(&self, val: Value) -> Self {
         if self.index.contains_key(&val) {
-            return self.clone();
+            return self.unchanged();
         }
         let seq = self.next_seq;
+        let n = self.count();
         Self {
             index: self.index.insert(val.clone(), seq),
             order: self.order.insert(seq, val),
             next_seq: seq + 1,
+            charge: self.charge.derive(n, n + 1, Self::path_bytes(n + 1)),
         }
     }
 
@@ -59,6 +68,7 @@ impl PersistentHashSet {
             self.index.insert_mut(val.clone(), seq);
             self.order.insert_mut(seq, val);
             self.next_seq = seq + 1;
+            self.charge = ShareCharge::full();
         }
         self
     }
@@ -66,13 +76,47 @@ impl PersistentHashSet {
     /// Return a new set with `val` removed.
     pub fn disj(&self, val: &Value) -> Self {
         match self.index.get(val) {
-            Some(seq) => Self {
-                index: self.index.remove(val),
-                order: self.order.remove(seq),
-                next_seq: self.next_seq,
-            },
-            None => self.clone(),
+            Some(seq) => {
+                let n = self.count();
+                Self {
+                    index: self.index.remove(val),
+                    order: self.order.remove(seq),
+                    next_seq: self.next_seq,
+                    charge: self.charge.derive(n, n - 1, Self::path_bytes(n)),
+                }
+            }
+            None => self.unchanged(),
         }
+    }
+
+    /// A copy returned by an update that changed nothing; it shares every node.
+    fn unchanged(&self) -> Self {
+        let n = self.count();
+        Self {
+            index: self.index.clone(),
+            order: self.order.clone(),
+            next_seq: self.next_seq,
+            charge: self.charge.derive(n, n, 0),
+        }
+    }
+
+    /// Bytes path-copied in both trees by inserting or removing one element.
+    fn path_bytes(n: usize) -> usize {
+        hamt_path_bytes::<(Value, u64)>(n) + rb_path_bytes::<(u64, Value)>(n)
+    }
+
+    /// Estimated bytes owned by this set if it shared no nodes.
+    pub(crate) fn full_size_extra(&self) -> usize {
+        // Per entry: index HashTrieMap entry (~40) + order RedBlackTree node
+        // (~48), value stored inline in the order tree (not behind GcPtr).
+        self.count() * (88 + std::mem::size_of::<Value>())
+    }
+
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
     }
 
     /// Iterate over all elements in insertion order.
@@ -108,10 +152,7 @@ impl cljrs_gc::Trace for PersistentHashSet {
     }
 
     fn gc_size_extra(&self) -> usize {
-        // Per entry: index HashTrieMap entry (~40) + order RedBlackTree node
-        // (~48), value stored inline in the order tree (not behind GcPtr).
-        let n = self.index.size();
-        n * (88 + std::mem::size_of::<Value>())
+        self.charge.on_alloc(self.full_size_extra())
     }
 }
 
@@ -165,5 +206,22 @@ mod tests {
             .conj(int(1));
         let iterated: Vec<Value> = s.iter().cloned().collect();
         assert_eq!(iterated, vec![int(10), int(3), int(7), int(1)]);
+    }
+
+    #[test]
+    fn conj_on_allocated_set_charges_path_bytes() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
+
+        let s = GcPtr::new(PersistentHashSet::from_iter((0..10_000).map(int)));
+        let added = s.get().conj(int(-1));
+        assert_eq!(added.charged(), PersistentHashSet::path_bytes(10_001));
+        assert!(added.charged() * 100 < s.get().full_size_extra());
+        // A no-op conj shares every node.
+        assert_eq!(s.get().conj(int(5)).charged(), 1);
+        // A set built by `conj_mut` owns all of its nodes.
+        let mut built = PersistentHashSet::empty();
+        built.conj_mut(int(1));
+        assert_eq!(built.charged(), built.full_size_extra());
     }
 }

@@ -92,7 +92,7 @@ impl cljrs_gc::Trace for TransientSet {
 
     fn gc_size_extra(&self) -> usize {
         let set = self.set.lock().unwrap();
-        set.gc_size_extra()
+        set.full_size_extra()
     }
 }
 

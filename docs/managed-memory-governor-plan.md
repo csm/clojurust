@@ -387,6 +387,14 @@ At `Red`, process pressure overrides local zero-yield suppression.
 GC heap accounting uses the size in `GcBoxHeader`.
 Allocation consumes isolate credit, and sweep returns it.
 
+Persistent vectors, hash maps, hash sets, sorted maps, and sorted sets share nodes between versions.
+A version derived by one update from a GC-allocated version is charged only its path-copied nodes, which is O(log n).
+A version built wholesale, cloned, or derived from a version that never reached the heap is charged its full size.
+A derived version is also charged in full when its count reaches twice that of its nearest fully charged ancestor.
+A loop of `conj` calls therefore charges O(n) element bytes in total plus O(log n) bytes per step.
+A surviving version whose fully charged ancestor was collected is under-counted by less than twice that ancestor's charge.
+`cljrs-value`'s `collections/share_charge.rs` holds the rule.
+
 The implementation must remove the unused hard-limit logic from `GcHeap`.
 The process governor becomes the only hard admission authority.
 
@@ -738,9 +746,8 @@ Phase 4 decisions that later phases must keep or replace:
 - `Yellow` and `Red` collection requests are unchanged; a refusal latches `Red` only while a normal chunk does not fit.
 - In `no-gc` builds `try_new` and `try_static_alloc` ask the governor only when the active region or the static arena must add a chunk (`Region::chunk_needed`, `StaticArena::try_alloc`); an object that fits in memory already charged is never refused.
 - The final Clojure representation of `MemoryLimitExceeded` remains deferred; Clojure code cannot catch it.
-- `PersistentVector::gc_size_extra` (and similar persistent-collection estimates) charges every element for each new version, ignoring structural sharing.
-  Under strict mode a growing persistent vector therefore reaches the limit with much less real data, and each `conj` near the limit is a large refused allocation followed by a collection.
-  Accounting for shared structure belongs to a later change; `crates/cljrs-runtime/tests/memory_limit.rs` retains `cons` cells for this reason.
+- Persistent vectors, hash maps, hash sets, sorted maps, and sorted sets charge a derived version only its path-copied nodes (see "GC heap" under memory classes).
+  A growing vector under strict mode therefore reaches the limit by retained data, and `crates/cljrs-runtime/tests/memory_limit.rs` retains one with `conj`.
 - The heap shutdown pass is still not assigned to a phase.
 
 #### Phase 2 benchmark

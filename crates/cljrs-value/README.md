@@ -41,6 +41,7 @@ src/
     hash_set.rs                  — PersistentHashSet (same index+ordering-log technique as PersistentHashMap)
     list.rs                      — PersistentList (singly-linked cons list)
     queue.rs                     — PersistentQueue (front-list + rear-vector)
+    share_charge.rs              — (crate-private) ShareCharge: per-version gc_size_extra charge for structurally shared collections (full size, or path-copied nodes when derived from a GC-allocated version); vector/HAMT/red-black path-size estimates
     vector.rs                    — PersistentVector (32-way trie + tail buffer)
     hamt/
       mod.rs                     — re-exports Node and bitmap helpers
@@ -451,7 +452,27 @@ impl TransientSet {
 All three implement `Default`, `Clone`, `ClojureHash`, and `Trace`.
 
 All collection Trace impls also override `gc_size_extra` to report the heap
-bytes owned by each collection beyond the GcBox struct.  Approximations used:
+bytes owned by each collection beyond the GcBox struct.  The table gives the
+**full** charge.  `PersistentVector`, `PersistentHashMap`, `PersistentHashSet`,
+`SortedMap`, and `SortedSet` instead charge only their path-copied nodes —
+O(log n), see `vector_path_bytes`, `hamt_path_bytes`, and `rb_path_bytes` in
+`share_charge.rs` — when the version was derived by one update (`conj`,
+`assoc`, `assoc_nth`, `dissoc`, `disj`, `pop`, or a no-op of these) from a
+version already allocated behind a `GcPtr`, because that parent's box already
+accounts for the shared nodes.  They charge the full amount when:
+
+- built wholesale (`empty`, `from_iter`, `from_pairs`, `from_vector`,
+  `map_entry`, an in-place `conj_mut`) or cloned;
+- derived from a version that was never GC-allocated (a Rust-side builder
+  loop), since the result then owns every node;
+- the count reaches twice that of the nearest fully charged ancestor, so a
+  chain of `n` updates charges O(n) element bytes in total plus O(log n) per
+  step, and a collection cannot grow past twice the size last admitted in
+  full.
+
+When a fully charged ancestor is collected, a surviving derived version is
+under-counted by less than twice that ancestor's full charge.  Each box still
+returns exactly its own stored header size when swept.  Approximations used:
 
 | Type | Formula |
 |------|---------|
@@ -460,7 +481,8 @@ bytes owned by each collection beyond the GcBox struct.  Approximations used:
 | `PersistentHashSet` | `n × (88 + size_of::<Value>())` |
 | `PersistentVector` | `n × (24 + size_of::<Value>())` |
 | `SortedMap` | `n × (40 + 2×size_of::<Value>())` |
-| `TransientMap/Set` | same as HashMap/Set (locked at alloc) |
+| `SortedSet` | `n × (40 + size_of::<Value>())` |
+| `TransientMap/Set` | full HashMap/Set charge of the inner map (locked at alloc) |
 | `TransientVector` | same as Vector (locked at alloc) |
 | `ObjectArray` | `capacity × size_of::<Value>()` |
 | Primitive arrays | `capacity × size_of::<T>()` |
