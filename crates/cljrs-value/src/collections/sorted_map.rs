@@ -63,6 +63,13 @@ impl SortedMap {
         self.inner.size() * (40 + 2 * std::mem::size_of::<Value>())
     }
 
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
+    }
+
     /// Iterate over all `(key, value)` pairs in sorted key order.
     pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
         self.inner.iter()
@@ -151,14 +158,12 @@ mod tests {
 
     #[test]
     fn assoc_on_allocated_map_charges_path_bytes() {
-        use cljrs_gc::{GcPtr, Trace};
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
 
         let m = GcPtr::new(SortedMap::from_pairs((0..10_000).map(|i| (int(i), int(i)))));
         let added = m.get().assoc(int(-1), int(0));
-        assert_eq!(
-            added.gc_size_extra(),
-            rb_path_bytes::<(Value, Value)>(10_001)
-        );
-        assert!(added.gc_size_extra() * 100 < m.get().full_size_extra());
+        assert_eq!(added.charged(), rb_path_bytes::<(Value, Value)>(10_001));
+        assert!(added.charged() * 100 < m.get().full_size_extra());
     }
 }

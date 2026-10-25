@@ -130,6 +130,13 @@ impl PersistentHashMap {
         self.count() * (88 + 2 * std::mem::size_of::<Value>())
     }
 
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
+    }
+
     /// Iterate over all `(key, value)` pairs in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
         self.order.iter().map(|(_, (k, v))| (k, v))
@@ -326,23 +333,16 @@ mod tests {
 
     #[test]
     fn assoc_on_allocated_map_charges_path_bytes() {
-        use cljrs_gc::Trace;
-
+        let _alloc = crate::collections::share_charge::alloc_scope();
         let m = GcPtr::new(PersistentHashMap::from_pairs(
             (0..10_000).map(|i| (int(i), int(i))),
         ));
         let added = m.get().assoc(int(-1), int(0));
-        assert_eq!(added.gc_size_extra(), PersistentHashMap::path_bytes(10_001));
+        assert_eq!(added.charged(), PersistentHashMap::path_bytes(10_001));
         let replaced = m.get().assoc(int(5), int(0));
-        assert_eq!(
-            replaced.gc_size_extra(),
-            rb_path_bytes::<OrderEntry>(10_000)
-        );
+        assert_eq!(replaced.charged(), rb_path_bytes::<OrderEntry>(10_000));
         let removed = m.get().dissoc(&int(5));
-        assert_eq!(
-            removed.gc_size_extra(),
-            PersistentHashMap::path_bytes(10_000)
-        );
-        assert!(removed.gc_size_extra() * 100 < m.get().full_size_extra());
+        assert_eq!(removed.charged(), PersistentHashMap::path_bytes(10_000));
+        assert!(removed.charged() * 100 < m.get().full_size_extra());
     }
 }

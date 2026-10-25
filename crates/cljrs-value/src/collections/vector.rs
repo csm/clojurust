@@ -111,6 +111,13 @@ impl PersistentVector {
         self.inner.len() * (24 + std::mem::size_of::<Value>())
     }
 
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
+    }
+
     /// Iterate over elements in index order.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
@@ -261,7 +268,8 @@ mod tests {
 
     #[test]
     fn conj_on_allocated_vector_charges_log_n() {
-        use cljrs_gc::{GcPtr, Trace};
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
 
         let path = vector_path_bytes::<Value>;
         let mut charges = Vec::new();
@@ -269,16 +277,16 @@ mod tests {
             let base = PersistentVector::from_iter((0..n as i64).map(int));
             let full = base.full_size_extra();
             let mut cur = GcPtr::new(base);
-            assert_eq!(cur.get().gc_size_extra(), full);
+            assert_eq!(cur.get().charged(), full);
             // Stay below 2n so no step re-charges the whole vector.
             for i in 0..500 {
                 let next = GcPtr::new(cur.get().conj(int(i)));
-                let charge = next.get().gc_size_extra();
+                let charge = next.get().charged();
                 assert_eq!(charge, path(n + i as usize + 1));
                 assert!(charge * 50 < full, "n={n}: {charge} vs full {full}");
                 cur = next;
             }
-            charges.push(cur.get().gc_size_extra());
+            charges.push(cur.get().charged());
         }
         // 100x the elements costs one or two extra trie levels per step.
         assert!(charges[1] <= 2 * charges[0], "{charges:?}");
@@ -286,24 +294,26 @@ mod tests {
 
     #[test]
     fn assoc_and_pop_on_allocated_vector_charge_log_n() {
-        use cljrs_gc::{GcPtr, Trace};
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
 
         let v = GcPtr::new(PersistentVector::from_iter((0..10_000).map(int)));
         let set = v.get().assoc_nth(5, int(-1)).unwrap();
-        assert_eq!(set.gc_size_extra(), vector_path_bytes::<Value>(10_000));
+        assert_eq!(set.charged(), vector_path_bytes::<Value>(10_000));
         let popped = v.get().pop().unwrap();
-        assert_eq!(popped.gc_size_extra(), vector_path_bytes::<Value>(10_000));
+        assert_eq!(popped.charged(), vector_path_bytes::<Value>(10_000));
     }
 
     #[test]
     fn conj_chain_recharges_in_full_on_doubling() {
-        use cljrs_gc::{GcPtr, Trace};
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
 
         let mut cur = GcPtr::new(PersistentVector::from_iter((0..100).map(int)));
         let mut full_at = Vec::new();
         for i in 100..1_000 {
             let next = GcPtr::new(cur.get().conj(int(i)));
-            if next.get().gc_size_extra() == next.get().full_size_extra() {
+            if next.get().charged() == next.get().full_size_extra() {
                 full_at.push(next.get().count());
             }
             cur = next;
@@ -313,18 +323,17 @@ mod tests {
 
     #[test]
     fn unallocated_builder_chain_is_charged_in_full() {
-        use cljrs_gc::Trace;
-
+        let _alloc = crate::collections::share_charge::alloc_scope();
         // A Rust-side loop whose intermediates never reach the GC heap owns
         // every node of its result.
         let mut v = PersistentVector::empty();
         for i in 0..1_000 {
             v = v.conj(int(i));
         }
-        assert_eq!(v.gc_size_extra(), v.full_size_extra());
+        assert_eq!(v.charged(), v.full_size_extra());
         // A clone shares its source's nodes and may outlive it.
         let shared = cljrs_gc::GcPtr::new(v);
         let copy = shared.get().clone();
-        assert_eq!(copy.gc_size_extra(), copy.full_size_extra());
+        assert_eq!(copy.charged(), copy.full_size_extra());
     }
 }

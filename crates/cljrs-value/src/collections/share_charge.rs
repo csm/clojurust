@@ -139,6 +139,19 @@ pub(crate) fn rb_path_bytes<E>(len: usize) -> usize {
     (2 * log2 + 3) * NODE + ARC_HEADER + std::mem::size_of::<E>()
 }
 
+/// Makes `GcPtr::new` in a test go through an allocator that calls
+/// `gc_size_extra`: the GC heap, or under `no-gc` a scratch region (the
+/// `no-gc` static arena never sizes its values). Bind it before any `GcPtr`
+/// the test creates; dropping it frees what the region holds.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn alloc_scope() -> impl Sized {
+    #[cfg(feature = "no-gc")]
+    {
+        cljrs_gc::alloc_ctx::ScratchGuard::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

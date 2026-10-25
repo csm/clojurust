@@ -64,6 +64,13 @@ impl SortedSet {
         self.inner.size() * (40 + std::mem::size_of::<Value>())
     }
 
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
+    }
+
     /// Iterate over all elements in sorted order
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
@@ -159,11 +166,12 @@ mod tests {
 
     #[test]
     fn conj_on_allocated_set_charges_path_bytes() {
-        use cljrs_gc::{GcPtr, Trace};
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        use cljrs_gc::GcPtr;
 
         let s = GcPtr::new(SortedSet::from_iter((0..10_000).map(int)));
         let added = s.get().conj(int(-1));
-        assert_eq!(added.gc_size_extra(), rb_path_bytes::<Value>(10_001));
-        assert!(added.gc_size_extra() * 100 < s.get().full_size_extra());
+        assert_eq!(added.charged(), rb_path_bytes::<Value>(10_001));
+        assert!(added.charged() * 100 < s.get().full_size_extra());
     }
 }
