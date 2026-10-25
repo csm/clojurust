@@ -22,7 +22,7 @@ pub mod static_arena;
 pub use governor::{
     Admission, CriticalSection, IsolateAccount, IsolateControl, MemoryCharge, MemoryClass,
     MemoryConfig, MemoryConfigError, MemoryLimitExceeded, MemorySnapshot, PressureLevel,
-    ProcessMemoryGovernor, enter_critical, governor, register_current_isolate,
+    ProcessMemoryGovernor, ShedHookId, enter_critical, governor, register_current_isolate,
     resolve_runtime_fault, with_critical,
 };
 pub use stats::{
