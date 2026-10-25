@@ -372,6 +372,12 @@ fn interpret_ir_inner(
         }
     }
 
+    // Scope this call's heap allocations in an alloc frame, as the
+    // tree-walker's `call_cljrs_fn` does: the result is moved out before the
+    // frame drops and re-rooted by the caller, with no safepoint in between.
+    // Each loop back-edge releases the frame (see `RecurJump` below).
+    let alloc_frame = cljrs_gc::push_alloc_frame();
+
     // Build a block index for O(1) lookup.
     // In the common case (dense sequential IDs), this is None and we use
     // block_id.0 directly as the index — no allocation at all.
@@ -476,6 +482,12 @@ fn interpret_ir_inner(
                 current_block_idx = resolve(target);
             }
             Terminator::RecurJump { target, args: _ } => {
+                // Every value live across the back-edge is in the register
+                // file, which is rooted for the whole call, so the previous
+                // iterations' allocations need no alloc-frame roots: release
+                // them so the dead intermediates are collectable.
+                alloc_frame.release();
+
                 // GC safepoint at loop back-edge.
                 crate::env::gc_roots::gc_safepoint(env)?;
 

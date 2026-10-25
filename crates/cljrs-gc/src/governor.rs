@@ -880,6 +880,10 @@ pub struct CollectionReport {
     /// Bytes freed by sweep.  They become free credit, and the account
     /// returns the credit above its retained limit to the governor.
     pub bytes_returned: usize,
+    /// Bytes of unreachable objects that sweep kept for their one cycle of
+    /// grace.  They are included in `bytes_after`, but the next collection
+    /// frees them, so they do not count as surviving.
+    pub bytes_pending: usize,
     /// Mark plus sweep time.
     pub duration: Duration,
 }
@@ -1269,8 +1273,11 @@ impl IsolateAccount {
     /// - `surviving / 2` (legacy heuristic, when the interval is zero), or
     /// - [`ProcessMemoryGovernor::min_headroom`].
     ///
-    /// After a zero-yield collection, headroom uses `surviving` as a floor
-    /// instead of `surviving / 2`.  The heap's own trigger is its `GcConfig`.
+    /// `surviving` is `bytes_after` minus `bytes_pending`: objects kept only
+    /// for their grace cycle are freed by the next collection.  After a
+    /// zero-yield collection (nothing freed and nothing pending), headroom
+    /// uses `surviving` as a floor instead of `surviving / 2`.  The heap's own
+    /// trigger is its `GcConfig`.
     pub fn record_collection(&self, report: CollectionReport) {
         let c = &self.control;
         c.last_collection_epoch.fetch_add(1, Ordering::Relaxed);
@@ -1284,6 +1291,9 @@ impl IsolateAccount {
         );
         let min = self.governor.min_headroom();
         let after = report.bytes_after;
+        // Grace-period objects are garbage the next collection frees: size
+        // the target from the bytes that actually survived.
+        let surviving = after.saturating_sub(report.bytes_pending);
 
         // Compute headroom from the allocation rate if an interval is configured.
         let rate_headroom: usize = {
@@ -1316,14 +1326,14 @@ impl IsolateAccount {
         self.alloc_since_collection.set(0);
         self.collection_started.set(Instant::now());
 
-        let headroom = if report.bytes_returned == 0 {
+        let headroom = if report.bytes_returned == 0 && report.bytes_pending == 0 {
             c.zero_yield_collections.fetch_add(1, Ordering::Relaxed);
-            rate_headroom.max(after).max(min)
+            rate_headroom.max(surviving).max(min)
         } else {
-            rate_headroom.max(after / 2).max(min)
+            rate_headroom.max(surviving / 2).max(min)
         };
         c.collection_target
-            .store(after.saturating_add(headroom), Ordering::Relaxed);
+            .store(surviving.saturating_add(headroom), Ordering::Relaxed);
         self.service_recall();
         self.sync();
         self.governor.evaluate(Some(c), false);
@@ -2742,6 +2752,7 @@ mod tests {
             bytes_before: before,
             bytes_after: after,
             bytes_returned: before - after,
+            bytes_pending: 0,
             duration: Duration::from_micros(1),
         }
     }
@@ -3016,6 +3027,36 @@ mod tests {
         assert_eq!(acc.free_credit_bytes(), 0, "Red retains no credit");
         assert_eq!(g.committed_bytes(), 0);
         assert_eq!(g.pressure(), PressureLevel::Green);
+    }
+
+    /// A collection that frees nothing but leaves garbage in its grace cycle
+    /// is not zero-yield: the target excludes the pending bytes, so the
+    /// follow-up collection that frees them is requested at once.
+    #[test]
+    fn pending_bytes_request_the_follow_up_collection() {
+        let g = leaked(4 * MIB, 8 * MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge(5 * MIB);
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        assert!(acc.control().take_collection_request());
+
+        let used = acc.used_bytes();
+        acc.record_collection(CollectionReport {
+            bytes_before: used,
+            bytes_after: used,
+            bytes_returned: 0,
+            bytes_pending: used - MIB,
+            duration: Duration::from_micros(1),
+        });
+        assert_eq!(
+            acc.control().zero_yield_collections.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(acc.control().collection_target(), MIB + g.min_headroom());
+        assert!(
+            acc.control().take_collection_request(),
+            "pending garbage requests the next collection"
+        );
     }
 
     #[test]
@@ -3446,6 +3487,7 @@ mod tests {
             bytes_before: used,
             bytes_after: 0,
             bytes_returned: used,
+            bytes_pending: 0,
             duration: Duration::from_millis(1),
         });
         // Short sleep to make elapsed > 0, then charge 1 MiB more and collect
@@ -3458,6 +3500,7 @@ mod tests {
             bytes_before: used2,
             bytes_after: 0,
             bytes_returned: used2,
+            bytes_pending: 0,
             duration: Duration::from_millis(1),
         });
         // The target must be ≥ MIN_COLLECTION_HEADROOM.
@@ -3512,6 +3555,7 @@ mod tests {
             bytes_before: used,
             bytes_after: used,
             bytes_returned: 0,
+            bytes_pending: 0,
             duration: Duration::from_micros(1),
         });
         small.charge(64 * KIB);
@@ -3596,6 +3640,7 @@ mod tests {
             bytes_before: used,
             bytes_after: 0,
             bytes_returned: used,
+            bytes_pending: 0,
             duration: Duration::from_micros(1),
         });
         assert_eq!(g.pressure(), PressureLevel::Green);
@@ -3654,6 +3699,7 @@ mod tests {
                 bytes_before: used,
                 bytes_after: 0,
                 bytes_returned: used,
+                bytes_pending: 0,
                 duration: Duration::from_micros(1),
             });
         };
@@ -3687,6 +3733,7 @@ mod tests {
             bytes_before: 6 * MIB,
             bytes_after: 0,
             bytes_returned: 6 * MIB,
+            bytes_pending: 0,
             duration: Duration::from_micros(1),
         });
         let target = acc.control().collection_target();
