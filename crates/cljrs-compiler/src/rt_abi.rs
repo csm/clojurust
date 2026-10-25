@@ -3825,7 +3825,13 @@ pub unsafe extern "C" fn rt_try(
                 // Unwind any regions opened inside the try body.
                 unwind_regions_to(region_depth, rt_region_depth);
                 // Body returned a ValueError (e.g. thrown via interpreter).
-                if matches!(&val_err, cljrs_value::ValueError::GasExhausted) {
+                // Neither gas exhaustion nor a memory-limit fault is
+                // catchable; the fault stays in its slot for the entry seam.
+                if matches!(
+                    &val_err,
+                    cljrs_value::ValueError::GasExhausted
+                        | cljrs_value::ValueError::MemoryLimitExceeded(_)
+                ) {
                     rt_const_nil()
                 } else if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {
@@ -4999,6 +5005,15 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
             2
         }
         Readiness::GasExhausted => cljrs_async::state_machine::POLL_GAS_EXHAUSTED,
+        // The poll ABI has no memory-fault code: report a throw and confirm
+        // the fault in its slot, which the async task checks after every
+        // poll before it looks at the code.
+        Readiness::MemoryLimitExceeded(fault) => {
+            cljrs_gc::governor::confirm_runtime_fault(fault);
+            sm.pending =
+                cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault).to_error_value();
+            cljrs_async::state_machine::POLL_THREW
+        }
     }
 }
 

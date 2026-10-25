@@ -20,7 +20,8 @@ use std::cell::RefCell;
 
 use crate::region::Region;
 use crate::static_arena::static_arena;
-use crate::{GcPtr, Trace};
+use crate::{AllocError, GcBox, GcPtr, Trace};
+use std::alloc::Layout;
 
 pub(crate) enum AllocCtx {
     /// Allocate in the global static arena (program-lifetime).
@@ -51,6 +52,28 @@ pub(crate) fn alloc_in_ctx<T: Trace + 'static>(value: T) -> GcPtr<T> {
             Some(AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr)) => {
                 // SAFETY: The Region pointer is valid while the owning ScratchGuard is live.
                 unsafe { &mut **ptr }.alloc(value)
+            }
+        }
+    })
+}
+
+/// Fallible [`alloc_in_ctx`]: the governor is asked only when the active
+/// region or the static arena needs a new chunk, so an allocation that fits
+/// in memory already charged is never refused.
+pub(crate) fn try_alloc_in_ctx<T: Trace + 'static>(value: T) -> Result<GcPtr<T>, AllocError<T>> {
+    ALLOC_CTX.with(|ctx| {
+        let ctx = ctx.borrow();
+        match ctx.last() {
+            None | Some(AllocCtx::Static) => static_arena().try_alloc(value),
+            Some(AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr)) => {
+                // SAFETY: The Region pointer is valid while the owning ScratchGuard is live.
+                let region = unsafe { &mut **ptr };
+                if let Some(bytes) = region.chunk_needed(Layout::new::<GcBox<T>>())
+                    && let Err(error) = crate::governor::try_reserve_current(bytes)
+                {
+                    return Err(AllocError { value, error });
+                }
+                Ok(region.alloc(value))
             }
         }
     })

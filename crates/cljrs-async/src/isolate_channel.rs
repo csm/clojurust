@@ -161,18 +161,21 @@ impl IsolateSender {
     ///
     /// Returns `Err(CloneError::NotShareable { .. })` if `v` contains a
     /// non-shareable type (mutable state, closures, native resources),
-    /// `Err(CloneError::Disconnected)` if the receiver has been dropped, and
-    /// `Err(CloneError::Full { .. })` if the message does not fit.
+    /// `Err(CloneError::Disconnected)` if the receiver has been dropped,
+    /// `Err(CloneError::Full { .. })` if the message does not fit, and
+    /// `Err(CloneError::MemoryLimitExceeded(_))` if the strict process
+    /// governor refuses its queue charge.
     pub fn send(&self, v: &Value) -> Result<(), CloneError> {
         self.try_send(v)
     }
 
     /// Serialize `v` and enqueue it, or return `CloneError::Full` when the
-    /// channel's byte limit (or the process governor) has no room for it.
+    /// channel's byte limit has no room for it (`MemoryLimitExceeded` when
+    /// the strict process governor refuses it).
     pub fn try_send(&self, v: &Value) -> Result<(), CloneError> {
         let sv = serialize_metered(v)?;
         self.enqueue(sv).map_err(|(_, e)| {
-            if matches!(e, CloneError::Full { .. }) {
+            if is_rejection(&e) {
                 governor().record_queue_rejection();
             }
             e
@@ -182,7 +185,9 @@ impl IsolateSender {
     /// Serialize `v` and enqueue it, waiting while the channel is full.
     ///
     /// A message larger than the channel's whole limit can never fit, so it
-    /// returns `CloneError::Full` at once.
+    /// returns `CloneError::Full` at once.  A strict-governor refusal
+    /// (`CloneError::MemoryLimitExceeded`) also returns at once: the
+    /// governor has no capacity wakeup to wait on.
     pub async fn send_async(&self, v: &Value) -> Result<(), CloneError> {
         let mut sv = serialize_metered(v)?;
         let mut waiting_since: Option<Instant> = None;
@@ -205,7 +210,7 @@ impl IsolateSender {
                     notified.await;
                 }
                 Err((_, e)) => {
-                    if matches!(e, CloneError::Full { .. }) {
+                    if is_rejection(&e) {
                         governor().record_queue_rejection();
                     }
                     return Err(e);
@@ -242,7 +247,7 @@ impl IsolateSender {
         }
         let charge = match governor().reserve_shared(MemoryClass::MessageQueue, bytes) {
             Ok(charge) => charge,
-            Err(_) => return Err((sv, full)),
+            Err(refused) => return Err((sv, CloneError::MemoryLimitExceeded(refused))),
         };
         st.queued_bytes += bytes;
         st.queue.push_back(AccountedMessage { value: sv, charge });
@@ -250,6 +255,15 @@ impl IsolateSender {
         self.shared.recv_ready.notify_one();
         Ok(())
     }
+}
+
+/// A refusal for lack of room (channel limit or process governor), as
+/// opposed to a disconnected or unshareable message.
+fn is_rejection(e: &CloneError) -> bool {
+    matches!(
+        e,
+        CloneError::Full { .. } | CloneError::MemoryLimitExceeded(_)
+    )
 }
 
 /// Serialize `v`, metering the crossing (bytes copied + serialize time) into

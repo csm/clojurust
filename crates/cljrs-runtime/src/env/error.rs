@@ -12,6 +12,13 @@ pub enum EvalError {
     #[error("gas exhausted")]
     GasExhausted,
 
+    /// The process memory governor refused a governed allocation (strict
+    /// mode), and a collection did not bring committed memory back within
+    /// the hard limit.  Fixed-size; building it never allocates.  Like
+    /// `GasExhausted`, `try`/`catch` does not intercept it.
+    #[error("{0}")]
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+
     /// An operation attempted to use a capability unavailable to an isolated
     /// transaction function.
     #[error("effect forbidden in transaction function: {0}")]
@@ -63,12 +70,16 @@ impl EvalError {
             EvalError::Thrown(v) => v,
             other => {
                 let msg = other.to_string();
-                Value::Error(cljrs_gc::GcPtr::new(cljrs_value::ExceptionInfo::new(
-                    cljrs_value::ValueError::Other(msg.clone()),
-                    msg,
-                    None,
-                    None,
-                )))
+                let error = match other {
+                    EvalError::MemoryLimitExceeded(fault) => {
+                        cljrs_value::ValueError::MemoryLimitExceeded(fault)
+                    }
+                    _ => cljrs_value::ValueError::Other(msg.clone()),
+                };
+                // Error reporting may use the critical memory reserve.
+                Value::Error(cljrs_gc::GcPtr::new_critical(
+                    cljrs_value::ExceptionInfo::new(error, msg, None, None),
+                ))
             }
         }
     }
@@ -87,9 +98,17 @@ pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
     match err {
         ValueError::Thrown(v) => EvalError::Thrown(v),
         ValueError::GasExhausted => EvalError::GasExhausted,
+        ValueError::MemoryLimitExceeded(fault) => {
+            // The error is back on a path that carries it; a copy left in
+            // the runtime-fault slot (see `callback::invoke`) would report
+            // it a second time.
+            let _ = cljrs_gc::governor::take_runtime_fault();
+            EvalError::MemoryLimitExceeded(fault)
+        }
         other => {
             let msg = other.to_string();
-            EvalError::Thrown(Value::Error(cljrs_gc::GcPtr::new(
+            // Error reporting may use the critical memory reserve.
+            EvalError::Thrown(Value::Error(cljrs_gc::GcPtr::new_critical(
                 cljrs_value::ExceptionInfo::new(other, msg, None, None),
             )))
         }

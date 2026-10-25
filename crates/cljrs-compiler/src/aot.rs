@@ -2373,6 +2373,12 @@ async fn run() {{
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
+    // A memory-limit fault raised in compiled code (strict mode) that no
+    // later collection cleared ends the program like an interpreter error.
+    if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{
+        eprintln!("cljrs: {{fault}}");
+        std::process::exit(1);
+    }}
 {main_call}
     // Pop the eval context.
     cljrs_runtime::env::callback::pop_eval_context();

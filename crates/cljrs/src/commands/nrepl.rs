@@ -18,7 +18,7 @@ pub struct Args {
     /// GC soft memory limit in MB (each isolate heap collects when it exceeds this).
     #[arg(long)]
     pub gc_soft_limit_mb: Option<usize>,
-    /// Process managed-memory hard limit in MB (reported by --gc-stats; not yet enforced).
+    /// Process managed-memory hard limit in MB (enforced only with CLJRS_MEMORY_STRICT=1).
     #[arg(long)]
     pub gc_hard_limit_mb: Option<usize>,
 }

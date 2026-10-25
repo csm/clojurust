@@ -38,7 +38,7 @@ src/
     mod.rs        — `Jit` (the runtime's `JitBackend`) + `install`; `on_var_rebind` stales superseded code
     jit_compiler.rs — `compile_jit` / `compile_jit_poll`: build a `JITModule`, register rt_abi symbols, call shared codegen
     jit_worker.rs   — background compile thread; maps Tier-1 type profiles to per-parameter specializations
-    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints; each module holds a governor `MemoryClass::Code` charge for its machine code until it is reclaimed
+    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints; each module holds a governor `MemoryClass::Code` charge (`reserve_reported`: reported, never denied, even in strict mode) for its machine code until it is reclaimed
     async_jit.rs    — `^:async` arity activation: lower → state machine → native poll fn
     osr_integration.rs — (test-only) end-to-end OSR entry compile + call
   wasm/         — (feature `wasm-aot`) AOT Clojure → WebAssembly backend (second backend over the same IR)
@@ -612,6 +612,10 @@ The generated harness `main()` calls `-main` (via `resolve`) after
 `__cljrs_main` returns, forwarding all command-line arguments (skipping the
 program name) as individual strings.  If `-main` is not defined the binary
 exits normally; if `-main` throws, the binary prints the error and exits 1.
+Before that, a memory-limit fault left by `__cljrs_main` (strict governor
+mode; `cljrs_gc::resolve_runtime_fault`) prints the fault and exits 1.
+`rt_try` does not catch `ValueError::MemoryLimitExceeded`, like
+`GasExhausted`; the fault stays in its slot for the entry seam.
 
 The generated harness `main()` (and the `compile_test_harness` test runner)
 calls `cljrs_gc::dump_stats_from_env()` once at exit, so AOT binaries honor

@@ -3,6 +3,7 @@ use crate::env::dynamics;
 use crate::env::env::Env;
 #[cfg(not(feature = "no-gc"))]
 use crate::env::env::GlobalEnv;
+use crate::env::error::{EvalError, EvalResult};
 use std::cell::RefCell;
 
 // ── Stop-the-world reclaim hooks (JIT code unloading, cold-IR sweep) ────────
@@ -183,14 +184,42 @@ pub fn force_collect(env: &Env) {
 
 /// Interpreter-level GC safepoint.
 ///
-/// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection
-/// is in progress) or initiates a collection (if memory pressure was signalled).
+/// Under GC mode it either parks (if collection is in progress) or initiates
+/// a collection (if memory pressure was signalled).  Then, in both modes, it
+/// resolves a pending memory fault: an allocation that strict admission
+/// refused but that could not fail (`GcPtr::new`).  The fault is dropped if
+/// committed memory is back within the hard limit and returned as
+/// [`EvalError::MemoryLimitExceeded`] otherwise.  Under `no-gc` there is no
+/// collection; region scopes release their memory as they exit.
 #[cfg(feature = "no-gc")]
-pub fn gc_safepoint(_env: &Env) {}
+pub fn gc_safepoint(_env: &Env) -> EvalResult<()> {
+    check_memory_fault()
+}
 
 #[cfg(not(feature = "no-gc"))]
-pub fn gc_safepoint(env: &Env) {
-    // Fast path: no GC activity at all.
+pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    // Fast path: no GC activity and no pending fault.
+    if !cljrs_gc::governor::runtime_fault_possible()
+        && !cljrs_gc::gc_requested()
+        && !cljrs_gc::CONFIG_CANCELLATION.in_progress()
+    {
+        return Ok(());
+    }
+    collect_at_safepoint(env);
+    check_memory_fault()
+}
+
+/// Turn the thread's pending memory fault, if it survives
+/// [`cljrs_gc::resolve_runtime_fault`], into an evaluation error.
+pub fn check_memory_fault() -> EvalResult<()> {
+    match cljrs_gc::resolve_runtime_fault() {
+        Some(fault) => Err(EvalError::MemoryLimitExceeded(fault)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "no-gc"))]
+fn collect_at_safepoint(env: &Env) {
     if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
         return;
     }

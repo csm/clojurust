@@ -4,7 +4,8 @@
 //! heap and collects it independently; the governor owns only counters,
 //! pressure policy, and thread-safe [`IsolateControl`] handles.
 //!
-//! **Status: Phase 3 (chunked credit, non-heap classes, observe-only).**
+//! **Status: Phase 4 (chunked credit, non-heap classes, opt-in strict
+//! admission).**
 //! Each isolate allocates from local credit that the governor grants in
 //! chunks of [`MemoryConfig::credit_chunk`]; granted credit counts as
 //! committed memory.  Region chunks draw from the same local credit and are
@@ -12,9 +13,29 @@
 //! and JIT code hold a [`MemoryCharge`]; static allocations are recorded with
 //! [`ProcessMemoryGovernor::charge_permanent`].
 //! The governor derives a process [`PressureLevel`] from committed bytes and
-//! requests collection from isolates at `Yellow`/`Red`.  It never rejects a
-//! grant: a grant that leaves committed bytes above the hard limit is recorded
-//! as a *would-reject* event (see [`MemorySnapshot::over_limit_events`]).
+//! requests collection from isolates at `Yellow`/`Red`.
+//!
+//! In observe-only mode (the default) the governor never rejects a grant: a
+//! grant that leaves committed bytes above the hard limit is recorded as a
+//! *would-reject* event (see [`MemorySnapshot::over_limit_events`]).
+//!
+//! In strict mode ([`MemoryConfig::strict`], `CLJRS_MEMORY_STRICT=1`) an
+//! application grant that would take committed bytes above the hard limit is
+//! refused ([`Admission::Application`]).  Fallible callers
+//! ([`IsolateAccount::try_reserve_credit`], [`ProcessMemoryGovernor::reserve_shared`],
+//! `GcPtr::try_new`) get a [`MemoryLimitExceeded`] and no counter changes.
+//! An infallible caller (`GcPtr::new`, a region chunk) cannot refuse, so it
+//! raises the thread's pending *runtime fault* ([`raise_runtime_fault`]),
+//! asks its isolate to collect, and takes the bytes from the critical
+//! reserve.  The interpreter resolves the fault at its next safepoint, after
+//! the collection: it continues if committed bytes are back within the hard
+//! limit and fails the evaluation with `MemoryLimitExceeded` otherwise
+//! ([`resolve_runtime_fault`]).  Runtime control work (error reporting,
+//! shutdown) runs inside a [`CriticalSection`], whose grants use the reserve
+//! ([`Admission::Critical`]) without raising a fault.  Only when the reserve
+//! is also exhausted does an infallible grant exceed
+//! `hard_limit + critical_reserve`; each such grant is counted in
+//! [`MemorySnapshot::reserve_overruns`].
 //!
 //! The hot path ([`IsolateAccount::charge`]) touches only thread-local `Cell`s.
 //! It contacts the governor only when local credit runs out.  A refill is the
@@ -63,6 +84,8 @@ pub const QUEUE_LIMIT_ENV: &str = "CLJRS_ISOLATE_QUEUE_LIMIT_MB";
 pub const DEPRECATED_SOFT_LIMIT_ENV: &str = "CLJRS_GC_SOFT_LIMIT_MB";
 /// Deprecated alias for [`HARD_LIMIT_ENV`].
 pub const DEPRECATED_HARD_LIMIT_ENV: &str = "CLJRS_GC_HARD_LIMIT_MB";
+/// Strict admission (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`).
+pub const STRICT_ENV: &str = "CLJRS_MEMORY_STRICT";
 
 // ── Memory classes and pressure ──────────────────────────────────────────────
 
@@ -125,7 +148,8 @@ pub enum PressureLevel {
     Green = 0,
     /// At or above the soft limit.
     Yellow = 1,
-    /// Above the hard limit (strict mode would reject new application credit).
+    /// Above the hard limit, or a strict-mode application request did not
+    /// fit below it.
     Red = 2,
 }
 
@@ -178,6 +202,9 @@ pub struct MemoryConfig {
     pub retained_credit_chunks: usize,
     /// Default byte limit for one isolate channel.
     pub queue_limit: usize,
+    /// Refuse application grants above the hard limit instead of only
+    /// recording them.
+    pub strict: bool,
 }
 
 /// A rejected [`MemoryConfig`].
@@ -206,6 +233,8 @@ pub enum MemoryConfigError {
     },
     /// An environment variable is not a non-negative integer.
     InvalidNumber { var: &'static str, value: String },
+    /// An environment variable is not a boolean flag.
+    InvalidFlag { var: &'static str, value: String },
 }
 
 impl fmt::Display for MemoryConfigError {
@@ -240,6 +269,9 @@ impl fmt::Display for MemoryConfigError {
             MemoryConfigError::InvalidNumber { var, value } => {
                 write!(f, "{var}={value:?} is not a non-negative integer")
             }
+            MemoryConfigError::InvalidFlag { var, value } => {
+                write!(f, "{var}={value:?} is not 1/true/yes/on or 0/false/no/off")
+            }
         }
     }
 }
@@ -257,6 +289,7 @@ impl MemoryConfig {
             credit_chunk: DEFAULT_CREDIT_CHUNK,
             retained_credit_chunks: DEFAULT_RETAINED_CREDIT_CHUNKS,
             queue_limit: DEFAULT_QUEUE_LIMIT.min(hard_limit),
+            strict: false,
         };
         config.validate()?;
         Ok(config)
@@ -361,6 +394,9 @@ impl MemoryConfig {
         if let Some(queue) = parse_env(QUEUE_LIMIT_ENV, lookup(QUEUE_LIMIT_ENV), MIB)? {
             config.queue_limit = queue;
         }
+        if let Some(strict) = parse_flag(STRICT_ENV, lookup(STRICT_ENV))? {
+            config.strict = strict;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -378,6 +414,17 @@ fn parse_env(
             .parse::<usize>()
             .map(|n| Some(n.saturating_mul(unit)))
             .map_err(|_| MemoryConfigError::InvalidNumber { var, value: raw }),
+    }
+}
+
+fn parse_flag(var: &'static str, value: Option<String>) -> Result<Option<bool>, MemoryConfigError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "" | "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(MemoryConfigError::InvalidFlag { var, value: raw }),
     }
 }
 
@@ -737,6 +784,11 @@ impl IsolateAccount {
     /// Account `bytes` of new heap allocation.  Thread-local unless local
     /// credit is insufficient, in which case the account refills from the
     /// governor.
+    ///
+    /// Infallible: when strict admission refuses the refill, the account
+    /// raises the thread's runtime fault and takes the bytes from the
+    /// critical reserve (see the module docs).  Use
+    /// [`Self::try_reserve_credit`] first to refuse instead.
     #[inline]
     pub fn charge(&self, bytes: usize) {
         self.used.set(self.used.get() + bytes);
@@ -819,15 +871,88 @@ impl IsolateAccount {
     fn refill(&self, bytes: usize) {
         let credit = self.credit.get();
         let shortfall = bytes - credit;
-        let chunk = self.governor.credit_chunk();
-        let grant = if shortfall > chunk {
-            shortfall.div_ceil(ACCOUNTING_UNIT) * ACCOUNTING_UNIT
-        } else {
-            chunk
+        let grant = match self.request_credit(shortfall, current_admission()) {
+            Ok(grant) => grant,
+            Err(refused) => self.emergency_credit(shortfall, refused),
         };
-        self.governor.grant(grant);
-        self.control.credit_refills.fetch_add(1, Ordering::Relaxed);
         self.credit.set(credit + grant - bytes);
+        self.after_grant();
+    }
+
+    /// Make sure local credit covers `bytes`, refilling from the governor if
+    /// needed, so that a following [`Self::charge`] of at most `bytes` stays
+    /// local.  In strict mode a refill that does not fit below the hard limit
+    /// is refused: the account and the governor's counters stay unchanged,
+    /// the refusal is recorded, and the isolate is asked to collect.
+    pub fn try_reserve_credit(&self, bytes: usize) -> Result<(), MemoryLimitExceeded> {
+        let credit = self.credit.get();
+        if credit >= bytes {
+            return Ok(());
+        }
+        match self.request_credit(bytes - credit, current_admission()) {
+            Ok(grant) => {
+                self.credit.set(credit + grant);
+                self.after_grant();
+                Ok(())
+            }
+            Err(refused) => {
+                self.governor
+                    .record_rejection(&refused, Some(&self.control));
+                Err(refused)
+            }
+        }
+    }
+
+    /// Fallible [`Self::charge`]: on refusal nothing is charged.
+    pub fn try_charge(&self, bytes: usize) -> Result<(), MemoryLimitExceeded> {
+        self.try_reserve_credit(bytes)?;
+        self.charge(bytes);
+        Ok(())
+    }
+
+    /// Ask the governor for at least `shortfall` bytes of credit: a normal
+    /// chunk, or the shortfall rounded up to [`ACCOUNTING_UNIT`] when that is
+    /// larger.  If strict admission refuses a chunk, retry with the rounded
+    /// shortfall alone.  Counters change only on success.
+    fn request_credit(
+        &self,
+        shortfall: usize,
+        admission: Admission,
+    ) -> Result<usize, MemoryLimitExceeded> {
+        let chunk = self.governor.credit_chunk();
+        let exact = shortfall.div_ceil(ACCOUNTING_UNIT) * ACCOUNTING_UNIT;
+        let grant = if shortfall > chunk { exact } else { chunk };
+        match self.governor.admit(MemoryClass::GcHeap, grant, admission) {
+            Ok(()) => Ok(grant),
+            Err(_) if exact < grant => self
+                .governor
+                .admit(MemoryClass::GcHeap, exact, admission)
+                .map(|()| exact),
+            Err(refused) => Err(refused),
+        }
+    }
+
+    /// Credit for an allocation that cannot be refused: record the refusal,
+    /// raise the thread's runtime fault (outside a [`CriticalSection`]), and
+    /// take exactly the shortfall from the critical reserve, or past it if
+    /// the reserve is exhausted too.
+    #[cold]
+    fn emergency_credit(&self, shortfall: usize, refused: MemoryLimitExceeded) -> usize {
+        if !critical_active() {
+            self.governor
+                .record_rejection(&refused, Some(&self.control));
+            raise_fault(self.governor, refused, Some(&self.control));
+        }
+        // Take only what this allocation needs, to spend the reserve slowly.
+        self.governor
+            .admit_or_overrun(MemoryClass::GcHeap, shortfall);
+        shortfall
+    }
+
+    /// Bookkeeping after new credit was granted.
+    fn after_grant(&self) {
+        self.governor.credit_refills.fetch_add(1, Ordering::Relaxed);
+        self.control.credit_refills.fetch_add(1, Ordering::Relaxed);
         if self.control.recall_requested() {
             self.service_recall();
         }
@@ -1085,14 +1210,227 @@ impl fmt::Display for MemoryLimitExceeded {
 
 impl std::error::Error for MemoryLimitExceeded {}
 
+// ── Admission ────────────────────────────────────────────────────────────────
+
+/// Which bound a strict-mode grant must stay within.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Application allocation: committed bytes must stay at or below the
+    /// hard limit.
+    Application,
+    /// Runtime control allocation (error reporting, shutdown, a refused
+    /// allocation that cannot fail): committed bytes must stay at or below
+    /// the hard limit plus the critical reserve.
+    Critical,
+}
+
+thread_local! {
+    static CRITICAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// While alive, the calling thread's grants use [`Admission::Critical`] and
+/// a refused application grant does not raise a runtime fault.  Created by
+/// [`enter_critical`]; nests.  Not `Send`: it marks the creating thread.
+#[must_use = "the critical section ends when this guard is dropped"]
+pub struct CriticalSection {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Enter a [`CriticalSection`] on the calling thread.
+pub fn enter_critical() -> CriticalSection {
+    let _ = CRITICAL_DEPTH.try_with(|d| d.set(d.get() + 1));
+    CriticalSection {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+impl Drop for CriticalSection {
+    fn drop(&mut self) {
+        let _ = CRITICAL_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Run `f` inside a [`CriticalSection`].
+pub fn with_critical<R>(f: impl FnOnce() -> R) -> R {
+    let _section = enter_critical();
+    f()
+}
+
+/// Whether the calling thread is inside a [`CriticalSection`].
+pub fn critical_active() -> bool {
+    CRITICAL_DEPTH.try_with(|d| d.get() > 0).unwrap_or(false)
+}
+
+fn current_admission() -> Admission {
+    if critical_active() {
+        Admission::Critical
+    } else {
+        Admission::Application
+    }
+}
+
+// ── Runtime faults ───────────────────────────────────────────────────────────
+
+/// A refused allocation that its caller could not report as an error.
+#[derive(Clone, Copy)]
+struct PendingFault {
+    governor: &'static ProcessMemoryGovernor,
+    fault: MemoryLimitExceeded,
+    /// Already reported by an evaluation boundary: deliver it unconditionally.
+    confirmed: bool,
+}
+
+/// The thread's pending runtime fault.  Separate from any pending Clojure
+/// exception; holds fixed-size data only, so raising it never allocates.
+struct FaultSlot(Cell<Option<PendingFault>>);
+
+impl FaultSlot {
+    fn set(&self, fault: Option<PendingFault>) {
+        let was = self.0.replace(fault).is_some();
+        match (was, fault.is_some()) {
+            (false, true) => {
+                PENDING_FAULTS.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                PENDING_FAULTS.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for FaultSlot {
+    fn drop(&mut self) {
+        self.set(None);
+    }
+}
+
+thread_local! {
+    static FAULT: FaultSlot = const { FaultSlot(Cell::new(None)) };
+}
+
+/// Threads with a pending runtime fault.  Lets the safepoint fast path skip
+/// the thread-local lookup when no thread has one.
+static PENDING_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+fn raise_fault(
+    governor: &'static ProcessMemoryGovernor,
+    fault: MemoryLimitExceeded,
+    requester: Option<&IsolateControl>,
+) {
+    let _ = FAULT.try_with(|slot| {
+        if slot.0.get().is_none() {
+            governor.runtime_faults.fetch_add(1, Ordering::Relaxed);
+            slot.set(Some(PendingFault {
+                governor,
+                fault,
+                confirmed: false,
+            }));
+        }
+    });
+    // The next safepoint collects before it decides whether to report.
+    match requester {
+        Some(control) => control.request_collection(),
+        None => {
+            let _ = with_registered_account(|a| a.control.request_collection());
+        }
+    }
+}
+
+/// Record that an allocation which could not fail was refused by the process
+/// governor.  The first fault is kept until it is resolved.  The calling
+/// isolate is asked to collect.
+pub fn raise_runtime_fault(fault: MemoryLimitExceeded) {
+    raise_fault(governor(), fault, None);
+}
+
+/// Store a fault that an evaluation boundary has already decided to report,
+/// so the next boundary delivers it whatever committed bytes are then.  Used
+/// where the error crosses a path that cannot carry it (compiled code).
+pub fn confirm_runtime_fault(fault: MemoryLimitExceeded) {
+    let _ = FAULT.try_with(|slot| {
+        slot.set(Some(PendingFault {
+            governor: governor(),
+            fault,
+            confirmed: true,
+        }))
+    });
+}
+
+/// Whether any thread may have a pending runtime fault.  One relaxed load.
+#[inline]
+pub fn runtime_fault_possible() -> bool {
+    PENDING_FAULTS.load(Ordering::Relaxed) != 0
+}
+
+/// The calling thread's pending fault, without clearing it.
+pub fn pending_runtime_fault() -> Option<MemoryLimitExceeded> {
+    if !runtime_fault_possible() {
+        return None;
+    }
+    FAULT
+        .try_with(|slot| slot.0.get().map(|p| p.fault))
+        .ok()
+        .flatten()
+}
+
+/// Clear and return the calling thread's pending fault unconditionally.
+pub fn take_runtime_fault() -> Option<MemoryLimitExceeded> {
+    if !runtime_fault_possible() {
+        return None;
+    }
+    FAULT
+        .try_with(|slot| {
+            let p = slot.0.get()?;
+            slot.set(None);
+            Some(p.fault)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Decide a pending fault at an evaluation boundary, after the isolate had
+/// its chance to collect.  A confirmed fault is returned.  An unconfirmed one
+/// is cleared, and `None` returned, if committed bytes are back below the
+/// hard limit with headroom to spare
+/// ([`ProcessMemoryGovernor::has_fault_headroom`]); otherwise it is returned.  Either way the slot is empty
+/// afterwards.  Cheap when no thread has a fault.
+#[inline]
+pub fn resolve_runtime_fault() -> Option<MemoryLimitExceeded> {
+    if !runtime_fault_possible() {
+        return None;
+    }
+    resolve_slow()
+}
+
+#[cold]
+fn resolve_slow() -> Option<MemoryLimitExceeded> {
+    FAULT
+        .try_with(|slot| {
+            let p = slot.0.get()?;
+            slot.set(None);
+            if !p.confirmed && p.governor.has_fault_headroom() {
+                p.governor
+                    .runtime_faults_cleared
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Some(p.fault)
+        })
+        .ok()
+        .flatten()
+}
+
 // ── Process governor ─────────────────────────────────────────────────────────
 
 /// Process-wide managed-memory governor.  See the module docs.
 pub struct ProcessMemoryGovernor {
     config: Mutex<Option<MemoryConfig>>,
     configured: AtomicBool,
+    strict: AtomicBool,
     soft_limit: AtomicUsize,
     hard_limit: AtomicUsize,
+    critical_reserve: AtomicUsize,
     credit_chunk: AtomicUsize,
     retained_credit_chunks: AtomicUsize,
     /// Total committed bytes; the sum of `class_bytes`.
@@ -1115,6 +1453,16 @@ pub struct ProcessMemoryGovernor {
     queue_waits: AtomicU64,
     queue_wait_nanos: AtomicU64,
     queue_rejections: AtomicU64,
+    /// Set by a strict-mode refusal; holds pressure at `Red` until a normal
+    /// chunk fits below the hard limit again.
+    reject_latch: AtomicBool,
+    rejected_reservations: AtomicU64,
+    rejected_bytes: AtomicU64,
+    critical_grants: AtomicU64,
+    reserve_overruns: AtomicU64,
+    reserve_overrun_bytes: AtomicU64,
+    runtime_faults: AtomicU64,
+    runtime_faults_cleared: AtomicU64,
     registry: Mutex<Vec<Weak<IsolateControl>>>,
     next_isolate_id: AtomicU64,
     isolates_registered: AtomicU64,
@@ -1126,8 +1474,10 @@ impl ProcessMemoryGovernor {
         Self {
             config: Mutex::new(None),
             configured: AtomicBool::new(false),
+            strict: AtomicBool::new(false),
             soft_limit: AtomicUsize::new(usize::MAX),
             hard_limit: AtomicUsize::new(usize::MAX),
+            critical_reserve: AtomicUsize::new(0),
             credit_chunk: AtomicUsize::new(DEFAULT_CREDIT_CHUNK),
             retained_credit_chunks: AtomicUsize::new(DEFAULT_RETAINED_CREDIT_CHUNKS),
             committed: AtomicUsize::new(0),
@@ -1147,6 +1497,14 @@ impl ProcessMemoryGovernor {
             queue_waits: AtomicU64::new(0),
             queue_wait_nanos: AtomicU64::new(0),
             queue_rejections: AtomicU64::new(0),
+            reject_latch: AtomicBool::new(false),
+            rejected_reservations: AtomicU64::new(0),
+            rejected_bytes: AtomicU64::new(0),
+            critical_grants: AtomicU64::new(0),
+            reserve_overruns: AtomicU64::new(0),
+            reserve_overrun_bytes: AtomicU64::new(0),
+            runtime_faults: AtomicU64::new(0),
+            runtime_faults_cleared: AtomicU64::new(0),
             registry: Mutex::new(Vec::new()),
             next_isolate_id: AtomicU64::new(1),
             isolates_registered: AtomicU64::new(0),
@@ -1174,6 +1532,9 @@ impl ProcessMemoryGovernor {
     fn install(&self, config: &MemoryConfig) {
         self.soft_limit.store(config.soft_limit, Ordering::Relaxed);
         self.hard_limit.store(config.hard_limit, Ordering::Relaxed);
+        self.critical_reserve
+            .store(config.critical_reserve, Ordering::Relaxed);
+        self.strict.store(config.strict, Ordering::Relaxed);
         self.credit_chunk
             .store(config.credit_chunk, Ordering::Relaxed);
         self.retained_credit_chunks
@@ -1210,6 +1571,28 @@ impl ProcessMemoryGovernor {
     fn credit_chunk(&self) -> usize {
         self.ensure_configured();
         self.credit_chunk.load(Ordering::Relaxed)
+    }
+
+    /// Whether strict admission is on.
+    pub fn is_strict(&self) -> bool {
+        self.ensure_configured();
+        self.strict.load(Ordering::Relaxed)
+    }
+
+    /// Whether committed bytes are at or below the hard limit.
+    pub fn within_hard_limit(&self) -> bool {
+        self.ensure_configured();
+        self.committed_bytes() <= self.hard_limit.load(Ordering::Relaxed)
+    }
+
+    /// Whether a collection left enough room below the hard limit to clear
+    /// a runtime fault: [`Self::min_headroom`], capped at an eighth of the
+    /// hard limit.  Clearing a fault with less room would collect again
+    /// after every few allocations while live data creeps up to the limit.
+    pub fn has_fault_headroom(&self) -> bool {
+        let hard = self.hard_limit.load(Ordering::Relaxed);
+        let headroom = self.min_headroom().min(hard / 8);
+        self.committed_bytes().saturating_add(headroom) <= hard
     }
 
     /// Smallest post-collection headroom: the larger of 16 credit chunks or
@@ -1262,14 +1645,66 @@ impl ProcessMemoryGovernor {
     }
 
     /// Reserve `bytes` of `class` for an allocation with an independent
-    /// lifetime.  Observe-only: the reservation always succeeds, and an
-    /// over-limit reservation is recorded as a would-reject event.
+    /// lifetime.  In observe-only mode the reservation always succeeds, and
+    /// an over-limit reservation is recorded as a would-reject event.  In
+    /// strict mode a reservation that does not fit below the hard limit is
+    /// refused (inside a [`CriticalSection`], below the hard limit plus the
+    /// critical reserve), leaving every counter unchanged.
     pub fn reserve_shared(
         &'static self,
         class: MemoryClass,
         bytes: usize,
     ) -> Result<MemoryCharge, MemoryLimitExceeded> {
+        self.reserve(class, bytes, current_admission())
+    }
+
+    /// [`Self::reserve_shared`] with [`Admission::Critical`]: for runtime
+    /// control data.
+    pub fn reserve_critical(
+        &'static self,
+        class: MemoryClass,
+        bytes: usize,
+    ) -> Result<MemoryCharge, MemoryLimitExceeded> {
+        self.reserve(class, bytes, Admission::Critical)
+    }
+
+    /// Reserve `bytes` of `class` for a constructor that cannot fail.
+    /// Always returns a charge for the full size: a strict-mode refusal
+    /// raises the thread's runtime fault (outside a [`CriticalSection`]) and
+    /// takes the bytes from the critical reserve, or past it as a counted
+    /// reserve overrun, like [`IsolateAccount::charge`].
+    pub fn reserve_infallible(&'static self, class: MemoryClass, bytes: usize) -> MemoryCharge {
+        self.admit_infallible(class, bytes);
+        self.evaluate(None, bytes > 0);
+        MemoryCharge {
+            governor: self,
+            class,
+            bytes,
+        }
+    }
+
+    /// Report `bytes` of `class` that the governor does not deny (JIT code).
+    /// Always succeeds, even in strict mode.
+    pub fn reserve_reported(&'static self, class: MemoryClass, bytes: usize) -> MemoryCharge {
         self.add(class, bytes);
+        self.evaluate(None, bytes > 0);
+        MemoryCharge {
+            governor: self,
+            class,
+            bytes,
+        }
+    }
+
+    fn reserve(
+        &'static self,
+        class: MemoryClass,
+        bytes: usize,
+        admission: Admission,
+    ) -> Result<MemoryCharge, MemoryLimitExceeded> {
+        if let Err(refused) = self.admit(class, bytes, admission) {
+            self.record_rejection(&refused, None);
+            return Err(refused);
+        }
         self.evaluate(None, bytes > 0);
         Ok(MemoryCharge {
             governor: self,
@@ -1279,12 +1714,136 @@ impl ProcessMemoryGovernor {
     }
 
     /// Record `bytes` of `class` that stay allocated for the process
-    /// lifetime (static data).  Observe-only and never returned.
-    pub fn charge_permanent(&self, class: MemoryClass, bytes: usize) {
-        if bytes > 0 {
-            self.add(class, bytes);
-            self.evaluate(None, false);
+    /// lifetime (static data); they are never returned.  Infallible: in
+    /// strict mode a refusal raises the thread's runtime fault and uses the
+    /// critical reserve, like [`IsolateAccount::charge`].
+    pub fn charge_permanent(&'static self, class: MemoryClass, bytes: usize) {
+        if bytes == 0 {
+            return;
         }
+        self.admit_infallible(class, bytes);
+        self.evaluate(None, false);
+    }
+
+    /// Commit bytes whose allocation cannot be refused.  Application
+    /// admission first; on a strict refusal, record it and raise the
+    /// thread's runtime fault (outside a critical section), then commit
+    /// through [`Self::admit_or_overrun`].
+    fn admit_infallible(&'static self, class: MemoryClass, bytes: usize) {
+        let admission = current_admission();
+        if let Err(refused) = self.admit(class, bytes, admission) {
+            if admission == Admission::Application {
+                self.record_rejection(&refused, None);
+                raise_fault(self, refused, None);
+            }
+            self.admit_or_overrun(class, bytes);
+        }
+    }
+
+    /// Fallible [`Self::charge_permanent`]: a refusal changes no counter.
+    pub fn try_charge_permanent(
+        &'static self,
+        class: MemoryClass,
+        bytes: usize,
+    ) -> Result<(), MemoryLimitExceeded> {
+        if let Err(refused) = self.admit(class, bytes, current_admission()) {
+            self.record_rejection(&refused, None);
+            return Err(refused);
+        }
+        self.evaluate(None, false);
+        Ok(())
+    }
+
+    /// Commit `bytes` of `class` if `admission` allows it.  Observe-only
+    /// mode always commits.  A refusal changes no counter.
+    fn admit(
+        &self,
+        class: MemoryClass,
+        bytes: usize,
+        admission: Admission,
+    ) -> Result<(), MemoryLimitExceeded> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.ensure_configured();
+        if !self.strict.load(Ordering::Relaxed) {
+            self.add(class, bytes);
+            return Ok(());
+        }
+        let hard = self.hard_limit.load(Ordering::Relaxed);
+        let limit = match admission {
+            Admission::Application => hard,
+            Admission::Critical => {
+                hard.saturating_add(self.critical_reserve.load(Ordering::Relaxed))
+            }
+        };
+        // A compare-and-swap loop, so concurrent grants never commit past
+        // `limit`.
+        let mut prev = self.committed.load(Ordering::Relaxed);
+        loop {
+            let next = match prev.checked_add(bytes) {
+                Some(n) if n <= limit => n,
+                _ => {
+                    return Err(MemoryLimitExceeded {
+                        class,
+                        requested: bytes,
+                        committed: prev,
+                        hard_limit: hard,
+                    });
+                }
+            };
+            match self.committed.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+        self.class_bytes[class.index()].fetch_add(bytes, Ordering::Relaxed);
+        if prev + bytes > hard {
+            self.critical_grants.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Commit bytes that cannot be refused: within the critical reserve if
+    /// possible, past it otherwise (counted as a reserve overrun).
+    fn admit_or_overrun(&self, class: MemoryClass, bytes: usize) {
+        if self.admit(class, bytes, Admission::Critical).is_err() {
+            self.add(class, bytes);
+            self.reserve_overruns.fetch_add(1, Ordering::Relaxed);
+            self.reserve_overrun_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+            tracing::warn!(
+                target: "memory",
+                class = class.name(),
+                bytes,
+                committed = self.committed_bytes(),
+                "critical memory reserve exhausted; allocation admitted past it"
+            );
+        }
+    }
+
+    /// Count a strict-mode refusal, hold pressure at `Red`, and request
+    /// collection.
+    fn record_rejection(&self, refused: &MemoryLimitExceeded, requester: Option<&IsolateControl>) {
+        self.rejected_reservations.fetch_add(1, Ordering::Relaxed);
+        self.rejected_bytes
+            .fetch_add(refused.requested as u64, Ordering::Relaxed);
+        self.reject_latch.store(true, Ordering::Relaxed);
+        tracing::info!(
+            target: "memory",
+            class = refused.class.name(),
+            requested = refused.requested,
+            committed = refused.committed,
+            hard_limit = refused.hard_limit,
+            isolate = requester.map(|c| c.id),
+            "governed reservation rejected"
+        );
+        self.evaluate(requester, true);
     }
 
     /// Record that a sender waited `waited` for queue capacity.
@@ -1299,12 +1858,6 @@ impl ProcessMemoryGovernor {
     /// Record a message that a byte-bounded queue refused.
     pub fn record_queue_rejection(&self) {
         self.queue_rejections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Commit `bytes` of isolate credit.  Observe-only: never refused.
-    fn grant(&self, bytes: usize) {
-        self.add(MemoryClass::GcHeap, bytes);
-        self.credit_refills.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Uncommit `bytes` of isolate credit or used heap bytes.
@@ -1390,7 +1943,15 @@ impl ProcessMemoryGovernor {
         raise_peak(&self.peak_used, committed - free);
         let soft = self.soft_limit.load(Ordering::Relaxed);
         let hard = self.hard_limit.load(Ordering::Relaxed);
-        let level = PressureLevel::classify(committed, soft, hard);
+        let mut level = PressureLevel::classify(committed, soft, hard);
+        if self.reject_latch.load(Ordering::Relaxed) {
+            let chunk = self.credit_chunk.load(Ordering::Relaxed);
+            if committed.saturating_add(chunk) <= hard {
+                self.reject_latch.store(false, Ordering::Relaxed);
+            } else {
+                level = PressureLevel::Red;
+            }
+        }
         let prev = self.pressure();
         // Only a change writes the shared pressure word.
         if prev != level
@@ -1413,7 +1974,7 @@ impl ProcessMemoryGovernor {
                 self.recall_credit();
             }
         }
-        if level == PressureLevel::Red && grew {
+        if grew && committed > hard {
             self.over_limit_events.fetch_add(1, Ordering::Relaxed);
             self.over_limit_bytes
                 .fetch_add((committed - hard) as u64, Ordering::Relaxed);
@@ -1422,7 +1983,7 @@ impl ProcessMemoryGovernor {
                 committed,
                 hard_limit = hard,
                 isolate = requester.map(|c| c.id),
-                "governed allocation over the hard limit (observe-only; not rejected)"
+                "governed allocation over the hard limit"
             );
         }
         if level == PressureLevel::Green {
@@ -1478,6 +2039,7 @@ impl ProcessMemoryGovernor {
         };
         isolates.sort_by_key(|i| i.id);
         MemorySnapshot {
+            strict: config.strict,
             soft_limit: config.soft_limit,
             hard_limit: config.hard_limit,
             critical_reserve: config.critical_reserve,
@@ -1502,6 +2064,13 @@ impl ProcessMemoryGovernor {
             queue_waits: self.queue_waits.load(Ordering::Relaxed),
             queue_wait_time: Duration::from_nanos(self.queue_wait_nanos.load(Ordering::Relaxed)),
             queue_rejections: self.queue_rejections.load(Ordering::Relaxed),
+            rejected_reservations: self.rejected_reservations.load(Ordering::Relaxed),
+            rejected_bytes: self.rejected_bytes.load(Ordering::Relaxed),
+            critical_grants: self.critical_grants.load(Ordering::Relaxed),
+            reserve_overruns: self.reserve_overruns.load(Ordering::Relaxed),
+            reserve_overrun_bytes: self.reserve_overrun_bytes.load(Ordering::Relaxed),
+            runtime_faults: self.runtime_faults.load(Ordering::Relaxed),
+            runtime_faults_cleared: self.runtime_faults_cleared.load(Ordering::Relaxed),
         }
     }
 }
@@ -1572,6 +2141,8 @@ pub struct IsolateSnapshot {
 /// observations; the snapshot as a whole is not a consistent cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySnapshot {
+    /// Strict admission is on.
+    pub strict: bool,
     pub soft_limit: usize,
     pub hard_limit: usize,
     pub critical_reserve: usize,
@@ -1600,8 +2171,9 @@ pub struct MemorySnapshot {
     pub credit_returned_bytes: u64,
     /// Pressure rises that recalled unused credit from every isolate.
     pub credit_recalls: u64,
-    /// Grants that ended above the hard limit.  Strict mode would
-    /// have rejected each one.
+    /// Grants that ended above the hard limit.  In observe-only mode,
+    /// strict mode would have rejected each one; in strict mode they are
+    /// critical-reserve grants and reserve overruns.
     pub over_limit_events: u64,
     /// Sum of the overage at each over-limit event.
     pub over_limit_bytes: u64,
@@ -1614,6 +2186,21 @@ pub struct MemorySnapshot {
     pub queue_wait_time: Duration,
     /// Messages a byte-bounded queue refused.
     pub queue_rejections: u64,
+    /// Strict-mode reservations and credit requests refused.
+    pub rejected_reservations: u64,
+    /// Bytes requested by refused reservations.
+    pub rejected_bytes: u64,
+    /// Grants that used the critical reserve (ended above the hard limit).
+    pub critical_grants: u64,
+    /// Infallible grants admitted past the critical reserve.
+    pub reserve_overruns: u64,
+    /// Bytes of those grants.
+    pub reserve_overrun_bytes: u64,
+    /// Runtime faults raised by refused infallible allocations.
+    pub runtime_faults: u64,
+    /// Runtime faults cleared because a collection brought committed bytes
+    /// back within the hard limit.
+    pub runtime_faults_cleared: u64,
 }
 
 impl MemorySnapshot {
@@ -1625,7 +2212,15 @@ impl MemorySnapshot {
 
 impl fmt::Display for MemorySnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Managed memory (observe-only):")?;
+        writeln!(
+            f,
+            "Managed memory ({}):",
+            if self.strict {
+                "strict"
+            } else {
+                "observe-only"
+            }
+        )?;
         writeln!(
             f,
             "  Limits:                soft {} / hard {} bytes (reserve {})",
@@ -1694,10 +2289,21 @@ impl fmt::Display for MemorySnapshot {
             "  Queues:                {} waits ({:?}), {} rejected",
             self.queue_waits, self.queue_wait_time, self.queue_rejections
         )?;
-        write!(
+        writeln!(
             f,
             "  Over hard limit:       {} events ({} bytes over)",
             self.over_limit_events, self.over_limit_bytes
+        )?;
+        write!(
+            f,
+            "  Rejected:              {} reservations ({} bytes), {} critical grants, {} reserve overruns ({} bytes), {} faults ({} cleared)",
+            self.rejected_reservations,
+            self.rejected_bytes,
+            self.critical_grants,
+            self.reserve_overruns,
+            self.reserve_overrun_bytes,
+            self.runtime_faults,
+            self.runtime_faults_cleared
         )
     }
 }
@@ -1756,6 +2362,12 @@ pub fn current_control() -> Option<Arc<IsolateControl>> {
     with_current_account(|a| a.control.clone())
 }
 
+/// [`IsolateAccount::try_reserve_credit`] on the calling thread's account.
+/// `Ok` during thread-local teardown, when no account is reachable.
+pub fn try_reserve_current(bytes: usize) -> Result<(), MemoryLimitExceeded> {
+    with_current_account(|a| a.try_reserve_credit(bytes)).unwrap_or(Ok(()))
+}
+
 /// Flush the calling thread's account and return a process snapshot.
 pub fn snapshot() -> MemorySnapshot {
     let _ = CURRENT.try_with(|cell| {
@@ -1773,6 +2385,15 @@ mod tests {
     fn leaked(soft: usize, hard: usize, chunk: usize) -> &'static ProcessMemoryGovernor {
         let mut config = MemoryConfig::with_limits(soft, hard).unwrap();
         config.credit_chunk = chunk;
+        Box::leak(Box::new(
+            ProcessMemoryGovernor::with_config(config).unwrap(),
+        ))
+    }
+
+    fn strict(soft: usize, hard: usize, chunk: usize) -> &'static ProcessMemoryGovernor {
+        let mut config = MemoryConfig::with_limits(soft, hard).unwrap();
+        config.credit_chunk = chunk;
+        config.strict = true;
         Box::leak(Box::new(
             ProcessMemoryGovernor::with_config(config).unwrap(),
         ))
@@ -2242,5 +2863,225 @@ mod tests {
         assert_eq!(g.committed_bytes(), 0, "thread exit returns everything");
         assert_eq!(g.free_credit_bytes(), 0);
         assert!(g.snapshot().peak_committed_bytes >= sum);
+    }
+
+    #[test]
+    fn env_strict_flag() {
+        let on =
+            MemoryConfig::from_lookup(|k| (k == STRICT_ENV).then(|| "yes".into()), |_| {}).unwrap();
+        assert!(on.strict);
+        let off =
+            MemoryConfig::from_lookup(|k| (k == STRICT_ENV).then(|| "0".into()), |_| {}).unwrap();
+        assert!(!off.strict);
+        let default = MemoryConfig::from_lookup(|_| None, |_| {}).unwrap();
+        assert!(!default.strict, "observe-only is the default");
+        let err = MemoryConfig::from_lookup(|k| (k == STRICT_ENV).then(|| "maybe".into()), |_| {})
+            .unwrap_err();
+        assert!(matches!(err, MemoryConfigError::InvalidFlag { .. }));
+    }
+
+    #[test]
+    fn observe_only_never_refuses() {
+        let g = leaked(MIB / 2, MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        assert!(acc.try_charge(2 * MIB).is_ok());
+        assert!(g.reserve_shared(MemoryClass::SharedValue, MIB).is_ok());
+        assert_eq!(g.snapshot().rejected_reservations, 0);
+        assert!(g.snapshot().over_limit_events >= 1);
+        assert_eq!(pending_runtime_fault(), None);
+    }
+
+    #[test]
+    fn strict_refusal_leaves_counters_unchanged() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        // Leaves less than one chunk below the hard limit.
+        acc.try_charge(990 * KIB).unwrap();
+        let committed = g.committed_bytes();
+        let (used, credit) = (acc.used_bytes(), acc.free_credit_bytes());
+        let classes: Vec<_> = MemoryClass::ALL.iter().map(|&c| g.class_bytes(c)).collect();
+
+        let err = acc.try_charge(200 * KIB).unwrap_err();
+        assert_eq!(err.class, MemoryClass::GcHeap);
+        assert_eq!(err.hard_limit, MIB);
+        assert_eq!(g.committed_bytes(), committed);
+        assert_eq!(acc.used_bytes(), used);
+        assert_eq!(acc.free_credit_bytes(), credit);
+        let after: Vec<_> = MemoryClass::ALL.iter().map(|&c| g.class_bytes(c)).collect();
+        assert_eq!(after, classes);
+
+        let snap = g.snapshot();
+        assert_eq!(snap.rejected_reservations, 1);
+        assert_eq!(snap.rejected_bytes, 200 * KIB as u64);
+        assert_eq!(snap.pressure, PressureLevel::Red, "a refusal holds Red");
+        assert!(acc.control().collection_requested());
+        assert_eq!(
+            pending_runtime_fault(),
+            None,
+            "a fallible refusal raises no fault"
+        );
+
+        // A request whose chunk is refused retries with its exact size.
+        let room = MIB - g.committed_bytes();
+        acc.try_charge(credit + room).unwrap();
+        assert_eq!(g.committed_bytes(), MIB);
+    }
+
+    #[test]
+    fn strict_shared_reservation_is_refused_and_reported_one_is_not() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let held = g.reserve_shared(MemoryClass::SharedValue, MIB).unwrap();
+        let err = g.reserve_shared(MemoryClass::MessageQueue, 1).unwrap_err();
+        assert_eq!(err.class, MemoryClass::MessageQueue);
+        assert_eq!(g.class_bytes(MemoryClass::MessageQueue), 0);
+        assert!(g.try_charge_permanent(MemoryClass::Static, 1).is_err());
+        let code = g.reserve_reported(MemoryClass::Code, 4 * KIB);
+        assert_eq!(g.committed_bytes(), MIB + 4 * KIB, "code is never denied");
+        let critical = g.reserve_critical(MemoryClass::Runtime, 4 * KIB).unwrap();
+        drop((held, code, critical));
+        assert_eq!(g.committed_bytes(), 0);
+    }
+
+    #[test]
+    fn infallible_charge_raises_a_fault_and_uses_the_reserve() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let reserve = g.config().critical_reserve;
+        let acc = g.register_isolate("a");
+        acc.charge(900 * KIB);
+        assert_eq!(pending_runtime_fault(), None);
+        acc.charge(200 * KIB);
+        let fault = pending_runtime_fault().expect("refused charge raises a fault");
+        assert_eq!(fault.requested, 200 * KIB);
+        assert!(g.committed_bytes() > MIB);
+        assert!(g.committed_bytes() <= MIB + reserve);
+        assert!(acc.control().collection_requested());
+        let snap = g.snapshot();
+        assert_eq!(snap.runtime_faults, 1);
+        assert!(snap.critical_grants >= 1);
+        assert_eq!(snap.reserve_overruns, 0);
+
+        // A second refusal keeps the first fault.
+        acc.charge(100 * KIB);
+        assert_eq!(pending_runtime_fault(), Some(fault));
+        assert_eq!(g.snapshot().runtime_faults, 1);
+
+        // Still over the limit: the fault is delivered, and the slot empties.
+        assert_eq!(resolve_runtime_fault(), Some(fault));
+        assert_eq!(pending_runtime_fault(), None);
+    }
+
+    #[test]
+    fn collection_that_frees_enough_clears_the_fault() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge(900 * KIB);
+        acc.charge(200 * KIB);
+        assert!(pending_runtime_fault().is_some());
+        let used = acc.used_bytes();
+        acc.release(used - 100 * KIB);
+        acc.record_collection(report(used, 100 * KIB));
+        assert!(g.has_fault_headroom());
+        assert_eq!(resolve_runtime_fault(), None, "collection fixed it");
+        assert_eq!(pending_runtime_fault(), None);
+        assert_eq!(g.snapshot().runtime_faults_cleared, 1);
+    }
+
+    #[test]
+    fn confirmed_fault_is_delivered_regardless_of_memory() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let fault = MemoryLimitExceeded {
+            class: MemoryClass::GcHeap,
+            requested: 1,
+            committed: 0,
+            hard_limit: MIB,
+        };
+        assert!(g.within_hard_limit());
+        confirm_runtime_fault(fault);
+        assert_eq!(resolve_runtime_fault(), Some(fault));
+        raise_runtime_fault(fault);
+        assert_eq!(take_runtime_fault(), Some(fault));
+        assert_eq!(resolve_runtime_fault(), None);
+    }
+
+    #[test]
+    fn critical_section_uses_the_reserve_without_a_fault() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let acc = g.register_isolate("a");
+        acc.charge(MIB);
+        with_critical(|| {
+            assert!(critical_active());
+            acc.charge(64 * KIB);
+            assert!(acc.try_charge(64 * KIB).is_ok());
+        });
+        assert!(!critical_active());
+        assert_eq!(pending_runtime_fault(), None);
+        assert!(g.committed_bytes() > MIB);
+        assert!(
+            acc.try_charge(64 * KIB).is_err(),
+            "outside, the limit applies"
+        );
+    }
+
+    #[test]
+    fn infallible_reservation_always_charges() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let reserve = g.config().critical_reserve;
+        let held = g.reserve_shared(MemoryClass::SharedValue, MIB).unwrap();
+        let critical = g
+            .reserve_critical(MemoryClass::SharedValue, reserve)
+            .unwrap();
+        assert_eq!(g.committed_bytes(), MIB + reserve, "limit and reserve full");
+        let charge = g.reserve_infallible(MemoryClass::SharedValue, 4 * KIB);
+        assert_eq!(charge.bytes(), 4 * KIB, "the charge is never dropped");
+        assert_eq!(g.committed_bytes(), MIB + reserve + 4 * KIB);
+        let snap = g.snapshot();
+        assert_eq!(snap.reserve_overruns, 1);
+        assert_eq!(snap.reserve_overrun_bytes, 4 * KIB as u64);
+        assert!(take_runtime_fault().is_some());
+        drop((held, critical, charge));
+        assert_eq!(g.committed_bytes(), 0);
+    }
+
+    #[test]
+    fn exhausted_reserve_overruns_and_counts_it() {
+        let g = strict(MIB / 2, MIB, 64 * KIB);
+        let reserve = g.config().critical_reserve;
+        let acc = g.register_isolate("a");
+        acc.charge(MIB + reserve + 64 * KIB);
+        let snap = g.snapshot();
+        assert_eq!(snap.reserve_overruns, 1);
+        assert!(snap.committed_bytes > MIB + reserve);
+        assert!(take_runtime_fault().is_some());
+    }
+
+    #[test]
+    fn concurrent_strict_requests_never_exceed_the_hard_limit() {
+        use std::sync::Barrier;
+        let hard = 4 * MIB;
+        let g = strict(hard / 2, hard, 16 * KIB);
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let acc = g.register_isolate(format!("iso-{i}"));
+                    barrier.wait();
+                    let mut refused = 0;
+                    for n in 0..4000usize {
+                        if acc.try_charge(64 + n % 3000).is_err() {
+                            refused += 1;
+                        }
+                        assert!(g.committed_bytes() <= hard);
+                    }
+                    refused
+                })
+            })
+            .collect();
+        let refused: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        let snap = g.snapshot();
+        assert!(refused > 0, "the budget is smaller than the demand");
+        assert!(snap.peak_committed_bytes <= hard);
+        assert_eq!(snap.committed_bytes, 0, "thread exit returns everything");
+        assert_eq!(snap.rejected_reservations, refused as u64);
     }
 }

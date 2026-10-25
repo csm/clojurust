@@ -186,8 +186,9 @@ one. Clone it freely to hand to extension `install` functions.
 | `CLJRS_GC_SOFT_LIMIT_MB` | `build()`, when `gc_config_from_env` is on | Per-isolate soft heap limit in MB (default: a third of system memory). Also a deprecated alias for `CLJRS_MEMORY_SOFT_LIMIT_MB`; the governor warns when it reads it. |
 | `CLJRS_GC_HARD_LIMIT_MB` | same | Per-isolate hard heap limit in MB (defaults to, and is never below, the soft limit; not enforced). Also a deprecated alias for `CLJRS_MEMORY_HARD_LIMIT_MB`. |
 | `CLJRS_MEMORY_SOFT_LIMIT_MB` | first allocation in the process | Process-wide managed-memory soft limit (default: 75% of the hard limit). |
-| `CLJRS_MEMORY_HARD_LIMIT_MB` | same | Process-wide managed-memory hard limit (default: the cgroup limit, else half of physical memory). Observed, not yet enforced. |
-| `CLJRS_MEMORY_CRITICAL_RESERVE_MB` | same | Reserve for runtime control operations (default: max(4 MiB, 1% of the hard limit), at most 256 MiB). |
+| `CLJRS_MEMORY_HARD_LIMIT_MB` | same | Process-wide managed-memory hard limit (default: the cgroup limit, else half of physical memory). Observed; enforced only with `CLJRS_MEMORY_STRICT`. |
+| `CLJRS_MEMORY_STRICT` | same | `1`/`true`/`yes`/`on` enforces the hard limit: an allocation that does not fit fails the evaluation with `EvalError::MemoryLimitExceeded` unless a collection brings managed memory back under the limit. Default: off (observe-only). |
+| `CLJRS_MEMORY_CRITICAL_RESERVE_MB` | same | Reserve above the hard limit for runtime control operations (error reporting, shutdown) and for allocations that cannot fail until the next safepoint, in strict mode (default: max(4 MiB, 1% of the hard limit), at most 256 MiB). |
 | `CLJRS_MEMORY_CREDIT_KB` | same | Allocation credit chunk an isolate takes from the governor at a time (default: 64). |
 | `CLJRS_ISOLATE_QUEUE_LIMIT_MB` | same | Default byte limit for one isolate channel (default: 64, at most the hard limit). `(isolate-chan limit-bytes)` overrides it per channel. |
 | `CLJRS_NO_IR` | `build()` | Pins the runtime at `TierState::TreeWalk` regardless of the execution mode. |
