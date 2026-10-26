@@ -350,8 +350,12 @@ fn interpret_ir_inner(
     osr_arity_id: Option<u64>,
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
-    // GC safepoint at function entry.
-    crate::env::gc_roots::gc_safepoint(env)?;
+    // GC safepoint at function entry.  Root the arguments first: a caller
+    // such as a native `reduce` may hold the only reference to them.
+    {
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        crate::env::gc_roots::gc_safepoint(env)?;
+    }
 
     let mut regs = Registers::new(ir_func.next_var);
     // Keep all values in the register file alive across GC safepoints.
@@ -372,11 +376,12 @@ fn interpret_ir_inner(
         }
     }
 
-    // Scope this call's heap allocations in an alloc frame, as the
-    // tree-walker's `call_cljrs_fn` does: the result is moved out before the
-    // frame drops and re-rooted by the caller, with no safepoint in between.
-    // Each loop back-edge releases the frame (see `RecurJump` below).
-    let alloc_frame = cljrs_gc::push_alloc_frame();
+    // Mark where this call's heap allocations start in ALLOC_ROOTS.  Each loop
+    // back-edge releases them (see `RecurJump` below).  The frame is never
+    // dropped: on return the allocations made since the last back-edge,
+    // including the result, stay rooted in the caller's frame as they did
+    // before IR calls had a frame, since native callers rely on that.
+    let alloc_frame = std::mem::ManuallyDrop::new(cljrs_gc::push_alloc_frame());
 
     // Build a block index for O(1) lookup.
     // In the common case (dense sequential IDs), this is None and we use
