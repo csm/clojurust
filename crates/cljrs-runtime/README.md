@@ -602,6 +602,7 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `push_env_root(env: &Env) -> EnvRootGuard` — registers an `Env` pointer as a GC root; guard removes on drop
 - `root_value(val: &Value) -> ValueRootGuard` — registers a single `Value` pointer as a GC root
 - `root_values(vals: &[Value]) -> ValueRootGuard` — registers a slice of `Value` pointers as GC roots
+- `ValueRootGuard` removes its own entry on drop (not the top one), so guards held across `await`s by different `LocalSet` tasks may drop in any order
 - `root_option_values(vals: &[Option<Value>]) -> OptionValueRootGuard` — registers an `Option<Value>` slice (e.g. IR register file)
 - `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  Under `no-gc` only the fault check runs
 - `check_memory_fault() -> EvalResult<()>` — the fault check alone (used at the native-code entry seams)
