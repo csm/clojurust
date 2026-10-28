@@ -584,7 +584,7 @@ exit (region chunks freed after the account is gone are not released twice);
 an idle isolate that never polls is not woken by a recall, so it keeps up to
 its retained chunks.
 
-### `mutator` — per-mutator state (virtual threads, Phase 0)
+### `mutator` — per-mutator state (virtual threads, Phases 0–1)
 
 Thread-locals that belong to a *running computation* (root shadow stacks,
 region stack, binding frames, eval contexts, gas meters, …) are registered as
@@ -596,6 +596,8 @@ pub struct MutatorSlot {
     pub name: &'static str,              // "<crate>/<STATIC_NAME>", unique
     pub init: fn() -> Box<dyn Any>,      // a fresh mutator's value
     pub swap: fn(&mut dyn Any),          // exchange with the thread-local
+    pub trace: fn(&dyn Any, &mut MarkVisitor), // detached GC roots
+    pub check: fn(),                    // check borrow discipline before swapping
 }
 pub fn slots() -> &'static [&'static MutatorSlot]; // sorted by name
 pub fn slot_names() -> Vec<&'static str>;
@@ -613,14 +615,20 @@ impl MutatorState {
 }
 
 pub fn guards_held() -> usize;           // TrackedMutex guards held (debug builds)
-pub fn assert_parkable();                // debug: no guards held, not in a critical section
+pub fn assert_parkable();                // check slot borrows; debug: guards and critical sections
 pub struct TrackedMutex<T>;              // std::sync::Mutex API subset; guards are counted
 pub struct TrackedMutexGuard<'a, T>;
 ```
 
 Slots are collected at link time, so a crate's slots exist only in binaries
-that link that crate.  A slot swap panics if its `RefCell` is borrowed — a
-borrow held across a context switch is a bug.
+that link that crate. Before a switch changes state, it checks every slot for active borrows.
+A borrowed `RefCell` causes a panic before any slot changes.
+
+Each detached state registers weakly with its isolate. Collection traces saved slot values
+through callbacks declared with `mutator_slot!(..., trace trace_saved)`.
+The callback takes `&T` and `&mut MarkVisitor`.
+The scheduler keeps root addresses valid until it restores the state and unwinds the owning stack.
+Completed fibers leave the registry before their stacks return to the pool.
 
 ### `GcConfig`
 

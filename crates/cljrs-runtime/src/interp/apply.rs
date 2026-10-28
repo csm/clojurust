@@ -58,7 +58,7 @@ fn fire_watches(
 thread_local! {
     static WATCH_ERROR: std::cell::RefCell<Option<EvalError>> = const { std::cell::RefCell::new(None) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/WATCH_ERROR", refcell WATCH_ERROR: Option<EvalError>);
+cljrs_gc::mutator_slot!("cljrs-runtime/WATCH_ERROR", refcell WATCH_ERROR: Option<EvalError>, trace trace_saved_watch_error);
 
 /// Check if a watch error occurred and propagate it.
 fn check_watch_error() -> EvalResult<()> {
@@ -2032,4 +2032,17 @@ fn handle_bound_fn_star(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         wrapped: f,
         captured_bindings: merged,
     })))
+}
+
+fn trace_saved_watch_error(error: &Option<EvalError>, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    match error {
+        Some(EvalError::Thrown(value)) => value.trace(visitor),
+        Some(EvalError::Recur(values)) => {
+            for value in values {
+                value.trace(visitor);
+            }
+        }
+        _ => {}
+    }
 }

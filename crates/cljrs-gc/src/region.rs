@@ -413,7 +413,16 @@ thread_local! {
     /// [`try_alloc_in_region`] to opportunistically use the top region.
     static REGION_STACK: RefCell<Vec<*mut Region>> = const { RefCell::new(Vec::new()) };
 }
-crate::mutator_slot!("cljrs-gc/REGION_STACK", refcell REGION_STACK: Vec<*mut Region>);
+crate::mutator_slot!("cljrs-gc/REGION_STACK", refcell REGION_STACK: Vec<*mut Region>, trace trace_saved_regions);
+
+fn trace_saved_regions(regions: &Vec<*mut Region>, visitor: &mut crate::MarkVisitor) {
+    #[cfg(not(feature = "no-gc"))]
+    for &region in regions {
+        // SAFETY: a suspended fiber retains the guards owning these regions.
+        unsafe { &*region }.trace_live(visitor);
+    }
+    let _ = (regions, visitor);
+}
 
 /// RAII guard that activates a [`Region`] on the thread-local stack.
 ///

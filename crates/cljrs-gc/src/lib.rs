@@ -817,6 +817,7 @@ mod gc_full {
             let mark_start = std::time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
+            crate::mutator::trace_suspended(&mut visitor);
             // Active bump regions are additional roots: a live region object
             // may hold `GcPtr`s into the heap, and those heap objects must not
             // be collected while the region can still reach them.  The mark
@@ -1046,7 +1047,14 @@ mod gc_full {
     thread_local! {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
     }
-    crate::mutator_slot!("cljrs-gc/ALLOC_ROOTS", refcell ALLOC_ROOTS: Vec<*mut GcBoxHeader>);
+    crate::mutator_slot!("cljrs-gc/ALLOC_ROOTS", refcell ALLOC_ROOTS: Vec<*mut GcBoxHeader>, trace trace_saved_alloc_roots);
+
+    fn trace_saved_alloc_roots(roots: &Vec<*mut GcBoxHeader>, visitor: &mut MarkVisitor) {
+        for &header in roots {
+            // SAFETY: the detached mutator owns the still-live allocation frame.
+            unsafe { visitor.mark_header(header) };
+        }
+    }
 
     pub struct AllocRootGuard {
         saved_len: usize,

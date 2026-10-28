@@ -23,6 +23,8 @@ use std::sync::Arc;
 mod builtins;
 pub mod channel;
 pub mod eval_async;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fiber;
 pub mod isolate;
 mod isolate_builtins;
 pub mod isolate_channel;

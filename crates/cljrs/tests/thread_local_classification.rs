@@ -97,6 +97,21 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "TEST_COUNTER",
         Thread("unit-test fixture"),
     ),
+    (
+        "cljrs-gc/src/mutator.rs",
+        "DETACHED",
+        Thread("weak registry of suspended states for this isolate"),
+    ),
+    (
+        "cljrs-async/src/fiber.rs",
+        "CURRENT",
+        Thread("driver metadata installed around resume and unwind"),
+    ),
+    (
+        "cljrs-async/src/fiber.rs",
+        "STACK_POOL",
+        Thread("bounded pool of unused stacks on this isolate"),
+    ),
     // ── cljrs-runtime ───────────────────────────────────────────────────────
     (
         "cljrs-runtime/src/env/gc_roots.rs",

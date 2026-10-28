@@ -3744,7 +3744,7 @@ pub unsafe extern "C" fn rt_with_bindings(
 thread_local! {
     static PENDING_EXCEPTION: std::cell::RefCell<Option<*const Value>> = const { std::cell::RefCell::new(None) };
 }
-cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCEPTION: Option<*const Value>);
+cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCEPTION: Option<*const Value>, trace trace_saved_exception);
 
 /// `(throw val)` — throws a Clojure value as an exception.
 ///
@@ -5278,5 +5278,13 @@ mod tests {
             "count of a 3-element cons chain must be 3, got {:?}",
             unsafe { &*n }
         );
+    }
+}
+
+fn trace_saved_exception(value: &Option<*const Value>, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    if let Some(ptr) = value {
+        // SAFETY: the compiled caller's exception slot remains live while parked.
+        unsafe { &**ptr }.trace(visitor);
     }
 }

@@ -223,6 +223,40 @@ must be read with `(await f)`, not `@f`. That is why it is *not*
 `cljrs-runtime/README.md`. Parallelism across OS threads is the isolate boundary,
 where values cross by copy.
 
+## Native fiber core
+
+`cljrs_async::fiber` provides stackful fibers on native targets. Each fiber stays on its
+isolate thread. Tokio's `LocalSet` drives the fiber and polls its parked futures.
+
+```rust,ignore
+let task = cljrs_async::fiber::spawn(|| {
+    cljrs_async::fiber::park_on(tokio::time::sleep(std::time::Duration::from_millis(1)));
+    Ok(cljrs_value::Value::Long(42))
+})?;
+let value = task.await?.into_result()?;
+```
+
+`park_on` can borrow fiber stack locals and suspend through synchronous native frames.
+`current()` returns the running fiber ID. During future polls, it returns `None`.
+Panics in the body or parked future become `EvalError::Runtime`.
+Cancellation unwinds the fiber with its mutator state installed before stack reuse.
+
+The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
+64 KB minimum. Each isolate pools up to 32 finished stacks.
+Saved mutator states retain precise GC roots. Suspended JIT frames keep their code epochs live.
+
+For captured managed values, use `spawn_rooted(values, body)` or `Fiber::with_roots(values, body)`.
+These values remain rooted before the first poll and until completion.
+For locals and opaque future captures, use the runtime's GC root guards.
+GC builds retire active regions through the existing async poison fallback.
+In `no-gc` builds, allocate captures in a static context.
+Spawned results stay rooted in `FiberResult` until consumption or drop.
+After `into_result`, the caller owns the normal root-registration responsibility.
+
+This phase adds the Rust core. Blocking primitives and the Clojure fiber surface follow in
+Phases 2 and 3 of `docs/virtual-threads-plan.md`. The existing async evaluator remains in use.
+The fiber module and corosensei dependency are excluded on `wasm32`.
+
 ## File layout
 
 | File | Description |
@@ -230,6 +264,7 @@ where values cross by copy.
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
 | `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
+| `src/fiber.rs` | Native stackful fibers, stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
 | `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
@@ -460,6 +495,7 @@ the browser's `setTimeout` is used instead of a non-functional OS-level clock.
 | `regex-full` | **on** | Forwards `regex-full` to this crate's workspace dependencies — `Value::Pattern` uses the `regex` crate. |
 | `small-regex` | off | Forwards `small-regex` instead: `regex-lite`, which trades Unicode character classes for ~277 KB of text. |
 | `deps` | **on** | Pass-through for `cljrs-runtime/deps` — git-backed dependency and versioned-var support. |
+| `fiber-sanitizer` | off | Enables corosensei's native stack-switch hooks for AddressSanitizer. Requires an ASan-instrumented build. |
 
 Every workspace dependency of this crate is taken with default features off (see
 the note in the root `Cargo.toml`), so these pass-throughs are what put back what

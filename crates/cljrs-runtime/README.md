@@ -619,6 +619,9 @@ stacks, the transaction policy, `OUTPUT_CAPTURE`, `BIG_DECIMAL_SCALE`,
 `WATCH_ERROR`, `IR_LOWERING_ACTIVE` and the JIT active-frame stack, they are
 registered with `cljrs_gc::mutator_slot!` so a fiber scheduler can swap them
 with `cljrs_gc::mutator::MutatorState` (docs/virtual-threads-plan.md).
+Saved states register weakly with the isolate. Their slot callbacks trace suspended stack roots,
+bindings, eval contexts, and watch errors during collection. Saved JIT frame stacks retain their
+registrations, so code reclamation also sees suspended fibers.
 
 Root tracing covers all namespaces (including immutable `ns@commit`
 namespaces) **and** the values in `GlobalEnv::version_cache`, so versioned
