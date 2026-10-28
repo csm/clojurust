@@ -7,6 +7,7 @@ use std::mem;
 use std::sync::{Arc, Condvar, Mutex};
 
 use cljrs_gc::GcPtr;
+use cljrs_gc::mutator::TrackedMutex;
 use cljrs_reader::Form;
 
 use crate::TypeHint;
@@ -110,7 +111,7 @@ pub struct Protocol {
     pub ns: Arc<str>,
     pub methods: Vec<ProtocolMethod>,
     /// type_tag → { method_name → impl fn }
-    pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+    pub impls: TrackedMutex<HashMap<Arc<str>, MethodMap>>,
     /// `(defprotocol Name :extend-via-metadata true ...)` — when set, protocol
     /// dispatch consults the dispatch value's metadata (keyed by this
     /// protocol's `ProtocolFn`s) before falling back to type-tag impls.
@@ -128,7 +129,7 @@ impl Protocol {
             name,
             ns,
             methods,
-            impls: Mutex::new(HashMap::new()),
+            impls: TrackedMutex::new(HashMap::new()),
             extend_via_metadata,
         }
     }
@@ -206,18 +207,18 @@ pub struct MultiFn {
     pub name: Arc<str>,
     pub dispatch_fn: Value,
     /// pr_str(dispatch-val) → implementation fn
-    pub methods: Mutex<HashMap<String, Value>>,
+    pub methods: TrackedMutex<HashMap<String, Value>>,
     /// pr_str(dispatch-val) → the dispatch value itself, for `isa?` lookups
-    pub dispatch_vals: Mutex<HashMap<String, Value>>,
+    pub dispatch_vals: TrackedMutex<HashMap<String, Value>>,
     /// recorded preferences: pr_str(preferred) → pr_str(over)
-    pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    pub prefers: TrackedMutex<HashMap<String, Vec<String>>>,
     /// pr_str(preference dispatch value) → original value, including values
     /// which do not currently have a method.
-    pub preference_vals: Mutex<HashMap<String, Value>>,
+    pub preference_vals: TrackedMutex<HashMap<String, Value>>,
     /// normally ":default"
     pub default_dispatch: String,
     method_generation: std::sync::atomic::AtomicU64,
-    method_cache: Mutex<MultiFnMethodCache>,
+    method_cache: TrackedMutex<MultiFnMethodCache>,
 }
 
 #[derive(Debug, Default)]
@@ -232,13 +233,13 @@ impl MultiFn {
         Self {
             name,
             dispatch_fn,
-            methods: Mutex::new(HashMap::new()),
-            dispatch_vals: Mutex::new(HashMap::new()),
-            prefers: Mutex::new(HashMap::new()),
-            preference_vals: Mutex::new(HashMap::new()),
+            methods: TrackedMutex::new(HashMap::new()),
+            dispatch_vals: TrackedMutex::new(HashMap::new()),
+            prefers: TrackedMutex::new(HashMap::new()),
+            preference_vals: TrackedMutex::new(HashMap::new()),
             default_dispatch,
             method_generation: std::sync::atomic::AtomicU64::new(0),
-            method_cache: Mutex::new(MultiFnMethodCache::default()),
+            method_cache: TrackedMutex::new(MultiFnMethodCache::default()),
         }
     }
 
@@ -354,14 +355,14 @@ impl cljrs_gc::Trace for MultiFn {
 pub struct Var {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
-    pub value: Mutex<Option<Value>>,
+    pub value: TrackedMutex<Option<Value>>,
     /// Cross-isolate mirror of the root binding (Phase B3).  `None` when the
     /// var is unbound or its current root is not promotable.
     pub shared_root: Arc<arc_swap::ArcSwap<Option<crate::shared::SharedValue>>>,
     pub is_macro: bool,
     /// Metadata map (e.g. `{:dynamic true}`).
-    pub meta: Mutex<Option<Value>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub meta: TrackedMutex<Option<Value>>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
     binding_generation: std::sync::atomic::AtomicU64,
 }
 
@@ -370,11 +371,11 @@ impl Var {
         Self {
             namespace: namespace.into(),
             name: name.into(),
-            value: Mutex::new(None),
+            value: TrackedMutex::new(None),
             shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             is_macro: false,
-            meta: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            meta: TrackedMutex::new(None),
+            watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -399,11 +400,11 @@ impl Var {
         Self {
             namespace: namespace.into(),
             name: name.into(),
-            value: Mutex::new(local),
+            value: TrackedMutex::new(local),
             shared_root,
             is_macro,
-            meta: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            meta: TrackedMutex::new(None),
+            watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -517,10 +518,10 @@ impl cljrs_gc::Trace for Var {
 /// A Clojure atom — a thread-safe mutable reference.
 #[derive(Debug)]
 pub struct Atom {
-    pub value: Mutex<Value>,
-    pub meta: Mutex<Option<Value>>,
-    pub validator: Mutex<Option<Value>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub value: TrackedMutex<Value>,
+    pub meta: TrackedMutex<Option<Value>>,
+    pub validator: TrackedMutex<Option<Value>>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
 }
 
 impl Atom {
@@ -529,10 +530,10 @@ impl Atom {
         // shared state, so its initial value must not be region-allocated.
         let v = crate::publish::publish_value(v);
         Self {
-            value: Mutex::new(v),
-            meta: Mutex::new(None),
-            validator: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            value: TrackedMutex::new(v),
+            meta: TrackedMutex::new(None),
+            validator: TrackedMutex::new(None),
+            watches: TrackedMutex::new(Vec::new()),
         }
     }
 
@@ -644,39 +645,39 @@ impl ReferClojureFilter {
 pub struct Namespace {
     pub name: Arc<str>,
     /// Vars interned directly in this namespace.
-    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    pub interns: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,
     /// Vars referred from other namespaces (e.g. clojure.core).
-    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    pub refers: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,
     /// Namespace aliases: short-name → full namespace name.
-    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,
+    pub aliases: TrackedMutex<HashMap<Arc<str>, Arc<str>>>,
     /// Absolute path of the source file this namespace was loaded from,
     /// populated by the loader.  Used by the versioned resolver to locate the
     /// file for `git show`.
-    pub source_file: Mutex<Option<Arc<str>>>,
+    pub source_file: TrackedMutex<Option<Arc<str>>>,
     /// Absolute path of the git repository root that contains `source_file`.
-    pub git_repo_root: Mutex<Option<Arc<str>>>,
+    pub git_repo_root: TrackedMutex<Option<Arc<str>>>,
     /// `true` for namespaces loaded from a specific commit (`name@hash`).
     /// Versioned namespaces are immutable: `intern()` will refuse new bindings.
     pub is_versioned: bool,
     /// Metadata attached via `(ns ^{...} name ...)` or an `ns` attr-map.
-    pub meta: Mutex<Option<Value>>,
+    pub meta: TrackedMutex<Option<Value>>,
     /// Narrowing applied to the automatic `clojure.core` refer, set by an
     /// `(:refer-clojure ...)` clause.  `None` refers all of core.
-    pub refer_clojure_filter: Mutex<Option<ReferClojureFilter>>,
+    pub refer_clojure_filter: TrackedMutex<Option<ReferClojureFilter>>,
 }
 
 impl Namespace {
     pub fn new(name: impl Into<Arc<str>>) -> Self {
         Self {
             name: name.into(),
-            interns: Mutex::new(HashMap::new()),
-            refers: Mutex::new(HashMap::new()),
-            aliases: Mutex::new(HashMap::new()),
-            source_file: Mutex::new(None),
-            git_repo_root: Mutex::new(None),
+            interns: TrackedMutex::new(HashMap::new()),
+            refers: TrackedMutex::new(HashMap::new()),
+            aliases: TrackedMutex::new(HashMap::new()),
+            source_file: TrackedMutex::new(None),
+            git_repo_root: TrackedMutex::new(None),
             is_versioned: false,
-            meta: Mutex::new(None),
-            refer_clojure_filter: Mutex::new(None),
+            meta: TrackedMutex::new(None),
+            refer_clojure_filter: TrackedMutex::new(None),
         }
     }
 
@@ -954,13 +955,13 @@ pub enum LazySeqState {
 
 /// A lazy sequence that forces its thunk exactly once and caches the result.
 pub struct LazySeq {
-    pub state: Mutex<LazySeqState>,
+    pub state: TrackedMutex<LazySeqState>,
 }
 
 impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: Mutex::new(LazySeqState::Pending(thunk)),
+            state: TrackedMutex::new(LazySeqState::Pending(thunk)),
         }
     }
 
@@ -1051,7 +1052,7 @@ impl cljrs_gc::Trace for CljxCons {
 
 /// Non-atomic mutable cell (single-thread performance, no CAS).
 pub struct Volatile {
-    pub value: Mutex<Value>,
+    pub value: TrackedMutex<Value>,
 }
 
 impl Volatile {
@@ -1059,7 +1060,7 @@ impl Volatile {
         // GC builds: heap-promotion fallback (see `Var::bind`).
         let v = crate::publish::publish_value(v);
         Self {
-            value: Mutex::new(v),
+            value: TrackedMutex::new(v),
         }
     }
 
@@ -1107,13 +1108,13 @@ pub enum DelayState {
 
 /// A lazy one-time computation (forced at most once, result cached).
 pub struct Delay {
-    pub state: Mutex<DelayState>,
+    pub state: TrackedMutex<DelayState>,
 }
 
 impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: Mutex::new(DelayState::Pending(thunk)),
+            state: TrackedMutex::new(DelayState::Pending(thunk)),
         }
     }
 
@@ -1378,7 +1379,7 @@ pub struct Agent {
     pub state: Arc<Mutex<Value>>,
     /// Last error.
     pub error: Arc<Mutex<Option<Value>>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
 }
 
 impl Agent {

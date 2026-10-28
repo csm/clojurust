@@ -90,6 +90,10 @@ src/
                     cross-isolate request epoch, RSS emergency pressure signal,
                     load-shedding hooks (ShedHookId, register_shed_hook,
                     unregister_shed_hook), Linux cgroup v2 soft-limit
+  mutator.rs      — per-mutator state for virtual threads: MutatorSlot registry
+                    (link-time, via inventory), mutator_slot! macro,
+                    MutatorState save/restore/swap, TrackedMutex (debug
+                    guard counting) and assert_parkable()
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects,
                     isolate-boundary crossings (bytes copied + serialize time)
@@ -508,6 +512,7 @@ pub fn try_reserve_current(bytes: usize) -> Result<(), MemoryLimitExceeded>;
 pub struct CriticalSection;            // guard; !Send; nests
 pub fn enter_critical() -> CriticalSection;
 pub fn with_critical<R>(f: impl FnOnce() -> R) -> R;
+pub fn in_critical_section() -> bool;   // a fiber must never park inside one
 pub fn critical_active() -> bool;
 
 // Runtime-fault slot (calling thread; fixed-size, never allocates):
@@ -574,6 +579,44 @@ Gaps: the isolate heap is not torn down at thread exit, so
 exit (region chunks freed after the account is gone are not released twice);
 an idle isolate that never polls is not woken by a recall, so it keeps up to
 its retained chunks.
+
+### `mutator` — per-mutator state (virtual threads, Phase 0)
+
+Thread-locals that belong to a *running computation* (root shadow stacks,
+region stack, binding frames, eval contexts, gas meters, …) are registered as
+slots so a fiber scheduler can swap them in and out around a context switch.
+See `docs/virtual-threads-plan.md`.
+
+```rust
+pub struct MutatorSlot {
+    pub name: &'static str,              // "<crate>/<STATIC_NAME>", unique
+    pub init: fn() -> Box<dyn Any>,      // a fresh mutator's value
+    pub swap: fn(&mut dyn Any),          // exchange with the thread-local
+}
+pub fn slots() -> &'static [&'static MutatorSlot]; // sorted by name
+pub fn slot_names() -> Vec<&'static str>;
+
+// Register a thread-local (`RefCell<T>` or `Cell<T>`, T: Default):
+cljrs_gc::mutator_slot!("my-crate/MY_STACK", refcell MY_STACK: Vec<Frame>);
+cljrs_gc::mutator_slot!("my-crate/MY_FLAG", cell MY_FLAG: bool);
+
+pub struct MutatorState;                 // !Send; one value per slot
+impl MutatorState {
+    pub fn fresh() -> Self;              // a not-yet-started computation
+    pub fn save() -> Self;               // detach current; thread gets fresh defaults
+    pub fn restore(self);                // reinstall a saved state
+    pub fn swap_with_current(&mut self); // exchange (scheduler resume/park)
+}
+
+pub fn guards_held() -> usize;           // TrackedMutex guards held (debug builds)
+pub fn assert_parkable();                // debug: no guards held, not in a critical section
+pub struct TrackedMutex<T>;              // std::sync::Mutex API subset; guards are counted
+pub struct TrackedMutexGuard<'a, T>;
+```
+
+Slots are collected at link time, so a crate's slots exist only in binaries
+that link that crate.  A slot swap panics if its `RefCell` is borrowed — a
+borrow held across a context switch is a bug.
 
 ### `GcConfig`
 

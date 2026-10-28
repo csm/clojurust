@@ -278,6 +278,31 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - **Exit:** full test suite green; `save`/`restore` round-trips under a test that swaps state
   between two hand-built evaluations at a safepoint.
 
+**Status: implemented.**
+
+- `cljrs_gc::mutator` holds the registry. Each per-fiber thread-local stays where it is and is
+  registered at link time with `cljrs_gc::mutator_slot!` (via `inventory`), so lower crates
+  need no dependency on the crates above them. `MutatorState` holds one value per slot.
+  `save`/`restore`/`swap_with_current` call `mem::swap` on each one, and a slot whose `RefCell`
+  is borrowed panics instead of swapping.
+- `MY_FRAMES` swaps the contents of the thread's registered frame stack, so `live_epochs`
+  keeps seeing the running fiber. It does not see suspended fibers until Phase 1 unions over
+  them.
+- `PENDING_EXCEPTION` and `RT_REGION_STACK` (`cljrs-compiler`) and `POISON_WATERMARK`
+  (`cljrs-gc`, a depth into `REGION_STACK`) are per-fiber too. The audit table above missed
+  them.
+- `crates/cljrs/tests/thread_local_classification.rs` is the classification test. It scans
+  `crates/*/src` and also checks that every per-fiber row is a registered slot.
+- `TrackedMutex` replaces `std::sync::Mutex` on the lock fields of `Var`, `Atom`, `Namespace`,
+  `MultiFn`, `Protocol`, `LazySeq`, `Delay`, `Volatile`, and on agent watches.
+  `mutator::assert_parkable` checks two things: no counted guard is held, and the thread is not
+  in a governor critical section.
+- `crates/cljrs-runtime/tests/mutator_state.rs` is the exit test. It parks evaluation A inside
+  a native fn and runs evaluation B on the same thread. Bindings, `with-out-str` capture and
+  eval context stay separate.
+- A saved state's GC roots are **not traced** yet. Until Phase 1 makes collection walk
+  suspended states, nothing may collect while a state is detached.
+
 ### Phase 1 — Fiber core (`cljrs-async::fiber`)
 
 - `corosensei`-based `Fiber`, stack pool, `FiberTask: Future`, `fiber::spawn`, `fiber::park_on`,

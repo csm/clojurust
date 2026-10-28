@@ -66,6 +66,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 thread_local! {
     pub static IR_LOWERING_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/IR_LOWERING_ACTIVE", cell IR_LOWERING_ACTIVE: bool);
 
 /// Attempt to execute via the IR interpreter.
 /// Returns `None` if IR is not available (not cached, lowering failed, etc.).

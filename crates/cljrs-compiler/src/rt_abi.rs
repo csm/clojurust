@@ -872,6 +872,7 @@ thread_local! {
     static RT_REGION_STACK: RefCell<Vec<Box<Region>>> =
         const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-compiler/RT_REGION_STACK", refcell RT_REGION_STACK: Vec<Box<Region>>);
 
 /// Allocate `val` directly into the region named by `handle`, falling back to
 /// the active thread-local region (then the GC heap) when `handle` is null.
@@ -3743,6 +3744,7 @@ pub unsafe extern "C" fn rt_with_bindings(
 thread_local! {
     static PENDING_EXCEPTION: std::cell::RefCell<Option<*const Value>> = const { std::cell::RefCell::new(None) };
 }
+cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCEPTION: Option<*const Value>);
 
 /// `(throw val)` — throws a Clojure value as an exception.
 ///

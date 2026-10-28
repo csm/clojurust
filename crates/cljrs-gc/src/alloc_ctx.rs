@@ -42,6 +42,7 @@ thread_local! {
     /// Empty ≡ Static (program-startup default).
     pub(crate) static ALLOC_CTX: RefCell<Vec<AllocCtx>> = const { RefCell::new(Vec::new()) };
 }
+crate::mutator_slot!("cljrs-gc/ALLOC_CTX", refcell ALLOC_CTX: Vec<AllocCtx>);
 
 /// Allocate `value` in the currently active allocation context.
 pub(crate) fn alloc_in_ctx<T: Trace + 'static>(value: T) -> GcPtr<T> {

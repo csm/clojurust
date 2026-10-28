@@ -60,6 +60,7 @@ const STREAM_FLUSH_THRESHOLD: usize = 1024;
 thread_local! {
     static OUTPUT_CAPTURE: std::cell::RefCell<Vec<OutputCapture>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/OUTPUT_CAPTURE", refcell OUTPUT_CAPTURE: Vec<OutputCapture>);
 
 // BigDecimal precision
 
@@ -72,6 +73,10 @@ struct BigDecimalPrecision {
 thread_local! {
     static BIG_DECIMAL_SCALE: std::cell::RefCell<Vec<BigDecimalPrecision>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!(
+    "cljrs-runtime/BIG_DECIMAL_SCALE",
+    refcell BIG_DECIMAL_SCALE: Vec<BigDecimalPrecision>
+);
 
 fn round_bigdecimal(result: BigDecimal, prec: &BigDecimalPrecision) -> ValueResult<BigDecimal> {
     let precision: u64 = prec.precision;
@@ -6199,7 +6204,11 @@ fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn add_watch_to(watches: &Mutex<Vec<(Value, Value)>>, key: Value, f: Value) {
+fn add_watch_to(
+    watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>,
+    key: Value,
+    f: Value,
+) {
     let mut ws = watches.lock().unwrap();
     if let Some(entry) = ws.iter_mut().find(|(k, _)| k == &key) {
         entry.1 = f;
@@ -6208,7 +6217,7 @@ fn add_watch_to(watches: &Mutex<Vec<(Value, Value)>>, key: Value, f: Value) {
     }
 }
 
-fn remove_watch_from(watches: &Mutex<Vec<(Value, Value)>>, key: &Value) {
+fn remove_watch_from(watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>, key: &Value) {
     watches.lock().unwrap().retain(|(k, _)| k != key);
 }
 

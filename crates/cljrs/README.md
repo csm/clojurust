@@ -52,6 +52,10 @@ tests/
   embedding_book_examples.rs — the snippets from the book's Embedding chapter
                       (`docs/book/src/embedding/`), compiled and run so the
                       documented host API cannot drift
+  thread_local_classification.rs — every `thread_local!` under `crates/*/src`
+                      is classified per-mutator (a registered
+                      `cljrs_gc::mutator_slot!`) or per-thread, with a reason;
+                      a new unclassified one fails (virtual threads Phase 0)
   pinned_dylib_e2e.rs — gated (`CLJRS_DYLIB_E2E=1`) pinned-native end-to-end
                       test; described under Pinned native packages below
   core_shadowing_tiers.rs — shadowed `clojure.core` names (a `let`-bound `inc`,
