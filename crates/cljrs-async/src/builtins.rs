@@ -560,8 +560,8 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
                 "alts!! options require key/value pairs".into(),
             ));
         }
-        for pair in args[1..].chunks_exact(2) {
-            option(&pair[0], &pair[1])?;
+        for [key, value] in args[1..].as_chunks::<2>().0 {
+            option(key, value)?;
         }
     }
     if alternatives.is_empty() && default.is_none() {
