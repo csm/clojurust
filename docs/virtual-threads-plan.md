@@ -361,7 +361,8 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - Delay and lazy sequence states distinguish pending, realizing, settled, and failed computations.
   The realizing state retains the traced thunk. Competing fibers wait without a realization lock.
   Cancellation restores the original pending thunk and wakes waiters to retry. Normal thunk errors remain cached.
-  Carrier code receives an error if a wait needs a parked fiber on the same thread to resume.
+  Monitor acquisition, delay forcing, and `try_realize` reject carrier waits on same-thread fibers.
+  Legacy infallible realization paths still panic on this check.
 - Core `slurp` and `spit` offload owned file work to the blocking worker pool.
   The existing channel interfaces provide parking paths for `cljrs-io` and `cljrs-net`.
 - Rust `parking::blocking` and `#[cljrs_interop::export(blocking)]` offload owned, `Send` work.
@@ -380,6 +381,11 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 
 Remaining Phase 2 work:
 
+- Migrate remaining production `realize()` calls to fallible realization and propagate errors through their callers.
+  These paths include equality, hashing, printing, sequence conversion, destructuring, and `cljrs-compiler/src/rt_abi.rs`.
+  Prioritize the five AOT ABI calls: a panic across an `extern "C"` boundary can abort the process.
+  Trait-based operations need an explicit error propagation strategy because equality, hashing, and formatting have infallible interfaces.
+  Add regressions with a parked realizer and carrier callers, including an AOT subprocess that must report an error without aborting.
 - Put alternatives and `:default` / `:priority` options for `alts!!`.
 - The general Clojure `(blocking & body)` form. Arbitrary Clojure closures contain `!Send` values.
   The Rust escape hatch and export attribute are available now.
