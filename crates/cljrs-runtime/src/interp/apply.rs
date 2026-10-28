@@ -853,6 +853,9 @@ fn macro_apply(
     }
 
     let expanded_val = call_cljrs_fn(mfn, args.as_ref(), env)?;
+    // The macro's call frame no longer roots its result, and converting it can
+    // realize lazy seqs, which runs code with GC safepoints.
+    let _expanded_root = crate::env::gc_roots::root_value(&expanded_val);
     let dummy_span = cljrs_types::span::Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
     crate::interp::macros::value_to_form(&expanded_val, dummy_span)
 }

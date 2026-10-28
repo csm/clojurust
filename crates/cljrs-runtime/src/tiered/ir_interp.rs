@@ -350,8 +350,12 @@ fn interpret_ir_inner(
     osr_arity_id: Option<u64>,
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
-    // GC safepoint at function entry.
-    crate::env::gc_roots::gc_safepoint(env)?;
+    // GC safepoint at function entry.  Root the arguments first: a caller
+    // such as a native `reduce` may hold the only reference to them.
+    {
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        crate::env::gc_roots::gc_safepoint(env)?;
+    }
 
     let mut regs = Registers::new(ir_func.next_var);
     // Keep all values in the register file alive across GC safepoints.
@@ -371,6 +375,13 @@ fn interpret_ir_inner(
             regs.set(*var_id, Value::Nil);
         }
     }
+
+    // Mark where this call's heap allocations start in ALLOC_ROOTS.  Each loop
+    // back-edge releases them (see `RecurJump` below).  The frame is never
+    // dropped: on return the allocations made since the last back-edge,
+    // including the result, stay rooted in the caller's frame as they did
+    // before IR calls had a frame, since native callers rely on that.
+    let alloc_frame = std::mem::ManuallyDrop::new(cljrs_gc::push_alloc_frame());
 
     // Build a block index for O(1) lookup.
     // In the common case (dense sequential IDs), this is None and we use
@@ -476,6 +487,12 @@ fn interpret_ir_inner(
                 current_block_idx = resolve(target);
             }
             Terminator::RecurJump { target, args: _ } => {
+                // Every value live across the back-edge is in the register
+                // file, which is rooted for the whole call, so the previous
+                // iterations' allocations need no alloc-frame roots: release
+                // them so the dead intermediates are collectable.
+                alloc_frame.release();
+
                 // GC safepoint at loop back-edge.
                 crate::env::gc_roots::gc_safepoint(env)?;
 

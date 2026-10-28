@@ -67,7 +67,8 @@ src/
                     leaf Trace impls; conditional GC vs no-gc implementations
   gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
   gc_full         — (GC mode only) GcHeap, HeapProxy, HEAP (per-isolate proxy),
-                    ALLOC_ROOTS, AllocRootGuard
+                    ALLOC_ROOTS, AllocRootGuard (push_alloc_frame();
+                    release() unroots the frame's allocations so far)
   nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
   static_arena.rs — (no-gc mode) global program-lifetime bump allocator;
                     in debug builds, tracks chunk ranges for is_static_addr()
@@ -485,7 +486,7 @@ impl IsolateControl {
     pub fn collection_requests(&self) -> u64;
     pub fn credit_refills(&self) -> u64;
 }
-pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub duration }
+pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub bytes_pending, pub duration }
 pub struct MemoryCharge;   // RAII; Drop returns its bytes once
 pub struct MemoryLimitExceeded { pub class, pub requested, pub committed, pub hard_limit }
 pub struct MemorySnapshot { /* strict flag, limits, pressure, committed/used/free
@@ -540,7 +541,10 @@ collection from another thread.  At `Yellow` the governor requests collection
 from the allocating isolate and from the largest heap, at most once per
 collection epoch and only above the isolate's post-collection target (the
 surviving bytes plus the larger of half of them or `min_headroom()`; after a
-zero-yield collection, the larger of all of them or `min_headroom()`); at
+zero-yield collection, the larger of all of them or `min_headroom()`).
+Surviving bytes exclude `bytes_pending`, the unreachable objects sweep keeps
+for their grace cycle, and a collection with pending bytes is not zero-yield,
+so the follow-up collection that frees them is requested promptly; at
 `Red` the target is ignored.  Pressure transitions log at `info` and
 over-limit events at `debug` under the `memory` tracing target.
 
@@ -645,7 +649,8 @@ programs and the AOT test harness call it once at exit.
   decremented by the same value when the object is freed.  Types that own
   significant out-of-line heap (Form AST trees in `CljxFn`, String capacity)
   override `gc_size_extra` so the GC threshold fires before the process OOMs.
-- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed),
+- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed
+  and nothing newly unreachable in its grace period),
   GC is suppressed until `memory_in_use` grows by another `soft_limit/10` bytes
   (a fixed additive headroom, not a percentage of current memory).  Using a
   percentage of current memory as headroom would compound across consecutive

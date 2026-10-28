@@ -75,16 +75,23 @@ impl Drop for EnvRootGuard {
     }
 }
 
-/// RAII guard that pops one entry from the value shadow stack on drop.
+/// RAII guard that removes its own entry from the value shadow stack on drop.
+///
+/// The entry is removed by identity rather than popped: async tasks on one
+/// `LocalSet` share this thread's stack and can hold guards across `await`s,
+/// so guards need not drop in LIFO order.
 pub struct ValueRootGuard {
-    pushed: bool,
+    entry: Option<(*const cljrs_value::Value, usize)>,
 }
 
 impl Drop for ValueRootGuard {
     fn drop(&mut self) {
-        if self.pushed {
+        if let Some(entry) = self.entry {
             VALUE_ROOTS.with(|roots| {
-                roots.borrow_mut().pop();
+                let mut roots = roots.borrow_mut();
+                if let Some(i) = roots.iter().rposition(|e| *e == entry) {
+                    roots.remove(i);
+                }
             });
         }
     }
@@ -101,23 +108,19 @@ pub fn push_env_root(env: &Env) -> EnvRootGuard {
 
 /// Register a single Value as a GC root.
 pub fn root_value(val: &cljrs_value::Value) -> ValueRootGuard {
-    VALUE_ROOTS.with(|roots| {
-        roots
-            .borrow_mut()
-            .push((val as *const cljrs_value::Value, 1));
-    });
-    ValueRootGuard { pushed: true }
+    let entry = (val as *const cljrs_value::Value, 1);
+    VALUE_ROOTS.with(|roots| roots.borrow_mut().push(entry));
+    ValueRootGuard { entry: Some(entry) }
 }
 
 /// Register a slice of Values as GC roots (e.g., a Vec<Value>).
 pub fn root_values(vals: &[cljrs_value::Value]) -> ValueRootGuard {
     if vals.is_empty() {
-        return ValueRootGuard { pushed: false };
+        return ValueRootGuard { entry: None };
     }
-    VALUE_ROOTS.with(|roots| {
-        roots.borrow_mut().push((vals.as_ptr(), vals.len()));
-    });
-    ValueRootGuard { pushed: true }
+    let entry = (vals.as_ptr(), vals.len());
+    VALUE_ROOTS.with(|roots| roots.borrow_mut().push(entry));
+    ValueRootGuard { entry: Some(entry) }
 }
 
 /// RAII guard that pops one entry from the option-value shadow stack on drop.
