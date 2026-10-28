@@ -37,8 +37,8 @@ pub(crate) const MULT_TAG: &str = "Mult";
 
 /// Outcome of a non-blocking rendezvous offer (capacity-0 `put!`).
 pub(crate) enum RvOffer {
-    /// Value placed into the empty slot; the carried token snapshots the
-    /// take-count so the putter can detect when its value is consumed.
+    /// Value placed into the empty slot; the token identifies its queue entry
+    /// so the putter can detect when that particular value is consumed.
     Offered(u64),
     /// A value is already pending; the caller should yield and retry.
     Full,
@@ -64,8 +64,6 @@ struct ChannelState {
     /// Buffered capacity; `0` means unbuffered (rendezvous).
     capacity: usize,
     closed: bool,
-    /// Monotonic count of successful takes, used to detect rendezvous handoff.
-    taken: u64,
     takes: BTreeMap<u64, Waiter>,
     puts: BTreeMap<u64, Waiter>,
     // Retain tracing links after a waiter commits, until its future is consumed.
@@ -256,7 +254,6 @@ impl ChannelState {
                 && let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None)
             {
                 let (order, value) = self.queue.pop_first().unwrap();
-                self.taken = self.taken.wrapping_add(1);
                 peer.take_order.set(Some(order));
                 wakes.extend(peer.finish(value, waiter.index));
                 continue;
@@ -322,7 +319,6 @@ impl CljChannel {
                 None
             }
         } else if let Some((order, value)) = state.queue.pop_first() {
-            state.taken = state.taken.wrapping_add(1);
             selection.take_order.set(Some(order));
             Some(value)
         } else if !state.closed
@@ -358,7 +354,6 @@ impl CljChannel {
                 next_waiter: 0,
                 capacity,
                 closed: false,
-                taken: 0,
                 takes: BTreeMap::new(),
                 puts: BTreeMap::new(),
                 registrations: BTreeMap::new(),
@@ -414,7 +409,6 @@ impl CljChannel {
             return RvOffer::Closed;
         }
         if st.queue.is_empty() {
-            let token = st.taken;
             // GC builds: heap-promotion fallback (see `try_put_buffered`).
             let order = st.value_order();
             st.queue
@@ -422,7 +416,7 @@ impl CljChannel {
             let wakes = st.service();
             drop(st);
             wake(wakes);
-            RvOffer::Offered(token)
+            RvOffer::Offered(order)
         } else {
             RvOffer::Full
         }
@@ -458,16 +452,15 @@ impl CljChannel {
 
     /// Check whether a rendezvous offer (made at `token`) has been taken.
     ///
-    /// Because the slot stays full until our value is consumed, no other putter
-    /// can offer in the meantime, so any increment of the take-count past
-    /// `token` is our handoff.
+    /// A cancelled take can restore an older value ahead of this offer.
+    /// Check and retract only the queue entry identified by the token.
     pub(crate) fn rv_status(&self, token: u64) -> RvStatus {
         let mut st = self.state.lock().unwrap();
-        if st.taken != token {
+        if !st.queue.contains_key(&token) {
             return RvStatus::Taken;
         }
         if st.closed {
-            st.queue.pop_first(); // cancel our still-pending offer
+            st.queue.remove(&token); // cancel only our still-pending offer
             return RvStatus::ClosedUntaken;
         }
         RvStatus::Waiting
@@ -622,6 +615,45 @@ mod notification_tests {
         drop(choice);
         assert_eq!(poll(&mut next), Poll::Ready(Value::Long(42)));
         assert_eq!(x.try_take(), None);
+    }
+
+    #[test]
+    fn rendezvous_offer_close_retracts_only_its_own_value() {
+        let ch = CljChannel::new(0);
+        let mut take = Box::pin(ch.take());
+        assert!(poll(&mut take).is_pending());
+        let RvOffer::Offered(first) = ch.rv_offer(&Value::Long(1)) else {
+            panic!("first offer was not accepted");
+        };
+        assert!(matches!(ch.rv_status(first), RvStatus::Taken));
+        let RvOffer::Offered(second) = ch.rv_offer(&Value::Long(2)) else {
+            panic!("second offer was not accepted");
+        };
+        drop(take);
+        ch.close();
+        assert!(matches!(ch.rv_status(second), RvStatus::ClosedUntaken));
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert_eq!(ch.try_take(), Some(Value::Nil));
+    }
+
+    #[test]
+    fn rendezvous_offer_waits_for_its_own_value_after_a_take_is_restored() {
+        let ch = CljChannel::new(0);
+        let mut take = Box::pin(ch.take());
+        assert!(poll(&mut take).is_pending());
+        let RvOffer::Offered(first) = ch.rv_offer(&Value::Long(1)) else {
+            panic!("first offer was not accepted");
+        };
+        assert!(matches!(ch.rv_status(first), RvStatus::Taken));
+        let RvOffer::Offered(second) = ch.rv_offer(&Value::Long(2)) else {
+            panic!("second offer was not accepted");
+        };
+        drop(take);
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert!(matches!(ch.rv_status(second), RvStatus::Waiting));
+        assert_eq!(ch.try_take(), Some(Value::Long(2)));
+        assert!(matches!(ch.rv_status(second), RvStatus::Taken));
+        assert_eq!(ch.try_take(), None);
     }
 
     #[test]
