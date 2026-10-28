@@ -6,6 +6,7 @@
 use std::ptr::NonNull;
 
 pub mod governor;
+pub mod mutator;
 pub mod region;
 pub mod stats;
 
@@ -1045,6 +1046,7 @@ mod gc_full {
     thread_local! {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
     }
+    crate::mutator_slot!("cljrs-gc/ALLOC_ROOTS", refcell ALLOC_ROOTS: Vec<*mut GcBoxHeader>);
 
     pub struct AllocRootGuard {
         saved_len: usize,

@@ -31,7 +31,7 @@ fn eval_error_to_value(e: EvalError) -> Value {
 /// Each watch fn is called as `(f key ref old new)`.
 /// Errors thrown by watch fns are re-thrown (matching Clojure behavior).
 fn fire_watches(
-    watches: &std::sync::Mutex<Vec<(Value, Value)>>,
+    watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>,
     reference: &Value,
     old: &Value,
     new: &Value,
@@ -58,6 +58,7 @@ fn fire_watches(
 thread_local! {
     static WATCH_ERROR: std::cell::RefCell<Option<EvalError>> = const { std::cell::RefCell::new(None) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/WATCH_ERROR", refcell WATCH_ERROR: Option<EvalError>);
 
 /// Check if a watch error occurred and propagate it.
 fn check_watch_error() -> EvalResult<()> {

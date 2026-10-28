@@ -118,6 +118,9 @@ tests/
                                      answers, over record, deftype, reify and the
                                      built-in kinds
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
+  mutator_state.rs                 — virtual threads Phase 0: MutatorState save/restore
+                                     between two live evaluations on one thread keeps
+                                     bindings, output capture and eval context apart
   versioned_resolution.rs          — versioned resolution against a real git fixture
   vcs_provider.rs                  — the VcsProvider seam: default provider, degradation
                                      with none installed, signature-check routing and
@@ -609,6 +612,13 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
 - `set_stw_reclaim_hook(f)` — registers a stop-the-world reclaim hook; multiple hooks may be registered and each runs (in registration order) inside the STW guard at the tail of every collection (`force_collect`, `gc_safepoint`, `async_gc_collect`), when all mutator threads are parked.  Registrants: the compiler's JIT code cache frees superseded native code (Phase 10.2); the `tiered` lowering worker sweeps idle Tier-1 IR (Phase 10.7)
+
+The root shadow stacks (`ENV_ROOTS`, `VALUE_ROOTS`, `OPTION_VALUE_ROOTS`) are
+per-mutator state: like `BINDING_STACK`, `EVAL_CONTEXT`, `CALL_DEPTH`, the gas
+stacks, the transaction policy, `OUTPUT_CAPTURE`, `BIG_DECIMAL_SCALE`,
+`WATCH_ERROR`, `IR_LOWERING_ACTIVE` and the JIT active-frame stack, they are
+registered with `cljrs_gc::mutator_slot!` so a fiber scheduler can swap them
+with `cljrs_gc::mutator::MutatorState` (docs/virtual-threads-plan.md).
 
 Root tracing covers all namespaces (including immutable `ns@commit`
 namespaces) **and** the values in `GlobalEnv::version_cache`, so versioned

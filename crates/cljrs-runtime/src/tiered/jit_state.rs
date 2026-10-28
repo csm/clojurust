@@ -801,6 +801,26 @@ thread_local! {
     };
 }
 
+// Per-mutator: each fiber has its own native-frame stack.  The thread's
+// registered `ThreadFrames` stays put; only its contents are exchanged, so the
+// registry keeps seeing whichever fiber is running.  A *suspended* fiber's
+// epochs live in its `MutatorState` instead, so once fibers exist,
+// `live_epochs` must also union over the isolate's suspended fibers.
+const _: () = {
+    fn init() -> Box<dyn std::any::Any> {
+        Box::new(Vec::<u64>::new())
+    }
+    fn swap(value: &mut dyn std::any::Any) {
+        let value = value
+            .downcast_mut::<Vec<u64>>()
+            .expect("mutator slot cljrs-runtime/MY_FRAMES: type mismatch");
+        MY_FRAMES.with(|f| std::mem::swap(&mut *f.stack.lock().unwrap(), value));
+    }
+    cljrs_gc::mutator::inventory::submit! {
+        cljrs_gc::mutator::MutatorSlot { name: "cljrs-runtime/MY_FRAMES", init, swap }
+    }
+};
+
 /// RAII guard that pops one active-frame epoch on drop (including on unwind,
 /// e.g. when native code throws back through the dispatch boundary).
 pub struct JitFrameGuard {

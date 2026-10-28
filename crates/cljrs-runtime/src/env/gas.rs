@@ -59,6 +59,9 @@ thread_local! {
     static EXHAUSTED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     static INTERRUPTS: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_ACTIVE", refcell ACTIVE: Vec<Arc<GasMeter>>);
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_EXHAUSTED", refcell EXHAUSTED: Vec<bool>);
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_INTERRUPTS", refcell INTERRUPTS: Vec<Arc<AtomicBool>>);
 
 /// Installs an interrupt flag for the dynamic extent of an evaluation on
 /// this thread. While installed, setting the flag (from any thread) makes the

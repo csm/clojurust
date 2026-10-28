@@ -413,6 +413,7 @@ thread_local! {
     /// [`try_alloc_in_region`] to opportunistically use the top region.
     static REGION_STACK: RefCell<Vec<*mut Region>> = const { RefCell::new(Vec::new()) };
 }
+crate::mutator_slot!("cljrs-gc/REGION_STACK", refcell REGION_STACK: Vec<*mut Region>);
 
 /// RAII guard that activates a [`Region`] on the thread-local stack.
 ///
@@ -467,6 +468,9 @@ thread_local! {
     /// retired (not reset) when it closes.
     static POISON_WATERMARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+// The watermark is a depth into REGION_STACK, so it moves with it.
+#[cfg(not(feature = "no-gc"))]
+crate::mutator_slot!("cljrs-gc/POISON_WATERMARK", cell POISON_WATERMARK: usize);
 
 /// Poison every region currently active on this thread: each will be retired
 /// instead of reset when its scope closes.  No-op when no region is active.

@@ -23,6 +23,7 @@ thread_local! {
     static BINDING_STACK: RefCell<Vec<HashMap<VarKey, Value>>> =
         const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/BINDING_STACK", refcell BINDING_STACK: Vec<HashMap<VarKey, Value>>);
 
 // ── RAII guard ────────────────────────────────────────────────────────────────
 

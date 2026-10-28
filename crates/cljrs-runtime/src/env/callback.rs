@@ -25,6 +25,7 @@ struct EvalContext {
 thread_local! {
     static EVAL_CONTEXT: RefCell<Vec<EvalContext>> = const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/EVAL_CONTEXT", refcell EVAL_CONTEXT: Vec<EvalContext>);
 
 /// Push the current eval context before calling a native function.
 pub fn push_eval_context(env: &Env) {

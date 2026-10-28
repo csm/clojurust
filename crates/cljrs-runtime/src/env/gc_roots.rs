@@ -63,6 +63,12 @@ thread_local! {
     static OPTION_VALUE_ROOTS: RefCell<Vec<(*const Option<cljrs_value::Value>, usize)>> =
         const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/ENV_ROOTS", refcell ENV_ROOTS: Vec<*const Env>);
+cljrs_gc::mutator_slot!("cljrs-runtime/VALUE_ROOTS", refcell VALUE_ROOTS: Vec<(*const cljrs_value::Value, usize)>);
+cljrs_gc::mutator_slot!(
+    "cljrs-runtime/OPTION_VALUE_ROOTS",
+    refcell OPTION_VALUE_ROOTS: Vec<(*const Option<cljrs_value::Value>, usize)>
+);
 
 /// RAII guard that pops the Env pointer on drop.
 pub struct EnvRootGuard;

@@ -32,7 +32,7 @@ src/
   symbol.rs                      — Symbol { namespace, name }
   type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
-  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
+  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent. The runtime-lock fields of Protocol, MultiFn, Var, Atom, Namespace, LazySeq, Volatile, Delay and Agent watches are `cljrs_gc::mutator::TrackedMutex` (debug builds count held guards so a fiber park can assert none is held — virtual threads Phase 0)
   value.rs                       — Value enum (incl. SharedAtom, ByteBlob variants), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -316,7 +316,7 @@ A var's *root* binding uses the **same** cross-isolate mechanism as
 
 ```rust
 pub struct Var {
-    pub value: Mutex<Option<Value>>,                          // isolate-local fast path
+    pub value: TrackedMutex<Option<Value>>,                   // isolate-local fast path
     pub shared_root: Arc<ArcSwap<Option<SharedValue>>>,       // cross-isolate mirror (B3)
     binding_generation: AtomicU64,                            // local root revision
     // …namespace, name, is_macro, meta, watches
@@ -567,14 +567,14 @@ module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
 ```rust
 pub struct Namespace {
     pub name: Arc<str>,
-    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,        // own vars
-    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,         // imported names
-    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,          // ns alias → ns name
-    pub source_file: Mutex<Option<Arc<str>>>,                 // path the ns was loaded from
-    pub git_repo_root: Mutex<Option<Arc<str>>>,               // repo root of source_file, if any
+    pub interns: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>, // own vars
+    pub refers: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,  // imported names
+    pub aliases: TrackedMutex<HashMap<Arc<str>, Arc<str>>>,   // ns alias → ns name
+    pub source_file: TrackedMutex<Option<Arc<str>>>,          // path the ns was loaded from
+    pub git_repo_root: TrackedMutex<Option<Arc<str>>>,        // repo root of source_file, if any
     pub is_versioned: bool,                                   // true for `name@commit` namespaces
-    pub meta: Mutex<Option<Value>>,                           // from `(ns ^{...} name ...)` / attr-map
-    pub refer_clojure_filter: Mutex<Option<ReferClojureFilter>>, // from `(:refer-clojure ...)`
+    pub meta: TrackedMutex<Option<Value>>,                    // from `(ns ^{...} name ...)` / attr-map
+    pub refer_clojure_filter: TrackedMutex<Option<ReferClojureFilter>>, // from `(:refer-clojure ...)`
 }
 
 impl Namespace {

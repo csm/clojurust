@@ -867,6 +867,7 @@ name = "cljrs-gc"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "inventory",
  "num-bigint",
  "num-rational",
  "system-memory",

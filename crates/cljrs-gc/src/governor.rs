@@ -1483,6 +1483,12 @@ impl Drop for CriticalSection {
     }
 }
 
+/// True while the calling thread is inside a [`CriticalSection`].  A fiber
+/// must never park here (see [`crate::mutator::assert_parkable`]).
+pub fn in_critical_section() -> bool {
+    CRITICAL_DEPTH.try_with(|d| d.get() != 0).unwrap_or(false)
+}
+
 /// Run `f` inside a [`CriticalSection`].
 pub fn with_critical<R>(f: impl FnOnce() -> R) -> R {
     let _section = enter_critical();
