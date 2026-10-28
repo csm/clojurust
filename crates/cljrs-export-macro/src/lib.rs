@@ -23,6 +23,7 @@ use syn::{
 // ── Attribute argument parsing ────────────────────────────────────────────────
 
 struct ExportArgs {
+    blocking: bool,
     ns: Option<LitStr>,
     name: Option<LitStr>,
     /// Minimum arity for variadic functions (default 0).
@@ -31,12 +32,20 @@ struct ExportArgs {
 
 impl Parse for ExportArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut blocking = false;
         let mut ns: Option<LitStr> = None;
         let mut name: Option<LitStr> = None;
         let mut variadic_min: Option<LitInt> = None;
 
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
+            if key == "blocking" {
+                blocking = true;
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
@@ -60,6 +69,7 @@ impl Parse for ExportArgs {
         }
 
         Ok(Self {
+            blocking,
             ns,
             name,
             variadic_min,
@@ -85,6 +95,11 @@ impl Parse for ExportArgs {
 ///   (default: Rust function name with `_` replaced by `-`).
 /// - `variadic_min = N` — for variadic functions, set the minimum arity
 ///   (default 0). Only meaningful when the function takes `&[Value]`.
+///
+/// - `blocking` — convert owned inputs on the isolate, run the Rust function
+///   on the blocking worker pool, then convert its result on the isolate.
+///   Inputs and output must be `Send + 'static`. Variadic `&[Value]` exports
+///   cannot use this attribute. Outside a fiber, the call runs directly.
 ///
 /// # Supported signatures
 ///
@@ -160,6 +175,12 @@ fn export_impl(args: ExportArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     // Detect variadic: exactly one parameter whose type is `&[Value]`.
     let variadic = params.len() == 1 && is_slice_of_value(&params[0].ty);
 
+    if args.blocking && variadic {
+        return Err(syn::Error::new_spanned(
+            fn_ident,
+            "blocking exports require owned, Send parameters; &[Value] cannot cross threads",
+        ));
+    }
     let native_fn_expr = if variadic {
         let min: usize = match &args.variadic_min {
             Some(lit) => lit.base10_parse()?,
@@ -172,7 +193,13 @@ fn export_impl(args: ExportArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             "`variadic_min` is only valid when the function takes `&[Value]`",
         ));
     } else {
-        build_fixed(&qualified, fn_ident, &params, &func.sig.output)?
+        build_fixed(
+            &qualified,
+            fn_ident,
+            &params,
+            &func.sig.output,
+            args.blocking,
+        )?
     };
 
     Ok(quote! {
@@ -192,13 +219,20 @@ fn build_fixed(
     fn_ident: &syn::Ident,
     params: &[&PatType],
     ret: &ReturnType,
+    blocking: bool,
 ) -> syn::Result<TokenStream2> {
     let n = params.len();
     let indices: Vec<usize> = (0..n).collect();
     let arg_idents: Vec<syn::Ident> = (0..n).map(|i| format_ident!("__a{i}")).collect();
     let param_tys: Vec<&Type> = params.iter().map(|pt| pt.ty.as_ref()).collect();
 
-    let result_expr = build_result_expr(quote! { #fn_ident(#(#arg_idents),*) }, ret)?;
+    let call = quote! { #fn_ident(#(#arg_idents),*) };
+    let call = if blocking {
+        quote! { ::cljrs_interop::blocking(move || #call) }
+    } else {
+        call
+    };
+    let result_expr = build_result_expr(call, ret)?;
 
     Ok(quote! {
         ::cljrs_interop::NativeFn::with_closure(

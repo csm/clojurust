@@ -769,6 +769,8 @@ mod tests {
 
     /// Two isolates allocate independently; the receiver's heap is unaffected
     /// by the sender's heap. Verifies cross-isolate copy (not shared pointer).
+    // This fixture measures the traced heaps, which no-gc does not use.
+    #[cfg(not(feature = "no-gc"))]
     #[test]
     fn receiver_heap_is_independent() {
         let barrier = Arc::new(std::sync::Barrier::new(2));

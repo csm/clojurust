@@ -26,6 +26,7 @@ src/
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
+  parking.rs                     — optional executor hooks, notification events, borrowed future parking, and Send-only blocking work
   publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
@@ -616,27 +617,82 @@ one local name, happens once in `GlobalEnv::set_refer_clojure_filter`.
 ### `Thunk` / `LazySeq` / `CljxCons` (Phase 5)
 
 ```rust
-pub trait Thunk: Send + Sync + std::fmt::Debug {
-    fn force(&self) -> Value;
+pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
+    fn force(&self) -> Result<Value, String>;
 }
 
-pub struct LazySeq {
-    pub state: Mutex<LazySeqState>,  // Pending(Box<dyn Thunk>) | Forced(Value)
+pub struct Realizer { /* isolate thread and optional fiber id */ }
+impl Realizer {
+    pub fn current() -> Self;
+    pub fn ensure_can_wait(self) -> Result<(), String>;
 }
+
+pub enum LazySeqState {
+    Pending(Rc<dyn Thunk>),
+    Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
+    Forced(Value),
+    Error(String),
+}
+pub struct LazySeq { pub state: TrackedMutex<LazySeqState> }
 impl LazySeq {
-    pub fn new(thunk: Box<dyn Thunk>) -> Self
-    pub fn realize(&self) -> Value   // forces once, caches result
+    pub fn new(thunk: Box<dyn Thunk>) -> Self;
+    pub fn try_realize(&self) -> Result<Value, String>;
+    pub fn realize(&self) -> Value;
+    pub fn error(&self) -> Option<String>;
 }
+pub struct CljxCons { pub head: Value, pub tail: Value }
+```
 
-pub struct CljxCons {
-    pub head: Value,
-    pub tail: Value,   // may be LazySeq, Cons, List, or Nil
+`Thunk` implementations live in `cljrs-runtime`, so this crate needs no evaluator dependency.
+The realization state retains the traced thunk while user code runs without the cell lock.
+Other fibers wait for the result. Cancellation or a panic restores `Pending` and wakes waiters so another reader can retry.
+Normal thunk errors remain cached.
+
+`Realizer` identifies both monitor owners and realization owners.
+`ensure_can_wait` rejects a carrier wait on a fiber that needs the same thread to resume.
+`try_realize` returns this error without changing the cell. Runtime sequence operations use this fallible entry point.
+The legacy `realize` helper returns nil for cached thunk errors and panics on an unsafe carrier wait.
+Its infallible trait callers cannot return a transient wait error.
+
+### `parking` (virtual threads Phase 2)
+
+```rust
+pub type BlockingResult = Box<dyn Any + Send>;
+pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
+pub struct Hooks {
+    pub current: fn() -> Option<u64>,
+    pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
+    pub sleep: fn(Duration),
+    pub blocking: fn(BlockingJob) -> BlockingResult,
+}
+pub fn install(hooks: Hooks);
+pub fn current() -> Option<u64>;
+pub fn park<F: Future>(future: F) -> F::Output;
+pub fn block_on<F: Future>(future: F) -> F::Output;
+pub fn sleep(duration: Duration);
+pub fn blocking<F, T>(job: F) -> T
+where F: FnOnce() -> T + Send + 'static, T: Send + 'static;
+
+pub struct Event { /* Default + Debug */ }
+impl Event {
+    pub fn listen(&self) -> Listener<'_>;
+    pub fn notify_all(&self);
+}
+pub struct Listener<'a> { /* Future<Output = ()> + Drop */ }
+impl Listener<'_> {
+    pub fn wait(self, timeout: Option<Duration>) -> bool;
 }
 ```
 
-`Thunk` implementations live in `cljrs-runtime` (e.g. `ClosureThunk`) so that
-`cljrs-value` stays free of evaluator dependencies while `LazySeq` can still
-call back through the trait object.
+Native fibers install the executor hooks once. This crate does not depend on Tokio.
+`park` accepts borrowed futures inside a fiber. `block_on` also supports notification futures outside a fiber with an OS-thread wait.
+`sleep` and `blocking` keep their direct behavior outside fibers.
+Managed values require precise roots across a park and cannot cross worker threads.
+
+A listener registers before its caller checks the protected condition.
+`notify_all` wakes every listener, and listener destruction removes its waker.
+`wait` returns false on timeout. It parks a fiber or waits on a Condvar outside fibers.
+Owner-aware callers use `Realizer::ensure_can_wait` before a potentially unsafe carrier wait.
 
 ### `TypeInstance` (Phase 6-ext — defrecord/deftype/reify)
 
@@ -668,20 +724,43 @@ itself is runtime state that does not cross a clone boundary.
 ```rust
 pub struct Volatile { pub value: Mutex<Value> }
 
-pub struct Delay { pub state: Mutex<DelayState> }  // Pending(Box<dyn Thunk>) | Forced(Value)
+pub enum DelayState {
+    Pending(Rc<dyn Thunk>),
+    Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
+    Forced(Value),
+    Error(String),
+}
+pub struct Delay { pub state: TrackedMutex<DelayState> }
+impl Delay {
+    pub fn new(thunk: Box<dyn Thunk>) -> Self;
+    pub fn force(&self) -> Result<Value, String>;
+    pub fn is_realized(&self) -> bool;
+}
 
 pub struct CljxPromise {
+    pub ready: parking::Event,
     pub value: Mutex<Option<Value>>,
     pub cond: Condvar,
 }
 
 pub struct CljxFuture {
+    pub ready: parking::Event,
     pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted
                                     // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
 
+impl CljxPromise {
+    pub fn new() -> Self;
+    pub fn deliver(&self, value: Value);
+    pub fn deref_blocking(&self) -> Value;
+    pub fn wait_value(&self, timeout: Option<Duration>) -> Option<Value>;
+    pub fn is_realized(&self) -> bool;
+}
 impl CljxFuture {
+    pub fn new() -> Self;
+    pub fn wait_value(&self, timeout: Option<Duration>) -> ValueResult<Option<Value>>;
+    pub fn settled_value(&self) -> Option<ValueResult<Value>>;
     pub fn is_done(&self) -> bool;
     pub fn is_cancelled(&self) -> bool;
     /// Running -> Cancelled, waking waiters; false if it had already settled.
@@ -701,6 +780,11 @@ pub struct Agent {
 }
 pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
 ```
+
+Delay realization uses the same owner checks and cancellation retry behavior as lazy sequences.
+Promise and future waits use `ready` notifications inside fibers and Condvar waits outside fibers.
+A timeout returns `None`. Settled future errors remain distinct from a timeout.
+`settled_value` reads a result without waiting. Settlement and cancellation wake both notification and Condvar consumers.
 
 ### `Protocol` / `ProtocolFn` / `MultiFn` (Phase 6)
 

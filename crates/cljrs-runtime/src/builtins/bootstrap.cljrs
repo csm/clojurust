@@ -1898,3 +1898,6 @@
 ;; The impl fns capture locals because deftype* registers them at the call site.
 (defmacro reify [& impls]
   `(make-type-instance (deftype* ~(gensym "reify__") [] ~@impls) {}))
+
+(defmacro locking [x & body]
+  (list 'clojure.core/locking-call x (cons 'fn (cons [] body))))

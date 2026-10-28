@@ -256,3 +256,23 @@ edge to a package, so one edge left at its defaults re-enables `regex-full` for
 the whole graph. `deps` has to be off as well for the size win to land, since
 `cljrs-project/vcs` pulls `regex` in through `pgp`. See
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+## Blocking native exports
+
+The `blocking` attribute runs an exported Rust function on the blocking worker pool when a fiber calls it.
+Outside a fiber, the function runs directly.
+
+```rust
+#[cljrs_interop::export(ns = "files", blocking)]
+fn read_text(path: String) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+```
+
+The wrapper converts arguments before the worker starts. It converts the result back to a Clojure value on the isolate.
+Arguments and results must be owned, `Send`, and `'static`. This includes the error type of a `Result`.
+The compiler rejects `Value` parameters and results because managed values cannot cross threads.
+Variadic exports with `&[Value]` cannot use `blocking`.
+
+Rust callers can use `cljrs_interop::blocking(move || ...)` with the same ownership constraints.
+A worker panic becomes a fiber error at the fiber boundary.

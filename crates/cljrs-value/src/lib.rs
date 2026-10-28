@@ -7,6 +7,7 @@ pub mod intern;
 pub mod jit_hooks;
 pub mod keyword;
 pub mod native_object;
+pub mod parking;
 #[cfg(not(feature = "no-gc"))]
 pub mod publish;
 pub mod regex;

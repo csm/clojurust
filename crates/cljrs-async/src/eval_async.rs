@@ -107,6 +107,7 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     };
     drop(state);
     future.get().cond.notify_all();
+    future.get().ready.notify_all();
 }
 
 /// Run the body of an `^:async` function to completion, yielding at every
@@ -282,6 +283,7 @@ pub async fn await_value(val: Value) -> EvalResult {
             let anchor = Value::Future(f.clone());
             let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
             loop {
+                let listener = f.get().ready.listen();
                 {
                     let guard = f.get().state.lock().unwrap();
                     match &*guard {
@@ -308,20 +310,21 @@ pub async fn await_value(val: Value) -> EvalResult {
                     }
                 }
                 cljrs_runtime::env::gc_roots::async_gc_collect();
-                tokio::task::yield_now().await;
+                listener.await;
             }
         }
         Value::Promise(p) => {
             let anchor = Value::Promise(p.clone());
             let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
             loop {
+                let listener = p.get().ready.listen();
                 {
                     if let Some(v) = p.get().value.lock().unwrap().as_ref() {
                         return Ok(v.clone());
                     }
                 }
                 cljrs_runtime::env::gc_roots::async_gc_collect();
-                tokio::task::yield_now().await;
+                listener.await;
             }
         }
         other => Ok(other),

@@ -53,6 +53,7 @@ src/
     gas.rs              — cooperative execution-credit metering
     gc_roots.rs         — GC root registration for the interpreter's Rust stack
     loader.rs           — namespace loading (require / load_ns) from source paths
+    monitor.rs          — reentrant object monitors, fiber waiters, and carrier deadlock checks
     policy.rs           — capability policy for isolated transaction functions
     taps.rs             — tap> / add-tap registry
     async_hook.rs       — AsyncRuntime seam and the async-JIT compile hook
@@ -1698,3 +1699,20 @@ the default provider at runtime.
 | `num-bigint`, `num-rational`, `bigdecimal`, `num-traits` | numeric tower |
 | `rand`, `rpds`, `uuid` | builtin implementations |
 | `log`, `thiserror` | diagnostics and error derivation |
+
+## Fiber monitors and blocking primitives
+
+`env::monitor::enter(&Value) -> ValueResult<MonitorGuard>` acquires an object monitor.
+`MonitorGuard` releases one reentrant acquisition on drop and stays on its creating thread.
+The caller must root the object while a guard or waiter retains its address.
+
+Monitor owners use `cljrs_value::types::Realizer`, which distinguishes fibers on the same isolate thread.
+A waiting fiber parks without an OS lock. Carrier code receives an error if the owner is a fiber on that thread.
+A different OS thread can still wait on the Condvar.
+The final owner or waiter removes its own registry entry. Acquisition does not scan the monitor table.
+
+The Clojure `locking` macro calls `locking-call` with a zero-argument callback.
+The callback retains the monitor through parks and releases it on return, error, or cancellation.
+`deref`, synchronous `await`, `sleep`, `Thread/sleep`, `slurp`, and `spit` use the optional parking hooks.
+Sequence builtins and macro conversion use `LazySeq::try_realize` to report realization errors without caching carrier wait errors.
+Root entry points do not yet create fibers. Those entry points remain Phase 3 work.

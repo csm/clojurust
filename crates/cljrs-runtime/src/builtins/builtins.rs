@@ -24,13 +24,13 @@ use crate::builtins::util::numeric_as_i64;
 use crate::env::env::GlobalEnv;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
+use cljrs_value::parking::sleep;
 use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
-    Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq,
-    MapValue, MultiFn, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom,
-    SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote,
-    promote,
+    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, Keyword, LazySeq, MapValue, MultiFn,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom, SortedSet, Symbol,
+    Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -42,7 +42,6 @@ use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
 use std::time::Duration;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
@@ -1695,6 +1694,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
+        ("locking-call", Arity::Fixed(2), builtin_locking_call),
         // Transients
         ("transient", Arity::Fixed(1), builtin_transient),
         ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
@@ -1881,11 +1881,13 @@ impl Iterator for ValueIter {
                     // Root self.current so the LazySeq (and the entire chain
                     // it's part of) survives any GC triggered during realize().
                     let _current_root = crate::env::gc_roots::root_value(&self.current);
-                    self.current = ls.get().realize();
-                    if let Some(err) = ls.get().error() {
-                        self.error = Some(err);
-                        self.current = Value::Nil;
-                        return None;
+                    match ls.get().try_realize() {
+                        Ok(value) => self.current = value,
+                        Err(error) => {
+                            self.error = Some(error);
+                            self.current = Value::Nil;
+                            return None;
+                        }
                     }
                 }
                 Value::Cons(c) => {
@@ -3450,7 +3452,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
         Value::ObjectArray(a) => a.get().0.lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
-            let realized = s.get().realize();
+            let realized = s.get().try_realize().map_err(ValueError::Other)?;
             return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
@@ -4065,10 +4067,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     // Iteratively unwrap lazy seqs to avoid stack overflow.
     let mut val = args[0].unwrap_meta().clone();
     while let Value::LazySeq(ls) = &val {
-        let realized = ls.get().realize();
-        if let Some(err) = ls.get().error() {
-            return Err(ValueError::Other(err));
-        }
+        let realized = ls.get().try_realize().map_err(ValueError::Other)?;
         val = realized;
     }
     match &val {
@@ -4215,10 +4214,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
             builtin_first(&[v])
         }
         Value::Cons(c) => Ok(c.get().head.clone()),
@@ -4258,10 +4254,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
             builtin_rest(&[v])
         }
         Value::Cons(c) => {
@@ -4540,10 +4533,7 @@ impl Thunk for ConcatThunk {
             // Peel through any lazy-seq wrappers on the head iteratively.
             let mut head = colls[0].clone();
             while let Value::LazySeq(ls) = &head {
-                let realized = ls.get().realize();
-                if let Some(err) = ls.get().error() {
-                    return Err(err);
-                }
+                let realized = ls.get().try_realize()?;
                 head = realized;
             }
 
@@ -4560,7 +4550,7 @@ impl Thunk for ConcatThunk {
                 _ => {}
             }
 
-            let (first, rest) = concat_first_rest(&head);
+            let (first, rest) = concat_first_rest(&head)?;
             match first {
                 Some(f) => {
                     colls[0] = rest;
@@ -4582,15 +4572,15 @@ impl Thunk for ConcatThunk {
 /// Extract first element and rest from a seq-like value without fully realizing it.
 /// Used by the lazy concat implementation.  Iteratively unwraps LazySeq to
 /// avoid stack overflow on deeply nested lazy chains.
-fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
+fn concat_first_rest(val: &Value) -> Result<(Option<Value>, Value), String> {
     // Iteratively unwrap lazy seqs first.
     let mut current = val.clone();
     while let Value::LazySeq(ls) = current {
-        current = ls.get().realize();
+        current = ls.get().try_realize()?;
     }
     let val = &current;
 
-    match val {
+    Ok(match val {
         Value::Nil => (None, Value::Nil),
         Value::Cons(c) => {
             let c = c.get();
@@ -4666,7 +4656,7 @@ fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
             }
         }
         _ => (None, Value::Nil),
-    }
+    })
 }
 
 fn builtin_keys(args: &[Value]) -> ValueResult<Value> {
@@ -5959,7 +5949,7 @@ fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
 fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
     match v {
         Value::Nil => Ok(None),
-        Value::LazySeq(ls) => seq_first_rest(&ls.get().realize()),
+        Value::LazySeq(ls) => seq_first_rest(&ls.get().try_realize().map_err(ValueError::Other)?),
         Value::Cons(c) => {
             let cell = c.get();
             Ok(Some((cell.head.clone(), cell.tail.clone())))
@@ -6262,131 +6252,32 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
         Value::Delay(d) => d.get().force().map_err(ValueError::Other),
         Value::Agent(a) => Ok(a.get().get_state()),
-        Value::Promise(p) => {
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
+        Value::Promise(_) | Value::Future(_) => {
+            if matches!(&args[0], Value::Future(_))
+                && crate::env::callback::current_is_async()
+                && cljrs_value::parking::current().is_none()
+            {
+                return Err(ValueError::Other("deref on a future is not allowed inside an ^:async function; use (await ...) instead".into()));
+            }
+            let timeout = if with_timeout {
+                match &args[1] {
+                    Value::Long(n) => Some(Duration::from_millis((*n).max(0) as u64)),
                     v => {
                         return Err(ValueError::WrongType {
                             expected: "long (timeout-ms)",
                             got: v.type_name().to_string(),
                         });
                     }
-                };
-                let timeout_val = args[2].clone();
-                let guard = p.get().value.lock().unwrap();
-                if guard.is_some() {
-                    return Ok(guard.as_ref().unwrap().clone());
-                }
-                let (guard, _) = p
-                    .get()
-                    .cond
-                    .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                    .unwrap();
-                Ok(guard.as_ref().cloned().unwrap_or(timeout_val))
-            } else {
-                Ok(p.get().deref_blocking())
-            }
-        }
-        Value::Future(f) => {
-            // `deref` blocks the OS thread; inside an `^:async` function that
-            // would park the single LocalSet executor. Steer callers to `await`.
-            if crate::env::callback::current_is_async() {
-                return Err(ValueError::Other(
-                    "deref on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
-                ));
-            }
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
-                    v => {
-                        return Err(ValueError::WrongType {
-                            expected: "long (timeout-ms)",
-                            got: v.type_name().to_string(),
-                        });
-                    }
-                };
-                let timeout_val = args[2].clone();
-                let guard = f.get().state.lock().unwrap();
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        Ok(v.clone())
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        Err(ValueError::Thrown(v.clone()))
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        Err(ValueError::GasExhausted)
-                    }
-                    FutureState::MemoryLimitExceeded(fault) => {
-                        f.get().mark_observed();
-                        Err(ValueError::MemoryLimitExceeded(*fault))
-                    }
-                    FutureState::Cancelled => {
-                        Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                    }
-                    FutureState::Running => {
-                        let (guard, _) = f
-                            .get()
-                            .cond
-                            .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                            .unwrap();
-                        match &*guard {
-                            FutureState::Done(v) => {
-                                f.get().mark_observed();
-                                Ok(v.clone())
-                            }
-                            FutureState::Failed(v) => {
-                                f.get().mark_observed();
-                                Err(ValueError::Thrown(v.clone()))
-                            }
-                            FutureState::GasExhausted => {
-                                f.get().mark_observed();
-                                Err(ValueError::GasExhausted)
-                            }
-                            FutureState::MemoryLimitExceeded(fault) => {
-                                f.get().mark_observed();
-                                Err(ValueError::MemoryLimitExceeded(*fault))
-                            }
-                            FutureState::Cancelled => {
-                                Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                            }
-                            FutureState::Running => Ok(timeout_val),
-                        }
-                    }
                 }
             } else {
-                let mut guard = f.get().state.lock().unwrap();
-                loop {
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(ValueError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(ValueError::GasExhausted);
-                        }
-                        FutureState::MemoryLimitExceeded(fault) => {
-                            f.get().mark_observed();
-                            return Err(ValueError::MemoryLimitExceeded(*fault));
-                        }
-                        FutureState::Cancelled => {
-                            return Err(ValueError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {
-                            guard = f.get().cond.wait(guard).unwrap();
-                        }
-                    }
-                }
-            }
+                None
+            };
+            let value = match &args[0] {
+                Value::Promise(p) => p.get().wait_value(timeout),
+                Value::Future(f) => f.get().wait_value(timeout)?,
+                _ => unreachable!(),
+            };
+            Ok(value.unwrap_or_else(|| args.get(2).cloned().unwrap_or(Value::Nil)))
         }
         Value::Volatile(v) => Ok(v.get().deref()),
         Value::Reduced(inner) => Ok((**inner).clone()),
@@ -6524,7 +6415,8 @@ fn builtin_spit(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().clone(),
         v => v.to_string(),
     };
-    std::fs::write(&path, &content).map_err(|e| ValueError::Other(e.to_string()))?;
+    cljrs_value::parking::blocking(move || std::fs::write(&path, &content))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::Nil)
 }
 
@@ -6538,7 +6430,8 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
+    let content = cljrs_value::parking::blocking(move || std::fs::read_to_string(&path))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::string(content))
 }
 
@@ -9282,7 +9175,14 @@ fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
     })
 }
 
-/// Sleep -- pause current thread for N ms
+/// Run a zero-argument callback while this computation owns an object monitor.
+fn builtin_locking_call(args: &[Value]) -> ValueResult<Value> {
+    let _root = crate::env::gc_roots::root_values(args);
+    let _monitor = crate::env::monitor::enter(&args[0])?;
+    crate::env::callback::invoke(&args[1], Vec::new())
+}
+
+/// Pause the current fiber, or the OS thread outside a fiber, for N ms.
 fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
     sleep(Duration::from_millis(
         i64::max(0, numeric_as_i64(&args[0])?) as u64,

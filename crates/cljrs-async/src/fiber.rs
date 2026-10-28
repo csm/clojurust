@@ -136,6 +136,36 @@ pub struct Fiber {
     task: FiberTask,
 }
 
+fn install_parking_hooks() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        cljrs_value::parking::install(cljrs_value::parking::Hooks {
+            current: || current().map(|id| id.0),
+            park: |future, timeout| {
+                park_on(async {
+                    match timeout {
+                        Some(duration) => tokio::time::timeout(duration, future).await.is_ok(),
+                        None => {
+                            future.await;
+                            true
+                        }
+                    }
+                })
+            },
+            sleep: |duration| park_on(tokio::time::sleep(duration)),
+            blocking: |job| {
+                park_on(async {
+                    crate::worker_pool::WorkerPool::global()
+                        .handle()
+                        .spawn_blocking(job)
+                        .await
+                        .expect("blocking worker panicked")
+                })
+            },
+        });
+    });
+}
+
 impl Fiber {
     pub fn new(body: impl FnOnce() -> EvalResult + 'static) -> Result<Self, EvalError> {
         Self::with_roots(Vec::new(), body)
@@ -149,6 +179,7 @@ impl Fiber {
         roots: Vec<Value>,
         body: impl FnOnce() -> EvalResult + 'static,
     ) -> Result<Self, EvalError> {
+        install_parking_hooks();
         let bytes = stack_bytes()?;
         let stack = STACK_POOL
             .with(|pool| {
