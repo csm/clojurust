@@ -461,6 +461,7 @@ Foundations already in place:
 ### Phase H (deferred) — Async JIT
 
 - [ ] Emit Cranelift state machines with explicit resume points for `^:async` functions, integrating with the Tokio executor
+- [ ] Re-evaluate against stackful fibers (`docs/virtual-threads-plan.md` Phase 5), which suspend JIT frames without a state-machine transform
 
 ---
 

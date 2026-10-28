@@ -1,0 +1,346 @@
+# Virtual Threads Plan — Stackful Fibers per Isolate
+
+## Why this document exists
+
+Today, code that waits on something in clojurust has two choices, and neither is good:
+
+- **Colored async.** `^:async` functions and `go` bodies run through a separate tree-walker
+  (`cljrs-async/src/eval_async.rs`) and must `await` every channel op, future, and socket read.
+  Ordinary functions — and every native HOF (`map`, `reduce`, `swap!`, …) — cannot suspend, so
+  async-ness spreads through call graphs, and `deref` inside an `^:async` body is a runtime error.
+- **Blocking the isolate.** Synchronous code calls `<!!`/`>!!` (a `Condvar` wait with a 1 ms
+  re-poll, `cljrs-async/src/channel.rs`) or `deref`, which stalls the *one* OS thread the isolate
+  owns. The `future-call` docstring has to warn that `(deref f)` "blocks the one thread the task
+  needs in order to finish".
+
+The JVM solved the same problem with virtual threads (Project Loom), and core.async now leans on
+them: `io-thread` runs a body that "may do blocking I/O but must not do extended computation" on a
+virtual thread when available, and recent core.async releases can run `go` blocks on virtual
+threads without the IOC transform. This plan gives clojurust the equivalent: **lightweight
+threads where blocking code parks the thread instead of blocking the carrier, with no async
+syntax.**
+
+Read `async-worker-pool-plan.md` (the isolate model) and `isolate-boundary-plan.md` first. This
+plan lives *inside* one isolate and does not change the cross-isolate model.
+
+---
+
+## The decision: stackful fibers, M:1 per isolate
+
+A **fiber** is a coroutine with its own machine stack. Parking a fiber saves its registers and
+switches to another stack; everything above the park point — tree-walker frames, native builtins
+calling back into Clojure, Cranelift JIT frames, AOT code — is suspended as-is.
+
+Why stackful rather than another compiler transform:
+
+1. **The interpreter is a recursive Rust tree-walker.** A CPS / state-machine transform can only
+   suspend code it rewrites. It cannot reach through `reduce` calling a Clojure fn calling
+   `slurp`, or through a JIT frame calling `rt_call`. That limit is exactly why `^:async` needs its
+   own evaluator today, and why `TODO.md` Phase H ("emit Cranelift state machines for `^:async`")
+   exists. Stack switching suspends all tiers uniformly and for free.
+2. **GC roots are precise shadow stacks, not conservative stack scans.** `ENV_ROOTS`,
+   `VALUE_ROOTS`, `OPTION_VALUE_ROOTS` (`cljrs-runtime/src/env/gc_roots.rs`) and `ALLOC_ROOTS`
+   (`cljrs-gc`) record root addresses explicitly. A suspended fiber's stack never moves, so its
+   recorded root pointers stay valid; the collector just needs to visit every fiber's root set
+   rather than only the running one. No stack-scanning machinery is required.
+3. **Fibers never migrate between OS threads.** `GcPtr` is honestly `!Send`, so a fiber is pinned
+   to its isolate's thread. That is a constraint (no work stealing — parallelism still comes from
+   isolates), but also a large simplification: Rust `thread_local!` addresses stay valid across a
+   switch, and only the *logical* per-mutator state has to be swapped.
+
+So the model is **M fibers : 1 isolate thread**, with N isolates for parallelism, unlike Loom's
+M:N over a carrier pool.
+
+### Integration with the existing executor
+
+Each isolate already runs a Tokio `current_thread` runtime + `LocalSet`. A fiber is driven as an
+ordinary `spawn_local` task:
+
+```rust
+// Sketch — names are provisional.
+struct FiberTask { co: Coroutine<Resume, Park, FiberResult>, state: MutatorState, pending: Option<ParkFuture> }
+
+impl Future for FiberTask {
+    type Output = FiberResult;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<FiberResult> {
+        // 1. If parked on a future, poll it; still Pending → return Pending.
+        // 2. Swap this fiber's MutatorState into the thread-locals.
+        // 3. co.resume(...) — runs Clojure until it parks or returns.
+        // 4. Swap MutatorState back out.
+        // 5. Park(fut) → store fut, poll it once with cx, return Pending.
+        //    Return(v) → Poll::Ready(v).
+    }
+}
+```
+
+Inside a fiber, a blocking primitive calls `fiber::park_on(fut)`, which suspends the coroutine and
+hands `fut` to the outer `poll`. This is the pattern Wasmtime uses (`wasmtime-fiber`) to run
+synchronous wasm against async host functions. It reuses the existing reactor, timers,
+`WorkerPool` offload, and every Tokio-based resource in `cljrs-net` without change.
+
+Outside a fiber (`fiber::current().is_none()`), the same primitives keep today's behavior.
+
+### Crate choice
+
+Use **`corosensei`** (maintained, used by Wasmer; x86_64, aarch64, riscv64, arm, and Windows;
+supports unwinding and backtraces through the coroutine boundary). `wasmtime-fiber` is the fallback.
+Do not adopt `may` or another full green-thread runtime: we need our own scheduler on top of
+the existing `LocalSet`, not a second executor.
+
+Stacks are `mmap`-reserved with a guard page and committed lazily by the OS, so a large
+reservation is cheap in physical memory. The tree-walker is stack-hungry (macro-heavy loading
+already needs 16 MB test threads), so the default reservation is configurable
+(`CLJRS_FIBER_STACK_KB`, default 1 MB for `io-thread`/`go`; the root fiber uses the main
+thread's size). Stacks are pooled and reused.
+
+---
+
+## What fights it (must be migrated)
+
+### 1. Per-mutator thread-local state
+
+About 30 `thread_local!` sites exist. Every one that holds the state of *a running computation*
+(as opposed to the isolate as a whole) must become per-fiber. Audit list:
+
+| State | Location | Per-fiber? | Notes |
+|---|---|---|---|
+| `ENV_ROOTS`, `VALUE_ROOTS`, `OPTION_VALUE_ROOTS` | `cljrs-runtime/src/env/gc_roots.rs` | **yes** | LIFO guards; interleaving fibers on one stack corrupts them |
+| `ALLOC_ROOTS` | `cljrs-gc/src/lib.rs` | **yes** | same |
+| `REGION_STACK` | `cljrs-gc/src/region.rs` | **yes** | regions are LIFO bump scopes; must never interleave |
+| `RETIRED_REGIONS` | `cljrs-gc/src/region.rs` | no | isolate-wide root set |
+| `ALLOC_CTX` | `cljrs-gc/src/alloc_ctx.rs` (`no-gc`) | **yes** | scratch/static/invocation context stack |
+| `BINDING_STACK` | `cljrs-runtime/src/env/dynamics.rs` | **yes** | dynamic `binding`; new fibers get conveyed frames like `future` |
+| `EVAL_CONTEXT` | `cljrs-runtime/src/env/callback.rs` | **yes** | includes `current_is_async` |
+| `CALL_DEPTH` | `cljrs-runtime/src/env/depth.rs` | **yes** | limit scaled to the fiber's stack size |
+| `ACTIVE`/`EXHAUSTED`/`INTERRUPTS` (gas) | `cljrs-runtime/src/env/gas.rs` | **yes** | gas meters are per computation |
+| `TRANSACTION_DEPTH` / `TRANSACTION_GENSYM` | `cljrs-runtime/src/env/policy.rs` | **yes** | STM transaction nesting |
+| `OUTPUT_CAPTURE`, `BIG_DECIMAL_SCALE` | `cljrs-runtime/src/builtins/builtins.rs` | **yes** | `with-out-str`, `with-precision` |
+| `WATCH_ERROR` | `cljrs-runtime/src/interp/apply.rs` | **yes** | |
+| `IR_LOWERING_ACTIVE` | `cljrs-runtime/src/tiered/apply.rs` | **yes** | |
+| `MY_FRAMES` (JIT active frames) | `cljrs-runtime/src/tiered/jit_state.rs` | **yes** | see GC/JIT below |
+| `PENDING_EXCEPTION` | `cljrs-compiler/src/rt_abi.rs` | **yes** | thrown-value slot between native frames |
+| `CRITICAL_DEPTH`, `FAULT` | `cljrs-gc/src/governor.rs` | review | critical sections must not park (assert) |
+| `ISOLATE_HEAP`, `CURRENT` account, `ISOLATE_CANCELLATION` | `cljrs-gc` | no | isolate-wide |
+| `TAP`, `ASYNC_DRIVER`, IC tracer flag, wasm DOM state | various | no | isolate/process-wide |
+
+Approach: gather the per-fiber rows into one `MutatorState` struct owned by each fiber, and
+have the scheduler swap it in and out around `resume`. For `Vec`-backed stacks a swap is a
+pointer exchange (`std::mem::swap` on the vectors), so a context switch stays O(number of
+fields), not O(depth). The root fiber (main thread / REPL eval) owns the state that exists today,
+so code that never spawns a fiber behaves as before.
+
+A unit test enumerates the `thread_local!` sites (a `grep`-driven list checked in CI) so a new
+thread-local added later must be classified as per-fiber or per-isolate.
+
+### 2. Locks and borrows held across a park
+
+A fiber that parks while holding a `std::sync::Mutex` guard (namespace, protocol table, var
+roots, channel internals) or an active `RefCell` borrow from `X.with(|x| …)` will deadlock or
+panic the *next fiber on the same thread*. This is stricter than Loom's "pinning", which only
+loses concurrency.
+
+- Runtime locks must be held only for short critical sections, never around evaluation of user
+  code or a blocking primitive. Audit `Namespace`, `Multimethod`, protocol registry, `Var`,
+  `LazySeq` realization (realizing a lazy seq runs user code — it must not hold its `Mutex` while
+  doing so; use a "realizing" state + parked waiters instead).
+- `locking` / `monitor-enter` gets a fiber-aware monitor (owner = fiber id, waiters parked).
+- Debug builds keep a per-thread "guards held" counter, incremented by a wrapper around the
+  runtime's lock types; `park_on` asserts it is zero.
+
+### 3. GC root tracing across fibers
+
+`GcHeap::collect` (and `async_gc_collect`) traces the current thread's root stacks. It must also
+trace every suspended fiber's `MutatorState`: root stacks, binding frames, eval contexts,
+retained region roots, and the fiber's pending result. The isolate keeps a registry of live
+fibers; collection walks it. A fiber that has finished drops out of the registry before its stack
+returns to the pool.
+
+Safepoints are unchanged: collection only happens on the running fiber at a safepoint, and
+suspended fibers are by construction stopped at a park point, which is a safepoint.
+
+### 4. JIT epoch reclamation
+
+`code_cache::reclaim_at_stw` frees stale code epochs with no live JIT frame, using per-thread
+active-frame tracking. With fibers, a suspended fiber may hold JIT frames from an old epoch, so
+`live_epochs` must union over all fibers in the isolate. This rides on making `MY_FRAMES`
+per-fiber.
+
+---
+
+## Parking-aware primitives
+
+Each primitive checks `fiber::current()`: inside a fiber it parks; outside it behaves as today.
+
+| Primitive | In a fiber | Notes |
+|---|---|---|
+| `<!!`, `>!!`, `alts!!` | park on the channel's take/put future | removes the 1 ms Condvar re-poll for fiber callers |
+| `deref` / `@` of future, promise | park until settled | fixes the "deref blocks the thread the task needs" deadlock |
+| `deref` of delay / lazy-seq being realized by another fiber | park on the realizer | see §2 |
+| `deref` with timeout | park on `select(settle, sleep)` | |
+| `Thread/sleep`, `sleep` | park on `tokio::time::sleep` | |
+| `cljrs-net` sockets (TCP, UDP, Unix, TLS, QUIC, h2/h3) | park on the existing Tokio futures | sync-looking wrappers become possible |
+| `cljrs-io` file I/O, `slurp`/`spit` | park on `WorkerPool::offload` | bytes cross the pool, values are built on the isolate |
+| process wait / pipes (`cljrs-stdlib/src/process.rs`) | park on offloaded wait | |
+| `locking`, STM `ref` retry waits, agent `await` | park on fiber-aware wait queues | |
+| native interop that blocks inside Rust | **pins the isolate** | see below |
+
+**Pinning.** A Rust function that blocks the OS thread (a `std::net` call in a user crate, a
+blocking FFI call) stalls every fiber on the isolate. Mitigations:
+
+- `(blocking & body)` / `cljrs.fiber/blocking` runs Send-safe work on `WorkerPool` and parks the
+  calling fiber. The interop export macro gets a `#[cljrs::export(blocking)]` attribute that does
+  the same for exported Rust functions automatically.
+- A stall detector: the GC-service task notes when the isolate hasn't reached a safepoint for
+  more than `CLJRS_FIBER_STALL_MS` (default 100 ms) while fibers are runnable, and logs the
+  offending native frame once. This is the equivalent of Loom's `jdk.tracePinnedThreads`.
+
+---
+
+## Clojure surface
+
+```clojure
+(require '[clojure.core.async :as a])
+
+;; io-thread: blocking I/O allowed, extended computation discouraged (core.async contract)
+(a/io-thread
+  (let [body (slurp "data.edn")]          ; parks, does not block the isolate
+    (a/>!! out (read-string body))))      ; parks
+
+;; plain blocking style in any fiber — no ^:async, no await
+(defn fetch-all [urls]
+  (->> urls
+       (map #(a/io-thread (http/get %)))  ; one fiber per request
+       (mapv a/<!!)))                     ; parks on each result
+```
+
+- **`io-thread`** (new, core.async-compatible): spawn a fiber running `body`, return a channel
+  that receives its result. Exceptions are delivered as with `thread`.
+- **`thread` / `thread-call`**: become fiber-backed. A truly parallel `thread` would need to run
+  closures on another isolate, which waits on the deferred `pfuture` / B3 shared code arena. Until
+  then, `thread` documents that it is concurrent, not parallel.
+- **`future` / `future-call`**: fiber-backed, so `@(future …)` parks instead of deadlocking.
+- **Root fiber**: `cljrs run`, the REPL, nREPL evals, `cljrs test`, and the AOT `main` preamble
+  run user code inside a root fiber, so top-level code may block-park freely.
+- **`go`**: in Phase 5, `go` may run its body directly on a fiber with `<!` ≡ `<!!`, matching
+  core.async's virtual-thread mode. `^:async`/`await` remain supported and become sugar
+  (`await` = park) rather than a second evaluator.
+- **Introspection**: `(cljrs.fiber/current)`, `(cljrs.fiber/count)`, fiber name for
+  diagnostics; fiber counts and stack bytes in `--gc-stats`.
+
+`.cljc` code written for JVM core.async (`io-thread`, `<!!`, `thread`) runs unchanged under
+`#?(:cljrs …)`-free code paths.
+
+---
+
+## Scheduling and fairness
+
+- **Run queue.** Runnable fibers are just ready `LocalSet` tasks; Tokio's local scheduler is the
+  run queue. No separate scheduler data structure in Phase 1.
+- **Cooperative preemption.** The interpreter already reaches safepoints at calls and loop
+  back-edges (GC safepoints, `gas` checks). Add a time-slice check there: if the current fiber
+  has run longer than `CLJRS_FIBER_SLICE_US` (default 10 ms) and other fibers are runnable,
+  `park_on(yield_now())`. Cranelift-compiled code already emits `rt_safepoint` polls (`cljrs-compiler/src/codegen.rs`), so this
+  covers all tiers. This keeps a CPU-heavy fiber from starving `io-thread` fibers, which a pure
+  cooperative model would not.
+- **Priorities** are out of scope.
+
+---
+
+## Stack overflow
+
+- Each fiber's `CALL_DEPTH` limit is derived from its stack reservation, so deep recursion
+  produces the normal clojurust stack-overflow error before hitting the guard page.
+- A guard-page hit (deep native recursion) is fatal in Phase 1, as on the main thread today.
+  Phase 4 investigates a `sigaltstack` handler that reports which fiber overflowed.
+
+---
+
+## Platform scope
+
+- **Supported:** Linux, macOS, Windows on x86_64 and aarch64 (corosensei targets).
+- **wasm32:** no stack switching until the wasm stack-switching proposal or JSPI is usable.
+  `cljrs-wasm` keeps the current colored model. `io-thread`/`thread`/`future` there fall back to
+  LocalSet tasks, and the parking primitives keep today's in-`^:async` behavior. Code is gated with
+  `#[cfg(not(target_arch = "wasm32"))]`.
+- **`no-gc` build:** works; `ALLOC_CTX` becomes per-fiber, and each fiber's scratch regions are
+  released when it finishes.
+
+---
+
+## Phases
+
+### Phase 0 — `MutatorState` consolidation (no behavior change)
+
+- Move every per-fiber row in the table above behind one `MutatorState` with
+  `save() -> MutatorState` / `restore(MutatorState)`.
+- Add the thread-local classification test.
+- Add the debug "guards held" counter on runtime lock wrappers.
+- **Exit:** full test suite green; `save`/`restore` round-trips under a test that swaps state
+  between two hand-built evaluations at a safepoint.
+
+### Phase 1 — Fiber core (`cljrs-async::fiber`)
+
+- `corosensei`-based `Fiber`, stack pool, `FiberTask: Future`, `fiber::spawn`, `fiber::park_on`,
+  `fiber::current`.
+- Per-isolate fiber registry; GC traces all suspended fibers; JIT `live_epochs` unions over
+  fibers.
+- Panics caught at the fiber boundary and delivered as `EvalError`.
+- **Exit:** GC stress test — 5,000 fibers interleaving allocation-heavy code with a
+  collection forced at every park and regions active, in both GC and `no-gc` builds, plus an
+  AddressSanitizer run on Linux CI.
+
+### Phase 2 — Parking primitives
+
+- `<!!`, `>!!`, `alts!!`, `deref` (future/promise/delay/timeout), `sleep`, `locking`.
+- `cljrs-net` and `cljrs-io` parking paths; `blocking` escape hatch;
+  `#[cljrs::export(blocking)]`.
+- Lazy-seq / delay realization without holding the realization lock across user code.
+- **Exit:** a 10k-connection echo server written in plain blocking style on one isolate.
+
+### Phase 3 — Clojure surface
+
+- `io-thread`; fiber-backed `thread`, `thread-call`, `future`.
+- Root fiber for `run`, REPL, nREPL, `test`, AOT `main`.
+- Binding conveyance into new fibers.
+- Docs in `docs/book`, `cljrs-async/README.md` updated.
+- **Exit:** core.async's `io-thread` examples run unchanged; `@(future …)` at top level and
+  inside `future` bodies no longer deadlocks.
+
+### Phase 4 — Fairness and observability
+
+- Time-slice preemption at safepoints.
+- Stall detector; fiber counts and stack bytes in `--gc-stats` and the governor snapshot
+  (fiber stacks charged as a new `MemoryClass::FiberStack`, so the governor can refuse new fibers
+  under pressure).
+- Fiber-aware overflow reporting.
+
+### Phase 5 — Converge async models
+
+- `go` bodies on fibers; `<!`/`>!` become parks.
+- `await` = park; `^:async` becomes a no-op marker kept for compatibility; `eval_async` retired
+  once the async test corpus passes on fibers.
+- Re-evaluate `TODO.md` Phase H (async JIT state machines); fibers make it unnecessary for
+  correctness and likely for performance.
+
+---
+
+## Costs and risks
+
+- **Memory per fiber.** Tree-walker frames are large; expect tens of KB committed per idle
+  `io-thread` fiber, more than a Loom virtual thread. JIT/AOT tiers reduce it. Measure in Phase 1
+  and set the default stack reservation from data.
+- **Context-switch cost.** Register save/restore (~tens of ns) plus the `MutatorState` swap.
+  Keep `MutatorState` to pointer-sized swaps; never copy root stacks.
+- **Unsafe surface.** Stack switching interacts with unwinding, TLS, debuggers, and sanitizers.
+  Confine all of it to `cljrs-async::fiber`; nothing else touches corosensei.
+- **Hidden thread-local state** added in future code. Mitigated by the classification test.
+- **Lock-across-park bugs** are the most likely source of real-world hangs. Mitigated by the debug
+  guard counter and by making realization/monitor waits fiber-aware.
+- **Two async models during transition** (Phases 1–4). Accepted. Phase 5 removes the duplication.
+
+## Non-goals
+
+- Moving fibers between isolates or OS threads (forbidden by `!Send`).
+- Shared-heap multi-threading. Parallelism stays isolate-based.
+- Preemption by signal (Go-style asynchronous preemption). Safepoint preemption is enough
+  because every tier already polls safepoints.
