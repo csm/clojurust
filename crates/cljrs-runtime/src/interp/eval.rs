@@ -20,6 +20,17 @@ use cljrs_value::{
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    if !matches!(
+        &form.kind,
+        FormKind::List(_)
+            | FormKind::Map(_)
+            | FormKind::Set(_)
+            | FormKind::SyntaxQuote(_)
+            | FormKind::TaggedLiteral(_, _)
+            | FormKind::Meta(_, _)
+    ) {
+        return eval_inner(form, env);
+    }
     cljrs_value::realization::catch(|| eval_inner(form, env)).unwrap_or_else(|message| {
         Err(crate::env::error::value_error_to_eval_error(
             cljrs_value::ValueError::Other(message),

@@ -992,10 +992,16 @@ The boundary catches only that payload. Ordinary panics and fiber cancellation c
 The evaluator and compiler ABI also install realization boundaries.
 Rust embedders can use `realization::catch(|| format!("{value}"))` for fallible printing.
 
-Transient map and set operations compute from traced snapshots outside their locks.
+`realization::is_inert(&Value) -> bool` identifies scalar values whose equality, hash, and display cannot run user code.
+Transient maps and sets use in-place updates and direct lookups while all keys meet this condition.
+Other operations compute from traced snapshots outside their locks.
 An update retries if another computation changes the collection during realization.
-Hashing transient collections and object arrays also uses traced snapshots.
 A failed realization does not change or poison a transient collection.
+
+Snapshots use stable host storage and the per-mutator `SNAPSHOT_ROOTS` shadow stack.
+They create no managed boxes. `collections::trace_snapshots(&mut MarkVisitor)` traces the active snapshots for runtime collectors.
+Detached mutator states trace snapshots in suspended fibers.
+Object-array hashing copies its vector once. Transient-vector hashing shares the existing persistent vector storage.
 
 ## Native blocking adapters
 

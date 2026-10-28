@@ -532,7 +532,11 @@ Cancellation removes uncommitted registrations. Losing operations do not transfe
 Future and promise dereferences also park inside fibers, including timed dereferences.
 `sleep` and `Thread/sleep` use the Tokio timer. `locking` uses reentrant monitors with a separate owner for each fiber.
 Delay and lazy sequence waiters receive the settled result after the first fiber finishes realization.
-Cancellation releases monitors, retracts unconsumed rendezvous offers, and restores interrupted thunks so realization waiters can retry.
+Cancellation releases monitors and retracts pending channel operations.
+An unconsumed committed take returns its value to the channel in FIFO order.
+Channel transfers wake only the selected tasks. Pending buffered puts fill free slots in registration order.
+Interrupted thunks return to their pending state so realization waiters can retry.
+Legacy async tasks reject explicit monitor calls, including calls through synchronous helpers.
 Carrier waits on a fiber-owned monitor or realization on the same thread fail before they can block the executor.
 Channel waiters register their wakers before readiness checks. Channel closure wakes every pending operation.
 

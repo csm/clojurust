@@ -1730,9 +1730,19 @@ An exit without an explicit acquisition in the current computation returns an er
 The per-fiber `HELD_MONITORS` slot traces retained objects.
 `env::monitor::MonitorCleanup` releases unmatched acquisitions on drop.
 Native fibers install this cleanup guard, including during cancellation.
+Synchronous callers outside fibers must pair explicit acquisitions with `monitor-exit` or install a `MonitorCleanup` guard.
+Legacy async tasks cannot retain explicit monitors because those tasks share the root mutator.
+`env::monitor::AsyncMonitorScope::enter() -> AsyncMonitorScope` marks each poll of these tasks.
+Its drop restores the caller's state. Explicit monitor calls from synchronous helpers also reject this task context.
 
-Evaluation, native callbacks, and IR instructions convert trait realization failures to catchable Clojure errors.
-Multimethod dispatch snapshots release registry locks before equality or formatting can realize user code.
+Evaluation and function boundaries convert trait realization failures to catchable Clojure errors.
+The IR interpreter installs one boundary per function execution.
+Atoms and identifier lookups need no realization boundary.
+Lexical scope guards remove `let` and `loop` frames on errors and unwinds.
+Native callback guards restore the eval context on unwinds.
+
+Multimethod dispatch borrows registry tables for scalar dispatch values and scalar hierarchy tags.
+Other values use traced snapshots and release registry locks before equality or formatting can run user code.
 
 ## Restricted native blocking form
 

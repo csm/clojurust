@@ -26,3 +26,25 @@ pub(crate) fn for_trait(sequence: &crate::LazySeq) -> crate::Value {
         .try_realize()
         .unwrap_or_else(|message| resume_unwind(Box::new(Failure(message))))
 }
+
+/// True for scalar values whose equality, hash, and display cannot run user code.
+/// This is conservative: composite and mutable values use the rooted slow path.
+pub fn is_inert(value: &crate::Value) -> bool {
+    use crate::Value;
+    matches!(
+        value.unwrap_meta(),
+        Value::Nil
+            | Value::Bool(_)
+            | Value::Long(_)
+            | Value::Double(_)
+            | Value::Char(_)
+            | Value::Str(_)
+            | Value::Keyword(_)
+            | Value::Symbol(_)
+            | Value::BigInt(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_)
+            | Value::Uuid(_)
+            | Value::Pattern(_)
+    )
+}

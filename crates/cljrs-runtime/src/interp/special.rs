@@ -563,44 +563,32 @@ fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
     let chains = crate::interp::virtualize::detect_let_chains(&bindings);
     let virtualizable_chains = find_virtualizable_chains(&chains, &bindings, body);
 
-    env.push_frame();
-
-    let pairs: Vec<_> = bindings.chunks(2).collect();
-    let mut i = 0;
-    while i < pairs.len() {
-        // Check if this binding starts a virtualizable chain.
-        if let Some(chain) = virtualizable_chains.iter().find(|c| c.start == i) {
-            match eval_virtualized_chain(chain, &pairs, env) {
-                Ok(()) => {
-                    i += chain.len;
-                    continue;
-                }
-                Err(e) => {
-                    env.pop_frame();
-                    return Err(e);
+    env.with_frame(|env| {
+        let pairs: Vec<_> = bindings.chunks(2).collect();
+        let mut i = 0;
+        while i < pairs.len() {
+            // Check if this binding starts a virtualizable chain.
+            if let Some(chain) = virtualizable_chains.iter().find(|c| c.start == i) {
+                match eval_virtualized_chain(chain, &pairs, env) {
+                    Ok(()) => {
+                        i += chain.len;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             }
+
+            // Normal evaluation.
+            let pair = pairs[i];
+            let val = eval(&pair[1], env)?;
+            bind_pattern(&pair[0], val, env)?;
+            i += 1;
         }
 
-        // Normal evaluation.
-        let pair = pairs[i];
-        let val = match eval(&pair[1], env) {
-            Ok(v) => v,
-            Err(e) => {
-                env.pop_frame();
-                return Err(e);
-            }
-        };
-        if let Err(e) = bind_pattern(&pair[0], val, env) {
-            env.pop_frame();
-            return Err(e);
-        }
-        i += 1;
-    }
-
-    let result = eval_body(body, env);
-    env.pop_frame();
-    result
+        eval_body(body, env)
+    })
 }
 
 /// Filter chains to only those that are safe to virtualize.
@@ -787,22 +775,20 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         #[cfg(not(feature = "no-gc"))]
         let _iter_frame = cljrs_gc::push_alloc_frame();
 
-        env.push_frame();
-        for (pat, val) in patterns.iter().zip(current_vals.iter()) {
-            if let Err(e) = bind_pattern(pat, val.clone(), env) {
-                env.pop_frame();
-                return Err(e);
+        let result = env.with_frame(|env| {
+            for (pat, val) in patterns.iter().zip(current_vals.iter()) {
+                bind_pattern(pat, val.clone(), env)?;
             }
-        }
 
-        // Under no-gc: pop scratch before tail expression so the return value
-        // or recur args are allocated in the enclosing scope's context.
-        #[cfg(not(feature = "no-gc"))]
-        let result = eval_body_recur(body, env);
-        #[cfg(feature = "no-gc")]
-        let result = eval_body_with_scratch_loop(body, &mut scratch, env);
+            // Under no-gc: pop scratch before tail expression so the return value
+            // or recur args are allocated in the enclosing scope's context.
+            #[cfg(not(feature = "no-gc"))]
+            let result = eval_body_recur(body, env);
+            #[cfg(feature = "no-gc")]
+            let result = eval_body_with_scratch_loop(body, &mut scratch, env);
 
-        env.pop_frame();
+            result
+        });
         // scratch / _iter_frame drop at the end of the iteration (after the
         // match below), freeing this iteration's intermediates.
 
@@ -1109,10 +1095,10 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
         let mut handled = false;
         for c in &catches {
             if catch_type_matches(c.type_sym, &thrown_val) {
-                env.push_frame();
-                env.bind(Arc::from(c.binding), thrown_val.clone());
-                result = eval_body(c.body, env);
-                env.pop_frame();
+                result = env.with_frame(|env| {
+                    env.bind(Arc::from(c.binding), thrown_val.clone());
+                    eval_body(c.body, env)
+                });
                 handled = true;
                 break;
             }

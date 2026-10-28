@@ -743,14 +743,8 @@ impl ClojureHash for Value {
                 h
             }
             Value::ObjectArray(a) => {
-                let mut h: u32 = 0;
                 let values = a.get().0.lock().unwrap().clone();
-                let snapshot =
-                    crate::collections::Snapshot::new(PersistentVector::from_iter(values));
-                for item in snapshot.get().iter() {
-                    h = hash_combine_ordered(h, item.clojure_hash())
-                }
-                h
+                crate::collections::hash_values(values)
             }
 
             Value::SharedAtom(a) => Arc::as_ptr(a) as u32,

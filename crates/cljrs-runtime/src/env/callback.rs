@@ -38,6 +38,11 @@ pub fn push_eval_context(env: &Env) {
     });
 }
 
+pub(crate) fn scoped_eval_context(env: &Env) -> EvalContextGuard {
+    push_eval_context(env);
+    EvalContextGuard { _priv: () }
+}
+
 /// True when the innermost active eval context is inside an `^:async` function
 /// body. Returns `false` when there is no active context.
 pub fn current_is_async() -> bool {

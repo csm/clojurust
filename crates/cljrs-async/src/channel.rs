@@ -19,7 +19,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
@@ -58,13 +58,18 @@ pub(crate) enum RvStatus {
 
 #[derive(Debug)]
 struct ChannelState {
-    queue: VecDeque<Value>,
+    queue: BTreeMap<u64, Value>,
+    next_value: u64,
+    next_waiter: u64,
     /// Buffered capacity; `0` means unbuffered (rendezvous).
     capacity: usize,
     closed: bool,
     /// Monotonic count of successful takes, used to detect rendezvous handoff.
     taken: u64,
-    waiters: Vec<Waiter>,
+    takes: BTreeMap<u64, Waiter>,
+    puts: BTreeMap<u64, Waiter>,
+    // Retain tracing links after a waiter commits, until its future is consumed.
+    registrations: BTreeMap<u64, Waiter>,
 }
 
 /// A CSP channel. See the module docs for the buffering model.
@@ -78,6 +83,7 @@ struct Selection {
     done: Cell<bool>,
     result: RefCell<Option<(Value, usize)>>,
     waker: RefCell<Option<Waker>>,
+    take_order: Cell<Option<u64>>,
 }
 impl Selection {
     fn new() -> Rc<Self> {
@@ -85,6 +91,7 @@ impl Selection {
             done: Cell::new(false),
             result: RefCell::new(None),
             waker: RefCell::new(None),
+            take_order: Cell::new(None),
         })
     }
     fn finish(&self, value: Value, index: usize) -> Option<Waker> {
@@ -123,14 +130,14 @@ impl SelectOp<'_> {
 struct Select<'a> {
     ops: Vec<SelectOp<'a>>,
     selection: Rc<Selection>,
-    registered: bool,
+    registrations: Vec<u64>,
     default: Option<Value>,
 }
 impl Future for Select<'_> {
     type Output = (Value, usize);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         *self.selection.waker.borrow_mut() = Some(cx.waker().clone());
-        if !self.selection.done.get() {
+        if !self.selection.done.get() && self.registrations.is_empty() {
             for (index, op) in self.ops.iter().enumerate() {
                 if op.channel().attempt(op.value(), &self.selection, index) {
                     break;
@@ -138,22 +145,37 @@ impl Future for Select<'_> {
             }
         }
         if let Some(result) = self.selection.result.borrow_mut().take() {
+            self.selection.take_order.set(None);
             return Poll::Ready(result);
         }
         if let Some(default) = self.default.take() {
             return Poll::Ready((default, usize::MAX));
         }
-        if !self.registered {
-            for (index, op) in self.ops.iter().enumerate() {
-                let value = op.value().cloned().map(cljrs_value::publish::publish_value);
-                op.channel().state.lock().unwrap().waiters.push(Waiter {
-                    selection: Rc::downgrade(&self.selection),
-                    index,
-                    value,
-                });
-                op.channel().wake_selectors();
-            }
-            self.registered = true;
+        if self.registrations.is_empty() {
+            let registrations = self
+                .ops
+                .iter()
+                .enumerate()
+                .map(|(index, op)| {
+                    let value = op.value().cloned().map(cljrs_value::publish::publish_value);
+                    let mut state = op.channel().state.lock().unwrap();
+                    let id = state.next_waiter;
+                    state.next_waiter += 1;
+                    let waiter = Waiter {
+                        selection: Rc::downgrade(&self.selection),
+                        index,
+                        value,
+                    };
+                    if waiter.value.is_some() {
+                        state.puts.insert(id, waiter.clone());
+                    } else {
+                        state.takes.insert(id, waiter.clone());
+                    }
+                    state.registrations.insert(id, waiter);
+                    id
+                })
+                .collect();
+            self.registrations = registrations;
         }
         Poll::Pending
     }
@@ -161,16 +183,22 @@ impl Future for Select<'_> {
 impl Drop for Select<'_> {
     fn drop(&mut self) {
         self.selection.done.set(true);
-        if self.registered {
-            let weak = Rc::downgrade(&self.selection);
-            for op in &self.ops {
-                op.channel()
-                    .state
-                    .lock()
-                    .unwrap()
-                    .waiters
-                    .retain(|w| !w.selection.ptr_eq(&weak));
-            }
+        for (op, id) in self.ops.iter().zip(&self.registrations) {
+            let mut state = op.channel().state.lock().unwrap();
+            state.takes.remove(id);
+            state.puts.remove(id);
+            state.registrations.remove(id);
+        }
+        // A producer may have committed while this future was parked. Return
+        // an unobserved take to its original FIFO position, even after close.
+        if let Some(order) = self.selection.take_order.take() {
+            let (value, index) = self.selection.result.borrow_mut().take().unwrap();
+            let channel = self.ops[index].channel();
+            let mut state = channel.state.lock().unwrap();
+            state.queue.insert(order, value);
+            let wakes = state.service();
+            drop(state);
+            wake(wakes);
         }
     }
 }
@@ -180,60 +208,130 @@ pub(crate) async fn select(ops: Vec<SelectOp<'_>>, default: Option<Value>) -> (V
     Select {
         ops,
         selection: Selection::new(),
-        registered: false,
+        registrations: Vec::new(),
         default,
     }
     .await
 }
 
+fn wake(wakes: Vec<Waker>) {
+    for waker in wakes {
+        waker.wake();
+    }
+}
+
+// Ordered maps provide FIFO matching and O(log N) cancellation without
+// scanning unrelated waiters. A selector cannot rendezvous with itself.
+fn pop_waiter(
+    waiters: &mut BTreeMap<u64, Waiter>,
+    exclude: Option<&Rc<Selection>>,
+) -> Option<(u64, Waiter, Rc<Selection>)> {
+    loop {
+        let (&id, waiter) = waiters.iter().find(|(_, waiter)| {
+            !waiter.selection.upgrade().is_some_and(|peer| {
+                !peer.done.get() && exclude.is_some_and(|s| Rc::ptr_eq(s, &peer))
+            })
+        })?;
+        let peer = waiter.selection.upgrade();
+        let waiter = waiters.remove(&id).unwrap();
+        if let Some(peer) = peer
+            && !peer.done.get()
+        {
+            return Some((id, waiter, peer));
+        }
+    }
+}
+
+impl ChannelState {
+    fn value_order(&mut self) -> u64 {
+        let order = self.next_value;
+        self.next_value += 1;
+        order
+    }
+
+    fn service(&mut self) -> Vec<Waker> {
+        let mut wakes = Vec::new();
+        loop {
+            if !self.queue.is_empty()
+                && let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None)
+            {
+                let (order, value) = self.queue.pop_first().unwrap();
+                self.taken = self.taken.wrapping_add(1);
+                peer.take_order.set(Some(order));
+                wakes.extend(peer.finish(value, waiter.index));
+                continue;
+            }
+            if self.closed {
+                while let Some((_, waiter, peer)) = pop_waiter(&mut self.puts, None) {
+                    wakes.extend(peer.finish(Value::Bool(false), waiter.index));
+                }
+                while let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None) {
+                    wakes.extend(peer.finish(Value::Nil, waiter.index));
+                }
+                break;
+            }
+            let Some((id, put, producer)) = pop_waiter(&mut self.puts, None) else {
+                break;
+            };
+            if self.queue.is_empty()
+                && let Some((_, take, consumer)) = pop_waiter(&mut self.takes, Some(&producer))
+            {
+                let order = self.value_order();
+                consumer.take_order.set(Some(order));
+                wakes.extend(consumer.finish(put.value.unwrap(), take.index));
+                wakes.extend(producer.finish(Value::Bool(true), put.index));
+            } else if self.capacity > 0 && self.queue.len() < self.capacity {
+                let order = self.value_order();
+                self.queue.insert(order, put.value.unwrap());
+                wakes.extend(producer.finish(Value::Bool(true), put.index));
+            } else {
+                self.puts.insert(id, put);
+                break;
+            }
+        }
+        wakes
+    }
+}
+
 impl CljChannel {
-    // Selection tokens are isolate-local. Matching two different tokens and
-    // committing both happens without a yield, under the channel state lock.
+    // Selection tokens are isolate-local. Commit under the state lock, then
+    // wake only the tasks whose operations completed.
     fn attempt(&self, put: Option<&Value>, selection: &Rc<Selection>, index: usize) -> bool {
         let mut state = self.state.lock().unwrap();
-        let mut wakes = Vec::new();
+        let mut wakes = state.service();
         let result = if let Some(value) = put {
             if state.closed {
                 Some(Value::Bool(false))
             } else if state.queue.is_empty()
-                && let Some((peer, peer_index)) = state
-                    .waiters
-                    .iter()
-                    .filter(|w| w.value.is_none())
-                    .filter_map(|w| w.selection.upgrade().map(|peer| (peer, w.index)))
-                    .find(|(peer, _)| !peer.done.get() && !Rc::ptr_eq(peer, selection))
+                && let Some((_, waiter, peer)) = pop_waiter(&mut state.takes, Some(selection))
             {
+                let order = state.value_order();
+                peer.take_order.set(Some(order));
                 wakes.extend(peer.finish(
                     cljrs_value::publish::publish_value(value.clone()),
-                    peer_index,
+                    waiter.index,
                 ));
                 Some(Value::Bool(true))
             } else if state.capacity > 0 && state.queue.len() < state.capacity {
+                let order = state.value_order();
                 state
                     .queue
-                    .push_back(cljrs_value::publish::publish_value(value.clone()));
+                    .insert(order, cljrs_value::publish::publish_value(value.clone()));
                 Some(Value::Bool(true))
             } else {
                 None
             }
-        } else if let Some(value) = state.queue.pop_front() {
+        } else if let Some((order, value)) = state.queue.pop_first() {
             state.taken = state.taken.wrapping_add(1);
+            selection.take_order.set(Some(order));
             Some(value)
         } else if !state.closed
-            && let Some((peer, peer_index, value)) = state
-                .waiters
-                .iter()
-                .filter_map(|w| {
-                    w.value.as_ref().and_then(|value| {
-                        w.selection
-                            .upgrade()
-                            .map(|peer| (peer, w.index, value.clone()))
-                    })
-                })
-                .find(|(peer, _, _)| !peer.done.get() && !Rc::ptr_eq(peer, selection))
+            && let Some((_, waiter, peer)) = pop_waiter(&mut state.puts, Some(selection))
         {
-            wakes.extend(peer.finish(Value::Bool(true), peer_index));
-            Some(value)
+            let order = state.value_order();
+            selection.take_order.set(Some(order));
+            wakes.extend(peer.finish(Value::Bool(true), waiter.index));
+            Some(waiter.value.unwrap())
         } else if state.closed {
             Some(Value::Nil)
         } else {
@@ -243,41 +341,27 @@ impl CljChannel {
         if let Some(value) = result {
             wakes.extend(selection.finish(value, index));
         }
+        // Fill newly freed buffered slots from pending puts in registration
+        // order before a fresh producer can acquire them.
+        wakes.extend(state.service());
         drop(state);
-        for waker in wakes {
-            waker.wake();
-        }
-        if committed {
-            self.wake_selectors();
-        }
+        wake(wakes);
         committed
-    }
-
-    fn wake_selectors(&self) {
-        let wakers: Vec<_> = self
-            .state
-            .lock()
-            .unwrap()
-            .waiters
-            .iter()
-            .filter_map(|w| w.selection.upgrade())
-            .filter(|s| !s.done.get())
-            .filter_map(|s| s.waker.borrow().clone())
-            .collect();
-        for waker in wakers {
-            waker.wake();
-        }
     }
 
     /// Create a channel. `capacity == 0` is a rendezvous (unbuffered) channel.
     pub fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(ChannelState {
-                queue: VecDeque::new(),
+                queue: BTreeMap::new(),
+                next_value: 0,
+                next_waiter: 0,
                 capacity,
                 closed: false,
                 taken: 0,
-                waiters: Vec::new(),
+                takes: BTreeMap::new(),
+                puts: BTreeMap::new(),
+                registrations: BTreeMap::new(),
             }),
         }
     }
@@ -290,9 +374,11 @@ impl CljChannel {
     /// Mark the channel closed. Idempotent. Pending and future takes drain any
     /// buffered values and then observe `nil`.
     pub fn close(&self) {
-        self.state.lock().unwrap().closed = true;
-        // Closure makes every outstanding operation ready.
-        self.wake_selectors();
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        let wakes = state.service();
+        drop(state);
+        wake(wakes);
     }
 
     /// Non-blocking take.
@@ -330,10 +416,12 @@ impl CljChannel {
         if st.queue.is_empty() {
             let token = st.taken;
             // GC builds: heap-promotion fallback (see `try_put_buffered`).
+            let order = st.value_order();
             st.queue
-                .push_back(cljrs_value::publish::publish_value(v.clone()));
+                .insert(order, cljrs_value::publish::publish_value(v.clone()));
+            let wakes = st.service();
             drop(st);
-            self.wake_selectors();
+            wake(wakes);
             RvOffer::Offered(token)
         } else {
             RvOffer::Full
@@ -379,7 +467,7 @@ impl CljChannel {
             return RvStatus::Taken;
         }
         if st.closed {
-            st.queue.pop_front(); // cancel our still-pending offer
+            st.queue.pop_first(); // cancel our still-pending offer
             return RvStatus::ClosedUntaken;
         }
         RvStatus::Waiting
@@ -389,10 +477,10 @@ impl CljChannel {
 impl Trace for CljChannel {
     fn trace(&self, visitor: &mut MarkVisitor) {
         let st = self.state.lock().unwrap();
-        for v in st.queue.iter() {
+        for v in st.queue.values() {
             v.trace(visitor);
         }
-        for waiter in &st.waiters {
+        for waiter in st.registrations.values() {
             if let Some(value) = &waiter.value {
                 value.trace(visitor);
             }
@@ -497,6 +585,91 @@ pub async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    fn poll<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        Pin::new(future).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn cancelled_committed_take_restores_the_value_in_fifo_order() {
+        for capacity in [0, 1] {
+            let ch = CljChannel::new(capacity);
+            let mut first = Box::pin(select(vec![SelectOp::Take(&ch)], None));
+            let mut second = Box::pin(select(vec![SelectOp::Take(&ch)], None));
+            assert!(poll(&mut first).is_pending());
+            assert!(poll(&mut second).is_pending());
+            assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+            assert_eq!(ch.try_put_buffered(&Value::Long(2)), Some(true));
+            // Cancellation order must not change the original value order.
+            drop(first);
+            ch.close();
+            drop(second);
+            assert_eq!(ch.try_take(), Some(Value::Long(1)));
+            assert_eq!(ch.try_take(), Some(Value::Long(2)));
+            assert_eq!(ch.try_take(), Some(Value::Nil));
+        }
+    }
+
+    #[test]
+    fn cancelled_alts_take_returns_to_the_winning_channel_and_next_waiter() {
+        let x = CljChannel::new(0);
+        let y = CljChannel::new(0);
+        let mut choice = Box::pin(select(vec![SelectOp::Take(&x), SelectOp::Take(&y)], None));
+        assert!(poll(&mut choice).is_pending());
+        assert_eq!(y.try_put_buffered(&Value::Long(42)), Some(true));
+        let mut next = Box::pin(y.take());
+        assert!(poll(&mut next).is_pending());
+        drop(choice);
+        assert_eq!(poll(&mut next), Poll::Ready(Value::Long(42)));
+        assert_eq!(x.try_take(), None);
+    }
+
+    #[test]
+    fn pending_buffered_puts_keep_fifo_when_polled_in_reverse_order() {
+        let ch = CljChannel::new(1);
+        assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+        let mut first = Box::pin(ch.put(Value::Long(2)));
+        let mut second = Box::pin(ch.put(Value::Long(3)));
+        assert!(poll(&mut first).is_pending());
+        assert!(poll(&mut second).is_pending());
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert!(poll(&mut second).is_pending());
+        assert_eq!(ch.try_put_buffered(&Value::Long(4)), None);
+        assert_eq!(ch.try_take(), Some(Value::Long(2)));
+        assert_eq!(poll(&mut second), Poll::Ready(true));
+        assert_eq!(poll(&mut first), Poll::Ready(true));
+        assert_eq!(ch.try_take(), Some(Value::Long(3)));
+    }
+
+    #[test]
+    fn transfer_wakes_only_the_selected_waiter() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Counter(AtomicUsize);
+        impl std::task::Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let ch = CljChannel::new(0);
+        let mut takes: Vec<_> = (0..10_000).map(|_| Box::pin(ch.take())).collect();
+        for take in &mut takes {
+            assert!(take.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert_eq!(takes[0].as_mut().poll(&mut cx), Poll::Ready(Value::Long(1)));
+        drop(takes);
+        let state = ch.state.lock().unwrap();
+        assert!(state.takes.is_empty());
+        assert!(state.registrations.is_empty());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn committed_take_result_stays_traced_until_the_receiver_is_polled() {

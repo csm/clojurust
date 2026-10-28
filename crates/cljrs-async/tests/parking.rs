@@ -733,3 +733,120 @@ fn transient_updates_preserve_changes_made_while_a_key_realizes() {
         .await;
     });
 }
+
+#[test]
+fn destructuring_realization_errors_do_not_leave_lexical_frames() {
+    run(|globals| async move {
+        let mut env = Env::new(globals, "user");
+        env.push_frame();
+        env.bind("kept".into(), Value::Long(99));
+        let _root = push_env_root(&env);
+        let bad = eval(
+            "(array-map (lazy-seq (throw (ex-info \"bad key\" {}))) 1)",
+            &mut env,
+        )
+        .unwrap();
+        env.bind("bad".into(), bad);
+        for form in [
+            "(try (let [leaked 1 {:keys [missing]} bad] missing) (catch Exception _ :caught))",
+            "(try (loop [leaked 1 {:keys [missing]} bad] missing) (catch Exception _ :caught))",
+        ] {
+            let depth = env.frames.len();
+            assert_eq!(format!("{}", eval(form, &mut env).unwrap()), ":caught");
+            assert_eq!(env.frames.len(), depth);
+            assert_eq!(env.lookup("kept"), Some(Value::Long(99)));
+            assert_eq!(env.lookup("leaked"), None);
+        }
+    });
+}
+
+#[test]
+fn legacy_async_tasks_cannot_acquire_or_release_explicit_root_monitors() {
+    run(|globals| async move {
+        let lock = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
+        let _root = cljrs_runtime::env::gc_roots::root_value(&lock);
+        cljrs_runtime::env::monitor::monitor_enter(&lock).unwrap();
+        for body in ["(monitor-enter lock)", "(monitor-exit lock)"] {
+            let copy = lock.clone();
+            let globals = globals.clone();
+            let future = spawn_future(async move {
+                let mut env = Env::new(globals, "user");
+                env.push_frame();
+                env.bind("lock".into(), copy);
+                // A sync helper must not hide the task's async origin.
+                eval(
+                    &format!("(try ((fn [] {body})) (catch Exception _ :rejected))"),
+                    &mut env,
+                )
+            });
+            let result = cljrs_async::await_value(future).await.unwrap();
+            assert_eq!(format!("{result}"), ":rejected");
+        }
+        // The async task did not remove the root owner's acquisition.
+        cljrs_runtime::env::monitor::monitor_exit(&lock).unwrap();
+        assert!(cljrs_runtime::env::monitor::monitor_exit(&lock).is_err());
+    });
+}
+
+#[test]
+fn collection_snapshots_trace_values_removed_while_hashing_is_parked() {
+    use cljrs_value::ClojureHash;
+    run(|_| async move {
+        for vector in [false, true] {
+            let frame = cljrs_gc::push_alloc_frame();
+            let first = Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(
+                WaitingThunk(
+                    Value::List(GcPtr::new(cljrs_value::PersistentList::from_iter([
+                        Value::Long(42),
+                    ]))),
+                    false,
+                ),
+            ))));
+            let values = vec![first, Value::string("only the snapshot retains this")];
+            let collection = if vector {
+                let value = cljrs_value::collections::TransientVector::new();
+                for element in values {
+                    value.append(element).unwrap();
+                }
+                Value::TransientVector(GcPtr::new(value))
+            } else {
+                Value::ObjectArray(GcPtr::new(cljrs_value::value::ObjectArray::new(values)))
+            };
+            let _root = cljrs_runtime::env::gc_roots::root_value(&collection);
+            drop(frame);
+            let copy = collection.clone();
+            let task = fiber::spawn_rooted(vec![copy.clone()], move || {
+                Ok(Value::Long(copy.clojure_hash() as i64))
+            })
+            .unwrap();
+            tokio::task::yield_now().await;
+            match &collection {
+                Value::ObjectArray(array) => array.get().0.lock().unwrap().clear(),
+                Value::TransientVector(vector) => {
+                    vector.get().pop().unwrap();
+                    vector.get().pop().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            #[cfg(not(feature = "no-gc"))]
+            for _ in 0..3 {
+                cljrs_gc::request_gc();
+                cljrs_runtime::env::gc_roots::async_gc_collect();
+            }
+            let expected = cljrs_value::hash::hash_combine_ordered(
+                cljrs_value::hash::hash_combine_ordered(
+                    0,
+                    Value::List(GcPtr::new(cljrs_value::PersistentList::from_iter([
+                        Value::Long(42),
+                    ])))
+                    .clojure_hash(),
+                ),
+                Value::string("only the snapshot retains this").clojure_hash(),
+            );
+            assert_eq!(
+                task.await.unwrap().into_result().unwrap(),
+                Value::Long(expected as i64)
+            );
+        }
+    });
+}

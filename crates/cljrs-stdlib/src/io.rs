@@ -138,11 +138,13 @@ impl Resource for IoWriter {
         let inner = self.inner.clone();
         let closed = self.closed.clone();
         file_work(move || {
-            let mut writer = inner.lock().unwrap().take();
-            closed.store(true, Ordering::Release);
+            let mut guard = inner.lock().unwrap();
+            let mut writer = guard.take();
             if let Some(writer) = writer.as_mut() {
-                writer.flush().map_err(|e| format!("flush error: {e}"))?;
+                let _ = writer.flush();
             }
+            drop(writer);
+            closed.store(true, Ordering::Release);
             Ok(())
         })
     }
@@ -421,4 +423,27 @@ fn builtin_make_parents(args: &[Value]) -> ValueResult<Value> {
             .map_err(|e| ValueError::Other(format!("cannot create dirs: {e}")))?;
     }
     Ok(Value::Bool(true))
+}
+
+#[cfg(all(test, unix))]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn close_ignores_a_final_flush_error_and_is_idempotent() {
+        use std::os::fd::OwnedFd;
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let file = std::fs::File::from(OwnedFd::from(stream));
+        let writer = IoWriter {
+            inner: Arc::new(Mutex::new(Some(BufWriter::new(file)))),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        writer.write_str("buffered body").unwrap();
+        assert!(writer.flush().is_err());
+        assert!(!writer.is_closed());
+        writer.close().unwrap();
+        assert!(writer.is_closed());
+        writer.close().unwrap();
+    }
 }

@@ -356,6 +356,8 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - `<!!` and `>!!` park on the existing channel futures. `alts!!` supports takes, put alternatives, `:default`, and `:priority`.
   Shared selection tokens commit one operation, including rendezvous handoffs between selectors.
   Losing operations do not transfer values. Cancellation removes their registrations.
+  Cancellation also restores an unconsumed committed take in FIFO order.
+  Ordered waiter queues preserve pending-put order and wake only the selected tasks.
 - Future and promise dereferences share notification waits across the builtin, reader dereference,
   and synchronous `await` paths. Timed waits use a deadline and preserve settled errors.
 - `sleep` and `Thread/sleep` park on Tokio timers. The `locking` macro uses reentrant monitors
@@ -366,6 +368,8 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   Monitor acquisition, delay forcing, and `try_realize` reject carrier waits on same-thread fibers.
   Equality, hashing, and formatting use a private realization error signal.
   Evaluation and boxed ABI boundaries convert this signal to catchable Clojure errors.
+  The IR interpreter uses one boundary per function execution.
+  Lexical scope guards remove frames on destructuring errors and unwinds.
   Ordinary panics and fiber cancellation remain distinct.
 - Core `slurp` and `spit` offload owned file work to the blocking worker pool.
   The existing channel interfaces provide parking paths for `cljrs-io` and `cljrs-net`.
@@ -397,7 +401,11 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 
 - Direct `monitor-enter` and `monitor-exit` functions retain explicit acquisitions in per-fiber state.
   The collector traces their objects. Fiber completion and cancellation release unmatched acquisitions.
-- Transient updates and object-array hashing use traced snapshots outside collection locks.
+  Legacy async tasks reject explicit monitors because those tasks share the root mutator.
+- Scalar transient keys use in-place updates and direct lookups without snapshots.
+  Other transient updates and object-array hashing use traced snapshots outside collection locks.
+  Snapshots use a per-mutator shadow stack without managed allocation.
+  Object-array hashing copies its vector once. Transient-vector hashing shares its existing storage.
   Concurrent transient changes cause an update to retry. Realization errors do not mutate or poison these collections.
 - `tests/fiber_io.rs` checks isolate progress during blocked file operations and process waits with FIFO gates.
 

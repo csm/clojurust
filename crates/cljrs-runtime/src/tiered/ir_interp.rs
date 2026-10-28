@@ -350,6 +350,34 @@ fn interpret_ir_inner(
     osr_arity_id: Option<u64>,
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
+    cljrs_value::realization::catch(|| {
+        interpret_ir_body(
+            ir_func,
+            args,
+            globals,
+            ns,
+            env,
+            osr_arity_id,
+            inherited_region,
+        )
+    })
+    .unwrap_or_else(|message| {
+        Err(value_error_to_eval_error(cljrs_value::ValueError::Other(
+            message,
+        )))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpret_ir_body(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
+    inherited_region: Option<*mut cljrs_gc::region::Region>,
+) -> EvalResult {
     // GC safepoint at function entry.  Root the arguments first: a caller
     // such as a native `reduce` may hold the only reference to them.
     {
@@ -527,25 +555,6 @@ fn is_truthy(val: &Value) -> bool {
 // ── Instruction execution ───────────────────────────────────────────────────
 
 fn execute_inst(
-    inst: &Inst,
-    regs: &mut Registers,
-    regions: &mut RegionFrame,
-    ir_func: &IrFunction,
-    globals: &Arc<GlobalEnv>,
-    ns: &Arc<str>,
-    env: &mut Env,
-) -> EvalResult<()> {
-    cljrs_value::realization::catch(|| {
-        execute_inst_inner(inst, regs, regions, ir_func, globals, ns, env)
-    })
-    .unwrap_or_else(|message| {
-        Err(crate::env::error::value_error_to_eval_error(
-            cljrs_value::ValueError::Other(message),
-        ))
-    })
-}
-
-fn execute_inst_inner(
     inst: &Inst,
     regs: &mut Registers,
     regions: &mut RegionFrame,

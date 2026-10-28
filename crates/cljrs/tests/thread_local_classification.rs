@@ -117,6 +117,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "HELD_MONITORS",
         Fiber("cljrs-runtime/HELD_MONITORS"),
     ),
+    (
+        "cljrs-value/src/collections/mod.rs",
+        "SNAPSHOT_ROOTS",
+        FiberWhen("cljrs-value/SNAPSHOT_ROOTS", !NO_GC),
+    ),
     // ── cljrs-runtime ───────────────────────────────────────────────────────
     (
         "cljrs-runtime/src/env/gc_roots.rs",

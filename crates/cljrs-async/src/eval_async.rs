@@ -78,6 +78,7 @@ where
             // task answers only to an interrupt of the eval that spawned it.
             let _interrupts = cljrs_runtime::env::gas::InterruptScope::enter(&interrupts);
             let _gas_guards = cljrs_runtime::env::gas::install_meters(&gas_meters);
+            let _monitors = cljrs_runtime::env::monitor::AsyncMonitorScope::enter();
             task.as_mut().poll(cx)
         })
         .await;

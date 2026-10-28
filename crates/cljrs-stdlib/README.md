@@ -228,6 +228,8 @@ whole graph and no second, direct dependency could switch them back off.
 `IoReader::open`, `read_line`, `read_all`, and `close` offload owned file work inside a native fiber.
 `IoWriter::open`, `write_str`, `flush`, and `close` use the same worker path.
 `is_closed` reads an atomic flag and does not wait for a file lock.
+Writer close ignores final-flush errors and sets this flag after the flush and file release.
+An explicit `flush` still reports write errors.
 The worker retains the file state if a waiting fiber is cancelled.
 Managed values and errors stay on the isolate.
 Outside a fiber, these methods keep their synchronous behavior.

@@ -94,6 +94,27 @@ impl PersistentHashMap {
         }
     }
 
+    // Only used when neither hashing nor equality can realize user code.
+    pub(crate) fn assoc_mut(&mut self, key: Value, value: Value) {
+        if let Some(seq) = self.index.get(&key).copied() {
+            self.order.insert_mut(seq, (key, value));
+        } else {
+            let seq = self.next_seq;
+            self.index.insert_mut(key.clone(), seq);
+            self.order.insert_mut(seq, (key, value));
+            self.next_seq += 1;
+        }
+        self.charge = ShareCharge::full();
+    }
+
+    pub(crate) fn dissoc_mut(&mut self, key: &Value) {
+        if let Some(seq) = self.index.get(key).copied() {
+            self.index.remove_mut(key);
+            self.order.remove_mut(&seq);
+            self.charge = ShareCharge::full();
+        }
+    }
+
     /// Return a new map with `key` removed.
     pub fn dissoc(&self, key: &Value) -> Self {
         match self.index.get(key) {

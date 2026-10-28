@@ -1096,6 +1096,23 @@ impl Env {
         self.frames.pop();
     }
 
+    // Keep lexical frames balanced across errors and realization unwinds.
+    pub(crate) fn with_frame<T>(&mut self, body: impl FnOnce(&mut Env) -> T) -> T {
+        struct Scope<'a> {
+            env: &'a mut Env,
+            depth: usize,
+        }
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                self.env.frames.truncate(self.depth);
+            }
+        }
+        let depth = self.frames.len();
+        self.push_frame();
+        let scope = Scope { env: self, depth };
+        body(scope.env)
+    }
+
     /// Bind `name` to `val` in the top frame.
     pub fn bind(&mut self, name: Arc<str>, val: Value) {
         if let Some(frame) = self.frames.last_mut() {
