@@ -596,7 +596,11 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         }
 
         // ── Lazy sequences: realize first ──
-        Value::LazySeq(p) => serialize(&p.get().realize()),
+        Value::LazySeq(p) => serialize(
+            &p.get()
+                .try_realize()
+                .map_err(|_| not_shareable("lazy seq whose realization failed"))?,
+        ),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {

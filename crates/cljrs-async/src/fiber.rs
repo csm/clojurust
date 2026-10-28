@@ -136,19 +136,9 @@ pub struct Fiber {
     task: FiberTask,
 }
 
-impl Fiber {
-    pub fn new(body: impl FnOnce() -> EvalResult + 'static) -> Result<Self, EvalError> {
-        Self::with_roots(Vec::new(), body)
-    }
-
-    /// Keep captured values rooted before the first poll and until completion.
-    /// GC builds retire active regions because opaque closure captures cannot
-    /// be rewritten after promotion. In no-gc builds, allocate captures in a
-    /// static context before constructing a fiber.
-    pub fn with_roots(
-        roots: Vec<Value>,
-        body: impl FnOnce() -> EvalResult + 'static,
-    ) -> Result<Self, EvalError> {
+fn install_parking_hooks() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
         cljrs_value::parking::install(cljrs_value::parking::Hooks {
             current: || current().map(|id| id.0),
             park: |future, timeout| {
@@ -173,6 +163,23 @@ impl Fiber {
                 })
             },
         });
+    });
+}
+
+impl Fiber {
+    pub fn new(body: impl FnOnce() -> EvalResult + 'static) -> Result<Self, EvalError> {
+        Self::with_roots(Vec::new(), body)
+    }
+
+    /// Keep captured values rooted before the first poll and until completion.
+    /// GC builds retire active regions because opaque closure captures cannot
+    /// be rewritten after promotion. In no-gc builds, allocate captures in a
+    /// static context before constructing a fiber.
+    pub fn with_roots(
+        roots: Vec<Value>,
+        body: impl FnOnce() -> EvalResult + 'static,
+    ) -> Result<Self, EvalError> {
+        install_parking_hooks();
         let bytes = stack_bytes()?;
         let stack = STACK_POOL
             .with(|pool| {

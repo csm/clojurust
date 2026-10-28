@@ -237,7 +237,7 @@ impl cljrs_value::Thunk for WaitingThunk {
     }
 }
 #[test]
-fn realizing_thunks_remain_traced_and_cancellation_wakes_waiters() {
+fn realizing_thunks_remain_traced() {
     run(|_| async move {
         let delay = Value::Delay(GcPtr::new(cljrs_value::Delay::new(Box::new(WaitingThunk(
             Value::string("retained"),
@@ -264,35 +264,6 @@ fn realizing_thunks_remain_traced_and_cancellation_wakes_waiters() {
             format!("{}", a.await.unwrap().into_result().unwrap()),
             "\"retained\""
         );
-
-        let cell = Value::Delay(GcPtr::new(cljrs_value::Delay::new(Box::new(WaitingThunk(
-            Value::Nil,
-            true,
-        )))));
-        let _root = cljrs_runtime::env::gc_roots::root_value(&cell);
-        let copy = cell.clone();
-        let a = fiber::spawn_rooted(vec![cell.clone()], move || {
-            let Value::Delay(cell) = copy else {
-                unreachable!()
-            };
-            cell.get()
-                .force()
-                .map_err(cljrs_runtime::env::error::EvalError::Runtime)
-        })
-        .unwrap();
-        tokio::task::yield_now().await;
-        let b = fiber::spawn_rooted(vec![cell.clone()], move || {
-            let Value::Delay(cell) = cell else {
-                unreachable!()
-            };
-            assert!(cell.get().force().unwrap_err().contains("interrupted"));
-            Ok(Value::Nil)
-        })
-        .unwrap();
-        tokio::task::yield_now().await;
-        a.abort();
-        assert!(a.await.is_err());
-        b.await.unwrap().into_result().unwrap();
     });
 }
 
@@ -394,5 +365,159 @@ fn closing_a_channel_wakes_every_parked_putter() {
                 putter.await.unwrap().into_result().unwrap();
             }
         }
+    });
+}
+
+#[derive(Debug)]
+struct RetryingThunk {
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    panic_first: bool,
+    value: Value,
+}
+impl cljrs_gc::Trace for RetryingThunk {
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        cljrs_gc::Trace::trace(&self.value, visitor);
+    }
+}
+impl cljrs_value::Thunk for RetryingThunk {
+    fn force(&self) -> Result<Value, String> {
+        let attempt = self.attempts.get() + 1;
+        self.attempts.set(attempt);
+        if attempt == 1 {
+            if self.panic_first {
+                panic!("first realization panicked");
+            }
+            fiber::park_on(std::future::pending::<()>());
+        }
+        Ok(self.value.clone())
+    }
+}
+fn realize(value: &Value) -> EvalResult {
+    match value {
+        Value::Delay(cell) => cell.get().force(),
+        Value::LazySeq(cell) => cell.get().try_realize(),
+        _ => unreachable!(),
+    }
+    .map_err(cljrs_runtime::env::error::EvalError::Runtime)
+}
+#[test]
+fn cancelled_and_panicked_realizers_allow_other_readers_to_retry() {
+    run(|_| async move {
+        for lazy in [false, true] {
+            for panic_first in [false, true] {
+                let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+                let thunk = RetryingThunk {
+                    attempts: attempts.clone(),
+                    panic_first,
+                    value: Value::string("retried"),
+                };
+                let cell = if lazy {
+                    Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(thunk))))
+                } else {
+                    Value::Delay(GcPtr::new(cljrs_value::Delay::new(Box::new(thunk))))
+                };
+                let _root = cljrs_runtime::env::gc_roots::root_value(&cell);
+                let copy = cell.clone();
+                let first =
+                    fiber::spawn_rooted(vec![cell.clone()], move || realize(&copy)).unwrap();
+                tokio::task::yield_now().await;
+                let copy = cell.clone();
+                let waiter =
+                    fiber::spawn_rooted(vec![cell.clone()], move || realize(&copy)).unwrap();
+                tokio::task::yield_now().await;
+                if panic_first {
+                    assert!(first.await.unwrap().into_result().is_err());
+                } else {
+                    first.abort();
+                    assert!(first.await.is_err());
+                }
+                assert_eq!(
+                    waiter.await.unwrap().into_result().unwrap(),
+                    Value::string("retried")
+                );
+                assert_eq!(realize(&cell).unwrap(), Value::string("retried"));
+                assert_eq!(attempts.get(), 2);
+            }
+        }
+    });
+}
+#[test]
+fn carrier_waits_on_same_thread_fibers_fail_without_poisoning_values() {
+    run(|globals| async move {
+        let lock = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
+        let delay = Value::Delay(GcPtr::new(cljrs_value::Delay::new(Box::new(WaitingThunk(
+            Value::Nil,
+            true,
+        )))));
+        let lazy = Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(
+            WaitingThunk(Value::Nil, true),
+        ))));
+        let roots = vec![lock.clone(), delay.clone(), lazy.clone()];
+        let _root = cljrs_runtime::env::gc_roots::root_values(&roots);
+        let copy = lock.clone();
+        let monitor = fiber::spawn_rooted(vec![copy.clone()], move || {
+            let _guard = cljrs_runtime::env::monitor::enter(&copy).unwrap();
+            fiber::park_on(std::future::pending::<()>());
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let mut realizers = Vec::new();
+        for value in [delay.clone(), lazy.clone()] {
+            realizers
+                .push(fiber::spawn_rooted(vec![value.clone()], move || realize(&value)).unwrap());
+        }
+        tokio::task::yield_now().await;
+        let mut env = Env::new(globals, "user");
+        env.push_frame();
+        env.bind("lock".into(), lock);
+        env.bind("d".into(), delay.clone());
+        env.bind("s".into(), lazy.clone());
+        let _root = push_env_root(&env);
+        let result = eval(
+            r#"[(try (locking lock 1) (catch Exception _ :rejected))
+                              (try @d (catch Exception _ :rejected))
+                              (try (first s) (catch Exception _ :rejected))]"#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(format!("{result}"), "[:rejected :rejected :rejected]");
+        let Value::LazySeq(lazy) = lazy else {
+            unreachable!()
+        };
+        assert!(lazy.get().error().is_none());
+        assert!(matches!(
+            &*lazy.get().state.lock().unwrap(),
+            cljrs_value::types::LazySeqState::Realizing { .. }
+        ));
+        let Value::Delay(delay) = delay else {
+            unreachable!()
+        };
+        assert!(!delay.get().is_realized());
+        monitor.abort();
+        assert!(monitor.await.is_err());
+        for realizer in realizers {
+            realizer.abort();
+            assert!(realizer.await.is_err());
+        }
+    });
+}
+#[test]
+fn alts_does_not_starve_a_ready_channel_later_in_the_input() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (require '[clojure.core.async :as a])
+          (let [x (a/chan 1) y (a/chan 1)]
+            (a/>!! x 1) (a/>!! y 2)
+            (loop [i 0 seen #{}]
+              (if (< i 256)
+                (let [[v ch] (a/alts!! [x y])]
+                  (a/>!! ch v)
+                  (recur (inc i) (conj seen (identical? ch x))))
+                (count seen))))"#,
+            "2",
+        )
+        .await;
     });
 }

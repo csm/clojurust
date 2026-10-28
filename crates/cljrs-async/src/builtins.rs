@@ -7,6 +7,7 @@
 //! `async-spawn` runs a thunk on the `LocalSet` as an async task (the runtime
 //! backing the `go` macro).
 
+use rand::seq::SliceRandom;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -532,14 +533,15 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
         ));
     }
     let _roots = cljrs_runtime::env::gc_roots::root_values(&channels);
-    let pointers = channels
-        .iter()
-        .map(|ch| channel_arg(std::slice::from_ref(ch)))
-        .collect::<ValueResult<Vec<_>>>()?;
-    let branches: Vec<Pin<Box<dyn Future<Output = (Value, usize)> + '_>>> = pointers
+    let mut pointers = channels
         .iter()
         .enumerate()
-        .map(|(i, ch)| Box::pin(async move { (chan_ref(ch.get()).take().await, i) }) as _)
+        .map(|(i, ch)| channel_arg(std::slice::from_ref(ch)).map(|ch| (i, ch)))
+        .collect::<ValueResult<Vec<_>>>()?;
+    pointers.shuffle(&mut rand::rng());
+    let branches: Vec<Pin<Box<dyn Future<Output = (Value, usize)> + '_>>> = pointers
+        .iter()
+        .map(|(i, ch)| Box::pin(async move { (chan_ref(ch.get()).take().await, *i) }) as _)
         .collect();
     let ((value, index), _, _) =
         cljrs_value::parking::block_on(futures_util::future::select_all(branches));

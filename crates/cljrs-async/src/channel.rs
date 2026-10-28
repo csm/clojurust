@@ -315,15 +315,10 @@ impl CljChannel {
     /// building block other native crates use to consume channel values.
     /// Must run within a Tokio `LocalSet` context.
     pub async fn take(&self) -> Value {
-        loop {
-            if let Some(v) = self.try_take() {
-                // Notify can coalesce several puts before takers are polled.
-                // Cascade so remaining data/closure reaches every waiter.
-                self.async_not_empty.notify_one();
-                return v;
-            }
-            self.async_not_empty.notified().await;
-        }
+        let value = wait_until(&self.async_not_empty, || self.try_take()).await;
+        // Notify can coalesce several puts before takers are polled.
+        self.async_not_empty.notify_one();
+        value
     }
 
     /// Asynchronously put `v` onto the channel, cooperatively yielding to the
@@ -336,35 +331,25 @@ impl CljChannel {
     /// Must run within a Tokio `LocalSet` context.
     pub async fn put(&self, v: Value) -> bool {
         if self.is_rendezvous() {
-            // Phase 1: claim the channel's single slot.
-            let token = loop {
-                match self.rv_offer(&v) {
-                    RvOffer::Offered(t) => break t,
-                    RvOffer::Closed => return false,
-                    RvOffer::Full => {}
-                }
-                self.async_not_full.notified().await;
-            };
+            let offer = wait_until(&self.async_not_full, || match self.rv_offer(&v) {
+                RvOffer::Offered(token) => Some(Ok(token)),
+                RvOffer::Closed => Some(Err(())),
+                RvOffer::Full => None,
+            })
+            .await;
+            let Ok(token) = offer else { return false };
             let _offer = RendezvousOffer {
                 channel: self,
                 token,
             };
-            // Phase 2: wait for a taker to consume the offered value.
-            loop {
-                match self.rv_status(token) {
-                    RvStatus::Taken => return true,
-                    RvStatus::ClosedUntaken => return false,
-                    RvStatus::Waiting => {}
-                }
-                self.async_not_full.notified().await;
-            }
+            wait_until(&self.async_not_full, || match self.rv_status(token) {
+                RvStatus::Taken => Some(true),
+                RvStatus::ClosedUntaken => Some(false),
+                RvStatus::Waiting => None,
+            })
+            .await
         } else {
-            loop {
-                if let Some(accepted) = self.try_put_buffered(&v) {
-                    return accepted;
-                }
-                self.async_not_full.notified().await;
-            }
+            wait_until(&self.async_not_full, || self.try_put_buffered(&v)).await
         }
     }
 
@@ -383,6 +368,21 @@ impl CljChannel {
             return RvStatus::ClosedUntaken;
         }
         RvStatus::Waiting
+    }
+}
+
+// Register before inspecting the condition. This closes the gap in which a
+// broadcast (including channel closure) could otherwise disappear. Enable is
+// also necessary for notify_one when several consumers compete for permits.
+async fn wait_until<T>(notify: &Notify, mut ready: impl FnMut() -> Option<T>) -> T {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(value) = ready() {
+            return value;
+        }
+        notified.await;
     }
 }
 
@@ -482,4 +482,30 @@ pub async fn chan_deliver(ch: &GcPtr<NativeObjectBox>, v: Value) {
 /// Returns `Value::Nil` when the channel is closed and drained.
 pub async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
     chan_ref(ch.get()).take().await
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broadcast_between_condition_check_and_await_is_not_lost() {
+        let notify = Notify::new();
+        let mut checked = false;
+        let wait = wait_until(&notify, || {
+            if checked {
+                return Some(42);
+            }
+            checked = true;
+            // Simulate close after a stale condition check but before await.
+            notify.notify_waiters();
+            None
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap(),
+            42
+        );
+    }
 }

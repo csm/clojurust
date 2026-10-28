@@ -70,6 +70,7 @@ impl Isolate {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "no-gc"))]
     use std::sync::{Arc, Barrier};
 
     #[test]
@@ -81,6 +82,8 @@ mod tests {
         handle.join().expect("isolate panicked");
     }
 
+    // no-gc uses static arenas and does not maintain traced heap counts.
+    #[cfg(not(feature = "no-gc"))]
     #[test]
     fn two_isolates_run_concurrently() {
         let barrier = Arc::new(Barrier::new(2));

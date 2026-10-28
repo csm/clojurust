@@ -41,6 +41,7 @@ Attribute macro that:
 | `ns` | string literal | **yes** | Clojure namespace, e.g. `"math"` |
 | `name` | string literal | no | Override the Clojure symbol name (default: fn name with `_` → `-`) |
 | `variadic_min` | integer | no | Minimum arity for variadic functions (default 0) |
+| `blocking` | flag | no | Run owned, Send-only native work on the worker pool when a fiber calls it |
 
 ### Supported signatures
 
@@ -73,6 +74,21 @@ pub fn sum(args: &[Value]) -> Result<Value, String> {
     Ok(total.into_value())
 }
 ```
+
+### Blocking exports (virtual threads Phase 2)
+
+```rust
+#[export(ns = "files", blocking)]
+fn read_text(path: String) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+```
+
+The wrapper converts arguments on the isolate before it starts the worker.
+The worker runs the Rust function while the fiber parks. The wrapper converts its result on the isolate after the worker returns.
+Inputs, results, and error types must be owned, `Send`, and `'static`.
+Variadic `&[Value]` exports cannot use `blocking` because managed values cannot cross threads.
+Outside a fiber, the wrapper calls the Rust function directly.
 
 ### Name conversion
 

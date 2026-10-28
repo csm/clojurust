@@ -1881,11 +1881,13 @@ impl Iterator for ValueIter {
                     // Root self.current so the LazySeq (and the entire chain
                     // it's part of) survives any GC triggered during realize().
                     let _current_root = crate::env::gc_roots::root_value(&self.current);
-                    self.current = ls.get().realize();
-                    if let Some(err) = ls.get().error() {
-                        self.error = Some(err);
-                        self.current = Value::Nil;
-                        return None;
+                    match ls.get().try_realize() {
+                        Ok(value) => self.current = value,
+                        Err(error) => {
+                            self.error = Some(error);
+                            self.current = Value::Nil;
+                            return None;
+                        }
                     }
                 }
                 Value::Cons(c) => {
@@ -3450,7 +3452,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
         Value::ObjectArray(a) => a.get().0.lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
-            let realized = s.get().realize();
+            let realized = s.get().try_realize().map_err(ValueError::Other)?;
             return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
@@ -4065,10 +4067,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     // Iteratively unwrap lazy seqs to avoid stack overflow.
     let mut val = args[0].unwrap_meta().clone();
     while let Value::LazySeq(ls) = &val {
-        let realized = ls.get().realize();
-        if let Some(err) = ls.get().error() {
-            return Err(ValueError::Other(err));
-        }
+        let realized = ls.get().try_realize().map_err(ValueError::Other)?;
         val = realized;
     }
     match &val {
@@ -4215,10 +4214,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
             builtin_first(&[v])
         }
         Value::Cons(c) => Ok(c.get().head.clone()),
@@ -4258,10 +4254,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize().map_err(ValueError::Other)?;
             builtin_rest(&[v])
         }
         Value::Cons(c) => {
@@ -4540,10 +4533,7 @@ impl Thunk for ConcatThunk {
             // Peel through any lazy-seq wrappers on the head iteratively.
             let mut head = colls[0].clone();
             while let Value::LazySeq(ls) = &head {
-                let realized = ls.get().realize();
-                if let Some(err) = ls.get().error() {
-                    return Err(err);
-                }
+                let realized = ls.get().try_realize()?;
                 head = realized;
             }
 
@@ -4560,7 +4550,7 @@ impl Thunk for ConcatThunk {
                 _ => {}
             }
 
-            let (first, rest) = concat_first_rest(&head);
+            let (first, rest) = concat_first_rest(&head)?;
             match first {
                 Some(f) => {
                     colls[0] = rest;
@@ -4582,15 +4572,15 @@ impl Thunk for ConcatThunk {
 /// Extract first element and rest from a seq-like value without fully realizing it.
 /// Used by the lazy concat implementation.  Iteratively unwraps LazySeq to
 /// avoid stack overflow on deeply nested lazy chains.
-fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
+fn concat_first_rest(val: &Value) -> Result<(Option<Value>, Value), String> {
     // Iteratively unwrap lazy seqs first.
     let mut current = val.clone();
     while let Value::LazySeq(ls) = current {
-        current = ls.get().realize();
+        current = ls.get().try_realize()?;
     }
     let val = &current;
 
-    match val {
+    Ok(match val {
         Value::Nil => (None, Value::Nil),
         Value::Cons(c) => {
             let c = c.get();
@@ -4666,7 +4656,7 @@ fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
             }
         }
         _ => (None, Value::Nil),
-    }
+    })
 }
 
 fn builtin_keys(args: &[Value]) -> ValueResult<Value> {
@@ -5959,7 +5949,7 @@ fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
 fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
     match v {
         Value::Nil => Ok(None),
-        Value::LazySeq(ls) => seq_first_rest(&ls.get().realize()),
+        Value::LazySeq(ls) => seq_first_rest(&ls.get().try_realize().map_err(ValueError::Other)?),
         Value::Cons(c) => {
             let cell = c.get();
             Ok(Some((cell.head.clone(), cell.tail.clone())))
@@ -9185,13 +9175,14 @@ fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
     })
 }
 
-/// Sleep -- pause current thread for N ms
+/// Run a zero-argument callback while this computation owns an object monitor.
 fn builtin_locking_call(args: &[Value]) -> ValueResult<Value> {
     let _root = crate::env::gc_roots::root_values(args);
     let _monitor = crate::env::monitor::enter(&args[0])?;
     crate::env::callback::invoke(&args[1], Vec::new())
 }
 
+/// Pause the current fiber, or the OS thread outside a fiber, for N ms.
 fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
     sleep(Duration::from_millis(
         i64::max(0, numeric_as_i64(&args[0])?) as u64,

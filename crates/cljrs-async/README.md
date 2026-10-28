@@ -86,11 +86,10 @@ Done (Phases A–H, A2, B1):
   `await`. The *distinct parallel primitive* (`pfuture`/`spawn`) that would run
   Clojure on another isolate is deferred — it needs B3's shared code arena so a
   worker can see the running program's code without copying the world.
-- Phase H: `<!!` (blocking take) and `>!!` (blocking put) for synchronous / REPL / test
-  contexts. Both use `Condvar`-based parking (with a 1 ms poll-interval fallback so they
-  remain non-deadlocking when called from the LocalSet executor thread). Errors with a
-  clear message if called inside an `^:async` function body. `CljChannel` condvars also
-  replace the previous spin-poll in the IR interpreter's `ChanTake`/`ChanPut` opcodes.
+- Phase H: `<!!` (blocking take) and `>!!` (blocking put) support synchronous callers.
+  Native fibers park on channel futures. Outside fibers, callers block the OS thread on a Condvar.
+  Colored async callers receive an error unless they run inside a fiber.
+  The IR interpreter's `ChanTake`/`ChanPut` opcodes use the same paths.
 
 ### Channel model
 
@@ -523,13 +522,16 @@ Inside a native fiber, `<!!` and `>!!` park on channel futures. Other fibers on 
 Outside a fiber, these operations keep their blocking behavior. Colored async callers still use `await`.
 
 `alts!!` selects one take from a nonempty collection of channels and returns `[value channel]`.
-Losing takes do not consume values. This first implementation accepts take operations only.
+Losing takes do not consume values. Each selection shuffles the channel order to avoid starving later channels.
+This first implementation accepts take operations only.
 Put alternatives and the `:default` and `:priority` options remain pending.
 
 Future and promise dereferences also park inside fibers, including timed dereferences.
 `sleep` and `Thread/sleep` use the Tokio timer. `locking` uses reentrant monitors with a separate owner for each fiber.
 Delay and lazy sequence waiters receive the settled result after the first fiber finishes realization.
-Cancellation releases monitors, retracts unconsumed rendezvous offers, and wakes realization waiters with an error.
+Cancellation releases monitors, retracts unconsumed rendezvous offers, and restores interrupted thunks so realization waiters can retry.
+Carrier waits on a fiber-owned monitor or realization on the same thread fail before they can block the executor.
+Channel waits register notifications before condition checks, so closure cannot lose a wakeup.
 
 Core `slurp` and `spit` run file work on the blocking worker pool.
 The existing `cljrs-io` and `cljrs-net` APIs return channels, so `<!!` and `>!!` also provide their parking paths.
@@ -538,3 +540,6 @@ Managed values stay on the isolate. Native Rust code can use `cljrs_value::parki
 The Clojure spawn functions and CLI entry points do not yet create fibers. Those changes belong to Phase 3.
 Rust embedders can use `fiber::spawn` or `Fiber::with_roots` now.
 The general Clojure `(blocking & body)` form remains pending because arbitrary Clojure closures cannot cross worker threads.
+
+Heap-isolation fixtures that assert traced heap counts run only in GC builds.
+Notification and parking regressions also run in `no-gc` builds.

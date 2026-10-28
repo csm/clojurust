@@ -780,6 +780,7 @@ dependencies = [
  "futures-util",
  "gloo-timers",
  "proptest",
+ "rand 0.10.2",
  "tokio",
 ]
 

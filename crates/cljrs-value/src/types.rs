@@ -946,21 +946,35 @@ pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
     fn force(&self) -> Result<Value, String>;
 }
 
-/// Identifies a realization without confusing fibers on the same OS thread.
+/// Identifies a computation by its isolate thread and optional fiber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Realizer {
-    Fiber(u64),
-    Thread(std::thread::ThreadId),
+pub struct Realizer {
+    thread: std::thread::ThreadId,
+    fiber: Option<u64>,
 }
 impl Realizer {
-    fn current() -> Self {
-        crate::parking::current()
-            .map(Self::Fiber)
-            .unwrap_or_else(|| Self::Thread(std::thread::current().id()))
+    pub fn current() -> Self {
+        Self {
+            thread: std::thread::current().id(),
+            fiber: crate::parking::current(),
+        }
+    }
+
+    /// Reject a carrier wait that would prevent this owner's fiber resuming.
+    /// A different fiber can park; a different thread can block normally.
+    pub fn ensure_can_wait(self) -> Result<(), String> {
+        if self.thread == std::thread::current().id()
+            && self.fiber.is_some()
+            && crate::parking::current().is_none()
+        {
+            Err("cannot block the isolate thread waiting for a parked fiber. Run this code inside a fiber.".into())
+        } else {
+            Ok(())
+        }
     }
 }
 
-// Cancellation/panic must settle a realization and wake competing waiters.
+// Cancellation/panic returns the original thunk to Pending for another reader.
 struct RealizationGuard<'a> {
     lazy: Option<&'a LazySeq>,
     delay: Option<&'a Delay>,
@@ -968,11 +982,19 @@ struct RealizationGuard<'a> {
 impl Drop for RealizationGuard<'_> {
     fn drop(&mut self) {
         if let Some(cell) = self.lazy {
-            *cell.state.lock().unwrap() = LazySeqState::Error("realization interrupted".into());
+            let mut state = cell.state.lock().unwrap();
+            if let LazySeqState::Realizing { thunk, .. } = &*state {
+                *state = LazySeqState::Pending(thunk.clone());
+            }
+            drop(state);
             cell.ready.notify_all();
         }
         if let Some(cell) = self.delay {
-            *cell.state.lock().unwrap() = DelayState::Error("realization interrupted".into());
+            let mut state = cell.state.lock().unwrap();
+            if let DelayState::Realizing { thunk, .. } = &*state {
+                *state = DelayState::Pending(thunk.clone());
+            }
+            drop(state);
             cell.ready.notify_all();
         }
     }
@@ -981,7 +1003,7 @@ impl Drop for RealizationGuard<'_> {
 /// Internal state of a lazy sequence cell.
 pub enum LazySeqState {
     /// Thunk not yet evaluated.
-    Pending(Box<dyn Thunk>),
+    Pending(Rc<dyn Thunk>),
     Realizing {
         owner: Realizer,
         thunk: Rc<dyn Thunk>,
@@ -992,7 +1014,7 @@ pub enum LazySeqState {
     Error(String),
 }
 
-/// A lazy sequence that forces its thunk exactly once and caches the result.
+/// A lazy sequence that caches its result and retries interrupted realizations.
 pub struct LazySeq {
     ready: Event,
     pub state: TrackedMutex<LazySeqState>,
@@ -1001,25 +1023,42 @@ pub struct LazySeq {
 impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: TrackedMutex::new(LazySeqState::Pending(thunk)),
+            state: TrackedMutex::new(LazySeqState::Pending(Rc::from(thunk))),
             ready: Event::default(),
         }
     }
 
     /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
-    /// On error, returns `Value::Nil` and caches the error (retrievable via `error()`).
+    /// Cached thunk errors return nil and remain available through `error()`.
+    /// Panics if a carrier wait would prevent the owning fiber resuming.
+    /// Use `try_realize` when the caller can return an error.
     pub fn realize(&self) -> Value {
+        match self.try_realize() {
+            Ok(value) => value,
+            Err(error) => {
+                // Infallible trait callers cannot return a transient wait
+                // error. Fail explicitly instead of silently losing data.
+                assert!(self.error().is_some(), "{error}");
+                Value::Nil
+            }
+        }
+    }
+
+    /// Realize a sequence with explicit errors, including unsafe carrier waits.
+    /// A rejected wait does not change the thunk or its realization state.
+    pub fn try_realize(&self) -> Result<Value, String> {
         let owner = Realizer::current();
         let thunk = loop {
             let listener = self.ready.listen();
             let mut state = self.state.lock().unwrap();
             match &*state {
-                LazySeqState::Forced(v) => return v.clone(),
-                LazySeqState::Error(_) => return Value::Nil,
+                LazySeqState::Forced(v) => return Ok(v.clone()),
+                LazySeqState::Error(error) => return Err(error.clone()),
                 LazySeqState::Realizing { owner: active, .. } => {
                     if *active == owner {
-                        return Value::Nil;
+                        return Ok(Value::Nil);
                     }
+                    active.ensure_can_wait()?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1031,7 +1070,6 @@ impl LazySeq {
             else {
                 unreachable!()
             };
-            let thunk: Rc<dyn Thunk> = Rc::from(thunk);
             *state = LazySeqState::Realizing {
                 owner,
                 thunk: thunk.clone(),
@@ -1046,11 +1084,11 @@ impl LazySeq {
             Ok(result) => {
                 let result = crate::publish::publish_value(result);
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
-                result
+                Ok(result)
             }
             Err(msg) => {
-                *self.state.lock().unwrap() = LazySeqState::Error(msg);
-                Value::Nil
+                *self.state.lock().unwrap() = LazySeqState::Error(msg.clone());
+                Err(msg)
             }
         };
         guard.lazy = None;
@@ -1165,7 +1203,7 @@ impl cljrs_gc::Trace for Volatile {
 /// Internal state of a delay cell.
 pub enum DelayState {
     Error(String),
-    Pending(Box<dyn Thunk>),
+    Pending(Rc<dyn Thunk>),
     Realizing {
         owner: Realizer,
         thunk: Rc<dyn Thunk>,
@@ -1173,7 +1211,7 @@ pub enum DelayState {
     Forced(Value),
 }
 
-/// A lazy one-time computation (forced at most once, result cached).
+/// A lazy computation with a cached result and retry after interruption.
 pub struct Delay {
     ready: Event,
     pub state: TrackedMutex<DelayState>,
@@ -1182,7 +1220,7 @@ pub struct Delay {
 impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: TrackedMutex::new(DelayState::Pending(thunk)),
+            state: TrackedMutex::new(DelayState::Pending(Rc::from(thunk))),
             ready: Event::default(),
         }
     }
@@ -1201,6 +1239,7 @@ impl Delay {
                     if *active == owner {
                         return Err("recursive delay realization".into());
                     }
+                    active.ensure_can_wait()?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1212,7 +1251,6 @@ impl Delay {
             else {
                 unreachable!()
             };
-            let thunk: Rc<dyn Thunk> = Rc::from(thunk);
             *state = DelayState::Realizing {
                 owner,
                 thunk: thunk.clone(),

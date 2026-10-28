@@ -496,6 +496,14 @@ pub fn poison_active_regions() {
 #[cfg(feature = "no-gc")]
 pub fn poison_active_regions() {}
 
+/// True when every active region must remain alive after its scope closes.
+/// Publishers can skip scans because no value can escape into freed regions.
+#[cfg(not(feature = "no-gc"))]
+pub fn active_regions_are_poisoned() -> bool {
+    let depth = region_stack_depth();
+    depth != 0 && POISON_WATERMARK.with(|watermark| watermark.get() >= depth)
+}
+
 /// Close a region whose scope has ended: pop it from the thread-local stack,
 /// then either drop it (running destructors, freeing memory) or — if it was
 /// poisoned — retire it.
@@ -684,6 +692,26 @@ mod tests {
             use crate::GcVisitor as _;
             visitor.visit(&self.child);
         }
+    }
+
+    #[test]
+    fn fresh_nested_regions_are_not_covered_by_an_outer_poison() {
+        assert!(!active_regions_are_poisoned());
+        let mut outer = Box::new(Region::new());
+        unsafe { push_region_raw(outer.as_mut() as *mut Region) };
+        assert!(!active_regions_are_poisoned());
+        poison_active_regions();
+        assert!(active_regions_are_poisoned());
+        let mut inner = Box::new(Region::new());
+        unsafe { push_region_raw(inner.as_mut() as *mut Region) };
+        assert!(
+            !active_regions_are_poisoned(),
+            "fresh regions still need a publish scan"
+        );
+        close_region(inner);
+        assert!(active_regions_are_poisoned());
+        close_region(outer);
+        assert!(!active_regions_are_poisoned());
     }
 
     #[test]

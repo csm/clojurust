@@ -351,16 +351,17 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 **Status: core parking paths implemented. API completion remains pending.**
 
 - `cljrs_value::parking` provides executor-independent hooks and notification events.
-  Native fibers install the hooks. Core crates do not depend on Tokio.
+  Native fibers install the hooks once. Core crates do not depend on Tokio.
 - `<!!` and `>!!` park on the existing channel futures. `alts!!` selects one take and returns
-  `[value channel]`. Losing takes do not consume values.
+  `[value channel]`. It shuffles channel order to avoid input-order starvation. Losing takes do not consume values.
 - Future and promise dereferences share notification waits across the builtin, reader dereference,
   and synchronous `await` paths. Timed waits use a deadline and preserve settled errors.
 - `sleep` and `Thread/sleep` park on Tokio timers. The `locking` macro uses reentrant monitors
-  whose owners distinguish fibers on the same OS thread.
+  whose owners distinguish fibers on the same OS thread. Final guard/waiter destruction removes the registry entry without a table scan.
 - Delay and lazy sequence states distinguish pending, realizing, settled, and failed computations.
   The realizing state retains the traced thunk. Competing fibers wait without a realization lock.
-  Cancellation caches an error and wakes waiters.
+  Cancellation restores the original pending thunk and wakes waiters to retry. Normal thunk errors remain cached.
+  Carrier code receives an error if a wait needs a parked fiber on the same thread to resume.
 - Core `slurp` and `spit` offload owned file work to the blocking worker pool.
   The existing channel interfaces provide parking paths for `cljrs-io` and `cljrs-net`.
 - Rust `parking::blocking` and `#[cljrs_interop::export(blocking)]` offload owned, `Send` work.

@@ -356,6 +356,10 @@ RAII guard that pushes a `Region` onto the thread-local stack. Use with
 /// scope closes.  No-op when no region is active.
 pub fn poison_active_regions();
 
+/// True when every active region must remain alive after its scope closes.
+/// Available in GC builds. Publishers can skip graph scans in this state.
+pub fn active_regions_are_poisoned() -> bool;
+
 /// Close a region whose scope ended: pop the thread-local stack entry, then
 /// reset/drop the region — or retire it if poisoned.  All owners of
 /// stack-registered regions (rt_abi, the IR interpreter) close through here.

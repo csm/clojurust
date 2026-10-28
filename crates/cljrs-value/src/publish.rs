@@ -244,9 +244,13 @@ pub fn publish_value(v: Value) -> Value {
     // Fast path: no region open on this thread ⇒ nothing reachable from `v`
     // can be region-allocated (region values never outlive their region
     // except through exactly the publishes this barrier intercepts).
-    if cljrs_gc::region::region_stack_depth() == 0 {
+    if cljrs_gc::region::region_stack_depth() == 0
+        || cljrs_gc::region::active_regions_are_poisoned()
+    {
         return v;
     }
+    // An opaque lazy tail poisons a scope once. Later cells need no graph
+    // scan: every active region is already guaranteed to outlive its values.
     match scan(&v) {
         Scan::Clean => v,
         Scan::Dirty => match serialize(&v) {
@@ -329,6 +333,25 @@ mod tests {
         let v = region_vec(&mut region, vec![Value::Long(5)]);
         let out = publish_value(v.clone());
         assert_eq!(out, v);
+    }
+
+    #[test]
+    fn retained_regions_skip_repeated_publication_and_keep_values_alive() {
+        let mut region = Box::new(Region::new());
+        let child = region_vec(&mut region, vec![Value::Long(42)]);
+        let value = Value::Vector(GcPtr::new(PersistentVector::from_iter([child])));
+        unsafe { cljrs_gc::region::push_region_raw(region.as_mut() as *mut Region) };
+        cljrs_gc::region::poison_active_regions();
+        let out = publish_value(value.clone());
+        let (Value::Vector(before), Value::Vector(after)) = (&value, &out) else {
+            panic!()
+        };
+        assert!(
+            GcPtr::ptr_eq(before, after),
+            "retained graphs need no scan or copy"
+        );
+        cljrs_gc::region::close_region(region);
+        assert_eq!(format!("{out}"), "[[42]]");
     }
 
     #[test]
