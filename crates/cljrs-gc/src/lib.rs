@@ -840,6 +840,9 @@ mod gc_full {
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
             // Bytes of objects with lives==0 that will be freed now.
             let mut freed_bytes: usize = 0;
+            // Bytes of unreachable objects whose grace period ends with this
+            // cycle: the next collection frees them unless they are re-rooted.
+            let mut pending_bytes: usize = 0;
             let mut current = inner.head;
             while !current.is_null() {
                 let header = unsafe { &*current };
@@ -853,6 +856,9 @@ mod gc_full {
                 } else if lives > 0 {
                     // In grace period (unreachable but not yet freed).
                     header.lives.set(lives - 1);
+                    if lives == 1 {
+                        pending_bytes += obj_size;
+                    }
                     live.push(current);
                 } else {
                     // Grace period exhausted — collect now.
@@ -887,6 +893,7 @@ mod gc_full {
                     bytes_before: pre_memory,
                     bytes_after: post_memory,
                     bytes_returned: freed_bytes,
+                    bytes_pending: pending_bytes,
                     duration: mark_elapsed + sweep_elapsed,
                 });
             });
@@ -897,16 +904,21 @@ mod gc_full {
             );
             tracing::debug!(
                 target: "gc",
-                "collection complete: freed {} (~{} bytes), {} remaining (~{} bytes), mark={:.2?} sweep={:.2?}",
+                "collection complete: freed {} (~{} bytes), {} remaining (~{} bytes, ~{} pending), mark={:.2?} sweep={:.2?}",
                 freed_count,
                 freed_bytes,
                 inner.count,
                 post_memory,
+                pending_bytes,
                 mark_elapsed,
                 sweep_elapsed
             );
-            if freed_count == 0 {
+            if freed_count == 0 && pending_bytes == 0 {
                 // Zero-yield collection: exponential-backoff suppression.
+                // Objects that only entered their grace period this cycle do
+                // not count as zero yield: the next collection frees them, and
+                // suppressing it would keep that garbage until the heap grows
+                // by another headroom.
                 // Each consecutive zero-yield cycle doubles the headroom before
                 // the next GC attempt (capped at soft_limit/4).  This prevents a
                 // GC storm during deep recursion where all objects are live —
@@ -1040,9 +1052,18 @@ mod gc_full {
         saved_len: usize,
     }
 
+    impl AllocRootGuard {
+        /// Unroot every allocation made since this frame was pushed, keeping
+        /// the frame open for further allocations.  Equivalent to dropping
+        /// the guard and pushing a new frame at the same depth.
+        pub fn release(&self) {
+            ALLOC_ROOTS.with(|roots| roots.borrow_mut().truncate(self.saved_len));
+        }
+    }
+
     impl Drop for AllocRootGuard {
         fn drop(&mut self) {
-            ALLOC_ROOTS.with(|roots| roots.borrow_mut().truncate(self.saved_len));
+            self.release();
         }
     }
 
@@ -1189,6 +1210,9 @@ mod nogc_stubs {
     pub fn wait_for_threads_to_park() {}
 
     pub struct AllocRootGuard;
+    impl AllocRootGuard {
+        pub fn release(&self) {}
+    }
     impl Drop for AllocRootGuard {
         fn drop(&mut self) {}
     }

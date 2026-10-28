@@ -465,6 +465,18 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
 
     let body = &args[1..];
     loop {
+        // Root current_vals so they survive GC — they're not yet bound in env.
+        let _vals_root = cljrs_runtime::env::gc_roots::root_values(&current_vals);
+
+        // GC safepoint on every iteration, as in the synchronous `eval_loop`,
+        // so a tight recur loop that never awaits still lets the collector run.
+        cljrs_runtime::env::gc_roots::gc_safepoint(env)?;
+
+        // Scope this iteration's allocations in a fresh alloc frame so the
+        // intermediates and the previous iteration's recur values become
+        // collectable once the iteration ends (see `eval_loop`).
+        let iter_frame = cljrs_gc::push_alloc_frame();
+
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
             if let Err(e) = bind_pattern(pat, val.clone(), env) {
@@ -473,12 +485,19 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
             }
         }
 
-        let result = eval_body_async(body, env).await;
+        let (result, suspended) = poll_tracking_suspension(eval_body_async(body, env)).await;
         env.pop_frame();
 
         match result {
-            Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_vals)) => {
+                // Dropping the frame truncates ALLOC_ROOTS back to where this
+                // iteration started.  That is only sound when nothing else ran
+                // in between: if the body yielded, other tasks on this thread's
+                // `LocalSet` may have pushed roots of their own above ours, so
+                // keep every entry and let the enclosing frame release them.
+                if suspended {
+                    std::mem::forget(iter_frame);
+                }
                 if new_vals.len() != patterns.len() {
                     return Err(EvalError::Arity {
                         name: "recur".into(),
@@ -486,11 +505,34 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
+                // new_vals are moved out before the frame drops and are
+                // re-rooted at the top of the next iteration; no safepoint
+                // runs in between.
                 current_vals = new_vals;
             }
-            Err(e) => return Err(e),
+            // The loop's result (or error payload) keeps its alloc-frame roots
+            // until the enclosing frame drops: the async caller may yield
+            // before it roots the value itself.
+            other => {
+                std::mem::forget(iter_frame);
+                return other;
+            }
         }
     }
+}
+
+/// Drive `fut` to completion and report whether it ever returned `Pending`,
+/// i.e. whether it yielded and let other tasks on the `LocalSet` run.
+async fn poll_tracking_suspension<F: Future>(fut: F) -> (F::Output, bool) {
+    let mut fut = std::pin::pin!(fut);
+    let mut suspended = false;
+    let out = std::future::poll_fn(|cx| {
+        let poll = fut.as_mut().poll(cx);
+        suspended |= poll.is_pending();
+        poll
+    })
+    .await;
+    (out, suspended)
 }
 
 /// `(recur args…)` — evaluate every argument with [`eval_async`] so an `await`

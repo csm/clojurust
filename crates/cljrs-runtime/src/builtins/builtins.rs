@@ -4872,17 +4872,7 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
                 // empty coll: call (f) for init
                 return crate::env::callback::invoke(f, vec![]);
             };
-            let mut acc = first;
-            for item in iter.by_ref() {
-                acc = crate::env::callback::invoke(f, vec![acc, item])?;
-                if let Value::Reduced(inner) = acc {
-                    return Ok(*inner);
-                }
-            }
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(acc)
+            reduce_from(f, first, &mut iter)
         }
         3 => {
             // (reduce f init coll)
@@ -4892,23 +4882,33 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
                     got: args[2].type_name().to_string(),
                 });
             }
-            let mut acc = args[1].clone();
             let mut iter = ValueIter::new(args[2].clone());
-            for item in iter.by_ref() {
-                acc = crate::env::callback::invoke(f, vec![acc, item])?;
-                if let Value::Reduced(inner) = acc {
-                    return Ok(*inner);
-                }
-            }
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(acc)
+            reduce_from(f, args[1].clone(), &mut iter)
         }
         n => Err(ValueError::Other(format!(
             "reduce requires 2 or 3 args, got {n}"
         ))),
     }
+}
+
+/// Fold `iter` into `init` with `f`, stopping early on a `reduced` value.
+///
+/// The accumulator is held in a box rooted for the whole fold: advancing a
+/// lazy `iter` runs code with GC safepoints while nothing else refers to it.
+/// The box is never moved from, so the root always points at a live `Value`.
+fn reduce_from(f: &Value, init: Value, iter: &mut ValueIter) -> ValueResult<Value> {
+    let mut acc = Box::new(init);
+    let _acc_root = crate::env::gc_roots::root_value(&acc);
+    for item in iter.by_ref() {
+        *acc = crate::env::callback::invoke(f, vec![(*acc).clone(), item])?;
+        if let Value::Reduced(inner) = &*acc {
+            return Ok((**inner).clone());
+        }
+    }
+    if let Some(err) = iter.take_error() {
+        return Err(ValueError::Other(err));
+    }
+    Ok((*acc).clone())
 }
 
 fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
