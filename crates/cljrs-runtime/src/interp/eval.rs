@@ -15,8 +15,7 @@ use cljrs_reader::form::FormKind;
 use cljrs_value::regex::Pattern;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    CljxFuture, FutureState, Keyword, MapValue, PersistentHashSet, PersistentList,
-    PersistentVector, Symbol, Value,
+    Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value,
 };
 
 /// Evaluate a `Form` in the given `Env`.
@@ -369,35 +368,11 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Reduced(inner) => Ok(*inner),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
-        Value::Future(f) => {
-            let mut guard = f.get().state.lock().unwrap();
-            loop {
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        return Ok(v.clone());
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::Thrown(v.clone()));
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        return Err(EvalError::GasExhausted);
-                    }
-                    FutureState::MemoryLimitExceeded(fault) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::MemoryLimitExceeded(*fault));
-                    }
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                    }
-                    FutureState::Running => {
-                        guard = f.get().cond.wait(guard).unwrap();
-                    }
-                }
-            }
-        }
+        Value::Future(f) => f
+            .get()
+            .wait_value(None)
+            .map(|v| v.unwrap())
+            .map_err(crate::env::error::value_error_to_eval_error),
         other => Err(EvalError::Runtime(format!(
             "cannot deref {}",
             other.type_name()

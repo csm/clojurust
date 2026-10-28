@@ -348,6 +348,43 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - Lazy-seq / delay realization without holding the realization lock across user code.
 - **Exit:** a 10k-connection echo server written in plain blocking style on one isolate.
 
+**Status: core parking paths implemented. API completion remains pending.**
+
+- `cljrs_value::parking` provides executor-independent hooks and notification events.
+  Native fibers install the hooks. Core crates do not depend on Tokio.
+- `<!!` and `>!!` park on the existing channel futures. `alts!!` selects one take and returns
+  `[value channel]`. Losing takes do not consume values.
+- Future and promise dereferences share notification waits across the builtin, reader dereference,
+  and synchronous `await` paths. Timed waits use a deadline and preserve settled errors.
+- `sleep` and `Thread/sleep` park on Tokio timers. The `locking` macro uses reentrant monitors
+  whose owners distinguish fibers on the same OS thread.
+- Delay and lazy sequence states distinguish pending, realizing, settled, and failed computations.
+  The realizing state retains the traced thunk. Competing fibers wait without a realization lock.
+  Cancellation caches an error and wakes waiters.
+- Core `slurp` and `spit` offload owned file work to the blocking worker pool.
+  The existing channel interfaces provide parking paths for `cljrs-io` and `cljrs-net`.
+- Rust `parking::blocking` and `#[cljrs_interop::export(blocking)]` offload owned, `Send` work.
+  Argument conversion and result conversion stay on the isolate. Variadic managed-value exports
+  cannot use the attribute.
+- Rendezvous cancellation retracts an unconsumed offer. Blocking and async channel callers
+  wake each other. Channel notifications also cascade after coalesced wakeups.
+- `cljrs-async/tests/parking.rs` covers contention, timeouts, errors, GC during realization,
+  cancellation, monitor ownership, worker execution, and blocking fallback in GC and `no-gc` builds.
+  The tests pass locally under AddressSanitizer in GC and `no-gc` builds, through both interpreter modes.
+  Linux ASan CI includes these tests. `cljrs-interop/tests/blocking_export.rs` covers export conversion.
+- `cljrs-net/tests/fiber_echo.rs` provides a normal 128-connection test and an explicit
+  10,000-connection stress test. Every connection uses a plain Clojure blocking-style handler.
+  The stress test requires a file-descriptor limit of at least 20,000.
+  Both cases pass locally on macOS. The 10,000 connections remain open together before any client sends data.
+
+Remaining Phase 2 work:
+
+- Put alternatives and `:default` / `:priority` options for `alts!!`.
+- The general Clojure `(blocking & body)` form. Arbitrary Clojure closures contain `!Send` values.
+  The Rust escape hatch and export attribute are available now.
+- Direct `monitor-enter` / `monitor-exit` forms. The `locking` macro already supports fiber contention.
+- Parking for synchronous reader/writer handles and process waits beyond the channel interfaces.
+
 ### Phase 3 — Clojure surface
 
 - `io-thread`; fiber-backed `thread`, `thread-call`, `future`.

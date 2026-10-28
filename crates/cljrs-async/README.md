@@ -432,8 +432,8 @@ pub mod channel {
         pub async fn put(&self, v: Value) -> bool;
         /// Close the channel (idempotent). Buffered values still drain to takers.
         pub fn close(&self);
-        /// Block the calling OS thread until a value is available (or channel closes → nil).
-        /// Uses Condvar with a 1 ms timeout to avoid deadlock on the LocalSet thread.
+        /// Park the current fiber, or block the OS thread outside a fiber.
+        /// Returns nil when the channel closes and drains.
         pub fn take_blocking(&self) -> Value;
         /// Block the calling OS thread until the value is accepted or the channel closes.
         /// Returns `true` on success, `false` if the channel was closed.
@@ -516,3 +516,25 @@ edge to a package, so one edge left at its defaults re-enables `regex-full` for
 the whole graph. `deps` has to be off as well for the size win to land, since
 `cljrs-project/vcs` pulls `regex` in through `pgp`. See
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+## Blocking operations inside native fibers
+
+Inside a native fiber, `<!!` and `>!!` park on channel futures. Other fibers on the isolate can run during the wait.
+Outside a fiber, these operations keep their blocking behavior. Colored async callers still use `await`.
+
+`alts!!` selects one take from a nonempty collection of channels and returns `[value channel]`.
+Losing takes do not consume values. This first implementation accepts take operations only.
+Put alternatives and the `:default` and `:priority` options remain pending.
+
+Future and promise dereferences also park inside fibers, including timed dereferences.
+`sleep` and `Thread/sleep` use the Tokio timer. `locking` uses reentrant monitors with a separate owner for each fiber.
+Delay and lazy sequence waiters receive the settled result after the first fiber finishes realization.
+Cancellation releases monitors, retracts unconsumed rendezvous offers, and wakes realization waiters with an error.
+
+Core `slurp` and `spit` run file work on the blocking worker pool.
+The existing `cljrs-io` and `cljrs-net` APIs return channels, so `<!!` and `>!!` also provide their parking paths.
+Managed values stay on the isolate. Native Rust code can use `cljrs_value::parking::blocking` for owned, `Send` work.
+
+The Clojure spawn functions and CLI entry points do not yet create fibers. Those changes belong to Phase 3.
+Rust embedders can use `fiber::spawn` or `Fiber::with_roots` now.
+The general Clojure `(blocking & body)` form remains pending because arbitrary Clojure closures cannot cross worker threads.

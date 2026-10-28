@@ -2,9 +2,12 @@
 
 #![allow(unused)]
 
+use crate::parking::Event;
 use std::collections::HashMap;
 use std::mem;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use cljrs_gc::GcPtr;
 use cljrs_gc::mutator::TrackedMutex;
@@ -943,10 +946,46 @@ pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
     fn force(&self) -> Result<Value, String>;
 }
 
+/// Identifies a realization without confusing fibers on the same OS thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Realizer {
+    Fiber(u64),
+    Thread(std::thread::ThreadId),
+}
+impl Realizer {
+    fn current() -> Self {
+        crate::parking::current()
+            .map(Self::Fiber)
+            .unwrap_or_else(|| Self::Thread(std::thread::current().id()))
+    }
+}
+
+// Cancellation/panic must settle a realization and wake competing waiters.
+struct RealizationGuard<'a> {
+    lazy: Option<&'a LazySeq>,
+    delay: Option<&'a Delay>,
+}
+impl Drop for RealizationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cell) = self.lazy {
+            *cell.state.lock().unwrap() = LazySeqState::Error("realization interrupted".into());
+            cell.ready.notify_all();
+        }
+        if let Some(cell) = self.delay {
+            *cell.state.lock().unwrap() = DelayState::Error("realization interrupted".into());
+            cell.ready.notify_all();
+        }
+    }
+}
+
 /// Internal state of a lazy sequence cell.
 pub enum LazySeqState {
     /// Thunk not yet evaluated.
     Pending(Box<dyn Thunk>),
+    Realizing {
+        owner: Realizer,
+        thunk: Rc<dyn Thunk>,
+    },
     /// Result cached after first force.
     Forced(Value),
     /// Thunk evaluation failed; error message is cached.
@@ -955,6 +994,7 @@ pub enum LazySeqState {
 
 /// A lazy sequence that forces its thunk exactly once and caches the result.
 pub struct LazySeq {
+    ready: Event,
     pub state: TrackedMutex<LazySeqState>,
 }
 
@@ -962,31 +1002,49 @@ impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
             state: TrackedMutex::new(LazySeqState::Pending(thunk)),
+            ready: Event::default(),
         }
     }
 
     /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
     /// On error, returns `Value::Nil` and caches the error (retrievable via `error()`).
     pub fn realize(&self) -> Value {
-        let thunk = {
-            let mut guard = self.state.lock().unwrap();
-            match &*guard {
+        let owner = Realizer::current();
+        let thunk = loop {
+            let listener = self.ready.listen();
+            let mut state = self.state.lock().unwrap();
+            match &*state {
                 LazySeqState::Forced(v) => return v.clone(),
                 LazySeqState::Error(_) => return Value::Nil,
+                LazySeqState::Realizing { owner: active, .. } => {
+                    if *active == owner {
+                        return Value::Nil;
+                    }
+                    drop(state);
+                    listener.wait(None);
+                    continue;
+                }
                 LazySeqState::Pending(_) => {}
             }
-            // Replace the pending state with a temporary Forced(Nil), extract the thunk.
-            let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
-            let LazySeqState::Pending(thunk) = prev else {
-                unreachable!("state was not Pending")
+            let LazySeqState::Pending(thunk) =
+                mem::replace(&mut *state, LazySeqState::Forced(Value::Nil))
+            else {
+                unreachable!()
             };
-            thunk
-            // guard dropped here — lock released before forcing
+            let thunk: Rc<dyn Thunk> = Rc::from(thunk);
+            *state = LazySeqState::Realizing {
+                owner,
+                thunk: thunk.clone(),
+            };
+            break thunk;
         };
-        // Force the thunk WITHOUT holding the lock. This ensures GC's
-        // lock().unwrap() in LazySeq::trace() will not deadlock.
-        match thunk.force() {
+        let mut guard = RealizationGuard {
+            lazy: Some(self),
+            delay: None,
+        };
+        let result = match thunk.force() {
             Ok(result) => {
+                let result = crate::publish::publish_value(result);
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 result
             }
@@ -994,7 +1052,10 @@ impl LazySeq {
                 *self.state.lock().unwrap() = LazySeqState::Error(msg);
                 Value::Nil
             }
-        }
+        };
+        guard.lazy = None;
+        self.ready.notify_all();
+        result
     }
 
     /// Return the cached error message, if the thunk failed.
@@ -1022,6 +1083,7 @@ impl cljrs_gc::Trace for LazySeq {
             let state = self.state.lock().unwrap();
             match &*state {
                 LazySeqState::Pending(thunk) => thunk.trace(visitor),
+                LazySeqState::Realizing { thunk, .. } => thunk.trace(visitor),
                 LazySeqState::Forced(v) => v.trace(visitor),
                 LazySeqState::Error(_) => {}
             }
@@ -1102,12 +1164,18 @@ impl cljrs_gc::Trace for Volatile {
 
 /// Internal state of a delay cell.
 pub enum DelayState {
+    Error(String),
     Pending(Box<dyn Thunk>),
+    Realizing {
+        owner: Realizer,
+        thunk: Rc<dyn Thunk>,
+    },
     Forced(Value),
 }
 
 /// A lazy one-time computation (forced at most once, result cached).
 pub struct Delay {
+    ready: Event,
     pub state: TrackedMutex<DelayState>,
 }
 
@@ -1115,34 +1183,62 @@ impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
             state: TrackedMutex::new(DelayState::Pending(thunk)),
+            ready: Event::default(),
         }
     }
 
     /// Force the delay and cache the result.
     /// Returns the value on success, or an error message on failure.
     pub fn force(&self) -> Result<Value, String> {
-        let thunk = {
-            let mut guard = self.state.lock().unwrap();
-            if let DelayState::Forced(v) = &*guard {
-                return Ok(v.clone());
+        let owner = Realizer::current();
+        let thunk = loop {
+            let listener = self.ready.listen();
+            let mut state = self.state.lock().unwrap();
+            match &*state {
+                DelayState::Forced(v) => return Ok(v.clone()),
+                DelayState::Error(e) => return Err(e.clone()),
+                DelayState::Realizing { owner: active, .. } => {
+                    if *active == owner {
+                        return Err("recursive delay realization".into());
+                    }
+                    drop(state);
+                    listener.wait(None);
+                    continue;
+                }
+                DelayState::Pending(_) => {}
             }
-            let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
-            let DelayState::Pending(thunk) = prev else {
-                unreachable!("state was not Pending")
+            let DelayState::Pending(thunk) =
+                mem::replace(&mut *state, DelayState::Forced(Value::Nil))
+            else {
+                unreachable!()
             };
-            thunk
-            // guard dropped here — lock released before forcing
+            let thunk: Rc<dyn Thunk> = Rc::from(thunk);
+            *state = DelayState::Realizing {
+                owner,
+                thunk: thunk.clone(),
+            };
+            break thunk;
         };
-        // Force the thunk WITHOUT holding the lock so GC's lock().unwrap() in
-        // Delay::trace() will not deadlock.
-        let result = thunk.force()?;
-        *self.state.lock().unwrap() = DelayState::Forced(result.clone());
-        Ok(result)
+        let mut guard = RealizationGuard {
+            lazy: None,
+            delay: Some(self),
+        };
+        let result = thunk.force().map(crate::publish::publish_value);
+        *self.state.lock().unwrap() = match &result {
+            Ok(value) => DelayState::Forced(value.clone()),
+            Err(error) => DelayState::Error(error.clone()),
+        };
+        guard.delay = None;
+        self.ready.notify_all();
+        result
     }
 
     /// True if the delay has already been forced.
     pub fn is_realized(&self) -> bool {
-        matches!(&*self.state.lock().unwrap(), DelayState::Forced(_))
+        matches!(
+            &*self.state.lock().unwrap(),
+            DelayState::Forced(_) | DelayState::Error(_)
+        )
     }
 }
 
@@ -1160,6 +1256,8 @@ impl cljrs_gc::Trace for Delay {
             let state = self.state.lock().unwrap();
             match &*state {
                 DelayState::Pending(thunk) => thunk.trace(visitor),
+                DelayState::Realizing { thunk, .. } => thunk.trace(visitor),
+                DelayState::Error(_) => {}
                 DelayState::Forced(v) => v.trace(visitor),
             }
         }
@@ -1170,6 +1268,7 @@ impl cljrs_gc::Trace for Delay {
 
 /// A one-shot rendezvous (promise).
 pub struct CljxPromise {
+    pub ready: Event,
     pub value: Mutex<Option<Value>>,
     pub cond: Condvar,
 }
@@ -1179,6 +1278,7 @@ impl CljxPromise {
         Self {
             value: Mutex::new(None),
             cond: Condvar::new(),
+            ready: Event::default(),
         }
     }
 
@@ -1191,16 +1291,27 @@ impl CljxPromise {
         if guard.is_none() {
             *guard = Some(v);
             self.cond.notify_all();
+            drop(guard);
+            self.ready.notify_all();
         }
     }
 
     /// Block until a value is available, then return it.
     pub fn deref_blocking(&self) -> Value {
-        let mut guard = self.value.lock().unwrap();
-        while guard.is_none() {
-            guard = self.cond.wait(guard).unwrap();
+        self.wait_value(None).unwrap()
+    }
+
+    pub fn wait_value(&self, timeout: Option<Duration>) -> Option<Value> {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let listener = self.ready.listen();
+            if let Some(value) = self.value.lock().unwrap().clone() {
+                return Some(value);
+            }
+            if !listener.wait(deadline.map(|d| d.saturating_duration_since(Instant::now()))) {
+                return self.value.lock().unwrap().clone();
+            }
         }
-        guard.as_ref().unwrap().clone()
     }
 
     /// True if already delivered.
@@ -1256,6 +1367,7 @@ pub const FUTURE_CANCELLED_MSG: &str = "future was cancelled";
 
 /// A future value computed asynchronously on another thread.
 pub struct CljxFuture {
+    pub ready: Event,
     pub state: Mutex<FutureState>,
     pub cond: Condvar,
     /// Set once a consumer has read the settled result (via `await`/`deref`).
@@ -1269,8 +1381,41 @@ impl CljxFuture {
         Self {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
+            ready: Event::default(),
             observed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Wait for settlement, parking only when running on a fiber.
+    pub fn wait_value(&self, timeout: Option<Duration>) -> crate::ValueResult<Option<Value>> {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let listener = self.ready.listen();
+            if let Some(result) = self.settled_value() {
+                return result.map(Some);
+            }
+            if !listener.wait(deadline.map(|d| d.saturating_duration_since(Instant::now()))) {
+                return self.settled_value().transpose();
+            }
+        }
+    }
+
+    pub fn settled_value(&self) -> Option<crate::ValueResult<Value>> {
+        use crate::ValueError;
+        let state = self.state.lock().unwrap();
+        let value = match &*state {
+            FutureState::Running => return None,
+            FutureState::Done(v) => Ok(v.clone()),
+            FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
+            FutureState::GasExhausted => Err(ValueError::GasExhausted),
+            FutureState::MemoryLimitExceeded(f) => Err(ValueError::MemoryLimitExceeded(*f)),
+            FutureState::Cancelled => {
+                drop(state);
+                return Some(Err(ValueError::Thrown(Self::cancelled_error())));
+            }
+        };
+        self.mark_observed();
+        Some(value)
     }
 
     /// True if done, failed, or cancelled (not still running).
@@ -1292,6 +1437,8 @@ impl CljxFuture {
         if matches!(&*state, FutureState::Running) {
             *state = FutureState::Cancelled;
             self.cond.notify_all();
+            drop(state);
+            self.ready.notify_all();
             true
         } else {
             false

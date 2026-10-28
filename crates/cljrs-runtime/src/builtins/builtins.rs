@@ -24,13 +24,13 @@ use crate::builtins::util::numeric_as_i64;
 use crate::env::env::GlobalEnv;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
+use cljrs_value::parking::sleep;
 use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
-    Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq,
-    MapValue, MultiFn, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom,
-    SortedSet, Symbol, Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote,
-    promote,
+    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, Keyword, LazySeq, MapValue, MultiFn,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom, SortedSet, Symbol,
+    Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_rational::Ratio;
@@ -42,7 +42,6 @@ use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
 use std::time::Duration;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
@@ -1695,6 +1694,7 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
+        ("locking-call", Arity::Fixed(2), builtin_locking_call),
         // Transients
         ("transient", Arity::Fixed(1), builtin_transient),
         ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
@@ -6262,131 +6262,32 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
         Value::Delay(d) => d.get().force().map_err(ValueError::Other),
         Value::Agent(a) => Ok(a.get().get_state()),
-        Value::Promise(p) => {
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
+        Value::Promise(_) | Value::Future(_) => {
+            if matches!(&args[0], Value::Future(_))
+                && crate::env::callback::current_is_async()
+                && cljrs_value::parking::current().is_none()
+            {
+                return Err(ValueError::Other("deref on a future is not allowed inside an ^:async function; use (await ...) instead".into()));
+            }
+            let timeout = if with_timeout {
+                match &args[1] {
+                    Value::Long(n) => Some(Duration::from_millis((*n).max(0) as u64)),
                     v => {
                         return Err(ValueError::WrongType {
                             expected: "long (timeout-ms)",
                             got: v.type_name().to_string(),
                         });
                     }
-                };
-                let timeout_val = args[2].clone();
-                let guard = p.get().value.lock().unwrap();
-                if guard.is_some() {
-                    return Ok(guard.as_ref().unwrap().clone());
-                }
-                let (guard, _) = p
-                    .get()
-                    .cond
-                    .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                    .unwrap();
-                Ok(guard.as_ref().cloned().unwrap_or(timeout_val))
-            } else {
-                Ok(p.get().deref_blocking())
-            }
-        }
-        Value::Future(f) => {
-            // `deref` blocks the OS thread; inside an `^:async` function that
-            // would park the single LocalSet executor. Steer callers to `await`.
-            if crate::env::callback::current_is_async() {
-                return Err(ValueError::Other(
-                    "deref on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
-                ));
-            }
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
-                    v => {
-                        return Err(ValueError::WrongType {
-                            expected: "long (timeout-ms)",
-                            got: v.type_name().to_string(),
-                        });
-                    }
-                };
-                let timeout_val = args[2].clone();
-                let guard = f.get().state.lock().unwrap();
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        Ok(v.clone())
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        Err(ValueError::Thrown(v.clone()))
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        Err(ValueError::GasExhausted)
-                    }
-                    FutureState::MemoryLimitExceeded(fault) => {
-                        f.get().mark_observed();
-                        Err(ValueError::MemoryLimitExceeded(*fault))
-                    }
-                    FutureState::Cancelled => {
-                        Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                    }
-                    FutureState::Running => {
-                        let (guard, _) = f
-                            .get()
-                            .cond
-                            .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                            .unwrap();
-                        match &*guard {
-                            FutureState::Done(v) => {
-                                f.get().mark_observed();
-                                Ok(v.clone())
-                            }
-                            FutureState::Failed(v) => {
-                                f.get().mark_observed();
-                                Err(ValueError::Thrown(v.clone()))
-                            }
-                            FutureState::GasExhausted => {
-                                f.get().mark_observed();
-                                Err(ValueError::GasExhausted)
-                            }
-                            FutureState::MemoryLimitExceeded(fault) => {
-                                f.get().mark_observed();
-                                Err(ValueError::MemoryLimitExceeded(*fault))
-                            }
-                            FutureState::Cancelled => {
-                                Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                            }
-                            FutureState::Running => Ok(timeout_val),
-                        }
-                    }
                 }
             } else {
-                let mut guard = f.get().state.lock().unwrap();
-                loop {
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(ValueError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(ValueError::GasExhausted);
-                        }
-                        FutureState::MemoryLimitExceeded(fault) => {
-                            f.get().mark_observed();
-                            return Err(ValueError::MemoryLimitExceeded(*fault));
-                        }
-                        FutureState::Cancelled => {
-                            return Err(ValueError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {
-                            guard = f.get().cond.wait(guard).unwrap();
-                        }
-                    }
-                }
-            }
+                None
+            };
+            let value = match &args[0] {
+                Value::Promise(p) => p.get().wait_value(timeout),
+                Value::Future(f) => f.get().wait_value(timeout)?,
+                _ => unreachable!(),
+            };
+            Ok(value.unwrap_or_else(|| args.get(2).cloned().unwrap_or(Value::Nil)))
         }
         Value::Volatile(v) => Ok(v.get().deref()),
         Value::Reduced(inner) => Ok((**inner).clone()),
@@ -6524,7 +6425,8 @@ fn builtin_spit(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().clone(),
         v => v.to_string(),
     };
-    std::fs::write(&path, &content).map_err(|e| ValueError::Other(e.to_string()))?;
+    cljrs_value::parking::blocking(move || std::fs::write(&path, &content))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::Nil)
 }
 
@@ -6538,7 +6440,8 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
+    let content = cljrs_value::parking::blocking(move || std::fs::read_to_string(&path))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::string(content))
 }
 
@@ -9283,6 +9186,12 @@ fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
 }
 
 /// Sleep -- pause current thread for N ms
+fn builtin_locking_call(args: &[Value]) -> ValueResult<Value> {
+    let _root = crate::env::gc_roots::root_values(args);
+    let _monitor = crate::env::monitor::enter(&args[0])?;
+    crate::env::callback::invoke(&args[1], Vec::new())
+}
+
 fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
     sleep(Duration::from_millis(
         i64::max(0, numeric_as_i64(&args[0])?) as u64,

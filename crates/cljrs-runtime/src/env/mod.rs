@@ -14,6 +14,7 @@ pub mod error;
 pub mod gas;
 pub mod gc_roots;
 pub mod loader;
+pub mod monitor;
 pub mod policy;
 pub mod taps;
 pub mod vcs;

@@ -149,6 +149,30 @@ impl Fiber {
         roots: Vec<Value>,
         body: impl FnOnce() -> EvalResult + 'static,
     ) -> Result<Self, EvalError> {
+        cljrs_value::parking::install(cljrs_value::parking::Hooks {
+            current: || current().map(|id| id.0),
+            park: |future, timeout| {
+                park_on(async {
+                    match timeout {
+                        Some(duration) => tokio::time::timeout(duration, future).await.is_ok(),
+                        None => {
+                            future.await;
+                            true
+                        }
+                    }
+                })
+            },
+            sleep: |duration| park_on(tokio::time::sleep(duration)),
+            blocking: |job| {
+                park_on(async {
+                    crate::worker_pool::WorkerPool::global()
+                        .handle()
+                        .spawn_blocking(job)
+                        .await
+                        .expect("blocking worker panicked")
+                })
+            },
+        });
         let bytes = stack_bytes()?;
         let stack = STACK_POOL
             .with(|pool| {

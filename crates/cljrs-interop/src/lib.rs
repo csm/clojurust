@@ -38,3 +38,6 @@ pub use cljrs_export_macro::export;
 // path resolves correctly inside user crates.
 #[doc(hidden)]
 pub use inventory;
+
+/// Offload Send-only Rust work while the current fiber parks.
+pub use cljrs_value::parking::blocking;

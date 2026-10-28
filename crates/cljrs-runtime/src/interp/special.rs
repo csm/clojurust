@@ -17,8 +17,8 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, Protocol, ProtocolMethod,
-    ReferClojureFilter, TypeHint, Value, ValueError,
+    CljxFn, CljxFnArity, Keyword, MapValue, Protocol, ProtocolMethod, ReferClojureFilter, TypeHint,
+    Value, ValueError,
 };
 
 /// Dispatch to the right special-form handler.
@@ -2493,44 +2493,15 @@ fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
 ///
 /// When `cljrs-async` is loaded, `eval_async` intercepts `await` forms before
 /// the sync evaluator reaches this handler, so this path is only taken in
-/// non-async (sync) code. It blocks the OS thread until the future/promise
-/// resolves — equivalent to `(deref val)`.
+/// non-async code. Inside a fiber, this path parks until settlement.
+/// Outside a fiber, it blocks the OS thread, like `(deref val)`.
 fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
     if args.is_empty() {
         return Err(EvalError::Runtime("await requires one argument".into()));
     }
     let val = eval(&args[0], env)?;
     match val {
-        Value::Future(f) => {
-            let mut guard = f.get().state.lock().unwrap();
-            loop {
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        return Ok(v.clone());
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::Thrown(v.clone()));
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        return Err(EvalError::GasExhausted);
-                    }
-                    FutureState::MemoryLimitExceeded(fault) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::MemoryLimitExceeded(*fault));
-                    }
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                    }
-                    FutureState::Running => {
-                        guard = f.get().cond.wait(guard).unwrap();
-                    }
-                }
-            }
-        }
-        Value::Promise(p) => Ok(p.get().deref_blocking()),
+        Value::Future(_) | Value::Promise(_) => crate::interp::eval::deref_value(val),
         other => Ok(other),
     }
 }

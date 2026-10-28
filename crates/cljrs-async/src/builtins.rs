@@ -33,6 +33,7 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         // Phase D: timeout and alts
         ("timeout", Arity::Fixed(1), builtin_timeout),
         ("alts", Arity::Fixed(1), builtin_alts),
+        ("alts!!", Arity::Fixed(1), builtin_alts_blocking),
         // Phase E: channels
         ("chan", Arity::Variadic { min: 0 }, builtin_chan),
         ("take!", Arity::Fixed(1), builtin_take),
@@ -221,11 +222,11 @@ fn builtin_offer(args: &[Value]) -> ValueResult<Value> {
 
 /// `(<!! ch)` — blocking take from a synchronous (non-async) context.
 ///
-/// Parks the calling OS thread until a value is available on `ch`, or returns
-/// `nil` if `ch` is closed and drained. Must **not** be called from inside an
-/// `^:async` function — use `(await (take! ch))` there instead.
+/// Parks a fiber until data arrives, or blocks the OS thread outside a fiber.
+/// Returns nil on a closed, drained channel. Colored async callers use take!.
 fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() {
+    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
+    {
         return Err(ValueError::Other(
             "<!! (blocking take) must not be called inside an ^:async function; \
              use (await (take! ch)) instead"
@@ -238,12 +239,11 @@ fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
 
 /// `(>!! ch val)` — blocking put from a synchronous (non-async) context.
 ///
-/// Parks the calling OS thread until `val` is accepted by `ch` (buffered or
-/// handed off in a rendezvous). Returns `true` on success, `false` if `ch` is
-/// closed. Must **not** be called from inside an `^:async` function — use
-/// `(await (put! ch val))` there instead.
+/// Parks a fiber until accepted, or blocks the OS thread outside a fiber.
+/// Returns true on success and false when closed. Colored async callers use put!.
 fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() {
+    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
+    {
         return Err(ValueError::Other(
             ">!! (blocking put) must not be called inside an ^:async function; \
              use (await (put! ch val)) instead"
@@ -514,4 +514,37 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
     let mult_obj = mult_arg(args, 0)?;
     mult_ref(mult_obj.get()).taps.lock().unwrap().clear();
     Ok(Value::NativeObject(mult_obj))
+}
+
+/// Select one take atomically; losing takes never consume a channel value.
+/// Returns [value channel], including nil when the selected channel is closed.
+fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
+    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
+    {
+        return Err(ValueError::Other(
+            "alts!! requires a synchronous context or a fiber".into(),
+        ));
+    }
+    let channels = value_to_seq_vec(&args[0]);
+    if channels.is_empty() {
+        return Err(ValueError::Other(
+            "alts!! requires at least one channel".into(),
+        ));
+    }
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&channels);
+    let pointers = channels
+        .iter()
+        .map(|ch| channel_arg(std::slice::from_ref(ch)))
+        .collect::<ValueResult<Vec<_>>>()?;
+    let branches: Vec<Pin<Box<dyn Future<Output = (Value, usize)> + '_>>> = pointers
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| Box::pin(async move { (chan_ref(ch.get()).take().await, i) }) as _)
+        .collect();
+    let ((value, index), _, _) =
+        cljrs_value::parking::block_on(futures_util::future::select_all(branches));
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+        value,
+        channels[index].clone(),
+    ]))))
 }

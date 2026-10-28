@@ -79,6 +79,24 @@ pub struct CljChannel {
     async_not_full: Notify,
 }
 
+// A cancelled rendezvous put must retract an unconsumed offer. Otherwise an
+// abandoned fiber leaves a ghost value and can wedge the next producer.
+struct RendezvousOffer<'a> {
+    channel: &'a CljChannel,
+    token: u64,
+}
+impl Drop for RendezvousOffer<'_> {
+    fn drop(&mut self) {
+        let mut state = self.channel.state.lock().unwrap();
+        if state.taken == self.token {
+            state.queue.pop_front();
+        }
+        drop(state);
+        self.channel.not_full.notify_all();
+        self.channel.async_not_full.notify_one();
+    }
+}
+
 impl CljChannel {
     /// Create a channel. `capacity == 0` is a rendezvous (unbuffered) channel.
     pub fn new(capacity: usize) -> Self {
@@ -105,12 +123,12 @@ impl CljChannel {
     /// buffered values and then observe `nil`.
     pub fn close(&self) {
         self.state.lock().unwrap().closed = true;
-        // Wake blocking (sync) callers.
         self.not_empty.notify_all();
         self.not_full.notify_all();
-        // Wake one async taker/putter; they cascade the notification on exit.
-        self.async_not_empty.notify_one();
-        self.async_not_full.notify_one();
+        // Closure releases every waiter, including buffered putters that do
+        // not consume data and therefore cannot cascade a take notification.
+        self.async_not_empty.notify_waiters();
+        self.async_not_full.notify_waiters();
     }
 
     /// Non-blocking take.
@@ -151,6 +169,7 @@ impl CljChannel {
             drop(st);
             self.not_empty.notify_all();
             self.async_not_empty.notify_one();
+            self.async_not_full.notify_one();
             return Some(true);
         }
         None
@@ -178,24 +197,28 @@ impl CljChannel {
 
     /// Blocking take for synchronous (non-async) callers.
     ///
-    /// Parks the calling OS thread on a `Condvar` until a value is available,
-    /// the channel is closed, or the 1 ms poll interval elapses (so the caller
-    /// remains responsive even when invoked from the LocalSet executor thread).
+    /// Inside a fiber, parks on `take()` without blocking the isolate. Outside
+    /// a fiber, waits on a Condvar with the existing 1 ms poll interval.
     /// Returns `Value::Nil` on a closed, drained channel.
     pub fn take_blocking(&self) -> Value {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::fiber::current().is_some() {
+            return crate::fiber::park_on(self.take());
+        }
         let mut guard = self.state.lock().unwrap();
         loop {
             if let Some(v) = guard.queue.pop_front() {
                 guard.taken = guard.taken.wrapping_add(1);
                 drop(guard);
                 self.not_full.notify_all();
+                self.async_not_full.notify_one();
                 return v;
             }
             if guard.closed {
                 return Value::Nil;
             }
-            // 1 ms timeout keeps the loop responsive on the LocalSet thread where
-            // notify_all may never fire (async producers can't run while blocked).
+            // Preserve the non-fiber fallback. Local tasks can make progress
+            // only when their caller runs inside a fiber.
             let (g, _) = self
                 .not_empty
                 .wait_timeout(guard, Duration::from_millis(1))
@@ -206,10 +229,16 @@ impl CljChannel {
 
     /// Blocking put for synchronous (non-async) callers.
     ///
-    /// Parks the calling OS thread until the value is accepted (buffered or
-    /// handed off in a rendezvous) or the channel is closed.
+    /// Inside a fiber, parks on `put()`. Outside a fiber, blocks the OS thread
+    /// until the value is accepted or the channel closes.
     /// Returns `true` on success, `false` if the channel was closed.
     pub fn put_blocking(&self, v: Value) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::fiber::current().is_some() {
+            let anchor = v;
+            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+            return crate::fiber::park_on(self.put(anchor.clone()));
+        }
         // GC builds: heap-promotion fallback — the taker may hold the value
         // past any region scope active on the putting side (or run on another
         // thread entirely).
@@ -228,6 +257,7 @@ impl CljChannel {
                     guard.queue.push_back(v.clone());
                     drop(guard);
                     self.not_empty.notify_all();
+                    self.async_not_empty.notify_one();
                     break t;
                 }
                 let (g, _) = self
@@ -246,6 +276,7 @@ impl CljChannel {
                     guard.queue.pop_front(); // cancel pending offer
                     drop(guard);
                     self.not_full.notify_all();
+                    self.async_not_full.notify_one();
                     return false;
                 }
                 let (g, _) = self
@@ -264,6 +295,7 @@ impl CljChannel {
                     guard.queue.push_back(v);
                     drop(guard);
                     self.not_empty.notify_all();
+                    self.async_not_empty.notify_one();
                     return true;
                 }
                 let (g, _) = self
@@ -285,10 +317,9 @@ impl CljChannel {
     pub async fn take(&self) -> Value {
         loop {
             if let Some(v) = self.try_take() {
-                if matches!(v, Value::Nil) {
-                    // Channel closed: cascade so other parked takers wake too.
-                    self.async_not_empty.notify_one();
-                }
+                // Notify can coalesce several puts before takers are polled.
+                // Cascade so remaining data/closure reaches every waiter.
+                self.async_not_empty.notify_one();
                 return v;
             }
             self.async_not_empty.notified().await;
@@ -313,6 +344,10 @@ impl CljChannel {
                     RvOffer::Full => {}
                 }
                 self.async_not_full.notified().await;
+            };
+            let _offer = RendezvousOffer {
+                channel: self,
+                token,
             };
             // Phase 2: wait for a taker to consume the offered value.
             loop {
