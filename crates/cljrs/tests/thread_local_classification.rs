@@ -260,10 +260,112 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `src` with every comment and the contents of every string and char
+/// literal blanked to spaces (newlines kept), so a `thread_local!` in a doc
+/// example or a brace inside a string cannot be mistaken for code.
+fn code_only(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            // Block comments nest in Rust.
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(chars[i]));
+                    i += 1;
+                }
+            }
+        } else if c == 'r' && matches!(next, Some('"') | Some('#')) && {
+            let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+            chars.get(i + 1 + hashes) == Some(&'"')
+        } {
+            // Raw string: r"…", r#"…"#, …
+            let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+            let open = 2 + hashes;
+            out.extend(std::iter::repeat_n(' ', open));
+            i += open;
+            while i < chars.len() {
+                if chars[i] == '"'
+                    && chars[i + 1..].iter().take_while(|&&h| h == '#').count() >= hashes
+                {
+                    out.extend(std::iter::repeat_n(' ', 1 + hashes));
+                    i += 1 + hashes;
+                    break;
+                }
+                out.push(blank(chars[i]));
+                i += 1;
+            }
+        } else if c == '"' {
+            out.push(' ');
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(blank(chars[i]));
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            i += 1;
+        } else if c == '\'' {
+            // A char literal ('x', '\n', '\u{…}'), not a lifetime ('a).
+            let len = if next == Some('\\') {
+                chars[i + 2..]
+                    .iter()
+                    .position(|&ch| ch == '\'')
+                    .map(|p| p + 3)
+            } else if chars.get(i + 2) == Some(&'\'') {
+                Some(3)
+            } else {
+                None
+            };
+            match len {
+                Some(len) => {
+                    out.extend(std::iter::repeat_n(' ', len));
+                    i += len;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Names of the statics declared inside each `thread_local! { … }` block.
 fn thread_local_statics(src: &str) -> Vec<String> {
+    let code = code_only(src);
     let mut names = Vec::new();
-    let mut rest = src;
+    let mut rest = code.as_str();
     while let Some(start) = rest.find("thread_local!") {
         let after = &rest[start + "thread_local!".len()..];
         let Some(open) = after.find(['{', '(']) else {
@@ -288,24 +390,40 @@ fn thread_local_statics(src: &str) -> Vec<String> {
             }
         }
         let body = &after[open..end];
-        for line in body.lines() {
-            let line = line.trim_start();
-            if line.starts_with("//") {
-                continue;
-            }
-            if let Some(pos) = line.find("static ") {
-                let ident: String = line[pos + "static ".len()..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !ident.is_empty() {
-                    names.push(ident);
-                }
+        let mut words = body.split(|c: char| !(c.is_alphanumeric() || c == '_'));
+        while let Some(word) = words.next() {
+            if word == "static"
+                && let Some(ident) = words.find(|w| !w.is_empty())
+            {
+                names.push(ident.to_string());
             }
         }
         rest = &after[end..];
     }
     names
+}
+
+#[test]
+fn scanner_ignores_comments_and_literals() {
+    let src = r##"
+//! ```ignore
+//! thread_local! {
+//!     static IN_DOC: RefCell<u8> = RefCell::new(0);
+//! }
+//! ```
+/* thread_local! { static IN_BLOCK: u8 = 0; } /* nested */ */
+const S: &str = "thread_local! { static IN_STRING: u8 = 0; }";
+const R: &str = r#"thread_local! { static IN_RAW: u8 = 0; }"#;
+const C: char = '{';
+fn f<'a>(_: &'a str) {}
+thread_local! {
+    // static IN_LINE_COMMENT: u8 = 0;
+    static REAL_ONE: Cell<u8> = const { Cell::new(0) }; // trailing
+    /// docs
+    pub(crate) static REAL_TWO: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+"##;
+    assert_eq!(thread_local_statics(src), vec!["REAL_ONE", "REAL_TWO"]);
 }
 
 #[test]
