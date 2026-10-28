@@ -6,14 +6,19 @@
  * the same license as Clojure.
  */
 
+use super::Snapshot;
 use crate::hash::{hash_combine_ordered, hash_combine_unordered};
 use crate::{ClojureHash, PersistentHashMap, Value, ValueError, ValueResult};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Debug)]
 pub struct TransientMap {
     map: Mutex<PersistentHashMap>,
     persisted: Mutex<bool>,
+    revision: AtomicU64,
 }
 
 impl TransientMap {
@@ -21,6 +26,7 @@ impl TransientMap {
         TransientMap {
             map: Mutex::new(PersistentHashMap::empty()),
             persisted: Mutex::new(false),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -28,25 +34,43 @@ impl TransientMap {
         TransientMap {
             map: Mutex::new(map.clone()),
             persisted: Mutex::new(false),
+            revision: AtomicU64::new(0),
         }
     }
 
+    fn update(
+        &self,
+        operation: impl Fn(&PersistentHashMap) -> PersistentHashMap,
+    ) -> ValueResult<()> {
+        loop {
+            let (snapshot, revision) = {
+                let map = self.map.lock().unwrap();
+                if *self.persisted.lock().unwrap() {
+                    return Err(ValueError::TransientAlreadyPersisted);
+                }
+                (
+                    Snapshot::new(map.clone()),
+                    self.revision.load(Ordering::Relaxed),
+                )
+            };
+            let candidate = operation(snapshot.get());
+            let mut map = self.map.lock().unwrap();
+            if *self.persisted.lock().unwrap() {
+                return Err(ValueError::TransientAlreadyPersisted);
+            }
+            if self.revision.load(Ordering::Relaxed) != revision {
+                continue;
+            }
+            *map = candidate;
+            self.revision.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    }
     pub fn assoc(&self, key: Value, value: Value) -> ValueResult<()> {
-        if *self.persisted.lock().unwrap() {
-            return Err(ValueError::TransientAlreadyPersisted);
-        }
-        let mut map = self.map.lock().unwrap();
-        *map = map.assoc(key, value);
-        Ok(())
+        self.update(|map| map.assoc(key.clone(), value.clone()))
     }
-
     pub fn dissoc(&self, key: &Value) -> ValueResult<()> {
-        if *self.persisted.lock().unwrap() {
-            return Err(ValueError::TransientAlreadyPersisted);
-        }
-        let mut map = self.map.lock().unwrap();
-        *map = map.dissoc(key);
-        Ok(())
+        self.update(|map| map.dissoc(key))
     }
 
     pub fn persistent(&self) -> ValueResult<PersistentHashMap> {
@@ -60,17 +84,19 @@ impl TransientMap {
     }
 
     pub fn find(&self, key: &Value) -> Option<(Value, Value)> {
-        let map = self.map.lock().unwrap();
-        let value = map.get(key);
-        value.map(|v| (key.clone(), v.clone()))
+        let snapshot = Snapshot::new(self.map.lock().unwrap().clone());
+        snapshot
+            .get()
+            .get(key)
+            .map(|value| (key.clone(), value.clone()))
     }
-
     pub fn get(&self, key: &Value) -> Option<Value> {
-        self.map.lock().unwrap().get(key).cloned()
+        let snapshot = Snapshot::new(self.map.lock().unwrap().clone());
+        snapshot.get().get(key).cloned()
     }
-
     pub fn contains_key(&self, key: &Value) -> bool {
-        self.map.lock().unwrap().contains_key(key)
+        let snapshot = Snapshot::new(self.map.lock().unwrap().clone());
+        snapshot.get().contains_key(key)
     }
 
     pub fn count(&self) -> usize {
@@ -84,6 +110,7 @@ impl Clone for TransientMap {
         Self {
             map: Mutex::new(self.map.lock().unwrap().clone()),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
+            revision: AtomicU64::new(0),
         }
     }
 }
@@ -91,7 +118,8 @@ impl Clone for TransientMap {
 impl ClojureHash for TransientMap {
     fn clojure_hash(&self) -> u32 {
         let mut hash: u32 = 0;
-        for (k, v) in self.map.lock().unwrap().iter() {
+        let snapshot = Snapshot::new(self.map.lock().unwrap().clone());
+        for (k, v) in snapshot.get().iter() {
             hash = hash_combine_unordered(
                 hash,
                 hash_combine_ordered(k.clojure_hash(), v.clojure_hash()),

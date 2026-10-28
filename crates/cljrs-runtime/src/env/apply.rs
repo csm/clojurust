@@ -132,7 +132,15 @@ pub(crate) fn prefers_in_hierarchy(
     y: &Value,
     hierarchy: &HierarchySnapshot,
 ) -> bool {
-    let prefers = mf.prefers.lock().unwrap();
+    let roots: Vec<Value> = hierarchy
+        .parents
+        .iter()
+        .chain(hierarchy.ancestors.iter())
+        .cloned()
+        .map(Value::Map)
+        .collect();
+    let _roots = crate::env::gc_roots::root_values(&roots);
+    let prefers = mf.prefers.lock().unwrap().clone();
     prefers_with_table(&prefers, hierarchy.parents.as_ref(), x, y)
 }
 
@@ -166,7 +174,17 @@ fn hierarchy_method_key(
     dispatch_val: &Value,
     hierarchy: &HierarchySnapshot,
 ) -> EvalResult<Option<String>> {
-    let dispatch_vals = mf.dispatch_vals.lock().unwrap();
+    let dispatch_vals = mf.dispatch_vals.lock().unwrap().clone();
+    let mut roots: Vec<Value> = dispatch_vals.values().cloned().collect();
+    roots.extend(
+        hierarchy
+            .parents
+            .iter()
+            .chain(hierarchy.ancestors.iter())
+            .cloned()
+            .map(Value::Map),
+    );
+    let _roots = crate::env::gc_roots::root_values(&roots);
     let mut matches: Vec<(String, Value)> = dispatch_vals
         .iter()
         .filter(|(k, v)| {
@@ -175,13 +193,12 @@ fn hierarchy_method_key(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    drop(dispatch_vals);
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     if matches.len() <= 1 {
         return Ok(matches.into_iter().next().map(|(k, _)| k));
     }
 
-    let prefers = mf.prefers.lock().unwrap();
+    let prefers = mf.prefers.lock().unwrap().clone();
     let dominates = |a: &(String, Value), b: &(String, Value)| {
         prefers_with_table(&prefers, hierarchy.parents.as_ref(), &a.1, &b.1)
             || isa_with_ancestors(&a.1, &b.1, hierarchy.ancestors.as_ref())
@@ -339,6 +356,16 @@ pub fn dispatch_if_async(callee: &Value, args: &[Value], env: &Env) -> Option<Va
 
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    cljrs_value::realization::catch(|| apply_value_inner(callee, args, env)).unwrap_or_else(
+        |message| {
+            Err(crate::env::error::value_error_to_eval_error(
+                cljrs_value::ValueError::Other(message),
+            ))
+        },
+    )
+}
+
+fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Root the callee and args so they survive any GC triggered at the safepoint.
     // These values are on the Rust stack but not yet in any Env frame.
     let _callee_root = crate::env::gc_roots::root_value(callee);
@@ -369,8 +396,9 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             // and may trigger GC.
             let _caller_root = crate::env::gc_roots::push_env_root(env);
             crate::env::callback::push_eval_context(env);
-            let result =
-                (nf.get().func)(&args).map_err(crate::env::error::value_error_to_eval_error);
+            let result = cljrs_value::realization::catch(|| (nf.get().func)(&args))
+                .unwrap_or_else(|message| Err(cljrs_value::ValueError::Other(message)))
+                .map_err(crate::env::error::value_error_to_eval_error);
             crate::env::callback::pop_eval_context();
             result
         }

@@ -1695,6 +1695,13 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
         ("locking-call", Arity::Fixed(2), builtin_locking_call),
+        (
+            "blocking-call",
+            Arity::Variadic { min: 1 },
+            builtin_blocking_call,
+        ),
+        ("monitor-enter", Arity::Fixed(1), builtin_monitor_enter),
+        ("monitor-exit", Arity::Fixed(1), builtin_monitor_exit),
         // Transients
         ("transient", Arity::Fixed(1), builtin_transient),
         ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
@@ -9229,6 +9236,26 @@ fn builtin_native_type(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::NativeObject(obj) => Ok(Value::Str(GcPtr::new(obj.get().type_tag().to_string()))),
         _ => Ok(Value::Nil),
+    }
+}
+
+fn builtin_monitor_enter(args: &[Value]) -> ValueResult<Value> {
+    crate::env::monitor::monitor_enter(&args[0])?;
+    Ok(Value::Nil)
+}
+fn builtin_monitor_exit(args: &[Value]) -> ValueResult<Value> {
+    crate::env::monitor::monitor_exit(&args[0])?;
+    Ok(Value::Nil)
+}
+
+/// Invoke an owned-work native adapter without moving the Clojure callable.
+fn builtin_blocking_call(args: &[Value]) -> ValueResult<Value> {
+    let _roots = crate::env::gc_roots::root_values(args);
+    match args[0].unwrap_meta() {
+        Value::NativeFunction(native) => native.get().call_blocking(&args[1..]),
+        _ => Err(ValueError::Other(
+            "blocking requires a typed native function, not a Clojure closure".into(),
+        )),
     }
 }
 

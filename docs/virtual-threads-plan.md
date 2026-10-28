@@ -187,9 +187,10 @@ Each primitive checks `fiber::current()`: inside a fiber it parks; outside it be
 **Pinning.** A Rust function that blocks the OS thread (a `std::net` call in a user crate, a
 blocking FFI call) stalls every fiber on the isolate. Mitigations:
 
-- `(blocking & body)` / `cljrs.fiber/blocking` runs Send-safe work on `WorkerPool` and parks the
-  calling fiber. The interop export macro gets a `#[cljrs::export(blocking)]` attribute that does
-  the same for exported Rust functions automatically.
+- `(blocking & calls)` / `cljrs.fiber/blocking` offloads typed native call bodies on `WorkerPool` and parks the calling fiber.
+  Arguments and results cross only after conversion to Rust types that implement `Send + 'static`.
+  The form rejects arbitrary Clojure closures and unsupported native adapters.
+  `#[cljrs::export(blocking)]` offloads an exported Rust function automatically without the Clojure form.
 - A stall detector: the GC-service task notes when the isolate hasn't reached a safepoint for
   more than `CLJRS_FIBER_STALL_MS` (default 100 ms) while fibers are runnable, and logs the
   offending native frame once. This is the equivalent of Loom's `jdk.tracePinnedThreads`.
@@ -348,12 +349,13 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - Lazy-seq / delay realization without holding the realization lock across user code.
 - **Exit:** a 10k-connection echo server written in plain blocking style on one isolate.
 
-**Status: core parking paths implemented. API completion remains pending.**
+**Status: implemented, including the restricted native-call `blocking` form.**
 
 - `cljrs_value::parking` provides executor-independent hooks and notification events.
   Native fibers install the hooks once. Core crates do not depend on Tokio.
-- `<!!` and `>!!` park on the existing channel futures. `alts!!` selects one take and returns
-  `[value channel]`. It shuffles channel order to avoid input-order starvation. Losing takes do not consume values.
+- `<!!` and `>!!` park on the existing channel futures. `alts!!` supports takes, put alternatives, `:default`, and `:priority`.
+  Shared selection tokens commit one operation, including rendezvous handoffs between selectors.
+  Losing operations do not transfer values. Cancellation removes their registrations.
 - Future and promise dereferences share notification waits across the builtin, reader dereference,
   and synchronous `await` paths. Timed waits use a deadline and preserve settled errors.
 - `sleep` and `Thread/sleep` park on Tokio timers. The `locking` macro uses reentrant monitors
@@ -362,14 +364,17 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   The realizing state retains the traced thunk. Competing fibers wait without a realization lock.
   Cancellation restores the original pending thunk and wakes waiters to retry. Normal thunk errors remain cached.
   Monitor acquisition, delay forcing, and `try_realize` reject carrier waits on same-thread fibers.
-  Legacy infallible realization paths still panic on this check.
+  Equality, hashing, and formatting use a private realization error signal.
+  Evaluation and boxed ABI boundaries convert this signal to catchable Clojure errors.
+  Ordinary panics and fiber cancellation remain distinct.
 - Core `slurp` and `spit` offload owned file work to the blocking worker pool.
   The existing channel interfaces provide parking paths for `cljrs-io` and `cljrs-net`.
+  Stdlib reader/writer operations and process waits offload owned host data and park their calling fiber.
 - Rust `parking::blocking` and `#[cljrs_interop::export(blocking)]` offload owned, `Send` work.
   Argument conversion and result conversion stay on the isolate. Variadic managed-value exports
   cannot use the attribute.
 - Rendezvous cancellation retracts an unconsumed offer. Blocking and async channel callers
-  wake each other. Channel notifications also cascade after coalesced wakeups.
+  wake each other through the same selection registrations.
 - `cljrs-async/tests/parking.rs` covers contention, timeouts, errors, GC during realization,
   cancellation, monitor ownership, worker execution, and blocking fallback in GC and `no-gc` builds.
   The tests pass locally under AddressSanitizer in GC and `no-gc` builds, through both interpreter modes.
@@ -379,18 +384,41 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   The stress test requires a file-descriptor limit of at least 20,000.
   Both cases pass locally on macOS. The 10,000 connections remain open together before any client sends data.
 
-Remaining Phase 2 work:
+- The five direct realization paths in the compiler ABI use `try_realize`.
+  Count, first, rest, apply, and fused into-map operations report realization errors through the pending-exception slot.
+  Keyword argument conversion uses the same error path.
+- `value_to_seq_vec` returns `ValueResult<Vec<Value>>` and roots its source during realization.
+  Destructuring, variadic recur, syntax quote, apply, async helpers, and string joining propagate its errors.
+  The conversion walks nested lazy sequences iteratively.
+- Carrier regressions cover sequences with parked realizers in both interpreter modes.
+  A subprocess exercises sequence, equality, hash, and print ABI paths and checks that rejected waits preserve the thunk.
+  These regressions pass locally in GC and `no-gc` builds.
+  An AOT regression checks catchable realization errors in a compiled binary and passes locally in a GC build.
 
-- Migrate remaining production `realize()` calls to fallible realization and propagate errors through their callers.
-  These paths include equality, hashing, printing, sequence conversion, destructuring, and `cljrs-compiler/src/rt_abi.rs`.
-  Prioritize the five AOT ABI calls: a panic across an `extern "C"` boundary can abort the process.
-  Trait-based operations need an explicit error propagation strategy because equality, hashing, and formatting have infallible interfaces.
-  Add regressions with a parked realizer and carrier callers, including an AOT subprocess that must report an error without aborting.
-- Put alternatives and `:default` / `:priority` options for `alts!!`.
-- The general Clojure `(blocking & body)` form. Arbitrary Clojure closures contain `!Send` values.
-  The Rust escape hatch and export attribute are available now.
-- Direct `monitor-enter` / `monitor-exit` forms. The `locking` macro already supports fiber contention.
-- Parking for synchronous reader/writer handles and process waits beyond the channel interfaces.
+- Direct `monitor-enter` and `monitor-exit` functions retain explicit acquisitions in per-fiber state.
+  The collector traces their objects. Fiber completion and cancellation release unmatched acquisitions.
+- Transient updates and object-array hashing use traced snapshots outside collection locks.
+  Concurrent transient changes cause an update to retry. Realization errors do not mutate or poison these collections.
+- `tests/fiber_io.rs` checks isolate progress during blocked file operations and process waits with FIFO gates.
+
+- `(blocking & calls)` and `cljrs.fiber/blocking` offload typed native calls, one call at a time.
+  Each body form must call a native function with an owned-work adapter.
+  Argument evaluation and `FromValue` conversion stay on the isolate.
+  The worker receives only Rust inputs and outputs that implement `Send + 'static`.
+  `IntoValue` conversion runs on the isolate after the wait.
+- Fixed-arity `#[export]` functions provide these adapters automatically.
+  An unsupported input or output type returns an error before the Rust body runs.
+  Variadic managed-value exports and Clojure closures are rejected.
+  This restricted form supplies the native escape hatch without moving Clojure closures or fibers between isolates.
+- `NativeFn::with_blocking` supports explicit adapters in Rust embedders.
+  Ordinary calls retain their original behavior. `#[export(blocking)]` still offloads automatically without the Clojure form.
+  Outside a fiber, calls run synchronously. Cancellation stops the wait but does not interrupt an active host operation.
+- `tests/blocking_form.rs` covers worker liveness, argument evaluation, errors, panics, unsupported captures, and cancellation in both interpreter modes.
+  `blocking_export.rs` checks that conversions stay on the caller thread and rejects unsupported inputs and outputs before execution.
+  An AOT fixture compiles and runs both macro spellings with typed native exports.
+
+The Phase 2 native escape hatch is complete under this restricted contract.
+Arbitrary Clojure closure offload remains outside this phase because it requires a separate cross-isolate code and capture design.
 
 ### Phase 3 — Clojure surface
 

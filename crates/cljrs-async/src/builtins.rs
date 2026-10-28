@@ -34,7 +34,7 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         // Phase D: timeout and alts
         ("timeout", Arity::Fixed(1), builtin_timeout),
         ("alts", Arity::Fixed(1), builtin_alts),
-        ("alts!!", Arity::Fixed(1), builtin_alts_blocking),
+        ("alts!!", Arity::Variadic { min: 1 }, builtin_alts_blocking),
         // Phase E: channels
         ("chan", Arity::Variadic { min: 0 }, builtin_chan),
         ("take!", Arity::Fixed(1), builtin_take),
@@ -95,7 +95,7 @@ async fn platform_sleep(ms: u64) {
 /// `coll` resolves first.
 fn builtin_alts(args: &[Value]) -> ValueResult<Value> {
     let futures = match args.first() {
-        Some(v) => value_to_seq_vec(v),
+        Some(v) => value_to_seq_vec(v)?,
         None => Vec::new(),
     };
     Ok(spawn_future(async move { Ok(alts_select(futures).await) }))
@@ -279,7 +279,7 @@ fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
 /// propagates immediately.
 fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
     let futures = match args.first() {
-        Some(v) => value_to_seq_vec(v),
+        Some(v) => value_to_seq_vec(v)?,
         None => Vec::new(),
     };
     Ok(spawn_future(async move {
@@ -332,7 +332,7 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
 fn builtin_onto_chan(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     let coll = args.get(1).cloned().unwrap_or(Value::Nil);
-    let values = value_to_seq_vec(&coll);
+    let values = value_to_seq_vec(&coll)?;
     let rendezvous = chan_ref(ch.get()).is_rendezvous();
     Ok(spawn_future(async move {
         for v in values {
@@ -374,7 +374,7 @@ fn builtin_onto_chan(args: &[Value]) -> ValueResult<Value> {
 /// immediately.
 fn builtin_to_chan(args: &[Value]) -> ValueResult<Value> {
     let coll = args.first().cloned().unwrap_or(Value::Nil);
-    let values = value_to_seq_vec(&coll);
+    let values = value_to_seq_vec(&coll)?;
     let capacity = values.len().max(1);
     let ch = gc_native_object(CljChannel::new(capacity));
     let ch_val = Value::NativeObject(ch.clone());
@@ -517,8 +517,8 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::NativeObject(mult_obj))
 }
 
-/// Select one take atomically; losing takes never consume a channel value.
-/// Returns [value channel], including nil when the selected channel is closed.
+/// Select exactly one take or `[channel value]` put. Options are :priority
+/// (input order) and :default (return immediately when nothing is ready).
 fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
     if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
     {
@@ -526,27 +526,90 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
             "alts!! requires a synchronous context or a fiber".into(),
         ));
     }
-    let channels = value_to_seq_vec(&args[0]);
-    if channels.is_empty() {
+    let alternatives = value_to_seq_vec(&args[0])?;
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&alternatives);
+    let mut default = None;
+    let mut priority = false;
+    let mut option = |key: &Value, value: &Value| -> ValueResult<()> {
+        match key {
+            Value::Keyword(k)
+                if k.get().namespace.is_none() && k.get().name.as_ref() == "default" =>
+            {
+                default = Some(value.clone())
+            }
+            Value::Keyword(k)
+                if k.get().namespace.is_none() && k.get().name.as_ref() == "priority" =>
+            {
+                priority = !matches!(value, Value::Nil | Value::Bool(false))
+            }
+            _ => {
+                return Err(ValueError::Other(
+                    "alts!! accepts only :default and :priority options".into(),
+                ));
+            }
+        }
+        Ok(())
+    };
+    if let [Value::Map(options)] = &args[1..] {
+        for (key, value) in options.iter() {
+            option(key, value)?;
+        }
+    } else {
+        if !(args.len() - 1).is_multiple_of(2) {
+            return Err(ValueError::Other(
+                "alts!! options require key/value pairs".into(),
+            ));
+        }
+        for pair in args[1..].chunks_exact(2) {
+            option(&pair[0], &pair[1])?;
+        }
+    }
+    if alternatives.is_empty() && default.is_none() {
         return Err(ValueError::Other(
-            "alts!! requires at least one channel".into(),
+            "alts!! requires at least one channel or a :default option".into(),
         ));
     }
-    let _roots = cljrs_runtime::env::gc_roots::root_values(&channels);
-    let mut pointers = channels
+    let mut requests = Vec::with_capacity(alternatives.len());
+    for alternative in &alternatives {
+        let (channel, value) = if let Value::Vector(pair) = alternative {
+            if pair.get().count() != 2 {
+                return Err(ValueError::Other(
+                    "alts!! put alternatives require [channel value]".into(),
+                ));
+            }
+            let value = pair.get().nth(1).unwrap().clone();
+            if matches!(value, Value::Nil) {
+                return Err(ValueError::Other("cannot put nil on a channel".into()));
+            }
+            (
+                channel_arg(std::slice::from_ref(pair.get().nth(0).unwrap()))?,
+                Some(value),
+            )
+        } else {
+            (channel_arg(std::slice::from_ref(alternative))?, None)
+        };
+        requests.push((channel, value));
+    }
+    if !priority {
+        requests.shuffle(&mut rand::rng());
+    }
+    let ops = requests
         .iter()
-        .enumerate()
-        .map(|(i, ch)| channel_arg(std::slice::from_ref(ch)).map(|ch| (i, ch)))
-        .collect::<ValueResult<Vec<_>>>()?;
-    pointers.shuffle(&mut rand::rng());
-    let branches: Vec<Pin<Box<dyn Future<Output = (Value, usize)> + '_>>> = pointers
-        .iter()
-        .map(|(i, ch)| Box::pin(async move { (chan_ref(ch.get()).take().await, *i) }) as _)
+        .map(|(channel, value)| {
+            let ch = chan_ref(channel.get());
+            match value {
+                Some(value) => crate::channel::SelectOp::Put(ch, value.clone()),
+                None => crate::channel::SelectOp::Take(ch),
+            }
+        })
         .collect();
-    let ((value, index), _, _) =
-        cljrs_value::parking::block_on(futures_util::future::select_all(branches));
+    let (value, index) = cljrs_value::parking::block_on(crate::channel::select(ops, default));
+    let channel = if index == usize::MAX {
+        Value::keyword(cljrs_value::Keyword::simple("default"))
+    } else {
+        Value::NativeObject(requests[index].0.clone())
+    };
     Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
-        value,
-        channels[index].clone(),
+        value, channel,
     ]))))
 }

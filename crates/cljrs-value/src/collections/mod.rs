@@ -22,3 +22,40 @@ pub use transient_map::TransientMap;
 pub use transient_set::TransientSet;
 pub use transient_vector::TransientVector;
 pub use vector::PersistentVector;
+
+// A stable, traced snapshot while a collection operation realizes user code.
+// no-gc needs no extra allocation: its active regions stay with the fiber.
+pub(crate) struct Snapshot<T: cljrs_gc::Trace + 'static> {
+    #[cfg(not(feature = "no-gc"))]
+    data: cljrs_gc::GcPtr<T>,
+    #[cfg(not(feature = "no-gc"))]
+    _root: cljrs_gc::AllocRootGuard,
+    #[cfg(feature = "no-gc")]
+    data: T,
+}
+impl<T: cljrs_gc::Trace + 'static> Snapshot<T> {
+    pub(crate) fn new(data: T) -> Self {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            let root = cljrs_gc::push_alloc_frame();
+            Self {
+                data: cljrs_gc::GcPtr::new(data),
+                _root: root,
+            }
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            Self { data }
+        }
+    }
+    pub(crate) fn get(&self) -> &T {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            self.data.get()
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            &self.data
+        }
+    }
+}

@@ -14,6 +14,7 @@ registration helpers, Registry, `#[export]` proc-macro).
 ```
 src/
   lib.rs       — re-exports, crate entry point
+  blocking.rs  — typed native worker adapters used by the Clojure blocking form
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
   exports.rs   — ExportEntry / ProvenanceEntry, inventory::collect!, register_exports,
                  register_provenance! macro
@@ -276,3 +277,42 @@ Variadic exports with `&[Value]` cannot use `blocking`.
 
 Rust callers can use `cljrs_interop::blocking(move || ...)` with the same ownership constraints.
 A worker panic becomes a fiber error at the fiber boundary.
+
+## Clojure blocking form
+
+Fixed-arity exports also provide an adapter for `(blocking & calls)` and `cljrs.fiber/blocking`.
+The `blocking` export attribute is optional for these calls.
+
+```rust
+#[cljrs_interop::export(ns = "host")]
+fn read_text(path: String) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+```
+
+```clojure
+(require '[cljrs.fiber :as fiber])
+(let [path "data.edn"]
+  (fiber/blocking (host/read-text path)))
+```
+
+Each body form must call a typed native function.
+Arguments can use ordinary Clojure expressions. Argument evaluation and `FromValue` conversion stay on the isolate.
+Only converted Rust inputs and outputs that implement `Send + 'static` enter the worker path.
+This requirement also applies to the error type in a `Result`.
+`IntoValue` conversion runs on the isolate after the wait.
+Worker panics become catchable Clojure errors.
+The calls run in order and return the last result. An empty form returns nil.
+
+Unsupported types remain valid for ordinary exports.
+A blocking call rejects them before the Rust body runs.
+This includes `Value` inputs or outputs, even for scalar values.
+Variadic `&[Value]` exports, Clojure closures, and registration helpers without an adapter are rejected.
+Rust embedders can provide explicit adapters with `NativeFn::with_blocking`.
+Outside a fiber, the call runs synchronously.
+Cancellation stops the wait without interrupting an active host operation.
+
+The hidden `blocking::BlockingCall<A, F, C>` and `BlockingDispatch` types support generated code.
+`BlockingCall::new(name, args, job, convert)` keeps the conversion callback on the isolate.
+The worker implementation requires `A`, the native job, and its output to implement `Send + 'static`.
+A fallback implementation reports an unsupported call without running the job.

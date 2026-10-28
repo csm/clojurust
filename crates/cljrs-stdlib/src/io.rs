@@ -2,7 +2,10 @@
 
 use std::any::Any;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use cljrs_value::resource::Resource;
 use cljrs_value::{Arity, ResourceHandle, Value, ValueError, ValueResult};
@@ -11,131 +14,144 @@ use crate::register_fns;
 
 // ── Concrete resource types ──────────────────────────────────────────────────
 
-/// A buffered file reader.
+// Only owned host data enters a worker. Managed errors are built after the wait.
+fn file_work<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> ValueResult<T> {
+    cljrs_value::parking::blocking(job).map_err(ValueError::Other)
+}
+
+/// A buffered file reader with parking-aware operations.
 #[derive(Debug)]
 pub struct IoReader {
-    inner: Mutex<Option<BufReader<std::fs::File>>>,
+    inner: Arc<Mutex<Option<BufReader<std::fs::File>>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl IoReader {
     pub fn open(path: &str) -> ValueResult<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| ValueError::Other(format!("cannot open {path}: {e}")))?;
+        let path = path.to_owned();
+        let file = file_work(move || {
+            std::fs::File::open(&path).map_err(|e| format!("cannot open {path}: {e}"))
+        })?;
         Ok(Self {
-            inner: Mutex::new(Some(BufReader::new(file))),
+            inner: Arc::new(Mutex::new(Some(BufReader::new(file)))),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn read_line(&self) -> ValueResult<Option<String>> {
-        let mut guard = self.inner.lock().unwrap();
-        let reader = guard
-            .as_mut()
-            .ok_or_else(|| ValueError::Other("reader is closed".into()))?;
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| ValueError::Other(format!("read error: {e}")))?;
-        if n == 0 {
-            Ok(None) // EOF
-        } else {
-            Ok(Some(line))
-        }
+        let inner = self.inner.clone();
+        file_work(move || {
+            let mut guard = inner.lock().unwrap();
+            let reader = guard.as_mut().ok_or("reader is closed")?;
+            let mut line = String::new();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| format!("read error: {e}"))?;
+            Ok((n != 0).then_some(line))
+        })
     }
 
     pub fn read_all(&self) -> ValueResult<String> {
-        let mut guard = self.inner.lock().unwrap();
-        let reader = guard
-            .as_mut()
-            .ok_or_else(|| ValueError::Other("reader is closed".into()))?;
-        let mut buf = String::new();
-        reader
-            .read_to_string(&mut buf)
-            .map_err(|e| ValueError::Other(format!("read error: {e}")))?;
-        Ok(buf)
+        let inner = self.inner.clone();
+        file_work(move || {
+            let mut guard = inner.lock().unwrap();
+            let reader = guard.as_mut().ok_or("reader is closed")?;
+            let mut buf = String::new();
+            reader
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("read error: {e}"))?;
+            Ok(buf)
+        })
     }
 }
 
 impl Resource for IoReader {
     fn close(&self) -> ValueResult<()> {
-        let mut guard = self.inner.lock().unwrap();
-        *guard = None;
-        Ok(())
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        file_work(move || {
+            *inner.lock().unwrap() = None;
+            closed.store(true, Ordering::Release);
+            Ok(())
+        })
     }
-
     fn is_closed(&self) -> bool {
-        self.inner.lock().unwrap().is_none()
+        self.closed.load(Ordering::Acquire)
     }
-
     fn resource_type(&self) -> &'static str {
         "reader"
     }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-/// A buffered file writer.
+/// A buffered file writer with parking-aware operations.
 #[derive(Debug)]
 pub struct IoWriter {
-    inner: Mutex<Option<BufWriter<std::fs::File>>>,
+    inner: Arc<Mutex<Option<BufWriter<std::fs::File>>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl IoWriter {
     pub fn open(path: &str, append: bool) -> ValueResult<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(!append)
-            .append(append)
-            .open(path)
-            .map_err(|e| ValueError::Other(format!("cannot open {path}: {e}")))?;
+        let path = path.to_owned();
+        let file = file_work(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(!append)
+                .append(append)
+                .open(&path)
+                .map_err(|e| format!("cannot open {path}: {e}"))
+        })?;
         Ok(Self {
-            inner: Mutex::new(Some(BufWriter::new(file))),
+            inner: Arc::new(Mutex::new(Some(BufWriter::new(file)))),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
-
     pub fn write_str(&self, s: &str) -> ValueResult<()> {
-        let mut guard = self.inner.lock().unwrap();
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| ValueError::Other("writer is closed".into()))?;
-        writer
-            .write_all(s.as_bytes())
-            .map_err(|e| ValueError::Other(format!("write error: {e}")))?;
-        Ok(())
-    }
-
-    pub fn flush(&self) -> ValueResult<()> {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(writer) = guard.as_mut() {
+        let inner = self.inner.clone();
+        let text = s.to_owned();
+        file_work(move || {
+            let mut guard = inner.lock().unwrap();
+            let writer = guard.as_mut().ok_or("writer is closed")?;
             writer
-                .flush()
-                .map_err(|e| ValueError::Other(format!("flush error: {e}")))?;
-        }
-        Ok(())
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("write error: {e}"))
+        })
+    }
+    pub fn flush(&self) -> ValueResult<()> {
+        let inner = self.inner.clone();
+        file_work(move || {
+            if let Some(writer) = inner.lock().unwrap().as_mut() {
+                writer.flush().map_err(|e| format!("flush error: {e}"))?;
+            }
+            Ok(())
+        })
     }
 }
-
 impl Resource for IoWriter {
     fn close(&self) -> ValueResult<()> {
-        let mut guard = self.inner.lock().unwrap();
-        // Flush before closing.
-        if let Some(ref mut w) = *guard {
-            let _ = w.flush();
-        }
-        *guard = None;
-        Ok(())
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        file_work(move || {
+            let mut writer = inner.lock().unwrap().take();
+            closed.store(true, Ordering::Release);
+            if let Some(writer) = writer.as_mut() {
+                writer.flush().map_err(|e| format!("flush error: {e}"))?;
+            }
+            Ok(())
+        })
     }
-
     fn is_closed(&self) -> bool {
-        self.inner.lock().unwrap().is_none()
+        self.closed.load(Ordering::Acquire)
     }
-
     fn resource_type(&self) -> &'static str {
         "writer"
     }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

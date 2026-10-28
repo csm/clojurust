@@ -20,6 +20,14 @@ use cljrs_value::{
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    cljrs_value::realization::catch(|| eval_inner(form, env)).unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            cljrs_value::ValueError::Other(message),
+        ))
+    })
+}
+
+fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
     if !crate::env::gas::charge(1) {
         return Err(EvalError::GasExhausted);
     }

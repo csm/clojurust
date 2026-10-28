@@ -81,7 +81,10 @@ impl TransientVector {
 impl ClojureHash for TransientVector {
     fn clojure_hash(&self) -> u32 {
         let mut hash: u32 = 0;
-        for v in self.vector.lock().unwrap().iter() {
+        let values = self.vector.lock().unwrap().clone();
+        let snapshot =
+            super::Snapshot::new(crate::PersistentVector::from_iter(values.iter().cloned()));
+        for v in snapshot.get().iter() {
             hash = hash_combine_ordered(hash, v.clojure_hash());
         }
         hash

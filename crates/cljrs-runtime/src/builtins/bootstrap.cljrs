@@ -1901,3 +1901,13 @@
 
 (defmacro locking [x & body]
   (list 'clojure.core/locking-call x (cons 'fn (cons [] body))))
+
+
+;; Argument evaluation stays on the isolate. Only typed native call bodies offload.
+(defmacro blocking [& calls]
+  (cons 'do
+    (map (fn [call]
+           (if (and (seq? call) (seq call))
+             (cons 'clojure.core/blocking-call call)
+             (throw (ex-info "blocking expects native call forms" {}))))
+         calls)))

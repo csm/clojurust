@@ -535,6 +535,25 @@ fn execute_inst(
     ns: &Arc<str>,
     env: &mut Env,
 ) -> EvalResult<()> {
+    cljrs_value::realization::catch(|| {
+        execute_inst_inner(inst, regs, regions, ir_func, globals, ns, env)
+    })
+    .unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            cljrs_value::ValueError::Other(message),
+        ))
+    })
+}
+
+fn execute_inst_inner(
+    inst: &Inst,
+    regs: &mut Registers,
+    regions: &mut RegionFrame,
+    ir_func: &IrFunction,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+) -> EvalResult<()> {
     match inst {
         Inst::Const(dst, c) => {
             regs.set(*dst, const_to_value(c)?);
@@ -1003,6 +1022,7 @@ fn alloc_closure(
 
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
+        blocking_func: None,
         name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {
             cljrs_value::Arity::Fixed(param_counts[0])
@@ -1345,7 +1365,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::KwargsMap => {
             let rest = args.into_iter().next().unwrap_or(Value::Nil);
-            let items = value_to_seq_vec(&rest);
+            let items =
+                value_to_seq_vec(&rest).map_err(crate::env::error::value_error_to_eval_error)?;
             Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)
         }
         KnownFn::Aget => builtin_call_native("aget", &args),
@@ -1480,7 +1501,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let mut args = args;
             let f = args.remove(0);
             let last = args.pop().unwrap();
-            let spread = crate::interp::destructure::value_to_seq_vec(&last);
+            let spread = crate::interp::destructure::value_to_seq_vec(&last)
+                .map_err(crate::env::error::value_error_to_eval_error)?;
             args.extend(spread);
             apply_value(&f, args, env)
         }

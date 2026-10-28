@@ -144,6 +144,56 @@ impl Drop for MonitorGuard {
     }
 }
 
+thread_local! {
+    static HELD_MONITORS: std::cell::RefCell<Vec<(MonitorGuard, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+cljrs_gc::mutator_slot!("cljrs-runtime/HELD_MONITORS", refcell HELD_MONITORS: Vec<(MonitorGuard, Value)>, trace trace_held);
+fn trace_held(held: &Vec<(MonitorGuard, Value)>, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    for (_, value) in held {
+        value.trace(visitor);
+    }
+}
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn trace_current(visitor: &mut cljrs_gc::MarkVisitor) {
+    HELD_MONITORS.with(|held| trace_held(&held.borrow(), visitor));
+}
+
+/// Acquire an explicit monitor for this computation until `monitor_exit`.
+pub fn monitor_enter(value: &Value) -> ValueResult<()> {
+    cljrs_gc::region::poison_active_regions();
+    let guard = enter(value)?;
+    HELD_MONITORS.with(|held| held.borrow_mut().push((guard, value.clone())));
+    Ok(())
+}
+
+/// Release one explicit acquisition. Reject objects this computation does not own.
+pub fn monitor_exit(value: &Value) -> ValueResult<()> {
+    let key = key(value)?;
+    let entry = HELD_MONITORS.with(|held| {
+        let mut held = held.borrow_mut();
+        let index = held
+            .iter()
+            .rposition(|(guard, _)| guard.0.key == key)
+            .ok_or_else(|| {
+                ValueError::Other("monitor-exit: this computation does not own the monitor".into())
+            })?;
+        Ok(held.remove(index))
+    });
+    let entry: (MonitorGuard, Value) = entry?;
+    drop(entry);
+    Ok(())
+}
+
+/// Release unmatched explicit acquisitions on fiber completion or cancellation.
+pub struct MonitorCleanup;
+impl Drop for MonitorCleanup {
+    fn drop(&mut self) {
+        let held = HELD_MONITORS.with(|held| std::mem::take(&mut *held.borrow_mut()));
+        drop(held);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
