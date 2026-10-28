@@ -285,9 +285,8 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   need no dependency on the crates above them. `MutatorState` holds one value per slot.
   `save`/`restore`/`swap_with_current` call `mem::swap` on each one, and a slot whose `RefCell`
   is borrowed panics instead of swapping.
-- `MY_FRAMES` swaps the contents of the thread's registered frame stack, so `live_epochs`
-  keeps seeing the running fiber. It does not see suspended fibers until Phase 1 unions over
-  them.
+- `MY_FRAMES` originally swapped the contents of the registered frame stack. Phase 1 now
+  swaps the registered stack identity, so `live_epochs` also sees suspended fibers.
 - `PENDING_EXCEPTION` and `RT_REGION_STACK` (`cljrs-compiler`) and `POISON_WATERMARK`
   (`cljrs-gc`, a depth into `REGION_STACK`) are per-fiber too. The audit table above missed
   them.
@@ -300,8 +299,8 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - `crates/cljrs-runtime/tests/mutator_state.rs` is the exit test. It parks evaluation A inside
   a native fn and runs evaluation B on the same thread. Bindings, `with-out-str` capture and
   eval context stay separate.
-- A saved state's GC roots are **not traced** yet. Until Phase 1 makes collection walk
-  suspended states, nothing may collect while a state is detached.
+- Phase 1 adds tracing for saved states. Their root addresses remain valid until the
+  scheduler restores the state and unwinds the owning stack.
 
 ### Phase 1 — Fiber core (`cljrs-async::fiber`)
 
@@ -313,6 +312,33 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - **Exit:** GC stress test — 5,000 fibers interleaving allocation-heavy code with a
   collection forced at every park and regions active, in both GC and `no-gc` builds, plus an
   AddressSanitizer run on Linux CI.
+
+**Status: implemented; Linux AddressSanitizer validation awaits CI.**
+
+- `cljrs_async::fiber` provides `Fiber`, `FiberTask`, `spawn`, `spawn_rooted`, `park_on`, and
+  `current` on native targets. Tokio's `LocalSet` drives each fiber on its isolate thread.
+- `park_on` keeps the future pinned on the fiber stack. The future can borrow local values.
+  The driver polls it with the fiber's mutator state installed.
+- Stacks default to 1 MB. `CLJRS_FIBER_STACK_KB` accepts at least 64 KB. Each isolate pools
+  up to 32 finished stacks. Root entry points remain unchanged until Phase 3.
+- Each `MutatorState` registers weakly with its isolate. Slot callbacks trace saved shadow
+  roots, allocation roots, regions, bindings, eval contexts, watch errors, and pending exceptions.
+  Collection also sees the saved carrier state during a fiber resume.
+- Each JIT frame stack retains its registration while saved. `live_epochs` includes suspended
+  fibers across all isolates.
+- Panics from fiber bodies or parked futures become `EvalError::Runtime`. Cancellation restores
+  the fiber state and unwinds the stack before pooling it.
+- `spawn_rooted` retains captured values before the first poll. Completed `spawn` results stay
+  rooted in `FiberResult` until the caller consumes or drops them. Rust callers must root managed
+  values held by opaque futures and closures. GC builds use the existing region poison fallback
+  for opaque captures. In `no-gc` builds, captures must come from a static allocation context.
+- `tests/fiber.rs` covers 5,000 fibers with allocation-heavy workloads, active regions, and
+  collection at every park. It also checks borrowed waits, cancellation, panic delivery, JIT
+  epochs, queued results, carrier roots, bindings, and output capture.
+- Local stress checks and macOS AddressSanitizer checks pass in GC and `no-gc` builds.
+  The macOS checks use `-Cllvm-args=-asan-globals=0` to avoid the Apple linker error on
+  inventory constructors. `.github/workflows/ci.yml` adds Linux AddressSanitizer jobs for both
+  modes with corosensei's sanitizer hooks enabled.
 
 ### Phase 2 — Parking primitives
 

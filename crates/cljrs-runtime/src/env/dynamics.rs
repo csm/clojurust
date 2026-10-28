@@ -23,7 +23,7 @@ thread_local! {
     static BINDING_STACK: RefCell<Vec<HashMap<VarKey, Value>>> =
         const { RefCell::new(Vec::new()) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/BINDING_STACK", refcell BINDING_STACK: Vec<HashMap<VarKey, Value>>);
+cljrs_gc::mutator_slot!("cljrs-runtime/BINDING_STACK", refcell BINDING_STACK: Vec<HashMap<VarKey, Value>>, trace trace_saved);
 
 // ── RAII guard ────────────────────────────────────────────────────────────────
 
@@ -121,4 +121,12 @@ pub fn trace_current(visitor: &mut cljrs_gc::MarkVisitor) {
             }
         }
     });
+}
+
+fn trace_saved(frames: &Vec<HashMap<VarKey, Value>>, visitor: &mut cljrs_gc::MarkVisitor) {
+    for frame in frames {
+        for value in frame.values() {
+            value.trace(visitor);
+        }
+    }
 }

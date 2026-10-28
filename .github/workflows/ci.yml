@@ -8,6 +8,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -58,3 +61,34 @@ jobs:
 
       - name: Build cljrs-wasm
         run: wasm-pack build crates/cljrs-wasm --target web --no-typescript --release
+
+  fiber-asan:
+    name: Fiber AddressSanitizer (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: gc
+            features: small-regex,fiber-sanitizer
+          - mode: no-gc
+            features: small-regex,fiber-sanitizer,no-gc
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      # Keep the 5,000-fiber full-collection stress loop practical under ASan.
+      CARGO_PROFILE_TEST_OPT_LEVEL: 1
+      # no-gc deliberately retains static arenas for the process lifetime.
+      ASAN_OPTIONS: detect_leaks=0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fiber-asan-${{ matrix.mode }}
+      - name: Fiber stress and lifecycle tests
+        run: >-
+          cargo test -p cljrs-async --target x86_64-unknown-linux-gnu
+          --no-default-features --features ${{ matrix.features }}
+          --test fiber -- --test-threads=1

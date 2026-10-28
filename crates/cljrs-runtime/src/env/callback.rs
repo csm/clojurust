@@ -25,7 +25,7 @@ struct EvalContext {
 thread_local! {
     static EVAL_CONTEXT: RefCell<Vec<EvalContext>> = const { RefCell::new(Vec::new()) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/EVAL_CONTEXT", refcell EVAL_CONTEXT: Vec<EvalContext>);
+cljrs_gc::mutator_slot!("cljrs-runtime/EVAL_CONTEXT", refcell EVAL_CONTEXT: Vec<EvalContext>, trace trace_saved);
 
 /// Push the current eval context before calling a native function.
 pub fn push_eval_context(env: &Env) {
@@ -177,4 +177,10 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
         }
         other => ValueError::Other(format!("{other}")),
     })
+}
+
+fn trace_saved(contexts: &Vec<EvalContext>, visitor: &mut cljrs_gc::MarkVisitor) {
+    for context in contexts {
+        crate::env::gc_roots::trace_globals(&context.globals, visitor);
+    }
 }

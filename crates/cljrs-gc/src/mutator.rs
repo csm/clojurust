@@ -30,7 +30,13 @@
 //! `refcell` swaps the contents of a `RefCell<T>` (panicking if the slot is
 //! borrowed — a borrow held across a context switch is a bug); `cell` swaps
 //! the contents of a `Cell<T>`.  The value type must implement `Default`; the
-//! default is the state a fresh fiber starts with.
+//! default is the state a fresh fiber starts with. Add `, trace trace_saved`
+//! for slots that contain GC references. The callback takes `&T` and a
+//! `&mut MarkVisitor` and traces the detached value without installing it.
+//!
+//! Every saved state registers weakly with its isolate. Collection traces
+//! those states as well as the current thread-locals. A scheduler must keep
+//! stack addresses valid until it restores the state and unwinds the stack.
 //!
 //! # Lock and critical-section discipline
 //!
@@ -40,9 +46,10 @@
 //! critical-section depth) is zero at a park point.
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::rc::{Rc, Weak};
 use std::sync::{LockResult, OnceLock, PoisonError, TryLockError, TryLockResult};
 
 #[doc(hidden)]
@@ -56,6 +63,10 @@ pub struct MutatorSlot {
     pub init: fn() -> Box<dyn Any>,
     /// Exchange the thread-local's current value with `*value`.
     pub swap: fn(&mut dyn Any),
+    /// Trace GC references held by a detached slot value.
+    pub trace: fn(&dyn Any, &mut crate::MarkVisitor),
+    /// Check borrow discipline before any slot is exchanged.
+    pub check: fn(),
 }
 
 inventory::collect!(MutatorSlot);
@@ -85,8 +96,15 @@ pub fn slot_names() -> Vec<&'static str> {
 /// Declare a thread-local as per-mutator state.  See the module docs.
 #[macro_export]
 macro_rules! mutator_slot {
-    ($name:literal, refcell $tl:ident : $ty:ty) => {
+    ($name:literal, refcell $tl:ident : $ty:ty $(, trace $tracer:path)?) => {
         const _: () = {
+            fn check() {
+                $tl.with(|cell| {
+                    let _borrow = cell.try_borrow_mut().expect(concat!(
+                        "mutator slot ", $name, " is borrowed across a context switch"
+                    ));
+                });
+            }
             fn init() -> ::std::boxed::Box<dyn ::std::any::Any> {
                 ::std::boxed::Box::new(<$ty as ::std::default::Default>::default())
             }
@@ -105,13 +123,18 @@ macro_rules! mutator_slot {
                     ::std::mem::swap(&mut *current, value);
                 });
             }
+            fn trace(value: &dyn ::std::any::Any, visitor: &mut $crate::MarkVisitor) {
+                let _ = (value, &visitor);
+                $( $tracer(value.downcast_ref::<$ty>().expect("mutator trace type mismatch"), visitor); )?
+            }
             $crate::mutator::inventory::submit! {
-                $crate::mutator::MutatorSlot { name: $name, init, swap }
+                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check }
             }
         };
     };
-    ($name:literal, cell $tl:ident : $ty:ty) => {
+    ($name:literal, cell $tl:ident : $ty:ty $(, trace $tracer:path)?) => {
         const _: () = {
+            fn check() {}
             fn init() -> ::std::boxed::Box<dyn ::std::any::Any> {
                 ::std::boxed::Box::new(<$ty as ::std::default::Default>::default())
             }
@@ -126,8 +149,12 @@ macro_rules! mutator_slot {
                     *value = cell.replace(incoming);
                 });
             }
+            fn trace(value: &dyn ::std::any::Any, visitor: &mut $crate::MarkVisitor) {
+                let _ = (value, &visitor);
+                $( $tracer(value.downcast_ref::<$ty>().expect("mutator trace type mismatch"), visitor); )?
+            }
             $crate::mutator::inventory::submit! {
-                $crate::mutator::MutatorSlot { name: $name, init, swap }
+                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check }
             }
         };
     };
@@ -138,8 +165,35 @@ macro_rules! mutator_slot {
 /// Values are created lazily: an entry that has never been swapped in is the
 /// slot's default, so [`MutatorState::fresh`] allocates nothing per slot.
 pub struct MutatorState {
-    values: Box<[Option<Box<dyn Any>>]>,
+    values: Rc<RefCell<SlotValues>>,
     _not_send: PhantomData<*const ()>,
+}
+
+type SlotValues = Box<[Option<Box<dyn Any>>]>;
+
+thread_local! {
+    // Weak entries never keep a finished fiber or its stack roots alive.
+    static DETACHED: RefCell<Vec<Weak<RefCell<SlotValues>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Trace every detached state on this isolate thread, including a driver's
+/// state while a fiber is running. Stack addresses stay valid until the fiber
+/// is unwound with its state installed and the state is dropped.
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn trace_suspended(visitor: &mut crate::MarkVisitor) {
+    DETACHED.with(|states| {
+        states.borrow_mut().retain(|weak| {
+            let Some(values) = weak.upgrade() else {
+                return false;
+            };
+            for (slot, value) in slots().iter().zip(values.borrow().iter()) {
+                if let Some(value) = value {
+                    (slot.trace)(&**value, visitor);
+                }
+            }
+            true
+        });
+    });
 }
 
 impl MutatorState {
@@ -147,7 +201,15 @@ impl MutatorState {
     pub fn fresh() -> Self {
         let values = slots().iter().map(|_| None).collect();
         Self {
-            values,
+            values: {
+                let values = Rc::new(RefCell::new(values));
+                DETACHED.with(|states| {
+                    let mut states = states.borrow_mut();
+                    states.retain(|w| w.strong_count() > 0);
+                    states.push(Rc::downgrade(&values));
+                });
+                values
+            },
             _not_send: PhantomData,
         }
     }
@@ -173,7 +235,8 @@ impl MutatorState {
     /// parks, so `self` alternates between "the fiber's state" and "the state
     /// of whoever was running before".
     pub fn swap_with_current(&mut self) {
-        for (slot, value) in slots().iter().zip(self.values.iter_mut()) {
+        check_slots();
+        for (slot, value) in slots().iter().zip(self.values.borrow_mut().iter_mut()) {
             let value = value.get_or_insert_with(slot.init);
             (slot.swap)(&mut **value);
         }
@@ -201,9 +264,11 @@ pub fn guards_held() -> usize {
 }
 
 /// Assert that the running computation may park: it holds no runtime lock
-/// and is not inside a governor critical section.  Debug builds only.
+/// and is not inside a governor critical section (debug builds). Borrowed
+/// mutator slots are rejected in every build, before a switch changes state.
 #[track_caller]
 pub fn assert_parkable() {
+    check_slots();
     if cfg!(debug_assertions) {
         let held = guards_held();
         assert!(
@@ -214,6 +279,12 @@ pub fn assert_parkable() {
             !crate::governor::in_critical_section(),
             "fiber parked inside a governor critical section"
         );
+    }
+}
+
+fn check_slots() {
+    for slot in slots() {
+        (slot.check)();
     }
 }
 

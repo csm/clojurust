@@ -1,7 +1,6 @@
 #[cfg(not(feature = "no-gc"))]
 use crate::env::dynamics;
 use crate::env::env::Env;
-#[cfg(not(feature = "no-gc"))]
 use crate::env::env::GlobalEnv;
 use crate::env::error::{EvalError, EvalResult};
 use std::cell::RefCell;
@@ -63,12 +62,45 @@ thread_local! {
     static OPTION_VALUE_ROOTS: RefCell<Vec<(*const Option<cljrs_value::Value>, usize)>> =
         const { RefCell::new(Vec::new()) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/ENV_ROOTS", refcell ENV_ROOTS: Vec<*const Env>);
-cljrs_gc::mutator_slot!("cljrs-runtime/VALUE_ROOTS", refcell VALUE_ROOTS: Vec<(*const cljrs_value::Value, usize)>);
+cljrs_gc::mutator_slot!("cljrs-runtime/ENV_ROOTS", refcell ENV_ROOTS: Vec<*const Env>, trace trace_saved_envs);
+cljrs_gc::mutator_slot!("cljrs-runtime/VALUE_ROOTS", refcell VALUE_ROOTS: Vec<(*const cljrs_value::Value, usize)>, trace trace_saved_values);
 cljrs_gc::mutator_slot!(
     "cljrs-runtime/OPTION_VALUE_ROOTS",
-    refcell OPTION_VALUE_ROOTS: Vec<(*const Option<cljrs_value::Value>, usize)>
+    refcell OPTION_VALUE_ROOTS: Vec<(*const Option<cljrs_value::Value>, usize)>, trace trace_saved_options
 );
+
+// SAFETY: detached states are traced only while the owning fiber's stack
+// remains allocated. Root guards are removed during unwind before stack reuse.
+fn trace_saved_envs(roots: &Vec<*const Env>, visitor: &mut cljrs_gc::MarkVisitor) {
+    for &env in roots {
+        trace_env_roots(unsafe { &*env }, visitor);
+    }
+}
+fn trace_saved_values(
+    roots: &Vec<(*const cljrs_value::Value, usize)>,
+    visitor: &mut cljrs_gc::MarkVisitor,
+) {
+    use cljrs_gc::Trace;
+    for &(ptr, len) in roots {
+        for value in unsafe { std::slice::from_raw_parts(ptr, len) } {
+            value.trace(visitor);
+        }
+    }
+}
+fn trace_saved_options(
+    roots: &Vec<(*const Option<cljrs_value::Value>, usize)>,
+    visitor: &mut cljrs_gc::MarkVisitor,
+) {
+    use cljrs_gc::Trace;
+    for &(ptr, len) in roots {
+        for value in unsafe { std::slice::from_raw_parts(ptr, len) }
+            .iter()
+            .flatten()
+        {
+            value.trace(visitor);
+        }
+    }
+}
 
 /// RAII guard that pops the Env pointer on drop.
 pub struct EnvRootGuard;
@@ -281,7 +313,6 @@ fn collect_at_safepoint(env: &Env) {
 // ── GC-only root tracing helpers ─────────────────────────────────────────────
 
 /// Trace all GcPtr values reachable from an Env's local frames.
-#[cfg(not(feature = "no-gc"))]
 fn trace_env_roots(env: &Env, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
     // Trace local frame bindings
@@ -349,8 +380,7 @@ fn trace_thread_env_roots(visitor: &mut cljrs_gc::MarkVisitor) {
 }
 
 /// Trace all namespaces and their contents.
-#[cfg(not(feature = "no-gc"))]
-fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
+pub(crate) fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::{GcVisitor as _, Trace};
     let namespaces = globals.namespaces.read().unwrap();
     for ns_ptr in namespaces.values() {
