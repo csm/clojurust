@@ -10,8 +10,7 @@
 //!
 //! ## Debug provenance (Phase 7)
 //!
-//! Under `cfg(all(feature = "no-gc", debug_assertions))` the arena maintains a
-//! registry of all addresses it has ever allocated.  [`is_static_addr`] checks
+//! The arena tracks its chunk address ranges in every no-gc build.  [`is_static_addr`] checks
 //! whether a raw pointer came from the arena, which lets the write-site
 //! assertions in `Atom::reset` / `Var::bind` catch region-local values being
 //! stored in program-lifetime containers.
@@ -117,7 +116,6 @@ impl Inner {
     }
 
     /// Check whether `addr` falls inside any chunk owned by this arena.
-    #[cfg(debug_assertions)]
     fn contains_addr(&self, addr: usize) -> bool {
         for chunk in &self.chunks {
             let base = chunk.data.as_ptr() as usize;
@@ -201,9 +199,8 @@ impl StaticArena {
 
     /// Return `true` if `addr` was allocated by this arena.
     ///
-    /// Used by debug-mode provenance assertions to distinguish static-arena
+    /// Used by publication and provenance checks to distinguish static-arena
     /// pointers from scratch-region pointers.
-    #[cfg(debug_assertions)]
     pub fn contains_addr(&self, addr: usize) -> bool {
         self.inner.lock().unwrap().contains_addr(addr)
     }
@@ -225,9 +222,7 @@ pub fn static_alloc_val<T: 'static>(value: T) -> crate::StaticGcPtr<T> {
 
 /// Return `true` if the raw pointer address was allocated by the static arena.
 ///
-/// This is an O(chunks) scan (typically 1–2 chunks) and is only intended for
-/// use in `debug_assert!` write-site checks.
-#[cfg(debug_assertions)]
+/// This is an O(chunks) scan used by no-gc publication and provenance checks.
 pub fn is_static_addr(addr: usize) -> bool {
     // If the arena has not been initialised yet, no allocation has ever been
     // made, so the address cannot be static.

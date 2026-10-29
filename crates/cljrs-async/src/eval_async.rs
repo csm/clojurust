@@ -60,8 +60,15 @@ where
     // bump-region scope active right now has closed.  Poison the active
     // regions so they are retired (kept alive) instead of reset; a no-op (one
     // thread-local read) when no region is open, which is the common case.
+    #[cfg(not(feature = "no-gc"))]
     cljrs_gc::region::poison_active_regions();
-    let future = GcPtr::new(CljxFuture::new());
+    #[cfg(feature = "no-gc")]
+    let lease = cljrs_gc::region::RegionLease::capture_active();
+    let future = {
+        #[cfg(feature = "no-gc")]
+        let _static_context = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+        GcPtr::new(CljxFuture::new_local())
+    };
     let task_future = future.clone();
     let gas_meters = cljrs_runtime::env::gas::active_meters();
     let interrupts = cljrs_runtime::env::gas::active_interrupts();
@@ -79,6 +86,8 @@ where
             let _interrupts = cljrs_runtime::env::gas::InterruptScope::enter(&interrupts);
             let _gas_guards = cljrs_runtime::env::gas::install_meters(&gas_meters);
             let _monitors = cljrs_runtime::env::monitor::AsyncMonitorScope::enter();
+            #[cfg(feature = "no-gc")]
+            let _lease_scope = lease.enter();
             task.as_mut().poll(cx)
         })
         .await;
@@ -99,12 +108,12 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
         return;
     }
     *state = match result {
-        Ok(v) => FutureState::Done(v),
+        Ok(v) => FutureState::Done(cljrs_value::publish::publish_value(v)),
         // Preserve the thrown value (and any non-Thrown error as a fresh
         // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
         Err(EvalError::GasExhausted) => FutureState::GasExhausted,
         Err(EvalError::MemoryLimitExceeded(fault)) => FutureState::MemoryLimitExceeded(fault),
-        Err(e) => FutureState::Failed(e.to_error_value()),
+        Err(e) => FutureState::Failed(cljrs_value::publish::publish_value(e.to_error_value())),
     };
     drop(state);
     future.get().cond.notify_all();

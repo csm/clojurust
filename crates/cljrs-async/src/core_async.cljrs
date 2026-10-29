@@ -54,8 +54,7 @@
   "Runs body in a fiber and returns a result channel, like thread.
   The body can do blocking I/O. Avoid extended computation in the body."
   [& body]
-  (list 'clojure.core.async/thread-call
-        (cons 'fn (cons [] body))))
+  (cons 'clojure.core.async/thread body))
 
 ;; (merge chs)
 ;;

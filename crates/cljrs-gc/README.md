@@ -734,11 +734,18 @@ programs and the AOT test harness call it once at exit.
 - Safepoint integration with JIT frames — Phase 10+
 - Automatic collection trigger (threshold-based) — deferred
 
-Native fiber publication also uses region retirement in `no-gc` builds.
-`ScratchGuard` registers each live scratch scope until destruction, including
-scopes that already removed their allocation context for a tail expression.
-Spawning retains those regions so child captures remain valid after the parent returns.
-Channel and lazy-value publication retain active regions for managed values.
-Retired regions stay charged until the isolate thread exits. This path trades
-memory reclamation for safe publication of opaque captures.
+No-gc task captures use `region::RegionLease::capture_active() -> RegionLease`.
+`RegionLease::enter() -> LeaseScope` conveys leases into nested tasks for one poll
+or fiber execution. Completion and cancellation release these leases.
+Closed regions remain in a deferred registry only while a task can use them.
+The last lease frees their storage and releases the governor charge.
+`ScratchGuard` keeps each scope registered through tail evaluation.
+
+Immutable no-gc publications copy into static storage. Opaque publications call
+`retain_regions_for(value: &impl Trace)` to retain their actual backing regions.
+This path preserves mutable identity without retaining unrelated caller scopes.
 Bounded isolated allocation invocations retain their original lifetime rules.
+
+`static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available
+in release no-gc builds for publication decisions. No-gc `MarkVisitor` implements
+`Default` and traverses values only for explicit region retention.

@@ -246,7 +246,18 @@ pub struct MarkVisitor {
 }
 
 #[cfg(feature = "no-gc")]
-pub struct MarkVisitor;
+#[derive(Default)]
+pub struct MarkVisitor {
+    retaining: Option<std::collections::HashSet<usize>>,
+}
+
+/// Retain only regions reached by an opaque published value in no-gc mode.
+#[cfg(feature = "no-gc")]
+pub fn retain_regions_for(value: &impl Trace) {
+    value.trace(&mut MarkVisitor {
+        retaining: Some(Default::default()),
+    });
+}
 
 #[cfg(not(feature = "no-gc"))]
 impl MarkVisitor {
@@ -311,7 +322,17 @@ impl MarkVisitor {
 
 #[cfg(feature = "no-gc")]
 impl GcVisitor for MarkVisitor {
-    fn visit<T: Trace + 'static>(&mut self, _: &GcPtr<T>) {}
+    fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
+        let Some(visited) = &mut self.retaining else {
+            return;
+        };
+        let address = ptr.0.as_ptr() as usize;
+        if !visited.insert(address) {
+            return;
+        }
+        region::retain_containing(address);
+        ptr.get().trace(self);
+    }
 }
 
 // =============================================================================
@@ -493,10 +514,10 @@ impl<T: Trace + 'static> GcPtr<T> {
 
     /// Return `true` if this pointer was allocated by the global `StaticArena`.
     ///
-    /// Only meaningful (and only compiled) in `no-gc` debug builds.  Used by
+    /// Available in no-gc builds for publication decisions and
     /// write-site assertions in `Atom::reset` / `Var::bind` to catch
     /// region-local values being stored in program-lifetime containers.
-    #[cfg(all(feature = "no-gc", debug_assertions))]
+    #[cfg(feature = "no-gc")]
     pub fn is_static_alloc(&self) -> bool {
         alloc_ctx::invocation_is_active() || static_arena::is_static_addr(self.0.as_ptr() as usize)
     }

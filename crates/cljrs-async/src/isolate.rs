@@ -56,6 +56,34 @@ impl Isolate {
             .expect("isolate: failed to spawn OS thread")
     }
 
+    /// Run a synchronous entry function in a root fiber on a new isolate.
+    /// Blocking Clojure waits park the root and let local tasks make progress.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn_root<F>(self, body: F) -> std::thread::JoinHandle<()>
+    where
+        F: FnOnce() -> cljrs_runtime::env::error::EvalResult + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(self.name.clone())
+            .spawn(move || {
+                cljrs_gc::register_current_isolate(&self.name);
+                let _mutator = cljrs_gc::register_mutator();
+                cljrs_gc::HEAP.set_config_from_env();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("isolate runtime");
+                let local = tokio::task::LocalSet::new();
+                let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+                let result = crate::fiber::run_root(&rt, &local, &mut carrier, body);
+                carrier.swap_with_current();
+                drop(local);
+                carrier.swap_with_current();
+                result.expect("isolate root failed");
+            })
+            .expect("isolate: failed to spawn OS thread")
+    }
+
     /// wasm32 stub — wasm has a single thread; return a dummy handle.
     #[cfg(target_arch = "wasm32")]
     pub fn spawn<F, Fut>(self, _f: F) -> std::thread::JoinHandle<()>

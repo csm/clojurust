@@ -74,7 +74,9 @@ concurrently on one isolate thread. Isolates provide parallel Clojure execution.
 `future-cancel` cancels the result without interrupting the body.
 
 `go` and `^:async` retain the async evaluator. Their bodies still use `await`.
-Outside a fiber, `deref` blocks the OS thread. On wasm32, callers retain the
+A pending local future rejects carrier dereference outside a fiber.
+Synchronous embedders use `fiber::run_root` or `Isolate::spawn_root`.
+Manual futures with producers on other OS threads retain blocking dereference. On wasm32, callers retain the
 async waiting rules.
 
 ## Channels
@@ -213,3 +215,6 @@ binary can be produced with `cargo build -p cljrs --no-default-features`.
 > the GC-service spawn no-ops in that case and should be re-invoked from inside a
 > `LocalSet::run_until` block. `timeout` uses the browser's `setTimeout`
 > (via `gloo-timers`) on `wasm32` instead of `tokio::time::sleep`.
+
+A failed `thread` or `io-thread` body prints an error and closes its result channel.
+Each call uses one fiber. The `io-thread` macro delegates to `thread`.

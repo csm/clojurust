@@ -148,3 +148,185 @@ fn root_restores_host_capture_and_preserves_background_roots_between_drives() {
         assert_eq!(cljrs_runtime::builtins::builtins::pop_output_capture().unwrap(), "");
     }).unwrap().join().unwrap();
 }
+
+#[test]
+fn pending_local_future_rejects_carrier_waits_and_root_can_borrow_env() {
+    cljrs_async::isolate::Isolate::new("carrier-wait-review")
+        .spawn(|| async {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            cljrs_async::init(runtime.globals());
+            let mut env = Env::new(runtime.globals().clone(), "user");
+            let forms = cljrs_reader::Parser::new("@(future 42)".into(), "<carrier>".into())
+                .parse_all()
+                .unwrap();
+            assert!(
+                cljrs_value::CljxFuture::new_local()
+                    .wait_value(Some(std::time::Duration::ZERO))
+                    .unwrap()
+                    .is_none()
+            );
+            let error = cljrs_runtime::tiered::eval(&forms[0], &mut env).unwrap_err();
+            assert!(error.to_string().contains("outside a fiber"), "{error}");
+            // A regular function called by a legacy go body must also reject the
+            // carrier wait instead of pinning the async evaluator.
+            let forms = cljrs_reader::Parser::new(
+                "(defn ordinary [] @(future 42)) (await (clojure.core.async/go (ordinary)))".into(),
+                "<legacy>".into(),
+            )
+            .parse_all()
+            .unwrap();
+            cljrs_async::eval_async::eval_async(&forms[0], &mut env)
+                .await
+                .unwrap();
+            let error = cljrs_async::eval_async::eval_async(&forms[1], &mut env)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("outside a fiber"), "{error}");
+        })
+        .join()
+        .unwrap();
+
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            cljrs_async::init(runtime.globals());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let mut carrier = MutatorState::fresh();
+            let mut env = Env::new(runtime.globals().clone(), "user");
+            env.push_frame();
+            env.bind("saved".into(), Value::Long(42));
+            let forms = cljrs_reader::Parser::new("@(future saved)".into(), "<embedding>".into())
+                .parse_all()
+                .unwrap();
+            assert_eq!(
+                fiber::run_root(&rt, &local, &mut carrier, || cljrs_runtime::tiered::eval(
+                    &forms[0], &mut env
+                ))
+                .unwrap(),
+                Value::Long(42)
+            );
+            carrier.swap_with_current();
+            drop(local);
+            carrier.swap_with_current();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn declared_native_captures_survive_collection_in_a_parked_fiber() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, async {
+                let _ = runtime;
+                let frame = cljrs_gc::push_alloc_frame();
+                let captured = Value::Vector(cljrs_gc::GcPtr::new(
+                    cljrs_value::PersistentVector::from_iter(vec![Value::string(
+                        "managed capture",
+                    )]),
+                ));
+                let native = Value::NativeFunction(cljrs_gc::GcPtr::new(
+                    cljrs_value::NativeFn::with_captures(
+                        "declared-capture",
+                        cljrs_value::Arity::Fixed(0),
+                        vec![captured],
+                        |captures, _| Ok(captures[0].clone()),
+                    ),
+                ));
+                let task = fiber::spawn_rooted(vec![native.clone()], move || {
+                    fiber::park_on(tokio::task::yield_now());
+                    let Value::NativeFunction(native) = native else {
+                        unreachable!()
+                    };
+                    (native.get().func)(&[])
+                        .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+                })
+                .unwrap();
+                drop(frame);
+                tokio::task::yield_now().await;
+                #[cfg(not(feature = "no-gc"))]
+                for _ in 0..3 {
+                    cljrs_gc::request_gc();
+                    cljrs_runtime::env::gc_roots::async_gc_collect();
+                }
+                assert_eq!(
+                    task.await.unwrap().into_result().unwrap().to_string(),
+                    "[\"managed capture\"]"
+                );
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(feature = "no-gc")]
+#[test]
+fn repeated_publishes_and_completed_spawns_release_scratch_regions() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async {
+                cljrs_async::init(runtime.globals());
+            });
+            let mut carrier = MutatorState::fresh();
+            let mut env = Env::new(runtime.globals().clone(), "user");
+            let retired = || {
+                cljrs_gc::governor::with_current_account(|account| account.retired_region_bytes())
+                    .unwrap()
+            };
+            let before = retired();
+            let source = r#"
+          (require '[clojure.core.async :as a])
+          (def values (atom []))
+          (dotimes [i 300]
+            (swap! values conj i)
+            (assert (= (inc i) @(future (inc i))))
+            (assert (= [i] (a/<!! (a/thread [i])))))
+          (dotimes [i 300] (future i))
+          (sleep 1)
+          (defn child []
+            (let [text (str "retained " "value")]
+              (future (sleep 1) @(future text))))
+          (assert (= "retained value" @(child)))
+        "#;
+            for form in cljrs_reader::Parser::new(source.into(), "<no-gc-retention>".into())
+                .parse_all()
+                .unwrap()
+            {
+                fiber::run_root(&rt, &local, &mut carrier, || {
+                    cljrs_runtime::tiered::eval(&form, &mut env)
+                })
+                .unwrap();
+            }
+            carrier.swap_with_current();
+            drop(local);
+            carrier.swap_with_current();
+            assert_eq!(
+                retired(),
+                before,
+                "completed tasks permanently retained scratch regions"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

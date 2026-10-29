@@ -442,7 +442,8 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
 - Native `future` and `future-call` run ordinary functions in fibers.
   The full future family now lives in `clojure.core`. Experimental names remain compatible.
 - `thread`, `thread-call`, and `io-thread` convey dynamic bindings and return result channels.
-  A non-nil result enters the channel before closure. Nil results and exceptions only close the channel.
+  A non-nil result enters the channel before closure. Nil results only close the channel.
+  Exceptions print a diagnostic before closure. Each call uses one body fiber.
 - Children receive binding snapshots, active gas meters, and interrupt flags.
   Binding changes stay private to each child.
 - `fiber::run_root` drives top-level evaluation on a 64 MiB stack.
@@ -455,7 +456,8 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
   Compiled closure adapters propagate pending exceptions. Future dereference preserves thrown data.
   Native closure adapters explicitly trace managed captures through `NativeFn::captures`.
 - `no-gc` scratch scopes register their live regions through tail evaluation.
-  Spawn and publication retain escaping regions until isolate exit.
+  Task captures lease scratch scopes until completion or cancellation.
+  Immutable publications copy into static storage. Opaque publications retain only their actual backing scopes.
   Bounded isolated allocation invocations cannot spawn Clojure fibers.
 - `fiber_surface.rs` covers nested futures, ordinary function waits, bindings, result-channel closure,
   cancellation, errors, forced collection, and host state restoration in both interpreter modes.
@@ -464,6 +466,13 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
   AOT regressions cover the compiled surface and generated test harness.
 - The book and affected crate READMEs document the native surface.
   `go`, `^:async`, and wasm32 retain the legacy async evaluator until Phase 5.
+
+Review fixes preserve resource-limit errors in a separate per-fiber slot.
+Compiled catch clauses cannot consume gas exhaustion or memory faults.
+Synchronous embeddings can borrow their Env and Form through `run_root`.
+`Isolate::spawn_root` provides a synchronous isolate entry point.
+Pending local futures reject carrier dereference instead of deadlocking.
+Native embedders declare managed captures with `NativeFn::with_captures`.
 
 ### Phase 4 — Fairness and observability
 

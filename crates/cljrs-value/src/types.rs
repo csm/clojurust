@@ -30,7 +30,7 @@ use crate::Value;
 /// value was produced inside a `StaticCtxGuard`, ALL allocations during its
 /// evaluation go to the static arena — so a static top-level pointer implies
 /// static contents.
-#[cfg(all(feature = "no-gc", debug_assertions))]
+#[cfg(feature = "no-gc")]
 pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
     use crate::value::MapValue;
     use crate::value::SetValue;
@@ -773,7 +773,8 @@ impl NativeFn {
         }
     }
 
-    /// Create from a closure or any `Fn(&[Value]) -> ValueResult<Value>`.
+    /// Create a Rust callable with no managed captures. For closures that
+    /// retain Values, use with_captures so the collector can visit them.
     pub fn with_closure(
         name: impl Into<Arc<str>>,
         arity: Arity,
@@ -789,6 +790,21 @@ impl NativeFn {
                     .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
             }),
         }
+    }
+
+    /// Create a callable with explicit managed captures for precise tracing.
+    /// The closure receives the traced capture slice, avoiding a second opaque
+    /// copy that could disagree with the declared roots.
+    pub fn with_captures(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        captures: Vec<Value>,
+        func: impl Fn(&[Value], &[Value]) -> crate::ValueResult<Value> + 'static,
+    ) -> Self {
+        let shared = captures.clone();
+        let mut native = Self::with_closure(name, arity, move |args| func(&shared, args));
+        native.captures = captures;
+        native
     }
 
     /// Create a native function with a separate owned-work blocking adapter.
@@ -1465,6 +1481,7 @@ pub struct CljxFuture {
     pub ready: Event,
     pub state: Mutex<FutureState>,
     pub cond: Condvar,
+    executor_thread: Option<std::thread::ThreadId>,
     /// Set once a consumer has read the settled result (via `await`/`deref`).
     /// Used to warn about a `Failed` future that is discarded without anyone
     /// ever observing its error (the fire-and-forget footgun).
@@ -1477,8 +1494,16 @@ impl CljxFuture {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
             ready: Event::default(),
+            executor_thread: None,
             observed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A future whose producer needs this thread's local executor.
+    pub fn new_local() -> Self {
+        let mut future = Self::new();
+        future.executor_thread = Some(std::thread::current().id());
+        future
     }
 
     /// Wait for settlement, parking only when running on a fiber.
@@ -1488,6 +1513,16 @@ impl CljxFuture {
             let listener = self.ready.listen();
             if let Some(result) = self.settled_value() {
                 return result.map(Some);
+            }
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                return self.settled_value().transpose();
+            }
+            if crate::parking::current().is_none()
+                && self.executor_thread == Some(std::thread::current().id())
+            {
+                return Err(crate::ValueError::Other(
+                    "cannot wait for an isolate future outside a fiber; use await in async code or fiber::run_root for synchronous evaluation".into(),
+                ));
             }
             if !listener.wait(deadline.map(|d| d.saturating_duration_since(Instant::now()))) {
                 return self.settled_value().transpose();

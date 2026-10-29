@@ -1736,3 +1736,7 @@ ordinary function into a fiber. The default implementation delegates to
 
 `macroexpand_all` expands the operand of reader dereference (`@`). Thus AOT
 and IR lowering expand `@(future ...)` before they compile the future body.
+
+Native JIT and OSR dispatch preserve resource-limit errors through
+`JitBackend::take_pending_resource_error() -> Option<ValueError>` and the matching
+`JitState` method. Gas exhaustion and memory-limit faults bypass Clojure catch clauses.

@@ -172,18 +172,21 @@ impl Fiber {
     }
 
     /// Keep captured values rooted before the first poll and until completion.
-    /// Both allocation modes retain active regions because opaque closure
-    /// captures cannot be rewritten after promotion.
+    /// GC builds poison active regions for opaque captures. No-gc builds
+    /// lease those regions only until task completion or cancellation.
     pub fn with_roots(
         roots: Vec<Value>,
         body: impl FnOnce() -> EvalResult + 'static,
     ) -> Result<Self, EvalError> {
-        Self::with_stack_bytes(roots, body, stack_bytes()?)
+        // SAFETY: this constructor requires a static body.
+        unsafe { Self::with_stack_bytes(roots, body, stack_bytes()?) }
     }
 
-    fn with_stack_bytes(
+    // SAFETY: borrowed bodies must be fully driven or dropped before returning
+    // to their caller. Only run_root may use a non-static body.
+    unsafe fn with_stack_bytes(
         roots: Vec<Value>,
-        body: impl FnOnce() -> EvalResult + 'static,
+        body: impl FnOnce() -> EvalResult,
         bytes: usize,
     ) -> Result<Self, EvalError> {
         install_parking_hooks();
@@ -198,7 +201,10 @@ impl Fiber {
             .unwrap_or_else(|| DefaultStack::new(bytes))
             .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
         let id = FiberId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        #[cfg(not(feature = "no-gc"))]
         cljrs_gc::region::poison_active_regions();
+        #[cfg(feature = "no-gc")]
+        let lease = cljrs_gc::region::RegionLease::capture_active();
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
         // Register captures in the fiber's detached state, not the caller's.
@@ -216,11 +222,24 @@ impl Fiber {
         task.state.swap_with_current();
         task.roots_guard = Some(root_values(&task.roots));
         task.state.swap_with_current();
-        task.co = Some(Coroutine::with_stack(stack, move |yielder, ()| {
-            CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
-            let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
-            body()
-        }));
+        task.co = Some(unsafe {
+            Coroutine::with_stack_unchecked(stack, move |yielder, ()| {
+                CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
+                let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
+                #[cfg(feature = "no-gc")]
+                let _lease_scope = lease.enter();
+                let result = body();
+                #[cfg(feature = "no-gc")]
+                let result = match result {
+                    Ok(value) => Ok(cljrs_value::publish::publish_value(value)),
+                    Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
+                        cljrs_value::publish::publish_value(value),
+                    )),
+                    other => other,
+                };
+                result
+            })
+        });
         Ok(Self { task })
     }
 
@@ -422,7 +441,7 @@ pub fn spawn_rooted(
     }))
 }
 
-/// Drive a top-level computation on a 64 MiB root stack.
+/// Drive a borrowed top-level computation on a 64 MiB root stack.
 /// Transfers the host's mutator state into the root and restores it afterward.
 /// `carrier` retains executor task roots between drives on the same LocalSet.
 /// Call outside the Tokio runtime and outside any fiber.
@@ -430,10 +449,13 @@ pub fn run_root(
     rt: &tokio::runtime::Runtime,
     local: &tokio::task::LocalSet,
     carrier: &mut MutatorState,
-    body: impl FnOnce() -> EvalResult + 'static,
+    body: impl FnOnce() -> EvalResult,
 ) -> EvalResult {
     assert!(current().is_none(), "nested root fiber");
-    let mut task = Fiber::with_stack_bytes(Vec::new(), body, 64 * 1024 * 1024)?.into_task();
+    // SAFETY: the task never escapes this synchronous function. Drive drops
+    // (and unwinds) it on every exit, including executor panics.
+    let mut task =
+        unsafe { Fiber::with_stack_bytes(Vec::new(), body, 64 * 1024 * 1024)? }.into_task();
     task.state.swap_with_current();
     task.roots_guard.take();
     task.state.swap_with_current();

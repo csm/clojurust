@@ -86,28 +86,10 @@ impl AsyncRuntime for AsyncRuntimeImpl {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::result_large_err)]
-    fn spawn_fiber_call(&self, callee: Value, args: Vec<Value>, mut env: Env) -> EvalResult {
-        use cljrs_runtime::env::{dynamics, gas};
-        #[cfg(feature = "no-gc")]
-        if cljrs_gc::alloc_ctx::invocation_is_active() {
-            return Err(EvalError::Runtime(
-                "cannot spawn a fiber from an isolated allocation invocation".into(),
-            ));
-        }
-        let bindings = dynamics::capture_current();
-        let meters = gas::active_meters();
-        let interrupts = gas::active_interrupts();
-        let mut roots = vec![callee.clone()];
-        roots.extend(args.iter().cloned());
-        roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
-        let task = crate::fiber::Fiber::with_roots(roots, move || {
-            dynamics::install_frames(bindings);
-            let _interrupts = gas::InterruptScope::enter(&interrupts);
-            let _meters = gas::install_meters(&meters);
-            cljrs_runtime::env::apply::apply_value(&callee, args, &mut env)
-        })?
-        .into_task();
-        Ok(spawn_future(task))
+    fn spawn_fiber_call(&self, callee: Value, args: Vec<Value>, env: Env) -> EvalResult {
+        Ok(spawn_future(
+            call_fiber(callee, args, env, Vec::new())?.into_task(),
+        ))
     }
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
@@ -123,6 +105,41 @@ impl AsyncRuntime for AsyncRuntimeImpl {
             Err(EvalError::Runtime("chan-put: channel is closed".into()))
         }
     }
+}
+
+/// Build a call fiber without an intermediate future cell or delivery fiber.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+pub(crate) fn call_fiber(
+    callee: Value,
+    args: Vec<Value>,
+    mut env: Env,
+    mut roots: Vec<Value>,
+) -> Result<crate::fiber::Fiber, EvalError> {
+    use cljrs_runtime::env::{dynamics, gas};
+    #[cfg(feature = "no-gc")]
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return Err(EvalError::Runtime(
+            "cannot spawn a fiber from an isolated allocation invocation".into(),
+        ));
+    }
+    let bindings = dynamics::capture_current();
+    let meters = gas::active_meters();
+    let interrupts = gas::active_interrupts();
+    roots.push(callee.clone());
+    roots.extend(args.iter().cloned());
+    roots.extend(
+        env.frames
+            .iter()
+            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
+    );
+    roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
+    crate::fiber::Fiber::with_roots(roots, move || {
+        dynamics::install_frames(bindings);
+        let _interrupts = gas::InterruptScope::enter(&interrupts);
+        let _meters = gas::install_meters(&meters);
+        cljrs_runtime::env::apply::apply_value(&callee, args, &mut env)
+    })
 }
 
 /// Pack args for a compiled (native) async state machine.

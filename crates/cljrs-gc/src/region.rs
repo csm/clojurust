@@ -129,6 +129,10 @@ pub struct Region {
     /// Set when the region is retired; its chunks are then charged to the
     /// account's retired-region count.
     retired: bool,
+    #[cfg(feature = "no-gc")]
+    lease: std::rc::Rc<()>,
+    #[cfg(feature = "no-gc")]
+    published: bool,
 }
 
 impl Region {
@@ -152,6 +156,10 @@ impl Region {
             byte_limit: None,
             object_count: 0,
             retired: false,
+            #[cfg(feature = "no-gc")]
+            lease: std::rc::Rc::new(()),
+            #[cfg(feature = "no-gc")]
+            published: false,
         }
     }
 
@@ -177,6 +185,10 @@ impl Region {
             byte_limit: Some(limit),
             object_count: 0,
             retired: false,
+            #[cfg(feature = "no-gc")]
+            lease: std::rc::Rc::new(()),
+            #[cfg(feature = "no-gc")]
+            published: false,
         }
     }
 
@@ -482,10 +494,18 @@ crate::mutator_slot!("cljrs-gc/POISON_WATERMARK", cell POISON_WATERMARK: usize);
 /// Poison every region currently active on this thread: each will be retired
 /// instead of reset when its scope closes.  No-op when no region is active.
 pub fn poison_active_regions() {
+    #[cfg(feature = "no-gc")]
+    REGION_STACK.with(|stack| {
+        for &region in stack.borrow().iter() {
+            // SAFETY: registered regions are live on this isolate thread.
+            unsafe { &mut *region }.published = true;
+        }
+    });
     let depth = region_stack_depth();
     if depth == 0 {
         return;
     }
+    #[cfg(not(feature = "no-gc"))]
     POISON_WATERMARK.with(|w| w.set(w.get().max(depth)));
     crate::stats::GC_STATS.record_region_poison();
 }
@@ -493,8 +513,18 @@ pub fn poison_active_regions() {
 /// True when every active region must remain alive after its scope closes.
 /// Publishers can skip scans because no value can escape into freed regions.
 pub fn active_regions_are_poisoned() -> bool {
-    let depth = region_stack_depth();
-    depth != 0 && POISON_WATERMARK.with(|watermark| watermark.get() >= depth)
+    #[cfg(feature = "no-gc")]
+    {
+        REGION_STACK.with(|stack| {
+            let stack = stack.borrow();
+            !stack.is_empty() && stack.iter().all(|&region| unsafe { &*region }.published)
+        })
+    }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        let depth = region_stack_depth();
+        depth != 0 && POISON_WATERMARK.with(|watermark| watermark.get() >= depth)
+    }
 }
 
 /// Close a region whose scope has ended: pop it from the thread-local stack,
@@ -504,6 +534,7 @@ pub fn active_regions_are_poisoned() -> bool {
 /// All owners of stack-registered regions (the rt_abi bridge, the IR
 /// interpreter, scratch guards) must close through here so the poison
 /// protocol is honoured.
+#[cfg(not(feature = "no-gc"))]
 pub fn close_region(mut region: Box<Region>) {
     let depth = region_stack_depth();
     pop_region_guard();
@@ -526,6 +557,116 @@ pub fn close_region(mut region: Box<Region>) {
         RETIRED_REGIONS.with(|r| r.borrow_mut().push(*region));
     }
     // else: `region` drops here — destructors run, chunks are freed.
+}
+
+#[cfg(feature = "no-gc")]
+thread_local! {
+    // Closed regions held by in-flight tasks; released outside the TLS borrow.
+    static LEASED_REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+}
+#[cfg(feature = "no-gc")]
+crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<RegionLease>);
+
+/// Keeps caller scratch scopes alive only while a task can use its captures.
+#[cfg(feature = "no-gc")]
+#[derive(Clone, Default)]
+pub struct RegionLease(Vec<std::rc::Rc<()>>);
+#[cfg(feature = "no-gc")]
+impl RegionLease {
+    pub fn capture_active() -> Self {
+        let mut owners = INHERITED_LEASES.with(|stack| {
+            stack
+                .borrow()
+                .iter()
+                .flat_map(|lease| lease.0.iter().cloned())
+                .collect::<Vec<_>>()
+        });
+        REGION_STACK.with(|stack| {
+            for &region in stack.borrow().iter() {
+                // SAFETY: all registered regions are live on this thread.
+                owners.push(unsafe { &*region }.lease.clone());
+            }
+        });
+        // Share each backing scope once, including inherited captures.
+        owners.sort_by_key(|owner| std::rc::Rc::as_ptr(owner) as usize);
+        owners.dedup_by(|a, b| std::rc::Rc::ptr_eq(a, b));
+        Self(owners)
+    }
+    pub fn enter(&self) -> LeaseScope {
+        INHERITED_LEASES.with(|stack| stack.borrow_mut().push(self.clone()));
+        LeaseScope
+    }
+}
+#[cfg(feature = "no-gc")]
+pub struct LeaseScope;
+#[cfg(feature = "no-gc")]
+impl Drop for LeaseScope {
+    fn drop(&mut self) {
+        let lease = INHERITED_LEASES.with(|stack| stack.borrow_mut().pop());
+        drop(lease);
+    }
+}
+#[cfg(feature = "no-gc")]
+impl Drop for RegionLease {
+    fn drop(&mut self) {
+        self.0.clear();
+        // A region destructor can drop further leases. Never run it while
+        // borrowing the deferred registry or during thread-local teardown.
+        let Ok(regions) = LEASED_REGIONS.try_with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+        else {
+            return;
+        };
+        let (live, dead): (Vec<_>, Vec<_>) = regions
+            .into_iter()
+            .partition(|region| std::rc::Rc::strong_count(&region.lease) > 1);
+        LEASED_REGIONS.with(|slot| slot.borrow_mut().extend(live));
+        drop(dead);
+    }
+}
+#[cfg(feature = "no-gc")]
+pub fn close_region(mut region: Box<Region>) {
+    pop_region_guard();
+    if region.published {
+        region.retire();
+        RETIRED_REGIONS.with(|slot| slot.borrow_mut().push(*region));
+    } else if std::rc::Rc::strong_count(&region.lease) > 1 {
+        region.retire();
+        LEASED_REGIONS.with(|slot| slot.borrow_mut().push(*region));
+    }
+}
+
+// A durable opaque value may retain its own backing scopes. Immutable values
+// are copied instead; no-gc task spawns use temporary leases, not this path.
+#[cfg(feature = "no-gc")]
+pub(crate) fn retain_containing(address: usize) {
+    fn contains(region: &Region, address: usize) -> bool {
+        region.chunks.iter().any(|chunk| {
+            let base = chunk.data.as_ptr() as usize;
+            address >= base && address < base + chunk.layout.size()
+        })
+    }
+    REGION_STACK.with(|slot| {
+        for &ptr in slot.borrow().iter() {
+            // SAFETY: live registered regions; no other thread can use them.
+            let region = unsafe { &mut *ptr };
+            if contains(region, address) {
+                region.published = true;
+            }
+        }
+    });
+    LEASED_REGIONS.with(|slot| {
+        let mut regions = slot.borrow_mut();
+        let mut index = 0;
+        while index < regions.len() {
+            if contains(&regions[index], address) {
+                let region = regions.swap_remove(index);
+                RETIRED_REGIONS.with(|retired| retired.borrow_mut().push(region));
+            } else {
+                index += 1;
+            }
+        }
+    });
 }
 
 /// Trace every retired region's objects (their heap children must stay
@@ -1078,5 +1219,37 @@ mod tests {
         );
         // No timing assertion: wall-clock comparisons are unreliable on shared
         // CI machines.  The eprintln above captures the numbers for inspection.
+    }
+}
+
+#[cfg(all(test, feature = "no-gc"))]
+mod lease_tests {
+    use super::*;
+    struct Probe(std::rc::Rc<std::cell::Cell<usize>>);
+    impl crate::Trace for Probe {
+        fn trace(&self, _: &mut crate::MarkVisitor) {}
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    #[test]
+    fn closed_scratch_scope_is_reclaimed_after_its_last_task_lease() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let scratch = crate::alloc_ctx::ScratchGuard::new();
+        let value = crate::GcPtr::new(Probe(drops.clone()));
+        let lease = RegionLease::capture_active();
+        let inherited = {
+            let _scope = lease.enter();
+            RegionLease::capture_active()
+        };
+        drop(scratch);
+        drop(lease);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(value.get().0.get(), 0);
+        drop(value);
+        drop(inherited);
+        assert_eq!(drops.get(), 1);
     }
 }

@@ -223,7 +223,9 @@ the caller's dynamic bindings. Changes in a child stay in that child.
 
 `io-thread` and `thread` return a channel. The channel receives a non-nil result,
 then closes. A nil result or an exception closes the channel without a value.
-`thread-call` accepts a zero-argument function. A failed future raises its error
+`thread-call` accepts a zero-argument function. Each call uses one body fiber.
+Body failures print a diagnostic before the channel closes.
+A failed future raises its error
 when a caller dereferences it. `future-cancel` cancels the result and leaves the body active.
 The experimental future names remain available for compatibility.
 
@@ -250,7 +252,7 @@ let task = cljrs_async::fiber::spawn(|| {
 let value = task.await?.into_result()?;
 ```
 
-`run_root(rt, local, carrier, body) -> EvalResult` drives an owned top-level
+`run_root(rt, local, carrier, body) -> EvalResult` drives a borrowed top-level
 computation on a 64 MiB stack. It transfers the host mutator state into the root
 and restores that state on return. The caller retains `carrier: MutatorState`
 between drives on the same LocalSet. This state holds roots for pending async tasks.
@@ -269,7 +271,8 @@ For captured managed values, use `spawn_rooted(values, body)` or `Fiber::with_ro
 These values remain rooted before the first poll and until completion.
 For locals and opaque future captures, use the runtime's GC root guards.
 GC builds retire active regions through the existing async poison fallback.
-In `no-gc` builds, spawning also retains active scratch regions for opaque captures.
+In `no-gc` builds, task captures lease active scratch regions until completion or cancellation.
+Immutable published data moves into static storage. Opaque published values retain only their backing scopes.
 Typed isolated allocation invocations cannot spawn Clojure fibers.
 Spawned results stay rooted in `FiberResult` until consumption or drop.
 After `into_result`, the caller owns the normal root-registration responsibility.
@@ -578,3 +581,10 @@ An empty form returns nil. Outside a fiber, execution is synchronous.
 
 Heap-isolation fixtures that assert traced heap counts run only in GC builds.
 Notification and parking regressions also run in `no-gc` builds.
+
+Synchronous embedders can use `Isolate::spawn_root(body)` or `fiber::run_root`
+with a borrowed Form and Env. Root evaluation preserves the original Env on unwind
+and avoids a deep Form clone. `Isolate::spawn` remains an async entry point.
+A pending local future rejects synchronous dereference on its carrier thread.
+Such code uses `await` or moves synchronous evaluation into a fiber.
+Settled futures and futures produced by another OS thread retain normal blocking behavior.

@@ -54,6 +54,16 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/region.rs",
+        "LEASED_REGIONS",
+        Thread("no-gc scratch scopes retained only by in-flight tasks"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "INHERITED_LEASES",
+        FiberWhen("cljrs-gc/INHERITED_LEASES", NO_GC),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
         "POISON_WATERMARK",
         Fiber("cljrs-gc/POISON_WATERMARK"),
     ),
@@ -218,6 +228,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-compiler/src/rt_abi.rs",
         "RT_SCRATCH",
         Thread("only live between two adjacent rt_abi calls, which never park"),
+    ),
+    (
+        "cljrs-compiler/src/rt_abi.rs",
+        "PENDING_RESOURCE_ERROR",
+        Fiber("cljrs-compiler/PENDING_RESOURCE_ERROR"),
     ),
     (
         "cljrs-compiler/src/rt_abi.rs",

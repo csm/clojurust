@@ -510,26 +510,12 @@ pub fn eval_form(form: &cljrs_reader::Form, env: &mut Env) -> Result<Value, Eval
             Some(drv) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    // Own the environment on the root stack and recover namespace/
-                    // lexical changes afterward, including evaluation failures.
-                    let replacement = Env::new(env.globals.clone(), &env.current_ns);
-                    let owned = std::rc::Rc::new(std::cell::RefCell::new(std::mem::replace(
-                        env,
-                        replacement,
-                    )));
-                    let child = owned.clone();
-                    let form = form.clone();
-                    let result = cljrs_async::fiber::run_root(
+                    cljrs_async::fiber::run_root(
                         &drv.rt,
                         &drv.local,
                         &mut drv.carrier.borrow_mut(),
-                        move || eval(&form, &mut child.borrow_mut()),
-                    );
-                    *env = std::rc::Rc::try_unwrap(owned)
-                        .ok()
-                        .expect("root retained env")
-                        .into_inner();
-                    result
+                        || eval(form, env),
+                    )
                 }
                 #[cfg(target_arch = "wasm32")]
                 drv.local

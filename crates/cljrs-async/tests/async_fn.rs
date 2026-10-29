@@ -287,6 +287,25 @@ fn at_deref_of_future_in_async_fn_errors() {
     });
 }
 
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+fn deref_of_future_in_sync_context_still_works() {
+    cljrs_async::isolate::Isolate::new("sync-future")
+        .spawn_root(|| {
+            let globals = async_env();
+            let mut env = Env::new(globals, "user");
+            assert_eq!(
+                eval_sync("(deref (future (+ 1 2)))", &mut env),
+                Value::Long(3)
+            );
+            assert_eq!(eval_sync("@(future (* 6 7))", &mut env), Value::Long(42));
+            Ok(Value::Nil)
+        })
+        .join()
+        .unwrap();
+}
+
 // ── Phase D: timeout, alts, alt ────────────────────────────────────────────
 
 const REQUIRE_ASYNC: &str = "(require '[clojure.core.async :refer [timeout alts alt]])";

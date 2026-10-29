@@ -291,6 +291,10 @@ fn try_osr_enter(slot: &OsrSlot, regs: &Registers, env: &mut Env) -> Option<Eval
     // stashes the thrown value and returns the nil sentinel — surface it as an
     // error while the alloc frame still roots it.
     let pending_exception = env.globals.jit().take_pending_exception();
+    let resource_error = env.globals.jit().take_pending_resource_error();
+    if let Some(error) = resource_error {
+        return Some(Err(crate::env::error::value_error_to_eval_error(error)));
+    }
     if let Err(fault) = crate::env::gc_roots::check_memory_fault() {
         return Some(Err(fault));
     }

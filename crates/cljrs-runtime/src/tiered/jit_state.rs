@@ -565,6 +565,12 @@ impl JitState {
         self.backend().and_then(|b| b.take_pending_exception())
     }
 
+    /// Take a native resource-limit error without converting it to a throw.
+    pub fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        self.backend()
+            .and_then(|backend| backend.take_pending_resource_error())
+    }
+
     /// Whether `arity_id` may be compiled with type specializations.
     pub fn specialization_allowed(&self, arity_id: u64) -> bool {
         !self.spec_banned.read().unwrap().contains(&arity_id)

@@ -309,39 +309,35 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let rt = globals
         .async_runtime()
         .ok_or_else(|| ValueError::Other("thread-call requires an async runtime".into()))?;
+    #[cfg(feature = "no-gc")]
+    let _static_context = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);
-    let fut = rt
-        .spawn_fiber_call(thunk, Vec::new(), call_env)
-        .map_err(|e| ValueError::Other(e.to_string()))?;
-    let roots = vec![ch_val.clone(), fut.clone()];
-    // Keep captures rooted even when the caller drops its result channel.
     #[cfg(not(target_arch = "wasm32"))]
-    let delivery = crate::fiber::Fiber::with_roots(roots, move || {
-        let value = crate::fiber::park_on(await_value(fut));
-        if let Ok(v) = value
-            && !matches!(v, Value::Nil)
-        {
-            chan_ref(result_ch.get()).try_put_buffered(&v);
-        }
-        chan_ref(result_ch.get()).close();
-        Ok(Value::Nil)
-    })
-    .map_err(|e| ValueError::Other(e.to_string()))?
-    .into_task();
+    let body = crate::runtime::call_fiber(thunk, Vec::new(), call_env, vec![ch_val.clone()])
+        .map_err(|error| ValueError::Other(error.to_string()))?
+        .into_task();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = rt;
     #[cfg(target_arch = "wasm32")]
-    let delivery = async move {
-        let _ = roots;
-        if let Ok(v) = await_value(fut).await {
-            if !matches!(v, Value::Nil) {
-                chan_ref(result_ch.get()).try_put_buffered(&v);
+    let body = crate::eval_async::await_value(
+        rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+            .map_err(|error| ValueError::Other(error.to_string()))?,
+    );
+    let anchor = ch_val.clone();
+    spawn_future(async move {
+        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+        match body.await {
+            Ok(value) if !matches!(value, Value::Nil) => {
+                chan_ref(result_ch.get()).try_put_buffered(&value);
             }
+            Ok(_) => {}
+            Err(error) => eprintln!("[clojurust thread error] {error}"),
         }
         chan_ref(result_ch.get()).close();
         Ok(Value::Nil)
-    };
-    spawn_future(delivery);
+    });
     Ok(ch_val)
 }
 

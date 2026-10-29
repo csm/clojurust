@@ -413,6 +413,53 @@ pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Valu
 
 /// Raise an exception carrying `msg` via the pending-exception slot and return
 /// nil (used by the array bridges for type and bounds errors).
+// Resource-limit signals stay separate from catchable Clojure values.
+#[derive(Clone, Copy)]
+enum ResourceError {
+    Gas,
+    Memory(cljrs_gc::MemoryLimitExceeded),
+}
+thread_local! {
+    static PENDING_RESOURCE_ERROR: std::cell::RefCell<Option<ResourceError>> = const { std::cell::RefCell::new(None) };
+}
+cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_RESOURCE_ERROR", refcell PENDING_RESOURCE_ERROR: Option<ResourceError>);
+
+/// Consume the current fiber's uncatchable native resource-limit signal.
+pub fn take_pending_resource_error() -> Option<cljrs_value::ValueError> {
+    PENDING_RESOURCE_ERROR
+        .with(|slot| slot.borrow_mut().take())
+        .map(|error| match error {
+            ResourceError::Gas => cljrs_value::ValueError::GasExhausted,
+            ResourceError::Memory(fault) => cljrs_value::ValueError::MemoryLimitExceeded(fault),
+        })
+}
+fn resource_error_pending() -> bool {
+    PENDING_RESOURCE_ERROR.with(|slot| slot.borrow().is_some())
+}
+fn signal_error(error: cljrs_value::ValueError) -> *const Value {
+    use cljrs_value::ValueError;
+    let resource = match error {
+        ValueError::GasExhausted => ResourceError::Gas,
+        ValueError::MemoryLimitExceeded(fault) => ResourceError::Memory(fault),
+        ValueError::Thrown(value) => return unsafe { rt_throw(box_val(value)) },
+        other => return throw_str(other.to_string()),
+    };
+    PENDING_RESOURCE_ERROR.with(|slot| {
+        slot.borrow_mut().get_or_insert(resource);
+    });
+    rt_const_nil()
+}
+fn compiled_result(ptr: *const Value) -> cljrs_value::ValueResult<Value> {
+    if let Some(error) = take_pending_resource_error() {
+        let _ = take_pending_exception_value();
+        return Err(error);
+    }
+    match take_pending_exception_value() {
+        Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
+        None => Ok(unsafe { val_ref(ptr) }.clone()),
+    }
+}
+
 fn throw_str(msg: String) -> *const Value {
     let exc = box_val(Value::Error(GcPtr::new(
         cljrs_value::error::ExceptionInfo::new(
@@ -2045,10 +2092,7 @@ pub unsafe extern "C" fn rt_make_fn(
             // We call it via a trampoline that passes args through a pointer array.
             let result_ptr = unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
 
-            match take_pending_exception_value() {
-                Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
-                None => Ok(unsafe { val_ref(result_ptr) }.clone()),
-            }
+            compiled_result(result_ptr)
         }),
     };
 
@@ -2131,10 +2175,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 
             let result_ptr =
                 unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled_params) };
-            match take_pending_exception_value() {
-                Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
-                None => Ok(unsafe { val_ref(result_ptr) }.clone()),
-            }
+            compiled_result(result_ptr)
         }),
     };
 
@@ -2225,10 +2266,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 }
                 let result_ptr =
                     unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
-                return match take_pending_exception_value() {
-                    Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
-                    None => Ok(unsafe { val_ref(result_ptr) }.clone()),
-                };
+                return compiled_result(result_ptr);
             }
 
             // Try variadic arity (argc >= fixed_count).
@@ -2253,10 +2291,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 all_ptrs.push(box_val(rest_list));
                 let result_ptr =
                     unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled) };
-                return match take_pending_exception_value() {
-                    Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
-                    None => Ok(unsafe { val_ref(result_ptr) }.clone()),
-                };
+                return compiled_result(result_ptr);
             }
 
             // No matching arity found.
@@ -2786,7 +2821,7 @@ pub unsafe extern "C" fn rt_call(
             });
             rt_const_nil()
         }
-        Err(error) => throw_str(error.to_string()),
+        Err(error) => signal_error(error),
     }
 }
 
@@ -2800,6 +2835,12 @@ pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_runtime::interp::eval::deref_value(v) {
         Ok(result) => box_invoke_result(result),
+        Err(cljrs_runtime::env::error::EvalError::GasExhausted) => {
+            signal_error(cljrs_value::ValueError::GasExhausted)
+        }
+        Err(cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault)) => {
+            signal_error(cljrs_value::ValueError::MemoryLimitExceeded(fault))
+        }
         Err(error) => unsafe { rt_throw(box_val(error.to_error_value())) },
     }
 }
@@ -3930,7 +3971,11 @@ pub unsafe extern "C" fn rt_try(
     let body_result = cljrs_runtime::env::callback::invoke(&body, vec![]);
 
     // Check for thrown exception (set by rt_throw in compiled code).
-    let ret = if let Some(thrown_ptr) = take_pending_exception() {
+    let ret = if resource_error_pending() || cljrs_runtime::env::gas::is_exhausted() {
+        let _ = take_pending_exception();
+        unwind_regions_to(region_depth, rt_region_depth);
+        rt_const_nil()
+    } else if let Some(thrown_ptr) = take_pending_exception() {
         // Unwind any regions opened inside the try body.
         unwind_regions_to(region_depth, rt_region_depth);
         // Exception was thrown from compiled code.
@@ -3938,7 +3983,7 @@ pub unsafe extern "C" fn rt_try(
             let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
             match cljrs_runtime::env::callback::invoke(&catch, vec![thrown_val]) {
                 Ok(v) => box_val(v),
-                Err(_) => rt_const_nil(),
+                Err(error) => signal_error(error),
             }
         } else {
             rt_const_nil()
@@ -3957,7 +4002,7 @@ pub unsafe extern "C" fn rt_try(
                     cljrs_value::ValueError::GasExhausted
                         | cljrs_value::ValueError::MemoryLimitExceeded(_)
                 ) {
-                    rt_const_nil()
+                    signal_error(val_err)
                 } else if !matches!(catch, Value::Nil) {
                     let thrown_val = match val_err {
                         cljrs_value::ValueError::Thrown(v) => v,
@@ -3965,7 +4010,7 @@ pub unsafe extern "C" fn rt_try(
                     };
                     match cljrs_runtime::env::callback::invoke(&catch, vec![thrown_val]) {
                         Ok(v) => box_val(v),
-                        Err(_) => rt_const_nil(),
+                        Err(error) => signal_error(error),
                     }
                 } else {
                     rt_const_nil()
@@ -3975,8 +4020,10 @@ pub unsafe extern "C" fn rt_try(
     };
 
     // Always run finally.
-    if !matches!(finally, Value::Nil) {
-        let _ = cljrs_runtime::env::callback::invoke(&finally, vec![]);
+    if !matches!(finally, Value::Nil)
+        && let Err(error) = cljrs_runtime::env::callback::invoke(&finally, vec![])
+    {
+        signal_error(error);
     }
 
     ret
@@ -4664,8 +4711,11 @@ pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
 /// Charge a weighted compiled basic-block checkpoint.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_gas_charge(cost: u64) -> u8 {
-    let charged = cljrs_runtime::env::gas::charge(cost);
+    let charged = !resource_error_pending() && cljrs_runtime::env::gas::charge(cost);
     if !charged {
+        if !resource_error_pending() {
+            signal_error(cljrs_value::ValueError::GasExhausted);
+        }
         unwind_all_native_regions();
     }
     u8::from(charged)
@@ -4966,7 +5016,7 @@ fn invoke_boxed(callee: &Value, args: Vec<Value>) -> *const Value {
             stash_pending_exception(val);
             rt_const_nil()
         }
-        Err(_e) => rt_const_nil(),
+        Err(error) => signal_error(error),
     }
 }
 
@@ -5608,5 +5658,113 @@ fn trace_saved_exception(value: &Option<*const Value>, visitor: &mut cljrs_gc::M
     if let Some(ptr) = value {
         // SAFETY: the compiled caller's exception slot remains live while parked.
         unsafe { &**ptr }.trace(visitor);
+    }
+}
+
+#[cfg(test)]
+mod resource_review_tests {
+    use super::*;
+    use cljrs_value::{Arity, CljxFuture, FutureState, NativeFn, ValueError};
+    fn value_error(kind: ResourceError) -> ValueError {
+        match kind {
+            ResourceError::Gas => ValueError::GasExhausted,
+            ResourceError::Memory(fault) => ValueError::MemoryLimitExceeded(fault),
+        }
+    }
+    fn assert_kind(error: ValueError, kind: ResourceError) {
+        assert!(matches!(
+            (error, kind),
+            (ValueError::GasExhausted, ResourceError::Gas)
+                | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
+        ));
+    }
+    #[test]
+    fn resource_limits_bypass_compiled_catch_and_survive_deref_and_adapters() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                for kind in [
+                    ResourceError::Gas,
+                    ResourceError::Memory(cljrs_gc::MemoryLimitExceeded {
+                        class: cljrs_gc::MemoryClass::GcHeap,
+                        requested: 1,
+                        committed: 2,
+                        hard_limit: 2,
+                    }),
+                ] {
+                    let failure = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "limit",
+                        Arity::Fixed(0),
+                        move |_| Err(value_error(kind)),
+                    )));
+                    let body = Value::NativeFunction(GcPtr::new(NativeFn::with_captures(
+                        "body",
+                        Arity::Fixed(0),
+                        vec![failure],
+                        |captures, _| {
+                            unsafe {
+                                rt_call(&captures[0], std::ptr::null(), 0);
+                            }
+                            Ok(Value::Nil)
+                        },
+                    )));
+                    let caught = std::rc::Rc::new(std::cell::Cell::new(false));
+                    let flag = caught.clone();
+                    let catcher = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "catch",
+                        Arity::Fixed(1),
+                        move |_| {
+                            flag.set(true);
+                            Ok(Value::Nil)
+                        },
+                    )));
+                    let nil = Value::Nil;
+                    unsafe {
+                        rt_try(&body, &catcher, &nil);
+                    }
+                    assert!(!caught.get(), "resource error reached catch");
+                    assert!(take_pending_exception_value().is_none());
+                    assert_kind(take_pending_resource_error().unwrap(), kind);
+                    let _ = cljrs_gc::governor::take_runtime_fault();
+
+                    let future = GcPtr::new(CljxFuture::new());
+                    *future.get().state.lock().unwrap() = match kind {
+                        ResourceError::Gas => FutureState::GasExhausted,
+                        ResourceError::Memory(fault) => FutureState::MemoryLimitExceeded(fault),
+                    };
+                    unsafe {
+                        rt_deref(&Value::Future(future));
+                    }
+                    assert!(take_pending_exception_value().is_none());
+                    assert_kind(compiled_result(rt_const_nil()).unwrap_err(), kind);
+                }
+                unsafe extern "C" fn gas_body() -> *const Value {
+                    signal_error(ValueError::GasExhausted)
+                }
+                let name = b"gas-body";
+                let wrapped = unsafe {
+                    rt_make_fn(
+                        name.as_ptr(),
+                        name.len() as u64,
+                        gas_body as *const u8,
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                };
+                let Value::NativeFunction(function) = (unsafe { val_ref(wrapped) }) else {
+                    panic!("not a function")
+                };
+                assert_kind((function.get().func)(&[]).unwrap_err(), ResourceError::Gas);
+                assert!(!resource_error_pending());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

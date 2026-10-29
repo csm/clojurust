@@ -798,3 +798,8 @@ Synchronous functions can dereference futures and use blocking channel operation
 Compiled closure adapters propagate their pending exception into the normal
 call result. `rt_deref` records future dereference errors in the pending-exception slot.
 Thus a failed compiled future remains catchable through `@` with its exception data.
+
+`rt_abi::take_pending_resource_error() -> Option<ValueError>` consumes a native
+resource-limit signal. These signals use a per-fiber slot separate from thrown
+Clojure values. Compiled catch clauses bypass this slot. Native closure adapters,
+JIT/OSR dispatch, and AOT entry points preserve the original error category.

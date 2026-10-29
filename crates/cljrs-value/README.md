@@ -1020,13 +1020,23 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
-In `no-gc` builds, `publish::publish_value` retains active scratch regions when
-a managed value enters a channel or another persistent cell. Scalars need no
-retention. This path keeps child-fiber captures and channel values valid after
-their producing scope returns. Isolated allocation invocations keep their bounded lifetime rules.
+In `no-gc` builds, `publish::publish_value` reuses static values and copies
+immutable scratch data into static storage. Mutable and opaque values retain
+only their actual backing regions. Publication preserves array and var identities.
+Isolated allocation invocations keep their bounded lifetime rules.
 
 `NativeFn::captures: Vec<Value>` records managed values retained by an opaque
 Rust callable. Its `Trace` implementation visits each value. Constructors start
 with an empty vector. Compiled and IR closure adapters fill this vector so
 suspended fibers retain their closure captures through collection.
 Rust embedders must record any managed captures in this vector.
+
+`NativeFn::with_captures(name, arity, captures, func) -> NativeFn` declares managed
+captures at construction. The callback receives `(&[Value], &[Value])` for captures
+and call arguments. `with_closure` is for Rust callables without managed captures.
+The interop registration helpers require `Send + Sync` host closures, which cannot
+capture isolate-local Values. Transaction host wrappers capture serialized host APIs.
+
+`CljxFuture::new_local()` records the executor thread. A pending local future
+rejects synchronous carrier dereference with a catchable error. `CljxFuture::new()`
+retains blocking behavior for manual futures and producers on another thread.

@@ -629,3 +629,6 @@ The wasm32 path retains `eval_async`.
 
 `tests/fiber_entrypoints.rs` covers nested future waits through `eval`, `run`, REPL,
 and `clojure.test`.
+
+Root evaluation borrows the caller's Env and Form directly. It preserves lexical
+state on executor unwind and avoids deep Form copies between top-level evaluations.

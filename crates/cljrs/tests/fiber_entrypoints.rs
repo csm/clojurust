@@ -187,3 +187,50 @@ fn nrepl_root_waits_preserve_output_and_session_bindings() {
     assert_eq!(values, ["41", "42"]);
     assert_eq!(output, ":root-output\n");
 }
+
+#[test]
+fn thread_body_errors_are_reported_and_close_the_result_channel() {
+    let output = command().args(["eval", "(require '[clojure.core.async :as a]) (a/<!! (a/io-thread (throw (ex-info \"review-boom\" {}))))"])
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("review-boom"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn executor_panic_preserves_the_callers_environment() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            cljrs::session::with_async_driver(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let mut env = cljrs_runtime::env::env::Env::new(runtime.globals().clone(), "user");
+                env.push_frame();
+                env.bind("saved".into(), cljrs_value::Value::Long(42));
+                let forms = cljrs_reader::Parser::new("saved".into(), "<unwind>".into())
+                    .parse_all()
+                    .unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = rt.block_on(async { cljrs::session::eval_form(&forms[0], &mut env) });
+                }));
+                assert!(panic.is_err(), "nested executor drive must panic");
+                assert_eq!(
+                    cljrs::session::eval_form(&forms[0], &mut env).unwrap(),
+                    cljrs_value::Value::Long(42)
+                );
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
