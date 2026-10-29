@@ -8563,8 +8563,7 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
             }
         };
         let proto = proto.get();
-        let mut impls = proto.impls.lock().unwrap();
-        let table = impls.entry(type_tag.clone()).or_default();
+        let mut prepared = Vec::new();
         for (k, f) in methods.iter() {
             let method_name: Arc<str> = match k.unwrap_meta() {
                 Value::Keyword(kw) => Arc::from(kw.get().name.as_ref()),
@@ -8577,8 +8576,13 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             };
-            table.insert(method_name, f.clone());
+            let function =
+                cljrs_value::publish::publish_for_owner(f.clone(), proto as *const _ as usize);
+            prepared.push((method_name, function));
         }
+        let mut impls = proto.impls.lock().unwrap();
+        let table = impls.entry(type_tag.clone()).or_default();
+        table.extend(prepared);
     }
     cljrs_value::bump_protocol_generation();
     Ok(Value::Nil)

@@ -1446,11 +1446,12 @@ pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value)
         // Fall back to the interpreter for lazy/cons inputs, then count.
         let pred_val = pred_ref.clone();
         let coll_val = coll_ref.clone();
-        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
-        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
-            return rt_const_nil();
-        }
-        return unsafe { rt_count(seq) };
+        return call_global_then(
+            "clojure.core",
+            "filter",
+            vec![pred_val, coll_val],
+            |seq| unsafe { rt_count(&seq) },
+        );
     };
     let mut n: usize = 0;
     for elem in elems {
@@ -1529,12 +1530,12 @@ pub unsafe extern "C" fn rt_into_filter(
         let to_val = to_ref.clone();
         let pred_val = pred_ref.clone();
         let coll_val = coll_ref.clone();
-        let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
-        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
-            return rt_const_nil();
-        }
-        let seq_val = unsafe { val_ref(seq) }.clone();
-        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+        return call_global_then(
+            "clojure.core",
+            "filter",
+            vec![pred_val, coll_val],
+            |seq_val| call_global_fn("clojure.core", "into", vec![to_val, seq_val]),
+        );
     };
     match to_ref {
         Value::Set(SetValue::Hash(set_ptr)) => {
@@ -1601,12 +1602,9 @@ pub unsafe extern "C" fn rt_into_mapcat(
         let to_val = to_ref.clone();
         let f_val = f_ref.clone();
         let coll_val = coll_ref.clone();
-        let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
-        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
-            return rt_const_nil();
-        }
-        let seq_val = unsafe { val_ref(seq) }.clone();
-        call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+        call_global_then("clojure.core", "mapcat", vec![f_val, coll_val], |seq_val| {
+            call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+        })
     };
 
     let Some(elems) = eager_seq_elems(coll_ref) else {
@@ -1726,12 +1724,9 @@ pub unsafe extern "C" fn rt_into_map(
         let to_val = to_ref.clone();
         let f_val = f_ref.clone();
         let coll_val = coll_ref.clone();
-        let seq = call_global_fn("clojure.core", "map", vec![f_val, coll_val]);
-        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
-            return rt_const_nil();
-        }
-        let seq_val = unsafe { val_ref(seq) }.clone();
-        return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
+        return call_global_then("clojure.core", "map", vec![f_val, coll_val], |seq_val| {
+            call_global_fn("clojure.core", "into", vec![to_val, seq_val])
+        });
     };
 
     let mut mapped: Vec<Value> = Vec::with_capacity(elems.len());
@@ -2048,14 +2043,14 @@ pub unsafe extern "C" fn rt_make_fn(
     let ncaptures = ncaptures as usize;
 
     // Clone captured values so they outlive this call.
-    let captured_values: Vec<Value> = if ncaptures > 0 {
+    let captured_values: Arc<[Value]> = if ncaptures > 0 {
         let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
         capture_slice
             .iter()
             .map(|p| unsafe { val_ref(*p) }.clone())
             .collect()
     } else {
-        vec![]
+        Arc::from([])
     };
 
     // Store the raw function pointer as a usize for the closure.
@@ -2080,7 +2075,7 @@ pub unsafe extern "C" fn rt_make_fn(
             let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
 
             // Add captured values as pointers
-            for cap in &captured_values {
+            for cap in captured_values.iter() {
                 all_ptrs.push(box_val(cap.clone()));
             }
 
@@ -2127,14 +2122,14 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
     let fixed_count = fixed_param_count as usize;
     let ncaptures = ncaptures as usize;
 
-    let captured_values: Vec<Value> = if ncaptures > 0 {
+    let captured_values: Arc<[Value]> = if ncaptures > 0 {
         let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
         capture_slice
             .iter()
             .map(|p| unsafe { val_ref(*p) }.clone())
             .collect()
     } else {
-        vec![]
+        Arc::from([])
     };
 
     let fn_addr = fn_ptr as usize;
@@ -2158,7 +2153,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
             let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_compiled_params);
 
             // Add captured values
-            for cap in &captured_values {
+            for cap in captured_values.iter() {
                 all_ptrs.push(box_val(cap.clone()));
             }
 
@@ -2226,14 +2221,14 @@ pub unsafe extern "C" fn rt_make_fn_multi(
         .collect();
 
     // Clone captured values.
-    let captured_values: Vec<Value> = if ncaptures > 0 {
+    let captured_values: Arc<[Value]> = if ncaptures > 0 {
         let capture_slice = unsafe { std::slice::from_raw_parts(captures, ncaptures) };
         capture_slice
             .iter()
             .map(|p| unsafe { val_ref(*p) }.clone())
             .collect()
     } else {
-        vec![]
+        Arc::from([])
     };
 
     // Determine arity info for the NativeFn.
@@ -2261,7 +2256,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
             if let Some(&(fn_addr, _pc, _v)) = matched {
                 let total_params = ncaptures + argc;
                 let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_params);
-                for cap in &captured_values {
+                for cap in captured_values.iter() {
                     all_ptrs.push(box_val(cap.clone()));
                 }
                 for arg in args {
@@ -2278,7 +2273,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 // Compiled function receives: captures + fixed_params + 1 (rest list)
                 let total_compiled = ncaptures + fixed_count + 1;
                 let mut all_ptrs: Vec<*const Value> = Vec::with_capacity(total_compiled);
-                for cap in &captured_values {
+                for cap in captured_values.iter() {
                     all_ptrs.push(box_val(cap.clone()));
                 }
                 for arg in &args[..fixed_count] {
@@ -3327,6 +3322,20 @@ pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
     }
 }
 
+fn box_eval_result(result: cljrs_runtime::env::error::EvalResult) -> *const Value {
+    use cljrs_runtime::env::error::EvalError;
+    use cljrs_value::ValueError;
+    match result {
+        Ok(value) => box_val(value),
+        Err(EvalError::Thrown(value)) => signal_error(ValueError::Thrown(value)),
+        Err(EvalError::GasExhausted) => signal_error(ValueError::GasExhausted),
+        Err(EvalError::MemoryLimitExceeded(fault)) => {
+            signal_error(ValueError::MemoryLimitExceeded(fault))
+        }
+        Err(other) => signal_error(ValueError::Other(other.to_string())),
+    }
+}
+
 // ── Atom operations ─────────────────────────────────────────────────────────
 
 /// `(reset! atom val)`.
@@ -3338,17 +3347,10 @@ pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
 pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) -> *const Value {
     let atom = unsafe { val_ref(atom) };
     let val = unsafe { val_ref(val) }.clone();
-    match atom {
-        Value::Atom(a) => box_val(a.get().reset(val)),
-        Value::SharedAtom(sa) => match cljrs_value::promote(&val) {
-            Ok(sv) => match sa.try_reset(sv) {
-                Ok(_) => box_val(val),
-                Err(fault) => signal_error(cljrs_value::ValueError::MemoryLimitExceeded(fault)),
-            },
-            Err(error) => signal_error(error.into_value_error()),
-        },
-        _ => rt_const_nil(),
-    }
+    let result = cljrs_runtime::env::callback::with_eval_context(|env| {
+        cljrs_runtime::interp::apply::eval_reset_bang(vec![atom.clone(), val], env)
+    });
+    box_eval_result(result)
 }
 
 /// `(swap! atom f & args)`.
@@ -3377,54 +3379,12 @@ pub unsafe extern "C" fn rt_atom_swap(
         vec![]
     };
 
-    match atom_val {
-        Value::Atom(a) => {
-            // swap! semantics: (f current-val extra-args...)
-            // CAS loop
-            loop {
-                let current = a.get().value.lock().unwrap().clone();
-                #[cfg(feature = "no-gc")]
-                let _previous_payload = cljrs_gc::region::RegionLease::for_value(&current);
-                let mut args = vec![current.clone()];
-                args.extend(extra.iter().cloned());
-                match cljrs_runtime::env::callback::invoke(&f, args) {
-                    Ok(new_val) => {
-                        if a.get().compare_and_set(&current, new_val.clone()) {
-                            return box_val(new_val);
-                        }
-                        // CAS failed, retry
-                    }
-                    Err(error) => return signal_error(error),
-                }
-            }
-        }
-        Value::SharedAtom(sa) => {
-            // Cross-isolate swap!: load → demote → apply f → promote → CAS-retry.
-            loop {
-                let cur = sa.deref_val();
-                let mut args = vec![cljrs_value::demote(&cur)];
-                args.extend(extra.iter().cloned());
-                match cljrs_runtime::env::callback::invoke(&f, args) {
-                    Ok(new_val) => match cljrs_value::promote(&new_val) {
-                        Ok(sv) => {
-                            match sa.try_compare_and_set(&cur, sv) {
-                                Ok(true) => return box_val(new_val),
-                                Ok(false) => {} // CAS failed, retry.
-                                Err(fault) => {
-                                    return signal_error(
-                                        cljrs_value::ValueError::MemoryLimitExceeded(fault),
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => return signal_error(error.into_value_error()),
-                    },
-                    Err(error) => return signal_error(error),
-                }
-            }
-        }
-        _ => rt_const_nil(),
-    }
+    let mut args = vec![atom_val.clone(), f];
+    args.extend(extra);
+    let result = cljrs_runtime::env::callback::with_eval_context(|env| {
+        cljrs_runtime::interp::apply::eval_swap_bang(args, env)
+    });
+    box_eval_result(result)
 }
 
 // ── Apply ───────────────────────────────────────────────────────────────────
@@ -3453,17 +3413,32 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
 
 // ── Higher-order functions ───────────────────────────────────────────────────
 
-/// Helper: look up a global function by namespace and name, then call it.
+fn call_global_value(ns: &str, name: &str, args: Vec<Value>) -> cljrs_value::ValueResult<Value> {
+    let (globals, _) = cljrs_runtime::env::callback::capture_eval_context()
+        .ok_or_else(|| cljrs_value::ValueError::Other("global call outside eval context".into()))?;
+    let callee = globals
+        .lookup_in_ns(ns, name)
+        .ok_or_else(|| cljrs_value::ValueError::Other(format!("unbound global {ns}/{name}")))?;
+    cljrs_runtime::env::callback::invoke(&callee, args)
+}
 fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
-    if let Some((globals, _)) = cljrs_runtime::env::callback::capture_eval_context()
-        && let Some(val) = globals.lookup_in_ns(ns, name)
-    {
-        match cljrs_runtime::env::callback::invoke(&val, args) {
-            Ok(result) => box_invoke_result(result),
-            Err(error) => signal_error(error),
+    match call_global_value(ns, name, args) {
+        Ok(value) => box_invoke_result(value),
+        Err(error) => signal_error(error),
+    }
+}
+fn call_global_then(
+    ns: &str,
+    name: &str,
+    args: Vec<Value>,
+    next: impl FnOnce(Value) -> *const Value,
+) -> *const Value {
+    match call_global_value(ns, name, args) {
+        Ok(value) => {
+            let _root = cljrs_runtime::env::gc_roots::root_value(&value);
+            next(value.clone())
         }
-    } else {
-        rt_const_nil()
+        Err(error) => signal_error(error),
     }
 }
 
@@ -5656,6 +5631,84 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[test]
+    fn compiled_atom_operations_validate_and_notify_exactly_like_the_interpreter() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                let _alloc = cljrs_gc::push_alloc_frame();
+                let atom = GcPtr::new(cljrs_value::Atom::new(Value::Long(1)));
+                atom.get()
+                    .set_validator(Some(Value::NativeFunction(GcPtr::new(NativeFn::new(
+                        "positive",
+                        Arity::Fixed(1),
+                        |args| Ok(Value::Bool(matches!(args[0], Value::Long(n) if n > 0))),
+                    )))));
+                let changes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let record = changes.clone();
+                atom.get().watches.lock().unwrap().push((
+                    Value::Nil,
+                    Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "watch",
+                        Arity::Fixed(4),
+                        move |args| {
+                            record.borrow_mut().push((args[2].clone(), args[3].clone()));
+                            Ok(Value::Nil)
+                        },
+                    ))),
+                ));
+                let value = Value::Atom(atom.clone());
+                let decrement = Value::NativeFunction(GcPtr::new(NativeFn::new(
+                    "decrement",
+                    Arity::Fixed(1),
+                    |args| {
+                        let Value::Long(n) = args[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Long(n - 1))
+                    },
+                )));
+                assert!(
+                    compiled_result(unsafe {
+                        rt_atom_swap(&value, &decrement, std::ptr::null(), 0)
+                    })
+                    .is_err()
+                );
+                assert_eq!(atom.get().deref(), Value::Long(1));
+                assert!(changes.borrow().is_empty());
+                assert!(
+                    compiled_result(unsafe { rt_atom_reset(&value, &Value::Long(0)) }).is_err()
+                );
+                assert_eq!(atom.get().deref(), Value::Long(1));
+                assert_eq!(
+                    compiled_result(unsafe { rt_atom_reset(&value, &Value::Long(3)) }).unwrap(),
+                    Value::Long(3)
+                );
+                assert_eq!(
+                    compiled_result(unsafe {
+                        rt_atom_swap(&value, &decrement, std::ptr::null(), 0)
+                    })
+                    .unwrap(),
+                    Value::Long(2)
+                );
+                assert_eq!(
+                    *changes.borrow(),
+                    vec![
+                        (Value::Long(1), Value::Long(3)),
+                        (Value::Long(3), Value::Long(2))
+                    ]
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn fused_into_fallbacks_stop_before_into_after_a_failure() {
         std::thread::Builder::new()

@@ -527,7 +527,12 @@ Ownership edges are weak. Cleanup follows affected paths and stops at live owner
 
 Fourth-pass review regressions cover top-level accumulators, replacement of opaque cell contents,
 consumer aliases, failed CAS publication, stale weak edges, and fused fallback failures.
-Unread thread resource failures report immediately and remain typed on their result channel.
+Thread result channels preserve typed resource failures. Unread failures report at channel destruction or executor teardown.
 Buffered takes avoid a second publication scan.
 Recur values use trampoline leases. Permanent atom and volatile contents use replaceable leases.
 Program-lifetime opaque publications without a replaceable owner still retain their actual backing scopes.
+
+Fifth-pass review regressions cover returned update aliases, cached reads without value traversal,
+small payload arenas, repeated top-level reads and Var rebindings, and release of consumed opaque channel values.
+Compiled atom updates share interpreter validators and watches. Native closures share one capture allocation.
+Handled thread resource failures produce no warning. Unread failures report once, including after collection.

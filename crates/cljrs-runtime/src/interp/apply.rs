@@ -976,13 +976,12 @@ fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().value.lock().unwrap().clone();
-            #[cfg(feature = "no-gc")]
-            let _previous_payload = cljrs_gc::region::RegionLease::for_value(&cur);
+            let previous_payload = v.get().snapshot();
+            let cur = previous_payload.value.clone();
             let mut call_args = vec![cur];
             call_args.extend(extra);
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1026,7 +1025,7 @@ fn handle_vreset(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     let new_val = eval(&arg_forms[1], env)?;
     match &vol_val {
         Value::Volatile(v) => {
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1202,10 +1201,9 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().value.lock().unwrap().clone();
-    #[cfg(feature = "no-gc")]
-    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
-    atom.get().reset(new_val.clone());
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1254,14 +1252,13 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
 
-    let old_val = atom.get().value.lock().unwrap().clone();
-    #[cfg(feature = "no-gc")]
-    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
     let mut args = vec![old_val.clone()];
     args.extend(evaled);
     let new_val = crate::env::apply::apply_value(&f, args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
-    atom.get().reset(new_val.clone());
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1441,10 +1438,9 @@ pub fn eval_reset_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
         }
     };
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().value.lock().unwrap().clone();
-    #[cfg(feature = "no-gc")]
-    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
-    atom.get().reset(new_val.clone());
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1471,14 +1467,13 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    let old_val = atom.get().value.lock().unwrap().clone();
-    #[cfg(feature = "no-gc")]
-    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
     let mut call_args = vec![old_val.clone()];
     call_args.extend(args);
     let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
-    atom.get().reset(new_val.clone());
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1512,7 +1507,7 @@ pub fn eval_vreset_bang(args: Vec<Value>) -> EvalResult {
     let new_val = args[1].clone();
     match &args[0] {
         Value::Volatile(v) => {
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1535,13 +1530,12 @@ pub fn eval_vswap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     let f = args.remove(0);
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().value.lock().unwrap().clone();
-            #[cfg(feature = "no-gc")]
-            let _previous_payload = cljrs_gc::region::RegionLease::for_value(&cur);
+            let previous_payload = v.get().snapshot();
+            let cur = previous_payload.value.clone();
             let mut call_args = vec![cur];
             call_args.extend(args);
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(

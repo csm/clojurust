@@ -59,6 +59,8 @@ pub(crate) enum RvStatus {
 #[derive(Debug)]
 struct ChannelState {
     queue: BTreeMap<u64, Value>,
+    #[cfg(feature = "no-gc")]
+    queue_leases: BTreeMap<u64, cljrs_value::publish::ValueLease>,
     next_value: u64,
     next_waiter: u64,
     /// Buffered capacity; `0` means unbuffered (rendezvous).
@@ -69,7 +71,7 @@ struct ChannelState {
     // Retain tracing links after a waiter commits, until its future is consumed.
     registrations: BTreeMap<u64, Waiter>,
     publications: Vec<Publication>,
-    failure: Option<ChannelFailure>,
+    failure: Option<Rc<FailureReport>>,
 }
 #[derive(Debug)]
 enum Publication {
@@ -90,6 +92,40 @@ impl ChannelFailure {
     }
 }
 
+#[derive(Debug)]
+struct FailureReport {
+    error: ChannelFailure,
+    observed: Cell<bool>,
+    reported: Cell<bool>,
+}
+impl FailureReport {
+    fn report(&self) {
+        if !self.observed.get() && !self.reported.replace(true) {
+            eprintln!("[clojurust thread error] {}", self.error.error());
+        }
+    }
+}
+thread_local! {
+    // No managed values. Shared by the isolate so executor teardown also
+    // reports static no-GC channels whose destructors never run.
+    static THREAD_FAILURES: RefCell<Vec<Rc<FailureReport>>> = const { RefCell::new(Vec::new()) };
+}
+pub fn report_unobserved_thread_failures() {
+    let reports = THREAD_FAILURES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    for report in reports {
+        report.report();
+    }
+}
+impl Drop for CljChannel {
+    fn drop(&mut self) {
+        if let Ok(state) = self.state.get_mut()
+            && let Some(failure) = &state.failure
+        {
+            failure.report();
+        }
+    }
+}
+
 /// A CSP channel. See the module docs for the buffering model.
 #[derive(Debug)]
 pub struct CljChannel {
@@ -104,6 +140,8 @@ struct Selection {
     result: RefCell<Option<(Value, usize)>>,
     waker: RefCell<Option<Waker>>,
     take_order: Cell<Option<u64>>,
+    #[cfg(feature = "no-gc")]
+    lease: RefCell<cljrs_value::publish::ValueLease>,
 }
 impl Selection {
     fn new() -> Rc<Self> {
@@ -112,6 +150,8 @@ impl Selection {
             result: RefCell::new(None),
             waker: RefCell::new(None),
             take_order: Cell::new(None),
+            #[cfg(feature = "no-gc")]
+            lease: Default::default(),
         })
     }
     fn finish(&self, value: Value, index: usize) -> Option<Waker> {
@@ -168,7 +208,7 @@ impl Future for Select<'_> {
         if let Some(result) = completed {
             self.selection.take_order.set(None);
             #[cfg(feature = "no-gc")]
-            cljrs_gc::region::RegionLease::for_value(&result.0).protect_current();
+            self.selection.lease.borrow().protect_current();
             return Poll::Ready(result);
         }
         if let Some(default) = self.default.take() {
@@ -219,6 +259,11 @@ impl Drop for Select<'_> {
             let channel = self.ops[index].channel();
             let mut state = channel.state.lock().unwrap();
             state.queue.insert(order, value);
+            #[cfg(feature = "no-gc")]
+            state.queue_leases.insert(
+                order,
+                std::mem::take(&mut *self.selection.lease.borrow_mut()),
+            );
             let wakes = state.service();
             drop(state);
             channel.publish_committed();
@@ -276,6 +321,10 @@ impl ChannelState {
     fn take_buffered(&mut self, selection: &Rc<Selection>) -> Option<Value> {
         let (order, value) = self.queue.pop_first()?;
         selection.take_order.set(Some(order));
+        #[cfg(feature = "no-gc")]
+        if let Some(lease) = self.queue_leases.remove(&order) {
+            *selection.lease.borrow_mut() = lease;
+        }
         // A put can be buffered and matched before this lock is released.
         // Move its pending publication to the receiver instead of losing it
         // when the queue entry disappears. Already-published entries need none.
@@ -331,20 +380,22 @@ impl ChannelState {
     }
 }
 
+struct PublishedValue {
+    value: Value,
+    #[cfg(feature = "no-gc")]
+    lease: cljrs_value::publish::ValueLease,
+}
+
 impl CljChannel {
-    fn publish(&self, value: Value) -> Value {
+    fn publish(&self, value: Value) -> PublishedValue {
         #[cfg(feature = "no-gc")]
-        {
-            if self.owner.is_permanent() {
-                cljrs_value::publish::publish_value(value)
-            } else {
-                self.owner.protect(&value);
-                value
-            }
-        }
+        let (value, lease) = cljrs_value::publish::prepare_for_owner(value, &self.owner);
         #[cfg(not(feature = "no-gc"))]
-        {
-            cljrs_value::publish::publish_value(value)
+        let value = cljrs_value::publish::publish_value(value);
+        PublishedValue {
+            value,
+            #[cfg(feature = "no-gc")]
+            lease,
         }
     }
     fn publish_committed(&self) {
@@ -355,29 +406,45 @@ impl CljChannel {
                     let value = self.state.lock().unwrap().queue.get(&order).cloned();
                     if let Some(value) = value {
                         let published = self.publish(value);
-                        self.state.lock().unwrap().queue.insert(order, published);
+                        let mut state = self.state.lock().unwrap();
+                        state.queue.insert(order, published.value);
+                        #[cfg(feature = "no-gc")]
+                        state.queue_leases.insert(order, published.lease);
                     }
                 }
                 Publication::Selection(selection) => {
                     let result = selection.result.borrow().clone();
                     if let Some((value, index)) = result {
                         let published = self.publish(value);
-                        *selection.result.borrow_mut() = Some((published, index));
+                        *selection.result.borrow_mut() = Some((published.value, index));
+                        #[cfg(feature = "no-gc")]
+                        {
+                            *selection.lease.borrow_mut() = published.lease;
+                        }
                     }
                 }
             }
         }
     }
     pub(crate) fn fail(&self, failure: ChannelFailure) {
-        self.state.lock().unwrap().failure = Some(failure);
+        let report = Rc::new(FailureReport {
+            error: failure,
+            observed: Cell::new(false),
+            reported: Cell::new(false),
+        });
+        THREAD_FAILURES.with(|slot| {
+            let mut reports = slot.borrow_mut();
+            reports.retain(|report| !report.observed.get() && !report.reported.get());
+            reports.push(report.clone());
+        });
+        self.state.lock().unwrap().failure = Some(report);
         self.close();
     }
     pub(crate) fn failure(&self) -> Option<cljrs_value::ValueError> {
-        self.state
-            .lock()
-            .unwrap()
-            .failure
-            .map(ChannelFailure::error)
+        self.state.lock().unwrap().failure.as_ref().map(|report| {
+            report.observed.set(true);
+            report.error.error()
+        })
     }
     /// Take a value and preserve a producer's resource-limit failure.
     pub async fn take_result(&self) -> cljrs_value::ValueResult<Value> {
@@ -450,6 +517,8 @@ impl CljChannel {
             owner: cljrs_gc::region::AllocationOwner::current(),
             state: Mutex::new(ChannelState {
                 queue: BTreeMap::new(),
+                #[cfg(feature = "no-gc")]
+                queue_leases: BTreeMap::new(),
                 next_value: 0,
                 next_waiter: 0,
                 capacity,
@@ -490,7 +559,7 @@ impl CljChannel {
         let completed = selection.result.borrow_mut().take();
         completed.map(|(value, _)| {
             #[cfg(feature = "no-gc")]
-            cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+            selection.lease.borrow().protect_current();
             value
         })
     }
@@ -570,6 +639,8 @@ impl CljChannel {
         }
         if st.closed {
             st.queue.remove(&token); // cancel only our still-pending offer
+            #[cfg(feature = "no-gc")]
+            st.queue_leases.remove(&token);
             return RvStatus::ClosedUntaken;
         }
         RvStatus::Waiting
@@ -577,6 +648,12 @@ impl CljChannel {
 }
 
 impl Trace for CljChannel {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut MarkVisitor) {
+        // Queue entries own cached payload leases. Leasing the channel must
+        // not snapshot its current contents into an unrelated permanent root.
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut MarkVisitor) {
         let st = self.state.lock().unwrap();
         for v in st.queue.values() {
@@ -840,6 +917,54 @@ mod notification_tests {
 #[cfg(test)]
 mod review_publication_tests {
     use super::*;
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn permanent_channels_release_opaque_payloads_after_the_take_scope_closes() {
+        #[derive(Debug)]
+        struct Probe(std::rc::Rc<Cell<bool>>);
+        impl Trace for Probe {
+            fn trace(&self, _: &mut MarkVisitor) {}
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let object = cljrs_value::gc_native_object(CljChannel::new(1));
+        let channel = object.get().downcast_ref::<CljChannel>().unwrap();
+        let var = cljrs_gc::GcPtr::new(cljrs_value::Var::new("user", "channel"));
+        for _ in 0..100 {
+            let dropped = Rc::new(Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _temporary = cljrs_gc::GcPtr::new(Probe(dropped.clone()));
+                let value = Value::NativeFunction(cljrs_gc::GcPtr::new(
+                    cljrs_value::NativeFn::with_captures(
+                        "payload",
+                        cljrs_value::Arity::Fixed(0),
+                        vec![Value::string("alive")],
+                        |captures, _| Ok(captures[0].clone()),
+                    ),
+                ));
+                assert_eq!(channel.try_put_buffered(&value), Some(true));
+            }
+            assert!(!dropped.get());
+            var.get().bind(Value::NativeObject(object.clone()));
+            {
+                let _consumer = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let Value::NativeFunction(f) = channel.try_take().unwrap() else {
+                    unreachable!()
+                };
+                assert_eq!((f.get().func)(&[]).unwrap().to_string(), "\"alive\"");
+                assert!(!dropped.get());
+            }
+            assert!(
+                dropped.get(),
+                "a drained permanent channel retained its old payload"
+            );
+        }
+    }
+
     #[test]
     fn a_buffered_offer_matched_before_unlock_keeps_its_one_publication() {
         let channel = CljChannel::new(0);

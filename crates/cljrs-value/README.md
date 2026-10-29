@@ -563,7 +563,7 @@ correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
 `CljxPromise::deliver`, and `cljrs-async`'s channel puts.
 Under `no-gc`, regional destinations transfer backing scopes.
-Replaceable atom and volatile contents use leases. Other static destinations copy proven finite immutable data.
+Replaceable cells, Var roots, and channel entries use cached leases and compact arenas for small finite payloads.
 
 ### `Namespace` (Phase 4)
 
@@ -1026,34 +1026,45 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
-In `no-gc` builds, `publish::publish_value` copies proven finite immutable data into static storage.
-It retains actual backing scopes for opaque values. Pending lazy sequences and mutable identities never enter serialization.
-`publish::publish_for_owner(value, address)` uses that policy for static destinations and transfers scopes for regional destinations.
-`publish::publish_return(value)` applies the same policy to completed function and loop results.
-Recur values use a replaceable lease owned by the trampoline. They do not enter static storage on each iteration.
-Static data has program lifetime. Copying finite data prevents unused caller temporaries from sharing that lifetime.
-Atoms and volatiles keep replaceable leases for contents stored in permanent cells.
-Updates preserve structural sharing and release obsolete scopes after their last consumer releases them.
-Reads transfer ownership into the consumer scope. Update callbacks hold temporary leases without retaining the previous payload through the new payload.
-Regional cells keep their contents for their owner scope. Bounded invocations retain their original allocation rules.
-`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` publishes only after its initial equality check succeeds.
-Interpreter, native, and compiled CAS operations use this method.
-The public `value` field remains available for compatibility. Direct writes bypass the ownership barrier.
-Use `reset` or `compare_and_set` for writes.
-Scalar vectors maintain a conservative summary so ownership tracing skips their elements.
-Unobserved future failures warn on drop, including gas exhaustion and memory-limit failures.
-Isolated allocation invocations keep their bounded lifetime rules.
+In `no-gc` builds, `publish::publish_value` copies finite immutable data into static storage at explicit program-lifetime boundaries.
+Unowned opaque publications retain their backing scopes. Pending sequences and mutable identities never enter serialization.
+`publish::publish_return(value)` transfers results into the caller or its active `ReadScope`.
+The evaluator publishes only its final escaping result after that read scope ends.
+Recur values use a replaceable trampoline lease.
 
-`NativeFn::captures: Vec<Value>` records managed values retained by an opaque
-Rust callable. Its `Trace` implementation visits each value. Constructors start
-with an empty vector. Compiled and IR closure adapters fill this vector so
-suspended fibers retain their closure captures through collection.
-Rust embedders must record any managed captures in this vector.
+`publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
+Small finite graphs use a dedicated arena, with a budget of 32 values and 4096 bytes per string.
+This arena contains no unrelated caller temporaries. Larger or unsupported shapes keep their backing scopes and preserve structural sharing.
+Opaque values preserve identity and laziness.
+Permanent destinations own their current payload lease. Regional destinations use ownership edges and cache weak snapshots.
+Ownership tracing records mutable container scopes without snapshotting their current contents.
+Namespace bindings, protocol implementations, and channel entries retain their contents through their own destination ownership.
+`ValueLease` implements `Default` and `Debug`.
+Its `snapshot() -> RegionLease` method acquires temporary ownership without another value traversal.
+Its `protect_current()` method transfers that cached ownership into the caller.
+
+Atoms, volatiles, and Var roots use this shared preparation path, including initial values and replacements.
+Reads reuse cached leases. Their cost depends on the number of backing scopes, without traversal of collection elements.
+Returned updates acquire caller ownership before the cell can replace its payload.
+`Atom::snapshot()` and `Volatile::snapshot()` return `publish::ValueSnapshot` for callbacks and watches.
+This snapshot exposes `value: Value` and keeps its no-GC backing scopes alive until drop.
+Its `protect_current()` method transfers ownership to the caller. Native GC callers still require normal value roots across collections.
+
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` rejects an unequal initial snapshot before publication.
+The public `value` field remains available for compatibility. Direct writes bypass ownership preparation.
+Use `reset`, `compare_and_set`, or `Var::bind` for writes.
+Scalar vectors maintain a summary so ownership tracing skips their elements.
+Unobserved future failures warn on drop, including resource failures. Internal thread delivery futures count as observed.
+Bounded invocations retain their original allocation rules.
+
+`NativeFn::captures: Arc<[Value]>` records managed values retained by a Rust callable.
+The callable and tracer share one immutable allocation. Compiled and IR adapters use the same capture slice.
+For struct literals, convert an existing capture vector with `.into()`.
 
 `NativeFn::with_captures(name, arity, captures, func) -> NativeFn` declares managed
 captures at construction. The callback receives `(&[Value], &[Value])` for captures
-and call arguments. The callback holds a shallow snapshot of the same captured Values.
-Keep the public capture vector unchanged after construction. `with_closure` is for Rust callables without managed captures.
+and call arguments. The callback shares the declared capture slice.
+Keep the public capture handle unchanged after construction. `with_closure` is for Rust callables without managed captures.
 The interop registration helpers require `Send + Sync` host closures, which cannot
 capture isolate-local Values. Transaction host wrappers capture serialized host APIs.
 

@@ -539,6 +539,7 @@ pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut Mutat
     }
     let _restore = Restore(carrier);
     drop(local);
+    crate::channel::report_unobserved_thread_failures();
 }
 
 /// Drive one root and destroy its executor with the matching carrier state.

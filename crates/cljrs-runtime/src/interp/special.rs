@@ -63,14 +63,10 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
     let target = parse_def(args, env)?;
+    #[cfg(feature = "no-gc")]
+    let _payload_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let val = match target.value_form {
-        Some(form) => {
-            // Under no-gc: def value expressions go to the StaticArena since the
-            // Var must outlive all scratch regions.
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-            eval(form, env)?
-        }
+        Some(form) => eval(form, env)?,
         None => Value::Nil,
     };
     intern_def(target, val, env)
@@ -1232,10 +1228,8 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
-    // Under no-gc: the Fn object must live in the StaticArena since the Var
-    // intern outlives all scratch regions.
     #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let _payload_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let mut fn_val = eval_fn(&fn_args, env)?;
     if is_async && let Value::Fn(ref mut f) = fn_val {
         f.get_mut().is_async = true;
@@ -2409,6 +2403,10 @@ fn register_impls_for_tag(
                     None => continue,
                 };
                 let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
+                let fn_val = cljrs_value::publish::publish_for_owner(
+                    fn_val,
+                    proto.get() as *const _ as usize,
+                );
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls
                     .entry(type_tag.clone())

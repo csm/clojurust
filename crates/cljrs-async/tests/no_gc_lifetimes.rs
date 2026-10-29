@@ -318,3 +318,73 @@ fn top_level_accumulators_and_replaced_opaque_values_do_not_accumulate_static_co
         .join()
         .unwrap();
 }
+
+#[test]
+fn returned_updates_and_top_level_reads_release_obsolete_backing_scopes() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap();
+            let mut env = Env::new(runtime.globals().clone(), "user");
+            let evaluate = |source: &str, env: &mut Env| {
+                for form in
+                    cljrs_reader::Parser::new(source.into(), "<returned-cell-values>".into())
+                        .parse_all()
+                        .unwrap()
+                {
+                    cljrs_runtime::interp::eval::eval(&form, env).unwrap();
+                }
+            };
+            evaluate(
+                r#"
+            (def a (atom (zipmap (range 40) (repeat nil))))
+            (def v (volatile! (zipmap (range 40) (repeat nil))))
+            (defn seed-a [] (swap! a assoc :j (str "shared" " text")) nil)
+            (defn seed-v [] (vswap! v assoc :j (str "shared" " text")) nil)
+            (defn take-a []
+              (let [m (swap! a assoc :k 1)]
+                (reset! a {})
+                (dotimes [i 100] (str "reuse " i))
+                (assert (= "shared text" (get m :j)))))
+            (defn take-v []
+              (let [m (vswap! v assoc :k 1)]
+                (vreset! v {})
+                (dotimes [i 100] (str "reuse " i))
+                (assert (= "shared text" (get m :j)))))
+            (seed-a) (take-a) (seed-v) (take-v)
+            (let [captured (the-ns 'user)] (def namespace-reader (fn [] captured)))
+            (assert (identical? *ns* (namespace-reader)))
+            (def namespace-reader nil)
+        "#,
+                &mut env,
+            );
+            let retired =
+                || cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap();
+            // Warm the macro and formatter paths before comparing repeated batches.
+            let workload = r#"
+            (def f (let [captured (str "captured" " closure")] (fn [] captured)))
+            (assert (= "captured closure" (f)))
+            (def f nil)
+            (swap! a assoc :j (str "new" " payload"))
+            (with-out-str (println @a))
+            (reset! a {})
+        "#;
+            evaluate(workload, &mut env);
+            let baseline = retired();
+            for _ in 0..100 {
+                evaluate(workload, &mut env);
+                assert_eq!(
+                    retired(),
+                    baseline,
+                    "a transient top-level read or Var rebind permanently retained a version"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -5,6 +5,29 @@ use cljrs_value::{Arity, NativeFn, Value, ValueError};
 
 #[test]
 fn thread_resource_failures_reach_every_consumer_and_bypass_catch() {
+    const CHILD: &str = "CLJRS_REVIEW_HANDLED_THREAD_LIMITS";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "thread_resource_failures_reach_every_consumer_and_bypass_catch",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            !stderr.contains("[clojurust thread error]"),
+            "handled failure was reported: {stderr}"
+        );
+        assert!(
+            !stderr.contains("a failed future was discarded"),
+            "internal delivery produced a duplicate warning: {stderr}"
+        );
+        return;
+    }
     std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
         for memory in [false, true] {
             for read in ["(a/<!! ch)", "@(a/take! ch)", "(a/alts!! [ch])", "(do (sleep 1) (a/poll! ch))"] {
@@ -25,6 +48,9 @@ fn thread_resource_failures_reach_every_consumer_and_bypass_catch() {
                     for form in &forms { cljrs_runtime::tiered::eval(form, &mut env)?; }
                     Ok(Value::Nil)
                 });
+                let env = Env::new(runtime.globals().clone(), "user");
+                cljrs_runtime::env::gc_roots::force_collect(&env);
+                cljrs_runtime::env::gc_roots::force_collect(&env);
                 if memory { assert!(matches!(result, Err(EvalError::MemoryLimitExceeded(_))), "{read}: {result:?}"); }
                 else { assert!(matches!(result, Err(EvalError::GasExhausted)), "{read}: {result:?}"); }
             }
@@ -51,6 +77,10 @@ fn unread_thread_resource_errors_are_reported_without_a_collection() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("a failed future was discarded"),
+            "duplicate delivery warning: {stderr}"
+        );
         assert_eq!(
             stderr.matches("[clojurust thread error]").count(),
             2,
@@ -107,6 +137,9 @@ fn unread_thread_resource_errors_are_reported_without_a_collection() {
                     Ok(Value::Nil)
                 })
                 .unwrap();
+                let env = Env::new(runtime.globals().clone(), "user");
+                cljrs_runtime::env::gc_roots::force_collect(&env);
+                cljrs_runtime::env::gc_roots::force_collect(&env);
             }
         })
         .unwrap()

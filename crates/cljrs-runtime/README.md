@@ -1746,7 +1746,7 @@ A `set!` update retains its backing scopes for that frame's lifetime.
 Values written by nested calls remain valid after those calls release their scratch storage.
 Object-array writes use the destination ownership barrier before storing an element.
 
-No-gc results and dynamic-binding writes copy proven finite immutable data when their destination has program lifetime.
+No-gc final results and dynamic-binding writes copy finite immutable data at explicit program-lifetime boundaries.
 Regional destinations retain backing scopes through ownership edges. Pending sequences and mutable identities preserve their original objects.
 
 No-gc recur values use a lease owned by the function or loop trampoline.
@@ -1754,3 +1754,12 @@ Each iteration replaces this lease before it releases the previous iteration.
 Atom and volatile updates evaluate in the current allocation context.
 The cells lease new contents and release replaced contents after their last consumer releases them.
 Update callbacks and watches hold temporary leases for the previous contents.
+
+The no-GC evaluator bounds temporary reads with `region::ReadScope`.
+Intermediate reads transfer cached leases into that scope. Only the final escaping result receives program-lifetime publication.
+Definition expressions use scratch storage. Namespace and Var containers remain permanent, while Var payloads use replaceable leases.
+Protocol method registration transfers function ownership before it stores the implementation.
+Atom and volatile update callbacks use cached snapshots for previous contents.
+Their returned values acquire caller ownership, including shared children from earlier versions.
+Small finite cell payloads use compact arenas. Other payloads preserve structural sharing and identity.
+Native and IR closures share one immutable capture slice between execution and tracing.

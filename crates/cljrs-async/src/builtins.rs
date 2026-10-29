@@ -337,7 +337,7 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
             .map_err(|error| ValueError::Other(error.to_string()))?,
     );
     let anchor = ch_val.clone();
-    spawn_future(async move {
+    let delivery = spawn_future(async move {
         let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
         match body.await {
             Ok(value) if !matches!(value, Value::Nil) => {
@@ -345,15 +345,10 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
             }
             Ok(_) => {}
             Err(error @ EvalError::GasExhausted) => {
-                eprintln!("[clojurust thread error] {error}");
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);
                 return Err(error);
             }
             Err(EvalError::MemoryLimitExceeded(fault)) => {
-                eprintln!(
-                    "[clojurust thread error] {}",
-                    EvalError::MemoryLimitExceeded(fault)
-                );
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Memory(fault));
                 return Err(EvalError::MemoryLimitExceeded(fault));
             }
@@ -362,6 +357,9 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
         chan_ref(result_ch.get()).close();
         Ok(Value::Nil)
     });
+    if let Value::Future(future) = delivery {
+        future.get().mark_observed();
+    }
     Ok(ch_val)
 }
 

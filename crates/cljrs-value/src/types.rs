@@ -160,6 +160,11 @@ pub fn bump_protocol_generation() {
 }
 
 impl cljrs_gc::Trace for Protocol {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {
+        // Mutable contents own their destination leases independently.
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let impls = self.impls.lock().unwrap();
@@ -359,6 +364,8 @@ pub struct Var {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
     pub value: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
     /// Cross-isolate mirror of the root binding (Phase B3).  `None` when the
     /// var is unbound or its current root is not promotable.
     pub shared_root: Arc<arc_swap::ArcSwap<Option<crate::shared::SharedValue>>>,
@@ -375,6 +382,8 @@ impl Var {
             namespace: namespace.into(),
             name: name.into(),
             value: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            value_lease: Default::default(),
             shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             is_macro: false,
             meta: TrackedMutex::new(None),
@@ -400,10 +409,23 @@ impl Var {
             .as_ref()
             .as_ref()
             .map(crate::shared::demote);
+        #[cfg(feature = "no-gc")]
+        let (local, lease) = match local {
+            Some(value) => {
+                let (value, lease) = crate::publish::prepare_for_owner(
+                    value,
+                    &cljrs_gc::region::AllocationOwner::current(),
+                );
+                (Some(value), lease)
+            }
+            None => (None, Default::default()),
+        };
         Self {
             namespace: namespace.into(),
             name: name.into(),
             value: TrackedMutex::new(local),
+            #[cfg(feature = "no-gc")]
+            value_lease: std::cell::RefCell::new(lease),
             shared_root,
             is_macro,
             meta: TrackedMutex::new(None),
@@ -417,7 +439,10 @@ impl Var {
     }
 
     pub fn deref(&self) -> Option<Value> {
-        self.value.lock().unwrap().clone()
+        let value = self.value.lock().unwrap().clone();
+        #[cfg(feature = "no-gc")]
+        self.value_lease.borrow().protect_current();
+        value
     }
 
     /// Generation of the isolate-local root binding, incremented after each
@@ -440,15 +465,14 @@ impl Var {
     }
 
     pub fn bind(&self, v: Value) {
-        // GC builds: heap-promotion fallback — a region-allocated value bound
-        // to a program-lifetime var is deep-copied to the heap (or the active
-        // regions are retired when it cannot be).  One depth check when no
-        // region is open.
-        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
-        // Static destinations must retain every non-static source after publication.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
+        #[cfg(not(feature = "no-gc"))]
+        let v = crate::publish::publish_value(v);
+        #[cfg(feature = "no-gc")]
+        let previous_lease = self.value_lease.borrow().snapshot();
+        #[cfg(feature = "no-gc")]
+        let (v, lease) = crate::publish::prepare_for_owner(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
         );
         // Replace the binding, holding the lock only across the swap.  The
         // previous value (if any) is handed to the JIT rebind hook so it can
@@ -459,6 +483,10 @@ impl Var {
             let mut slot = self.value.lock().unwrap();
             slot.replace(v.clone())
         };
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         // Promote-on-`def` (Phase B3): mirror the new root into the
         // cross-isolate cell when it is promotable, else clear the cell so it
         // never advertises a stale or non-shareable root.  `def` is rare and
@@ -471,6 +499,10 @@ impl Var {
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
         }
+        #[cfg(feature = "no-gc")]
+        {
+            drop(previous_lease);
+        }
     }
 
     pub fn get_meta(&self) -> Option<Value> {
@@ -478,6 +510,7 @@ impl Var {
     }
 
     pub fn set_meta(&self, m: Value) {
+        let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
         *self.meta.lock().unwrap() = Some(m);
     }
 
@@ -488,6 +521,7 @@ impl Var {
 
 impl cljrs_gc::Trace for Var {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             if let Some(v) = value.as_ref() {
@@ -517,7 +551,7 @@ impl cljrs_gc::Trace for Var {
 pub struct Atom {
     pub value: TrackedMutex<Value>,
     #[cfg(feature = "no-gc")]
-    value_lease: std::cell::RefCell<cljrs_gc::region::RegionLease>,
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
     pub meta: TrackedMutex<Option<Value>>,
     pub validator: TrackedMutex<Option<Value>>,
     pub watches: TrackedMutex<Vec<(Value, Value)>>,
@@ -528,51 +562,50 @@ impl Atom {
         // Heap-promotion fallback (GC builds): an atom is program-lifetime
         // shared state, so its initial value must not be region-allocated.
         #[cfg(feature = "no-gc")]
-        let v = crate::publish::publish_return(v);
+        let (v, lease) =
+            crate::publish::prepare_for_owner(v, &cljrs_gc::region::AllocationOwner::current());
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
             #[cfg(feature = "no-gc")]
-            value_lease: Default::default(),
+            value_lease: std::cell::RefCell::new(lease),
             meta: TrackedMutex::new(None),
             validator: TrackedMutex::new(None),
             watches: TrackedMutex::new(Vec::new()),
         }
     }
 
+    pub fn snapshot(&self) -> crate::publish::ValueSnapshot {
+        crate::publish::ValueSnapshot {
+            value: self.value.lock().unwrap().clone(),
+            #[cfg(feature = "no-gc")]
+            lease: self.value_lease.borrow().snapshot(),
+        }
+    }
+
     pub fn deref(&self) -> Value {
-        let value = self.value.lock().unwrap().clone();
-        #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
-        value
+        let snapshot = self.snapshot();
+        snapshot.protect_current();
+        snapshot.value
     }
 
     pub fn reset(&self, v: Value) -> Value {
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         #[cfg(feature = "no-gc")]
-        let lease = self.lease_value(&v);
+        let (v, lease) = crate::publish::prepare_for_owner(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(feature = "no-gc")]
+        lease.protect_current();
         *self.value.lock().unwrap() = v.clone();
         #[cfg(feature = "no-gc")]
         {
             *self.value_lease.borrow_mut() = lease;
         }
         v
-    }
-
-    #[cfg(feature = "no-gc")]
-    fn lease_value(&self, value: &Value) -> cljrs_gc::region::RegionLease {
-        if cljrs_gc::alloc_ctx::invocation_is_active() {
-            return Default::default();
-        }
-        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
-        if owner.is_permanent() {
-            cljrs_gc::region::RegionLease::for_value(value)
-        } else {
-            owner.protect(value);
-            Default::default()
-        }
     }
 
     /// Replace the value only if it still equals `expected`.
@@ -590,7 +623,10 @@ impl Atom {
         #[cfg(not(feature = "no-gc"))]
         let value = crate::publish::publish_value(value);
         #[cfg(feature = "no-gc")]
-        let lease = self.lease_value(&value);
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
         let mut guard = self.value.lock().unwrap();
         if !matches_expected(&guard) {
             return false;
@@ -623,6 +659,7 @@ impl Atom {
 
 impl cljrs_gc::Trace for Atom {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             value.trace(visitor);
@@ -747,11 +784,17 @@ impl Namespace {
     }
 
     pub fn set_meta(&self, m: Value) {
+        let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
         *self.meta.lock().unwrap() = Some(m);
     }
 }
 
 impl cljrs_gc::Trace for Namespace {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {
+        // Mutable contents own their destination leases independently.
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         {
@@ -797,7 +840,7 @@ pub struct NativeFn {
     pub arity: Arity,
     pub func: NativeFnFunc,
     /// Managed values retained by the opaque callable closure.
-    pub captures: Vec<Value>,
+    pub captures: Arc<[Value]>,
     /// Optional adapter that marshals owned inputs and offloads native work.
     pub blocking_func: Option<NativeFnFunc>,
 }
@@ -809,7 +852,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
-            captures: Vec::new(),
+            captures: Default::default(),
             func: Arc::new(move |args| {
                 crate::realization::catch(|| func(args))
                     .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
@@ -828,7 +871,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
-            captures: Vec::new(),
+            captures: Default::default(),
             func: Arc::new(move |args| {
                 crate::realization::catch(|| func(args))
                     .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
@@ -837,15 +880,15 @@ impl NativeFn {
     }
 
     /// Create a callable with explicit managed captures for precise tracing.
-    /// The callback receives an immutable snapshot of the declared captures.
-    /// The closure holds a shallow copy of the same Values; callers must not
-    /// change the public `captures` vector after construction.
+    /// The callback and tracer share one immutable capture slice.
+    /// Callers must not replace the public `captures` handle after construction.
     pub fn with_captures(
         name: impl Into<Arc<str>>,
         arity: Arity,
         captures: Vec<Value>,
         func: impl Fn(&[Value], &[Value]) -> crate::ValueResult<Value> + 'static,
     ) -> Self {
+        let captures: Arc<[Value]> = captures.into();
         let shared = captures.clone();
         let mut native = Self::with_closure(name, arity, move |args| func(&shared, args));
         native.captures = captures;
@@ -904,7 +947,7 @@ impl std::fmt::Debug for NativeFn {
 
 impl cljrs_gc::Trace for NativeFn {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        for value in &self.captures {
+        for value in self.captures.iter() {
             value.trace(visitor);
         }
     }
@@ -1272,55 +1315,54 @@ impl cljrs_gc::Trace for CljxCons {
 pub struct Volatile {
     pub value: TrackedMutex<Value>,
     #[cfg(feature = "no-gc")]
-    value_lease: std::cell::RefCell<cljrs_gc::region::RegionLease>,
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
 }
 
 impl Volatile {
     pub fn new(v: Value) -> Self {
         // GC builds: heap-promotion fallback (see `Var::bind`).
         #[cfg(feature = "no-gc")]
-        let v = crate::publish::publish_return(v);
+        let (v, lease) =
+            crate::publish::prepare_for_owner(v, &cljrs_gc::region::AllocationOwner::current());
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
             #[cfg(feature = "no-gc")]
-            value_lease: Default::default(),
+            value_lease: std::cell::RefCell::new(lease),
+        }
+    }
+
+    pub fn snapshot(&self) -> crate::publish::ValueSnapshot {
+        crate::publish::ValueSnapshot {
+            value: self.value.lock().unwrap().clone(),
+            #[cfg(feature = "no-gc")]
+            lease: self.value_lease.borrow().snapshot(),
         }
     }
 
     pub fn deref(&self) -> Value {
-        let value = self.value.lock().unwrap().clone();
-        #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
-        value
+        let snapshot = self.snapshot();
+        snapshot.protect_current();
+        snapshot.value
     }
 
     pub fn reset(&self, v: Value) -> Value {
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         #[cfg(feature = "no-gc")]
-        let lease = self.lease_value(&v);
+        let (v, lease) = crate::publish::prepare_for_owner(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(feature = "no-gc")]
+        lease.protect_current();
         *self.value.lock().unwrap() = v.clone();
         #[cfg(feature = "no-gc")]
         {
             *self.value_lease.borrow_mut() = lease;
         }
         v
-    }
-
-    #[cfg(feature = "no-gc")]
-    fn lease_value(&self, value: &Value) -> cljrs_gc::region::RegionLease {
-        if cljrs_gc::alloc_ctx::invocation_is_active() {
-            return Default::default();
-        }
-        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
-        if owner.is_permanent() {
-            cljrs_gc::region::RegionLease::for_value(value)
-        } else {
-            owner.protect(value);
-            Default::default()
-        }
     }
 }
 
@@ -1332,6 +1374,7 @@ impl std::fmt::Debug for Volatile {
 
 impl cljrs_gc::Trace for Volatile {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             value.trace(visitor);
@@ -1795,6 +1838,18 @@ impl cljrs_gc::Trace for Agent {
 mod var_tests {
     use super::*;
     use crate::shared::SharedValue;
+
+    #[test]
+    fn native_captures_share_one_immutable_allocation() {
+        let native = NativeFn::with_captures(
+            "capture",
+            Arity::Fixed(0),
+            vec![Value::Long(7)],
+            |captures, _| Ok(captures[0].clone()),
+        );
+        assert_eq!(Arc::strong_count(&native.captures), 2);
+        assert_eq!((native.func)(&[]).unwrap(), Value::Long(7));
+    }
 
     #[test]
     fn bind_promotable_mirrors_shared_root() {

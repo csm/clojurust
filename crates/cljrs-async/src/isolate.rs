@@ -82,6 +82,8 @@ impl Isolate {
                     .expect("isolate: failed to build Tokio runtime");
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&rt, f());
+                drop(local);
+                crate::channel::report_unobserved_thread_failures();
             })
             .expect("isolate: failed to spawn OS thread")
     }

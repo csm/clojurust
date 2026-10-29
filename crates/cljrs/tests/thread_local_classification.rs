@@ -31,6 +31,18 @@ const NO_GC: bool = cfg!(feature = "no-gc");
 
 /// `(file relative to crates/, static name, class)`.
 const CLASSIFICATION: &[(&str, &str, Class)] = &[
+    (
+        "cljrs-gc/src/region.rs",
+        "READ_SCOPES",
+        FiberWhen("cljrs-gc/READ_SCOPES", NO_GC),
+    ),
+    (
+        "cljrs-async/src/channel.rs",
+        "THREAD_FAILURES",
+        Thread(
+            "unobserved resource reports contain no managed values and flush at isolate teardown",
+        ),
+    ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
         "cljrs-gc/src/lib.rs",

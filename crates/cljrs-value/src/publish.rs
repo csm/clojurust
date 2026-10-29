@@ -128,7 +128,6 @@ fn scan(v: &Value) -> Scan {
         | Value::Long(_)
         | Value::Double(_)
         | Value::Char(_)
-        | Value::Uuid(_)
         | Value::ByteBlob(_)
         | Value::SharedAtom(_)
         | Value::Resource(_) => Clean,
@@ -137,6 +136,7 @@ fn scan(v: &Value) -> Scan {
         Value::BigInt(p) => tag(p),
         Value::BigDecimal(p) => tag(p),
         Value::Ratio(p) => tag(p),
+        Value::Uuid(p) => tag(p),
         Value::Str(p) => tag(p),
         Value::Pattern(p) => tag(p),
         Value::Symbol(p) => tag(p),
@@ -342,10 +342,130 @@ pub fn publish_for_owner(value: Value, address: usize) -> Value {
     }
 }
 
+/// A payload snapshot held across a callback or replacement.
+pub struct ValueSnapshot {
+    pub value: Value,
+    #[cfg(feature = "no-gc")]
+    pub(crate) lease: cljrs_gc::region::RegionLease,
+}
+impl ValueSnapshot {
+    pub fn protect_current(&self) {
+        #[cfg(feature = "no-gc")]
+        self.lease.protect_current();
+    }
+}
+
+/// Cached backing scopes for a replaceable payload. Regional containers use
+/// weak snapshots, while permanent containers own their current payload.
+#[cfg(feature = "no-gc")]
+#[derive(Debug, Default)]
+pub struct ValueLease {
+    owned: Option<cljrs_gc::region::RegionLease>,
+    scoped: cljrs_gc::region::WeakRegionLease,
+}
+#[cfg(feature = "no-gc")]
+impl ValueLease {
+    pub fn snapshot(&self) -> cljrs_gc::region::RegionLease {
+        self.owned
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.scoped.upgrade())
+    }
+    pub fn protect_current(&self) {
+        self.snapshot().protect_current();
+    }
+}
+
+#[cfg(feature = "no-gc")]
+fn small_finite(value: &Value, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match value {
+        Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => true,
+        Value::Str(s) => s.get().len() <= 4096,
+        Value::Uuid(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
+        Value::BigInt(n) => n.get().bits() <= 32768,
+        Value::Ratio(n) => {
+            n.get()
+                .numer()
+                .bits()
+                .saturating_add(n.get().denom().bits())
+                <= 32768
+        }
+        Value::Keyword(_) | Value::Symbol(_) => true,
+        Value::Vector(v) => {
+            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
+        }
+        Value::List(v) => {
+            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
+        }
+        Value::Queue(v) => {
+            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
+        }
+        Value::Set(v) => v.count() <= *budget && v.iter().all(|v| small_finite(v, budget)),
+        Value::Cons(v) => {
+            small_finite(&v.get().head, budget) && small_finite(&v.get().tail, budget)
+        }
+        Value::TypeInstance(v) if v.get().mutable.is_none() => {
+            small_finite(&Value::Map(v.get().fields.clone()), budget)
+        }
+        Value::Map(m) => {
+            if m.count().saturating_mul(2) > *budget {
+                return false;
+            }
+            m.iter()
+                .all(|(k, v)| small_finite(k, budget) && small_finite(v, budget))
+        }
+        Value::WithMeta(v, meta) => small_finite(v, budget) && small_finite(meta, budget),
+        Value::Reduced(v) => small_finite(v, budget),
+        _ => false,
+    }
+}
+
+/// Prepare one replaceable payload. Small finite graphs get their own arena;
+/// larger and opaque graphs preserve identity and structural sharing.
+#[cfg(feature = "no-gc")]
+pub fn prepare_for_owner(
+    mut value: Value,
+    owner: &cljrs_gc::region::AllocationOwner,
+) -> (Value, ValueLease) {
+    use cljrs_gc::region::RegionLease;
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return (value, Default::default());
+    }
+    let mut compact = None;
+    if owner.is_permanent()
+        && small_finite(&value, &mut 32)
+        && scan(&value) == Scan::Dirty
+        && let Ok(wire) = serialize(&value)
+    {
+        let scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        value = deserialize(wire);
+        compact = Some(scope);
+    }
+    let lease = RegionLease::for_value(&value);
+    let cached = if owner.is_permanent() {
+        ValueLease {
+            owned: Some(lease),
+            scoped: Default::default(),
+        }
+    } else {
+        owner.adopt(&lease);
+        ValueLease {
+            scoped: lease.downgrade(),
+            owned: None,
+        }
+    };
+    drop(compact);
+    (value, cached)
+}
+
 /// Transfer a result into its caller without retaining unrelated scratch data.
 #[cfg(feature = "no-gc")]
 pub fn publish_return(value: Value) -> Value {
-    if cljrs_gc::alloc_ctx::is_static_context() {
+    if cljrs_gc::alloc_ctx::is_static_context() && !cljrs_gc::region::ReadScope::is_active() {
         publish_value(value)
     } else {
         cljrs_gc::region::RegionLease::for_value(&value).protect_current();

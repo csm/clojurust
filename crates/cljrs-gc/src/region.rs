@@ -649,12 +649,56 @@ thread_local! {
     // Boxes keep allocation targets stable after their lexical scope closes.
     static LEASED_REGIONS: RefCell<std::collections::BTreeMap<u64, Box<Region>>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+    static READ_SCOPES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
     static LEASE_SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Isolate-local address index shared by its fibers; entries do not own regions.
     static REGION_OWNERS: RefCell<std::collections::BTreeMap<usize, (usize, std::rc::Weak<LeaseOwner>)>> = const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 #[cfg(feature = "no-gc")]
 crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<RegionLease>);
+#[cfg(feature = "no-gc")]
+crate::mutator_slot!("cljrs-gc/READ_SCOPES", refcell READ_SCOPES: Vec<RegionLease>);
+
+/// Weak cached backing scopes for a region-owned container.
+#[cfg(feature = "no-gc")]
+#[derive(Default, Debug)]
+pub struct WeakRegionLease(Vec<std::rc::Weak<LeaseOwner>>);
+#[cfg(feature = "no-gc")]
+impl WeakRegionLease {
+    pub fn upgrade(&self) -> RegionLease {
+        RegionLease::new(self.0.iter().filter_map(std::rc::Weak::upgrade).collect())
+    }
+}
+
+/// Borrows made during one top-level evaluation, released after its result escapes.
+#[cfg(feature = "no-gc")]
+pub struct ReadScope(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+#[cfg(feature = "no-gc")]
+impl ReadScope {
+    pub fn enter() -> Option<Self> {
+        if Self::is_active() || crate::alloc_ctx::invocation_is_active() {
+            return None;
+        }
+        READ_SCOPES.with(|scopes| scopes.borrow_mut().push(Default::default()));
+        Some(Self(true, std::marker::PhantomData))
+    }
+    pub fn is_active() -> bool {
+        READ_SCOPES.with(|scopes| !scopes.borrow().is_empty())
+    }
+    pub fn finish(mut self) -> RegionLease {
+        self.0 = false;
+        READ_SCOPES.with(|scopes| scopes.borrow_mut().pop().expect("balanced read scope"))
+    }
+}
+#[cfg(feature = "no-gc")]
+impl Drop for ReadScope {
+    fn drop(&mut self) {
+        if self.0 {
+            let lease = READ_SCOPES.with(|scopes| scopes.borrow_mut().pop());
+            drop(lease);
+        }
+    }
+}
 
 /// Temporary ownership of scratch scopes. Empty until a scope is shared.
 #[cfg(feature = "no-gc")]
@@ -690,6 +734,14 @@ impl RegionLease {
                 .flat_map(|lease| lease.0.iter().cloned())
                 .collect::<Vec<_>>()
         });
+        READ_SCOPES.with(|scopes| {
+            owners.extend(
+                scopes
+                    .borrow()
+                    .iter()
+                    .flat_map(|lease| lease.0.iter().cloned()),
+            );
+        });
         for ptr in live_regions() {
             // SAFETY: both scope registries contain live, stable regions.
             owners.push(unsafe { &mut *ptr }.owner());
@@ -720,6 +772,17 @@ impl RegionLease {
         {
             owner.external.set(owner.external.get() + 1);
             self.0.push(owner);
+        }
+    }
+    pub fn downgrade(&self) -> WeakRegionLease {
+        WeakRegionLease(self.0.iter().map(std::rc::Rc::downgrade).collect())
+    }
+    fn extend(&mut self, lease: &Self) {
+        for owner in &lease.0 {
+            if !self.0.iter().any(|existing| existing.id == owner.id) {
+                owner.external.set(owner.external.get() + 1);
+                self.0.push(owner.clone());
+            }
         }
     }
     pub fn protect_current(&self) {
@@ -767,7 +830,19 @@ impl AllocationOwner {
     pub fn protect(&self, value: &impl Trace) {
         self.adopt(&RegionLease::for_value(value));
     }
-    fn adopt(&self, lease: &RegionLease) {
+    pub fn adopt(&self, lease: &RegionLease) {
+        if self.is_permanent()
+            && READ_SCOPES.with(|scopes| {
+                if let Some(scope) = scopes.borrow_mut().last_mut() {
+                    scope.extend(lease);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            return;
+        }
         if let Some(owner) = self.0.upgrade() {
             if owner.permanent.get() {
                 for source in &lease.0 {

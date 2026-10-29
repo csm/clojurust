@@ -998,7 +998,7 @@ fn alloc_closure(
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
 ) -> EvalResult {
-    let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
+    let captured_values: Arc<[Value]> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
     // Each arity maps to a named subfunction in ir_func.subfunctions.
@@ -1088,7 +1088,7 @@ fn alloc_closure(
                 let subfunc = &subfuncs[idx];
 
                 // Build full args: captures + call_args (+ rest list for variadic).
-                let mut full_args = captured_values.clone();
+                let mut full_args = captured_values.to_vec();
                 if is_variadic[idx] {
                     let pc = param_counts[idx];
                     // Fixed params.

@@ -20,6 +20,30 @@ use cljrs_value::{
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    let scope = cljrs_gc::region::ReadScope::enter();
+    let result = eval_caught(form, env);
+    #[cfg(feature = "no-gc")]
+    if let Some(scope) = scope {
+        let _borrowed = scope.finish();
+        return match result {
+            Ok(value) => Ok(cljrs_value::publish::publish_return(value)),
+            Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
+                cljrs_value::publish::publish_return(value),
+            )),
+            Err(EvalError::Recur(values)) => Err(EvalError::Recur(
+                values
+                    .into_iter()
+                    .map(cljrs_value::publish::publish_return)
+                    .collect(),
+            )),
+            other => other,
+        };
+    }
+    result
+}
+
+fn eval_caught(form: &Form, env: &mut Env) -> EvalResult {
     if !matches!(
         &form.kind,
         FormKind::List(_)

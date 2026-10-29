@@ -763,3 +763,16 @@ Bounded isolated allocation invocations retain their original lifetime rules.
 `static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available
 in release no-gc builds for publication decisions.
 No-gc `MarkVisitor` implements `Default` and traverses values only for explicit ownership transfer.
+
+`RegionLease::downgrade() -> WeakRegionLease` caches backing scopes without an external ownership root.
+`WeakRegionLease` implements `Default` and `Debug`. Its `upgrade() -> RegionLease` acquires temporary ownership.
+`AllocationOwner::adopt(&RegionLease)` transfers cached ownership without another value traversal.
+
+`region::ReadScope::enter() -> Option<ReadScope>` starts the outermost evaluation read scope.
+Nested calls return `None`. Bounded invocations also return `None`.
+`ReadScope::is_active()` identifies an active read scope.
+`finish(self) -> RegionLease` removes the scope and returns its leases while the final result escapes.
+Drop releases a scope on unwind. A scope stays on its creating thread.
+Fibers swap this state with their other mutator slots.
+Task capture includes these leases so suspended work retains borrowed inputs.
+Low-level embedders can use a read scope to bound temporary reads outside the evaluator.

@@ -53,6 +53,154 @@ mod publication_review_tests {
             self.0.set(true);
         }
     }
+    #[derive(Debug)]
+    struct Counted {
+        traces: std::rc::Rc<std::cell::Cell<usize>>,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl cljrs_gc::Trace for Counted {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {
+            self.traces.set(self.traces.get() + 1);
+        }
+    }
+    impl NativeObject for Counted {
+        fn type_tag(&self) -> &str {
+            "Counted"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+    #[test]
+    fn cached_cell_snapshots_do_not_retrace_or_permanently_pin_payloads() {
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let traces = std::rc::Rc::new(std::cell::Cell::new(0));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let counted = Value::NativeObject(gc_native_object(Counted {
+                traces: traces.clone(),
+                dropped: dropped.clone(),
+            }));
+            let map = Value::Map(MapValue::from_pairs(
+                (0..1000)
+                    .map(|i| (Value::Long(i), counted.clone()))
+                    .collect(),
+            ));
+            atom.get().reset(map);
+        }
+        let initial = traces.get();
+        assert_eq!(initial, 1);
+        for _ in 0..1000 {
+            let scope = cljrs_gc::region::ReadScope::enter().unwrap();
+            let snapshot = atom.get().snapshot();
+            assert!(matches!(snapshot.value, Value::Map(_)));
+            atom.get().deref();
+            drop(scope);
+        }
+        assert_eq!(traces.get(), initial, "reads walked the full map graph");
+        atom.get().reset(Value::Nil);
+        assert!(
+            dropped.get(),
+            "top-level reads permanently pinned the old payload"
+        );
+    }
+
+    #[test]
+    fn small_scalar_boxes_copy_out_of_unrelated_scratch_storage() {
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let _temporary = GcPtr::new(Probe(dropped.clone()));
+            atom.get()
+                .reset(Value::Uuid(GcPtr::new(crate::value::UuidValue(42))));
+        }
+        assert!(dropped.get());
+        let snapshot = atom.get().snapshot();
+        let Value::Uuid(uuid) = &snapshot.value else {
+            unreachable!()
+        };
+        assert_eq!(uuid.get().0, 42);
+        atom.get().reset(Value::Nil);
+        assert_eq!(uuid.get().0, 42);
+    }
+
+    #[test]
+    fn returned_updates_protect_shared_children_after_the_cell_is_replaced() {
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let object = Value::NativeObject(gc_native_object(Counted {
+                traces: Default::default(),
+                dropped: dropped.clone(),
+            }));
+            atom.get().reset(Value::Map(MapValue::from_pairs(vec![(
+                Value::Long(0),
+                object,
+            )])));
+        }
+        {
+            let _consumer = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let previous = atom.get().snapshot();
+            let Value::Map(old) = &previous.value else {
+                unreachable!()
+            };
+            let returned = atom
+                .get()
+                .reset(Value::Map(old.assoc(Value::Long(1), Value::Long(2))));
+            drop(previous);
+            atom.get().reset(Value::Nil);
+            assert!(
+                !dropped.get(),
+                "replacing the cell freed a child of its returned value"
+            );
+            let Value::Map(returned) = returned else {
+                unreachable!()
+            };
+            let Value::NativeObject(child) = returned.get(&Value::Long(0)).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(child.get().type_tag(), "Counted");
+        }
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn var_rebinding_releases_opaque_roots_after_the_last_reader() {
+        let var = GcPtr::new(Var::new("user", "root"));
+        for _ in 0..100 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _temporary = GcPtr::new(Probe(dropped.clone()));
+                var.get()
+                    .bind(Value::NativeFunction(GcPtr::new(NativeFn::with_captures(
+                        "root",
+                        Arity::Fixed(0),
+                        vec![Value::string("alive")],
+                        |captures, _| Ok(captures[0].clone()),
+                    ))));
+            }
+            let scope = cljrs_gc::region::ReadScope::enter().unwrap();
+            let alias = var.get().deref().unwrap();
+            var.get().bind(Value::Nil);
+            assert!(!dropped.get());
+            let Value::NativeFunction(f) = alias else {
+                unreachable!()
+            };
+            assert_eq!((f.get().func)(&[]).unwrap().to_string(), "\"alive\"");
+            drop(scope);
+            assert!(dropped.get(), "an obsolete Var root remained permanent");
+        }
+    }
+
     #[test]
     fn static_publication_copies_finite_data_and_releases_temporary_storage() {
         let atom = cljrs_gc::GcPtr::new(Atom::new(Value::Nil));
@@ -75,6 +223,10 @@ mod publication_review_tests {
             let returned = publish::publish_return(value);
             drop(scope);
             assert_eq!(returned.to_string(), "[\"published\"]");
+            assert!(
+                dropped.get(),
+                "a small payload kept unrelated scratch temporaries alive"
+            );
             atom.get().reset(Value::Nil);
             assert!(
                 dropped.get(),

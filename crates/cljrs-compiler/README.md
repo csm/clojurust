@@ -816,4 +816,7 @@ Generated program entries consume both ordinary exceptions and resource errors b
 Fused `into` fallbacks stop after a failed `filter`, `mapcat`, or `map` call.
 They preserve both ordinary exceptions and typed resource failures without another interpreter call.
 Call bridges use `signal_error` for every failure, including thrown values.
-Compiled local-atom CAS uses `Atom::compare_and_set`, which shares the interpreter ownership barrier.
+Compiled atom reset and swap use the interpreter update functions.
+They share validators, watches, resource errors, and return ownership with interpreted calls.
+Fused fallbacks compose a Result-valued global-call helper, so a failed first call prevents the next call.
+Compiled closures share an `Arc<[Value]>` between execution and tracing.

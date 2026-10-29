@@ -305,7 +305,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
 | `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
 | `tests/no_gc_lifetimes.rs` | No-GC lifetime tests for task results, lazy sequences, top-level accumulators, and replacement of cell contents |
-| `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report immediately |
+| `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report once at destruction or teardown |
 | `tests/fiber_surface.rs` | Blocking Clojure surface, nested futures, binding conveyance, channel closure, root state restoration, and GC across root drives |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
 | `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under the legacy `eval_async` driver |
@@ -620,5 +620,15 @@ Channels publish values only after a put commits. Failed offers and losing or ca
 Buffered channel values pass publication once, when the put commits.
 A take transfers ownership to the consumer without another publication scan.
 Direct handoffs publish the accepted value before either participant resumes.
-Thread bodies report resource failures immediately, including when nobody reads the result channel.
-The channel also preserves the typed failure for later reads.
+Channels report resource failures only when the failure remains unread at destruction or executor teardown.
+A read marks the report observed. The internal delivery future also counts as observed, so collection produces no duplicate warning.
+`channel::report_unobserved_thread_failures()` flushes reports after all consumers finish.
+Native root drivers and both isolate entry points call this helper during teardown.
+Other embedders, including wasm hosts, can call it when their executor closes.
+Channel reports contain no managed Values.
+
+Each no-GC queue entry and completed selection owns a cached payload lease.
+A take moves that lease to the selection. Cancellation restores it with the queued value.
+The consumer acquires ownership before the selection releases its lease.
+Permanent channels release consumed payloads after their last consumer releases them.
+Channel ownership tracing skips replaceable queue contents, which manage their own leases.
