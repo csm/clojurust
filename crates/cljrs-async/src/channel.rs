@@ -273,16 +273,28 @@ impl ChannelState {
         order
     }
 
+    fn take_buffered(&mut self, selection: &Rc<Selection>) -> Option<Value> {
+        let (order, value) = self.queue.pop_first()?;
+        selection.take_order.set(Some(order));
+        // A put can be buffered and matched before this lock is released.
+        // Move its pending publication to the receiver instead of losing it
+        // when the queue entry disappears. Already-published entries need none.
+        for publication in &mut self.publications {
+            if matches!(publication, Publication::Queue(queued) if *queued == order) {
+                *publication = Publication::Selection(selection.clone());
+            }
+        }
+        Some(value)
+    }
+
     fn service(&mut self) -> Vec<Waker> {
         let mut wakes = Vec::new();
         loop {
             if !self.queue.is_empty()
                 && let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None)
             {
-                let (order, value) = self.queue.pop_first().unwrap();
-                peer.take_order.set(Some(order));
+                let value = self.take_buffered(&peer).unwrap();
                 wakes.extend(peer.finish(value, waiter.index));
-                self.publications.push(Publication::Selection(peer));
                 continue;
             }
             if self.closed {
@@ -401,11 +413,7 @@ impl CljChannel {
             } else {
                 None
             }
-        } else if let Some((order, value)) = state.queue.pop_first() {
-            selection.take_order.set(Some(order));
-            state
-                .publications
-                .push(Publication::Selection(selection.clone()));
+        } else if let Some(value) = state.take_buffered(selection) {
             Some(value)
         } else if !state.closed
             && let Some((_, waiter, peer)) = pop_waiter(&mut state.puts, Some(selection))
@@ -832,6 +840,48 @@ mod notification_tests {
 #[cfg(test)]
 mod review_publication_tests {
     use super::*;
+    #[test]
+    fn a_buffered_offer_matched_before_unlock_keeps_its_one_publication() {
+        let channel = CljChannel::new(0);
+        let mut receiver = Box::pin(channel.take());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(receiver.as_mut().poll(&mut cx).is_pending());
+        let mut region = cljrs_gc::region::Region::new();
+        let guard = unsafe { cljrs_gc::region::RegionGuard::new(&mut region) };
+        let value =
+            Value::Vector(region.alloc(cljrs_value::PersistentVector::from_iter([Value::Long(7)])));
+        assert!(matches!(channel.rv_offer(&value), RvOffer::Offered(_)));
+        drop(guard);
+        drop(region);
+        let Poll::Ready(Value::Vector(vector)) = receiver.as_mut().poll(&mut cx) else {
+            panic!("take did not complete")
+        };
+        #[cfg(not(feature = "no-gc"))]
+        assert!(!vector.is_region_alloc());
+        #[cfg(feature = "no-gc")]
+        assert!(vector.is_static_alloc());
+        assert_eq!(vector.get().iter().next(), Some(&Value::Long(7)));
+    }
+
+    #[test]
+    fn draining_a_published_buffer_does_not_schedule_another_publication() {
+        let channel = CljChannel::new(1);
+        assert_eq!(channel.try_put_buffered(&Value::Long(7)), Some(true));
+        let selection = Selection::new();
+        let mut state = channel.state.lock().unwrap();
+        state.takes.insert(
+            0,
+            Waiter {
+                selection: Rc::downgrade(&selection),
+                index: 0,
+                value: None,
+            },
+        );
+        state.service();
+        assert_eq!(*selection.result.borrow(), Some((Value::Long(7), 0)));
+        assert!(state.publications.is_empty());
+    }
+
     #[test]
     fn failed_offers_and_losing_or_cancelled_alternatives_do_not_publish() {
         let full = CljChannel::new(1);

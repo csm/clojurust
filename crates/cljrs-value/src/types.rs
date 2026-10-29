@@ -516,6 +516,8 @@ impl cljrs_gc::Trace for Var {
 #[derive(Debug)]
 pub struct Atom {
     pub value: TrackedMutex<Value>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<cljrs_gc::region::RegionLease>,
     pub meta: TrackedMutex<Option<Value>>,
     pub validator: TrackedMutex<Option<Value>>,
     pub watches: TrackedMutex<Vec<(Value, Value)>>,
@@ -531,6 +533,8 @@ impl Atom {
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
+            #[cfg(feature = "no-gc")]
+            value_lease: Default::default(),
             meta: TrackedMutex::new(None),
             validator: TrackedMutex::new(None),
             watches: TrackedMutex::new(Vec::new()),
@@ -538,20 +542,66 @@ impl Atom {
     }
 
     pub fn deref(&self) -> Value {
-        self.value.lock().unwrap().clone()
+        let value = self.value.lock().unwrap().clone();
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+        value
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // GC builds: heap-promotion fallback (see `Var::bind`).
-        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
-        // Static destinations must retain every non-static source after publication.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
-        );
-        let mut guard = self.value.lock().unwrap();
-        *guard = v.clone();
+        #[cfg(not(feature = "no-gc"))]
+        let v = crate::publish::publish_value(v);
+        #[cfg(feature = "no-gc")]
+        let lease = self.lease_value(&v);
+        *self.value.lock().unwrap() = v.clone();
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         v
+    }
+
+    #[cfg(feature = "no-gc")]
+    fn lease_value(&self, value: &Value) -> cljrs_gc::region::RegionLease {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Default::default();
+        }
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        if owner.is_permanent() {
+            cljrs_gc::region::RegionLease::for_value(value)
+        } else {
+            owner.protect(value);
+            Default::default()
+        }
+    }
+
+    /// Replace the value only if it still equals `expected`.
+    /// Failed attempts do not publish or lease the candidate.
+    pub fn compare_and_set(&self, expected: &Value, value: Value) -> bool {
+        // The common vector update compares the exact snapshot just read.
+        // Avoid walking its shared elements for each accumulator update.
+        let matches_expected = |current: &Value| {
+            matches!((current, expected), (Value::Vector(a), Value::Vector(b)) if GcPtr::ptr_eq(a, b))
+                || current == expected
+        };
+        if !matches_expected(&self.value.lock().unwrap()) {
+            return false;
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        #[cfg(feature = "no-gc")]
+        let lease = self.lease_value(&value);
+        let mut guard = self.value.lock().unwrap();
+        if !matches_expected(&guard) {
+            return false;
+        }
+        *guard = value;
+        drop(guard);
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
+        true
     }
 
     pub fn get_meta(&self) -> Option<Value> {
@@ -1221,6 +1271,8 @@ impl cljrs_gc::Trace for CljxCons {
 /// Non-atomic mutable cell (single-thread performance, no CAS).
 pub struct Volatile {
     pub value: TrackedMutex<Value>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<cljrs_gc::region::RegionLease>,
 }
 
 impl Volatile {
@@ -1232,23 +1284,43 @@ impl Volatile {
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
+            #[cfg(feature = "no-gc")]
+            value_lease: Default::default(),
         }
     }
 
     pub fn deref(&self) -> Value {
-        self.value.lock().unwrap().clone()
+        let value = self.value.lock().unwrap().clone();
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+        value
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // GC builds: heap-promotion fallback (see `Var::bind`).
-        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
-        // Static destinations must retain every non-static source after publication.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
-        );
+        #[cfg(not(feature = "no-gc"))]
+        let v = crate::publish::publish_value(v);
+        #[cfg(feature = "no-gc")]
+        let lease = self.lease_value(&v);
         *self.value.lock().unwrap() = v.clone();
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         v
+    }
+
+    #[cfg(feature = "no-gc")]
+    fn lease_value(&self, value: &Value) -> cljrs_gc::region::RegionLease {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Default::default();
+        }
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        if owner.is_permanent() {
+            cljrs_gc::region::RegionLease::for_value(value)
+        } else {
+            owner.protect(value);
+            Default::default()
+        }
     }
 }
 
@@ -1624,11 +1696,16 @@ impl Drop for CljxFuture {
         // (still-valid) allocation.
         if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(state) = self.state.lock()
-            && matches!(&*state, FutureState::Failed(_))
+            && matches!(
+                &*state,
+                FutureState::Failed(_)
+                    | FutureState::GasExhausted
+                    | FutureState::MemoryLimitExceeded(_)
+            )
         {
             eprintln!(
                 "[clojurust warning] a failed future was discarded without its error \
-                 being observed (no await/deref); the thrown exception was lost"
+                 being observed (no await/deref); the failure was lost"
             );
         }
     }

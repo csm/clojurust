@@ -748,6 +748,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         current_vals.push(eval(&bindings[i], env)?);
     }
 
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::default();
     loop {
         // Root current_vals so they survive GC — they're not yet bound in env.
         let _vals_root = crate::env::gc_roots::root_values(&current_vals);
@@ -785,7 +787,7 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
             #[cfg(not(feature = "no-gc"))]
             let result = eval_body_recur(body, env);
             #[cfg(feature = "no-gc")]
-            let result = eval_body_with_scratch_loop(body, &mut scratch, env);
+            let result = eval_body_with_scratch_loop(body, &mut scratch, &mut recur_lease, env);
 
             result
         });
@@ -834,6 +836,7 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
 fn eval_body_with_scratch_loop(
     body: &[Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
+    recur_lease: &mut cljrs_gc::region::RegionLease,
     env: &mut Env,
 ) -> EvalResult {
     let mut result = Ok(Value::Nil);
@@ -849,12 +852,12 @@ fn eval_body_with_scratch_loop(
         Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
             cljrs_value::publish::publish_return(value),
         )),
-        Err(EvalError::Recur(values)) => Err(EvalError::Recur(
-            values
-                .into_iter()
-                .map(cljrs_value::publish::publish_return)
-                .collect(),
-        )),
+        Err(EvalError::Recur(values)) => {
+            // Recur is local to this trampoline, even when its caller is static.
+            // Acquire the next lease before releasing the previous iteration.
+            *recur_lease = cljrs_gc::region::RegionLease::for_values(&values);
+            Err(EvalError::Recur(values))
+        }
         other => other,
     }
 }

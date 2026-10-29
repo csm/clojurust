@@ -8240,15 +8240,9 @@ fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Atom(a) => {
-            let mut guard = a.get().value.lock().unwrap();
-            if *guard == args[1] {
-                *guard = args[2].clone();
-                Ok(Value::Bool(true))
-            } else {
-                Ok(Value::Bool(false))
-            }
-        }
+        Value::Atom(a) => Ok(Value::Bool(
+            a.get().compare_and_set(&args[1], args[2].clone()),
+        )),
         Value::SharedAtom(sa) => {
             // Lock-free CAS: succeed only if the live value still equals the
             // expected one, by content, at the moment of the atomic store.

@@ -739,11 +739,14 @@ or fiber execution. Completion and cancellation release these leases.
 Closed regions remain in a deferred registry only while a task can use them.
 The last external lease permits storage reclamation and releases the governor charge.
 Weak dependency edges let mutually dependent closed scopes be reclaimed together.
+Reclamation removes both halves of each edge, including entries in live neighbors.
 `ScratchGuard` keeps each scope discoverable through result ownership transfer.
 
 No-gc publication preserves value identity and laziness. `retain_regions_for(value: &impl Trace)`
 retains only actual backing scopes for program-lifetime destinations.
 `RegionLease::for_value(value)` traces those scopes without evaluating user code.
+`RegionLease::for_values<T: Trace>(values: &[T])` leases several values with one visited set.
+`RegionLease` implements `Default`, `Clone`, and `Debug`.
 `RegionLease::protect_current()` transfers their ownership into the current destination scope.
 `AllocationOwner::current()` and `for_address(address)` return weak destination handles.
 Their `protect(value)` method keeps source scopes alive for that destination's lifetime.

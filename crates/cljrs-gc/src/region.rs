@@ -591,6 +591,29 @@ struct LeaseOwner {
     dependencies: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
 }
 #[cfg(feature = "no-gc")]
+impl Drop for LeaseOwner {
+    fn drop(&mut self) {
+        // Remove both halves before the last strong reference disappears.
+        // Otherwise Weak entries keep metadata allocations alive indefinitely.
+        for source in self
+            .dependencies
+            .get_mut()
+            .values()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            source.dependents.borrow_mut().remove(&self.id);
+        }
+        for dependent in self
+            .dependents
+            .get_mut()
+            .values()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            dependent.dependencies.borrow_mut().remove(&self.id);
+        }
+    }
+}
+#[cfg(feature = "no-gc")]
 impl Region {
     fn owner(&mut self) -> std::rc::Rc<LeaseOwner> {
         if let Some(owner) = &self.lease {
@@ -638,6 +661,14 @@ crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<
 #[derive(Default)]
 pub struct RegionLease(Vec<std::rc::Rc<LeaseOwner>>);
 #[cfg(feature = "no-gc")]
+impl std::fmt::Debug for RegionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|owner| owner.id))
+            .finish()
+    }
+}
+#[cfg(feature = "no-gc")]
 impl Clone for RegionLease {
     fn clone(&self) -> Self {
         Self::new(self.0.clone())
@@ -669,6 +700,18 @@ impl RegionLease {
     }
     pub fn for_value(value: &impl Trace) -> Self {
         crate::leases_for(value)
+    }
+    /// Lease the scopes reached by several values with one visited set.
+    pub fn for_values<T: Trace>(values: &[T]) -> Self {
+        struct Values<'a, T>(&'a [T]);
+        impl<T: Trace> Trace for Values<'_, T> {
+            fn trace(&self, visitor: &mut crate::MarkVisitor) {
+                for value in self.0 {
+                    value.trace(visitor);
+                }
+            }
+        }
+        Self::for_value(&Values(values))
     }
     pub(crate) fn add_address(&mut self, address: usize) {
         if let Some(owner) = find_owner(address)
@@ -1576,6 +1619,34 @@ mod lease_tests {
             self.0.set(self.0.get() + 1);
         }
     }
+    #[test]
+    fn released_dependents_remove_their_weak_edges() {
+        struct Edge(crate::GcPtr<Probe>);
+        impl crate::Trace for Edge {
+            fn trace(&self, visitor: &mut crate::MarkVisitor) {
+                use crate::GcVisitor;
+                visitor.visit(&self.0);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _parent = crate::alloc_ctx::ScratchGuard::new();
+        let value = crate::GcPtr::new(Probe(drops));
+        let parent = AllocationOwner::current().0.upgrade().unwrap();
+        for _ in 0..200 {
+            let child = crate::alloc_ctx::ScratchGuard::new();
+            AllocationOwner::current().protect(&Edge(value.clone()));
+            assert_eq!(parent.dependents.borrow().len(), 1);
+            drop(child);
+            assert!(parent.dependents.borrow().is_empty());
+            assert!(parent.dependencies.borrow().is_empty());
+        }
+        assert_eq!(
+            std::rc::Rc::weak_count(&parent),
+            1,
+            "only the chunk address index remains"
+        );
+    }
+
     #[test]
     fn mutually_dependent_closed_scopes_live_until_the_last_external_lease() {
         struct Edge(crate::GcPtr<Probe>);

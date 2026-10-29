@@ -574,6 +574,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
     let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
     let mut current_args = Vec::from(args);
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::default();
     loop {
         // Root current_args on the shadow stack so they survive GC.
         // They haven't been bound into the env yet.
@@ -625,7 +627,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         let result = {
             let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
             // scratch drops here: resets the region (frees intermediates)
-            eval_body_with_scratch(&arity.body, &mut scratch, &mut env)
+            eval_body_with_scratch(&arity.body, &mut scratch, &mut recur_lease, &mut env)
         };
         env.pop_frame();
         // _call_frame drops at the end of this iteration (after the match
@@ -751,6 +753,7 @@ fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult 
 fn eval_body_with_scratch(
     body: &[cljrs_reader::Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
+    recur_lease: &mut cljrs_gc::region::RegionLease,
     env: &mut Env,
 ) -> EvalResult {
     let mut result = Ok(Value::Nil);
@@ -766,12 +769,12 @@ fn eval_body_with_scratch(
         Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
             cljrs_value::publish::publish_return(value),
         )),
-        Err(EvalError::Recur(values)) => Err(EvalError::Recur(
-            values
-                .into_iter()
-                .map(cljrs_value::publish::publish_return)
-                .collect(),
-        )),
+        Err(EvalError::Recur(values)) => {
+            // Recur is local to this trampoline, even when its caller is static.
+            // Acquire the next lease before releasing the previous iteration.
+            *recur_lease = cljrs_gc::region::RegionLease::for_values(&values);
+            Err(EvalError::Recur(values))
+        }
         other => other,
     }
 }
@@ -973,13 +976,11 @@ fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().deref();
+            let cur = v.get().value.lock().unwrap().clone();
+            #[cfg(feature = "no-gc")]
+            let _previous_payload = cljrs_gc::region::RegionLease::for_value(&cur);
             let mut call_args = vec![cur];
             call_args.extend(extra);
-            // Under no-gc: the value written into the volatile must live in the
-            // StaticArena since the volatile outlives all scratch regions.
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
             v.get().reset(new_val.clone());
             Ok(new_val)
@@ -1022,10 +1023,6 @@ fn handle_vreset(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         });
     }
     let vol_val = eval(&arg_forms[0], env)?;
-    // Under no-gc: the new value written into the volatile must live in the
-    // StaticArena since the volatile outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = eval(&arg_forms[1], env)?;
     match &vol_val {
         Value::Volatile(v) => {
@@ -1191,10 +1188,6 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         });
     }
     let atom_val = eval(&arg_forms[0], env)?;
-    // Under no-gc: the new value written into the atom must live in the
-    // StaticArena since the atom outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = eval(&arg_forms[1], env)?;
 
     let atom = match &atom_val {
@@ -1209,7 +1202,9 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().deref();
+    let old_val = atom.get().value.lock().unwrap().clone();
+    #[cfg(feature = "no-gc")]
+    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
     atom.get().reset(new_val.clone());
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
@@ -1259,13 +1254,11 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
 
-    let old_val = atom.get().deref();
+    let old_val = atom.get().value.lock().unwrap().clone();
+    #[cfg(feature = "no-gc")]
+    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
     let mut args = vec![old_val.clone()];
     args.extend(evaled);
-    // Under no-gc: the value written into the atom must live in the StaticArena
-    // since the atom outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = crate::env::apply::apply_value(&f, args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
     atom.get().reset(new_val.clone());
@@ -1447,10 +1440,10 @@ pub fn eval_reset_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().deref();
+    let old_val = atom.get().value.lock().unwrap().clone();
+    #[cfg(feature = "no-gc")]
+    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
     atom.get().reset(new_val.clone());
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
@@ -1478,11 +1471,11 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    let old_val = atom.get().deref();
+    let old_val = atom.get().value.lock().unwrap().clone();
+    #[cfg(feature = "no-gc")]
+    let _previous_payload = cljrs_gc::region::RegionLease::for_value(&old_val);
     let mut call_args = vec![old_val.clone()];
     call_args.extend(args);
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
     atom.get().reset(new_val.clone());
@@ -1516,8 +1509,6 @@ pub fn eval_vreset_bang(args: Vec<Value>) -> EvalResult {
             got: args.len(),
         });
     }
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = args[1].clone();
     match &args[0] {
         Value::Volatile(v) => {
@@ -1544,11 +1535,11 @@ pub fn eval_vswap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     let f = args.remove(0);
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().deref();
+            let cur = v.get().value.lock().unwrap().clone();
+            #[cfg(feature = "no-gc")]
+            let _previous_payload = cljrs_gc::region::RegionLease::for_value(&cur);
             let mut call_args = vec![cur];
             call_args.extend(args);
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
             v.get().reset(new_val.clone());
             Ok(new_val)

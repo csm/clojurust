@@ -1748,3 +1748,9 @@ Object-array writes use the destination ownership barrier before storing an elem
 
 No-gc results and dynamic-binding writes copy proven finite immutable data when their destination has program lifetime.
 Regional destinations retain backing scopes through ownership edges. Pending sequences and mutable identities preserve their original objects.
+
+No-gc recur values use a lease owned by the function or loop trampoline.
+Each iteration replaces this lease before it releases the previous iteration.
+Atom and volatile updates evaluate in the current allocation context.
+The cells lease new contents and release replaced contents after their last consumer releases them.
+Update callbacks and watches hold temporary leases for the previous contents.

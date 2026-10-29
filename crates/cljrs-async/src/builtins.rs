@@ -345,10 +345,15 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
             }
             Ok(_) => {}
             Err(error @ EvalError::GasExhausted) => {
+                eprintln!("[clojurust thread error] {error}");
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);
                 return Err(error);
             }
             Err(EvalError::MemoryLimitExceeded(fault)) => {
+                eprintln!(
+                    "[clojurust thread error] {}",
+                    EvalError::MemoryLimitExceeded(fault)
+                );
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Memory(fault));
                 return Err(EvalError::MemoryLimitExceeded(fault));
             }

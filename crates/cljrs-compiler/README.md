@@ -812,3 +812,8 @@ A finally-only clause rethrows the original exception after successful cleanup.
 All callback bridges, including compiled `swap!`, fused collection operations, `apply`, bindings, and output capture, preserve callback failures.
 `rt_abi::take_pending_exception_value()` consumes an ordinary pending throw while its native allocation roots remain live.
 Generated program entries consume both ordinary exceptions and resource errors before calling `-main`.
+
+Fused `into` fallbacks stop after a failed `filter`, `mapcat`, or `map` call.
+They preserve both ordinary exceptions and typed resource failures without another interpreter call.
+Call bridges use `signal_error` for every failure, including thrown values.
+Compiled local-atom CAS uses `Atom::compare_and_set`, which shares the interpreter ownership barrier.

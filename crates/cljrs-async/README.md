@@ -304,6 +304,8 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
 | `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
+| `tests/no_gc_lifetimes.rs` | No-GC lifetime tests for task results, lazy sequences, top-level accumulators, and replacement of cell contents |
+| `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report immediately |
 | `tests/fiber_surface.rs` | Blocking Clojure surface, nested futures, binding conveyance, channel closure, root state restoration, and GC across root drives |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
 | `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under the legacy `eval_async` driver |
@@ -614,3 +616,9 @@ Managed Values remain on their isolate thread. An OS-thread panic still appears 
 Clojure blocking takes, future takes, polls, and channel alternatives propagate those failures without making them catchable.
 Ordinary thread-body throws are reported and close the result channel.
 Channels publish values only after a put commits. Failed offers and losing or cancelled alternatives do not publish their candidates.
+
+Buffered channel values pass publication once, when the put commits.
+A take transfers ownership to the consumer without another publication scan.
+Direct handoffs publish the accepted value before either participant resumes.
+Thread bodies report resource failures immediately, including when nobody reads the result channel.
+The channel also preserves the typed failure for later reads.

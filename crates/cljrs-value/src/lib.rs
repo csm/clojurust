@@ -43,6 +43,7 @@ pub use value::{MapValue, ObjectArray, SetValue, TypeInstance, Value};
 #[cfg(all(test, feature = "no-gc"))]
 mod publication_review_tests {
     use super::*;
+    use cljrs_gc::GcPtr;
     struct Probe(std::rc::Rc<std::cell::Cell<bool>>);
     impl cljrs_gc::Trace for Probe {
         fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
@@ -73,14 +74,60 @@ mod publication_review_tests {
             scope.pop_for_return();
             let returned = publish::publish_return(value);
             drop(scope);
+            assert_eq!(returned.to_string(), "[\"published\"]");
+            atom.get().reset(Value::Nil);
             assert!(
                 dropped.get(),
-                "a static publication retained unrelated temporaries"
+                "replaced cell payload retained its scratch storage"
             );
-            assert_eq!(returned.to_string(), "[\"published\"]");
-            assert_eq!(atom.get().deref().to_string(), "[\"published\"]");
         }
         drop(permanent);
+    }
+
+    #[test]
+    fn static_cells_release_replaced_opaque_payloads_and_preserve_borrowed_aliases() {
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let volatile = GcPtr::new(Volatile::new(Value::Nil));
+        for _ in 0..100 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _temporary = GcPtr::new(Probe(dropped.clone()));
+                let payload = Value::NativeFunction(GcPtr::new(NativeFn::with_captures(
+                    "payload",
+                    Arity::Fixed(0),
+                    vec![Value::string("alive")],
+                    |captures, _| Ok(captures[0].clone()),
+                )));
+                atom.get().reset(payload.clone());
+                volatile.get().reset(payload);
+            }
+            assert!(!dropped.get());
+            {
+                let _consumer = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let alias = atom.get().deref();
+                atom.get().reset(Value::Nil);
+                volatile.get().reset(Value::Nil);
+                assert!(!dropped.get(), "a live alias lost its backing scope");
+                let Value::NativeFunction(f) = alias else {
+                    unreachable!()
+                };
+                assert_eq!((f.get().func)(&[]).unwrap().to_string(), "\"alive\"");
+            }
+            assert!(
+                dropped.get(),
+                "an obsolete opaque payload retained its scope"
+            );
+        }
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let _temporary = GcPtr::new(Probe(dropped.clone()));
+            let rejected =
+                Value::ObjectArray(GcPtr::new(ObjectArray(std::sync::Mutex::new(vec![]))));
+            assert!(!atom.get().compare_and_set(&Value::Long(1), rejected));
+        }
+        assert!(dropped.get(), "a failed CAS retained its candidate");
     }
 
     #[test]

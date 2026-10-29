@@ -524,3 +524,10 @@ Third-pass review regressions cover all callback bridges, uncaught AOT top-level
 failed channel publication, static publication of finite data, and cycles between scope owners.
 Root-isolate failures use a thread-safe result type. Thread result channels preserve resource-limit errors.
 Ownership edges are weak. Cleanup follows affected paths and stops at live owners.
+
+Fourth-pass review regressions cover top-level accumulators, replacement of opaque cell contents,
+consumer aliases, failed CAS publication, stale weak edges, and fused fallback failures.
+Unread thread resource failures report immediately and remain typed on their result channel.
+Buffered takes avoid a second publication scan.
+Recur values use trampoline leases. Permanent atom and volatile contents use replaceable leases.
+Program-lifetime opaque publications without a replaceable owner still retain their actual backing scopes.

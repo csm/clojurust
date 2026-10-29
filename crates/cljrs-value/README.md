@@ -562,7 +562,8 @@ The runtime safety net for bump regions coexisting with the tracing GC:
 correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
 `CljxPromise::deliver`, and `cljrs-async`'s channel puts.
-Under `no-gc`, regional destinations transfer backing scopes. Static destinations copy proven finite immutable data.
+Under `no-gc`, regional destinations transfer backing scopes.
+Replaceable atom and volatile contents use leases. Other static destinations copy proven finite immutable data.
 
 ### `Namespace` (Phase 4)
 
@@ -723,7 +724,12 @@ itself is runtime state that does not cross a clone boundary.
 ### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
 
 ```rust
-pub struct Volatile { pub value: Mutex<Value> }
+pub struct Volatile { pub value: TrackedMutex<Value>, /* private ownership state */ }
+impl Volatile {
+    pub fn new(value: Value) -> Self;
+    pub fn deref(&self) -> Value;
+    pub fn reset(&self, value: Value) -> Value;
+}
 
 pub enum DelayState {
     Pending(Rc<dyn Thunk>),
@@ -1023,8 +1029,19 @@ Ordinary `func` calls retain their original behavior.
 In `no-gc` builds, `publish::publish_value` copies proven finite immutable data into static storage.
 It retains actual backing scopes for opaque values. Pending lazy sequences and mutable identities never enter serialization.
 `publish::publish_for_owner(value, address)` uses that policy for static destinations and transfers scopes for regional destinations.
-`publish::publish_return(value)` applies the same policy to function and loop results.
+`publish::publish_return(value)` applies the same policy to completed function and loop results.
+Recur values use a replaceable lease owned by the trampoline. They do not enter static storage on each iteration.
 Static data has program lifetime. Copying finite data prevents unused caller temporaries from sharing that lifetime.
+Atoms and volatiles keep replaceable leases for contents stored in permanent cells.
+Updates preserve structural sharing and release obsolete scopes after their last consumer releases them.
+Reads transfer ownership into the consumer scope. Update callbacks hold temporary leases without retaining the previous payload through the new payload.
+Regional cells keep their contents for their owner scope. Bounded invocations retain their original allocation rules.
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` publishes only after its initial equality check succeeds.
+Interpreter, native, and compiled CAS operations use this method.
+The public `value` field remains available for compatibility. Direct writes bypass the ownership barrier.
+Use `reset` or `compare_and_set` for writes.
+Scalar vectors maintain a conservative summary so ownership tracing skips their elements.
+Unobserved future failures warn on drop, including gas exhaustion and memory-limit failures.
 Isolated allocation invocations keep their bounded lifetime rules.
 
 `NativeFn::captures: Vec<Value>` records managed values retained by an opaque

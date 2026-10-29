@@ -1447,6 +1447,9 @@ pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value)
         let pred_val = pred_ref.clone();
         let coll_val = coll_ref.clone();
         let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+            return rt_const_nil();
+        }
         return unsafe { rt_count(seq) };
     };
     let mut n: usize = 0;
@@ -1479,14 +1482,6 @@ fn eager_seq_elems(coll: &Value) -> Option<Vec<Value>> {
         Value::Nil => Some(Vec::new()),
         _ => None,
     }
-}
-
-/// Store a thrown value in the pending-exception slot (mirrors `rt_call`).
-#[inline]
-fn stash_pending_exception(val: Value) {
-    PENDING_EXCEPTION.with(|cell| {
-        *cell.borrow_mut() = Some(box_val(val));
-    });
 }
 
 /// Apply a filter predicate to `elem`.  Returns `Some(keep)`, or `None` if the
@@ -1535,6 +1530,9 @@ pub unsafe extern "C" fn rt_into_filter(
         let pred_val = pred_ref.clone();
         let coll_val = coll_ref.clone();
         let seq = call_global_fn("clojure.core", "filter", vec![pred_val, coll_val]);
+        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+            return rt_const_nil();
+        }
         let seq_val = unsafe { val_ref(seq) }.clone();
         return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
     };
@@ -1604,6 +1602,9 @@ pub unsafe extern "C" fn rt_into_mapcat(
         let f_val = f_ref.clone();
         let coll_val = coll_ref.clone();
         let seq = call_global_fn("clojure.core", "mapcat", vec![f_val, coll_val]);
+        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+            return rt_const_nil();
+        }
         let seq_val = unsafe { val_ref(seq) }.clone();
         call_global_fn("clojure.core", "into", vec![to_val, seq_val])
     };
@@ -1726,6 +1727,9 @@ pub unsafe extern "C" fn rt_into_map(
         let f_val = f_ref.clone();
         let coll_val = coll_ref.clone();
         let seq = call_global_fn("clojure.core", "map", vec![f_val, coll_val]);
+        if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+            return rt_const_nil();
+        }
         let seq_val = unsafe { val_ref(seq) }.clone();
         return call_global_fn("clojure.core", "into", vec![to_val, seq_val]);
     };
@@ -2583,8 +2587,8 @@ unsafe fn rt_call_compiled(
             eprintln!(
                 "[rt] error: compiled function arity {nargs} exceeds trampoline maximum (16)"
             );
-            stash_pending_exception(Value::Str(GcPtr::new(format!(
-                "compiled function arity {nargs} exceeds trampoline maximum (16)"
+            signal_error(cljrs_value::ValueError::Thrown(Value::Str(GcPtr::new(
+                format!("compiled function arity {nargs} exceeds trampoline maximum (16)"),
             ))));
             rt_const_nil()
         }
@@ -2650,7 +2654,9 @@ pub unsafe extern "C" fn rt_load_global(
                     }
                 }
                 Err(e) => {
-                    stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+                    signal_error(cljrs_value::ValueError::Thrown(Value::Str(GcPtr::new(
+                        format!("{e}"),
+                    ))));
                     return rt_const_nil();
                 }
             }
@@ -2684,7 +2690,9 @@ fn resolve_versioned_boxed(ns_part: &str, name: &str, commit: &str) -> *const Va
     ) {
         Ok(val) => box_or_intern_val(val),
         Err(e) => {
-            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            signal_error(cljrs_value::ValueError::Thrown(Value::Str(GcPtr::new(
+                format!("{e}"),
+            ))));
             rt_const_nil()
         }
     }
@@ -2814,12 +2822,6 @@ pub unsafe extern "C" fn rt_call(
 
     match cljrs_runtime::env::callback::invoke(callee, arg_values) {
         Ok(result) => box_invoke_result(result),
-        Err(cljrs_value::ValueError::Thrown(val)) => {
-            PENDING_EXCEPTION.with(|cell| {
-                *cell.borrow_mut() = Some(box_val(val));
-            });
-            rt_const_nil()
-        }
         Err(error) => signal_error(error),
     }
 }
@@ -3381,23 +3383,13 @@ pub unsafe extern "C" fn rt_atom_swap(
             // CAS loop
             loop {
                 let current = a.get().value.lock().unwrap().clone();
+                #[cfg(feature = "no-gc")]
+                let _previous_payload = cljrs_gc::region::RegionLease::for_value(&current);
                 let mut args = vec![current.clone()];
                 args.extend(extra.iter().cloned());
                 match cljrs_runtime::env::callback::invoke(&f, args) {
                     Ok(new_val) => {
-                        // Heap-promotion fallback (see `Atom::reset`): an atom
-                        // is program-lifetime shared state, so a region-tagged
-                        // value must be deep-copied to the GC heap (or the
-                        // region poisoned) *before* it is stored here — this
-                        // CAS loop bypasses `Atom::reset`, so it must run the
-                        // barrier itself instead of silently skipping it.
-                        let new_val = cljrs_value::publish::publish_for_owner(
-                            new_val,
-                            a.get() as *const _ as usize,
-                        );
-                        let mut guard = a.get().value.lock().unwrap();
-                        if *guard == current {
-                            *guard = new_val.clone();
+                        if a.get().compare_and_set(&current, new_val.clone()) {
                             return box_val(new_val);
                         }
                         // CAS failed, retry
@@ -4989,7 +4981,9 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
             raw
         }
         Err(e) => {
-            stash_pending_exception(Value::Str(GcPtr::new(format!("{e}"))));
+            signal_error(cljrs_value::ValueError::Thrown(Value::Str(GcPtr::new(
+                format!("{e}"),
+            ))));
             rt_const_nil()
         }
     }
@@ -5000,10 +4994,6 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
 fn invoke_boxed(callee: &Value, args: Vec<Value>) -> *const Value {
     match cljrs_runtime::env::callback::invoke(callee, args) {
         Ok(result) => box_invoke_result(result),
-        Err(cljrs_value::ValueError::Thrown(val)) => {
-            stash_pending_exception(val);
-            rt_const_nil()
-        }
         Err(error) => signal_error(error),
     }
 }
@@ -5667,6 +5657,67 @@ mod resource_review_tests {
         ));
     }
     #[test]
+    fn fused_into_fallbacks_stop_before_into_after_a_failure() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                let _alloc = cljrs_gc::push_alloc_frame();
+                let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                let counter = calls.clone();
+                runtime.globals().intern(
+                    "clojure.core",
+                    "into".into(),
+                    Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "into",
+                        Arity::Fixed(2),
+                        move |_| {
+                            counter.set(counter.get() + 1);
+                            Ok(Value::Nil)
+                        },
+                    ))),
+                );
+                for error in [
+                    ValueError::Thrown(Value::Long(71)),
+                    ValueError::GasExhausted,
+                    ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
+                        class: cljrs_gc::MemoryClass::GcHeap,
+                        requested: 1,
+                        committed: 2,
+                        hard_limit: 2,
+                    }),
+                ] {
+                    for name in ["filter", "mapcat", "map"] {
+                        let error = error.clone();
+                        runtime.globals().intern(
+                            "clojure.core",
+                            name.into(),
+                            Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                                name,
+                                Arity::Fixed(2),
+                                move |_| Err(error.clone()),
+                            ))),
+                        );
+                    }
+                    let empty = Value::Vector(GcPtr::new(PersistentVector::empty()));
+                    let not_seqable = Value::Bool(true);
+                    for bridge in [rt_into_filter, rt_into_mapcat, rt_into_map] {
+                        let result = unsafe { bridge(&empty, &Value::Nil, &not_seqable) };
+                        assert!(compiled_result(result).is_err());
+                        assert_eq!(calls.get(), 0, "into ran after its source operation failed");
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn every_callback_bridge_preserves_ordinary_and_resource_errors() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -5782,6 +5833,62 @@ mod resource_review_tests {
                     };
                     assert!(matches!(atom.get().deref(), Value::Nil));
                 }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn compiled_atom_updates_lease_shared_vectors_without_static_copies() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+
+                let atom = GcPtr::new(cljrs_value::Atom::new(Value::Vector(GcPtr::new(
+                    PersistentVector::empty(),
+                ))));
+                let atom_value = Value::Atom(atom.clone());
+                let append = Value::NativeFunction(GcPtr::new(NativeFn::new(
+                    "append",
+                    Arity::Fixed(1),
+                    |args| {
+                        let Value::Vector(vector) = &args[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Vector(GcPtr::new(
+                            vector.get().conj(Value::Long(vector.get().count() as i64)),
+                        )))
+                    },
+                )));
+                let retired = || {
+                    cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap()
+                };
+                let baseline = retired();
+                for count in 1..=1000 {
+                    let _scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                    let result = compiled_result(unsafe {
+                        rt_atom_swap(&atom_value, &append, std::ptr::null(), 0)
+                    })
+                    .unwrap();
+                    let Value::Vector(vector) = result else {
+                        unreachable!()
+                    };
+                    assert!(!vector.is_static_alloc());
+                    assert_eq!(vector.get().count(), count);
+                }
+                atom.get().reset(Value::Nil);
+                assert_eq!(
+                    retired(),
+                    baseline,
+                    "old accumulator versions stayed leased"
+                );
             })
             .unwrap()
             .join()

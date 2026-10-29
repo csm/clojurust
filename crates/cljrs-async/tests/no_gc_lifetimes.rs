@@ -237,3 +237,84 @@ fn queued_rust_spawn_results_transfer_into_the_consumers_scope() {
     })
     .unwrap();
 }
+
+#[test]
+fn top_level_accumulators_and_replaced_opaque_values_do_not_accumulate_static_copies() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let mut env = Env::new(runtime.globals().clone(), "user");
+            let evaluate = |source: &str, env: &mut Env| {
+                let mut result = cljrs_value::Value::Nil;
+                for form in cljrs_reader::Parser::new(source.into(), "<top-level-storage>".into())
+                    .parse_all()
+                    .unwrap()
+                {
+                    result = cljrs_runtime::interp::eval::eval(&form, env).unwrap();
+                }
+                result
+            };
+            evaluate("(def cell (atom [])) (def opaque (atom nil))", &mut env);
+            let before = cljrs_gc::governor::snapshot().class_bytes(cljrs_gc::MemoryClass::Static);
+            assert_eq!(
+                evaluate(
+                    r#"
+            (count (loop [acc [] i 0]
+                (if (< i 2000) (recur (conj acc i) (inc i)) acc)))
+        "#,
+                    &mut env
+                ),
+                cljrs_value::Value::Long(2000)
+            );
+            evaluate(
+                r#"
+            (dotimes [i 2000] (swap! cell conj i))
+            (assert (= 2000 (count @cell)))
+            (let [old @cell]
+                (reset! cell [])
+                (assert (= 1999 (nth old 1999))))
+            (dotimes [i 300]
+                (reset! opaque (fn [] i)))
+            (assert (= 299 (@opaque)))
+            (reset! opaque nil)
+            (loop [xs nil i 0]
+                (if (< i 300)
+                    (recur (lazy-seq (list i)) (inc i))
+                    (assert (= 299 (first xs)))))
+        "#,
+                &mut env,
+            );
+            let retired =
+                || cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap();
+            let baseline = retired();
+            for _ in 0..3 {
+                evaluate(
+                    r#"
+                (dotimes [i 100] (reset! opaque (fn [] i)))
+                (reset! opaque nil)
+                (loop [xs nil i 0]
+                    (if (< i 100)
+                        (recur (lazy-seq (list i)) (inc i))
+                        (assert (= 99 (first xs)))))
+            "#,
+                    &mut env,
+                );
+                assert_eq!(
+                    retired(),
+                    baseline,
+                    "replaced opaque contents permanently retained iteration regions"
+                );
+            }
+            let after = cljrs_gc::governor::snapshot().class_bytes(cljrs_gc::MemoryClass::Static);
+            assert!(
+                after - before < 2 * 1024 * 1024,
+                "top-level updates copied accumulators into static storage: {} bytes",
+                after - before
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
