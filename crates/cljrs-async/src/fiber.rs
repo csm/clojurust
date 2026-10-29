@@ -207,6 +207,13 @@ impl Fiber {
         let lease = cljrs_gc::region::RegionLease::capture_active();
         #[cfg(feature = "no-gc")]
         let allocation = cljrs_gc::region::AllocationSnapshot::capture();
+        #[cfg(feature = "no-gc")]
+        let lease = {
+            let mut lease = lease;
+            lease.extend(&cljrs_gc::region::RegionLease::for_values(&roots));
+            lease
+        };
+        let reports = crate::channel::FailureReports::current();
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
         // Register captures in the fiber's detached state, not the caller's.
@@ -226,6 +233,7 @@ impl Fiber {
             allocation: allocation.clone(),
         };
         task.state.swap_with_current();
+        reports.install();
         task.roots_guard = Some(root_values(&task.roots));
         task.state.swap_with_current();
         task.co = Some(unsafe {
@@ -500,6 +508,17 @@ pub fn run_root(
     body: impl FnOnce() -> EvalResult,
 ) -> EvalResult {
     assert!(current().is_none(), "nested root fiber");
+    // The root and every task it spawns share this carrier's report registry.
+    carrier.swap_with_current();
+    let reports = crate::channel::FailureReports::current();
+    carrier.swap_with_current();
+    struct RestoreReports(crate::channel::FailureReports);
+    impl Drop for RestoreReports {
+        fn drop(&mut self) {
+            self.0.install();
+        }
+    }
+    let _reports = RestoreReports(reports.install());
     // SAFETY: the task never escapes this synchronous function. Drive drops
     // (and unwinds) it on every exit, including executor panics.
     let mut task =

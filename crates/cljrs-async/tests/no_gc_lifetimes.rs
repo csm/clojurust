@@ -336,6 +336,8 @@ fn returned_updates_and_top_level_reads_release_obsolete_backing_scopes() {
                         .parse_all()
                         .unwrap()
                 {
+                    // The embedding caller discards this result before its read scope ends.
+                    let _read = cljrs_gc::region::ReadScope::enter();
                     cljrs_runtime::interp::eval::eval(&form, env).unwrap();
                 }
             };
@@ -356,6 +358,31 @@ fn returned_updates_and_top_level_reads_release_obsolete_backing_scopes() {
                 (dotimes [i 100] (str "reuse " i))
                 (assert (= "shared text" (get m :j)))))
             (seed-a) (take-a) (seed-v) (take-v)
+            (let [value [1 :a (str "identity" " value")]
+                  returned (reset! a value)]
+              (assert (identical? value returned))
+              (assert (identical? value @a))
+              (assert (identical? value (swap! a (fn [old] old))))
+              (assert (identical? value (vreset! v value)))
+              (assert (identical? value @v)))
+            (reset! a {})
+            (vreset! v {})
+            (defn make-watched []
+              (let [text (str "callback" " alive")]
+                (atom 1 :meta {:label text} :validator (fn [value] (and (= "callback alive" text) (pos? value))))))
+            (def watched (make-watched))
+            (def events (atom []))
+            (defn install-callbacks []
+              (let [text (str "callback" " alive")]
+                (add-watch watched :key (fn [key reference old new] (swap! events conj [text old new])))))
+            (install-callbacks)
+            (dotimes [i 100] (str "reuse " i))
+            (assert (= "callback alive" (:label (meta watched))))
+            (reset! watched 2)
+            (assert (= [["callback alive" 1 2]] @events))
+            (assert (= :rejected (try (reset! watched -1) (catch Exception e :rejected))))
+            (remove-watch watched :key)
+
             (let [captured (the-ns 'user)] (def namespace-reader (fn [] captured)))
             (assert (identical? *ns* (namespace-reader)))
             (def namespace-reader nil)
@@ -387,4 +414,69 @@ fn returned_updates_and_top_level_reads_release_obsolete_backing_scopes() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn spawned_tasks_keep_actual_captures_without_inheriting_unrelated_reads() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    #[derive(Debug)]
+    struct Probe(std::rc::Rc<std::cell::Cell<bool>>);
+    impl cljrs_gc::Trace for Probe {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    impl cljrs_value::NativeObject for Probe {
+        fn type_tag(&self) -> &str {
+            "Probe"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let read = cljrs_gc::region::ReadScope::enter().unwrap();
+        let atom = cljrs_gc::GcPtr::new(cljrs_value::Atom::new(cljrs_value::Value::Nil));
+        let mut dropped = Vec::new();
+        let mut captured = cljrs_value::Value::Nil;
+        for _ in 0..100 {
+            let probe = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                atom.get().reset(cljrs_value::Value::NativeObject(
+                    cljrs_value::gc_native_object(Probe(probe.clone())),
+                ));
+            }
+            captured = atom.get().deref();
+            atom.get().reset(cljrs_value::Value::Nil);
+            dropped.push(probe);
+        }
+        let task =
+            cljrs_async::spawn_future_with_roots(
+                vec![captured.clone()],
+                async move { Ok(captured) },
+            );
+        drop(read);
+        assert!(
+            dropped[..99].iter().all(|p| p.get()),
+            "a task inherited unrelated read leases"
+        );
+        assert!(
+            !dropped[99].get(),
+            "the actual capture was released before polling"
+        );
+        let _consumer = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        assert!(matches!(
+            cljrs_async::await_value(task).await.unwrap(),
+            cljrs_value::Value::NativeObject(_)
+        ));
+    });
 }

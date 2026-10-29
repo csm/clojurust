@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 
 use cljrs_async::channel::{chan_deliver as deliver, chan_put as put, chan_ref, make_chan};
-use cljrs_async::spawn_future;
+use cljrs_async::spawn_future_with_roots;
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::GlobalEnv;
 use cljrs_value::{Arity, ExceptionInfo, NativeFn, Value, ValueError, ValueResult};
@@ -118,7 +118,7 @@ fn builtin_chunk_chan(args: &[Value]) -> ValueResult<Value> {
     let cap = size_arg_or(args, 2, DEFAULT_STREAM_CAP)?;
     let ch = make_chan(cap);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) => {
@@ -156,7 +156,7 @@ fn builtin_byte_chan(args: &[Value]) -> ValueResult<Value> {
     let cap = size_arg_or(args, 1, DEFAULT_STREAM_CAP)?;
     let ch = make_chan(cap);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) => {
@@ -197,7 +197,7 @@ fn builtin_char_chan(args: &[Value]) -> ValueResult<Value> {
     let cap = size_arg_or(args, 2, DEFAULT_STREAM_CAP)?;
     let ch = make_chan(cap);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) => {
@@ -245,7 +245,7 @@ fn builtin_line_chan(args: &[Value]) -> ValueResult<Value> {
     let cap = size_arg_or(args, 2, DEFAULT_STREAM_CAP)?;
     let ch = make_chan(cap);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) => {
@@ -299,7 +299,7 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
     let encoding = resolve_charset(args.get(1))?;
     let ch = make_chan(1);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let result = match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 let (text, _, _) = encoding.decode(&bytes);
@@ -319,7 +319,7 @@ fn builtin_slurp_bytes(args: &[Value]) -> ValueResult<Value> {
     let path = str_arg(args, 0, "string (path)")?;
     let ch = make_chan(1);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let result = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes_value(&bytes),
             Err(e) => io_error(format!("cannot read {path}: {e}")),
@@ -345,7 +345,7 @@ fn builtin_read_bytes(args: &[Value]) -> ValueResult<Value> {
     };
     let ch = make_chan(1);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let result = read_n_bytes(&path, n).await;
         deliver(&ch, result).await;
         Ok(Value::Nil)
@@ -397,7 +397,7 @@ fn builtin_spit(args: &[Value]) -> ValueResult<Value> {
     };
     let ch = make_chan(1);
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![ch_val.clone()], async move {
         let result = match tokio::fs::write(&path, &bytes).await {
             Ok(()) => Value::Long(bytes.len() as i64),
             Err(e) => io_error(format!("cannot write {path}: {e}")),

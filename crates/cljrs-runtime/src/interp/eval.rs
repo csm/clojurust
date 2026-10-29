@@ -20,9 +20,13 @@ use cljrs_value::{
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    with_read_scope(|| eval_unscoped(form, env))
+}
+
+pub(crate) fn with_read_scope(body: impl FnOnce() -> EvalResult) -> EvalResult {
     #[cfg(feature = "no-gc")]
     let scope = cljrs_gc::region::ReadScope::enter();
-    let result = eval_caught(form, env);
+    let result = body();
     #[cfg(feature = "no-gc")]
     if let Some(scope) = scope {
         let _borrowed = scope.finish();
@@ -43,7 +47,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
     result
 }
 
-fn eval_caught(form: &Form, env: &mut Env) -> EvalResult {
+pub(crate) fn eval_unscoped(form: &Form, env: &mut Env) -> EvalResult {
     if !matches!(
         &form.kind,
         FormKind::List(_)
@@ -113,7 +117,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&vals);
-                vals.push(eval(f, env)?);
+                vals.push(eval_unscoped(f, env)?);
             }
             Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))))
         }
@@ -124,7 +128,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             let mut pairs: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&pairs);
-                pairs.push(eval(f, env)?);
+                pairs.push(eval_unscoped(f, env)?);
             }
             let kv_pairs: Vec<(Value, Value)> = pairs
                 .chunks(2)
@@ -137,7 +141,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&vals);
-                vals.push(eval(f, env)?);
+                vals.push(eval_unscoped(f, env)?);
             }
             Ok(Value::Set(SetValue::Hash(GcPtr::new(
                 PersistentHashSet::from_iter(vals),
@@ -158,7 +162,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             "unquote-splice outside syntax-quote".into(),
         )),
         FormKind::Deref(inner) => {
-            let v = eval(inner, env)?;
+            let v = eval_unscoped(inner, env)?;
             if env.is_async && matches!(v, Value::Future(_)) {
                 return Err(EvalError::Runtime(
                     "deref (@) on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
@@ -186,7 +190,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             //
             // `lower::anf` applies the same rule, so a promoted or AOT-compiled
             // body answers `meta` the same way an interpreted one does.
-            let mut value = eval(form, env)?;
+            let mut value = eval_unscoped(form, env)?;
             // `^:async (fn …)` is both: it makes the fn async, and — an `fn`
             // taking runtime metadata — lands `{:async true}` on it.
             // A stacked annotation (`^:async ^:a (fn …)`) has already wrapped
@@ -204,14 +208,16 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             if !form.takes_runtime_meta() {
                 return Ok(value);
             }
-            let m = crate::builtins::form::expand_meta_annotation(meta, &mut |f| eval(f, env))?;
+            let m = crate::builtins::form::expand_meta_annotation(meta, &mut |f| {
+                eval_unscoped(f, env)
+            })?;
             Ok(crate::builtins::form::attach_meta(value, m))
         }
 
         // ── Dispatch ──────────────────────────────────────────────────────
         FormKind::AnonFn(body) => {
             let expanded = crate::builtins::form::expand_anon_fn(body, form.span.clone());
-            eval(&expanded, env)
+            eval_unscoped(&expanded, env)
         }
         FormKind::ReaderCond {
             splicing: _,
@@ -425,18 +431,39 @@ pub fn deref_value(v: Value) -> EvalResult {
 
 /// Evaluate a sequence of forms and return the value of the last one.
 pub fn eval_body(forms: &[Form], env: &mut Env) -> EvalResult {
-    let mut result = Value::Nil;
-    for form in forms {
-        result = eval(form, env)?;
+    let Some((last, discarded)) = forms.split_last() else {
+        return Ok(Value::Nil);
+    };
+    for form in discarded {
+        #[cfg(feature = "no-gc")]
+        let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let result = eval_unscoped(form, env);
+        #[cfg(feature = "no-gc")]
+        if result.is_err() {
+            scratch.pop_for_return();
+            return match result {
+                Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
+                    cljrs_value::publish::publish_return(value),
+                )),
+                Err(EvalError::Recur(values)) => Err(EvalError::Recur(
+                    values
+                        .into_iter()
+                        .map(cljrs_value::publish::publish_return)
+                        .collect(),
+                )),
+                other => other,
+            };
+        }
+        result?;
     }
-    Ok(result)
+    eval_unscoped(last, env)
 }
 
 // ── reader cond ───────────────────────────────────────────────────────────────
 
 fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
     match crate::builtins::form::select_reader_cond(clauses) {
-        Some(f) => eval(f, env),
+        Some(f) => eval_unscoped(f, env),
         None => Ok(Value::Nil),
     }
 }
@@ -446,7 +473,7 @@ fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
 fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
     match tag {
         "uuid" => {
-            let val = eval(inner, env)?;
+            let val = eval_unscoped(inner, env)?;
             match &val {
                 Value::Str(s) => {
                     let uuid = uuid::Uuid::parse_str(s.get())
@@ -461,7 +488,7 @@ fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
         }
         "inst" => {
             // TODO: implement #inst for date/time literals
-            let val = eval(inner, env)?;
+            let val = eval_unscoped(inner, env)?;
             Ok(val)
         }
         _ => Err(EvalError::Runtime(format!(
@@ -499,7 +526,7 @@ mod tests {
         let forms = parser.parse_all().map_err(EvalError::Read)?;
         let mut result = Value::Nil;
         for form in forms {
-            result = eval(&form, env)?;
+            result = eval_unscoped(&form, env)?;
         }
         Ok(result)
     }

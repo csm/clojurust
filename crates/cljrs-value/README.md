@@ -563,7 +563,7 @@ correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
 `CljxPromise::deliver`, and `cljrs-async`'s channel puts.
 Under `no-gc`, regional destinations transfer backing scopes.
-Replaceable cells, Var roots, and channel entries use cached leases and compact arenas for small finite payloads.
+Replaceable cells, Var roots, and channel entries use cached leases. Publication preserves object identity.
 
 ### `Namespace` (Phase 4)
 
@@ -1026,17 +1026,17 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
-In `no-gc` builds, `publish::publish_value` copies finite immutable data into static storage at explicit program-lifetime boundaries.
-Unowned opaque publications retain their backing scopes. Pending sequences and mutable identities never enter serialization.
+In `no-gc` builds, `publish::publish_value` retains backing scopes at explicit program-lifetime boundaries.
+All values preserve identity and laziness; publication does not serialize them.
 `publish::publish_return(value)` transfers results into the caller or its active `ReadScope`.
 The evaluator publishes only its final escaping result after that read scope ends.
 Recur values use a replaceable trampoline lease.
 
 `publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
-Small finite graphs use a dedicated arena, with a budget of 32 values and 4096 bytes per string.
-This arena contains no unrelated caller temporaries. Larger or unsupported shapes keep their backing scopes and preserve structural sharing.
-Opaque values preserve identity and laziness.
-Permanent destinations own their current payload lease. Regional destinations use ownership edges and cache weak snapshots.
+Every payload keeps its original identity and structural sharing.
+A live payload retains its source arena, including other allocations in that arena.
+Replacing or consuming the payload releases that ownership after its last reader finishes.
+Permanent destinations own their current payload lease. Regional destinations use counted, replaceable ownership edges and cache weak snapshots.
 Ownership tracing records mutable container scopes without snapshotting their current contents.
 Namespace bindings, protocol implementations, and channel entries retain their contents through their own destination ownership.
 `ValueLease` implements `Default` and `Debug`.
@@ -1044,6 +1044,8 @@ Its `snapshot() -> RegionLease` method acquires temporary ownership without anot
 Its `protect_current()` method transfers that cached ownership into the caller.
 
 Atoms, volatiles, and Var roots use this shared preparation path, including initial values and replacements.
+Atom metadata, validators, and watch callbacks have independent replaceable leases. Var metadata and watches do too.
+Use `add_watch` and `remove_watch` to maintain ownership; direct mutation of the public watch vector bypasses these barriers.
 Reads reuse cached leases. Their cost depends on the number of backing scopes, without traversal of collection elements.
 Returned updates acquire caller ownership before the cell can replace its payload.
 `Atom::snapshot()` and `Volatile::snapshot()` return `publish::ValueSnapshot` for callbacks and watches.

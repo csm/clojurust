@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 use crate::interp::destructure::value_to_seq_vec;
-use crate::interp::eval::eval;
+use crate::interp::eval::eval_unscoped as eval;
 
 /// Convert an EvalError to a Value for storage (e.g. agent errors).
 /// Preserves Thrown values (ex-info); other errors become strings.
@@ -37,6 +37,11 @@ fn fire_watches(
     new: &Value,
     env: &mut Env,
 ) {
+    match reference {
+        Value::Atom(atom) => atom.get().protect_watches(),
+        Value::Var(var) => var.get().protect_watches(),
+        _ => {}
+    }
     let ws: Vec<(Value, Value)> = watches.lock().unwrap().clone();
     for (key, f) in &ws {
         let args = vec![key.clone(), reference.clone(), old.clone(), new.clone()];

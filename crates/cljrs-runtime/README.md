@@ -1756,10 +1756,12 @@ The cells lease new contents and release replaced contents after their last cons
 Update callbacks and watches hold temporary leases for the previous contents.
 
 The no-GC evaluator bounds temporary reads with `region::ReadScope`.
-Intermediate reads transfer cached leases into that scope. Only the final escaping result receives program-lifetime publication.
+The public evaluator enters this scope once. Recursive form evaluation uses the direct interpreter entry.
+Each call, loop iteration, and discarded `do` statement bounds its own temporary reads.
+Only the final escaping result receives program-lifetime publication.
 Definition expressions use scratch storage. Namespace and Var containers remain permanent, while Var payloads use replaceable leases.
 Protocol method registration transfers function ownership before it stores the implementation.
 Atom and volatile update callbacks use cached snapshots for previous contents.
 Their returned values acquire caller ownership, including shared children from earlier versions.
-Small finite cell payloads use compact arenas. Other payloads preserve structural sharing and identity.
+All cell payloads preserve structural sharing and identity. Replacement releases obsolete ownership edges.
 Native and IR closures share one immutable capture slice between execution and tracing.

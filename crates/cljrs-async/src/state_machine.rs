@@ -47,8 +47,6 @@ use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::env::gc_roots::{ValueRootGuard, root_value, root_values};
 use cljrs_value::{CljxFuture, FutureState, Value};
 
-use crate::eval_async::spawn_future;
-
 /// The eval context (globals + namespace) a compiled poll function runs under,
 /// so its `rt_*` global-lookup / call bridges work while the task runs detached
 /// on the executor.
@@ -239,9 +237,10 @@ pub fn spawn_state_machine(
     args: Vec<Value>,
     eval_ctx: Option<EvalCtx>,
 ) -> Value {
+    let roots = args.clone();
     let mut sm = CljxStateMachine::new(poll_fn, n_slots, args);
     sm.eval_ctx = eval_ctx;
-    spawn_future(CompiledAsyncTask::new(sm))
+    crate::eval_async::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
 }
 
 // ── Compiled poll-function registry ──────────────────────────────────────────

@@ -105,13 +105,25 @@ impl FailureReport {
         }
     }
 }
+#[derive(Clone, Default)]
+pub(crate) struct FailureReports(Rc<RefCell<Vec<Rc<FailureReport>>>>);
 thread_local! {
-    // No managed values. Shared by the isolate so executor teardown also
-    // reports static no-GC channels whose destructors never run.
-    static THREAD_FAILURES: RefCell<Vec<Rc<FailureReport>>> = const { RefCell::new(Vec::new()) };
+    // Shared by the fibers and carrier of one executor. Contains no Values.
+    static THREAD_FAILURES: RefCell<FailureReports> = RefCell::new(FailureReports::default());
+}
+cljrs_gc::mutator_slot!("cljrs-async/THREAD_FAILURES", refcell THREAD_FAILURES: FailureReports);
+impl FailureReports {
+    pub(crate) fn current() -> Self {
+        THREAD_FAILURES.with(|slot| slot.borrow().clone())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn install(&self) -> Self {
+        THREAD_FAILURES.with(|slot| slot.replace(self.clone()))
+    }
 }
 pub fn report_unobserved_thread_failures() {
-    let reports = THREAD_FAILURES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let registry = FailureReports::current();
+    let reports = std::mem::take(&mut *registry.0.borrow_mut());
     for report in reports {
         report.report();
     }
@@ -432,11 +444,12 @@ impl CljChannel {
             observed: Cell::new(false),
             reported: Cell::new(false),
         });
-        THREAD_FAILURES.with(|slot| {
-            let mut reports = slot.borrow_mut();
+        {
+            let registry = FailureReports::current();
+            let mut reports = registry.0.borrow_mut();
             reports.retain(|report| !report.observed.get() && !report.reported.get());
             reports.push(report.clone());
-        });
+        }
         self.state.lock().unwrap().failure = Some(report);
         self.close();
     }
@@ -971,20 +984,19 @@ mod review_publication_tests {
         let mut receiver = Box::pin(channel.take());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(receiver.as_mut().poll(&mut cx).is_pending());
-        let mut region = cljrs_gc::region::Region::new();
-        let guard = unsafe { cljrs_gc::region::RegionGuard::new(&mut region) };
+        let mut region = Box::new(cljrs_gc::region::Region::new());
+        unsafe { cljrs_gc::region::push_region_raw(region.as_mut() as *mut _) };
         let value =
             Value::Vector(region.alloc(cljrs_value::PersistentVector::from_iter([Value::Long(7)])));
         assert!(matches!(channel.rv_offer(&value), RvOffer::Offered(_)));
-        drop(guard);
-        drop(region);
+        cljrs_gc::region::close_region(region);
         let Poll::Ready(Value::Vector(vector)) = receiver.as_mut().poll(&mut cx) else {
             panic!("take did not complete")
         };
         #[cfg(not(feature = "no-gc"))]
         assert!(!vector.is_region_alloc());
         #[cfg(feature = "no-gc")]
-        assert!(vector.is_static_alloc());
+        assert!(matches!(&value, Value::Vector(original) if GcPtr::ptr_eq(original, &vector)));
         assert_eq!(vector.get().iter().next(), Some(&Value::Long(7)));
     }
 
@@ -1048,6 +1060,50 @@ mod review_publication_tests {
         assert_eq!(
             cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap(),
             retired
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod executor_report_tests {
+    #![allow(clippy::result_large_err)]
+    use super::*;
+    #[test]
+    fn helper_executor_teardown_does_not_report_a_live_session_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+        let channel = crate::fiber::run_root(&rt, &local, &mut carrier, || {
+            let channel = gc_native_object(CljChannel::new(1));
+            channel
+                .get()
+                .downcast_ref::<CljChannel>()
+                .unwrap()
+                .fail(ChannelFailure::Gas);
+            Ok(Value::NativeObject(channel))
+        })
+        .unwrap();
+        let Value::NativeObject(channel) = channel else {
+            unreachable!()
+        };
+        let channel = channel.get().downcast_ref::<CljChannel>().unwrap();
+        let report = channel.state.lock().unwrap().failure.clone().unwrap();
+        crate::fiber::run_root_owned(&rt, tokio::task::LocalSet::new(), || Ok(Value::Nil)).unwrap();
+        assert!(
+            !report.reported.get(),
+            "an unrelated executor reported this failure"
+        );
+        assert!(matches!(
+            channel.failure(),
+            Some(cljrs_value::ValueError::GasExhausted)
+        ));
+        crate::fiber::drop_local_with_carrier(local, &mut carrier);
+        assert!(
+            !report.reported.get(),
+            "a handled failure was reported during its own teardown"
         );
     }
 }

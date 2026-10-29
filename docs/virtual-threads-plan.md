@@ -533,6 +533,14 @@ Recur values use trampoline leases. Permanent atom and volatile contents use rep
 Program-lifetime opaque publications without a replaceable owner still retain their actual backing scopes.
 
 Fifth-pass review regressions cover returned update aliases, cached reads without value traversal,
-small payload arenas, repeated top-level reads and Var rebindings, and release of consumed opaque channel values.
+repeated top-level reads and Var rebindings, and release of consumed opaque channel values.
 Compiled atom updates share interpreter validators and watches. Native closures share one capture allocation.
 Handled thread resource failures produce no warning. Unread failures report once, including after collection.
+
+
+Sixth-pass review regressions cover replaceable regional ownership, auxiliary atom slots, and publication identity.
+Read scopes end with each call or iteration. Stores retain ownership independently of these scopes.
+Global Var reads reuse cached leases without allocating a snapshot for every lookup.
+Declared task captures exclude unrelated read leases. Executor report registries stay with their carrier and fibers.
+Compiled atom callback errors use the shared conversion helper, including runtime memory-fault confirmation.
+Publication preserves identity. A live payload can retain unrelated allocations in its source arena until its last owner releases it.

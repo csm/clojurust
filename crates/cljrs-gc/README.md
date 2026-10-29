@@ -747,7 +747,8 @@ retains only actual backing scopes for program-lifetime destinations.
 `RegionLease::for_value(value)` traces those scopes without evaluating user code.
 `RegionLease::for_values<T: Trace>(values: &[T])` leases several values with one visited set.
 `RegionLease` implements `Default`, `Clone`, and `Debug`.
-`RegionLease::protect_current()` transfers their ownership into the current destination scope.
+`RegionLease::protect_current()` borrows backing scopes into the current read scope.
+Without a read scope, it transfers ownership into the current allocation destination.
 `AllocationOwner::current()` and `for_address(address)` return weak destination handles.
 Their `protect(value)` method keeps source scopes alive for that destination's lifetime.
 `AllocationOwner::is_permanent()` identifies a static or permanently retained destination.
@@ -766,7 +767,12 @@ No-gc `MarkVisitor` implements `Default` and traverses values only for explicit 
 
 `RegionLease::downgrade() -> WeakRegionLease` caches backing scopes without an external ownership root.
 `WeakRegionLease` implements `Default` and `Debug`. Its `upgrade() -> RegionLease` acquires temporary ownership.
-`AllocationOwner::adopt(&RegionLease)` transfers cached ownership without another value traversal.
+`AllocationOwner::adopt(&RegionLease)` stores cached ownership for the full destination lifetime.
+Store operations never route ownership into temporary read scopes.
+`AllocationOwner::replaceable(&RegionLease) -> RegionDependency` creates counted edges for one replaceable slot.
+Dropping that slot removes its edges. Other slots and durable stores retain their own edges.
+`RegionDependency` implements `Default` and `Debug`; `snapshot()` acquires a temporary `RegionLease`.
+`RegionLease::extend(&RegionLease)` merges owners with a set indexed by scope ID.
 
 `region::ReadScope::enter() -> Option<ReadScope>` starts the outermost evaluation read scope.
 Nested calls return `None`. Bounded invocations also return `None`.
@@ -774,5 +780,10 @@ Nested calls return `None`. Bounded invocations also return `None`.
 `finish(self) -> RegionLease` removes the scope and returns its leases while the final result escapes.
 Drop releases a scope on unwind. A scope stays on its creating thread.
 Fibers swap this state with their other mutator slots.
-Task capture includes these leases so suspended work retains borrowed inputs.
+Each scratch guard opens a nested read scope for one call or iteration.
+`pop_for_return()` removes this scope while retaining its leases until result transfer finishes.
+`ReadScope::nested()` also opens a nested scope explicitly.
+Task capture excludes temporary read scopes. Callers must declare captured managed values.
 Low-level embedders can use a read scope to bound temporary reads outside the evaluator.
+Keep the scope alive while using borrowed results. Discard the results before dropping the scope.
+Without an enclosing caller scope, raw escaping results receive program-lifetime ownership.

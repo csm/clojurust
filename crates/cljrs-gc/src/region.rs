@@ -589,6 +589,7 @@ struct LeaseOwner {
     permanent: std::cell::Cell<bool>,
     dependents: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
     dependencies: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
+    dependency_counts: RefCell<std::collections::BTreeMap<u64, usize>>,
 }
 #[cfg(feature = "no-gc")]
 impl Drop for LeaseOwner {
@@ -610,6 +611,7 @@ impl Drop for LeaseOwner {
             .filter_map(std::rc::Weak::upgrade)
         {
             dependent.dependencies.borrow_mut().remove(&self.id);
+            dependent.dependency_counts.borrow_mut().remove(&self.id);
         }
     }
 }
@@ -627,6 +629,7 @@ impl Region {
             permanent: std::cell::Cell::new(false),
             dependents: RefCell::new(Default::default()),
             dependencies: RefCell::new(Default::default()),
+            dependency_counts: RefCell::new(Default::default()),
         });
         self.lease = Some(owner.clone());
         for chunk in &self.chunks {
@@ -682,6 +685,10 @@ impl ReadScope {
         READ_SCOPES.with(|scopes| scopes.borrow_mut().push(Default::default()));
         Some(Self(true, std::marker::PhantomData))
     }
+    pub fn nested() -> Self {
+        READ_SCOPES.with(|scopes| scopes.borrow_mut().push(Default::default()));
+        Self(true, std::marker::PhantomData)
+    }
     pub fn is_active() -> bool {
         READ_SCOPES.with(|scopes| !scopes.borrow().is_empty())
     }
@@ -703,7 +710,10 @@ impl Drop for ReadScope {
 /// Temporary ownership of scratch scopes. Empty until a scope is shared.
 #[cfg(feature = "no-gc")]
 #[derive(Default)]
-pub struct RegionLease(Vec<std::rc::Rc<LeaseOwner>>);
+pub struct RegionLease(
+    Vec<std::rc::Rc<LeaseOwner>>,
+    std::collections::BTreeSet<u64>,
+);
 #[cfg(feature = "no-gc")]
 impl std::fmt::Debug for RegionLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -724,7 +734,8 @@ impl RegionLease {
         for owner in &owners {
             owner.external.set(owner.external.get() + 1);
         }
-        Self(owners)
+        let ids = owners.iter().map(|owner| owner.id).collect();
+        Self(owners, ids)
     }
     pub fn capture_active() -> Self {
         let mut owners = INHERITED_LEASES.with(|stack| {
@@ -733,14 +744,6 @@ impl RegionLease {
                 .iter()
                 .flat_map(|lease| lease.0.iter().cloned())
                 .collect::<Vec<_>>()
-        });
-        READ_SCOPES.with(|scopes| {
-            owners.extend(
-                scopes
-                    .borrow()
-                    .iter()
-                    .flat_map(|lease| lease.0.iter().cloned()),
-            );
         });
         for ptr in live_regions() {
             // SAFETY: both scope registries contain live, stable regions.
@@ -768,7 +771,7 @@ impl RegionLease {
     pub(crate) fn add_address(&mut self, address: usize) {
         if let Some(owner) = find_owner(address)
             && !owner.permanent.get()
-            && !self.0.iter().any(|existing| existing.id == owner.id)
+            && self.1.insert(owner.id)
         {
             owner.external.set(owner.external.get() + 1);
             self.0.push(owner);
@@ -777,18 +780,29 @@ impl RegionLease {
     pub fn downgrade(&self) -> WeakRegionLease {
         WeakRegionLease(self.0.iter().map(std::rc::Rc::downgrade).collect())
     }
-    fn extend(&mut self, lease: &Self) {
+    pub fn extend(&mut self, lease: &Self) {
         for owner in &lease.0 {
-            if !self.0.iter().any(|existing| existing.id == owner.id) {
+            if self.1.insert(owner.id) {
                 owner.external.set(owner.external.get() + 1);
                 self.0.push(owner.clone());
             }
         }
     }
     pub fn protect_current(&self) {
-        if !self.0.is_empty() {
-            AllocationOwner::current().adopt(self);
+        if self.0.is_empty() {
+            return;
         }
+        if READ_SCOPES.with(|scopes| {
+            if let Some(scope) = scopes.borrow_mut().last_mut() {
+                scope.extend(self);
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+        AllocationOwner::current().adopt(self);
     }
     pub fn enter(&self) -> LeaseScope {
         INHERITED_LEASES.with(|stack| stack.borrow_mut().push(self.clone()));
@@ -830,19 +844,8 @@ impl AllocationOwner {
     pub fn protect(&self, value: &impl Trace) {
         self.adopt(&RegionLease::for_value(value));
     }
+    /// Store backing scopes for the destination's full lifetime.
     pub fn adopt(&self, lease: &RegionLease) {
-        if self.is_permanent()
-            && READ_SCOPES.with(|scopes| {
-                if let Some(scope) = scopes.borrow_mut().last_mut() {
-                    scope.extend(lease);
-                    true
-                } else {
-                    false
-                }
-            })
-        {
-            return;
-        }
         if let Some(owner) = self.0.upgrade() {
             if owner.permanent.get() {
                 for source in &lease.0 {
@@ -852,10 +855,15 @@ impl AllocationOwner {
             }
             let mut dependencies = owner.dependencies.borrow_mut();
             for source in &lease.0 {
-                if source.id != owner.id
-                    && !source.permanent.get()
-                    && let std::collections::btree_map::Entry::Vacant(entry) =
-                        dependencies.entry(source.id)
+                if source.id == owner.id || source.permanent.get() {
+                    continue;
+                }
+                owner
+                    .dependency_counts
+                    .borrow_mut()
+                    .insert(source.id, usize::MAX);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    dependencies.entry(source.id)
                 {
                     entry.insert(std::rc::Rc::downgrade(source));
                     source
@@ -872,6 +880,79 @@ impl AllocationOwner {
         }
     }
 }
+/// Replaceable ownership edges. Dropping a slot releases only its own edges.
+#[cfg(feature = "no-gc")]
+#[derive(Default, Debug)]
+pub struct RegionDependency {
+    destination: AllocationOwner,
+    sources: WeakRegionLease,
+}
+#[cfg(feature = "no-gc")]
+impl RegionDependency {
+    pub fn snapshot(&self) -> RegionLease {
+        self.sources.upgrade()
+    }
+}
+#[cfg(feature = "no-gc")]
+impl AllocationOwner {
+    pub fn replaceable(&self, lease: &RegionLease) -> RegionDependency {
+        let Some(owner) = self.0.upgrade() else {
+            return RegionDependency::default();
+        };
+        for source in &lease.0 {
+            if source.id == owner.id || source.permanent.get() {
+                continue;
+            }
+            let mut counts = owner.dependency_counts.borrow_mut();
+            let count = counts.entry(source.id).or_default();
+            if *count != usize::MAX {
+                *count += 1;
+            }
+            owner
+                .dependencies
+                .borrow_mut()
+                .insert(source.id, std::rc::Rc::downgrade(source));
+            source
+                .dependents
+                .borrow_mut()
+                .insert(owner.id, std::rc::Rc::downgrade(&owner));
+        }
+        RegionDependency {
+            destination: self.clone(),
+            sources: lease.downgrade(),
+        }
+    }
+}
+#[cfg(feature = "no-gc")]
+impl Drop for RegionDependency {
+    fn drop(&mut self) {
+        let Some(owner) = self.destination.0.upgrade() else {
+            return;
+        };
+        let mut released = Vec::new();
+        for source in self.sources.0.iter().filter_map(std::rc::Weak::upgrade) {
+            if source.id == owner.id {
+                continue;
+            }
+            let mut counts = owner.dependency_counts.borrow_mut();
+            let Some(count) = counts.get_mut(&source.id) else {
+                continue;
+            };
+            if *count == usize::MAX {
+                continue;
+            }
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&source.id);
+                owner.dependencies.borrow_mut().remove(&source.id);
+                source.dependents.borrow_mut().remove(&owner.id);
+                released.push(source);
+            }
+        }
+        collect_leased_regions(released);
+    }
+}
+
 /// Captured allocation destination for a fiber, separate from its live roots.
 #[cfg(feature = "no-gc")]
 #[derive(Clone, Default)]

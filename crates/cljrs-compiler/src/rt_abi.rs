@@ -3323,16 +3323,11 @@ pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
 }
 
 fn box_eval_result(result: cljrs_runtime::env::error::EvalResult) -> *const Value {
-    use cljrs_runtime::env::error::EvalError;
-    use cljrs_value::ValueError;
     match result {
         Ok(value) => box_val(value),
-        Err(EvalError::Thrown(value)) => signal_error(ValueError::Thrown(value)),
-        Err(EvalError::GasExhausted) => signal_error(ValueError::GasExhausted),
-        Err(EvalError::MemoryLimitExceeded(fault)) => {
-            signal_error(ValueError::MemoryLimitExceeded(fault))
-        }
-        Err(other) => signal_error(ValueError::Other(other.to_string())),
+        Err(error) => signal_error(cljrs_runtime::env::callback::eval_error_to_value_error(
+            error,
+        )),
     }
 }
 
@@ -5631,6 +5626,41 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[test]
+    fn compiled_atom_callbacks_confirm_memory_faults() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                let fault = cljrs_gc::MemoryLimitExceeded {
+                    class: cljrs_gc::MemoryClass::GcHeap,
+                    requested: 1,
+                    committed: 2,
+                    hard_limit: 2,
+                };
+                let atom = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Long(1))));
+                let callback = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "memory-fault",
+                    Arity::Fixed(1),
+                    move |_| Err(ValueError::MemoryLimitExceeded(fault)),
+                )));
+                cljrs_gc::governor::take_runtime_fault();
+                let result = unsafe { rt_atom_swap(&atom, &callback, std::ptr::null(), 0) };
+                assert_eq!(cljrs_gc::governor::take_runtime_fault(), Some(fault));
+                assert!(matches!(
+                    compiled_result(result),
+                    Err(ValueError::MemoryLimitExceeded(_))
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn compiled_atom_operations_validate_and_notify_exactly_like_the_interpreter() {
         std::thread::Builder::new()

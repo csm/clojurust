@@ -333,6 +333,59 @@ impl cljrs_gc::Trace for MultiFn {
     }
 }
 
+#[cfg(feature = "no-gc")]
+fn prepare_optional(
+    value: Option<Value>,
+    address: usize,
+) -> (Option<Value>, crate::publish::ValueLease) {
+    match value {
+        Some(value) => {
+            let (value, lease) = crate::publish::prepare_for_owner(
+                value,
+                &cljrs_gc::region::AllocationOwner::for_address(address),
+            );
+            (Some(value), lease)
+        }
+        None => (None, Default::default()),
+    }
+}
+fn edit_watches(
+    watches: &TrackedMutex<Vec<(Value, Value)>>,
+    added: Option<(Value, Value)>,
+    removed: Option<&Value>,
+) {
+    let mut watches = watches.lock().unwrap();
+    if let Some((key, callback)) = added {
+        if let Some(entry) = watches.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 = callback;
+        } else {
+            watches.push((key, callback));
+        }
+    }
+    if let Some(key) = removed {
+        watches.retain(|(k, _)| k != key);
+    }
+}
+
+#[cfg(feature = "no-gc")]
+fn refresh_watch_lease(
+    watches: &TrackedMutex<Vec<(Value, Value)>>,
+    cached: &std::cell::RefCell<crate::publish::ValueLease>,
+    address: usize,
+) {
+    let values: Vec<Value> = watches
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(key, callback)| [key.clone(), callback.clone()])
+        .collect();
+    let lease = crate::publish::ValueLease::for_values(
+        &values,
+        &cljrs_gc::region::AllocationOwner::for_address(address),
+    );
+    *cached.borrow_mut() = lease;
+}
+
 // ── Var ───────────────────────────────────────────────────────────────────────
 
 /// A Clojure var — a namespace-interned mutable root binding.
@@ -372,6 +425,10 @@ pub struct Var {
     pub is_macro: bool,
     /// Metadata map (e.g. `{:dynamic true}`).
     pub meta: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    meta_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    #[cfg(feature = "no-gc")]
+    watch_lease: std::cell::RefCell<crate::publish::ValueLease>,
     pub watches: TrackedMutex<Vec<(Value, Value)>>,
     binding_generation: std::sync::atomic::AtomicU64,
 }
@@ -387,6 +444,10 @@ impl Var {
             shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             is_macro: false,
             meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
             watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -429,6 +490,10 @@ impl Var {
             shared_root,
             is_macro,
             meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
             watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -505,13 +570,44 @@ impl Var {
         }
     }
 
+    pub fn add_watch(&self, key: Value, callback: Value) {
+        edit_watches(&self.watches, Some((key, callback)), None);
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    pub fn remove_watch(&self, key: &Value) {
+        edit_watches(&self.watches, None, Some(key));
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    #[cfg(feature = "no-gc")]
+    fn refresh_watch_lease(&self) {
+        refresh_watch_lease(&self.watches, &self.watch_lease, self as *const _ as usize);
+    }
+    pub fn protect_watches(&self) {
+        #[cfg(feature = "no-gc")]
+        self.watch_lease.borrow().protect_current();
+    }
+
     pub fn get_meta(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.meta_lease.borrow().protect_current();
         self.meta.lock().unwrap().clone()
     }
 
     pub fn set_meta(&self, m: Value) {
+        #[cfg(not(feature = "no-gc"))]
         let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
+        #[cfg(feature = "no-gc")]
+        let (m, lease) = crate::publish::prepare_for_owner(
+            m,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
         *self.meta.lock().unwrap() = Some(m);
+        #[cfg(feature = "no-gc")]
+        {
+            *self.meta_lease.borrow_mut() = lease;
+        }
     }
 
     pub fn full_name(&self) -> String {
@@ -520,6 +616,9 @@ impl Var {
 }
 
 impl cljrs_gc::Trace for Var {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         #[cfg(not(feature = "no-gc"))]
         {
@@ -553,7 +652,13 @@ pub struct Atom {
     #[cfg(feature = "no-gc")]
     value_lease: std::cell::RefCell<crate::publish::ValueLease>,
     pub meta: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    meta_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    #[cfg(feature = "no-gc")]
+    watch_lease: std::cell::RefCell<crate::publish::ValueLease>,
     pub validator: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    validator_lease: std::cell::RefCell<crate::publish::ValueLease>,
     pub watches: TrackedMutex<Vec<(Value, Value)>>,
 }
 
@@ -571,7 +676,13 @@ impl Atom {
             #[cfg(feature = "no-gc")]
             value_lease: std::cell::RefCell::new(lease),
             meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
             validator: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            validator_lease: Default::default(),
             watches: TrackedMutex::new(Vec::new()),
         }
     }
@@ -640,24 +751,62 @@ impl Atom {
         true
     }
 
+    pub fn add_watch(&self, key: Value, callback: Value) {
+        edit_watches(&self.watches, Some((key, callback)), None);
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    pub fn remove_watch(&self, key: &Value) {
+        edit_watches(&self.watches, None, Some(key));
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    #[cfg(feature = "no-gc")]
+    fn refresh_watch_lease(&self) {
+        refresh_watch_lease(&self.watches, &self.watch_lease, self as *const _ as usize);
+    }
+    pub fn protect_watches(&self) {
+        #[cfg(feature = "no-gc")]
+        self.watch_lease.borrow().protect_current();
+    }
+
     pub fn get_meta(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.meta_lease.borrow().protect_current();
         self.meta.lock().unwrap().clone()
     }
 
     pub fn set_meta(&self, m: Option<Value>) {
+        #[cfg(feature = "no-gc")]
+        let (m, lease) = prepare_optional(m, self as *const _ as usize);
         *self.meta.lock().unwrap() = m;
+        #[cfg(feature = "no-gc")]
+        {
+            *self.meta_lease.borrow_mut() = lease;
+        }
     }
 
     pub fn get_validator(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.validator_lease.borrow().protect_current();
         self.validator.lock().unwrap().clone()
     }
 
     pub fn set_validator(&self, vf: Option<Value>) {
+        #[cfg(feature = "no-gc")]
+        let (vf, lease) = prepare_optional(vf, self as *const _ as usize);
         *self.validator.lock().unwrap() = vf;
+        #[cfg(feature = "no-gc")]
+        {
+            *self.validator_lease.borrow_mut() = lease;
+        }
     }
 }
 
 impl cljrs_gc::Trace for Atom {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         #[cfg(not(feature = "no-gc"))]
         {

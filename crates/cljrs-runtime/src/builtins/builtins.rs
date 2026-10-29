@@ -6225,8 +6225,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
     let key = args[1].clone();
     let f = args[2].clone();
     match &args[0] {
-        Value::Atom(a) => add_watch_to(&a.get().watches, key, f),
-        Value::Var(v) => add_watch_to(&v.get().watches, key, f),
+        Value::Atom(a) => a.get().add_watch(key, f),
+        Value::Var(v) => v.get().add_watch(key, f),
         Value::Agent(a) => add_watch_to(&a.get().watches, key, f),
         v => {
             return Err(ValueError::WrongType {
@@ -6241,8 +6241,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
 fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
     let key = &args[1];
     match &args[0] {
-        Value::Atom(a) => remove_watch_from(&a.get().watches, key),
-        Value::Var(v) => remove_watch_from(&v.get().watches, key),
+        Value::Atom(a) => a.get().remove_watch(key),
+        Value::Var(v) => v.get().remove_watch(key),
         Value::Agent(a) => remove_watch_from(&a.get().watches, key),
         v => {
             return Err(ValueError::WrongType {

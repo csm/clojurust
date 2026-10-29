@@ -269,7 +269,9 @@ Saved mutator states retain precise GC roots. Suspended JIT frames keep their co
 
 For captured managed values, use `spawn_rooted(values, body)` or `Fiber::with_roots(values, body)`.
 These values remain rooted before the first poll and until completion.
-For locals and opaque future captures, use the runtime's GC root guards.
+For future captures, use `spawn_future_with_roots(values, task)`.
+The task leases declared captures without inheriting unrelated temporary reads.
+For task locals, use the runtime's GC root guards.
 GC builds retire active regions through the existing async poison fallback.
 In `no-gc` builds, task captures lease active scratch regions until completion or cancellation.
 Task results retain their backing scopes for the destination's lifetime.
@@ -357,7 +359,7 @@ pub mod isolate {
 
 /// Re-exports for sibling native crates (e.g. cljrs-io) that drive their own
 /// work onto the shared LocalSet executor.
-pub use eval_async::{await_value, spawn_future};
+pub use eval_async::{await_value, spawn_future, spawn_future_with_roots};
 
 pub mod worker_pool {
     /// Global Send-only worker pool backed by a Tokio multi-thread runtime.
@@ -435,6 +437,11 @@ pub mod eval_async {
     /// settles when it completes. The shared delivery point for async primitives;
     /// public so other native crates can produce results through the same path.
     pub fn spawn_future<F>(task: F) -> Value
+    where
+        F: Future<Output = Result<Value, EvalError>> + 'static;
+
+    /// Spawn a task with its captured managed values.
+    pub fn spawn_future_with_roots<F>(roots: Vec<Value>, task: F) -> Value
     where
         F: Future<Output = Result<Value, EvalError>> + 'static;
 
@@ -622,7 +629,8 @@ A take transfers ownership to the consumer without another publication scan.
 Direct handoffs publish the accepted value before either participant resumes.
 Channels report resource failures only when the failure remains unread at destruction or executor teardown.
 A read marks the report observed. The internal delivery future also counts as observed, so collection produces no duplicate warning.
-`channel::report_unobserved_thread_failures()` flushes reports after all consumers finish.
+`channel::report_unobserved_thread_failures()` flushes the current executor registry after all consumers finish.
+The carrier and its fibers share this registry. Another executor's teardown cannot flush these reports.
 Native root drivers and both isolate entry points call this helper during teardown.
 Other embedders, including wasm hosts, can call it when their executor closes.
 Channel reports contain no managed Values.
@@ -630,5 +638,5 @@ Channel reports contain no managed Values.
 Each no-GC queue entry and completed selection owns a cached payload lease.
 A take moves that lease to the selection. Cancellation restores it with the queued value.
 The consumer acquires ownership before the selection releases its lease.
-Permanent channels release consumed payloads after their last consumer releases them.
+Permanent and regional channels release consumed payloads after their last consumer releases them.
 Channel ownership tracing skips replaceable queue contents, which manage their own leases.

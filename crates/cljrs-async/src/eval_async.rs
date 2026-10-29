@@ -42,6 +42,38 @@ use cljrs_value::{
     PersistentVector, Value,
 };
 
+// Managed captures must be visible before the first task poll. Keep their
+// shadow roots in a detached state so dropping a task uses the same registry.
+#[cfg(not(feature = "no-gc"))]
+struct CapturedRoots {
+    _values: Box<[Value]>,
+    state: cljrs_gc::mutator::MutatorState,
+    guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
+}
+#[cfg(not(feature = "no-gc"))]
+impl CapturedRoots {
+    fn new(values: Vec<Value>) -> Self {
+        let values = values.into_boxed_slice();
+        let mut state = cljrs_gc::mutator::MutatorState::fresh();
+        state.swap_with_current();
+        let guard = Some(cljrs_runtime::env::gc_roots::root_values(&values));
+        state.swap_with_current();
+        Self {
+            _values: values,
+            state,
+            guard,
+        }
+    }
+}
+#[cfg(not(feature = "no-gc"))]
+impl Drop for CapturedRoots {
+    fn drop(&mut self) {
+        self.state.swap_with_current();
+        self.guard.take();
+        self.state.swap_with_current();
+    }
+}
+
 /// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
 /// task settles on completion. The single delivery point for every async
 /// primitive (`^:async` calls, `timeout`, `alts`).
@@ -55,6 +87,15 @@ pub fn spawn_future<F>(task: F) -> Value
 where
     F: Future<Output = EvalResult> + 'static,
 {
+    spawn_future_with_roots(Vec::new(), task)
+}
+
+/// Spawn a task with explicit managed captures. Use this for borrowed values
+/// that can outlive their current cell binding or evaluation read scope.
+pub fn spawn_future_with_roots<F>(roots: Vec<Value>, task: F) -> Value
+where
+    F: Future<Output = EvalResult> + 'static,
+{
     // GC builds: heap-promotion fallback — the task's captured environment is
     // opaque to the publish-barrier scan, and the task may run after any
     // bump-region scope active right now has closed.  Poison the active
@@ -63,18 +104,28 @@ where
     #[cfg(not(feature = "no-gc"))]
     cljrs_gc::region::poison_active_regions();
     #[cfg(feature = "no-gc")]
-    let lease = cljrs_gc::region::RegionLease::capture_active();
+    let lease = {
+        let mut lease = cljrs_gc::region::RegionLease::capture_active();
+        lease.extend(&cljrs_gc::region::RegionLease::for_values(&roots));
+        lease
+    };
     #[cfg(feature = "no-gc")]
     let allocation = cljrs_gc::region::AllocationSnapshot::capture();
     let future = GcPtr::new(CljxFuture::new_local());
     let task_future = future.clone();
+    #[cfg(not(feature = "no-gc"))]
+    let captures = {
+        let mut roots = roots;
+        roots.push(Value::Future(task_future.clone()));
+        CapturedRoots::new(roots)
+    };
+    #[cfg(feature = "no-gc")]
+    let _ = roots;
     let gas_meters = cljrs_runtime::env::gas::active_meters();
     let interrupts = cljrs_runtime::env::gas::active_interrupts();
     tokio::task::spawn_local(async move {
-        // Root the result future across GC cycles: the spawning scope's alloc
-        // frame may have dropped before the task gets to run.
-        let anchor = Value::Future(task_future.clone());
-        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+        #[cfg(not(feature = "no-gc"))]
+        let _captures = captures;
         let mut task = Box::pin(task);
         let result = std::future::poll_fn(|cx| {
             // LocalSet tasks share an OS thread, so TLS state must be scoped

@@ -160,6 +160,8 @@ impl Drop for InvocationGuard {
 /// Callers then protect the result's backing scopes in the caller's context.
 /// The guard frees unshared storage when it drops.
 pub struct ScratchGuard {
+    reads: Option<crate::region::ReadScope>,
+    borrowed: crate::region::RegionLease,
     region: Option<Box<Region>>,
     /// Whether the ctx entry is currently on the stack.
     in_ctx: bool,
@@ -170,6 +172,8 @@ impl ScratchGuard {
         if invocation_is_active() {
             return Self {
                 region: None,
+                reads: None,
+                borrowed: Default::default(),
                 in_ctx: false,
             };
         }
@@ -178,6 +182,8 @@ impl ScratchGuard {
         ALLOC_CTX.with(|ctx| ctx.borrow_mut().push(AllocCtx::Region(ptr)));
         Self {
             region: Some(region),
+            reads: Some(crate::region::ReadScope::nested()),
+            borrowed: Default::default(),
             in_ctx: true,
         }
     }
@@ -188,6 +194,9 @@ impl ScratchGuard {
     /// the stack — the caller's active context.  The scratch region's memory
     /// is still live and readable until `self` drops.
     pub fn pop_for_return(&mut self) {
+        if let Some(reads) = self.reads.take() {
+            self.borrowed = reads.finish();
+        }
         if self.in_ctx {
             ALLOC_CTX.with(|ctx| {
                 let mut ctx = ctx.borrow_mut();

@@ -11,7 +11,7 @@ use crate::env::env::{Env, RequireRefer, RequireSpec};
 use crate::env::error::{EvalError, EvalResult};
 use crate::env::loader::load_ns;
 use crate::interp::destructure::bind_pattern;
-use crate::interp::eval::{eval, eval_body, is_special_form};
+use crate::interp::eval::{eval_body, eval_unscoped as eval, is_special_form};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -2050,7 +2050,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
     }
     // Name metadata belongs on the var `defprotocol` binds, not here.
     let (name, _) = require_sym_meta(args, 0, "protocol*", env)?;
-    let specs = crate::interp::eval::eval(&args[1], env)?;
+    let specs = crate::interp::eval::eval_unscoped(&args[1], env)?;
     let specs: Vec<Value> = match specs.unwrap_meta() {
         Value::Vector(v) => v.get().iter().cloned().collect(),
         Value::Nil => Vec::new(),
@@ -2067,7 +2067,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
         .collect::<EvalResult<Vec<_>>>()?;
     let extend_via_metadata = match args.get(2) {
         Some(f) => !matches!(
-            crate::interp::eval::eval(f, env)?,
+            crate::interp::eval::eval_unscoped(f, env)?,
             Value::Nil | Value::Bool(false)
         ),
         None => false,

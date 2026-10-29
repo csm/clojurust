@@ -25,18 +25,22 @@
 //! when no region is active, which is the case for virtually every top-level
 //! `def`.
 //!
-//! In no-gc builds, finite immutable graphs are copied into static storage at
-//! program-lifetime boundaries. Pending sequences and mutable identities never
-//! enter serialization. They retain their actual backing scopes instead.
-//! Region-local destinations transfer ownership without copying.
+//! No-gc publication retains backing scopes without copying values. Replaceable
+//! destinations release their ownership edges when the payload changes. Raw
+//! program-lifetime publications retain their actual backing scopes.
 
 use crate::Value;
+#[cfg(not(feature = "no-gc"))]
 use crate::clone::{deserialize, serialize};
+#[cfg(not(feature = "no-gc"))]
 use crate::types::{DelayState, LazySeqState};
+#[cfg(not(feature = "no-gc"))]
 use crate::value::{MapValue, SetValue};
+#[cfg(not(feature = "no-gc"))]
 use cljrs_gc::{GcPtr, Trace};
 
 /// Scan verdict for one value graph.
+#[cfg(not(feature = "no-gc"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scan {
     /// No region-allocated box reachable.
@@ -47,6 +51,7 @@ enum Scan {
     Opaque,
 }
 
+#[cfg(not(feature = "no-gc"))]
 impl Scan {
     fn join(self, other: Scan) -> Scan {
         use Scan::*;
@@ -59,23 +64,16 @@ impl Scan {
 }
 
 /// Tag check for one box.
+#[cfg(not(feature = "no-gc"))]
 fn tag<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
-    #[cfg(feature = "no-gc")]
-    let dirty = !cljrs_gc::static_arena::is_static_addr(p.get() as *const T as usize);
-    #[cfg(not(feature = "no-gc"))]
     let dirty = p.is_region_alloc();
     if dirty { Scan::Dirty } else { Scan::Clean }
 }
 
 /// Like [`tag`] but for boxes whose pointee cannot be deep-copied (mutable
 /// identity, closures, native state): a region-tagged box is unrecoverable.
+#[cfg(not(feature = "no-gc"))]
 fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
-    #[cfg(feature = "no-gc")]
-    {
-        let _ = p;
-        Scan::Opaque
-    }
-    #[cfg(not(feature = "no-gc"))]
     if p.is_region_alloc() {
         Scan::Opaque
     } else {
@@ -83,6 +81,7 @@ fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
     }
 }
 
+#[cfg(not(feature = "no-gc"))]
 fn scan_map(m: &MapValue) -> Scan {
     let mut acc = match m {
         MapValue::Array(p) => tag(p),
@@ -103,24 +102,9 @@ fn scan_map(m: &MapValue) -> Scan {
 /// `Clean` because their contents pass through this same barrier on every
 /// store; heap closures and pending thunks are `Opaque` because their
 /// captured environments are invisible here.
+#[cfg(not(feature = "no-gc"))]
 fn scan(v: &Value) -> Scan {
     use Scan::*;
-    // Mutable identities and unrealized sequences never enter serialization.
-    #[cfg(feature = "no-gc")]
-    if matches!(
-        v,
-        Value::ObjectArray(_)
-            | Value::IntArray(_)
-            | Value::LongArray(_)
-            | Value::ShortArray(_)
-            | Value::ByteArray(_)
-            | Value::FloatArray(_)
-            | Value::DoubleArray(_)
-            | Value::BooleanArray(_)
-            | Value::CharArray(_)
-    ) {
-        return Opaque;
-    }
     match v {
         // Immediates and Arc-backed values: nothing region-allocated.
         Value::Nil
@@ -307,24 +291,13 @@ pub fn publish_for_owner(value: Value, _address: usize) -> Value {
     publish_value(value)
 }
 
-/// Copy proven finite immutable data into static storage. Opaque values retain
-/// identity and laziness by leasing only their actual backing scopes.
+/// Retain actual backing scopes for an explicit program-lifetime result.
+/// Values preserve their identity and laziness.
 #[cfg(feature = "no-gc")]
 pub fn publish_value(value: Value) -> Value {
-    if cljrs_gc::alloc_ctx::invocation_is_active() {
-        return value;
+    if !cljrs_gc::alloc_ctx::invocation_is_active() {
+        cljrs_gc::retain_regions_for(&value);
     }
-    match scan(&value) {
-        Scan::Clean => return value,
-        Scan::Dirty => {
-            if let Ok(wire) = serialize(&value) {
-                let _static_scope = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-                return deserialize(wire);
-            }
-        }
-        Scan::Opaque => {}
-    }
-    cljrs_gc::retain_regions_for(&value);
     value
 }
 
@@ -356,109 +329,64 @@ impl ValueSnapshot {
 }
 
 /// Cached backing scopes for a replaceable payload. Regional containers use
-/// weak snapshots, while permanent containers own their current payload.
+/// replaceable weak edges, while permanent containers own their current payload.
 #[cfg(feature = "no-gc")]
 #[derive(Debug, Default)]
 pub struct ValueLease {
     owned: Option<cljrs_gc::region::RegionLease>,
-    scoped: cljrs_gc::region::WeakRegionLease,
+    scoped: cljrs_gc::region::RegionDependency,
 }
 #[cfg(feature = "no-gc")]
 impl ValueLease {
+    pub fn for_values(values: &[Value], owner: &cljrs_gc::region::AllocationOwner) -> Self {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Self::default();
+        }
+        Self::from_lease(cljrs_gc::region::RegionLease::for_values(values), owner)
+    }
+    fn from_lease(
+        lease: cljrs_gc::region::RegionLease,
+        owner: &cljrs_gc::region::AllocationOwner,
+    ) -> Self {
+        if owner.is_permanent() {
+            Self {
+                owned: Some(lease),
+                scoped: Default::default(),
+            }
+        } else {
+            Self {
+                scoped: owner.replaceable(&lease),
+                owned: None,
+            }
+        }
+    }
     pub fn snapshot(&self) -> cljrs_gc::region::RegionLease {
         self.owned
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| self.scoped.upgrade())
+            .unwrap_or_else(|| self.scoped.snapshot())
     }
     pub fn protect_current(&self) {
-        self.snapshot().protect_current();
+        if let Some(lease) = &self.owned {
+            lease.protect_current();
+        } else {
+            self.scoped.snapshot().protect_current();
+        }
     }
 }
 
-#[cfg(feature = "no-gc")]
-fn small_finite(value: &Value, budget: &mut usize) -> bool {
-    if *budget == 0 {
-        return false;
-    }
-    *budget -= 1;
-    match value {
-        Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_) => true,
-        Value::Str(s) => s.get().len() <= 4096,
-        Value::Uuid(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
-        Value::BigInt(n) => n.get().bits() <= 32768,
-        Value::Ratio(n) => {
-            n.get()
-                .numer()
-                .bits()
-                .saturating_add(n.get().denom().bits())
-                <= 32768
-        }
-        Value::Keyword(_) | Value::Symbol(_) => true,
-        Value::Vector(v) => {
-            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
-        }
-        Value::List(v) => {
-            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
-        }
-        Value::Queue(v) => {
-            v.get().count() <= *budget && v.get().iter().all(|v| small_finite(v, budget))
-        }
-        Value::Set(v) => v.count() <= *budget && v.iter().all(|v| small_finite(v, budget)),
-        Value::Cons(v) => {
-            small_finite(&v.get().head, budget) && small_finite(&v.get().tail, budget)
-        }
-        Value::TypeInstance(v) if v.get().mutable.is_none() => {
-            small_finite(&Value::Map(v.get().fields.clone()), budget)
-        }
-        Value::Map(m) => {
-            if m.count().saturating_mul(2) > *budget {
-                return false;
-            }
-            m.iter()
-                .all(|(k, v)| small_finite(k, budget) && small_finite(v, budget))
-        }
-        Value::WithMeta(v, meta) => small_finite(v, budget) && small_finite(meta, budget),
-        Value::Reduced(v) => small_finite(v, budget),
-        _ => false,
-    }
-}
-
-/// Prepare one replaceable payload. Small finite graphs get their own arena;
-/// larger and opaque graphs preserve identity and structural sharing.
+/// Prepare a replaceable payload without copying identity-bearing values.
 #[cfg(feature = "no-gc")]
 pub fn prepare_for_owner(
-    mut value: Value,
+    value: Value,
     owner: &cljrs_gc::region::AllocationOwner,
 ) -> (Value, ValueLease) {
     use cljrs_gc::region::RegionLease;
     if cljrs_gc::alloc_ctx::invocation_is_active() {
         return (value, Default::default());
     }
-    let mut compact = None;
-    if owner.is_permanent()
-        && small_finite(&value, &mut 32)
-        && scan(&value) == Scan::Dirty
-        && let Ok(wire) = serialize(&value)
-    {
-        let scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
-        value = deserialize(wire);
-        compact = Some(scope);
-    }
     let lease = RegionLease::for_value(&value);
-    let cached = if owner.is_permanent() {
-        ValueLease {
-            owned: Some(lease),
-            scoped: Default::default(),
-        }
-    } else {
-        owner.adopt(&lease);
-        ValueLease {
-            scoped: lease.downgrade(),
-            owned: None,
-        }
-    };
-    drop(compact);
+    let cached = ValueLease::from_lease(lease, owner);
     (value, cached)
 }
 

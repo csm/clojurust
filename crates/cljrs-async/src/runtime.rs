@@ -8,7 +8,9 @@ use cljrs_runtime::interp::apply::select_arity;
 use cljrs_value::{NativeObjectBox, PersistentList, Value};
 
 use crate::channel::CljChannel;
-use crate::eval_async::{run_async_fn, spawn_future};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::eval_async::spawn_future;
+use crate::eval_async::{run_async_fn, spawn_future_with_roots};
 use crate::state_machine::{
     lookup_poll_fn, lookup_poll_fn_named, mark_compile_attempted, spawn_state_machine,
 };
@@ -81,7 +83,9 @@ impl AsyncRuntime for AsyncRuntimeImpl {
         // `spawn_future` keeps the task on the current LocalSet thread, so the
         // `!Send` Clojure values (env, args, GcPtrs) never cross threads, and
         // delivers the body's result into the returned Future.
-        spawn_future(async move { run_async_fn(callee, args, &env).await })
+        let mut roots = args.clone();
+        roots.push(callee.clone());
+        spawn_future_with_roots(roots, async move { run_async_fn(callee, args, &env).await })
     }
 
     #[cfg(not(target_arch = "wasm32"))]

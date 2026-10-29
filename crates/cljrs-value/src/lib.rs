@@ -112,16 +112,20 @@ mod publication_review_tests {
     }
 
     #[test]
-    fn small_scalar_boxes_copy_out_of_unrelated_scratch_storage() {
+    fn stored_scalar_boxes_preserve_identity_and_release_with_the_last_alias() {
         let atom = GcPtr::new(Atom::new(Value::Nil));
         let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
         {
             let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
             let _temporary = GcPtr::new(Probe(dropped.clone()));
-            atom.get()
-                .reset(Value::Uuid(GcPtr::new(crate::value::UuidValue(42))));
+            let uuid = GcPtr::new(crate::value::UuidValue(42));
+            let returned = atom.get().reset(Value::Uuid(uuid.clone()));
+            let Value::Uuid(returned) = returned else {
+                unreachable!()
+            };
+            assert!(GcPtr::ptr_eq(&uuid, &returned));
         }
-        assert!(dropped.get());
+        assert!(!dropped.get());
         let snapshot = atom.get().snapshot();
         let Value::Uuid(uuid) = &snapshot.value else {
             unreachable!()
@@ -129,6 +133,8 @@ mod publication_review_tests {
         assert_eq!(uuid.get().0, 42);
         atom.get().reset(Value::Nil);
         assert_eq!(uuid.get().0, 42);
+        drop(snapshot);
+        assert!(dropped.get());
     }
 
     #[test]
@@ -173,6 +179,84 @@ mod publication_review_tests {
     }
 
     #[test]
+    fn metadata_validators_and_watches_release_replaced_callbacks() {
+        let _container = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        for _ in 0..50 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let callback = Value::NativeFunction(GcPtr::new(NativeFn::with_captures(
+                    "owned-callback",
+                    Arity::Fixed(1),
+                    vec![Value::NativeObject(gc_native_object(Counted {
+                        traces: Default::default(),
+                        dropped: dropped.clone(),
+                    }))],
+                    |captures, _| Ok(captures[0].clone()),
+                )));
+                atom.get().set_validator(Some(callback.clone()));
+                atom.get().set_meta(Some(callback.clone()));
+                atom.get().add_watch(Value::Long(1), callback);
+            }
+            assert!(!dropped.get());
+            {
+                let _reader = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let validator = atom.get().get_validator().unwrap();
+                assert!(matches!(validator, Value::NativeFunction(_)));
+                assert!(atom.get().get_meta().is_some());
+                atom.get().set_validator(None);
+                atom.get().set_meta(None);
+                atom.get().remove_watch(&Value::Long(1));
+                assert!(
+                    !dropped.get(),
+                    "a borrowed callback was freed during replacement"
+                );
+                let Value::NativeFunction(f) = validator else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    (f.get().func)(&[Value::Nil]).unwrap(),
+                    Value::NativeObject(_)
+                ));
+            }
+            assert!(
+                dropped.get(),
+                "removed auxiliary slots retained their source"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_stores_outlive_an_active_read_scope() {
+        std::thread::spawn(|| {
+            let destination = cljrs_gc::region::AllocationSnapshot::capture();
+            let read = cljrs_gc::region::ReadScope::enter().unwrap();
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let value = {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let value = Value::NativeObject(gc_native_object(Counted {
+                    traces: Default::default(),
+                    dropped: dropped.clone(),
+                }));
+                destination.protect(&value);
+                value
+            };
+            drop(read);
+            assert!(
+                !dropped.get(),
+                "a store was shortened to the reader lifetime"
+            );
+            let Value::NativeObject(value) = value else {
+                unreachable!()
+            };
+            assert_eq!(value.get().type_tag(), "Counted");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn var_rebinding_releases_opaque_roots_after_the_last_reader() {
         let var = GcPtr::new(Var::new("user", "root"));
         for _ in 0..100 {
@@ -202,38 +286,60 @@ mod publication_review_tests {
     }
 
     #[test]
-    fn static_publication_copies_finite_data_and_releases_temporary_storage() {
-        let atom = cljrs_gc::GcPtr::new(Atom::new(Value::Nil));
-        // A captured allocation destination can itself have been published.
-        let permanent = cljrs_gc::alloc_ctx::ScratchGuard::new();
-        let identity = Value::ObjectArray(cljrs_gc::GcPtr::new(ObjectArray(
-            std::sync::Mutex::new(vec![]),
-        )));
-        publish::publish_value(identity);
-        assert!(cljrs_gc::alloc_ctx::is_static_context());
+    fn regional_cells_release_each_replaced_payload_without_changing_identity() {
+        let _container = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let other = GcPtr::new(Atom::new(Value::Nil));
         for _ in 0..100 {
             let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-            let mut scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
-            let _temporary = cljrs_gc::GcPtr::new(Probe(dropped.clone()));
-            let value = Value::Vector(cljrs_gc::GcPtr::new(PersistentVector::from_iter([
-                Value::Str(cljrs_gc::GcPtr::new("published".to_string())),
-            ])));
-            atom.get().reset(value.clone());
-            scope.pop_for_return();
-            let returned = publish::publish_return(value);
-            drop(scope);
-            assert_eq!(returned.to_string(), "[\"published\"]");
-            assert!(
-                dropped.get(),
-                "a small payload kept unrelated scratch temporaries alive"
-            );
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _temporary = GcPtr::new(Probe(dropped.clone()));
+                let vector = GcPtr::new(PersistentVector::from_iter([Value::Long(1)]));
+                let returned = atom.get().reset(Value::Vector(vector.clone()));
+                let Value::Vector(returned) = returned else {
+                    unreachable!()
+                };
+                assert!(GcPtr::ptr_eq(&vector, &returned));
+                other.get().reset(Value::Vector(vector));
+            }
+            assert!(!dropped.get());
             atom.get().reset(Value::Nil);
+            assert!(!dropped.get(), "another slot still owns the same source");
+            other.get().reset(Value::Nil);
             assert!(
                 dropped.get(),
-                "replaced cell payload retained its scratch storage"
+                "obsolete regional payload kept its source alive"
             );
         }
-        drop(permanent);
+    }
+
+    #[test]
+    fn replacement_does_not_inherit_the_previous_payloads_read_lease() {
+        let _container = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let mut previous: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
+        for _ in 0..100 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _iteration = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _old = atom.get().deref();
+                atom.get()
+                    .reset(Value::NativeObject(gc_native_object(Counted {
+                        traces: Default::default(),
+                        dropped: dropped.clone(),
+                    })));
+            }
+            if let Some(old) = previous {
+                assert!(
+                    old.get(),
+                    "a read became a durable dependency of the replacement"
+                );
+            }
+            previous = Some(dropped);
+        }
+        atom.get().reset(Value::Nil);
+        assert!(previous.unwrap().get());
     }
 
     #[test]

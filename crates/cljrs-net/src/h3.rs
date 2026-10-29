@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, make_chan};
-use cljrs_async::eval_async::spawn_future;
+use cljrs_async::eval_async::spawn_future_with_roots;
 use cljrs_async::worker_pool::WorkerPool;
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::GlobalEnv;
@@ -450,7 +450,7 @@ pub fn h3_request(
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
 
-    spawn_future(async move {
+    spawn_future_with_roots(vec![promise_val.clone()], async move {
         do_h3_response(response_rx, body_rx, body_buf, pool_abort, promise).await
     });
 

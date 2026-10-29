@@ -39,9 +39,7 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     (
         "cljrs-async/src/channel.rs",
         "THREAD_FAILURES",
-        Thread(
-            "unobserved resource reports contain no managed values and flush at isolate teardown",
-        ),
+        Fiber("cljrs-async/THREAD_FAILURES"),
     ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
