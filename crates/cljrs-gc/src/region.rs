@@ -454,7 +454,7 @@ impl Drop for RegionGuard {
     }
 }
 
-// ── Poisoned / retired regions (GC build) ───────────────────────────────────
+// ── Poisoned / retired regions ───────────────────────────────────
 //
 // The heap-promotion fallback (Phase 10.5): when a value that is *opaque* to
 // the promotion scan (e.g. an unrealized lazy seq) is published to a
@@ -465,7 +465,6 @@ impl Drop for RegionGuard {
 // GC root so heap children stay live) instead of being reset.  A deliberate,
 // bounded leak, mirroring the JIT's pinned-epoch precedent.
 
-#[cfg(not(feature = "no-gc"))]
 thread_local! {
     /// Regions whose scopes have closed but which may still be referenced —
     /// kept alive for the rest of the process and traced as roots.  Moving
@@ -478,12 +477,10 @@ thread_local! {
     static POISON_WATERMARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 // The watermark is a depth into REGION_STACK, so it moves with it.
-#[cfg(not(feature = "no-gc"))]
 crate::mutator_slot!("cljrs-gc/POISON_WATERMARK", cell POISON_WATERMARK: usize);
 
 /// Poison every region currently active on this thread: each will be retired
 /// instead of reset when its scope closes.  No-op when no region is active.
-#[cfg(not(feature = "no-gc"))]
 pub fn poison_active_regions() {
     let depth = region_stack_depth();
     if depth == 0 {
@@ -493,12 +490,8 @@ pub fn poison_active_regions() {
     crate::stats::GC_STATS.record_region_poison();
 }
 
-#[cfg(feature = "no-gc")]
-pub fn poison_active_regions() {}
-
 /// True when every active region must remain alive after its scope closes.
 /// Publishers can skip scans because no value can escape into freed regions.
-#[cfg(not(feature = "no-gc"))]
 pub fn active_regions_are_poisoned() -> bool {
     let depth = region_stack_depth();
     depth != 0 && POISON_WATERMARK.with(|watermark| watermark.get() >= depth)
@@ -511,7 +504,6 @@ pub fn active_regions_are_poisoned() -> bool {
 /// All owners of stack-registered regions (the rt_abi bridge, the IR
 /// interpreter, scratch guards) must close through here so the poison
 /// protocol is honoured.
-#[cfg(not(feature = "no-gc"))]
 pub fn close_region(mut region: Box<Region>) {
     let depth = region_stack_depth();
     pop_region_guard();
@@ -534,12 +526,6 @@ pub fn close_region(mut region: Box<Region>) {
         RETIRED_REGIONS.with(|r| r.borrow_mut().push(*region));
     }
     // else: `region` drops here — destructors run, chunks are freed.
-}
-
-#[cfg(feature = "no-gc")]
-pub fn close_region(region: Box<Region>) {
-    pop_region_guard();
-    drop(region);
 }
 
 /// Trace every retired region's objects (their heap children must stay

@@ -752,6 +752,8 @@ pub struct NativeFn {
     pub name: Arc<str>,
     pub arity: Arity,
     pub func: NativeFnFunc,
+    /// Managed values retained by the opaque callable closure.
+    pub captures: Vec<Value>,
     /// Optional adapter that marshals owned inputs and offloads native work.
     pub blocking_func: Option<NativeFnFunc>,
 }
@@ -763,6 +765,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
+            captures: Vec::new(),
             func: Arc::new(move |args| {
                 crate::realization::catch(|| func(args))
                     .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
@@ -780,6 +783,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
+            captures: Vec::new(),
             func: Arc::new(move |args| {
                 crate::realization::catch(|| func(args))
                     .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
@@ -838,7 +842,11 @@ impl std::fmt::Debug for NativeFn {
 }
 
 impl cljrs_gc::Trace for NativeFn {
-    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        for value in &self.captures {
+            value.trace(visitor);
+        }
+    }
 }
 
 // ── CljxFnArity ───────────────────────────────────────────────────────────────

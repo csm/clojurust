@@ -298,9 +298,10 @@ fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
     }))
 }
 
-/// `(thread-call f)` — run zero-arg function `f` as an async task on the
-/// `LocalSet` and return a channel that receives the result. This is the
-/// runtime backing the `thread` macro.
+/// Run a zero-arg function in a native fiber and return its result channel.
+/// A non-nil result is delivered before closure; nil/errors only close it.
+/// On wasm32, use the existing async task path.
+#[allow(clippy::result_large_err)]
 fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_runtime::env::callback::capture_eval_context()
@@ -311,17 +312,36 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);
-    let fut = rt.spawn_async_call(thunk, Vec::new(), call_env);
-    spawn_future(async move {
-        let v = await_value(fut).await.unwrap_or(Value::Nil);
-        loop {
-            if chan_ref(result_ch.get()).try_put_buffered(&v).is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
+    let fut = rt
+        .spawn_fiber_call(thunk, Vec::new(), call_env)
+        .map_err(|e| ValueError::Other(e.to_string()))?;
+    let roots = vec![ch_val.clone(), fut.clone()];
+    // Keep captures rooted even when the caller drops its result channel.
+    #[cfg(not(target_arch = "wasm32"))]
+    let delivery = crate::fiber::Fiber::with_roots(roots, move || {
+        let value = crate::fiber::park_on(await_value(fut));
+        if let Ok(v) = value
+            && !matches!(v, Value::Nil)
+        {
+            chan_ref(result_ch.get()).try_put_buffered(&v);
         }
+        chan_ref(result_ch.get()).close();
         Ok(Value::Nil)
-    });
+    })
+    .map_err(|e| ValueError::Other(e.to_string()))?
+    .into_task();
+    #[cfg(target_arch = "wasm32")]
+    let delivery = async move {
+        let _ = roots;
+        if let Ok(v) = await_value(fut).await {
+            if !matches!(v, Value::Nil) {
+                chan_ref(result_ch.get()).try_put_buffered(&v);
+            }
+        }
+        chan_ref(result_ch.get()).close();
+        Ok(Value::Nil)
+    };
+    spawn_future(delivery);
     Ok(ch_val)
 }
 

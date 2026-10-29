@@ -181,6 +181,7 @@ fn pinned_native_dylib_end_to_end() {
     // Host's own (HEAD) implementation — must remain untouched.
     let head_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: Vec::new(),
         name: Arc::from("build-tag"),
         arity: cljrs_value::Arity::Fixed(0),
         func: Arc::new(|_args| Ok(Value::Long(99))),
@@ -622,6 +623,7 @@ fn a_local_dep_without_rust_init_declines_versioned_resolution() {
     // The host's own implementation, which the fallback must reach.
     let head_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: Vec::new(),
         name: Arc::from("build-tag"),
         arity: cljrs_value::Arity::Fixed(0),
         func: Arc::new(|_args| Ok(Value::Long(99))),
@@ -689,6 +691,7 @@ fn local_root_native_dep_does_not_serve_versioned_resolution() {
     // The host's own implementation, which the fallback must reach.
     let head_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: Vec::new(),
         name: Arc::from("build-tag"),
         arity: cljrs_value::Arity::Fixed(0),
         func: Arc::new(|_args| Ok(Value::Long(99))),

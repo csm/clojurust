@@ -84,6 +84,32 @@ impl AsyncRuntime for AsyncRuntimeImpl {
         spawn_future(async move { run_async_fn(callee, args, &env).await })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::result_large_err)]
+    fn spawn_fiber_call(&self, callee: Value, args: Vec<Value>, mut env: Env) -> EvalResult {
+        use cljrs_runtime::env::{dynamics, gas};
+        #[cfg(feature = "no-gc")]
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Err(EvalError::Runtime(
+                "cannot spawn a fiber from an isolated allocation invocation".into(),
+            ));
+        }
+        let bindings = dynamics::capture_current();
+        let meters = gas::active_meters();
+        let interrupts = gas::active_interrupts();
+        let mut roots = vec![callee.clone()];
+        roots.extend(args.iter().cloned());
+        roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
+        let task = crate::fiber::Fiber::with_roots(roots, move || {
+            dynamics::install_frames(bindings);
+            let _interrupts = gas::InterruptScope::enter(&interrupts);
+            let _meters = gas::install_meters(&meters);
+            cljrs_runtime::env::apply::apply_value(&callee, args, &mut env)
+        })?
+        .into_task();
+        Ok(spawn_future(task))
+    }
+
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
         Ok(ch.take_blocking())

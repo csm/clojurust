@@ -167,6 +167,10 @@ impl ScratchGuard {
         }
         let mut region = Box::new(Region::new());
         let ptr = region.as_mut() as *mut Region;
+        // Register the live scope even after pop_for_return removes its
+        // allocation context. A spawned task can capture its tail locals.
+        // SAFETY: the boxed region stays alive until close_region in Drop.
+        std::mem::forget(unsafe { crate::region::RegionGuard::new(&mut region) });
         ALLOC_CTX.with(|ctx| ctx.borrow_mut().push(AllocCtx::Region(ptr)));
         Self {
             region: Some(region),
@@ -201,8 +205,8 @@ impl Drop for ScratchGuard {
         }
         // Reset the region: runs destructors on all contained values and
         // reclaims bump-allocator memory for reuse.
-        if let Some(region) = &mut self.region {
-            region.reset();
+        if let Some(region) = self.region.take() {
+            crate::region::close_region(region);
         }
     }
 }

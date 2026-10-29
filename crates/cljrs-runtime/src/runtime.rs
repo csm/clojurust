@@ -215,10 +215,7 @@ impl RuntimeBuilder {
         );
         globals.mark_loaded("cljrs.fiber");
 
-        // Experimental namespace: natives first, then the Clojure source that
-        // builds on them. Not referred into `user` — an explicit `require` is
-        // the only way in, so a feature probe for `clojure.core/future` and
-        // friends still (correctly) finds nothing.
+        // Keep the experimental future spellings as compatibility aliases.
         builtins::register_experimental(&globals, builtins::EXPERIMENTAL_NS);
         eval_embedded(
             &globals,

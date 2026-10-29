@@ -357,7 +357,7 @@ RAII guard that pushes a `Region` onto the thread-local stack. Use with
 pub fn poison_active_regions();
 
 /// True when every active region must remain alive after its scope closes.
-/// Available in GC builds. Publishers can skip graph scans in this state.
+/// Publishers can skip graph scans in this state.
 pub fn active_regions_are_poisoned() -> bool;
 
 /// Close a region whose scope ended: pop the thread-local stack entry, then
@@ -733,3 +733,12 @@ programs and the AOT test harness call it once at exit.
 - Weak references (`WeakGcPtr<T>`) — deferred
 - Safepoint integration with JIT frames — Phase 10+
 - Automatic collection trigger (threshold-based) — deferred
+
+Native fiber publication also uses region retirement in `no-gc` builds.
+`ScratchGuard` registers each live scratch scope until destruction, including
+scopes that already removed their allocation context for a tail expression.
+Spawning retains those regions so child captures remain valid after the parent returns.
+Channel and lazy-value publication retain active regions for managed values.
+Retired regions stay charged until the isolate thread exits. This path trades
+memory reclamation for safe publication of opaque captures.
+Bounded isolated allocation invocations retain their original lifetime rules.

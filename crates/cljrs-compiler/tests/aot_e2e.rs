@@ -3003,3 +3003,58 @@ fn test_lazy_realization_errors() {
         "[:count :first :rest :apply :into :equal :hash :print]",
     );
 }
+
+#[test]
+fn aot_root_fiber_supports_blocking_surface() {
+    let stdout = compile_and_run(
+        "root_fiber_surface",
+        r#"
+      (ns fiber-main (:require [clojure.core.async :as a]))
+      (def ^:dynamic *x* :root)
+      (println @(future 42))
+      (println @(future @(future (sleep 1) 42)))
+      (println (deref (future (deref (future (sleep 1) 42)))))
+      (println (a/<!! (a/io-thread (sleep 1) :io)))
+      (println (try @(future (throw (ex-info "failure" {:x :caught})))
+                    (catch Exception e (:x (ex-data e)))))
+      (defn -main []
+        (println (binding [*x* :conveyed] @(future *x*))))
+    "#,
+    );
+    assert_eq!(stdout.lines().filter(|l| *l == "42").count(), 3, "{stdout}");
+    assert!(stdout.contains(":io"), "{stdout}");
+    assert!(stdout.contains(":conveyed"), "{stdout}");
+    assert!(stdout.contains(":caught"), "{stdout}");
+}
+
+#[test]
+fn aot_test_harness_runs_blocking_test_bodies() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("cljrs_fiber_test_harness_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("fiber_test.cljrs"),
+        r#"
+      (ns fiber-test (:require [clojure.test :refer [deftest is]]
+                               [clojure.core.async :as a]))
+      (deftest blocking-test
+        (is (= 42 @(future @(future 42))))
+        (is (= :ready (a/<!! (a/io-thread (sleep 1) :ready)))))
+    "#,
+    )
+    .unwrap();
+    let bin = dir.join("fiber_tests");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let dir = dir.clone();
+            let bin = bin.clone();
+            move || cljrs_compiler::aot::compile_test_harness(&dir, &bin, &[])
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let stdout = run_binary("fiber_tests", &bin);
+    assert!(stdout.contains("2 passed, 0 failed, 0 errors"), "{stdout}");
+}

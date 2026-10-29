@@ -23,22 +23,25 @@ CLI binary.
 The whole async tier runs on a Tokio **`current_thread` runtime driving a
 `LocalSet`**. Every Clojure value stays on one thread, which keeps the
 garbage collector's `!Send` pointers (`GcPtr<T>`) sound — no value ever crosses
-a thread boundary inside async code. CPU-bound parallelism continues to use the
-existing thread-based `future`, `pmap`, and `agent` primitives, which are
-unchanged.
+a thread boundary inside async code. Native fibers share this executor.
+`future`, `thread`, and `io-thread` run ordinary functions in fibers.
+Isolates provide parallel Clojure execution.
 
-## Two ways to wait
+## Waiting in ordinary functions
 
-clojurust distinguishes async waiting from blocking waiting:
+On native targets, the CLI and AOT entry points run top-level code in root fibers.
+`@`, `<!!`, `>!!`, and `sleep` park the calling fiber. Other fibers and async
+tasks can then run on the isolate thread.
 
-- **`await`** is a special form. Inside an `^:async` function (or a `go`
-  block), it *yields* the single executor thread to other tasks until the value
-  it is given — a `Future`, a `promise`, or a channel operation — resolves.
-- **`deref` / `@`** *blocks* the calling OS thread. Using `deref` on a future
-  from within an `^:async` body is a runtime error that steers you to `await`.
+```clojure
+(require '[clojure.core.async :as a])
+@(future @(future 42))
+(a/<!! (a/io-thread (sleep 10) :ready))
+```
 
-Without `cljrs-async` loaded, `(await x)` falls back to a blocking deref, so the
-form is still meaningful in purely synchronous code.
+`go` and `^:async` still use the async evaluator. Their bodies use `await`.
+Outside a fiber, synchronous waits block the OS thread. The wasm32 runtime
+retains the async waiting rules.
 
 To scale Clojure work across CPU cores, that single-threaded executor is
 instantiated multiple times as independent **isolates**, each with its own heap

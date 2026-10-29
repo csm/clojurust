@@ -19,11 +19,27 @@ pub mod type_hint;
 pub mod types;
 pub mod value;
 
-/// `no-gc` builds keep their `StaticCtxGuard` discipline; the publish barrier
-/// is an identity function there.
+/// In `no-gc` builds, publication retains active scratch regions because
+/// an opaque value can escape into a channel or another task.
 #[cfg(feature = "no-gc")]
 pub mod publish {
     pub fn publish_value(v: crate::Value) -> crate::Value {
+        if !cljrs_gc::alloc_ctx::invocation_is_active()
+            && !matches!(
+                v,
+                crate::Value::Nil
+                    | crate::Value::Bool(_)
+                    | crate::Value::Long(_)
+                    | crate::Value::Double(_)
+                    | crate::Value::Char(_)
+                    | crate::Value::Uuid(_)
+                    | crate::Value::ByteBlob(_)
+                    | crate::Value::SharedAtom(_)
+                    | crate::Value::Resource(_)
+            )
+        {
+            cljrs_gc::region::poison_active_regions();
+        }
         v
     }
 }

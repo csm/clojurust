@@ -368,13 +368,23 @@ fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
 /// is a `Future`/`Promise` (e.g. the result of an `^:async` `-main`), this
 /// yields until it resolves; any other value is returned unchanged.
 #[cfg(feature = "async")]
+#[allow(clippy::result_large_err)]
 fn await_main_result(value: Value) -> miette::Result<()> {
     ASYNC_DRIVER.with(|d| {
         let guard = d.borrow();
         match guard.as_ref() {
             Some(drv) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                cljrs_async::fiber::run_root(
+                    &drv.rt,
+                    &drv.local,
+                    &mut drv.carrier.borrow_mut(),
+                    move || cljrs_async::fiber::park_on(cljrs_async::await_value(value)),
+                )
+                .map_err(format_eval_error)?;
+                #[cfg(target_arch = "wasm32")]
                 drv.local
-                    .block_on(&drv.rt, cljrs_async::eval_async::await_value(value))
+                    .block_on(&drv.rt, cljrs_async::await_value(value))
                     .map_err(format_eval_error)?;
                 Ok(())
             }
@@ -426,6 +436,19 @@ pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value
 struct AsyncDriver {
     rt: tokio::runtime::Runtime,
     local: tokio::task::LocalSet,
+    #[cfg(not(target_arch = "wasm32"))]
+    carrier: std::cell::RefCell<cljrs_gc::mutator::MutatorState>,
+}
+
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+impl Drop for AsyncDriver {
+    fn drop(&mut self) {
+        // Legacy tasks must unwind with their carrier root stacks installed.
+        let local = std::mem::replace(&mut self.local, tokio::task::LocalSet::new());
+        self.carrier.get_mut().swap_with_current();
+        drop(local);
+        self.carrier.get_mut().swap_with_current();
+    }
 }
 
 #[cfg(feature = "async")]
@@ -450,18 +473,31 @@ pub fn with_async_driver<T>(f: impl FnOnce() -> T) -> T {
         .build()
         .expect("failed to build Tokio runtime");
     let local = tokio::task::LocalSet::new();
-    ASYNC_DRIVER.with(|d| *d.borrow_mut() = Some(AsyncDriver { rt, local }));
-    let result = f();
-    ASYNC_DRIVER.with(|d| *d.borrow_mut() = None);
-    result
+    ASYNC_DRIVER.with(|d| {
+        *d.borrow_mut() = Some(AsyncDriver {
+            rt,
+            local,
+            #[cfg(not(target_arch = "wasm32"))]
+            carrier: std::cell::RefCell::new(cljrs_gc::mutator::MutatorState::fresh()),
+        })
+    });
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            ASYNC_DRIVER.with(|d| {
+                d.borrow_mut().take();
+            });
+        }
+    }
+    let _cleanup = Cleanup;
+    f()
 }
 
 /// Evaluate a single top-level form.
 ///
-/// With the `async` feature, the form is driven on the shared `LocalSet` via
-/// [`tokio::task::LocalSet::block_on`], so spawned tasks — core.async channel
-/// producers, `^:async` calls, the `cljrs-io` readers/writers — make progress
-/// and a top-level `await` resolves. Tasks that outlive a form (e.g. a producer
+/// With the `async` feature on native targets, a root fiber evaluates the
+/// form on the shared LocalSet. Blocking waits park through ordinary calls.
+/// On wasm32, the async evaluator drives the form. Tasks that outlive a form (e.g. a producer
 /// feeding a channel `def`d in one REPL line and consumed in the next) stay
 /// queued on the `LocalSet` and continue on the next form's drive. Without the
 /// feature it is a plain synchronous `eval`.
@@ -471,9 +507,34 @@ pub fn eval_form(form: &cljrs_reader::Form, env: &mut Env) -> Result<Value, Eval
     ASYNC_DRIVER.with(|d| {
         let guard = d.borrow();
         match guard.as_ref() {
-            Some(drv) => drv
-                .local
-                .block_on(&drv.rt, cljrs_async::eval_async::eval_async(form, env)),
+            Some(drv) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Own the environment on the root stack and recover namespace/
+                    // lexical changes afterward, including evaluation failures.
+                    let replacement = Env::new(env.globals.clone(), &env.current_ns);
+                    let owned = std::rc::Rc::new(std::cell::RefCell::new(std::mem::replace(
+                        env,
+                        replacement,
+                    )));
+                    let child = owned.clone();
+                    let form = form.clone();
+                    let result = cljrs_async::fiber::run_root(
+                        &drv.rt,
+                        &drv.local,
+                        &mut drv.carrier.borrow_mut(),
+                        move || eval(&form, &mut child.borrow_mut()),
+                    );
+                    *env = std::rc::Rc::try_unwrap(owned)
+                        .ok()
+                        .expect("root retained env")
+                        .into_inner();
+                    result
+                }
+                #[cfg(target_arch = "wasm32")]
+                drv.local
+                    .block_on(&drv.rt, cljrs_async::eval_async::eval_async(form, env))
+            }
             // No driver installed (shouldn't happen once `main` runs): fall back
             // to a synchronous evaluation rather than panicking.
             None => eval(form, env),

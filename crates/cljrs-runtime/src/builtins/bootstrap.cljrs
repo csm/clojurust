@@ -1911,3 +1911,10 @@
              (cons 'clojure.core/blocking-call call)
              (throw (ex-info "blocking expects native call forms" {}))))
          calls)))
+
+(defmacro future
+  "Runs body concurrently on this isolate in a fiber. Conveys dynamic bindings.
+  Dereferencing parks the calling fiber. Use isolates for parallel execution.
+  Cancellation discards the result without interrupting the body."
+  [& body]
+  (list 'clojure.core/future-call (list 'fn [] (cons 'do body))))

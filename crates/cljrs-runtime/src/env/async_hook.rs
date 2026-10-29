@@ -23,6 +23,12 @@ pub trait AsyncRuntime: Send + Sync {
     /// `Value::Future` immediately; the body runs concurrently.
     fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value;
 
+    /// Spawn an ordinary synchronous call on a parking-capable fiber.
+    /// Runtimes without fibers retain their async task implementation.
+    fn spawn_fiber_call(&self, callee: Value, args: Vec<Value>, env: Env) -> EvalResult {
+        Ok(self.spawn_async_call(callee, args, env))
+    }
+
     /// Block the current OS thread until a value can be taken from the channel.
     ///
     /// Used by the IR interpreter's sync-context fallback for `ChanTake`.

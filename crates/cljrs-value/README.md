@@ -1019,3 +1019,14 @@ It must convert results after the worker returns.
 checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
+
+In `no-gc` builds, `publish::publish_value` retains active scratch regions when
+a managed value enters a channel or another persistent cell. Scalars need no
+retention. This path keeps child-fiber captures and channel values valid after
+their producing scope returns. Isolated allocation invocations keep their bounded lifetime rules.
+
+`NativeFn::captures: Vec<Value>` records managed values retained by an opaque
+Rust callable. Its `Trace` implementation visits each value. Constructors start
+with an empty vector. Compiled and IR closure adapters fill this vector so
+suspended fibers retain their closure captures through collection.
+Rust embedders must record any managed captures in this vector.

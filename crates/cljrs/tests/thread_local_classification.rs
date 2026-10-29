@@ -55,7 +55,7 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     (
         "cljrs-gc/src/region.rs",
         "POISON_WATERMARK",
-        FiberWhen("cljrs-gc/POISON_WATERMARK", !NO_GC),
+        Fiber("cljrs-gc/POISON_WATERMARK"),
     ),
     (
         "cljrs-gc/src/alloc_ctx.rs",

@@ -1416,8 +1416,15 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("ensure-reduced", Arity::Fixed(1), builtin_ensure_reduced),
         ("promise", Arity::Fixed(0), builtin_promise),
         ("deliver", Arity::Fixed(2), builtin_deliver),
-        // future/agent: not yet implemented — omitted from namespace
-        // future-done?, future-cancelled?, future-cancel, future-call* are stubs
+        ("future-call", Arity::Fixed(1), builtin_future_call),
+        ("future?", Arity::Fixed(1), builtin_future_q),
+        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
+        (
+            "future-cancelled?",
+            Arity::Fixed(1),
+            builtin_future_cancelled_q,
+        ),
+        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         // agent, await-agent, agent-error, restart-agent are stubs
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
         (
@@ -1763,7 +1770,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("eval", Arity::Fixed(1), builtin_eval_sentinel),
     ];
 
-    intern_builtins(globals, ns, fns, BUILTIN_DOCS);
+    let docs = [BUILTIN_DOCS, EXPERIMENTAL_DOCS].concat();
+    intern_builtins(globals, ns, fns, &docs);
 
     // Math constants.
     globals.intern(
@@ -1794,12 +1802,7 @@ fn intern_builtins(
     }
 }
 
-/// The namespace experimental APIs live in.
-///
-/// Deliberately not referred into `user` and not part of `clojure.core`:
-/// everything here is reachable only by an explicit `require`, so
-/// `(when-var-exists future ...)` and similar feature probes see the same
-/// absence a JVM-less runtime would report.
+/// Compatibility namespace for the original experimental future APIs.
 pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 
 /// Doc meta for the experimental builtins, kept separate from `BUILTIN_DOCS`
@@ -1807,7 +1810,7 @@ pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
     (
         "future-call",
-        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Read it with (await f) from an ^:async fn: (deref f) blocks the one thread the task needs in order to finish.",
+        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Dereferencing parks a calling fiber. Dynamic bindings are conveyed; execution is concurrent on one isolate.",
     ),
     ("future?", "Returns true if x is a future."),
     ("future-done?", "Returns true if the future has settled."),
@@ -1823,9 +1826,7 @@ const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
 
 /// Register the experimental native builtins into `ns` (see [`EXPERIMENTAL_NS`]).
 ///
-/// The future family lives here rather than in `clojure.core` because it cannot
-/// honour `clojure.core/future`'s contract on this runtime — see the crate
-/// README's "Experimental namespace" section.
+/// These names remain available alongside the core future family.
 pub fn register_experimental(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // futures — the executor comes from the installed async runtime
@@ -8924,8 +8925,7 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
 ///
 /// The task runs on the installed async runtime's executor, which is this
 /// isolate's: cooperative, not parallel, since every Clojure value is `!Send`.
-/// Read the result with `(await f)`; `(deref f)` blocks the one thread the task
-/// needs in order to finish.
+/// Dereferencing parks a calling fiber. Dynamic bindings are conveyed.
 fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = match args {
         [thunk] => thunk.clone(),
@@ -8945,7 +8945,8 @@ fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
         )
     })?;
     let call_env = crate::env::env::Env::new(globals, &ns);
-    Ok(rt.spawn_async_call(thunk, Vec::new(), call_env))
+    rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+        .map_err(|e| ValueError::Other(e.to_string()))
 }
 
 fn builtin_future_q(args: &[Value]) -> ValueResult<Value> {
@@ -9301,23 +9302,14 @@ mod doc_tests {
         }
     }
 
-    /// The future family is deliberately absent from `clojure.core`: it cannot
-    /// honour that namespace's contract on a one-thread-per-isolate runtime, and
-    /// feature probes (`when-var-exists future`) must keep seeing nothing there.
     #[test]
-    fn future_family_is_not_in_clojure_core() {
+    fn future_family_is_in_core_and_experimental_namespace() {
         let globals = test_globals();
         register_experimental(&globals, EXPERIMENTAL_NS);
         for (name, _) in EXPERIMENTAL_DOCS {
-            assert!(
-                globals.lookup_var("clojure.core", name).is_none(),
-                "{name:?} is registered in clojure.core; it belongs in {EXPERIMENTAL_NS}"
-            );
+            assert!(globals.lookup_var("clojure.core", name).is_some());
+            assert!(globals.lookup_var(EXPERIMENTAL_NS, name).is_some());
         }
-        assert!(
-            globals.lookup_var("clojure.core", "future").is_none(),
-            "clojure.core/future is defined; it belongs in {EXPERIMENTAL_NS}"
-        );
     }
 
     #[test]

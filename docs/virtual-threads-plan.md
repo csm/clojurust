@@ -437,6 +437,34 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
 - **Exit:** core.async's `io-thread` examples run unchanged; `@(future …)` at top level and
   inside `future` bodies no longer deadlocks.
 
+**Status: implemented.**
+
+- Native `future` and `future-call` run ordinary functions in fibers.
+  The full future family now lives in `clojure.core`. Experimental names remain compatible.
+- `thread`, `thread-call`, and `io-thread` convey dynamic bindings and return result channels.
+  A non-nil result enters the channel before closure. Nil results and exceptions only close the channel.
+- Children receive binding snapshots, active gas meters, and interrupt flags.
+  Binding changes stay private to each child.
+- `fiber::run_root` drives top-level evaluation on a 64 MiB stack.
+  It transfers and restores host mutator state, including output capture and nREPL bindings.
+  A separate carrier state retains legacy async roots between drives and during executor destruction.
+- CLI `run`, `eval`, REPL, nREPL, and tests use root evaluation.
+  Generated AOT program and test harnesses also use root fibers.
+  The AOT preamble, namespace initializers, compiled entry, and `-main` can park.
+- Macro expansion traverses reader dereference, so `@(future ...)` compiles correctly.
+  Compiled closure adapters propagate pending exceptions. Future dereference preserves thrown data.
+  Native closure adapters explicitly trace managed captures through `NativeFn::captures`.
+- `no-gc` scratch scopes register their live regions through tail evaluation.
+  Spawn and publication retain escaping regions until isolate exit.
+  Bounded isolated allocation invocations cannot spawn Clojure fibers.
+- `fiber_surface.rs` covers nested futures, ordinary function waits, bindings, result-channel closure,
+  cancellation, errors, forced collection, and host state restoration in both interpreter modes.
+  The tests pass in GC and `no-gc` builds.
+  `fiber_entrypoints.rs` covers CLI and nREPL evaluation, including streamed output and session bindings.
+  AOT regressions cover the compiled surface and generated test harness.
+- The book and affected crate READMEs document the native surface.
+  `go`, `^:async`, and wasm32 retain the legacy async evaluator until Phase 5.
+
 ### Phase 4 — Fairness and observability
 
 - Time-slice preemption at safepoints.

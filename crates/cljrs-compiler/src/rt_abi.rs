@@ -2014,6 +2014,7 @@ pub unsafe extern "C" fn rt_make_fn(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: captured_values.clone(),
         name: name.clone(),
         arity: cljrs_value::Arity::Fixed(param_count),
         func: Arc::new(move |args: &[Value]| {
@@ -2044,7 +2045,10 @@ pub unsafe extern "C" fn rt_make_fn(
             // We call it via a trampoline that passes args through a pointer array.
             let result_ptr = unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
 
-            Ok(unsafe { val_ref(result_ptr) }.clone())
+            match take_pending_exception_value() {
+                Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
+                None => Ok(unsafe { val_ref(result_ptr) }.clone()),
+            }
         }),
     };
 
@@ -2092,6 +2096,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: captured_values.clone(),
         name: name.clone(),
         arity: cljrs_value::Arity::Variadic { min: fixed_count },
         func: Arc::new(move |args: &[Value]| {
@@ -2126,7 +2131,10 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 
             let result_ptr =
                 unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled_params) };
-            Ok(unsafe { val_ref(result_ptr) }.clone())
+            match take_pending_exception_value() {
+                Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
+                None => Ok(unsafe { val_ref(result_ptr) }.clone()),
+            }
         }),
     };
 
@@ -2199,6 +2207,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     let fn_name = name.clone();
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        captures: captured_values.clone(),
         name,
         arity,
         func: Arc::new(move |args: &[Value]| {
@@ -2216,7 +2225,10 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 }
                 let result_ptr =
                     unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_params) };
-                return Ok(unsafe { val_ref(result_ptr) }.clone());
+                return match take_pending_exception_value() {
+                    Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
+                    None => Ok(unsafe { val_ref(result_ptr) }.clone()),
+                };
             }
 
             // Try variadic arity (argc >= fixed_count).
@@ -2241,7 +2253,10 @@ pub unsafe extern "C" fn rt_make_fn_multi(
                 all_ptrs.push(box_val(rest_list));
                 let result_ptr =
                     unsafe { rt_call_compiled(fn_addr, all_ptrs.as_ptr(), total_compiled) };
-                return Ok(unsafe { val_ref(result_ptr) }.clone());
+                return match take_pending_exception_value() {
+                    Some(value) => Err(cljrs_value::ValueError::Thrown(value)),
+                    None => Ok(unsafe { val_ref(result_ptr) }.clone()),
+                };
             }
 
             // No matching arity found.
@@ -2771,7 +2786,7 @@ pub unsafe extern "C" fn rt_call(
             });
             rt_const_nil()
         }
-        Err(_e) => rt_const_nil(),
+        Err(error) => throw_str(error.to_string()),
     }
 }
 
@@ -2785,7 +2800,7 @@ pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_runtime::interp::eval::deref_value(v) {
         Ok(result) => box_invoke_result(result),
-        Err(_) => rt_const_nil(),
+        Err(error) => unsafe { rt_throw(box_val(error.to_error_value())) },
     }
 }
 

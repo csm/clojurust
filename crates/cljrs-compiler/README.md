@@ -785,3 +785,16 @@ and process waits. A separate host thread releases each gate after the isolate m
 `tests/blocking_form.rs` checks native call offload, rejection, errors, and cancellation in tree-walk and tiered modes.
 `tests/aot_native_init_e2e.rs` also compiles the core and namespaced `blocking` macros with typed native exports.
 Compiled Clojure closures have no blocking adapter and cannot move across the worker boundary.
+
+### Root fibers in native harnesses
+
+Generated program and test harnesses drive their entry function with
+`cljrs_async::fiber::run_root`. The 64 MiB root stack covers namespace setup,
+preamble evaluation, native initializers, compiled entry code, and `-main`.
+The test harness registers `clojure.core.async` and drives test bodies in the root fiber.
+Synchronous functions can dereference futures and use blocking channel operations.
+`tests/aot_e2e.rs` covers nested future waits, `io-thread`, and dynamic binding conveyance in a native binary.
+
+Compiled closure adapters propagate their pending exception into the normal
+call result. `rt_deref` records future dereference errors in the pending-exception slot.
+Thus a failed compiled future remains catchable through `@` with its exception data.

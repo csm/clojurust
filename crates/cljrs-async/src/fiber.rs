@@ -172,15 +172,21 @@ impl Fiber {
     }
 
     /// Keep captured values rooted before the first poll and until completion.
-    /// GC builds retire active regions because opaque closure captures cannot
-    /// be rewritten after promotion. In no-gc builds, allocate captures in a
-    /// static context before constructing a fiber.
+    /// Both allocation modes retain active regions because opaque closure
+    /// captures cannot be rewritten after promotion.
     pub fn with_roots(
         roots: Vec<Value>,
         body: impl FnOnce() -> EvalResult + 'static,
     ) -> Result<Self, EvalError> {
+        Self::with_stack_bytes(roots, body, stack_bytes()?)
+    }
+
+    fn with_stack_bytes(
+        roots: Vec<Value>,
+        body: impl FnOnce() -> EvalResult + 'static,
+        bytes: usize,
+    ) -> Result<Self, EvalError> {
         install_parking_hooks();
-        let bytes = stack_bytes()?;
         let stack = STACK_POOL
             .with(|pool| {
                 let mut pool = pool.borrow_mut();
@@ -205,6 +211,7 @@ impl Fiber {
             bytes,
             id,
             yielder: std::ptr::null(),
+            root: false,
         };
         task.state.swap_with_current();
         task.roots_guard = Some(root_values(&task.roots));
@@ -236,6 +243,7 @@ pub struct FiberTask {
     bytes: usize,
     id: FiberId,
     yielder: *const Yielder<(), Park>,
+    root: bool,
 }
 
 impl FiberTask {
@@ -325,23 +333,33 @@ impl Future for FiberTask {
         }
         this.state.swap_with_current();
         if result.is_ready() {
-            this.state = MutatorState::fresh();
+            if !this.root {
+                this.state = MutatorState::fresh();
+            }
             this.release_stack();
         }
         result
     }
 }
 
-impl Drop for FiberTask {
-    fn drop(&mut self) {
+impl FiberTask {
+    fn cancel(&mut self) {
         if self.co.is_some() {
             self.state.swap_with_current();
             self.unwind();
             self.roots_guard.take();
             self.state.swap_with_current();
-            self.state = MutatorState::fresh();
+            if !self.root {
+                self.state = MutatorState::fresh();
+            }
             self.release_stack();
         }
+    }
+}
+
+impl Drop for FiberTask {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -402,4 +420,39 @@ pub fn spawn_rooted(
     Ok(tokio::task::spawn_local(async move {
         FiberResult::new(task.await)
     }))
+}
+
+/// Drive a top-level computation on a 64 MiB root stack.
+/// Transfers the host's mutator state into the root and restores it afterward.
+/// `carrier` retains executor task roots between drives on the same LocalSet.
+/// Call outside the Tokio runtime and outside any fiber.
+pub fn run_root(
+    rt: &tokio::runtime::Runtime,
+    local: &tokio::task::LocalSet,
+    carrier: &mut MutatorState,
+    body: impl FnOnce() -> EvalResult + 'static,
+) -> EvalResult {
+    assert!(current().is_none(), "nested root fiber");
+    let mut task = Fiber::with_stack_bytes(Vec::new(), body, 64 * 1024 * 1024)?.into_task();
+    task.state.swap_with_current();
+    task.roots_guard.take();
+    task.state.swap_with_current();
+    task.state = MutatorState::save();
+    task.root = true;
+    carrier.swap_with_current();
+    // Restore both states even if the executor panics. Pending legacy async
+    // tasks retain their carrier roots separately from the host's LIFO guards.
+    struct Drive<'a> {
+        task: FiberTask,
+        carrier: &'a mut MutatorState,
+    }
+    impl Drop for Drive<'_> {
+        fn drop(&mut self) {
+            self.task.cancel();
+            self.carrier.swap_with_current();
+            self.task.state.swap_with_current();
+        }
+    }
+    let mut drive = Drive { task, carrier };
+    local.block_on(rt, &mut drive.task)
 }

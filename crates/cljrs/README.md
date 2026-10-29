@@ -617,3 +617,15 @@ fetch and commit-signature verification — and `pgp` pulls `regex` in. A CLI bu
 that way therefore links both engines and is *larger*, not smaller. The engine
 swap only pays off for an embedding that has no `pgp` in its graph; see
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+### Root fibers
+
+With the `async` feature on native targets, `session::eval_form` drives ordinary
+evaluation in a root fiber. This path serves `run`, `eval`, REPL, nREPL, and tests.
+Top-level `@(future ...)` and blocking channel operations park the root fiber.
+`AsyncDriver` retains carrier roots between forms and installs them during task destruction.
+Root evaluation preserves namespace changes, host bindings, output capture, and interrupt state.
+The wasm32 path retains `eval_async`.
+
+`tests/fiber_entrypoints.rs` covers nested future waits through `eval`, `run`, REPL,
+and `clojure.test`.

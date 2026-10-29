@@ -204,23 +204,38 @@ that state only while their own task is being polled and take it back off before
 output such a task prints is not captured by a suspended `with-out-str`. A `set!` of a bound var
 inside the body persists across yields.
 
-### `await` and the single-thread executor
+### Blocking style on native fibers
 
-`await` only yields when evaluated by `eval_async` (i.e. inside an `^:async` function body or
-another async driver). The synchronous `await`/`deref` fallback in `cljrs_runtime::interp` blocks the OS
-thread on a condvar; doing that to an *async-spawned* future from the `LocalSet` driver thread
-deadlocks, because the task that would resolve the future cannot run while the only executor
-thread is parked. In Phase B, await async results from within async context. A top-level
-blocking bridge is a later phase.
+`future`, `future-call`, `thread`, `thread-call`, and `io-thread` run ordinary
+functions in fibers on the isolate thread. Each child receives a snapshot of
+the caller's dynamic bindings. Changes in a child stay in that child.
 
-`cljrs.core.experimental/future` (registered in `cljrs-runtime`, executed through
-the `AsyncRuntime` hook this crate installs) inherits exactly this rule: its body
-is a task on the caller's executor, so it is cooperative rather than parallel and
-must be read with `(await f)`, not `@f`. That is why it is *not*
-`clojure.core/future`, which stays undefined: see
-"`cljrs.core.experimental/future` — cooperative, not parallel" in
-`cljrs-runtime/README.md`. Parallelism across OS threads is the isolate boundary,
-where values cross by copy.
+```clojure
+(require '[clojure.core.async :as a])
+
+@(future @(future 42))
+(a/<!! (a/io-thread (slurp "data.edn")))
+
+(let [ch (a/chan)]
+  (a/io-thread (a/>!! ch "hello"))
+  (a/<!! ch))
+```
+
+`io-thread` and `thread` return a channel. The channel receives a non-nil result,
+then closes. A nil result or an exception closes the channel without a value.
+`thread-call` accepts a zero-argument function. A failed future raises its error
+when a caller dereferences it. `future-cancel` cancels the result and leaves the body active.
+The experimental future names remain available for compatibility.
+
+The CLI drives `run`, `eval`, REPL, nREPL, and test forms in root fibers.
+The AOT program and test harnesses also use root fibers. Ordinary functions can
+use `@`, `<!!`, `>!!`, and `sleep` through nested calls without async annotations.
+Execution is concurrent on one isolate. Isolates provide parallel Clojure execution.
+CPU-heavy bodies can delay other fibers until a park point.
+
+`go` and `^:async` retain the async evaluator until Phase 5. In those bodies,
+`await` remains the supported wait operation. On wasm32, the surface uses
+LocalSet tasks and retains the async waiting rules.
 
 ## Native fiber core
 
@@ -235,6 +250,12 @@ let task = cljrs_async::fiber::spawn(|| {
 let value = task.await?.into_result()?;
 ```
 
+`run_root(rt, local, carrier, body) -> EvalResult` drives an owned top-level
+computation on a 64 MiB stack. It transfers the host mutator state into the root
+and restores that state on return. The caller retains `carrier: MutatorState`
+between drives on the same LocalSet. This state holds roots for pending async tasks.
+The caller also installs this carrier state while destroying the LocalSet.
+
 `park_on` can borrow fiber stack locals and suspend through synchronous native frames.
 `current()` returns the running fiber ID. During future polls, it returns `None`.
 Panics in the body or parked future become `EvalError::Runtime`.
@@ -248,12 +269,13 @@ For captured managed values, use `spawn_rooted(values, body)` or `Fiber::with_ro
 These values remain rooted before the first poll and until completion.
 For locals and opaque future captures, use the runtime's GC root guards.
 GC builds retire active regions through the existing async poison fallback.
-In `no-gc` builds, allocate captures in a static context.
+In `no-gc` builds, spawning also retains active scratch regions for opaque captures.
+Typed isolated allocation invocations cannot spawn Clojure fibers.
 Spawned results stay rooted in `FiberResult` until consumption or drop.
 After `into_result`, the caller owns the normal root-registration responsibility.
 
-This phase adds the Rust core. Blocking primitives and the Clojure fiber surface follow in
-Phases 2 and 3 of `docs/virtual-threads-plan.md`. The existing async evaluator remains in use.
+The native parking primitives and Clojure fiber surface are available.
+The existing async evaluator still drives `go` and `^:async`.
 The fiber module and corosensei dependency are excluded on `wasm32`.
 
 ## File layout
@@ -261,7 +283,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | File | Description |
 |---|---|
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
-| `src/runtime.rs` | `AsyncRuntimeImpl` — Tokio-backed `AsyncRuntime`; `spawn_async_call` spawns the body on the `LocalSet` via `spawn_future` |
+| `src/runtime.rs` | `AsyncRuntimeImpl`: async task dispatch and fiber call dispatch with binding, gas, and interrupt conveyance |
 | `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
 | `src/fiber.rs` | Native stackful fibers, stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
@@ -277,8 +299,9 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
 | `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
+| `tests/fiber_surface.rs` | Blocking Clojure surface, nested futures, binding conveyance, channel closure, root state restoration, and GC across root drives |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
-| `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under `eval_async` — the path every top-level form takes when the async driver is installed |
+| `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under the legacy `eval_async` driver |
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |
 | `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and `eval_async` (csm/clojurust#428) |
 | `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically in `eval_async` and the sync evaluator (containers, `let*`/`loop*` binding vectors) |

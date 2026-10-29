@@ -218,6 +218,9 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Set(new_items)
         }
+        // Reader dereference evaluates its operand, so nested macros must
+        // expand before IR/AOT lowering just as in an explicit deref call.
+        FormKind::Deref(inner) => FormKind::Deref(Box::new(macroexpand_all(inner, env)?)),
         // Atoms, keywords, strings, etc. — no sub-forms.
         _ => return Ok(expanded),
     };

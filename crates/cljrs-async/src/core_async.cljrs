@@ -41,9 +41,19 @@
 
 ;; (thread body...)
 ;;
-;; Run `body` as an async task, returning a channel that delivers the result.
-;; Analogous to clojure.core.async/thread but backed by the LocalSet executor.
-(defmacro thread [& body]
+;; Fibers run concurrently on the isolate thread and convey dynamic bindings.
+(defmacro thread
+  "Runs body in a fiber and returns a result channel. Conveys dynamic bindings.
+  Sends a non-nil result, then closes. A nil result or exception only closes.
+  Execution is concurrent on one isolate. Use isolates for parallel execution."
+  [& body]
+  (list 'clojure.core.async/thread-call
+        (cons 'fn (cons [] body))))
+
+(defmacro io-thread
+  "Runs body in a fiber and returns a result channel, like thread.
+  The body can do blocking I/O. Avoid extended computation in the body."
+  [& body]
   (list 'clojure.core.async/thread-call
         (cons 'fn (cons [] body))))
 
