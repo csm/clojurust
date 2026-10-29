@@ -1459,11 +1459,7 @@ pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value)
                 .unwrap_or(false),
             _ => match cljrs_runtime::env::callback::invoke(pred_ref, vec![elem]) {
                 Ok(r) => !matches!(r, Value::Nil | Value::Bool(false)),
-                Err(cljrs_value::ValueError::Thrown(val)) => {
-                    stash_pending_exception(val);
-                    return rt_const_nil();
-                }
-                Err(_) => return rt_const_nil(),
+                Err(error) => return signal_error(error),
             },
         };
         if keep {
@@ -1507,11 +1503,10 @@ fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
         ),
         _ => match cljrs_runtime::env::callback::invoke(pred, vec![elem.clone()]) {
             Ok(r) => Some(!matches!(r, Value::Nil | Value::Bool(false))),
-            Err(cljrs_value::ValueError::Thrown(val)) => {
-                stash_pending_exception(val);
+            Err(error) => {
+                signal_error(error);
                 None
             }
-            Err(_) => None,
         },
     }
 }
@@ -1620,11 +1615,7 @@ pub unsafe extern "C" fn rt_into_mapcat(
     for elem in elems {
         let r = match cljrs_runtime::env::callback::invoke(f_ref, vec![elem]) {
             Ok(v) => v,
-            Err(cljrs_value::ValueError::Thrown(val)) => {
-                stash_pending_exception(val);
-                return rt_const_nil();
-            }
-            Err(_) => return rt_const_nil(),
+            Err(error) => return signal_error(error),
         };
         match eager_seq_elems(&r) {
             Some(inner) => elements.extend(inner),
@@ -1743,11 +1734,7 @@ pub unsafe extern "C" fn rt_into_map(
     for elem in elems {
         match cljrs_runtime::env::callback::invoke(f_ref, vec![elem]) {
             Ok(v) => mapped.push(v),
-            Err(cljrs_value::ValueError::Thrown(val)) => {
-                stash_pending_exception(val);
-                return rt_const_nil();
-            }
-            Err(_) => return rt_const_nil(),
+            Err(error) => return signal_error(error),
         }
     }
 
@@ -2995,9 +2982,12 @@ pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *co
 pub unsafe extern "C" fn rt_with_out_str(body_fn: *const Value) -> *const Value {
     let f = unsafe { val_ref(body_fn) }.clone();
     cljrs_runtime::builtins::builtins::push_output_capture();
-    let _result = cljrs_runtime::env::callback::invoke(&f, vec![]);
+    let result = cljrs_runtime::env::callback::invoke(&f, vec![]);
     let captured = cljrs_runtime::builtins::builtins::pop_output_capture().unwrap_or_default();
-    box_val(Value::Str(GcPtr::new(captured)))
+    match result {
+        Ok(_) => box_val(Value::Str(GcPtr::new(captured))),
+        Err(error) => signal_error(error),
+    }
 }
 
 // ── Collection operations (extended) ─────────────────────────────────────────
@@ -3321,15 +3311,15 @@ pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
     match t {
         Value::TransientVector(tv) => match tv.get().persistent() {
             Ok(v) => box_val(Value::Vector(GcPtr::new(v))),
-            Err(_) => rt_const_nil(),
+            Err(error) => signal_error(error),
         },
         Value::TransientMap(m) => match m.get().persistent() {
             Ok(m) => box_val(Value::Map(MapValue::Hash(GcPtr::new(m)))),
-            Err(_) => rt_const_nil(),
+            Err(error) => signal_error(error),
         },
         Value::TransientSet(s) => match s.get().persistent() {
             Ok(s) => box_val(Value::Set(SetValue::Hash(GcPtr::new(s)))),
-            Err(_) => rt_const_nil(),
+            Err(error) => signal_error(error),
         },
         _ => box_val(t.clone()),
     }
@@ -3349,11 +3339,11 @@ pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) ->
     match atom {
         Value::Atom(a) => box_val(a.get().reset(val)),
         Value::SharedAtom(sa) => match cljrs_value::promote(&val) {
-            Ok(sv) => {
-                sa.reset(sv);
-                box_val(val)
-            }
-            Err(_) => rt_const_nil(),
+            Ok(sv) => match sa.try_reset(sv) {
+                Ok(_) => box_val(val),
+                Err(fault) => signal_error(cljrs_value::ValueError::MemoryLimitExceeded(fault)),
+            },
+            Err(error) => signal_error(error.into_value_error()),
         },
         _ => rt_const_nil(),
     }
@@ -3401,7 +3391,10 @@ pub unsafe extern "C" fn rt_atom_swap(
                         // region poisoned) *before* it is stored here — this
                         // CAS loop bypasses `Atom::reset`, so it must run the
                         // barrier itself instead of silently skipping it.
-                        let new_val = cljrs_value::publish::publish_value(new_val);
+                        let new_val = cljrs_value::publish::publish_for_owner(
+                            new_val,
+                            a.get() as *const _ as usize,
+                        );
                         let mut guard = a.get().value.lock().unwrap();
                         if *guard == current {
                             *guard = new_val.clone();
@@ -3409,7 +3402,7 @@ pub unsafe extern "C" fn rt_atom_swap(
                         }
                         // CAS failed, retry
                     }
-                    Err(_) => return rt_const_nil(),
+                    Err(error) => return signal_error(error),
                 }
             }
         }
@@ -3422,14 +3415,19 @@ pub unsafe extern "C" fn rt_atom_swap(
                 match cljrs_runtime::env::callback::invoke(&f, args) {
                     Ok(new_val) => match cljrs_value::promote(&new_val) {
                         Ok(sv) => {
-                            if sa.compare_and_set(&cur, sv) {
-                                return box_val(new_val);
+                            match sa.try_compare_and_set(&cur, sv) {
+                                Ok(true) => return box_val(new_val),
+                                Ok(false) => {} // CAS failed, retry.
+                                Err(fault) => {
+                                    return signal_error(
+                                        cljrs_value::ValueError::MemoryLimitExceeded(fault),
+                                    );
+                                }
                             }
-                            // CAS failed, retry
                         }
-                        Err(_) => return rt_const_nil(),
+                        Err(error) => return signal_error(error.into_value_error()),
                     },
-                    Err(_) => return rt_const_nil(),
+                    Err(error) => return signal_error(error),
                 }
             }
         }
@@ -3452,18 +3450,12 @@ pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *co
     let _root = cljrs_runtime::env::gc_roots::root_value(&f);
     let args = match cljrs_runtime::interp::destructure::value_to_seq_vec(arglist) {
         Ok(args) => args,
-        Err(error) => return throw_str(error.to_string()),
+        Err(error) => return signal_error(error),
     };
 
     match cljrs_runtime::env::callback::invoke(&f, args) {
         Ok(result) => box_val(result),
-        Err(cljrs_value::ValueError::Thrown(val)) => {
-            PENDING_EXCEPTION.with(|cell| {
-                *cell.borrow_mut() = Some(box_val(val));
-            });
-            rt_const_nil()
-        }
-        Err(_) => rt_const_nil(),
+        Err(error) => signal_error(error),
     }
 }
 
@@ -3476,13 +3468,7 @@ fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
     {
         match cljrs_runtime::env::callback::invoke(&val, args) {
             Ok(result) => box_invoke_result(result),
-            Err(cljrs_value::ValueError::Thrown(v)) => {
-                PENDING_EXCEPTION.with(|cell| {
-                    *cell.borrow_mut() = Some(box_val(v));
-                });
-                rt_const_nil()
-            }
-            Err(_) => rt_const_nil(),
+            Err(error) => signal_error(error),
         }
     } else {
         rt_const_nil()
@@ -3820,11 +3806,7 @@ pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *con
         for _ in 0..*k {
             match cljrs_runtime::env::callback::invoke(f_ref, vec![]) {
                 Ok(v) => items.push(v),
-                Err(cljrs_value::ValueError::Thrown(val)) => {
-                    stash_pending_exception(val);
-                    return rt_const_nil();
-                }
-                Err(_) => return rt_const_nil(),
+                Err(error) => return signal_error(error),
             }
         }
         let pv = PersistentVector::from_iter(items);
@@ -3899,13 +3881,7 @@ pub unsafe extern "C" fn rt_with_bindings(
 
     match cljrs_runtime::env::callback::invoke(&body, vec![]) {
         Ok(result) => box_val(result),
-        Err(cljrs_value::ValueError::Thrown(val)) => {
-            PENDING_EXCEPTION.with(|cell| {
-                *cell.borrow_mut() = Some(box_val(val));
-            });
-            rt_const_nil()
-        }
-        Err(_) => rt_const_nil(),
+        Err(error) => signal_error(error),
     }
     // _guard drops here → pop_frame()
 }
@@ -3950,7 +3926,7 @@ fn take_pending_exception() -> Option<*const Value> {
 /// interpreter caller instead of being swallowed as nil.  The caller must
 /// invoke this while the JIT frame's alloc roots are still live (the pending
 /// pointer targets a Value boxed inside the native frame).
-pub(crate) fn take_pending_exception_value() -> Option<Value> {
+pub fn take_pending_exception_value() -> Option<Value> {
     take_pending_exception().map(|ptr| unsafe { val_ref(ptr) }.clone())
 }
 
@@ -5690,6 +5666,128 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[test]
+    fn every_callback_bridge_preserves_ordinary_and_resource_errors() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                let _alloc = cljrs_gc::push_alloc_frame();
+                let one = Value::Vector(GcPtr::new(PersistentVector::from_iter([Value::Long(1)])));
+                let empty = Value::Vector(GcPtr::new(PersistentVector::empty()));
+                let atom = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
+                let shared = Value::SharedAtom(std::sync::Arc::new(cljrs_value::SharedAtom::new(
+                    cljrs_value::SharedValue::Long(0),
+                )));
+                let errors = [
+                    ValueError::Thrown(Value::Long(71)),
+                    ValueError::Other("bridge-error".into()),
+                    ValueError::ArityError {
+                        name: "arity".into(),
+                        expected: "1".into(),
+                        got: 0,
+                    },
+                    ValueError::GasExhausted,
+                    ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
+                        class: cljrs_gc::MemoryClass::GcHeap,
+                        requested: 1,
+                        committed: 2,
+                        hard_limit: 2,
+                    }),
+                ];
+                for error in errors {
+                    let captured = error.clone();
+                    let function = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "failure",
+                        Arity::Variadic { min: 0 },
+                        move |_| Err(captured.clone()),
+                    )));
+                    runtime
+                        .globals()
+                        .intern("user", "bridge-failure".into(), function.clone());
+                    type Bridge<'a> = (&'static str, Box<dyn Fn() -> *const Value + 'a>);
+                    let bridges: Vec<Bridge<'_>> = vec![
+                        ("apply", Box::new(|| unsafe { rt_apply(&function, &empty) })),
+                        (
+                            "swap",
+                            Box::new(|| unsafe {
+                                rt_atom_swap(&atom, &function, std::ptr::null(), 0)
+                            }),
+                        ),
+                        (
+                            "shared-swap",
+                            Box::new(|| unsafe {
+                                rt_atom_swap(&shared, &function, std::ptr::null(), 0)
+                            }),
+                        ),
+                        (
+                            "count-filter",
+                            Box::new(|| unsafe { rt_count_filter(&function, &one) }),
+                        ),
+                        (
+                            "into-filter",
+                            Box::new(|| unsafe { rt_into_filter(&empty, &function, &one) }),
+                        ),
+                        (
+                            "into-mapcat",
+                            Box::new(|| unsafe { rt_into_mapcat(&empty, &function, &one) }),
+                        ),
+                        (
+                            "into-map",
+                            Box::new(|| unsafe { rt_into_map(&empty, &function, &one) }),
+                        ),
+                        (
+                            "repeatedly",
+                            Box::new(|| unsafe { rt_repeatedly(&Value::Long(1), &function) }),
+                        ),
+                        (
+                            "bindings",
+                            Box::new(|| unsafe {
+                                rt_with_bindings(
+                                    std::ptr::NonNull::dangling().as_ptr(),
+                                    0,
+                                    &function,
+                                )
+                            }),
+                        ),
+                        ("output", Box::new(|| unsafe { rt_with_out_str(&function) })),
+                        (
+                            "global",
+                            Box::new(|| call_global_fn("user", "bridge-failure", vec![])),
+                        ),
+                    ];
+                    for (name, bridge) in bridges {
+                        let outcome = compiled_result(bridge());
+                        match &error {
+                            ValueError::GasExhausted => assert!(
+                                matches!(outcome, Err(ValueError::GasExhausted)),
+                                "{name}: {outcome:?}"
+                            ),
+                            ValueError::MemoryLimitExceeded(_) => assert!(
+                                matches!(outcome, Err(ValueError::MemoryLimitExceeded(_))),
+                                "{name}: {outcome:?}"
+                            ),
+                            _ => assert!(
+                                matches!(outcome, Err(ValueError::Thrown(_))),
+                                "{name}: {outcome:?}"
+                            ),
+                        }
+                    }
+                    let Value::Atom(atom) = &atom else {
+                        unreachable!()
+                    };
+                    assert!(matches!(atom.get().deref(), Value::Nil));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[cfg(feature = "no-gc")]
     #[test]
     fn explicit_native_allocators_obey_popped_scratch_and_static_destinations() {

@@ -562,7 +562,7 @@ The runtime safety net for bump regions coexisting with the tracing GC:
 correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
 `CljxPromise::deliver`, and `cljrs-async`'s channel puts.
-Under `no-gc`, the barrier transfers ownership of actual backing scopes without copying values.
+Under `no-gc`, regional destinations transfer backing scopes. Static destinations copy proven finite immutable data.
 
 ### `Namespace` (Phase 4)
 
@@ -1020,9 +1020,11 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
-In `no-gc` builds, `publish::publish_value` retains actual backing regions for a program-lifetime destination.
-`publish::publish_for_owner(value, address)` transfers backing scopes into the destination object's region.
-Publication preserves identity and laziness. It does not copy values or evaluate user code.
+In `no-gc` builds, `publish::publish_value` copies proven finite immutable data into static storage.
+It retains actual backing scopes for opaque values. Pending lazy sequences and mutable identities never enter serialization.
+`publish::publish_for_owner(value, address)` uses that policy for static destinations and transfers scopes for regional destinations.
+`publish::publish_return(value)` applies the same policy to function and loop results.
+Static data has program lifetime. Copying finite data prevents unused caller temporaries from sharing that lifetime.
 Isolated allocation invocations keep their bounded lifetime rules.
 
 `NativeFn::captures: Vec<Value>` records managed values retained by an opaque
@@ -1033,7 +1035,8 @@ Rust embedders must record any managed captures in this vector.
 
 `NativeFn::with_captures(name, arity, captures, func) -> NativeFn` declares managed
 captures at construction. The callback receives `(&[Value], &[Value])` for captures
-and call arguments. `with_closure` is for Rust callables without managed captures.
+and call arguments. The callback holds a shallow snapshot of the same captured Values.
+Keep the public capture vector unchanged after construction. `with_closure` is for Rust callables without managed captures.
 The interop registration helpers require `Send + Sync` host closures, which cannot
 capture isolate-local Values. Transaction host wrappers capture serialized host APIs.
 

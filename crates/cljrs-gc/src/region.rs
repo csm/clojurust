@@ -584,8 +584,11 @@ static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 struct LeaseOwner {
     id: u64,
     region: *mut Region,
-    ancestors: Vec<u64>,
-    dependencies: RefCell<std::collections::BTreeMap<u64, RegionLease>>,
+    closed: std::cell::Cell<bool>,
+    external: std::cell::Cell<usize>,
+    permanent: std::cell::Cell<bool>,
+    dependents: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
+    dependencies: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
 }
 #[cfg(feature = "no-gc")]
 impl Region {
@@ -596,7 +599,10 @@ impl Region {
         let owner = std::rc::Rc::new(LeaseOwner {
             id: self.id,
             region: self,
-            ancestors: crate::alloc_ctx::ancestor_ids(self as *mut Region),
+            closed: std::cell::Cell::new(false),
+            external: std::cell::Cell::new(0),
+            permanent: std::cell::Cell::new(false),
+            dependents: RefCell::new(Default::default()),
             dependencies: RefCell::new(Default::default()),
         });
         self.lease = Some(owner.clone());
@@ -605,8 +611,8 @@ impl Region {
         }
         owner
     }
-    pub(crate) fn scope_id(&self) -> u64 {
-        self.id
+    pub(crate) fn is_permanent(&self) -> bool {
+        self.published
     }
     fn contains(&self, address: usize) -> bool {
         self.chunks.iter().any(|chunk| {
@@ -620,6 +626,7 @@ thread_local! {
     // Boxes keep allocation targets stable after their lexical scope closes.
     static LEASED_REGIONS: RefCell<std::collections::BTreeMap<u64, Box<Region>>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+    static LEASE_SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Isolate-local address index shared by its fibers; entries do not own regions.
     static REGION_OWNERS: RefCell<std::collections::BTreeMap<usize, (usize, std::rc::Weak<LeaseOwner>)>> = const { RefCell::new(std::collections::BTreeMap::new()) };
 }
@@ -628,10 +635,22 @@ crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<
 
 /// Temporary ownership of scratch scopes. Empty until a scope is shared.
 #[cfg(feature = "no-gc")]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct RegionLease(Vec<std::rc::Rc<LeaseOwner>>);
 #[cfg(feature = "no-gc")]
+impl Clone for RegionLease {
+    fn clone(&self) -> Self {
+        Self::new(self.0.clone())
+    }
+}
+#[cfg(feature = "no-gc")]
 impl RegionLease {
+    fn new(owners: Vec<std::rc::Rc<LeaseOwner>>) -> Self {
+        for owner in &owners {
+            owner.external.set(owner.external.get() + 1);
+        }
+        Self(owners)
+    }
     pub fn capture_active() -> Self {
         let mut owners = INHERITED_LEASES.with(|stack| {
             stack
@@ -646,15 +665,17 @@ impl RegionLease {
         }
         owners.sort_by_key(|owner| owner.id);
         owners.dedup_by_key(|owner| owner.id);
-        Self(owners)
+        Self::new(owners)
     }
     pub fn for_value(value: &impl Trace) -> Self {
         crate::leases_for(value)
     }
     pub(crate) fn add_address(&mut self, address: usize) {
         if let Some(owner) = find_owner(address)
+            && !owner.permanent.get()
             && !self.0.iter().any(|existing| existing.id == owner.id)
         {
+            owner.external.set(owner.external.get() + 1);
             self.0.push(owner);
         }
     }
@@ -697,17 +718,32 @@ impl AllocationOwner {
                 .unwrap_or_default(),
         )
     }
+    pub fn is_permanent(&self) -> bool {
+        self.0.upgrade().is_none_or(|owner| owner.permanent.get())
+    }
     pub fn protect(&self, value: &impl Trace) {
         self.adopt(&RegionLease::for_value(value));
     }
     fn adopt(&self, lease: &RegionLease) {
         if let Some(owner) = self.0.upgrade() {
+            if owner.permanent.get() {
+                for source in &lease.0 {
+                    retain_owner(source);
+                }
+                return;
+            }
             let mut dependencies = owner.dependencies.borrow_mut();
             for source in &lease.0 {
-                if source.id != owner.id && !owner.ancestors.contains(&source.id) {
-                    dependencies
-                        .entry(source.id)
-                        .or_insert_with(|| RegionLease(vec![source.clone()]));
+                if source.id != owner.id
+                    && !source.permanent.get()
+                    && let std::collections::btree_map::Entry::Vacant(entry) =
+                        dependencies.entry(source.id)
+                {
+                    entry.insert(std::rc::Rc::downgrade(source));
+                    source
+                        .dependents
+                        .borrow_mut()
+                        .insert(owner.id, std::rc::Rc::downgrade(&owner));
                 }
             }
         } else {
@@ -725,7 +761,7 @@ pub struct AllocationSnapshot(RegionLease);
 #[cfg(feature = "no-gc")]
 impl AllocationSnapshot {
     pub fn capture() -> Self {
-        Self(RegionLease(
+        Self(RegionLease::new(
             crate::alloc_ctx::current_region()
                 .map(|ptr| unsafe { &mut *ptr }.owner())
                 .into_iter()
@@ -758,22 +794,138 @@ impl Drop for LeaseScope {
 #[cfg(feature = "no-gc")]
 impl Drop for RegionLease {
     fn drop(&mut self) {
-        // Only a final external reference can make a deferred scope reclaimable.
-        let released = self
-            .0
-            .iter()
-            .filter(|owner| std::rc::Rc::strong_count(owner) == 2)
-            .map(|owner| owner.id)
-            .collect::<Vec<_>>();
-        self.0.clear();
-        for id in released {
-            let Ok(dead) = LEASED_REGIONS.try_with(|slot| slot.borrow_mut().remove(&id)) else {
-                continue;
-            };
-            drop(dead); // Destructors can release other scopes; no registry borrow crosses Drop.
+        let mut released = Vec::new();
+        for owner in &self.0 {
+            let remaining = owner
+                .external
+                .get()
+                .checked_sub(1)
+                .expect("balanced scope leases");
+            owner.external.set(remaining);
+            if remaining == 0 && owner.closed.get() {
+                released.push(owner.clone());
+            }
         }
+        self.0.clear();
+        collect_leased_regions(released);
     }
 }
+
+// Follow only the released scopes' connected ownership paths. Dependency
+// edges are weak; lexical scopes and external task/result leases are roots.
+#[cfg(feature = "no-gc")]
+fn collect_leased_regions(seeds: Vec<std::rc::Rc<LeaseOwner>>) {
+    if seeds.is_empty()
+        || LEASE_SWEEPING
+            .try_with(|flag| flag.replace(true))
+            .unwrap_or(true)
+    {
+        return;
+    }
+    struct Sweep;
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            let _ = LEASE_SWEEPING.try_with(|flag| flag.set(false));
+        }
+    }
+    let _sweep = Sweep;
+    fn rooted(owner: &LeaseOwner) -> bool {
+        !owner.closed.get() || owner.external.get() != 0 || owner.permanent.get()
+    }
+    let mut owners = std::collections::BTreeMap::new();
+    // A direct live owner already keeps this entire outgoing graph alive.
+    // Return-call scopes usually have exactly this shape; avoid traversing
+    // their captured value graphs on every call or lazy-sequence step.
+    let mut pending = seeds
+        .into_iter()
+        .filter(|owner| {
+            !rooted(owner)
+                && !owner
+                    .dependents
+                    .borrow()
+                    .values()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .any(|parent| rooted(&parent))
+        })
+        .collect::<Vec<_>>();
+    while let Some(owner) = pending.pop() {
+        if owners.contains_key(&owner.id) {
+            continue;
+        }
+        if !rooted(&owner) {
+            pending.extend(
+                owner
+                    .dependencies
+                    .borrow()
+                    .values()
+                    .filter_map(std::rc::Weak::upgrade),
+            );
+        }
+        owners.insert(owner.id, owner);
+    }
+    let candidates = owners.keys().copied().collect::<Vec<_>>();
+    // Incoming paths reveal roots outside the candidate subgraph. Stop at a
+    // root so unrelated descendants of long-lived scopes are never scanned.
+    let mut pending = candidates.clone();
+    while let Some(id) = pending.pop() {
+        let owner = owners[&id].clone();
+        if rooted(&owner) {
+            continue;
+        }
+        for parent in owner
+            .dependents
+            .borrow()
+            .values()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            owners.entry(parent.id).or_insert_with(|| {
+                pending.push(parent.id);
+                parent
+            });
+        }
+    }
+    // Build only the incoming edges discovered for non-root candidates.
+    // Scanning every dependency of a live caller would revisit all earlier
+    // loop results whenever one small child scope closes.
+    let mut outgoing: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    for owner in owners.values().filter(|owner| !rooted(owner)) {
+        for parent in owner
+            .dependents
+            .borrow()
+            .keys()
+            .filter(|id| owners.contains_key(id))
+        {
+            outgoing.entry(*parent).or_default().push(owner.id);
+        }
+    }
+    let mut pending = owners
+        .values()
+        .filter(|owner| rooted(owner))
+        .map(|owner| owner.id)
+        .collect::<Vec<_>>();
+    let mut reachable = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if let Some(children) = outgoing.get(&id) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    let Ok(dead) = LEASED_REGIONS.try_with(|slot| {
+        let mut regions = slot.borrow_mut();
+        candidates
+            .into_iter()
+            .filter(|id| !reachable.contains(id))
+            .filter_map(|id| regions.remove(&id))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    drop(owners);
+    drop(dead);
+}
+
 #[cfg(feature = "no-gc")]
 pub fn close_region(region: Box<Region>) {
     pop_region_guard();
@@ -781,18 +933,20 @@ pub fn close_region(region: Box<Region>) {
 }
 #[cfg(feature = "no-gc")]
 pub(crate) fn close_scratch_region(mut region: Box<Region>) {
+    if let Some(owner) = &region.lease {
+        owner.closed.set(true);
+    }
     if region.published {
         region.retire();
         RETIRED_REGIONS.with(|slot| slot.borrow_mut().push(region));
-    } else if region
-        .lease
-        .as_ref()
-        .is_some_and(|owner| std::rc::Rc::strong_count(owner) > 1)
-    {
+    } else if region.lease.is_some() {
+        let owner = region.lease.as_ref().unwrap().clone();
         region.retire();
         LEASED_REGIONS.with(|slot| slot.borrow_mut().insert(region.id, region));
+        collect_leased_regions(vec![owner]);
     }
 }
+
 #[cfg(feature = "no-gc")]
 fn live_regions() -> Vec<*mut Region> {
     let mut regions = crate::alloc_ctx::live_regions();
@@ -838,6 +992,7 @@ fn unindex_chunk(chunk: &Chunk) {
 #[cfg(feature = "no-gc")]
 fn retain_owner(owner: &std::rc::Rc<LeaseOwner>) {
     // The owner reference pins this box in either a live scope or the deferred table.
+    owner.permanent.set(true);
     unsafe { &mut *owner.region }.published = true;
     let deferred = LEASED_REGIONS.with(|slot| slot.borrow_mut().remove(&owner.id));
     if let Some(region) = deferred {
@@ -1421,6 +1576,35 @@ mod lease_tests {
             self.0.set(self.0.get() + 1);
         }
     }
+    #[test]
+    fn mutually_dependent_closed_scopes_live_until_the_last_external_lease() {
+        struct Edge(crate::GcPtr<Probe>);
+        impl crate::Trace for Edge {
+            fn trace(&self, visitor: &mut crate::MarkVisitor) {
+                use crate::GcVisitor;
+                visitor.visit(&self.0);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let a = crate::alloc_ctx::ScratchGuard::new();
+        let value_a = crate::GcPtr::new(Probe(drops.clone()));
+        let owner_a = AllocationOwner::current();
+        let lease_a = RegionLease::capture_active();
+        drop(a);
+        let b = crate::alloc_ctx::ScratchGuard::new();
+        let value_b = crate::GcPtr::new(Probe(drops.clone()));
+        let owner_b = AllocationOwner::current();
+        let lease_b = RegionLease::capture_active();
+        drop(b);
+        owner_a.protect(&Edge(value_b.clone()));
+        owner_b.protect(&Edge(value_a.clone()));
+        drop(lease_a);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(value_a.get().0.get(), 0);
+        drop(lease_b);
+        assert_eq!(drops.get(), 2);
+    }
+
     #[test]
     fn allocation_guard_pins_a_closed_destination_and_its_later_chunks() {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));

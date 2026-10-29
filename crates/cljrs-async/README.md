@@ -339,6 +339,17 @@ pub mod isolate {
         where
             F: FnOnce() -> Fut + Send + 'static,
             Fut: Future<Output = ()> + 'static;
+
+        /// Return root evaluation errors through the join result.
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn spawn_root<F>(self, body: F) -> std::thread::JoinHandle<Result<(), RootError>>
+        where
+            F: FnOnce() -> EvalResult + Send + 'static;
+    }
+    pub enum RootError {
+        GasExhausted,
+        MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+        Evaluation(String),
     }
 }
 
@@ -594,3 +605,12 @@ Settled futures and futures produced by another OS thread retain normal blocking
 `fiber::run_root_owned(rt, local, body)` owns one executor drive and destroys its local tasks with the carrier state installed.
 `fiber::drop_local_with_carrier(local, carrier)` provides the same teardown for executors retained between root drives.
 Both helpers restore caller state if task destruction unwinds.
+
+`Isolate::spawn_root` returns `JoinHandle<Result<(), RootError>>`.
+Root errors remain ordinary results. `RootError` preserves typed gas and memory-limit details and carries diagnostic text for other errors.
+Managed Values remain on their isolate thread. An OS-thread panic still appears in the outer join result.
+
+`CljChannel::take_result()` preserves resource-limit failures from a thread producer.
+Clojure blocking takes, future takes, polls, and channel alternatives propagate those failures without making them catchable.
+Ordinary thread-body throws are reported and close the result channel.
+Channels publish values only after a put commits. Failed offers and losing or cancelled alternatives do not publish their candidates.

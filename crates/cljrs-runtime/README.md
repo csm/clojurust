@@ -1745,3 +1745,6 @@ In `no-gc` builds, dynamic binding frames record their allocation destination.
 A `set!` update retains its backing scopes for that frame's lifetime.
 Values written by nested calls remain valid after those calls release their scratch storage.
 Object-array writes use the destination ownership barrier before storing an element.
+
+No-gc results and dynamic-binding writes copy proven finite immutable data when their destination has program lifetime.
+Regional destinations retain backing scopes through ownership edges. Pending sequences and mutable identities preserve their original objects.

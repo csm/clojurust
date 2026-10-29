@@ -2375,6 +2375,9 @@ fn run() -> cljrs_runtime::env::error::EvalResult {{
     if let Some(error) = cljrs_compiler::rt_abi::take_pending_resource_error() {{
         return Err(cljrs_runtime::env::error::value_error_to_eval_error(error));
     }}
+    if let Some(thrown) = cljrs_compiler::rt_abi::take_pending_exception_value() {{
+        return Err(cljrs_runtime::env::error::EvalError::Thrown(thrown));
+    }}
     // A memory-limit fault raised in compiled code (strict mode) that no
     // later collection cleared ends the program like an interpreter error.
     if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{

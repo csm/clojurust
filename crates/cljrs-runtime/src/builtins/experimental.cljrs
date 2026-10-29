@@ -1,6 +1,5 @@
-;; cljrs.core.experimental — APIs that exist for integrators but cannot honour
-;; the contract their Clojure namesakes carry, and so are kept out of
-;; clojure.core.
+;; cljrs.core.experimental — compatibility spellings for APIs now available
+;; in clojure.core.
 ;;
 ;; Nothing here is referred into `user`; reach it with an explicit
 ;; (require '[cljrs.core.experimental :as x]).

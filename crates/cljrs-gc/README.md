@@ -41,7 +41,8 @@ on every dereference; `GcPtr::is_region_alloc()` exposes it.
 The evaluator transfers ownership of returned backing scopes into the caller before the scratch guard exits.
 Unused intermediates are freed when their scope exits.
 Static expressions use the global `StaticArena` and live for the program lifetime.
-Publication traces backing scopes without evaluating lazy sequences or copying values.
+Region-local publication transfers backing scopes without evaluating lazy sequences.
+Static publication copies proven finite immutable data and retains opaque backing scopes.
 There is no `GcHeap` or stop-the-world collection.
 
 An isolated invocation can instead install `alloc_ctx::InvocationGuard`. In
@@ -736,7 +737,8 @@ No-gc task captures use `region::RegionLease::capture_active() -> RegionLease`.
 `RegionLease::enter() -> LeaseScope` conveys leases into nested tasks for one poll
 or fiber execution. Completion and cancellation release these leases.
 Closed regions remain in a deferred registry only while a task can use them.
-The last lease frees their storage and releases the governor charge.
+The last external lease permits storage reclamation and releases the governor charge.
+Weak dependency edges let mutually dependent closed scopes be reclaimed together.
 `ScratchGuard` keeps each scope discoverable through result ownership transfer.
 
 No-gc publication preserves value identity and laziness. `retain_regions_for(value: &impl Trace)`
@@ -745,11 +747,14 @@ retains only actual backing scopes for program-lifetime destinations.
 `RegionLease::protect_current()` transfers their ownership into the current destination scope.
 `AllocationOwner::current()` and `for_address(address)` return weak destination handles.
 Their `protect(value)` method keeps source scopes alive for that destination's lifetime.
+`AllocationOwner::is_permanent()` identifies a static or permanently retained destination.
 `AllocationSnapshot::capture()` retains a task's allocation destination.
 Its `enter()` method installs that destination until the returned `alloc_ctx::ContextGuard` drops.
 Its `protect(value)` method transfers result ownership into the captured destination.
 Ordinary scratch scopes create no lease metadata until sharing occurs.
-The address index and deferred-region map avoid full scans when a lease drops.
+The address index and incoming ownership edges limit cleanup to affected scopes.
+Live callers stop traversal. Task polls do not scan unrelated deferred scopes.
+`alloc_ctx::is_static_context()` identifies a program-lifetime allocation destination.
 Bounded isolated allocation invocations retain their original lifetime rules.
 
 `static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available

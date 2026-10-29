@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
-use cljrs_runtime::env::error::EvalResult;
+use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::interp::destructure::value_to_seq_vec;
 use cljrs_value::{
     Arity, NativeFn, NativeObjectBox, PersistentVector, Value, ValueError, ValueResult,
@@ -98,15 +98,15 @@ fn builtin_alts(args: &[Value]) -> ValueResult<Value> {
         Some(v) => value_to_seq_vec(v)?,
         None => Vec::new(),
     };
-    Ok(spawn_future(async move { Ok(alts_select(futures).await) }))
+    Ok(spawn_future(async move { alts_select(futures).await }))
 }
 
 /// Await all `futures` concurrently; return `[value index]` of the first to
 /// complete. An empty input resolves to `nil`. A future that completes with an
-/// error contributes `nil` as its value.
-async fn alts_select(futures: Vec<Value>) -> Value {
+/// ordinary error contributes `nil`; resource-limit errors propagate.
+async fn alts_select(futures: Vec<Value>) -> EvalResult {
     if futures.is_empty() {
-        return Value::Nil;
+        return Ok(Value::Nil);
     }
     let branches: Vec<AltBranch> = futures
         .into_iter()
@@ -119,11 +119,16 @@ async fn alts_select(futures: Vec<Value>) -> Value {
         })
         .collect();
     let ((result, idx), _, _) = futures_util::future::select_all(branches).await;
-    let value = result.unwrap_or(Value::Nil);
-    Value::Vector(GcPtr::new(PersistentVector::from_iter([
+    let value = match result {
+        Err(error @ (EvalError::GasExhausted | EvalError::MemoryLimitExceeded(_))) => {
+            return Err(error);
+        }
+        other => other.unwrap_or(Value::Nil),
+    };
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
         value,
         Value::Long(idx as i64),
-    ])))
+    ]))))
 }
 
 // ── Channels ────────────────────────────────────────────────────────────────
@@ -175,9 +180,12 @@ fn builtin_chan(args: &[Value]) -> ValueResult<Value> {
 /// event-driven notification rather than busy-polling.
 fn builtin_take(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(spawn_future(
-        async move { Ok(chan_ref(ch.get()).take().await) },
-    ))
+    Ok(spawn_future(async move {
+        chan_ref(ch.get())
+            .take_result()
+            .await
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+    }))
 }
 
 /// `(put! ch val)` — a Future that resolves `true` once `val` is delivered (for
@@ -202,7 +210,12 @@ fn builtin_close(args: &[Value]) -> ValueResult<Value> {
 /// channel is empty or closed. Never parks.
 fn builtin_poll(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(chan_ref(ch.get()).try_take().unwrap_or(Value::Nil))
+    let channel = chan_ref(ch.get());
+    let value = channel.try_take().unwrap_or(Value::Nil);
+    if let Some(error) = channel.failure() {
+        return Err(error);
+    }
+    Ok(value)
 }
 
 /// `(offer! ch val)` — non-blocking put. Returns `true` if `val` was buffered
@@ -235,7 +248,7 @@ fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
         ));
     }
     let ch = channel_arg(args)?;
-    Ok(chan_ref(ch.get()).take_blocking())
+    cljrs_value::parking::block_on(chan_ref(ch.get()).take_result())
 }
 
 /// `(>!! ch val)` — blocking put from a synchronous (non-async) context.
@@ -331,6 +344,14 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
                 chan_ref(result_ch.get()).try_put_buffered(&value);
             }
             Ok(_) => {}
+            Err(error @ EvalError::GasExhausted) => {
+                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);
+                return Err(error);
+            }
+            Err(EvalError::MemoryLimitExceeded(fault)) => {
+                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Memory(fault));
+                return Err(EvalError::MemoryLimitExceeded(fault));
+            }
             Err(error) => eprintln!("[clojurust thread error] {error}"),
         }
         chan_ref(result_ch.get()).close();
@@ -618,6 +639,12 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
         })
         .collect();
     let (value, index) = cljrs_value::parking::block_on(crate::channel::select(ops, default));
+    if index != usize::MAX
+        && requests[index].1.is_none()
+        && let Some(error) = chan_ref(requests[index].0.get()).failure()
+    {
+        return Err(error);
+    }
     let channel = if index == usize::MAX {
         Value::keyword(cljrs_value::Keyword::simple("default"))
     } else {

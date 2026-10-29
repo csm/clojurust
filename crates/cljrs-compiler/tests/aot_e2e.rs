@@ -3019,6 +3019,10 @@ fn aot_root_fiber_supports_blocking_surface() {
                     (catch Exception e (:x (ex-data e)))))
       (println (try (try (throw (ex-info "original" {})) (finally nil))
                     (catch Exception e :rethrow)))
+      (def counter (atom 0))
+      (println (try (swap! counter (fn [_] (throw (ex-info "swap failure" {}))))
+                    (catch Exception e :swap-caught)))
+      (println (try (apply (fn [x] x) []) (catch Exception e :apply-caught)))
       (defn -main []
         (println (binding [*x* :conveyed] @(future *x*))))
     "#,
@@ -3028,6 +3032,8 @@ fn aot_root_fiber_supports_blocking_surface() {
     assert!(stdout.contains(":conveyed"), "{stdout}");
     assert!(stdout.contains(":caught"), "{stdout}");
     assert!(stdout.contains(":rethrow"), "{stdout}");
+    assert!(stdout.contains(":swap-caught"), "{stdout}");
+    assert!(stdout.contains(":apply-caught"), "{stdout}");
 }
 
 #[test]
@@ -3127,5 +3133,44 @@ pub extern "C" fn gas_init(_registry: *mut cljrs_interop::Registry) {
     assert!(stderr.contains("gas exhausted"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("stack backtrace"), "{stderr}");
+    assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
+}
+
+#[test]
+fn aot_uncaught_top_level_throw_stops_before_main() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("throw.cljrs");
+    let binary = dir.path().join("throw-bin");
+    let stats = dir.path().join("stats.txt");
+    std::fs::write(
+        &source,
+        r#"
+      (defn -main [] (println :main-must-not-run))
+      (throw (ex-info "top-level boom" {:reason :review}))
+    "#,
+    )
+    .unwrap();
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || cljrs_compiler::aot::compile_file(&source, &binary, &common::session(vec![]))
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let output = Command::new(binary)
+        .env("CLJRS_GC_STATS", &stats)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("top-level boom"), "{stderr}");
+    assert!(!stdout.contains(":main-must-not-run"), "{stdout}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
 }

@@ -94,7 +94,8 @@ impl AsyncRuntime for AsyncRuntimeImpl {
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
-        Ok(ch.take_blocking())
+        cljrs_value::parking::block_on(ch.take_result())
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
     }
 
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()> {

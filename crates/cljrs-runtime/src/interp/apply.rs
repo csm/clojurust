@@ -761,18 +761,19 @@ fn eval_body_with_scratch(
         }
     }
     scratch.pop_for_return();
-    match &result {
-        Ok(value) | Err(EvalError::Thrown(value)) => {
-            cljrs_gc::region::RegionLease::for_value(value).protect_current()
-        }
-        Err(EvalError::Recur(values)) => {
-            for value in values {
-                cljrs_gc::region::RegionLease::for_value(value).protect_current();
-            }
-        }
-        _ => {}
+    match result {
+        Ok(value) => Ok(cljrs_value::publish::publish_return(value)),
+        Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
+            cljrs_value::publish::publish_return(value),
+        )),
+        Err(EvalError::Recur(values)) => Err(EvalError::Recur(
+            values
+                .into_iter()
+                .map(cljrs_value::publish::publish_return)
+                .collect(),
+        )),
+        other => other,
     }
-    result
 }
 
 /// Select the matching arity for the given argument count.

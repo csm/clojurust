@@ -526,7 +526,7 @@ impl Atom {
         // Heap-promotion fallback (GC builds): an atom is program-lifetime
         // shared state, so its initial value must not be region-allocated.
         #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&v).protect_current();
+        let v = crate::publish::publish_return(v);
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
@@ -787,8 +787,9 @@ impl NativeFn {
     }
 
     /// Create a callable with explicit managed captures for precise tracing.
-    /// The closure receives the traced capture slice, avoiding a second opaque
-    /// copy that could disagree with the declared roots.
+    /// The callback receives an immutable snapshot of the declared captures.
+    /// The closure holds a shallow copy of the same Values; callers must not
+    /// change the public `captures` vector after construction.
     pub fn with_captures(
         name: impl Into<Arc<str>>,
         arity: Arity,
@@ -1226,7 +1227,7 @@ impl Volatile {
     pub fn new(v: Value) -> Self {
         // GC builds: heap-promotion fallback (see `Var::bind`).
         #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&v).protect_current();
+        let v = crate::publish::publish_return(v);
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {

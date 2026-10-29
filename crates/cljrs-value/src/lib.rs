@@ -8,7 +8,6 @@ pub mod jit_hooks;
 pub mod keyword;
 pub mod native_object;
 pub mod parking;
-#[cfg(not(feature = "no-gc"))]
 pub mod publish;
 pub mod realization;
 pub mod regex;
@@ -18,23 +17,6 @@ pub mod symbol;
 pub mod type_hint;
 pub mod types;
 pub mod value;
-
-/// No-gc publication traces backing scopes without evaluating user code.
-#[cfg(feature = "no-gc")]
-pub mod publish {
-    pub fn publish_value(value: crate::Value) -> crate::Value {
-        if !cljrs_gc::alloc_ctx::invocation_is_active() {
-            cljrs_gc::retain_regions_for(&value);
-        }
-        value
-    }
-    pub fn publish_for_owner(value: crate::Value, address: usize) -> crate::Value {
-        if !cljrs_gc::alloc_ctx::invocation_is_active() {
-            cljrs_gc::region::AllocationOwner::for_address(address).protect(&value);
-        }
-        value
-    }
-}
 
 pub use collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
@@ -70,6 +52,37 @@ mod publication_review_tests {
             self.0.set(true);
         }
     }
+    #[test]
+    fn static_publication_copies_finite_data_and_releases_temporary_storage() {
+        let atom = cljrs_gc::GcPtr::new(Atom::new(Value::Nil));
+        // A captured allocation destination can itself have been published.
+        let permanent = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let identity = Value::ObjectArray(cljrs_gc::GcPtr::new(ObjectArray(
+            std::sync::Mutex::new(vec![]),
+        )));
+        publish::publish_value(identity);
+        assert!(cljrs_gc::alloc_ctx::is_static_context());
+        for _ in 0..100 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let mut scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let _temporary = cljrs_gc::GcPtr::new(Probe(dropped.clone()));
+            let value = Value::Vector(cljrs_gc::GcPtr::new(PersistentVector::from_iter([
+                Value::Str(cljrs_gc::GcPtr::new("published".to_string())),
+            ])));
+            atom.get().reset(value.clone());
+            scope.pop_for_return();
+            let returned = publish::publish_return(value);
+            drop(scope);
+            assert!(
+                dropped.get(),
+                "a static publication retained unrelated temporaries"
+            );
+            assert_eq!(returned.to_string(), "[\"published\"]");
+            assert_eq!(atom.get().deref().to_string(), "[\"published\"]");
+        }
+        drop(permanent);
+    }
+
     #[test]
     fn opaque_publication_preserves_identity_and_releases_unrelated_scopes() {
         let dropped = std::rc::Rc::new(std::cell::Cell::new(false));

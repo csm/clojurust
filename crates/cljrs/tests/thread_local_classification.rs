@@ -59,6 +59,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/region.rs",
+        "LEASE_SWEEPING",
+        Thread("isolate-local region ownership sweep guard"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
         "LEASED_REGIONS",
         Thread("closed no-gc scopes retained by tasks or destination ownership"),
     ),

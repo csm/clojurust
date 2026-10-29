@@ -25,8 +25,10 @@
 //! when no region is active, which is the case for virtually every top-level
 //! `def`.
 //!
-//! Only compiled in GC builds; the `no-gc` build keeps its `StaticCtxGuard`
-//! discipline (and debug provenance assertions) instead.
+//! In no-gc builds, finite immutable graphs are copied into static storage at
+//! program-lifetime boundaries. Pending sequences and mutable identities never
+//! enter serialization. They retain their actual backing scopes instead.
+//! Region-local destinations transfer ownership without copying.
 
 use crate::Value;
 use crate::clone::{deserialize, serialize};
@@ -58,16 +60,22 @@ impl Scan {
 
 /// Tag check for one box.
 fn tag<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
-    if p.is_region_alloc() {
-        Scan::Dirty
-    } else {
-        Scan::Clean
-    }
+    #[cfg(feature = "no-gc")]
+    let dirty = !cljrs_gc::static_arena::is_static_addr(p.get() as *const T as usize);
+    #[cfg(not(feature = "no-gc"))]
+    let dirty = p.is_region_alloc();
+    if dirty { Scan::Dirty } else { Scan::Clean }
 }
 
 /// Like [`tag`] but for boxes whose pointee cannot be deep-copied (mutable
 /// identity, closures, native state): a region-tagged box is unrecoverable.
 fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = p;
+        Scan::Opaque
+    }
+    #[cfg(not(feature = "no-gc"))]
     if p.is_region_alloc() {
         Scan::Opaque
     } else {
@@ -97,6 +105,22 @@ fn scan_map(m: &MapValue) -> Scan {
 /// captured environments are invisible here.
 fn scan(v: &Value) -> Scan {
     use Scan::*;
+    // Mutable identities and unrealized sequences never enter serialization.
+    #[cfg(feature = "no-gc")]
+    if matches!(
+        v,
+        Value::ObjectArray(_)
+            | Value::IntArray(_)
+            | Value::LongArray(_)
+            | Value::ShortArray(_)
+            | Value::ByteArray(_)
+            | Value::FloatArray(_)
+            | Value::DoubleArray(_)
+            | Value::BooleanArray(_)
+            | Value::CharArray(_)
+    ) {
+        return Opaque;
+    }
     match v {
         // Immediates and Arc-backed values: nothing region-allocated.
         Value::Nil
@@ -154,7 +178,13 @@ fn scan(v: &Value) -> Scan {
         Value::Reduced(inner) => scan(inner),
 
         // Records.
-        Value::TypeInstance(p) => tag(p).join(scan_map(&p.get().fields)),
+        Value::TypeInstance(p) => {
+            if p.get().mutable.is_some() {
+                Opaque
+            } else {
+                tag(p).join(scan_map(&p.get().fields))
+            }
+        }
 
         // Errors: box tag plus the data map / cause chain / thrown value.
         Value::Error(p) => {
@@ -240,6 +270,7 @@ fn scan(v: &Value) -> Scan {
 /// active regions when the value is opaque to the scan.
 ///
 /// Returns the value to store (the original, or its heap-promoted copy).
+#[cfg(not(feature = "no-gc"))]
 pub fn publish_value(v: Value) -> Value {
     // Fast path: no region open on this thread ⇒ nothing reachable from `v`
     // can be region-allocated (region values never outlive their region
@@ -271,13 +302,60 @@ pub fn publish_value(v: Value) -> Value {
 }
 
 /// GC publication uses the same promotion barrier for every destination.
+#[cfg(not(feature = "no-gc"))]
 pub fn publish_for_owner(value: Value, _address: usize) -> Value {
     publish_value(value)
 }
 
+/// Copy proven finite immutable data into static storage. Opaque values retain
+/// identity and laziness by leasing only their actual backing scopes.
+#[cfg(feature = "no-gc")]
+pub fn publish_value(value: Value) -> Value {
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return value;
+    }
+    match scan(&value) {
+        Scan::Clean => return value,
+        Scan::Dirty => {
+            if let Ok(wire) = serialize(&value) {
+                let _static_scope = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+                return deserialize(wire);
+            }
+        }
+        Scan::Opaque => {}
+    }
+    cljrs_gc::retain_regions_for(&value);
+    value
+}
+
+#[cfg(feature = "no-gc")]
+pub fn publish_for_owner(value: Value, address: usize) -> Value {
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return value;
+    }
+    let owner = cljrs_gc::region::AllocationOwner::for_address(address);
+    if owner.is_permanent() {
+        publish_value(value)
+    } else {
+        owner.protect(&value);
+        value
+    }
+}
+
+/// Transfer a result into its caller without retaining unrelated scratch data.
+#[cfg(feature = "no-gc")]
+pub fn publish_return(value: Value) -> Value {
+    if cljrs_gc::alloc_ctx::is_static_context() {
+        publish_value(value)
+    } else {
+        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+        value
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 mod tests {
     use super::*;
     use crate::PersistentVector;

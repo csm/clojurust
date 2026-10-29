@@ -303,6 +303,7 @@ fn deref_of_future_in_sync_context_still_works() {
             Ok(Value::Nil)
         })
         .join()
+        .unwrap()
         .unwrap();
 }
 

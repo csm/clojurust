@@ -268,24 +268,9 @@ pub(crate) fn live_regions() -> Vec<*mut Region> {
             .collect()
     })
 }
-pub(crate) fn ancestor_ids(target: *mut Region) -> Vec<u64> {
-    ALLOC_CTX.with(|ctx| {
-        ctx.borrow()
-            .iter()
-            .take_while(|entry| match entry {
-                AllocCtx::Region(ptr) | AllocCtx::Inactive(ptr) | AllocCtx::Invocation(ptr) => {
-                    *ptr != target
-                }
-                _ => true,
-            })
-            .filter_map(|entry| match entry {
-                AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr) => {
-                    Some(unsafe { &**ptr }.scope_id())
-                }
-                _ => None,
-            })
-            .collect()
-    })
+/// True when allocations have program lifetime rather than a scratch destination.
+pub fn is_static_context() -> bool {
+    !invocation_is_active() && current_region().is_none_or(|ptr| unsafe { &*ptr }.is_permanent())
 }
 
 // ── StaticCtxGuard ────────────────────────────────────────────────────────────

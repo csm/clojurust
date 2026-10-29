@@ -123,7 +123,12 @@ pub fn set_thread_local(var: &GcPtr<Var>, val: Value) -> bool {
         if let Some((index, owner)) = target {
             // The binding frame can outlive this function's scratch scope.
             // Trace outside the stack borrow; values can contain bound functions.
-            owner.protect(&val);
+            let val = if owner.is_permanent() {
+                cljrs_value::publish::publish_value(val)
+            } else {
+                owner.protect(&val);
+                val
+            };
             BINDING_STACK.with(|stack| {
                 stack.borrow_mut()[index].values.insert(key, val);
             });

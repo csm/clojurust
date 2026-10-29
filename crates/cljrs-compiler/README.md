@@ -808,3 +808,7 @@ Generated native harnesses return resource-limit errors through the root fiber.
 They print the error and exit with status 1 after context cleanup and GC-statistics output.
 The compiled `try` bridge preserves resource errors across catch and finally clauses.
 A finally-only clause rethrows the original exception after successful cleanup.
+
+All callback bridges, including compiled `swap!`, fused collection operations, `apply`, bindings, and output capture, preserve callback failures.
+`rt_abi::take_pending_exception_value()` consumes an ordinary pending throw while its native allocation roots remain live.
+Generated program entries consume both ordinary exceptions and resource errors before calling `-main`.
