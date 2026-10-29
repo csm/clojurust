@@ -198,7 +198,8 @@ fn sq_seq(
             FormKind::UnquoteSplice(inner) => {
                 // ~@expr: evaluate and spread.
                 let v = crate::interp::eval::eval(inner, env)?;
-                let items = crate::interp::destructure::value_to_seq_vec(&v);
+                let items = crate::interp::destructure::value_to_seq_vec(&v)
+                    .map_err(crate::env::error::value_error_to_eval_error)?;
                 out.push(Segment::Many(items));
             }
             _ => {

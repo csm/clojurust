@@ -4,7 +4,7 @@ use crate::builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{Keyword, PersistentList, Symbol, Value};
+use cljrs_value::{Keyword, PersistentList, Symbol, Value, ValueError, ValueResult};
 use std::sync::Arc;
 
 use crate::env::env::Env;
@@ -41,7 +41,7 @@ pub fn bind_pattern(pattern: &Form, val: Value, env: &mut Env) -> EvalResult<()>
 /// [sym* (& rest)? (:as alias)?]
 /// ```
 pub fn bind_sequential(pattern: &[Form], val: &Value, env: &mut Env) -> EvalResult<()> {
-    let items = value_to_seq_vec(val);
+    let items = value_to_seq_vec(val).map_err(crate::env::error::value_error_to_eval_error)?;
     let mut idx = 0usize;
     let mut i = 0usize;
 
@@ -98,46 +98,44 @@ pub fn bind_sequential(pattern: &[Form], val: &Value, env: &mut Env) -> EvalResu
     Ok(())
 }
 
-/// Convert any sequential Value to a Vec of its elements.
-pub fn value_to_seq_vec(val: &Value) -> Vec<Value> {
-    match val {
-        Value::WithMeta(inner, _) => value_to_seq_vec(inner),
-        Value::Nil => vec![],
-        Value::LazySeq(ls) => value_to_seq_vec(&ls.get().realize()),
-        Value::Cons(c) => {
-            let mut result = vec![c.get().head.clone()];
-            let mut tail = c.get().tail.clone();
-            loop {
-                match tail {
-                    Value::Nil => break,
-                    Value::List(l) => {
-                        result.extend(l.get().iter().cloned());
-                        break;
-                    }
-                    Value::Cons(next_c) => {
-                        result.push(next_c.get().head.clone());
-                        tail = next_c.get().tail.clone();
-                    }
-                    Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
-                    }
-                    _ => break,
-                }
+/// Convert a seqable Value to its elements, propagating lazy realization errors.
+/// Non-seqable values retain the historical empty-vector result.
+pub fn value_to_seq_vec(val: &Value) -> ValueResult<Vec<Value>> {
+    // Realization can park or collect. The original chain retains both the
+    // accumulated elements and each thunk's cached result throughout the walk.
+    let _root = crate::env::gc_roots::root_value(val);
+    let mut result = Vec::new();
+    let mut current = val.clone();
+    loop {
+        match current.unwrap_meta() {
+            Value::Nil => break,
+            Value::LazySeq(ls) => {
+                current = ls.get().try_realize().map_err(ValueError::Other)?;
             }
-            result
+            Value::Cons(c) => {
+                result.push(c.get().head.clone());
+                current = c.get().tail.clone();
+            }
+            Value::List(l) => {
+                result.extend(l.get().iter().cloned());
+                break;
+            }
+            Value::Vector(v) => {
+                result.extend(v.get().iter().cloned());
+                break;
+            }
+            Value::Set(s) => {
+                result.extend(s.iter().cloned());
+                break;
+            }
+            Value::Map(m) => {
+                m.for_each(|k, v| result.push(Value::map_entry(k.clone(), v.clone())));
+                break;
+            }
+            _ => break,
         }
-        Value::List(l) => l.get().iter().cloned().collect(),
-        Value::Vector(v) => v.get().iter().cloned().collect(),
-        Value::Set(s) => s.iter().cloned().collect(),
-        Value::Map(m) => {
-            let mut result = Vec::new();
-            m.for_each(|k, v| {
-                result.push(Value::map_entry(k.clone(), v.clone()));
-            });
-            result
-        }
-        _ => vec![],
     }
+    Ok(result)
 }
 
 // ── Associative destructuring ─────────────────────────────────────────────────

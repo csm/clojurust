@@ -13,6 +13,8 @@
 //! - **`#[export]`** — proc-macro for automatic function registration
 //! - **`register_exports`** — register all `#[export]`-annotated functions at once
 
+#[doc(hidden)]
+pub mod blocking;
 pub mod error;
 pub mod exports;
 pub mod marshal;

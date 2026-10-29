@@ -211,6 +211,7 @@ impl Fiber {
         task.state.swap_with_current();
         task.co = Some(Coroutine::with_stack(stack, move |yielder, ()| {
             CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
+            let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
             body()
         }));
         Ok(Self { task })

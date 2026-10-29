@@ -1138,6 +1138,12 @@ anyway would evaluate each `:or` default twice per call — destructuring defaul
 are eager, so a side-effecting one would fire once here and once in the prologue
 (issue #363).
 
+`interp::destructure::value_to_seq_vec(&Value) -> ValueResult<Vec<Value>>`
+converts a seqable value to its elements. It roots the source during realization
+and propagates lazy thunk errors, including rejected carrier waits on parked fibers.
+Non-seqable values return an empty vector. Destructuring and sequence consumers
+propagate these errors to their evaluator.
+
 ### Value-level special form helpers (IR interpreter API)
 
 The IR interpreter receives already-evaluated `Vec<Value>` arguments rather than
@@ -1716,3 +1722,44 @@ The callback retains the monitor through parks and releases it on return, error,
 `deref`, synchronous `await`, `sleep`, `Thread/sleep`, `slurp`, and `spit` use the optional parking hooks.
 Sequence builtins and macro conversion use `LazySeq::try_realize` to report realization errors without caching carrier wait errors.
 Root entry points do not yet create fibers. Those entry points remain Phase 3 work.
+
+`env::monitor::monitor_enter(&Value) -> ValueResult<()>` acquires an explicit monitor.
+`env::monitor::monitor_exit(&Value) -> ValueResult<()>` releases one explicit acquisition.
+The Clojure functions are `monitor-enter` and `monitor-exit`.
+An exit without an explicit acquisition in the current computation returns an error.
+The per-fiber `HELD_MONITORS` slot traces retained objects.
+`env::monitor::MonitorCleanup` releases unmatched acquisitions on drop.
+Native fibers install this cleanup guard, including during cancellation.
+Synchronous callers outside fibers must pair explicit acquisitions with `monitor-exit` or install a `MonitorCleanup` guard.
+Legacy async tasks cannot retain explicit monitors because those tasks share the root mutator.
+`env::monitor::AsyncMonitorScope::enter() -> AsyncMonitorScope` marks each poll of these tasks.
+Its drop restores the caller's state. Explicit monitor calls from synchronous helpers also reject this task context.
+
+Evaluation and function boundaries convert trait realization failures to catchable Clojure errors.
+The IR interpreter installs one boundary per function execution.
+Atoms and identifier lookups need no realization boundary.
+Lexical scope guards remove `let` and `loop` frames on errors and unwinds.
+Native callback guards restore the eval context on unwinds.
+
+Multimethod dispatch borrows registry tables for scalar dispatch values and scalar hierarchy tags.
+Other values use traced snapshots and release registry locks before equality or formatting can run user code.
+
+## Restricted native blocking form
+
+`(blocking & calls)` and `cljrs.fiber/blocking` expand each call into `clojure.core/blocking-call`.
+`blocking-call` accepts a native function and its evaluated arguments.
+It roots the function and arguments, then calls `NativeFn::call_blocking`.
+Unsupported functions return an error before their native body runs.
+The form returns the last result, or nil for no calls.
+
+```clojure
+(require '[cljrs.fiber :as fiber])
+(let [path "data.edn"]
+  (fiber/blocking (host/read-text path)))
+```
+
+`host/read-text` must provide a typed native adapter, such as a fixed-arity `#[export]` function.
+Arguments can contain ordinary Clojure expressions. Their evaluation and conversion stay on the isolate.
+Native inputs and outputs must implement `Send + 'static`.
+Clojure closures and native functions without an adapter are rejected.
+A native fiber parks during worker execution. Outside a fiber, the call runs synchronously.

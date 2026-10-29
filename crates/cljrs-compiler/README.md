@@ -198,6 +198,13 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Comparison:** `rt_eq`, `rt_case_eq` (type-strict equality for `case` dispatch — `Long`/`BigInt` interchangeable, mixed numerics never equal), `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Primitive arrays:** `rt_alength(arr) -> i64`, `rt_aget_long(arr, i) -> i64`, `rt_aget_double(arr, i) -> f64` (unboxed element loads), `rt_aset_long`/`rt_aset_double` (unboxed stores), `rt_aget`/`rt_aset` (boxed fallback for unknown element types) — all bounds-checked, throwing on out-of-range / type mismatch
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest` (both seq any value — vector/list/cons fast paths, plus string/map/set/lazy-seq via `seq`; `rt_first`/`rt_nth`/`rt_peek` return an *interior pointer* into vector storage, so escape analysis treats them as aliasing arg 0), `rt_next` (`seq`-of-`rest`: returns `nil` when exhausted, unlike `rt_rest`), `rt_assoc`, `rt_conj`
+- **Lazy realization errors:** `rt_count`, `rt_first`, `rt_rest`, `rt_apply`,
+  `rt_into_map`, and `rt_kwargs_map` propagate realization errors through the
+  pending-exception slot. A rejected carrier wait preserves the pending thunk.
+  Every boxed ABI bridge uses `#[catch_realization(throw_str)]` to contain
+  realization failures from equality, hashing, and formatting.
+  ABI subprocess tests cover parked realizers. An AOT test covers catchable
+  realization errors in a compiled binary.
 - **Keyword arguments:** `rt_kwargs_map(rest) -> *const Value` — the compiled tiers' half of `KnownFn::KwargsMap`, normalizing a variadic rest seq into the value a map-shaped rest pattern (`[& {:keys [a b]}]`) destructures against. Delegates to `Value::from_kwargs_rest`, the one definition every tier shares (issue #368). A lone trailing argument is returned as-is, so like `rt_first`/`rt_nth` its result can alias arg 0; a dangling key raises through the pending-exception slot rather than unwinding out of the `extern "C"` frame
 - **Scratch:** `rt_scratch_ptr(n_bytes: u32) -> *mut u8` — a thread-local, monotonically growing scratch buffer the wasm backend uses to marshal element-pointer arrays before the slice-taking `rt_alloc_*` bridges (the native backend uses an on-stack slot instead)
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
@@ -770,3 +777,11 @@ crate — a second direct dependency cannot undo a feature another edge enabled.
 | `cljrs-project` (workspace) | `config::RustConfig` — the user's `:rust` crate configuration, carried in `CompileSession` |
 | `cljrs-io`/`-net`/`-charset`/`-base64` | **dev-dependencies only** — extensions the end-to-end tests supply the way a host does |
 | `target-lexicon` (workspace) | Target triple detection |
+
+`tests/fiber_io.rs` uses FIFO gates to check isolate progress during file reads
+and process waits. A separate host thread releases each gate after the isolate makes progress.
+`rt_abi::tests::boxed_abi_bridges_have_realization_boundaries` audits boxed ABI entry points.
+
+`tests/blocking_form.rs` checks native call offload, rejection, errors, and cancellation in tree-walk and tiered modes.
+`tests/aot_native_init_e2e.rs` also compiles the core and namespaced `blocking` macros with typed native exports.
+Compiled Clojure closures have no blocking adapter and cannot move across the worker boundary.

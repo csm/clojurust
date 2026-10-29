@@ -204,6 +204,16 @@ impl RuntimeBuilder {
         // Re-refer clojure.core now that the bootstrap has defined its HOFs.
         globals.refer_core("user");
         globals.mark_loaded("clojure.core");
+        // The fiber namespace shares the restricted native blocking macro.
+        globals.get_or_create_ns("cljrs.fiber");
+        globals.intern(
+            "cljrs.fiber",
+            "blocking".into(),
+            globals
+                .lookup_in_ns("clojure.core", "blocking")
+                .expect("bootstrap blocking macro"),
+        );
+        globals.mark_loaded("cljrs.fiber");
 
         // Experimental namespace: natives first, then the Clojure source that
         // builds on them. Not referred into `user` — an explicit `require` is

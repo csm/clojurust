@@ -6,14 +6,20 @@
  * the same license as Clojure.
  */
 
+use super::Snapshot;
 use crate::hash::{hash_combine_ordered, hash_combine_unordered};
 use crate::{ClojureHash, PersistentHashMap, Value, ValueError, ValueResult};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 #[derive(Debug)]
 pub struct TransientMap {
     map: Mutex<PersistentHashMap>,
     persisted: Mutex<bool>,
+    revision: AtomicU64,
+    keys_may_realize: AtomicBool,
 }
 
 impl TransientMap {
@@ -21,6 +27,8 @@ impl TransientMap {
         TransientMap {
             map: Mutex::new(PersistentHashMap::empty()),
             persisted: Mutex::new(false),
+            revision: AtomicU64::new(0),
+            keys_may_realize: AtomicBool::new(false),
         }
     }
 
@@ -28,25 +36,66 @@ impl TransientMap {
         TransientMap {
             map: Mutex::new(map.clone()),
             persisted: Mutex::new(false),
+            revision: AtomicU64::new(0),
+            keys_may_realize: AtomicBool::new(
+                !(map.iter().all(|(key, _)| crate::realization::is_inert(key))),
+            ),
         }
     }
 
+    fn update(
+        &self,
+        key: &Value,
+        fast: impl FnOnce(&mut PersistentHashMap),
+        operation: impl Fn(&PersistentHashMap) -> PersistentHashMap,
+    ) -> ValueResult<()> {
+        {
+            let mut collection = self.map.lock().unwrap();
+            if *self.persisted.lock().unwrap() {
+                return Err(ValueError::TransientAlreadyPersisted);
+            }
+            if !self.keys_may_realize.load(Ordering::Relaxed) && crate::realization::is_inert(key) {
+                fast(&mut collection);
+                self.revision.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        loop {
+            let (snapshot, revision) = {
+                let map = self.map.lock().unwrap();
+                if *self.persisted.lock().unwrap() {
+                    return Err(ValueError::TransientAlreadyPersisted);
+                }
+                (
+                    Snapshot::new(map.clone()),
+                    self.revision.load(Ordering::Relaxed),
+                )
+            };
+            let candidate = operation(snapshot.get());
+            let mut map = self.map.lock().unwrap();
+            if *self.persisted.lock().unwrap() {
+                return Err(ValueError::TransientAlreadyPersisted);
+            }
+            if self.revision.load(Ordering::Relaxed) != revision {
+                continue;
+            }
+            *map = candidate;
+            if !crate::realization::is_inert(key) {
+                self.keys_may_realize.store(true, Ordering::Relaxed);
+            }
+            self.revision.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    }
     pub fn assoc(&self, key: Value, value: Value) -> ValueResult<()> {
-        if *self.persisted.lock().unwrap() {
-            return Err(ValueError::TransientAlreadyPersisted);
-        }
-        let mut map = self.map.lock().unwrap();
-        *map = map.assoc(key, value);
-        Ok(())
+        self.update(
+            &key,
+            |map| map.assoc_mut(key.clone(), value.clone()),
+            |map| map.assoc(key.clone(), value.clone()),
+        )
     }
-
     pub fn dissoc(&self, key: &Value) -> ValueResult<()> {
-        if *self.persisted.lock().unwrap() {
-            return Err(ValueError::TransientAlreadyPersisted);
-        }
-        let mut map = self.map.lock().unwrap();
-        *map = map.dissoc(key);
-        Ok(())
+        self.update(key, |map| map.dissoc_mut(key), |map| map.dissoc(key))
     }
 
     pub fn persistent(&self) -> ValueResult<PersistentHashMap> {
@@ -59,18 +108,25 @@ impl TransientMap {
         Ok(map.clone())
     }
 
-    pub fn find(&self, key: &Value) -> Option<(Value, Value)> {
+    fn lookup<T>(&self, key: &Value, operation: impl Fn(&PersistentHashMap) -> T) -> T {
         let map = self.map.lock().unwrap();
-        let value = map.get(key);
-        value.map(|v| (key.clone(), v.clone()))
+        if !self.keys_may_realize.load(Ordering::Relaxed) && crate::realization::is_inert(key) {
+            return operation(&map);
+        }
+        let snapshot = Snapshot::new(map.clone());
+        drop(map);
+        operation(snapshot.get())
     }
-
+    pub fn find(&self, key: &Value) -> Option<(Value, Value)> {
+        self.lookup(key, |map| {
+            map.get(key).map(|value| (key.clone(), value.clone()))
+        })
+    }
     pub fn get(&self, key: &Value) -> Option<Value> {
-        self.map.lock().unwrap().get(key).cloned()
+        self.lookup(key, |map| map.get(key).cloned())
     }
-
     pub fn contains_key(&self, key: &Value) -> bool {
-        self.map.lock().unwrap().contains_key(key)
+        self.lookup(key, |map| map.contains_key(key))
     }
 
     pub fn count(&self) -> usize {
@@ -84,6 +140,8 @@ impl Clone for TransientMap {
         Self {
             map: Mutex::new(self.map.lock().unwrap().clone()),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
+            revision: AtomicU64::new(0),
+            keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
 }
@@ -91,7 +149,8 @@ impl Clone for TransientMap {
 impl ClojureHash for TransientMap {
     fn clojure_hash(&self) -> u32 {
         let mut hash: u32 = 0;
-        for (k, v) in self.map.lock().unwrap().iter() {
+        let snapshot = Snapshot::new(self.map.lock().unwrap().clone());
+        for (k, v) in snapshot.get().iter() {
             hash = hash_combine_unordered(
                 hash,
                 hash_combine_ordered(k.clojure_hash(), v.clojure_hash()),

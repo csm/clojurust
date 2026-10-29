@@ -112,6 +112,16 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "STACK_POOL",
         Thread("bounded pool of unused stacks on this isolate"),
     ),
+    (
+        "cljrs-runtime/src/env/monitor.rs",
+        "HELD_MONITORS",
+        Fiber("cljrs-runtime/HELD_MONITORS"),
+    ),
+    (
+        "cljrs-value/src/collections/mod.rs",
+        "SNAPSHOT_ROOTS",
+        FiberWhen("cljrs-value/SNAPSHOT_ROOTS", !NO_GC),
+    ),
     // ── cljrs-runtime ───────────────────────────────────────────────────────
     (
         "cljrs-runtime/src/env/gc_roots.rs",

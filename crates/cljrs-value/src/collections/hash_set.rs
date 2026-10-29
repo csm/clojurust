@@ -73,6 +73,14 @@ impl PersistentHashSet {
         self
     }
 
+    pub(crate) fn disj_mut(&mut self, value: &Value) {
+        if let Some(seq) = self.index.get(value).copied() {
+            self.index.remove_mut(value);
+            self.order.remove_mut(&seq);
+            self.charge = ShareCharge::full();
+        }
+    }
+
     /// Return a new set with `val` removed.
     pub fn disj(&self, val: &Value) -> Self {
         match self.index.get(val) {

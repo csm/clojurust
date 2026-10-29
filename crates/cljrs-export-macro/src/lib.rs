@@ -226,16 +226,26 @@ fn build_fixed(
     let arg_idents: Vec<syn::Ident> = (0..n).map(|i| format_ident!("__a{i}")).collect();
     let param_tys: Vec<&Type> = params.iter().map(|pt| pt.ty.as_ref()).collect();
 
-    let call = quote! { #fn_ident(#(#arg_idents),*) };
+    let direct_call = quote! { #fn_ident(#(#arg_idents),*) };
     let call = if blocking {
-        quote! { ::cljrs_interop::blocking(move || #call) }
+        quote! { ::cljrs_interop::blocking(move || #direct_call) }
     } else {
-        call
+        direct_call.clone()
     };
     let result_expr = build_result_expr(call, ret)?;
+    let convert = match ret {
+        ReturnType::Default => quote! { |_| Ok(::cljrs_interop::Value::Nil) },
+        ReturnType::Type(_, ty) if is_unit_type(ty) => {
+            quote! { |_| Ok(::cljrs_interop::Value::Nil) }
+        }
+        _ => {
+            let converted = build_result_expr(quote! { __result }, ret)?;
+            quote! { |__result| { #converted } }
+        }
+    };
 
     Ok(quote! {
-        ::cljrs_interop::NativeFn::with_closure(
+        ::cljrs_interop::NativeFn::with_blocking(
             #qualified,
             ::cljrs_interop::Arity::Fixed(#n),
             move |args| {
@@ -244,7 +254,18 @@ fn build_fixed(
                         <#param_tys as ::cljrs_interop::FromValue>::from_value(&args[#indices])?;
                 )*
                 #result_expr
-            }
+            },
+            move |args| {
+                #(
+                    let #arg_idents =
+                        <#param_tys as ::cljrs_interop::FromValue>::from_value(&args[#indices])?;
+                )*
+                use ::cljrs_interop::blocking::BlockingDispatch as _;
+                let __call = ::cljrs_interop::blocking::BlockingCall::new(
+                    #qualified, (#(#arg_idents,)*), move |(#(#arg_idents,)*)| #direct_call, #convert,
+                );
+                (&__call).run_blocking()
+            },
         )
     })
 }
@@ -342,4 +363,20 @@ fn result_ok_type(ty: &Type) -> Option<&Type> {
 /// Returns true for the unit type `()`.
 fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// Catch lazy realization failures before an extern-C ABI boundary.
+/// The argument names a function that converts an error string to the ABI result.
+#[proc_macro_attribute]
+pub fn catch_realization(handler: TokenStream, item: TokenStream) -> TokenStream {
+    let handler = parse_macro_input!(handler as syn::Path);
+    let mut function = parse_macro_input!(item as ItemFn);
+    let body = function.block;
+    function.block = Box::new(syn::parse_quote!({
+        match cljrs_value::realization::catch(|| #body) {
+            Ok(value) => value,
+            Err(message) => #handler(message),
+        }
+    }));
+    quote!(#function).into()
 }

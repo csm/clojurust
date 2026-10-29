@@ -520,7 +520,8 @@ fn dispatch_seq_method(method: &str, target: &Value, args: &[Value]) -> EvalResu
             let needle = args
                 .first()
                 .ok_or_else(|| EvalError::Runtime(".indexOf requires an argument".into()))?;
-            let items = crate::interp::destructure::value_to_seq_vec(target);
+            let items = crate::interp::destructure::value_to_seq_vec(target)
+                .map_err(crate::env::error::value_error_to_eval_error)?;
             for (i, item) in items.iter().enumerate() {
                 if item == needle {
                     return Ok(Value::Long(i as i64));
@@ -647,7 +648,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
                         match rest_val {
                             Value::Nil => {} // no extra args
                             _ => {
-                                let rest_items = value_to_seq_vec(rest_val);
+                                let rest_items = value_to_seq_vec(rest_val)
+                                    .map_err(crate::env::error::value_error_to_eval_error)?;
                                 flat.extend(rest_items);
                             }
                         }
@@ -715,7 +717,8 @@ fn bind_fn_params_impl(
             // convert the rest args list into a map of alternating key-value pairs,
             // matching Clojure's keyword-arguments convention.
             let destructure_val = if pattern.is_kwargs_rest_pattern() {
-                let items = value_to_seq_vec(&rest_val);
+                let items = value_to_seq_vec(&rest_val)
+                    .map_err(crate::env::error::value_error_to_eval_error)?;
                 Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)?
             } else {
                 rest_val

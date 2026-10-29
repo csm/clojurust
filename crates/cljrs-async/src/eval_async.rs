@@ -31,7 +31,7 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_runtime::builtins::form::{expand_pairs, expand_reader_conds_cow};
 use cljrs_runtime::env::env::Env;
-use cljrs_runtime::env::error::{EvalError, EvalResult};
+use cljrs_runtime::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 use cljrs_runtime::interp::apply::{bind_fn_params, select_arity};
 use cljrs_runtime::interp::destructure::{bind_pattern, value_to_seq_vec};
 use cljrs_runtime::interp::eval::{eval, is_special_form};
@@ -78,6 +78,7 @@ where
             // task answers only to an interrupt of the eval that spawned it.
             let _interrupts = cljrs_runtime::env::gas::InterruptScope::enter(&interrupts);
             let _gas_guards = cljrs_runtime::env::gas::install_meters(&gas_meters);
+            let _monitors = cljrs_runtime::env::monitor::AsyncMonitorScope::enter();
             task.as_mut().poll(cx)
         })
         .await;
@@ -154,7 +155,7 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
         match result {
             Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_args)) => {
-                current_args = flatten_recur_args(&arity, new_args);
+                current_args = flatten_recur_args(&arity, new_args)?;
             }
             Err(e) => return Err(e),
         }
@@ -851,17 +852,19 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
 
 /// Flatten `recur` arguments for a variadic arity so the rest collection is
 /// spread back into individual positional arguments (mirrors `call_cljrs_fn`).
-fn flatten_recur_args(arity: &CljxFnArity, new_args: Vec<Value>) -> Vec<Value> {
+fn flatten_recur_args(arity: &CljxFnArity, new_args: Vec<Value>) -> EvalResult<Vec<Value>> {
     if arity.rest_param.is_some() {
         let n = arity.params.len();
         if new_args.len() == n + 1 {
             let mut flat = new_args[..n].to_vec();
             match &new_args[n] {
                 Value::Nil => {}
-                rest_val => flat.extend(value_to_seq_vec(rest_val)),
+                rest_val => {
+                    flat.extend(value_to_seq_vec(rest_val).map_err(value_error_to_eval_error)?)
+                }
             }
-            return flat;
+            return Ok(flat);
         }
     }
-    new_args
+    Ok(new_args)
 }

@@ -12,18 +12,22 @@
 //!   until a `take!` consumes its value, so producer and consumer hand off
 //!   directly. Only one value is in flight at a time.
 //!
-//! The async `put` and `take` methods use `tokio::sync::Notify` for wakeups:
-//! a waiting task parks until a producer/consumer fires the relevant `Notify`,
-//! so no spinning or busy-polling occurs on the executor.
+//! Takes, puts, and alternatives share selection tokens. A matching pair
+//! commits both tokens before it wakes either task. Cancellation removes
+//! uncommitted registrations. Parked fibers and ordinary blocking callers
+//! use the same event-driven operations.
 
 use std::any::Any;
-use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
 
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_value::{NativeObject, NativeObjectBox, Value, gc_native_object};
-use tokio::sync::Notify;
 
 /// The native type tag reported by [`NativeObject::type_tag`] for channels.
 pub(crate) const CHANNEL_TAG: &str = "Channel";
@@ -33,8 +37,8 @@ pub(crate) const MULT_TAG: &str = "Mult";
 
 /// Outcome of a non-blocking rendezvous offer (capacity-0 `put!`).
 pub(crate) enum RvOffer {
-    /// Value placed into the empty slot; the carried token snapshots the
-    /// take-count so the putter can detect when its value is consumed.
+    /// Value placed into the empty slot; the token identifies its queue entry
+    /// so the putter can detect when that particular value is consumed.
     Offered(u64),
     /// A value is already pending; the caller should yield and retry.
     Full,
@@ -54,63 +58,306 @@ pub(crate) enum RvStatus {
 
 #[derive(Debug)]
 struct ChannelState {
-    queue: VecDeque<Value>,
+    queue: BTreeMap<u64, Value>,
+    next_value: u64,
+    next_waiter: u64,
     /// Buffered capacity; `0` means unbuffered (rendezvous).
     capacity: usize,
     closed: bool,
-    /// Monotonic count of successful takes, used to detect rendezvous handoff.
-    taken: u64,
+    takes: BTreeMap<u64, Waiter>,
+    puts: BTreeMap<u64, Waiter>,
+    // Retain tracing links after a waiter commits, until its future is consumed.
+    registrations: BTreeMap<u64, Waiter>,
 }
 
 /// A CSP channel. See the module docs for the buffering model.
 #[derive(Debug)]
 pub struct CljChannel {
     state: Mutex<ChannelState>,
-    /// Fires when a value is added to the queue or the channel closes.
-    /// Wakes blocking takers waiting for data.
-    not_empty: Condvar,
-    /// Fires when a value is removed from the queue or the channel closes.
-    /// Wakes blocking putters waiting for space, and rendezvous putters waiting
-    /// for their offered value to be consumed.
-    not_full: Condvar,
-    /// Async wakeup for `take`: fired when an item is enqueued or the channel closes.
-    async_not_empty: Notify,
-    /// Async wakeup for `put`: fired when an item is dequeued or the channel closes.
-    async_not_full: Notify,
 }
 
-// A cancelled rendezvous put must retract an unconsumed offer. Otherwise an
-// abandoned fiber leaves a ghost value and can wedge the next producer.
-struct RendezvousOffer<'a> {
-    channel: &'a CljChannel,
-    token: u64,
+#[derive(Debug)]
+struct Selection {
+    done: Cell<bool>,
+    result: RefCell<Option<(Value, usize)>>,
+    waker: RefCell<Option<Waker>>,
+    take_order: Cell<Option<u64>>,
 }
-impl Drop for RendezvousOffer<'_> {
-    fn drop(&mut self) {
-        let mut state = self.channel.state.lock().unwrap();
-        if state.taken == self.token {
-            state.queue.pop_front();
+impl Selection {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            done: Cell::new(false),
+            result: RefCell::new(None),
+            waker: RefCell::new(None),
+            take_order: Cell::new(None),
+        })
+    }
+    fn finish(&self, value: Value, index: usize) -> Option<Waker> {
+        assert!(!self.done.replace(true));
+        *self.result.borrow_mut() = Some((value, index));
+        self.waker.borrow_mut().take()
+    }
+}
+#[derive(Clone, Debug)]
+struct Waiter {
+    selection: Weak<Selection>,
+    index: usize,
+    // None = take, Some(value) = put. Values are published before registration.
+    value: Option<Value>,
+}
+
+/// One take or put alternative in an atomic channel selection.
+pub(crate) enum SelectOp<'a> {
+    Take(&'a CljChannel),
+    Put(&'a CljChannel, Value),
+}
+impl SelectOp<'_> {
+    fn channel(&self) -> &CljChannel {
+        match self {
+            Self::Take(ch) | Self::Put(ch, _) => ch,
         }
-        drop(state);
-        self.channel.not_full.notify_all();
-        self.channel.async_not_full.notify_one();
+    }
+    fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Take(_) => None,
+            Self::Put(_, value) => Some(value),
+        }
+    }
+}
+
+struct Select<'a> {
+    ops: Vec<SelectOp<'a>>,
+    selection: Rc<Selection>,
+    registrations: Vec<u64>,
+    default: Option<Value>,
+}
+impl Future for Select<'_> {
+    type Output = (Value, usize);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        *self.selection.waker.borrow_mut() = Some(cx.waker().clone());
+        if !self.selection.done.get() && self.registrations.is_empty() {
+            for (index, op) in self.ops.iter().enumerate() {
+                if op.channel().attempt(op.value(), &self.selection, index) {
+                    break;
+                }
+            }
+        }
+        if let Some(result) = self.selection.result.borrow_mut().take() {
+            self.selection.take_order.set(None);
+            return Poll::Ready(result);
+        }
+        if let Some(default) = self.default.take() {
+            return Poll::Ready((default, usize::MAX));
+        }
+        if self.registrations.is_empty() {
+            let registrations = self
+                .ops
+                .iter()
+                .enumerate()
+                .map(|(index, op)| {
+                    let value = op.value().cloned().map(cljrs_value::publish::publish_value);
+                    let mut state = op.channel().state.lock().unwrap();
+                    let id = state.next_waiter;
+                    state.next_waiter += 1;
+                    let waiter = Waiter {
+                        selection: Rc::downgrade(&self.selection),
+                        index,
+                        value,
+                    };
+                    if waiter.value.is_some() {
+                        state.puts.insert(id, waiter.clone());
+                    } else {
+                        state.takes.insert(id, waiter.clone());
+                    }
+                    state.registrations.insert(id, waiter);
+                    id
+                })
+                .collect();
+            self.registrations = registrations;
+        }
+        Poll::Pending
+    }
+}
+impl Drop for Select<'_> {
+    fn drop(&mut self) {
+        self.selection.done.set(true);
+        for (op, id) in self.ops.iter().zip(&self.registrations) {
+            let mut state = op.channel().state.lock().unwrap();
+            state.takes.remove(id);
+            state.puts.remove(id);
+            state.registrations.remove(id);
+        }
+        // A producer may have committed while this future was parked. Return
+        // an unobserved take to its original FIFO position, even after close.
+        if let Some(order) = self.selection.take_order.take() {
+            let (value, index) = self.selection.result.borrow_mut().take().unwrap();
+            let channel = self.ops[index].channel();
+            let mut state = channel.state.lock().unwrap();
+            state.queue.insert(order, value);
+            let wakes = state.service();
+            drop(state);
+            wake(wakes);
+        }
+    }
+}
+
+/// Exactly one operation commits. An available default commits no operation.
+pub(crate) async fn select(ops: Vec<SelectOp<'_>>, default: Option<Value>) -> (Value, usize) {
+    Select {
+        ops,
+        selection: Selection::new(),
+        registrations: Vec::new(),
+        default,
+    }
+    .await
+}
+
+fn wake(wakes: Vec<Waker>) {
+    for waker in wakes {
+        waker.wake();
+    }
+}
+
+// Ordered maps provide FIFO matching and O(log N) cancellation without
+// scanning unrelated waiters. A selector cannot rendezvous with itself.
+fn pop_waiter(
+    waiters: &mut BTreeMap<u64, Waiter>,
+    exclude: Option<&Rc<Selection>>,
+) -> Option<(u64, Waiter, Rc<Selection>)> {
+    loop {
+        let (&id, waiter) = waiters.iter().find(|(_, waiter)| {
+            !waiter.selection.upgrade().is_some_and(|peer| {
+                !peer.done.get() && exclude.is_some_and(|s| Rc::ptr_eq(s, &peer))
+            })
+        })?;
+        let peer = waiter.selection.upgrade();
+        let waiter = waiters.remove(&id).unwrap();
+        if let Some(peer) = peer
+            && !peer.done.get()
+        {
+            return Some((id, waiter, peer));
+        }
+    }
+}
+
+impl ChannelState {
+    fn value_order(&mut self) -> u64 {
+        let order = self.next_value;
+        self.next_value += 1;
+        order
+    }
+
+    fn service(&mut self) -> Vec<Waker> {
+        let mut wakes = Vec::new();
+        loop {
+            if !self.queue.is_empty()
+                && let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None)
+            {
+                let (order, value) = self.queue.pop_first().unwrap();
+                peer.take_order.set(Some(order));
+                wakes.extend(peer.finish(value, waiter.index));
+                continue;
+            }
+            if self.closed {
+                while let Some((_, waiter, peer)) = pop_waiter(&mut self.puts, None) {
+                    wakes.extend(peer.finish(Value::Bool(false), waiter.index));
+                }
+                while let Some((_, waiter, peer)) = pop_waiter(&mut self.takes, None) {
+                    wakes.extend(peer.finish(Value::Nil, waiter.index));
+                }
+                break;
+            }
+            let Some((id, put, producer)) = pop_waiter(&mut self.puts, None) else {
+                break;
+            };
+            if self.queue.is_empty()
+                && let Some((_, take, consumer)) = pop_waiter(&mut self.takes, Some(&producer))
+            {
+                let order = self.value_order();
+                consumer.take_order.set(Some(order));
+                wakes.extend(consumer.finish(put.value.unwrap(), take.index));
+                wakes.extend(producer.finish(Value::Bool(true), put.index));
+            } else if self.capacity > 0 && self.queue.len() < self.capacity {
+                let order = self.value_order();
+                self.queue.insert(order, put.value.unwrap());
+                wakes.extend(producer.finish(Value::Bool(true), put.index));
+            } else {
+                self.puts.insert(id, put);
+                break;
+            }
+        }
+        wakes
     }
 }
 
 impl CljChannel {
+    // Selection tokens are isolate-local. Commit under the state lock, then
+    // wake only the tasks whose operations completed.
+    fn attempt(&self, put: Option<&Value>, selection: &Rc<Selection>, index: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let mut wakes = state.service();
+        let result = if let Some(value) = put {
+            if state.closed {
+                Some(Value::Bool(false))
+            } else if state.queue.is_empty()
+                && let Some((_, waiter, peer)) = pop_waiter(&mut state.takes, Some(selection))
+            {
+                let order = state.value_order();
+                peer.take_order.set(Some(order));
+                wakes.extend(peer.finish(
+                    cljrs_value::publish::publish_value(value.clone()),
+                    waiter.index,
+                ));
+                Some(Value::Bool(true))
+            } else if state.capacity > 0 && state.queue.len() < state.capacity {
+                let order = state.value_order();
+                state
+                    .queue
+                    .insert(order, cljrs_value::publish::publish_value(value.clone()));
+                Some(Value::Bool(true))
+            } else {
+                None
+            }
+        } else if let Some((order, value)) = state.queue.pop_first() {
+            selection.take_order.set(Some(order));
+            Some(value)
+        } else if !state.closed
+            && let Some((_, waiter, peer)) = pop_waiter(&mut state.puts, Some(selection))
+        {
+            let order = state.value_order();
+            selection.take_order.set(Some(order));
+            wakes.extend(peer.finish(Value::Bool(true), waiter.index));
+            Some(waiter.value.unwrap())
+        } else if state.closed {
+            Some(Value::Nil)
+        } else {
+            None
+        };
+        let committed = result.is_some();
+        if let Some(value) = result {
+            wakes.extend(selection.finish(value, index));
+        }
+        // Fill newly freed buffered slots from pending puts in registration
+        // order before a fresh producer can acquire them.
+        wakes.extend(state.service());
+        drop(state);
+        wake(wakes);
+        committed
+    }
+
     /// Create a channel. `capacity == 0` is a rendezvous (unbuffered) channel.
     pub fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(ChannelState {
-                queue: VecDeque::new(),
+                queue: BTreeMap::new(),
+                next_value: 0,
+                next_waiter: 0,
                 capacity,
                 closed: false,
-                taken: 0,
+                takes: BTreeMap::new(),
+                puts: BTreeMap::new(),
+                registrations: BTreeMap::new(),
             }),
-            not_empty: Condvar::new(),
-            not_full: Condvar::new(),
-            async_not_empty: Notify::new(),
-            async_not_full: Notify::new(),
         }
     }
 
@@ -122,13 +369,11 @@ impl CljChannel {
     /// Mark the channel closed. Idempotent. Pending and future takes drain any
     /// buffered values and then observe `nil`.
     pub fn close(&self) {
-        self.state.lock().unwrap().closed = true;
-        self.not_empty.notify_all();
-        self.not_full.notify_all();
-        // Closure releases every waiter, including buffered putters that do
-        // not consume data and therefore cannot cascade a take notification.
-        self.async_not_empty.notify_waiters();
-        self.async_not_full.notify_waiters();
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        let wakes = state.service();
+        drop(state);
+        wake(wakes);
     }
 
     /// Non-blocking take.
@@ -137,18 +382,9 @@ impl CljChannel {
     /// - `Some(Value::Nil)` — the channel is closed and drained.
     /// - `None` — the channel is open and empty (would block).
     pub(crate) fn try_take(&self) -> Option<Value> {
-        let mut st = self.state.lock().unwrap();
-        if let Some(v) = st.queue.pop_front() {
-            st.taken = st.taken.wrapping_add(1);
-            drop(st);
-            self.not_full.notify_all();
-            self.async_not_full.notify_one();
-            return Some(v);
-        }
-        if st.closed {
-            return Some(Value::Nil);
-        }
-        None
+        let selection = Selection::new();
+        self.attempt(None, &selection, 0);
+        selection.result.borrow_mut().take().map(|(value, _)| value)
     }
 
     /// Non-blocking buffered put (capacity >= 1).
@@ -157,22 +393,13 @@ impl CljChannel {
     /// - `Some(false)` — the channel is closed.
     /// - `None` — the buffer is full (would block).
     pub(crate) fn try_put_buffered(&self, v: &Value) -> Option<bool> {
-        let mut st = self.state.lock().unwrap();
-        if st.closed {
-            return Some(false);
-        }
-        if st.queue.len() < st.capacity {
-            // GC builds: heap-promotion fallback — the taker may hold the
-            // value past any region scope active on the putting side.
-            st.queue
-                .push_back(cljrs_value::publish::publish_value(v.clone()));
-            drop(st);
-            self.not_empty.notify_all();
-            self.async_not_empty.notify_one();
-            self.async_not_full.notify_one();
-            return Some(true);
-        }
-        None
+        let selection = Selection::new();
+        self.attempt(Some(v), &selection, 0);
+        selection
+            .result
+            .borrow_mut()
+            .take()
+            .map(|(value, _)| matches!(value, Value::Bool(true)))
     }
 
     /// Offer a value into a rendezvous channel's single slot.
@@ -182,215 +409,79 @@ impl CljChannel {
             return RvOffer::Closed;
         }
         if st.queue.is_empty() {
-            let token = st.taken;
             // GC builds: heap-promotion fallback (see `try_put_buffered`).
+            let order = st.value_order();
             st.queue
-                .push_back(cljrs_value::publish::publish_value(v.clone()));
+                .insert(order, cljrs_value::publish::publish_value(v.clone()));
+            let wakes = st.service();
             drop(st);
-            self.not_empty.notify_all();
-            self.async_not_empty.notify_one();
-            RvOffer::Offered(token)
+            wake(wakes);
+            RvOffer::Offered(order)
         } else {
             RvOffer::Full
         }
     }
 
-    /// Blocking take for synchronous (non-async) callers.
-    ///
-    /// Inside a fiber, parks on `take()` without blocking the isolate. Outside
-    /// a fiber, waits on a Condvar with the existing 1 ms poll interval.
-    /// Returns `Value::Nil` on a closed, drained channel.
+    /// Take a value, parking a fiber or blocking an ordinary caller.
     pub fn take_blocking(&self) -> Value {
-        #[cfg(not(target_arch = "wasm32"))]
-        if crate::fiber::current().is_some() {
-            return crate::fiber::park_on(self.take());
-        }
-        let mut guard = self.state.lock().unwrap();
-        loop {
-            if let Some(v) = guard.queue.pop_front() {
-                guard.taken = guard.taken.wrapping_add(1);
-                drop(guard);
-                self.not_full.notify_all();
-                self.async_not_full.notify_one();
-                return v;
-            }
-            if guard.closed {
-                return Value::Nil;
-            }
-            // Preserve the non-fiber fallback. Local tasks can make progress
-            // only when their caller runs inside a fiber.
-            let (g, _) = self
-                .not_empty
-                .wait_timeout(guard, Duration::from_millis(1))
-                .unwrap();
-            guard = g;
-        }
+        cljrs_value::parking::block_on(self.take())
     }
 
-    /// Blocking put for synchronous (non-async) callers.
-    ///
-    /// Inside a fiber, parks on `put()`. Outside a fiber, blocks the OS thread
-    /// until the value is accepted or the channel closes.
-    /// Returns `true` on success, `false` if the channel was closed.
+    /// Put a value, parking a fiber or blocking an ordinary caller.
     pub fn put_blocking(&self, v: Value) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        if crate::fiber::current().is_some() {
-            let anchor = v;
-            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-            return crate::fiber::park_on(self.put(anchor.clone()));
-        }
-        // GC builds: heap-promotion fallback — the taker may hold the value
-        // past any region scope active on the putting side (or run on another
-        // thread entirely).
-        let v = cljrs_value::publish::publish_value(v);
-        let mut guard = self.state.lock().unwrap();
-        let cap = guard.capacity;
-
-        if cap == 0 {
-            // Rendezvous: phase 1 — claim the single slot.
-            let token = loop {
-                if guard.closed {
-                    return false;
-                }
-                if guard.queue.is_empty() {
-                    let t = guard.taken;
-                    guard.queue.push_back(v.clone());
-                    drop(guard);
-                    self.not_empty.notify_all();
-                    self.async_not_empty.notify_one();
-                    break t;
-                }
-                let (g, _) = self
-                    .not_full
-                    .wait_timeout(guard, Duration::from_millis(1))
-                    .unwrap();
-                guard = g;
-            };
-            // Phase 2 — wait for a taker to consume our offered value.
-            guard = self.state.lock().unwrap();
-            loop {
-                if guard.taken != token {
-                    return true;
-                }
-                if guard.closed {
-                    guard.queue.pop_front(); // cancel pending offer
-                    drop(guard);
-                    self.not_full.notify_all();
-                    self.async_not_full.notify_one();
-                    return false;
-                }
-                let (g, _) = self
-                    .not_full
-                    .wait_timeout(guard, Duration::from_millis(1))
-                    .unwrap();
-                guard = g;
-            }
-        } else {
-            // Buffered: wait for room.
-            loop {
-                if guard.closed {
-                    return false;
-                }
-                if guard.queue.len() < cap {
-                    guard.queue.push_back(v);
-                    drop(guard);
-                    self.not_empty.notify_all();
-                    self.async_not_empty.notify_one();
-                    return true;
-                }
-                let (g, _) = self
-                    .not_full
-                    .wait_timeout(guard, Duration::from_millis(1))
-                    .unwrap();
-                guard = g;
-            }
-        }
+        let _root = cljrs_runtime::env::gc_roots::root_value(&v);
+        cljrs_value::parking::block_on(self.put(v.clone()))
     }
 
-    /// Asynchronously take a value from the channel, cooperatively yielding to
-    /// the `LocalSet` executor until a value is available or the channel closes.
-    /// Returns `Value::Nil` when the channel is closed and drained.
-    ///
-    /// This is the async counterpart to [`Self::take_blocking`] and the
-    /// building block other native crates use to consume channel values.
-    /// Must run within a Tokio `LocalSet` context.
+    /// Wait for a value or channel closure without blocking the executor.
     pub async fn take(&self) -> Value {
-        let value = wait_until(&self.async_not_empty, || self.try_take()).await;
-        // Notify can coalesce several puts before takers are polled.
-        self.async_not_empty.notify_one();
-        value
+        select(vec![SelectOp::Take(self)], None).await.0
     }
 
-    /// Asynchronously put `v` onto the channel, cooperatively yielding to the
-    /// `LocalSet` executor until the value is accepted — buffered (capacity >= 1)
-    /// or handed off to a taker (rendezvous). Resolves `true` on success, or
-    /// `false` if the channel is (or becomes) closed before the value lands.
-    ///
-    /// This is the async counterpart to [`Self::put_blocking`] and the building
-    /// block other native crates use to stream produced values onto a channel.
-    /// Must run within a Tokio `LocalSet` context.
-    pub async fn put(&self, v: Value) -> bool {
-        if self.is_rendezvous() {
-            let offer = wait_until(&self.async_not_full, || match self.rv_offer(&v) {
-                RvOffer::Offered(token) => Some(Ok(token)),
-                RvOffer::Closed => Some(Err(())),
-                RvOffer::Full => None,
-            })
-            .await;
-            let Ok(token) = offer else { return false };
-            let _offer = RendezvousOffer {
-                channel: self,
-                token,
-            };
-            wait_until(&self.async_not_full, || match self.rv_status(token) {
-                RvStatus::Taken => Some(true),
-                RvStatus::ClosedUntaken => Some(false),
-                RvStatus::Waiting => None,
-            })
-            .await
-        } else {
-            wait_until(&self.async_not_full, || self.try_put_buffered(&v)).await
-        }
+    /// Wait until a put commits or the channel closes. Cancellation retracts
+    /// every uncommitted offer, including rendezvous values.
+    pub async fn put(&self, value: Value) -> bool {
+        let _root = cljrs_runtime::env::gc_roots::root_value(&value);
+        matches!(
+            select(vec![SelectOp::Put(self, value.clone())], None)
+                .await
+                .0,
+            Value::Bool(true)
+        )
     }
 
     /// Check whether a rendezvous offer (made at `token`) has been taken.
     ///
-    /// Because the slot stays full until our value is consumed, no other putter
-    /// can offer in the meantime, so any increment of the take-count past
-    /// `token` is our handoff.
+    /// A cancelled take can restore an older value ahead of this offer.
+    /// Check and retract only the queue entry identified by the token.
     pub(crate) fn rv_status(&self, token: u64) -> RvStatus {
         let mut st = self.state.lock().unwrap();
-        if st.taken != token {
+        if !st.queue.contains_key(&token) {
             return RvStatus::Taken;
         }
         if st.closed {
-            st.queue.pop_front(); // cancel our still-pending offer
+            st.queue.remove(&token); // cancel only our still-pending offer
             return RvStatus::ClosedUntaken;
         }
         RvStatus::Waiting
     }
 }
 
-// Register before inspecting the condition. This closes the gap in which a
-// broadcast (including channel closure) could otherwise disappear. Enable is
-// also necessary for notify_one when several consumers compete for permits.
-async fn wait_until<T>(notify: &Notify, mut ready: impl FnMut() -> Option<T>) -> T {
-    loop {
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if let Some(value) = ready() {
-            return value;
-        }
-        notified.await;
-    }
-}
-
 impl Trace for CljChannel {
     fn trace(&self, visitor: &mut MarkVisitor) {
         let st = self.state.lock().unwrap();
-        for v in st.queue.iter() {
+        for v in st.queue.values() {
             v.trace(visitor);
+        }
+        for waiter in st.registrations.values() {
+            if let Some(value) = &waiter.value {
+                value.trace(visitor);
+            }
+            if let Some(selection) = waiter.selection.upgrade()
+                && let Some((value, _)) = &*selection.result.borrow()
+            {
+                value.trace(visitor);
+            }
         }
     }
 }
@@ -488,24 +579,151 @@ pub async fn chan_take(ch: &GcPtr<NativeObjectBox>) -> Value {
 mod notification_tests {
     use super::*;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn broadcast_between_condition_check_and_await_is_not_lost() {
-        let notify = Notify::new();
-        let mut checked = false;
-        let wait = wait_until(&notify, || {
-            if checked {
-                return Some(42);
+    fn poll<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        Pin::new(future).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn cancelled_committed_take_restores_the_value_in_fifo_order() {
+        for capacity in [0, 1] {
+            let ch = CljChannel::new(capacity);
+            let mut first = Box::pin(select(vec![SelectOp::Take(&ch)], None));
+            let mut second = Box::pin(select(vec![SelectOp::Take(&ch)], None));
+            assert!(poll(&mut first).is_pending());
+            assert!(poll(&mut second).is_pending());
+            assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+            assert_eq!(ch.try_put_buffered(&Value::Long(2)), Some(true));
+            // Cancellation order must not change the original value order.
+            drop(first);
+            ch.close();
+            drop(second);
+            assert_eq!(ch.try_take(), Some(Value::Long(1)));
+            assert_eq!(ch.try_take(), Some(Value::Long(2)));
+            assert_eq!(ch.try_take(), Some(Value::Nil));
+        }
+    }
+
+    #[test]
+    fn cancelled_alts_take_returns_to_the_winning_channel_and_next_waiter() {
+        let x = CljChannel::new(0);
+        let y = CljChannel::new(0);
+        let mut choice = Box::pin(select(vec![SelectOp::Take(&x), SelectOp::Take(&y)], None));
+        assert!(poll(&mut choice).is_pending());
+        assert_eq!(y.try_put_buffered(&Value::Long(42)), Some(true));
+        let mut next = Box::pin(y.take());
+        assert!(poll(&mut next).is_pending());
+        drop(choice);
+        assert_eq!(poll(&mut next), Poll::Ready(Value::Long(42)));
+        assert_eq!(x.try_take(), None);
+    }
+
+    #[test]
+    fn rendezvous_offer_close_retracts_only_its_own_value() {
+        let ch = CljChannel::new(0);
+        let mut take = Box::pin(ch.take());
+        assert!(poll(&mut take).is_pending());
+        let RvOffer::Offered(first) = ch.rv_offer(&Value::Long(1)) else {
+            panic!("first offer was not accepted");
+        };
+        assert!(matches!(ch.rv_status(first), RvStatus::Taken));
+        let RvOffer::Offered(second) = ch.rv_offer(&Value::Long(2)) else {
+            panic!("second offer was not accepted");
+        };
+        drop(take);
+        ch.close();
+        assert!(matches!(ch.rv_status(second), RvStatus::ClosedUntaken));
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert_eq!(ch.try_take(), Some(Value::Nil));
+    }
+
+    #[test]
+    fn rendezvous_offer_waits_for_its_own_value_after_a_take_is_restored() {
+        let ch = CljChannel::new(0);
+        let mut take = Box::pin(ch.take());
+        assert!(poll(&mut take).is_pending());
+        let RvOffer::Offered(first) = ch.rv_offer(&Value::Long(1)) else {
+            panic!("first offer was not accepted");
+        };
+        assert!(matches!(ch.rv_status(first), RvStatus::Taken));
+        let RvOffer::Offered(second) = ch.rv_offer(&Value::Long(2)) else {
+            panic!("second offer was not accepted");
+        };
+        drop(take);
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert!(matches!(ch.rv_status(second), RvStatus::Waiting));
+        assert_eq!(ch.try_take(), Some(Value::Long(2)));
+        assert!(matches!(ch.rv_status(second), RvStatus::Taken));
+        assert_eq!(ch.try_take(), None);
+    }
+
+    #[test]
+    fn pending_buffered_puts_keep_fifo_when_polled_in_reverse_order() {
+        let ch = CljChannel::new(1);
+        assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+        let mut first = Box::pin(ch.put(Value::Long(2)));
+        let mut second = Box::pin(ch.put(Value::Long(3)));
+        assert!(poll(&mut first).is_pending());
+        assert!(poll(&mut second).is_pending());
+        assert_eq!(ch.try_take(), Some(Value::Long(1)));
+        assert!(poll(&mut second).is_pending());
+        assert_eq!(ch.try_put_buffered(&Value::Long(4)), None);
+        assert_eq!(ch.try_take(), Some(Value::Long(2)));
+        assert_eq!(poll(&mut second), Poll::Ready(true));
+        assert_eq!(poll(&mut first), Poll::Ready(true));
+        assert_eq!(ch.try_take(), Some(Value::Long(3)));
+    }
+
+    #[test]
+    fn transfer_wakes_only_the_selected_waiter() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Counter(AtomicUsize);
+        impl std::task::Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
             }
-            checked = true;
-            // Simulate close after a stale condition check but before await.
-            notify.notify_waiters();
-            None
-        });
+        }
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let ch = CljChannel::new(0);
+        let mut takes: Vec<_> = (0..10_000).map(|_| Box::pin(ch.take())).collect();
+        for take in &mut takes {
+            assert!(take.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        assert_eq!(ch.try_put_buffered(&Value::Long(1)), Some(true));
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert_eq!(takes[0].as_mut().poll(&mut cx), Poll::Ready(Value::Long(1)));
+        drop(takes);
+        let state = ch.state.lock().unwrap();
+        assert!(state.takes.is_empty());
+        assert!(state.registrations.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_take_result_stays_traced_until_the_receiver_is_polled() {
+        let channel = make_chan(1);
+        let anchor = Value::NativeObject(channel.clone());
+        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+        let ch = chan_ref(channel.get());
+        let mut take = std::pin::pin!(ch.take());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(take.as_mut().poll(&mut cx).is_pending());
+        let frame = cljrs_gc::push_alloc_frame();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), wait)
-                .await
-                .unwrap(),
-            42
+            ch.try_put_buffered(&Value::string("waiting result")),
+            Some(true)
         );
+        drop(frame);
+        #[cfg(not(feature = "no-gc"))]
+        for _ in 0..3 {
+            cljrs_gc::request_gc();
+            cljrs_runtime::env::gc_roots::async_gc_collect();
+        }
+        assert_eq!(format!("{}", take.await), "\"waiting result\"");
     }
 }

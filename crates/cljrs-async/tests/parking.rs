@@ -521,3 +521,332 @@ fn alts_does_not_starve_a_ready_channel_later_in_the_input() {
         .await;
     });
 }
+
+#[test]
+fn sequence_consumers_propagate_carrier_wait_errors() {
+    run(|globals| async move {
+        let lazy = Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(
+            WaitingThunk(Value::Nil, true),
+        ))));
+        let copy = lazy.clone();
+        let realizer = fiber::spawn_rooted(vec![lazy.clone()], move || realize(&copy)).unwrap();
+        tokio::task::yield_now().await;
+        let mut env = Env::new(globals, "user");
+        env.push_frame();
+        env.bind("s".into(), lazy.clone());
+        let _root = push_env_root(&env);
+        for source in [
+            "(let [[x] s] x)",
+            "(= s '(1))",
+            "(hash s)",
+            "(pr-str s)",
+            "(str s)",
+            "(get {s 1} '(1))",
+            "{s 1 :a 2 :b 3 :c 4 :d 5 :e 6 :f 7 :g 8 :h 9}",
+            "#{s}",
+            "(apply vector s)",
+            "(let [f (fn [& xs] (if (seq? xs) (recur s) xs))] (f 1))",
+            "`(~@s)",
+            "(do (require '[clojure.core.async :as a]) (a/alts!! s))",
+            "(clojure.core.async/join-all s)",
+            "(clojure.core.async/onto-chan! (clojure.core.async/chan 1) s)",
+            "(clojure.core.async/to-chan! s)",
+        ] {
+            let error = eval(source, &mut env).expect_err(source);
+            assert!(
+                error.to_string().contains("parked fiber"),
+                "{source}: {error}"
+            );
+        }
+        let Value::LazySeq(cell) = &lazy else {
+            unreachable!()
+        };
+        assert!(cell.get().error().is_none());
+        realizer.abort();
+        assert!(realizer.await.is_err());
+    });
+}
+
+#[test]
+fn sequence_consumers_preserve_cached_thunk_errors() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (let [s (lazy-seq (throw (ex-info "bad-sequence" {})))]
+            [(try (let [[x] s] x) (catch Exception _ :rejected))
+             (try (apply vector s) (catch Exception _ :rejected))
+             (try `(~@s) (catch Exception _ :rejected))])"#,
+            "[:rejected :rejected :rejected]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sequence_conversion_parks_for_a_competing_realizer() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (let [s (lazy-seq (sleep 2)
+                    (cons (str "head") (lazy-seq (sleep 2) (list (str "tail")))))
+                owner (fiber-call (fn [] (first s)))
+                consumer (fiber-call (fn [] (let [[x y] s] [x y])))
+                spread (fiber-call (fn [] (apply vector s)))]
+            [@owner @consumer @spread])"#,
+            r#"["head" ["head" "tail"] ["head" "tail"]]"#,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn alts_put_default_priority_and_rendezvous_are_atomic() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (require '[clojure.core.async :as a])
+          (let [x (a/chan 1) y (a/chan 1) rv (a/chan)]
+            [(first (a/alts!! [x [y 7]] :priority true))
+             (a/alts!! [x] :default :empty)
+             (a/alts!! [[y 8]] :default :full)
+             (a/<!! y)
+             (let [taker (fiber-call (fn [] (a/<!! rv)))
+                   choice (a/alts!! [[rv 42] x])]
+               [(first choice) (identical? (second choice) rv) @taker])
+             (let [other (a/chan 1)]
+               (a/>!! other 9)
+               [(first (a/alts!! [[rv 100] other] :priority true))
+                (a/alts!! [rv] :default :no-ghost)])])"#,
+            "[true [:empty :default] [:full :default] 7 [true true 42] [9 [:no-ghost :default]]]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn explicit_monitors_are_reentrant_and_have_fiber_ownership() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (let [lock (atom nil) n (atom 0)
+                a (fiber-call (fn []
+                    (monitor-enter lock) (monitor-enter lock)
+                    (sleep 3) (swap! n inc)
+                    (monitor-exit lock) (monitor-exit lock)))
+                b (fiber-call (fn [] (locking lock (swap! n inc))))]
+            @a @b
+            [@n (try (monitor-exit lock) (catch Exception _ :not-owner))])"#,
+            "[2 :not-owner]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn cancelled_explicit_monitor_owners_release_waiters() {
+    run(|_| async move {
+        let lock = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
+        let copy = lock.clone();
+        let owner = fiber::spawn_rooted(vec![copy.clone()], move || {
+            cljrs_runtime::env::monitor::monitor_enter(&copy).unwrap();
+            fiber::park_on(std::future::pending::<()>());
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        let waiter = fiber::spawn_rooted(vec![lock.clone()], move || {
+            let _guard = cljrs_runtime::env::monitor::enter(&lock).unwrap();
+            Ok(Value::Long(42))
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        owner.abort();
+        assert!(owner.await.is_err());
+        assert_eq!(
+            waiter.await.unwrap().into_result().unwrap(),
+            Value::Long(42)
+        );
+    });
+}
+
+#[test]
+fn failed_transient_hashing_does_not_poison_or_mutate_the_collection() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (let [s (lazy-seq (throw (ex-info "hash failed" {})))
+                m (transient {}) t (transient #{})]
+            [(try (assoc! m s 1) (catch Exception _ :rejected))
+             (persistent! (assoc! m :ok 2))
+             (try (conj! t s) (catch Exception _ :rejected))
+             (persistent! (conj! t :ok))])"#,
+            "[:rejected {:ok 2} :rejected #{:ok}]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn two_alts_rendezvous_selectors_commit_only_one_pair() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (require '[clojure.core.async :as a])
+          (let [x (a/chan) y (a/chan)
+                p (fiber-call (fn [] (a/alts!! [[x 1] [y 2]])))
+                result (a/alts!! [x y])
+                sent @p]
+            [(first sent) (identical? (second result) (second sent))
+             (a/alts!! [x y] :default :empty)
+             (a/alts!! [] :default nil)])"#,
+            "[true true [:empty :default] [nil :default]]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn transient_updates_preserve_changes_made_while_a_key_realizes() {
+    run(|globals| async move {
+        check(
+            globals,
+            r#"
+          (let [m (transient {}) s (transient #{})
+                key (lazy-seq (sleep 5) (list 1))
+                set-key (lazy-seq (sleep 5) (list 2))
+                a (fiber-call (fn [] (assoc! m key :lazy)))
+                b (fiber-call (fn [] (sleep 1) (assoc! m :other :kept)))
+                c (fiber-call (fn [] (conj! s set-key)))
+                d (fiber-call (fn [] (sleep 1) (conj! s :other)))]
+            @a @b @c @d
+            (let [m (persistent! m) s (persistent! s)]
+              [(count m) (get m '(1)) (:other m)
+               (count s) (contains? s '(2)) (contains? s :other)]))"#,
+            "[2 :lazy :kept 2 true true]",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn destructuring_realization_errors_do_not_leave_lexical_frames() {
+    run(|globals| async move {
+        let mut env = Env::new(globals, "user");
+        env.push_frame();
+        env.bind("kept".into(), Value::Long(99));
+        let _root = push_env_root(&env);
+        let bad = eval(
+            "(array-map (lazy-seq (throw (ex-info \"bad key\" {}))) 1)",
+            &mut env,
+        )
+        .unwrap();
+        env.bind("bad".into(), bad);
+        for form in [
+            "(try (let [leaked 1 {:keys [missing]} bad] missing) (catch Exception _ :caught))",
+            "(try (loop [leaked 1 {:keys [missing]} bad] missing) (catch Exception _ :caught))",
+        ] {
+            let depth = env.frames.len();
+            assert_eq!(format!("{}", eval(form, &mut env).unwrap()), ":caught");
+            assert_eq!(env.frames.len(), depth);
+            assert_eq!(env.lookup("kept"), Some(Value::Long(99)));
+            assert_eq!(env.lookup("leaked"), None);
+        }
+    });
+}
+
+#[test]
+fn legacy_async_tasks_cannot_acquire_or_release_explicit_root_monitors() {
+    run(|globals| async move {
+        let lock = Value::Atom(GcPtr::new(cljrs_value::Atom::new(Value::Nil)));
+        let _root = cljrs_runtime::env::gc_roots::root_value(&lock);
+        cljrs_runtime::env::monitor::monitor_enter(&lock).unwrap();
+        for body in ["(monitor-enter lock)", "(monitor-exit lock)"] {
+            let copy = lock.clone();
+            let globals = globals.clone();
+            let future = spawn_future(async move {
+                let mut env = Env::new(globals, "user");
+                env.push_frame();
+                env.bind("lock".into(), copy);
+                // A sync helper must not hide the task's async origin.
+                eval(
+                    &format!("(try ((fn [] {body})) (catch Exception _ :rejected))"),
+                    &mut env,
+                )
+            });
+            let result = cljrs_async::await_value(future).await.unwrap();
+            assert_eq!(format!("{result}"), ":rejected");
+        }
+        // The async task did not remove the root owner's acquisition.
+        cljrs_runtime::env::monitor::monitor_exit(&lock).unwrap();
+        assert!(cljrs_runtime::env::monitor::monitor_exit(&lock).is_err());
+    });
+}
+
+#[test]
+fn collection_snapshots_trace_values_removed_while_hashing_is_parked() {
+    use cljrs_value::ClojureHash;
+    run(|_| async move {
+        for vector in [false, true] {
+            let frame = cljrs_gc::push_alloc_frame();
+            let first = Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(
+                WaitingThunk(
+                    Value::List(GcPtr::new(cljrs_value::PersistentList::from_iter([
+                        Value::Long(42),
+                    ]))),
+                    false,
+                ),
+            ))));
+            let values = vec![first, Value::string("only the snapshot retains this")];
+            let collection = if vector {
+                let value = cljrs_value::collections::TransientVector::new();
+                for element in values {
+                    value.append(element).unwrap();
+                }
+                Value::TransientVector(GcPtr::new(value))
+            } else {
+                Value::ObjectArray(GcPtr::new(cljrs_value::value::ObjectArray::new(values)))
+            };
+            let _root = cljrs_runtime::env::gc_roots::root_value(&collection);
+            drop(frame);
+            let copy = collection.clone();
+            let task = fiber::spawn_rooted(vec![copy.clone()], move || {
+                Ok(Value::Long(copy.clojure_hash() as i64))
+            })
+            .unwrap();
+            tokio::task::yield_now().await;
+            match &collection {
+                Value::ObjectArray(array) => array.get().0.lock().unwrap().clear(),
+                Value::TransientVector(vector) => {
+                    vector.get().pop().unwrap();
+                    vector.get().pop().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            #[cfg(not(feature = "no-gc"))]
+            for _ in 0..3 {
+                cljrs_gc::request_gc();
+                cljrs_runtime::env::gc_roots::async_gc_collect();
+            }
+            let expected = cljrs_value::hash::hash_combine_ordered(
+                cljrs_value::hash::hash_combine_ordered(
+                    0,
+                    Value::List(GcPtr::new(cljrs_value::PersistentList::from_iter([
+                        Value::Long(42),
+                    ])))
+                    .clojure_hash(),
+                ),
+                Value::string("only the snapshot retains this").clojure_hash(),
+            );
+            assert_eq!(
+                task.await.unwrap().into_result().unwrap(),
+                Value::Long(expected as i64)
+            );
+        }
+    });
+}

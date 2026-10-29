@@ -2982,3 +2982,24 @@ fn require_fully_compiled_accepts_a_complete_wasm_module() {
     .expect("a plain defn lowers, so nothing is omitted");
     assert!(out.exists());
 }
+
+/// Lazy thunk errors must cross the native ABI as catchable exceptions.
+#[test]
+fn test_lazy_realization_errors() {
+    assert_output(
+        "lazy_realization_errors",
+        r#"
+(defn broken [] (lazy-seq (throw (ex-info "bad-sequence" {}))))
+(println
+  [(try (count (broken)) (catch Exception _ :count))
+   (try (first (broken)) (catch Exception _ :first))
+   (try (rest (broken)) (catch Exception _ :rest))
+   (try (apply vector (broken)) (catch Exception _ :apply))
+   (try (into [] (map identity (broken))) (catch Exception _ :into))
+   (try (= (broken) '(1)) (catch Exception _ :equal))
+   (try (hash (broken)) (catch Exception _ :hash))
+   (try (pr-str (broken)) (catch Exception _ :print))])
+"#,
+        "[:count :first :rest :apply :into :equal :hash :print]",
+    );
+}

@@ -216,6 +216,8 @@ pub fn force_collect(env: &Env) {
         trace_value_roots(visitor);
         trace_option_value_roots(visitor);
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         crate::env::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });
@@ -300,6 +302,8 @@ fn collect_at_safepoint(env: &Env) {
         trace_option_value_roots(visitor);
         // Trace dynamic variable bindings on this thread
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         // Trace the global tap system (functions and queued values)
         crate::env::taps::trace_roots(visitor);
         // Trace in-flight allocations from this thread's alloc root frames
@@ -429,6 +433,8 @@ pub fn async_gc_collect() {
         trace_value_roots(visitor);
         trace_option_value_roots(visitor);
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         crate::env::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });

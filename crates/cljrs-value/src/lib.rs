@@ -10,6 +10,7 @@ pub mod native_object;
 pub mod parking;
 #[cfg(not(feature = "no-gc"))]
 pub mod publish;
+pub mod realization;
 pub mod regex;
 pub mod resource;
 pub mod shared;

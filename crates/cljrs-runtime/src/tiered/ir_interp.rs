@@ -350,6 +350,34 @@ fn interpret_ir_inner(
     osr_arity_id: Option<u64>,
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
+    cljrs_value::realization::catch(|| {
+        interpret_ir_body(
+            ir_func,
+            args,
+            globals,
+            ns,
+            env,
+            osr_arity_id,
+            inherited_region,
+        )
+    })
+    .unwrap_or_else(|message| {
+        Err(value_error_to_eval_error(cljrs_value::ValueError::Other(
+            message,
+        )))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpret_ir_body(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
+    inherited_region: Option<*mut cljrs_gc::region::Region>,
+) -> EvalResult {
     // GC safepoint at function entry.  Root the arguments first: a caller
     // such as a native `reduce` may hold the only reference to them.
     {
@@ -1003,6 +1031,7 @@ fn alloc_closure(
 
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
+        blocking_func: None,
         name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {
             cljrs_value::Arity::Fixed(param_counts[0])
@@ -1345,7 +1374,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::KwargsMap => {
             let rest = args.into_iter().next().unwrap_or(Value::Nil);
-            let items = value_to_seq_vec(&rest);
+            let items =
+                value_to_seq_vec(&rest).map_err(crate::env::error::value_error_to_eval_error)?;
             Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)
         }
         KnownFn::Aget => builtin_call_native("aget", &args),
@@ -1480,7 +1510,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let mut args = args;
             let f = args.remove(0);
             let last = args.pop().unwrap();
-            let spread = crate::interp::destructure::value_to_seq_vec(&last);
+            let spread = crate::interp::destructure::value_to_seq_vec(&last)
+                .map_err(crate::env::error::value_error_to_eval_error)?;
             args.extend(spread);
             apply_value(&f, args, env)
         }

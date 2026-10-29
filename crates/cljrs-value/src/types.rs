@@ -752,6 +752,8 @@ pub struct NativeFn {
     pub name: Arc<str>,
     pub arity: Arity,
     pub func: NativeFnFunc,
+    /// Optional adapter that marshals owned inputs and offloads native work.
+    pub blocking_func: Option<NativeFnFunc>,
 }
 
 impl NativeFn {
@@ -760,7 +762,11 @@ impl NativeFn {
         Self {
             name: name.into(),
             arity,
-            func: Arc::new(func),
+            blocking_func: None,
+            func: Arc::new(move |args| {
+                crate::realization::catch(|| func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            }),
         }
     }
 
@@ -773,8 +779,51 @@ impl NativeFn {
         Self {
             name: name.into(),
             arity,
-            func: Arc::new(func),
+            blocking_func: None,
+            func: Arc::new(move |args| {
+                crate::realization::catch(|| func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            }),
         }
+    }
+
+    /// Create a native function with a separate owned-work blocking adapter.
+    /// The adapter must keep managed conversions on the caller's isolate.
+    pub fn with_blocking(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        func: impl Fn(&[Value]) -> crate::ValueResult<Value> + 'static,
+        blocking_func: impl Fn(&[Value]) -> crate::ValueResult<Value> + 'static,
+    ) -> Self {
+        let mut native = Self::with_closure(name, arity, func);
+        native.blocking_func = Some(Arc::new(move |args| {
+            crate::realization::catch(|| blocking_func(args))
+                .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+        }));
+        native
+    }
+
+    /// Call the blocking adapter. Reject unsupported functions before execution.
+    pub fn call_blocking(&self, args: &[Value]) -> crate::ValueResult<Value> {
+        let expected = match self.arity {
+            Arity::Fixed(n) if args.len() != n => Some(n.to_string()),
+            Arity::Variadic { min } if args.len() < min => Some(format!("{min}+")),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            return Err(crate::ValueError::ArityError {
+                name: self.name.to_string(),
+                expected,
+                got: args.len(),
+            });
+        }
+        let adapter = self.blocking_func.as_ref().ok_or_else(|| {
+            crate::ValueError::Other(format!(
+                "blocking cannot offload {}: this function has no owned-work adapter",
+                self.name
+            ))
+        })?;
+        adapter(args)
     }
 }
 

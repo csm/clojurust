@@ -400,14 +400,14 @@ impl PartialEq for Value {
         // A lazy-seq that realizes to nil is an empty sequence, which is equal
         // to both nil and any empty sequential collection (matching Clojure).
         if let Value::LazySeq(ls) = self {
-            let realized = ls.get().realize();
+            let realized = crate::realization::for_trait(ls.get());
             if realized == Value::Nil && other.is_sequential() {
                 return value_to_seq_vec(other).is_empty();
             }
             return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
-            let realized = ls.get().realize();
+            let realized = crate::realization::for_trait(ls.get());
             if realized == Value::Nil && self.is_sequential() {
                 return value_to_seq_vec(self).is_empty();
             }
@@ -550,7 +550,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
     // Iteratively unwrap lazy seqs.
     let mut v = v.clone();
     while let Value::LazySeq(ls) = &v {
-        v = ls.get().realize();
+        v = crate::realization::for_trait(ls.get());
     }
     match &v {
         Value::List(l) => l.get().iter().cloned().collect(),
@@ -571,7 +571,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
                         tail = next_c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
+                        tail = crate::realization::for_trait(ls.get());
                     }
                     _ => break,
                 }
@@ -743,11 +743,8 @@ impl ClojureHash for Value {
                 h
             }
             Value::ObjectArray(a) => {
-                let mut h: u32 = 0;
-                for item in a.get().0.lock().unwrap().iter() {
-                    h = hash_combine_ordered(h, item.clojure_hash())
-                }
-                h
+                let values = a.get().0.lock().unwrap().clone();
+                crate::collections::hash_values(values)
             }
 
             Value::SharedAtom(a) => Arc::as_ptr(a) as u32,
@@ -776,7 +773,7 @@ impl ClojureHash for Value {
             Value::Macro(f) => f.get() as *const _ as u32,
             Value::BigDecimal(d) => hash_string(&d.get().to_string()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
-            Value::LazySeq(ls) => ls.get().realize().clojure_hash(),
+            Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
             Value::Protocol(p) => p.get() as *const _ as u32,
             Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
             Value::MultiFn(mf) => mf.get() as *const _ as u32,
@@ -1022,7 +1019,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
             write!(f, ")")
         }
-        Value::LazySeq(ls) => pr_str(&ls.get().realize(), f, readably),
+        Value::LazySeq(ls) => pr_str(&crate::realization::for_trait(ls.get()), f, readably),
         Value::Cons(c) => {
             write!(f, "(")?;
             pr_str(&c.get().head, f, readably)?;
@@ -1043,7 +1040,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
                         tail = next_c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
+                        tail = crate::realization::for_trait(ls.get());
                     }
                     other => {
                         write!(f, " . ")?;

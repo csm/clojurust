@@ -238,6 +238,10 @@ pub fn execute(mut cmd: Command, program: &str, stdin: Option<String>) -> ValueR
 
 fn builtin_run(args: &[Value]) -> ValueResult<Value> {
     let req = collect(args)?;
-    let output = execute(command(&req), &req.argv[0], req.stdin.clone())?;
-    Ok(result_value(&output, req.out_bytes))
+    let out_bytes = req.out_bytes;
+    let output = cljrs_value::parking::blocking(move || {
+        execute(command(&req), &req.argv[0], req.stdin.clone()).map_err(|error| error.to_string())
+    })
+    .map_err(ValueError::Other)?;
+    Ok(result_value(&output, out_bytes))
 }

@@ -210,31 +210,37 @@ pub extern "C" fn rt_safepoint() {
 // ── Constants ───────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_nil() -> *const Value {
     intern_nil()
 }
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_true() -> *const Value {
     intern_bool(true)
 }
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_false() -> *const Value {
     intern_bool(false)
 }
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_long(n: i64) -> *const Value {
     intern_long(n)
 }
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_double(n: f64) -> *const Value {
     box_val(Value::Double(n))
 }
 
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_const_char(c: u32) -> *const Value {
     box_val(Value::Char(char::from_u32(c).unwrap_or('\u{FFFD}')))
 }
@@ -244,6 +250,7 @@ pub extern "C" fn rt_const_char(c: u32) -> *const Value {
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_string(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let s = std::str::from_utf8(bytes).unwrap_or("<invalid utf8>");
@@ -261,6 +268,7 @@ pub unsafe extern "C" fn rt_const_string(ptr: *const u8, len: u64) -> *const Val
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
@@ -272,6 +280,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_symbol(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
@@ -299,6 +308,7 @@ unsafe fn parse_string_const(
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_regex(ptr: *const u8, len: u64) -> *const Value {
     unsafe { parse_string_const(ptr, len, cljrs_runtime::builtins::parse_regex) }
 }
@@ -306,6 +316,7 @@ pub unsafe extern "C" fn rt_const_regex(ptr: *const u8, len: u64) -> *const Valu
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_ratio(ptr: *const u8, len: u64) -> *const Value {
     unsafe { parse_string_const(ptr, len, cljrs_runtime::builtins::parse_ratio) }
 }
@@ -313,6 +324,7 @@ pub unsafe extern "C" fn rt_const_ratio(ptr: *const u8, len: u64) -> *const Valu
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_const_bigdecimal(ptr: *const u8, len: u64) -> *const Value {
     unsafe { parse_string_const(ptr, len, cljrs_runtime::builtins::parse_bigdecimal) }
 }
@@ -355,6 +367,7 @@ fn make_overflow_exc() -> *const Value {
 /// # Safety
 /// Trivially safe (no pointer arguments); `extern "C"` for codegen linkage.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_overflow_error() -> *const Value {
     make_overflow_exc()
 }
@@ -362,6 +375,7 @@ pub extern "C" fn rt_overflow_error() -> *const Value {
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let args = [unsafe { val_ref(a) }.clone(), unsafe { val_ref(b) }.clone()];
@@ -374,6 +388,7 @@ pub unsafe extern "C" fn rt_add(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let args = [unsafe { val_ref(a) }.clone(), unsafe { val_ref(b) }.clone()];
@@ -386,6 +401,7 @@ pub unsafe extern "C" fn rt_sub(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_mul(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let args = [unsafe { val_ref(a) }.clone(), unsafe { val_ref(b) }.clone()];
@@ -509,6 +525,7 @@ pub unsafe extern "C" fn rt_aget_double(arr: *const Value, i: i64) -> f64 {
 /// # Safety
 /// `arr` must be a valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_aset_long(arr: *const Value, i: i64, v: i64) -> *const Value {
     let arr = unsafe { val_ref(arr) };
     match arr {
@@ -529,6 +546,7 @@ pub unsafe extern "C" fn rt_aset_long(arr: *const Value, i: i64, v: i64) -> *con
 /// # Safety
 /// `arr` must be a valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_aset_double(arr: *const Value, i: i64, v: f64) -> *const Value {
     let arr = unsafe { val_ref(arr) };
     match arr {
@@ -550,6 +568,7 @@ pub unsafe extern "C" fn rt_aset_double(arr: *const Value, i: i64, v: f64) -> *c
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const Value {
     let arr = unsafe { val_ref(arr) };
     let idx = unsafe { val_ref(idx) };
@@ -592,6 +611,7 @@ pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const
 /// # Safety
 /// All pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_aset(
     arr: *const Value,
     idx: *const Value,
@@ -654,6 +674,7 @@ pub unsafe extern "C" fn rt_aset(
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_unchecked_add(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -670,6 +691,7 @@ pub unsafe extern "C" fn rt_unchecked_add(a: *const Value, b: *const Value) -> *
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_unchecked_sub(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -686,6 +708,7 @@ pub unsafe extern "C" fn rt_unchecked_sub(a: *const Value, b: *const Value) -> *
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_unchecked_mul(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -702,6 +725,7 @@ pub unsafe extern "C" fn rt_unchecked_mul(a: *const Value, b: *const Value) -> *
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -718,6 +742,7 @@ pub unsafe extern "C" fn rt_div(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -732,6 +757,7 @@ pub unsafe extern "C" fn rt_rem(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_mod(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let args = [unsafe { val_ref(a) }.clone(), unsafe { val_ref(b) }.clone()];
@@ -746,6 +772,7 @@ pub unsafe extern "C" fn rt_mod(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -760,6 +787,7 @@ pub unsafe extern "C" fn rt_eq(a: *const Value, b: *const Value) -> *const Value
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_case_eq(a: *const Value, b: *const Value) -> *const Value {
     let a_val = unsafe { val_ref(a) };
     let b_val = unsafe { val_ref(b) };
@@ -793,6 +821,7 @@ pub unsafe extern "C" fn rt_case_eq(a: *const Value, b: *const Value) -> *const 
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -810,6 +839,7 @@ pub unsafe extern "C" fn rt_lt(a: *const Value, b: *const Value) -> *const Value
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -827,6 +857,7 @@ pub unsafe extern "C" fn rt_gt(a: *const Value, b: *const Value) -> *const Value
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -844,6 +875,7 @@ pub unsafe extern "C" fn rt_lte(a: *const Value, b: *const Value) -> *const Valu
 /// # Safety
 /// Both pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_gte(a: *const Value, b: *const Value) -> *const Value {
     bump_boxed_arith();
     let a = unsafe { val_ref(a) };
@@ -932,6 +964,7 @@ pub extern "C" fn rt_region_start() -> *mut Region {
 /// Must be paired with a prior `rt_region_start` call; `handle` must be that
 /// call's return value.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_region_end(handle: *mut Region) -> *const Value {
     let popped = RT_REGION_STACK.with(|s| s.borrow_mut().pop());
     debug_assert!(
@@ -956,6 +989,7 @@ pub extern "C" fn rt_region_end(handle: *mut Region) -> *const Value {
 /// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
 /// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_region_alloc_vector(
     handle: *mut Region,
     elems: *const *const Value,
@@ -982,6 +1016,7 @@ pub unsafe extern "C" fn rt_region_alloc_vector(
 /// `pairs` must point to `2*n` valid `*const Value` pointers; `handle` must
 /// be a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_region_alloc_map(
     handle: *mut Region,
     pairs: *const *const Value,
@@ -1009,6 +1044,7 @@ pub unsafe extern "C" fn rt_region_alloc_map(
 /// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
 /// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_region_alloc_set(
     handle: *mut Region,
     elems: *const *const Value,
@@ -1035,6 +1071,7 @@ pub unsafe extern "C" fn rt_region_alloc_set(
 /// `elems` must point to `n` valid `*const Value` pointers; `handle` must be
 /// a live region (see [`region_alloc_box`]).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_region_alloc_list(
     handle: *mut Region,
     elems: *const *const Value,
@@ -1061,6 +1098,7 @@ pub unsafe extern "C" fn rt_region_alloc_list(
 /// Both value pointers must be valid; `handle` must be a live region (see
 /// [`region_alloc_box`]).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_region_alloc_cons(
     handle: *mut Region,
     head: *const Value,
@@ -1153,6 +1191,7 @@ pub extern "C" fn rt_scratch_ptr(n_bytes: u32) -> *mut u8 {
 /// `elems` must point to `n` valid `*const Value` pointers, or may be null
 /// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let items: Vec<Value> = if n > 0 {
@@ -1174,6 +1213,7 @@ pub unsafe extern "C" fn rt_alloc_vector(elems: *const *const Value, n: u64) -> 
 /// `pairs` must point to `2*n` valid `*const Value` pointers, or may be null
 /// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let kv_pairs: Vec<(Value, Value)> = if n > 0 {
@@ -1197,6 +1237,7 @@ pub unsafe extern "C" fn rt_alloc_map(pairs: *const *const Value, n: u64) -> *co
 /// `elems` must point to `n` valid `*const Value` pointers, or may be null
 /// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let items: Vec<Value> = if n > 0 {
@@ -1218,6 +1259,7 @@ pub unsafe extern "C" fn rt_alloc_set(elems: *const *const Value, n: u64) -> *co
 /// `elems` must point to `n` valid `*const Value` pointers, or may be null
 /// when `n` is 0 (codegen passes null for empty literals).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *const Value {
     let n = n as usize;
     let items: Vec<Value> = if n > 0 {
@@ -1238,6 +1280,7 @@ pub unsafe extern "C" fn rt_alloc_list(elems: *const *const Value, n: u64) -> *c
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_alloc_cons(head: *const Value, tail: *const Value) -> *const Value {
     let h = unsafe { val_ref(head) }.clone();
     let t = unsafe { val_ref(tail) }.clone();
@@ -1251,6 +1294,7 @@ pub unsafe extern "C" fn rt_alloc_cons(head: *const Value, tail: *const Value) -
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_get(coll: *const Value, key: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     let key = unsafe { val_ref(key) };
@@ -1274,6 +1318,7 @@ pub unsafe extern "C" fn rt_get(coll: *const Value, key: *const Value) -> *const
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     let n = match coll {
@@ -1288,6 +1333,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         // returns 0 for every lazy seq, silently corrupting any
         // `(count (filter …))` computation.
         Value::Cons(_) | Value::LazySeq(_) => {
+            let _root = cljrs_runtime::env::gc_roots::root_value(coll);
             let mut count = 0usize;
             let mut current = coll.clone();
             loop {
@@ -1298,7 +1344,10 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
                         current = c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        current = ls.get().realize();
+                        current = match ls.get().try_realize() {
+                            Ok(value) => value,
+                            Err(error) => return throw_str(error),
+                        };
                     }
                     Value::List(l) => {
                         count += l.get().count();
@@ -1330,6 +1379,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_count_filter(pred: *const Value, coll: *const Value) -> *const Value {
     let pred_ref = unsafe { val_ref(pred) };
     let coll_ref = unsafe { val_ref(coll) };
@@ -1417,6 +1467,7 @@ fn pred_truthy(pred: &Value, elem: &Value) -> Option<bool> {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_into_filter(
     to: *const Value,
     pred: *const Value,
@@ -1482,6 +1533,7 @@ pub unsafe extern "C" fn rt_into_filter(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_into_mapcat(
     to: *const Value,
     f: *const Value,
@@ -1553,8 +1605,9 @@ pub unsafe extern "C" fn rt_into_mapcat(
 /// back to the interpreter.  Unlike [`eager_seq_elems`], this forces lazy
 /// thunks; it is used where the caller is an eager consumer that would fully
 /// realize the source anyway.
-fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
-    match coll {
+fn realize_seq_elems(coll: &Value) -> Result<Option<Vec<Value>>, String> {
+    let _root = cljrs_runtime::env::gc_roots::root_value(coll);
+    Ok(match coll {
         Value::Vector(v) => Some(v.get().iter().cloned().collect()),
         Value::Set(s) => Some(s.iter().cloned().collect()),
         Value::List(l) => Some(l.get().iter().cloned().collect()),
@@ -1570,7 +1623,7 @@ fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
                         current = c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        current = ls.get().realize();
+                        current = ls.get().try_realize()?;
                     }
                     Value::List(l) => {
                         out.extend(l.get().iter().cloned());
@@ -1580,13 +1633,13 @@ fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
                         out.extend(v.get().iter().cloned());
                         break;
                     }
-                    _ => return None,
+                    _ => return Ok(None),
                 }
             }
             Some(out)
         }
         _ => None,
-    }
+    })
 }
 
 /// `(into to (map f coll))` fused — eager, region-aware, and realizes lazy
@@ -1604,6 +1657,7 @@ fn realize_seq_elems(coll: &Value) -> Option<Vec<Value>> {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_into_map(
     to: *const Value,
     f: *const Value,
@@ -1613,7 +1667,11 @@ pub unsafe extern "C" fn rt_into_map(
     let f_ref = unsafe { val_ref(f) };
     let coll_ref = unsafe { val_ref(coll) };
 
-    let Some(elems) = realize_seq_elems(coll_ref) else {
+    let elems = match realize_seq_elems(coll_ref) {
+        Ok(elems) => elems,
+        Err(error) => return throw_str(error),
+    };
+    let Some(elems) = elems else {
         let to_val = to_ref.clone();
         let f_val = f_ref.clone();
         let coll_val = coll_ref.clone();
@@ -1690,6 +1748,7 @@ pub unsafe extern "C" fn rt_into_map(
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     let empty = match coll {
@@ -1709,6 +1768,7 @@ pub unsafe extern "C" fn rt_is_empty(coll: *const Value) -> *const Value {
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) }.unwrap_meta();
     match coll_ref {
@@ -1722,7 +1782,11 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
         Value::Nil => intern_nil(),
         // Lazy sequences: realize one step, then take the first of that.
         Value::LazySeq(ls) => {
-            let realized = box_val(ls.get().realize());
+            let _root = cljrs_runtime::env::gc_roots::root_value(coll_ref);
+            let realized = match ls.get().try_realize() {
+                Ok(value) => box_val(value),
+                Err(error) => return throw_str(error),
+            };
             unsafe { rt_first(realized) }
         }
         // Other seqables (String, Map, Set): `seq` them into a List first, then
@@ -1741,6 +1805,7 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) }.unwrap_meta();
     match coll_ref {
@@ -1763,7 +1828,11 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
         Value::Nil => box_coll_val(Value::List(alloc_inner_coll(PersistentList::empty()))),
         // Lazy sequences: realize one step, then take the rest of that.
         Value::LazySeq(ls) => {
-            let realized = box_val(ls.get().realize());
+            let _root = cljrs_runtime::env::gc_roots::root_value(coll_ref);
+            let realized = match ls.get().try_realize() {
+                Ok(value) => box_val(value),
+                Err(error) => return throw_str(error),
+            };
             unsafe { rt_rest(realized) }
         }
         // Other seqables (String, Map, Set): `seq` them into a List first, then
@@ -1789,6 +1858,7 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_next(coll: *const Value) -> *const Value {
     let rest = unsafe { rt_rest(coll) };
     unsafe { rt_seq(rest) }
@@ -1799,6 +1869,7 @@ pub unsafe extern "C" fn rt_next(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_assoc(
     m: *const Value,
     k: *const Value,
@@ -1838,6 +1909,7 @@ pub unsafe extern "C" fn rt_assoc(
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) };
     let meta = coll_ref.get_meta().cloned();
@@ -1908,6 +1980,7 @@ fn notify_closure_escape() {
 /// `fn_ptr` must be a valid function pointer with the expected signature.
 /// `captures` must point to `ncaptures` valid `*const Value` pointers.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_make_fn(
     name_ptr: *const u8,
     name_len: u64,
@@ -1940,6 +2013,7 @@ pub unsafe extern "C" fn rt_make_fn(
     let total_params = ncaptures + param_count;
 
     let native_fn = cljrs_value::NativeFn {
+        blocking_func: None,
         name: name.clone(),
         arity: cljrs_value::Arity::Fixed(param_count),
         func: Arc::new(move |args: &[Value]| {
@@ -1985,6 +2059,7 @@ pub unsafe extern "C" fn rt_make_fn(
 /// # Safety
 /// All pointer parameters must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_make_fn_variadic(
     name_ptr: *const u8,
     name_len: u64,
@@ -2016,6 +2091,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
     let total_compiled_params = ncaptures + fixed_count + 1;
 
     let native_fn = cljrs_value::NativeFn {
+        blocking_func: None,
         name: name.clone(),
         arity: cljrs_value::Arity::Variadic { min: fixed_count },
         func: Arc::new(move |args: &[Value]| {
@@ -2067,6 +2143,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 /// # Safety
 /// All pointer parameters must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_make_fn_multi(
     name_ptr: *const u8,
     name_len: u64,
@@ -2121,6 +2198,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
 
     let fn_name = name.clone();
     let native_fn = cljrs_value::NativeFn {
+        blocking_func: None,
         name,
         arity,
         func: Arc::new(move |args: &[Value]| {
@@ -2471,6 +2549,7 @@ unsafe fn rt_call_compiled(
 /// # Safety
 /// String pointers must be valid UTF-8.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_load_global(
     ns_ptr: *const u8,
     ns_len: u64,
@@ -2567,6 +2646,7 @@ fn resolve_versioned_boxed(ns_part: &str, name: &str, commit: &str) -> *const Va
 /// # Safety
 /// String pointers must be valid UTF-8.  `val` must be a valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_def_var(
     ns_ptr: *const u8,
     ns_len: u64,
@@ -2597,6 +2677,7 @@ pub unsafe extern "C" fn rt_def_var(
 /// # Safety
 /// String pointers must be valid UTF-8.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_load_var(
     ns_ptr: *const u8,
     ns_len: u64,
@@ -2641,6 +2722,7 @@ pub unsafe extern "C" fn rt_load_var(
 /// `callee` must be a valid `*const Value` pointing to a callable.
 /// `args` must point to `nargs` valid `*const Value` pointers.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_call(
     callee: *const Value,
     args: *const *const Value,
@@ -2698,6 +2780,7 @@ pub unsafe extern "C" fn rt_call(
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) }.clone();
     match cljrs_runtime::interp::eval::deref_value(v) {
@@ -2713,6 +2796,7 @@ pub unsafe extern "C" fn rt_deref(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
     cljrs_runtime::builtins::builtins::emit_output_ln(&format!("{}", PrintValue(v)));
@@ -2724,6 +2808,7 @@ pub unsafe extern "C" fn rt_println(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_pr(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
     cljrs_runtime::builtins::builtins::emit_output(&format!("{v}"));
@@ -2735,6 +2820,7 @@ pub unsafe extern "C" fn rt_pr(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_is_nil(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Nil))
 }
@@ -2742,6 +2828,7 @@ pub unsafe extern "C" fn rt_is_nil(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_is_seq(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
     intern_bool(matches!(
@@ -2753,6 +2840,7 @@ pub unsafe extern "C" fn rt_is_seq(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_is_vector(v: *const Value) -> *const Value {
     intern_bool(matches!(
         unsafe { val_ref(v) }.unwrap_meta(),
@@ -2763,6 +2851,7 @@ pub unsafe extern "C" fn rt_is_vector(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }.unwrap_meta(), Value::Map(_)))
 }
@@ -2774,6 +2863,7 @@ pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_identical(a: *const Value, b: *const Value) -> *const Value {
     intern_bool(std::ptr::eq(a, b))
 }
@@ -2785,6 +2875,7 @@ pub unsafe extern "C" fn rt_identical(a: *const Value, b: *const Value) -> *cons
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_str(v: *const Value) -> *const Value {
     let v = unsafe { val_ref(v) };
     let s = format!("{}", PrintValue(v));
@@ -2796,6 +2887,7 @@ pub unsafe extern "C" fn rt_str(v: *const Value) -> *const Value {
 /// # Safety
 /// `elems` must point to `n` valid `*const Value` pointers.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_str_n(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     let mut result = String::new();
@@ -2812,6 +2904,7 @@ pub unsafe extern "C" fn rt_str_n(elems: *const *const Value, n: i64) -> *const 
 /// # Safety
 /// `elems` must point to `n` valid `*const Value` pointers.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     let s: String = args
@@ -2830,6 +2923,7 @@ pub unsafe extern "C" fn rt_println_n(elems: *const *const Value, n: i64) -> *co
 /// # Safety
 /// `body_fn` must be a valid pointer to a Value (a callable).
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_with_out_str(body_fn: *const Value) -> *const Value {
     let f = unsafe { val_ref(body_fn) }.clone();
     cljrs_runtime::builtins::builtins::push_output_capture();
@@ -2845,6 +2939,7 @@ pub unsafe extern "C" fn rt_with_out_str(body_fn: *const Value) -> *const Value 
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_dissoc(m: *const Value, k: *const Value) -> *const Value {
     let m_ref = unsafe { val_ref(m) };
     let meta = m_ref.get_meta().cloned();
@@ -2863,6 +2958,7 @@ pub unsafe extern "C" fn rt_dissoc(m: *const Value, k: *const Value) -> *const V
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_disj(set: *const Value, val: *const Value) -> *const Value {
     let set_ref = unsafe { val_ref(set) };
     let meta = set_ref.get_meta().cloned();
@@ -2881,6 +2977,7 @@ pub unsafe extern "C" fn rt_disj(set: *const Value, val: *const Value) -> *const
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     let idx = unsafe { val_ref(idx) };
@@ -2916,8 +3013,13 @@ pub unsafe extern "C" fn rt_nth(coll: *const Value, idx: *const Value) -> *const
 /// # Safety
 /// `rest` must point to a valid, live [`Value`].
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_kwargs_map(rest: *const Value) -> *const Value {
-    let items = cljrs_runtime::interp::destructure::value_to_seq_vec(unsafe { val_ref(rest) });
+    let items = match cljrs_runtime::interp::destructure::value_to_seq_vec(unsafe { val_ref(rest) })
+    {
+        Ok(items) => items,
+        Err(error) => return throw_str(error.to_string()),
+    };
     match Value::from_kwargs_rest(items) {
         // The result is a map the caller just built, or — for a single trailing
         // argument — that argument passed through, which may be any value
@@ -2932,6 +3034,7 @@ pub unsafe extern "C" fn rt_kwargs_map(rest: *const Value) -> *const Value {
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     let key = unsafe { val_ref(key) };
@@ -2958,6 +3061,7 @@ pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) }.unwrap_meta();
     match coll_ref {
@@ -3019,6 +3123,7 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
 /// # Safety
 /// `thunk_fn` must be a valid pointer to a callable Value.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
     use cljrs_value::types::{LazySeq, Thunk};
 
@@ -3056,6 +3161,7 @@ pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
 /// # Safety
 /// `coll` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_transient(coll: *const Value) -> *const Value {
     use cljrs_value::collections::{TransientMap, TransientSet, TransientVector};
 
@@ -3079,6 +3185,7 @@ pub unsafe extern "C" fn rt_transient(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_assoc_bang(
     t: *const Value,
     k: *const Value,
@@ -3107,6 +3214,7 @@ pub unsafe extern "C" fn rt_assoc_bang(
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_conj_bang(t: *const Value, v: *const Value) -> *const Value {
     let t = unsafe { val_ref(t) };
     let v = unsafe { val_ref(v) }.clone();
@@ -3139,6 +3247,7 @@ pub unsafe extern "C" fn rt_conj_bang(t: *const Value, v: *const Value) -> *cons
 /// # Safety
 /// `t` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
     let t = unsafe { val_ref(t) };
     match t {
@@ -3165,6 +3274,7 @@ pub unsafe extern "C" fn rt_persistent_bang(t: *const Value) -> *const Value {
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) -> *const Value {
     let atom = unsafe { val_ref(atom) };
     let val = unsafe { val_ref(val) }.clone();
@@ -3187,6 +3297,7 @@ pub unsafe extern "C" fn rt_atom_reset(atom: *const Value, val: *const Value) ->
 /// `atom` and `f` must be valid pointers.
 /// `extra_args` must point to `nextra` valid pointers.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_atom_swap(
     atom: *const Value,
     f: *const Value,
@@ -3265,38 +3376,16 @@ pub unsafe extern "C" fn rt_atom_swap(
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_apply(f: *const Value, arglist: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
     let arglist = unsafe { val_ref(arglist) };
 
-    // Collect the arg list into a Vec.
-    let mut args = Vec::new();
-    let mut current = arglist.clone();
-    loop {
-        match &current {
-            Value::Nil => break,
-            Value::List(l) => {
-                for item in l.get().iter() {
-                    args.push(item.clone());
-                }
-                break;
-            }
-            Value::Vector(v) => {
-                for item in v.get().iter() {
-                    args.push(item.clone());
-                }
-                break;
-            }
-            Value::Cons(c) => {
-                args.push(c.get().head.clone());
-                current = c.get().tail.clone();
-            }
-            Value::LazySeq(ls) => {
-                current = ls.get().realize();
-            }
-            _ => break,
-        }
-    }
+    let _root = cljrs_runtime::env::gc_roots::root_value(&f);
+    let args = match cljrs_runtime::interp::destructure::value_to_seq_vec(arglist) {
+        Ok(args) => args,
+        Err(error) => return throw_str(error.to_string()),
+    };
 
     match cljrs_runtime::env::callback::invoke(&f, args) {
         Ok(result) => box_val(result),
@@ -3337,6 +3426,7 @@ fn call_global_fn(ns: &str, name: &str, args: Vec<Value>) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_reduce2(f: *const Value, coll: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3348,6 +3438,7 @@ pub unsafe extern "C" fn rt_reduce2(f: *const Value, coll: *const Value) -> *con
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_reduce3(
     f: *const Value,
     init: *const Value,
@@ -3363,6 +3454,7 @@ pub unsafe extern "C" fn rt_reduce3(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_map(f: *const Value, coll: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3373,6 +3465,7 @@ pub unsafe extern "C" fn rt_map(f: *const Value, coll: *const Value) -> *const V
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_filter(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3383,6 +3476,7 @@ pub unsafe extern "C" fn rt_filter(pred: *const Value, coll: *const Value) -> *c
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_mapv(f: *const Value, coll: *const Value) -> *const Value {
     let f = unsafe { val_ref(f) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3393,6 +3487,7 @@ pub unsafe extern "C" fn rt_mapv(f: *const Value, coll: *const Value) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_filterv(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3403,6 +3498,7 @@ pub unsafe extern "C" fn rt_filterv(pred: *const Value, coll: *const Value) -> *
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_some(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3413,6 +3509,7 @@ pub unsafe extern "C" fn rt_some(pred: *const Value, coll: *const Value) -> *con
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *const Value {
     let pred = unsafe { val_ref(pred) }.clone();
     let coll = unsafe { val_ref(coll) }.clone();
@@ -3423,6 +3520,7 @@ pub unsafe extern "C" fn rt_every(pred: *const Value, coll: *const Value) -> *co
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const Value {
     let to_ref = unsafe { val_ref(to) };
     let from_ref = unsafe { val_ref(from) };
@@ -3524,6 +3622,7 @@ fn as_pair(v: &Value) -> Option<(Value, Value)> {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_into3(
     to: *const Value,
     xform: *const Value,
@@ -3539,6 +3638,7 @@ pub unsafe extern "C" fn rt_into3(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) };
     match coll_ref {
@@ -3561,6 +3661,7 @@ pub unsafe extern "C" fn rt_peek(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) };
     match coll_ref {
@@ -3579,6 +3680,7 @@ pub unsafe extern "C" fn rt_pop(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
     let coll_ref = unsafe { val_ref(coll) };
     match coll_ref {
@@ -3595,6 +3697,7 @@ pub unsafe extern "C" fn rt_vec(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *const Value {
     let f_ref = unsafe { val_ref(f) };
     let coll_ref = unsafe { val_ref(coll) };
@@ -3631,6 +3734,7 @@ pub unsafe extern "C" fn rt_mapcat(f: *const Value, coll: *const Value) -> *cons
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *const Value {
     let n_ref = unsafe { val_ref(n) };
     let f_ref = unsafe { val_ref(f) };
@@ -3673,6 +3777,7 @@ pub unsafe extern "C" fn rt_repeatedly(n: *const Value, f: *const Value) -> *con
 /// # Safety
 /// Both pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_set_bang(var_ptr: *const Value, val_ptr: *const Value) -> *const Value {
     let var_val = unsafe { val_ref(var_ptr) };
     let val = unsafe { val_ref(val_ptr) }.clone();
@@ -3701,6 +3806,7 @@ pub unsafe extern "C" fn rt_set_bang(var_ptr: *const Value, val_ptr: *const Valu
 /// `bindings` must point to `2 * npairs` valid `*const Value` pointers.
 /// `body_fn` must be a valid `*const Value` pointing to a callable.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_with_bindings(
     bindings: *const *const Value,
     npairs: u64,
@@ -3755,6 +3861,7 @@ cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCE
 /// # Safety
 /// `val` must be a valid pointer to a live `Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_throw(val: *const Value) -> *const Value {
     PENDING_EXCEPTION.with(|cell| {
         *cell.borrow_mut() = Some(val);
@@ -3790,6 +3897,7 @@ pub(crate) fn take_pending_exception_value() -> Option<Value> {
 /// # Safety
 /// All pointers must be valid `*const Value`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_try(
     body_fn: *const Value,
     catch_fn: *const Value,
@@ -3863,6 +3971,7 @@ pub unsafe extern "C" fn rt_try(
 
 /// `(group-by f coll)`
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_group_by(f: *const Value, coll: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -3871,6 +3980,7 @@ pub extern "C" fn rt_group_by(f: *const Value, coll: *const Value) -> *const Val
 
 /// `(partition n coll)`
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_partition2(n: *const Value, coll: *const Value) -> *const Value {
     let nv = unsafe { val_ref(n) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -3879,6 +3989,7 @@ pub extern "C" fn rt_partition2(n: *const Value, coll: *const Value) -> *const V
 
 /// `(partition n step coll)`
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_partition3(
     n: *const Value,
     step: *const Value,
@@ -3892,6 +4003,7 @@ pub extern "C" fn rt_partition3(
 
 /// `(partition n step pad coll)`
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_partition4(
     n: *const Value,
     step: *const Value,
@@ -3909,6 +4021,7 @@ pub extern "C" fn rt_partition4(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_frequencies(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
     call_global_fn("clojure.core", "frequencies", vec![cv])
@@ -3918,6 +4031,7 @@ pub extern "C" fn rt_frequencies(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_keep(f: *const Value, coll: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -3928,6 +4042,7 @@ pub extern "C" fn rt_keep(f: *const Value, coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_remove(pred: *const Value, coll: *const Value) -> *const Value {
     let pv = unsafe { val_ref(pred) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -3938,6 +4053,7 @@ pub extern "C" fn rt_remove(pred: *const Value, coll: *const Value) -> *const Va
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_map_indexed(f: *const Value, coll: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -3948,6 +4064,7 @@ pub extern "C" fn rt_map_indexed(f: *const Value, coll: *const Value) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Value {
     let kv = unsafe { val_ref(keys) }.clone();
     let vv = unsafe { val_ref(vals) }.clone();
@@ -3958,6 +4075,7 @@ pub extern "C" fn rt_zipmap(keys: *const Value, vals: *const Value) -> *const Va
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_juxt(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "juxt", args)
@@ -3967,6 +4085,7 @@ pub unsafe extern "C" fn rt_juxt(elems: *const *const Value, n: i64) -> *const V
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_comp(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "comp", args)
@@ -3976,6 +4095,7 @@ pub unsafe extern "C" fn rt_comp(elems: *const *const Value, n: i64) -> *const V
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_partial(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "partial", args)
@@ -3986,6 +4106,7 @@ pub unsafe extern "C" fn rt_partial(elems: *const *const Value, n: i64) -> *cons
 /// # Safety
 /// `f` must be a valid pointer to a callable Value.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
     let fv = unsafe { val_ref(f) }.clone();
     call_global_fn("clojure.core", "complement", vec![fv])
@@ -3997,6 +4118,7 @@ pub extern "C" fn rt_complement(f: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_concat(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "concat", args)
@@ -4006,6 +4128,7 @@ pub unsafe extern "C" fn rt_concat(elems: *const *const Value, n: i64) -> *const
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_range1(end: *const Value) -> *const Value {
     let e = unsafe { val_ref(end) }.clone();
     call_global_fn("clojure.core", "range", vec![e])
@@ -4015,6 +4138,7 @@ pub unsafe extern "C" fn rt_range1(end: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_range2(start: *const Value, end: *const Value) -> *const Value {
     let s = unsafe { val_ref(start) }.clone();
     let e = unsafe { val_ref(end) }.clone();
@@ -4025,6 +4149,7 @@ pub unsafe extern "C" fn rt_range2(start: *const Value, end: *const Value) -> *c
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_range3(
     start: *const Value,
     end: *const Value,
@@ -4040,6 +4165,7 @@ pub unsafe extern "C" fn rt_range3(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_take(n: *const Value, coll: *const Value) -> *const Value {
     let nv = unsafe { val_ref(n) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -4050,6 +4176,7 @@ pub unsafe extern "C" fn rt_take(n: *const Value, coll: *const Value) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_drop(n: *const Value, coll: *const Value) -> *const Value {
     let nv = unsafe { val_ref(n) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -4060,6 +4187,7 @@ pub unsafe extern "C" fn rt_drop(n: *const Value, coll: *const Value) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_reverse(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
     call_global_fn("clojure.core", "reverse", vec![cv])
@@ -4069,6 +4197,7 @@ pub unsafe extern "C" fn rt_reverse(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_sort(coll: *const Value) -> *const Value {
     let cv = unsafe { val_ref(coll) }.clone();
     call_global_fn("clojure.core", "sort", vec![cv])
@@ -4078,6 +4207,7 @@ pub unsafe extern "C" fn rt_sort(coll: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_sort_by(keyfn: *const Value, coll: *const Value) -> *const Value {
     let kf = unsafe { val_ref(keyfn) }.clone();
     let cv = unsafe { val_ref(coll) }.clone();
@@ -4090,6 +4220,7 @@ pub unsafe extern "C" fn rt_sort_by(keyfn: *const Value, coll: *const Value) -> 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_keys(m: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
     call_global_fn("clojure.core", "keys", vec![mv])
@@ -4099,6 +4230,7 @@ pub unsafe extern "C" fn rt_keys(m: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
     call_global_fn("clojure.core", "vals", vec![mv])
@@ -4108,6 +4240,7 @@ pub unsafe extern "C" fn rt_vals(m: *const Value) -> *const Value {
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_merge(elems: *const *const Value, n: i64) -> *const Value {
     let args = unsafe { collect_args(elems, n) };
     call_global_fn("clojure.core", "merge", args)
@@ -4117,6 +4250,7 @@ pub unsafe extern "C" fn rt_merge(elems: *const *const Value, n: i64) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_update(
     m: *const Value,
     k: *const Value,
@@ -4132,6 +4266,7 @@ pub unsafe extern "C" fn rt_update(
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_get_in(m: *const Value, ks: *const Value) -> *const Value {
     let mv = unsafe { val_ref(m) }.clone();
     let kv = unsafe { val_ref(ks) }.clone();
@@ -4142,6 +4277,7 @@ pub unsafe extern "C" fn rt_get_in(m: *const Value, ks: *const Value) -> *const 
 /// # Safety
 /// All pointers must be valid.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_assoc_in(
     m: *const Value,
     ks: *const Value,
@@ -4158,6 +4294,7 @@ pub unsafe extern "C" fn rt_assoc_in(
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     intern_bool(matches!(val, Value::Long(_) | Value::Double(_)))
@@ -4166,6 +4303,7 @@ pub extern "C" fn rt_is_number(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_string(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Str(_)))
 }
@@ -4173,6 +4311,7 @@ pub extern "C" fn rt_is_string(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_keyword(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Keyword(_)))
 }
@@ -4180,6 +4319,7 @@ pub extern "C" fn rt_is_keyword(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_symbol(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Symbol(_)))
 }
@@ -4187,6 +4327,7 @@ pub extern "C" fn rt_is_symbol(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_bool(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Bool(_)))
 }
@@ -4194,6 +4335,7 @@ pub extern "C" fn rt_is_bool(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
     intern_bool(matches!(unsafe { val_ref(v) }, Value::Long(_)))
 }
@@ -4205,6 +4347,7 @@ pub extern "C" fn rt_is_int(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     cljrs_runtime::builtins::builtins::emit_output_ln(&format!("{val}"));
@@ -4216,6 +4359,7 @@ pub extern "C" fn rt_prn(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_print(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) };
     cljrs_runtime::builtins::builtins::emit_output(&format!("{}", PrintValue(val)));
@@ -4229,6 +4373,7 @@ pub extern "C" fn rt_print(v: *const Value) -> *const Value {
 /// # Safety
 /// `v` must be a valid pointer.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_atom(v: *const Value) -> *const Value {
     let val = unsafe { val_ref(v) }.clone();
     call_global_fn("clojure.core", "atom", vec![val])
@@ -4496,6 +4641,7 @@ pub unsafe extern "C" fn rt_coerce_double(v: *const Value) -> f64 {
 
 /// Box a raw boolean (0/1) as an interned `Value::Bool`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
     intern_bool(b != 0)
 }
@@ -4532,6 +4678,7 @@ pub(crate) fn deopt_sentinel_addr() -> usize {
 
 /// Entry-guard failure: count it and return the deopt sentinel.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_deopt() -> *const Value {
     jit_stats::GUARD_DEOPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     deopt_sentinel()
@@ -4702,6 +4849,7 @@ fn intern_keyword(name: &str) -> *const Value {
 /// `ptr`/`len` must describe valid UTF-8; `slot` must point to the call
 /// site's 8-byte data slot.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usize) -> *const Value {
     jit_stats::KW_IC_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
@@ -4731,6 +4879,7 @@ pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usiz
 /// `ns_ptr`/`name_ptr` must describe valid UTF-8; `slot` must point to the
 /// call site's 8-byte data slot.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_load_global_versioned_ic(
     ns_ptr: *const u8,
     ns_len: u64,
@@ -4823,6 +4972,7 @@ fn invoke_boxed(callee: &Value, args: Vec<Value>) -> *const Value {
 /// Same contract as `rt_call`, plus `slot` must point to the call site's
 /// 8-byte data slot.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_call_ic(
     callee: *const Value,
     args: *const *const Value,
@@ -4970,6 +5120,7 @@ pub extern "C" fn rt_state_store(sm: *mut CljxStateMachine, slot: u32, val: *con
 /// # Safety
 /// `sm` must be live and `slot` in range.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_state_load(sm: *mut CljxStateMachine, slot: u32) -> *const Value {
     let sm = unsafe { &*sm };
     box_val(sm.slots[slot as usize].clone())
@@ -5026,6 +5177,7 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
 /// # Safety
 /// `sm` must point to a live `CljxStateMachine`.
 #[unsafe(no_mangle)]
+#[cljrs_export_macro::catch_realization(throw_str)]
 pub extern "C" fn rt_async_take_result(sm: *mut CljxStateMachine) -> *const Value {
     let sm = unsafe { &*sm };
     box_val(sm.pending.clone())
@@ -5092,6 +5244,161 @@ mod async_sm_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boxed_abi_bridges_have_realization_boundaries() {
+        let source = include_str!("rt_abi.rs");
+        let mut checked = 0;
+        for item in source.split(concat!("#[unsafe", "(no_mangle)]")).skip(1) {
+            let signature = item.split('{').next().unwrap();
+            if signature.contains("extern \"C\"") && signature.contains("-> *const Value") {
+                checked += 1;
+                assert!(
+                    signature.contains("catch_realization(throw_str)"),
+                    "missing boundary: {signature}"
+                );
+            }
+        }
+        assert!(checked > 100, "ABI scanner must inspect every boxed bridge");
+    }
+
+    // Run the extern-C calls in a subprocess: a regression must fail this
+    // test instead of aborting the complete compiler test runner.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn lazy_realization_abi_subprocess() {
+        const CHILD: &str = "CLJRS_TEST_LAZY_ABI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rt_abi::tests::lazy_realization_abi_subprocess",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("ABI child blocked the carrier instead of reporting an error");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "ABI child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[derive(Debug)]
+        struct GateThunk(std::cell::RefCell<Option<tokio::sync::oneshot::Receiver<()>>>);
+        impl cljrs_gc::Trace for GateThunk {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl cljrs_value::Thunk for GateThunk {
+            fn force(&self) -> Result<Value, String> {
+                let receiver = self.0.borrow_mut().take().unwrap();
+                cljrs_async::fiber::park_on(receiver).unwrap();
+                Ok(Value::List(GcPtr::new(PersistentList::from_iter([
+                    Value::Long(42),
+                ]))))
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let _mutator = cljrs_gc::register_mutator();
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                tokio::task::LocalSet::new().block_on(&rt, async {
+                    let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                        runtime.globals().clone(),
+                        "user".into(),
+                    );
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let lazy = Value::LazySeq(GcPtr::new(cljrs_value::LazySeq::new(Box::new(
+                        GateThunk(std::cell::RefCell::new(Some(receiver))),
+                    ))));
+                    let _root = cljrs_runtime::env::gc_roots::root_value(&lazy);
+                    let copy = lazy.clone();
+                    let owner = cljrs_async::fiber::spawn_rooted(vec![copy.clone()], move || {
+                        let Value::LazySeq(cell) = copy else {
+                            unreachable!()
+                        };
+                        cell.get()
+                            .try_realize()
+                            .map_err(cljrs_runtime::env::error::EvalError::Runtime)
+                    })
+                    .unwrap();
+                    tokio::task::yield_now().await;
+                    let f = Value::NativeFunction(GcPtr::new(cljrs_value::NativeFn::new(
+                        "identity",
+                        cljrs_value::Arity::Fixed(1),
+                        |args| Ok(args[0].clone()),
+                    )));
+                    let _fn_root = cljrs_runtime::env::gc_roots::root_value(&f);
+                    let to = Value::Vector(GcPtr::new(PersistentVector::empty()));
+                    let _to_root = cljrs_runtime::env::gc_roots::root_value(&to);
+                    for op in 0..9 {
+                        assert!(take_pending_exception_value().is_none());
+                        let result = unsafe {
+                            match op {
+                                0 => rt_count(&lazy),
+                                1 => rt_first(&lazy),
+                                2 => rt_rest(&lazy),
+                                3 => rt_apply(&f, &lazy),
+                                4 => rt_into_map(&to, &f, &lazy),
+                                5 => rt_kwargs_map(&lazy),
+                                6 => rt_eq(&lazy, &to),
+                                7 => rt_str(&lazy),
+                                8 => {
+                                    let hash = runtime
+                                        .globals()
+                                        .lookup_in_ns("clojure.core", "hash")
+                                        .unwrap();
+                                    rt_call(&hash, [&lazy as *const Value].as_ptr(), 1)
+                                }
+                                _ => unreachable!(),
+                            }
+                        };
+                        assert!(matches!(unsafe { val_ref(result) }, Value::Nil));
+                        let error =
+                            take_pending_exception_value().expect("pending realization error");
+                        let Value::Error(error) = error else {
+                            panic!("expected structured error")
+                        };
+                        assert!(error.get().message().contains("parked fiber"));
+                        let Value::LazySeq(cell) = &lazy else {
+                            unreachable!()
+                        };
+                        assert!(
+                            cell.get().error().is_none(),
+                            "rejected wait must not poison the thunk"
+                        );
+                    }
+                    sender.send(()).unwrap();
+                    owner.await.unwrap().into_result().unwrap();
+                    assert_eq!(unsafe { val_ref(rt_count(&lazy)) }, &Value::Long(1));
+                    assert_eq!(unsafe { val_ref(rt_first(&lazy)) }, &Value::Long(42));
+                    assert_eq!(unsafe { val_ref(rt_apply(&f, &lazy)) }, &Value::Long(42));
+                    assert!(take_pending_exception_value().is_none());
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn test_const_nil() {

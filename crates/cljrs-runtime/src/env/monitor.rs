@@ -144,6 +144,100 @@ impl Drop for MonitorGuard {
     }
 }
 
+#[derive(Default)]
+struct MonitorState {
+    held: Vec<(MonitorGuard, Value)>,
+    legacy_async: bool,
+}
+thread_local! {
+    static HELD_MONITORS: std::cell::RefCell<MonitorState> = const { std::cell::RefCell::new(MonitorState { held: Vec::new(), legacy_async: false }) };
+}
+cljrs_gc::mutator_slot!("cljrs-runtime/HELD_MONITORS", refcell HELD_MONITORS: MonitorState, trace trace_held);
+fn trace_held(state: &MonitorState, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    for (_, value) in &state.held {
+        value.trace(visitor);
+    }
+}
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn trace_current(visitor: &mut cljrs_gc::MarkVisitor) {
+    HELD_MONITORS.with(|held| trace_held(&held.borrow(), visitor));
+}
+
+// Legacy async tasks share the root mutator and cannot retain explicit
+// ownership across a yield. Fibers have their own monitor state and can.
+fn ensure_explicit_owner() -> ValueResult<()> {
+    if cljrs_value::parking::current().is_none()
+        && (HELD_MONITORS.with(|state| state.borrow().legacy_async)
+            || crate::env::callback::current_is_async())
+    {
+        return Err(ValueError::Other(
+            "explicit monitors require a synchronous context or a fiber".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mark one poll of a legacy async task. Explicit monitors are rejected even
+/// when that task calls a synchronous helper. Drop restores the caller's state.
+#[must_use]
+pub struct AsyncMonitorScope {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl AsyncMonitorScope {
+    pub fn enter() -> Self {
+        Self {
+            previous: HELD_MONITORS
+                .with(|state| std::mem::replace(&mut state.borrow_mut().legacy_async, true)),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for AsyncMonitorScope {
+    fn drop(&mut self) {
+        HELD_MONITORS.with(|state| state.borrow_mut().legacy_async = self.previous);
+    }
+}
+
+/// Acquire an explicit monitor for this computation until `monitor_exit`.
+pub fn monitor_enter(value: &Value) -> ValueResult<()> {
+    ensure_explicit_owner()?;
+    cljrs_gc::region::poison_active_regions();
+    let guard = enter(value)?;
+    HELD_MONITORS.with(|held| held.borrow_mut().held.push((guard, value.clone())));
+    Ok(())
+}
+
+/// Release one explicit acquisition. Reject objects this computation does not own.
+pub fn monitor_exit(value: &Value) -> ValueResult<()> {
+    ensure_explicit_owner()?;
+    let key = key(value)?;
+    let entry = HELD_MONITORS.with(|held| {
+        let mut state = held.borrow_mut();
+        let held = &mut state.held;
+        let index = held
+            .iter()
+            .rposition(|(guard, _)| guard.0.key == key)
+            .ok_or_else(|| {
+                ValueError::Other("monitor-exit: this computation does not own the monitor".into())
+            })?;
+        Ok(held.remove(index))
+    });
+    let entry: (MonitorGuard, Value) = entry?;
+    drop(entry);
+    Ok(())
+}
+
+/// Release unmatched explicit acquisitions on fiber completion or cancellation.
+pub struct MonitorCleanup;
+impl Drop for MonitorCleanup {
+    fn drop(&mut self) {
+        let held = HELD_MONITORS.with(|held| std::mem::take(&mut held.borrow_mut().held));
+        drop(held);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

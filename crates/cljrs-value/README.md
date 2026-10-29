@@ -29,6 +29,7 @@ src/
   parking.rs                     — optional executor hooks, notification events, borrowed future parking, and Send-only blocking work
   publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
+  realization.rs                 — fallible boundaries for equality, hashing, and formatting through Rust traits
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
   symbol.rs                      — Symbol { namespace, name }
   type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
@@ -980,3 +981,41 @@ re-exports `deps` for that reason.
 The one crate where the swap cannot pay is the CLI: `cljrs` depends on
 `cljrs-project` with `vcs`/`vcs-net`/`ssh` unconditionally, so `pgp` — and with it
 `regex` — is always in that binary.
+
+## Realization errors in Rust traits
+
+`realization::catch<T>(operation: impl FnOnce() -> T) -> Result<T, String>`
+reports lazy realization errors from equality, hashing, and formatting.
+These traits stop immediately on an error through a private unwind payload.
+The boundary catches only that payload. Ordinary panics and fiber cancellation continue unwinding.
+`NativeFn::new` and `NativeFn::with_closure` convert these errors to `ValueError::Other`.
+The evaluator and compiler ABI also install realization boundaries.
+Rust embedders can use `realization::catch(|| format!("{value}"))` for fallible printing.
+
+`realization::is_inert(&Value) -> bool` identifies scalar values whose equality, hash, and display cannot run user code.
+Transient maps and sets use in-place updates and direct lookups while all keys meet this condition.
+Other operations compute from traced snapshots outside their locks.
+An update retries if another computation changes the collection during realization.
+A failed realization does not change or poison a transient collection.
+
+Snapshots use stable host storage and the per-mutator `SNAPSHOT_ROOTS` shadow stack.
+They create no managed boxes. `collections::trace_snapshots(&mut MarkVisitor)` traces the active snapshots for runtime collectors.
+Detached mutator states trace snapshots in suspended fibers.
+Object-array hashing copies its vector once. Transient-vector hashing shares the existing persistent vector storage.
+
+## Native blocking adapters
+
+`NativeFn` has an optional `blocking_func: Option<NativeFnFunc>` field.
+`NativeFn::new` and `NativeFn::with_closure` leave this field empty.
+Compiled Clojure closures also leave it empty.
+
+`NativeFn::with_blocking(name, arity, func, blocking_func) -> NativeFn`
+registers separate ordinary and blocking adapters.
+Both adapters take `&[Value]` and return `ValueResult<Value>` on the isolate.
+The blocking adapter must convert inputs before it offloads owned Rust work.
+It must convert results after the worker returns.
+
+`NativeFn::call_blocking(&self, args: &[Value]) -> ValueResult<Value>`
+checks arity and rejects a missing adapter before execution.
+Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
+Ordinary `func` calls retain their original behavior.
