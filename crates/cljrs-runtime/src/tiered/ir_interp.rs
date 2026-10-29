@@ -167,6 +167,12 @@ fn region_alloc_val<T: cljrs_gc::Trace + 'static>(
     target: Option<*mut cljrs_gc::region::Region>,
     val: T,
 ) -> cljrs_gc::GcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = target;
+        GcPtr::new(val)
+    }
+    #[cfg(not(feature = "no-gc"))]
     match target {
         // SAFETY: handles are only bound to regions owned by a live
         // `RegionEntry` of this or a caller's frame.

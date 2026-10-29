@@ -144,9 +144,15 @@ impl Drop for MonitorGuard {
     }
 }
 
+struct HeldMonitor {
+    guard: MonitorGuard,
+    value: Value,
+    #[cfg(feature = "no-gc")]
+    _lease: cljrs_gc::region::RegionLease,
+}
 #[derive(Default)]
 struct MonitorState {
-    held: Vec<(MonitorGuard, Value)>,
+    held: Vec<HeldMonitor>,
     legacy_async: bool,
 }
 thread_local! {
@@ -155,8 +161,8 @@ thread_local! {
 cljrs_gc::mutator_slot!("cljrs-runtime/HELD_MONITORS", refcell HELD_MONITORS: MonitorState, trace trace_held);
 fn trace_held(state: &MonitorState, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
-    for (_, value) in &state.held {
-        value.trace(visitor);
+    for entry in &state.held {
+        entry.value.trace(visitor);
     }
 }
 #[cfg(not(feature = "no-gc"))]
@@ -203,9 +209,16 @@ impl Drop for AsyncMonitorScope {
 /// Acquire an explicit monitor for this computation until `monitor_exit`.
 pub fn monitor_enter(value: &Value) -> ValueResult<()> {
     ensure_explicit_owner()?;
+    #[cfg(not(feature = "no-gc"))]
     cljrs_gc::region::poison_active_regions();
     let guard = enter(value)?;
-    HELD_MONITORS.with(|held| held.borrow_mut().held.push((guard, value.clone())));
+    let entry = HeldMonitor {
+        guard,
+        value: value.clone(),
+        #[cfg(feature = "no-gc")]
+        _lease: cljrs_gc::region::RegionLease::for_value(value),
+    };
+    HELD_MONITORS.with(|held| held.borrow_mut().held.push(entry));
     Ok(())
 }
 
@@ -218,13 +231,13 @@ pub fn monitor_exit(value: &Value) -> ValueResult<()> {
         let held = &mut state.held;
         let index = held
             .iter()
-            .rposition(|(guard, _)| guard.0.key == key)
+            .rposition(|entry| entry.guard.0.key == key)
             .ok_or_else(|| {
                 ValueError::Other("monitor-exit: this computation does not own the monitor".into())
             })?;
         Ok(held.remove(index))
     });
-    let entry: (MonitorGuard, Value) = entry?;
+    let entry: HeldMonitor = entry?;
     drop(entry);
     Ok(())
 }

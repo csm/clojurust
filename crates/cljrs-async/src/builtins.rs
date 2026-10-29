@@ -309,8 +309,6 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let rt = globals
         .async_runtime()
         .ok_or_else(|| ValueError::Other("thread-call requires an async runtime".into()))?;
-    #[cfg(feature = "no-gc")]
-    let _static_context = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);

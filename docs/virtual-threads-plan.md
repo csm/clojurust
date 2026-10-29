@@ -457,7 +457,9 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
   Native closure adapters explicitly trace managed captures through `NativeFn::captures`.
 - `no-gc` scratch scopes register their live regions through tail evaluation.
   Task captures lease scratch scopes until completion or cancellation.
-  Immutable publications copy into static storage. Opaque publications retain only their actual backing scopes.
+  Publications trace actual backing scopes without copying data or realizing lazy sequences.
+  Results transfer scope ownership to their destination. Completed transient results can then release their storage.
+  Monitor entry does not retire no-gc scratch scopes. Ordinary scopes allocate lease metadata only when shared.
   Bounded isolated allocation invocations cannot spawn Clojure fibers.
 - `fiber_surface.rs` covers nested futures, ordinary function waits, bindings, result-channel closure,
   cancellation, errors, forced collection, and host state restoration in both interpreter modes.
@@ -512,3 +514,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - Shared-heap multi-threading. Parallelism stays isolate-based.
 - Preemption by signal (Go-style asynchronous preemption). Safepoint preemption is enough
   because every tier already polls safepoints.
+
+The Phase 3 review regressions cover dynamic return allocation, lazy and infinite sequence publication,
+large transient task results, monitor entry, dynamic-binding updates, gas-only exhaustion signals, and finally-only exceptions.
+Generated AOT resource failures return exit status 1 after scope cleanup and GC-statistics output.
+Executor teardown uses the shared carrier-state helpers.

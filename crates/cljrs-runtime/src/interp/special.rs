@@ -780,8 +780,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                 bind_pattern(pat, val.clone(), env)?;
             }
 
-            // Under no-gc: pop scratch before tail expression so the return value
-            // or recur args are allocated in the enclosing scope's context.
+            // Under no-gc: transfer return/recur backing scopes into the
+            // enclosing destination before this iteration releases scratch.
             #[cfg(not(feature = "no-gc"))]
             let result = eval_body_recur(body, env);
             #[cfg(feature = "no-gc")]
@@ -802,8 +802,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
-                // new_vals were evaluated in the caller's context (scratch was
-                // popped before the tail form), so they survive the reset.
+                // Ownership of new_vals was transferred to the enclosing
+                // destination, so they survive this iteration's scratch guard.
                 current_vals = new_vals;
             }
             Err(e) => return Err(e),
@@ -828,26 +828,34 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
     Ok(result)
 }
 
-/// Under `no-gc`: eval loop body with scratch-region semantics.
-///
-/// Evaluates all non-tail forms inside the scratch region, then pops the
-/// scratch before the tail (return/recur) expression so it lands in the
-/// caller's context.
+/// Evaluate the body in scratch, then transfer returned backing scopes to the
+/// caller. Tail control-flow forms keep their unused temporaries in scratch.
 #[cfg(feature = "no-gc")]
 fn eval_body_with_scratch_loop(
     body: &[Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
     env: &mut Env,
 ) -> EvalResult {
-    if body.is_empty() {
-        scratch.pop_for_return();
-        return Ok(Value::Nil);
-    }
-    for form in &body[..body.len() - 1] {
-        eval(form, env)?;
+    let mut result = Ok(Value::Nil);
+    for form in body {
+        result = eval(form, env);
+        if result.is_err() {
+            break;
+        }
     }
     scratch.pop_for_return();
-    eval(&body[body.len() - 1], env)
+    match &result {
+        Ok(value) | Err(EvalError::Thrown(value)) => {
+            cljrs_gc::region::RegionLease::for_value(value).protect_current()
+        }
+        Err(EvalError::Recur(values)) => {
+            for value in values {
+                cljrs_gc::region::RegionLease::for_value(value).protect_current();
+            }
+        }
+        _ => {}
+    }
+    result
 }
 
 // ── quote ─────────────────────────────────────────────────────────────────────

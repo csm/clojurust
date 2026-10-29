@@ -19,11 +19,26 @@ pub fn var_key_of(var: &GcPtr<Var>) -> VarKey {
     var.get() as *const Var as usize
 }
 
+struct BindingFrame {
+    values: HashMap<VarKey, Value>,
+    #[cfg(feature = "no-gc")]
+    owner: cljrs_gc::region::AllocationOwner,
+}
+impl BindingFrame {
+    fn new(values: HashMap<VarKey, Value>) -> Self {
+        Self {
+            values,
+            #[cfg(feature = "no-gc")]
+            owner: cljrs_gc::region::AllocationOwner::current(),
+        }
+    }
+}
+
 thread_local! {
-    static BINDING_STACK: RefCell<Vec<HashMap<VarKey, Value>>> =
+    static BINDING_STACK: RefCell<Vec<BindingFrame>> =
         const { RefCell::new(Vec::new()) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/BINDING_STACK", refcell BINDING_STACK: Vec<HashMap<VarKey, Value>>, trace trace_saved);
+cljrs_gc::mutator_slot!("cljrs-runtime/BINDING_STACK", refcell BINDING_STACK: Vec<BindingFrame>, trace trace_saved);
 
 // ── RAII guard ────────────────────────────────────────────────────────────────
 
@@ -40,7 +55,7 @@ impl Drop for BindingGuard {
 
 /// Push a new dynamic binding frame; return a guard that pops it on drop.
 pub fn push_frame(bindings: HashMap<VarKey, Value>) -> BindingGuard {
-    BINDING_STACK.with(|s| s.borrow_mut().push(bindings));
+    BINDING_STACK.with(|s| s.borrow_mut().push(BindingFrame::new(bindings)));
     BindingGuard
 }
 
@@ -50,7 +65,12 @@ pub fn push_frame(bindings: HashMap<VarKey, Value>) -> BindingGuard {
 /// Must be called with the innermost frame's guard.
 pub fn take_frame(guard: BindingGuard) -> HashMap<VarKey, Value> {
     std::mem::forget(guard);
-    BINDING_STACK.with(|s| s.borrow_mut().pop().unwrap_or_default())
+    BINDING_STACK.with(|s| {
+        s.borrow_mut()
+            .pop()
+            .map(|frame| frame.values)
+            .unwrap_or_default()
+    })
 }
 
 fn pop_frame() {
@@ -69,7 +89,7 @@ pub fn deref_var(var: &GcPtr<Var>) -> Option<Value> {
         s.borrow()
             .iter()
             .rev()
-            .find_map(|frame| frame.get(&key).cloned())
+            .find_map(|frame| frame.values.get(&key).cloned())
     });
     tl.or_else(|| var.get().deref())
 }
@@ -77,7 +97,11 @@ pub fn deref_var(var: &GcPtr<Var>) -> Option<Value> {
 /// True if `var` has any thread-local binding on this thread.
 pub fn is_thread_bound(var: &GcPtr<Var>) -> bool {
     let key = var_key_of(var);
-    BINDING_STACK.with(|s| s.borrow().iter().any(|frame| frame.contains_key(&key)))
+    BINDING_STACK.with(|s| {
+        s.borrow()
+            .iter()
+            .any(|frame| frame.values.contains_key(&key))
+    })
 }
 
 /// Set the innermost thread-local binding for `var`.
@@ -85,9 +109,33 @@ pub fn is_thread_bound(var: &GcPtr<Var>) -> bool {
 /// to setting the root).
 pub fn set_thread_local(var: &GcPtr<Var>, val: Value) -> bool {
     let key = var_key_of(var);
+    #[cfg(feature = "no-gc")]
+    {
+        let target = BINDING_STACK.with(|stack| {
+            stack
+                .borrow()
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, frame)| frame.values.contains_key(&key))
+                .map(|(index, frame)| (index, frame.owner.clone()))
+        });
+        if let Some((index, owner)) = target {
+            // The binding frame can outlive this function's scratch scope.
+            // Trace outside the stack borrow; values can contain bound functions.
+            owner.protect(&val);
+            BINDING_STACK.with(|stack| {
+                stack.borrow_mut()[index].values.insert(key, val);
+            });
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(feature = "no-gc"))]
     BINDING_STACK.with(|s| {
         for frame in s.borrow_mut().iter_mut().rev() {
-            if let std::collections::hash_map::Entry::Occupied(mut e) = frame.entry(key) {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = frame.values.entry(key) {
                 e.insert(val);
                 return true;
             }
@@ -101,12 +149,17 @@ pub fn set_thread_local(var: &GcPtr<Var>, val: Value) -> bool {
 /// Snapshot the current thread's entire binding stack (for conveyance into a
 /// child thread, e.g. `future`).
 pub fn capture_current() -> Vec<HashMap<VarKey, Value>> {
-    BINDING_STACK.with(|s| s.borrow().clone())
+    BINDING_STACK.with(|s| {
+        s.borrow()
+            .iter()
+            .map(|frame| frame.values.clone())
+            .collect()
+    })
 }
 
 /// Install a previously captured snapshot on the current (new) thread.
 pub fn install_frames(frames: Vec<HashMap<VarKey, Value>>) {
-    BINDING_STACK.with(|s| *s.borrow_mut() = frames);
+    BINDING_STACK.with(|s| *s.borrow_mut() = frames.into_iter().map(BindingFrame::new).collect());
 }
 
 // ── GC root tracing ───────────────────────────────────────────────────────────
@@ -116,16 +169,16 @@ pub fn install_frames(frames: Vec<HashMap<VarKey, Value>>) {
 pub fn trace_current(visitor: &mut cljrs_gc::MarkVisitor) {
     BINDING_STACK.with(|s| {
         for frame in s.borrow().iter() {
-            for val in frame.values() {
+            for val in frame.values.values() {
                 val.trace(visitor);
             }
         }
     });
 }
 
-fn trace_saved(frames: &Vec<HashMap<VarKey, Value>>, visitor: &mut cljrs_gc::MarkVisitor) {
+fn trace_saved(frames: &Vec<BindingFrame>, visitor: &mut cljrs_gc::MarkVisitor) {
     for frame in frames {
-        for value in frame.values() {
+        for value in frame.values.values() {
             value.trace(visitor);
         }
     }

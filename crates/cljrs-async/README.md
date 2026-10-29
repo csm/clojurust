@@ -272,9 +272,11 @@ These values remain rooted before the first poll and until completion.
 For locals and opaque future captures, use the runtime's GC root guards.
 GC builds retire active regions through the existing async poison fallback.
 In `no-gc` builds, task captures lease active scratch regions until completion or cancellation.
-Immutable published data moves into static storage. Opaque published values retain only their backing scopes.
+Task results retain their backing scopes for the destination's lifetime.
+Publication preserves lazy sequences without copying or realizing them.
 Typed isolated allocation invocations cannot spawn Clojure fibers.
 Spawned results stay rooted in `FiberResult` until consumption or drop.
+In no-gc builds, queued results hold scope leases until the consumer takes ownership.
 After `into_result`, the caller owns the normal root-registration responsibility.
 
 The native parking primitives and Clojure fiber surface are available.
@@ -571,8 +573,8 @@ The stdlib reader, writer, and process operations use the same parking hooks.
 The existing `cljrs-io` and `cljrs-net` APIs return channels, so `<!!` and `>!!` also provide their parking paths.
 Managed values stay on the isolate. Native Rust code can use `cljrs_value::parking::blocking` for owned, `Send` work.
 
-The Clojure spawn functions and CLI entry points do not yet create fibers. Those changes belong to Phase 3.
-Rust embedders can use `fiber::spawn` or `Fiber::with_roots` now.
+Clojure spawn functions and native CLI entry points create fibers.
+Rust embedders can use `fiber::spawn` or `Fiber::with_roots`.
 `(blocking & calls)` and `cljrs.fiber/blocking` accept typed native call forms.
 Arguments and their conversions stay on the isolate. Only Rust inputs and outputs with `Send + 'static` cross to workers.
 The form rejects Clojure closures, variadic managed-value exports, and native functions without an owned-work adapter.
@@ -588,3 +590,7 @@ and avoids a deep Form clone. `Isolate::spawn` remains an async entry point.
 A pending local future rejects synchronous dereference on its carrier thread.
 Such code uses `await` or moves synchronous evaluation into a fiber.
 Settled futures and futures produced by another OS thread retain normal blocking behavior.
+
+`fiber::run_root_owned(rt, local, body)` owns one executor drive and destroys its local tasks with the carrier state installed.
+`fiber::drop_local_with_carrier(local, carrier)` provides the same teardown for executors retained between root drives.
+Both helpers restore caller state if task destruction unwinds.

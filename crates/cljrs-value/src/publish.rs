@@ -270,6 +270,11 @@ pub fn publish_value(v: Value) -> Value {
     }
 }
 
+/// GC publication uses the same promotion barrier for every destination.
+pub fn publish_for_owner(value: Value, _address: usize) -> Value {
+    publish_value(value)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

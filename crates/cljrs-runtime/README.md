@@ -1740,3 +1740,8 @@ and IR lowering expand `@(future ...)` before they compile the future body.
 Native JIT and OSR dispatch preserve resource-limit errors through
 `JitBackend::take_pending_resource_error() -> Option<ValueError>` and the matching
 `JitState` method. Gas exhaustion and memory-limit faults bypass Clojure catch clauses.
+
+In `no-gc` builds, dynamic binding frames record their allocation destination.
+A `set!` update retains its backing scopes for that frame's lifetime.
+Values written by nested calls remain valid after those calls release their scratch storage.
+Object-array writes use the destination ownership barrier before storing an element.

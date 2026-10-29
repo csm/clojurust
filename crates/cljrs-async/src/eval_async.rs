@@ -64,11 +64,9 @@ where
     cljrs_gc::region::poison_active_regions();
     #[cfg(feature = "no-gc")]
     let lease = cljrs_gc::region::RegionLease::capture_active();
-    let future = {
-        #[cfg(feature = "no-gc")]
-        let _static_context = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-        GcPtr::new(CljxFuture::new_local())
-    };
+    #[cfg(feature = "no-gc")]
+    let allocation = cljrs_gc::region::AllocationSnapshot::capture();
+    let future = GcPtr::new(CljxFuture::new_local());
     let task_future = future.clone();
     let gas_meters = cljrs_runtime::env::gas::active_meters();
     let interrupts = cljrs_runtime::env::gas::active_interrupts();
@@ -88,9 +86,15 @@ where
             let _monitors = cljrs_runtime::env::monitor::AsyncMonitorScope::enter();
             #[cfg(feature = "no-gc")]
             let _lease_scope = lease.enter();
+            #[cfg(feature = "no-gc")]
+            let _allocation_scope = allocation.enter();
             task.as_mut().poll(cx)
         })
         .await;
+        #[cfg(feature = "no-gc")]
+        let _lease_scope = lease.enter();
+        #[cfg(feature = "no-gc")]
+        let _allocation_scope = allocation.enter();
         settle_future(&task_future, result);
     });
     Value::Future(future)
@@ -98,7 +102,7 @@ where
 
 /// Write a completed result into a future and wake blocking `deref` waiters.
 pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
-    let mut state = future.get().state.lock().unwrap();
+    let state = future.get().state.lock().unwrap();
     // Cancellation is sticky. `future-cancel` does not interrupt the task, so a
     // task cancelled mid-body still runs to completion and lands here; letting
     // it write its result would flip `future-cancelled?` back to false and hand
@@ -107,14 +111,26 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     if matches!(&*state, FutureState::Cancelled) {
         return;
     }
-    *state = match result {
-        Ok(v) => FutureState::Done(cljrs_value::publish::publish_value(v)),
+    drop(state);
+    let settled = match result {
+        Ok(v) => FutureState::Done(cljrs_value::publish::publish_for_owner(
+            v,
+            future.get() as *const _ as usize,
+        )),
         // Preserve the thrown value (and any non-Thrown error as a fresh
         // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
         Err(EvalError::GasExhausted) => FutureState::GasExhausted,
         Err(EvalError::MemoryLimitExceeded(fault)) => FutureState::MemoryLimitExceeded(fault),
-        Err(e) => FutureState::Failed(cljrs_value::publish::publish_value(e.to_error_value())),
+        Err(e) => FutureState::Failed(cljrs_value::publish::publish_for_owner(
+            e.to_error_value(),
+            future.get() as *const _ as usize,
+        )),
     };
+    let mut state = future.get().state.lock().unwrap();
+    if matches!(&*state, FutureState::Cancelled) {
+        return;
+    }
+    *state = settled;
     drop(state);
     future.get().cond.notify_all();
     future.get().ready.notify_all();
@@ -294,30 +310,8 @@ pub async fn await_value(val: Value) -> EvalResult {
             let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
             loop {
                 let listener = f.get().ready.listen();
-                {
-                    let guard = f.get().state.lock().unwrap();
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(EvalError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(EvalError::GasExhausted);
-                        }
-                        FutureState::MemoryLimitExceeded(fault) => {
-                            f.get().mark_observed();
-                            return Err(EvalError::MemoryLimitExceeded(*fault));
-                        }
-                        FutureState::Cancelled => {
-                            return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {}
-                    }
+                if let Some(result) = f.get().settled_value() {
+                    return result.map_err(cljrs_runtime::env::error::value_error_to_eval_error);
                 }
                 cljrs_runtime::env::gc_roots::async_gc_collect();
                 listener.await;

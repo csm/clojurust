@@ -130,7 +130,9 @@ pub struct Region {
     /// account's retired-region count.
     retired: bool,
     #[cfg(feature = "no-gc")]
-    lease: std::rc::Rc<()>,
+    lease: Option<std::rc::Rc<LeaseOwner>>,
+    #[cfg(feature = "no-gc")]
+    id: u64,
     #[cfg(feature = "no-gc")]
     published: bool,
 }
@@ -157,7 +159,9 @@ impl Region {
             object_count: 0,
             retired: false,
             #[cfg(feature = "no-gc")]
-            lease: std::rc::Rc::new(()),
+            lease: None,
+            #[cfg(feature = "no-gc")]
+            id: NEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             #[cfg(feature = "no-gc")]
             published: false,
         }
@@ -186,7 +190,9 @@ impl Region {
             object_count: 0,
             retired: false,
             #[cfg(feature = "no-gc")]
-            lease: std::rc::Rc::new(()),
+            lease: None,
+            #[cfg(feature = "no-gc")]
+            id: NEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             #[cfg(feature = "no-gc")]
             published: false,
         }
@@ -265,7 +271,10 @@ impl Region {
 
         // Free all chunks except the first.
         while self.chunks.len() > 1 {
-            self.chunks.pop().unwrap().free(self.retired);
+            let chunk = self.chunks.pop().unwrap();
+            #[cfg(feature = "no-gc")]
+            unindex_chunk(&chunk);
+            chunk.free(self.retired);
         }
 
         // Reset bump pointer to the start of the first chunk.
@@ -384,6 +393,11 @@ impl Region {
         }
         let chunk_size = DEFAULT_CHUNK_SIZE.max(size * 2);
         let chunk = Chunk::new(chunk_size, layout.align());
+        if self.retired && chunk.charged {
+            crate::governor::with_registered_account(|account| {
+                account.retire_region(chunk.layout.size())
+            });
+        }
         let base = chunk.data.as_ptr() as usize;
 
         let aligned = (base + layout.align() - 1) & !(layout.align() - 1);
@@ -391,6 +405,10 @@ impl Region {
         self.end = base + chunk_size;
         self.bytes_used += size;
 
+        #[cfg(feature = "no-gc")]
+        if let Some(owner) = &self.lease {
+            index_chunk(&chunk, owner);
+        }
         self.chunks.push(chunk);
         aligned as *mut u8
     }
@@ -411,6 +429,8 @@ impl Drop for Region {
         // Free all chunks.
         let retired = self.retired;
         for chunk in self.chunks.drain(..) {
+            #[cfg(feature = "no-gc")]
+            unindex_chunk(&chunk);
             chunk.free(retired);
         }
     }
@@ -477,13 +497,16 @@ impl Drop for RegionGuard {
 // GC root so heap children stay live) instead of being reset.  A deliberate,
 // bounded leak, mirroring the JIT's pinned-epoch precedent.
 
+#[cfg(not(feature = "no-gc"))]
+type RetiredRegion = Region;
+#[cfg(feature = "no-gc")]
+type RetiredRegion = Box<Region>;
+
 thread_local! {
     /// Regions whose scopes have closed but which may still be referenced —
-    /// kept alive for the rest of the process and traced as roots.  Moving
-    /// the `Region` struct out of its `Box` is safe: object memory lives in
-    /// separately-allocated chunks, and no raw pointer to the struct itself
-    /// survives once it has left the active stack.
-    static RETIRED_REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    /// kept alive for the rest of the process and traced as roots in GC builds.
+    /// No-gc boxes also preserve captured allocation-target addresses.
+    static RETIRED_REGIONS: RefCell<Vec<RetiredRegion>> = const { RefCell::new(Vec::new()) };
     /// Poison watermark: every region at stack depth ≤ this value must be
     /// retired (not reset) when it closes.
     static POISON_WATERMARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -494,20 +517,15 @@ crate::mutator_slot!("cljrs-gc/POISON_WATERMARK", cell POISON_WATERMARK: usize);
 /// Poison every region currently active on this thread: each will be retired
 /// instead of reset when its scope closes.  No-op when no region is active.
 pub fn poison_active_regions() {
-    #[cfg(feature = "no-gc")]
-    REGION_STACK.with(|stack| {
-        for &region in stack.borrow().iter() {
-            // SAFETY: registered regions are live on this isolate thread.
-            unsafe { &mut *region }.published = true;
-        }
-    });
-    let depth = region_stack_depth();
-    if depth == 0 {
-        return;
-    }
     #[cfg(not(feature = "no-gc"))]
-    POISON_WATERMARK.with(|w| w.set(w.get().max(depth)));
-    crate::stats::GC_STATS.record_region_poison();
+    {
+        let depth = region_stack_depth();
+        if depth == 0 {
+            return;
+        }
+        POISON_WATERMARK.with(|w| w.set(w.get().max(depth)));
+        crate::stats::GC_STATS.record_region_poison();
+    }
 }
 
 /// True when every active region must remain alive after its scope closes.
@@ -560,18 +578,58 @@ pub fn close_region(mut region: Box<Region>) {
 }
 
 #[cfg(feature = "no-gc")]
+static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "no-gc")]
+struct LeaseOwner {
+    id: u64,
+    region: *mut Region,
+    ancestors: Vec<u64>,
+    dependencies: RefCell<std::collections::BTreeMap<u64, RegionLease>>,
+}
+#[cfg(feature = "no-gc")]
+impl Region {
+    fn owner(&mut self) -> std::rc::Rc<LeaseOwner> {
+        if let Some(owner) = &self.lease {
+            return owner.clone();
+        }
+        let owner = std::rc::Rc::new(LeaseOwner {
+            id: self.id,
+            region: self,
+            ancestors: crate::alloc_ctx::ancestor_ids(self as *mut Region),
+            dependencies: RefCell::new(Default::default()),
+        });
+        self.lease = Some(owner.clone());
+        for chunk in &self.chunks {
+            index_chunk(chunk, &owner);
+        }
+        owner
+    }
+    pub(crate) fn scope_id(&self) -> u64 {
+        self.id
+    }
+    fn contains(&self, address: usize) -> bool {
+        self.chunks.iter().any(|chunk| {
+            let base = chunk.data.as_ptr() as usize;
+            address >= base && address < base + chunk.layout.size()
+        })
+    }
+}
+#[cfg(feature = "no-gc")]
 thread_local! {
-    // Closed regions held by in-flight tasks; released outside the TLS borrow.
-    static LEASED_REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    // Boxes keep allocation targets stable after their lexical scope closes.
+    static LEASED_REGIONS: RefCell<std::collections::BTreeMap<u64, Box<Region>>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+    // Isolate-local address index shared by its fibers; entries do not own regions.
+    static REGION_OWNERS: RefCell<std::collections::BTreeMap<usize, (usize, std::rc::Weak<LeaseOwner>)>> = const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 #[cfg(feature = "no-gc")]
 crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<RegionLease>);
 
-/// Keeps caller scratch scopes alive only while a task can use its captures.
+/// Temporary ownership of scratch scopes. Empty until a scope is shared.
 #[cfg(feature = "no-gc")]
 #[derive(Clone, Default)]
-pub struct RegionLease(Vec<std::rc::Rc<()>>);
+pub struct RegionLease(Vec<std::rc::Rc<LeaseOwner>>);
 #[cfg(feature = "no-gc")]
 impl RegionLease {
     pub fn capture_active() -> Self {
@@ -582,24 +640,114 @@ impl RegionLease {
                 .flat_map(|lease| lease.0.iter().cloned())
                 .collect::<Vec<_>>()
         });
-        REGION_STACK.with(|stack| {
-            for &region in stack.borrow().iter() {
-                // SAFETY: all registered regions are live on this thread.
-                owners.push(unsafe { &*region }.lease.clone());
-            }
-        });
-        // Share each backing scope once, including inherited captures.
-        owners.sort_by_key(|owner| std::rc::Rc::as_ptr(owner) as usize);
-        owners.dedup_by(|a, b| std::rc::Rc::ptr_eq(a, b));
+        for ptr in live_regions() {
+            // SAFETY: both scope registries contain live, stable regions.
+            owners.push(unsafe { &mut *ptr }.owner());
+        }
+        owners.sort_by_key(|owner| owner.id);
+        owners.dedup_by_key(|owner| owner.id);
         Self(owners)
+    }
+    pub fn for_value(value: &impl Trace) -> Self {
+        crate::leases_for(value)
+    }
+    pub(crate) fn add_address(&mut self, address: usize) {
+        if let Some(owner) = find_owner(address)
+            && !self.0.iter().any(|existing| existing.id == owner.id)
+        {
+            self.0.push(owner);
+        }
+    }
+    pub fn protect_current(&self) {
+        if !self.0.is_empty() {
+            AllocationOwner::current().adopt(self);
+        }
     }
     pub fn enter(&self) -> LeaseScope {
         INHERITED_LEASES.with(|stack| stack.borrow_mut().push(self.clone()));
-        LeaseScope
+        LeaseScope(std::marker::PhantomData)
+    }
+}
+/// Weak ownership of a value's destination scope; does not pin its own container.
+#[cfg(feature = "no-gc")]
+#[derive(Clone, Default)]
+pub struct AllocationOwner(std::rc::Weak<LeaseOwner>);
+#[cfg(feature = "no-gc")]
+impl std::fmt::Debug for AllocationOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AllocationOwner")
     }
 }
 #[cfg(feature = "no-gc")]
-pub struct LeaseScope;
+impl AllocationOwner {
+    pub fn current() -> Self {
+        let owner = crate::alloc_ctx::current_region().map(|ptr| unsafe { &mut *ptr }.owner());
+        Self(
+            owner
+                .as_ref()
+                .map(std::rc::Rc::downgrade)
+                .unwrap_or_default(),
+        )
+    }
+    pub fn for_address(address: usize) -> Self {
+        Self(
+            find_owner(address)
+                .as_ref()
+                .map(std::rc::Rc::downgrade)
+                .unwrap_or_default(),
+        )
+    }
+    pub fn protect(&self, value: &impl Trace) {
+        self.adopt(&RegionLease::for_value(value));
+    }
+    fn adopt(&self, lease: &RegionLease) {
+        if let Some(owner) = self.0.upgrade() {
+            let mut dependencies = owner.dependencies.borrow_mut();
+            for source in &lease.0 {
+                if source.id != owner.id && !owner.ancestors.contains(&source.id) {
+                    dependencies
+                        .entry(source.id)
+                        .or_insert_with(|| RegionLease(vec![source.clone()]));
+                }
+            }
+        } else {
+            // A static sink has program lifetime. Keep only actual backing scopes.
+            for source in &lease.0 {
+                retain_owner(source);
+            }
+        }
+    }
+}
+/// Captured allocation destination for a fiber, separate from its live roots.
+#[cfg(feature = "no-gc")]
+#[derive(Clone, Default)]
+pub struct AllocationSnapshot(RegionLease);
+#[cfg(feature = "no-gc")]
+impl AllocationSnapshot {
+    pub fn capture() -> Self {
+        Self(RegionLease(
+            crate::alloc_ctx::current_region()
+                .map(|ptr| unsafe { &mut *ptr }.owner())
+                .into_iter()
+                .collect(),
+        ))
+    }
+    pub fn enter(&self) -> crate::alloc_ctx::ContextGuard {
+        crate::alloc_ctx::enter_target(self.0.0.first().map(|owner| owner.region), self.0.clone())
+    }
+    pub fn protect(&self, value: &impl Trace) {
+        AllocationOwner(
+            self.0
+                .0
+                .first()
+                .map(std::rc::Rc::downgrade)
+                .unwrap_or_default(),
+        )
+        .protect(value);
+    }
+}
+#[cfg(feature = "no-gc")]
+pub struct LeaseScope(std::marker::PhantomData<std::rc::Rc<()>>);
 #[cfg(feature = "no-gc")]
 impl Drop for LeaseScope {
     fn drop(&mut self) {
@@ -610,63 +758,97 @@ impl Drop for LeaseScope {
 #[cfg(feature = "no-gc")]
 impl Drop for RegionLease {
     fn drop(&mut self) {
+        // Only a final external reference can make a deferred scope reclaimable.
+        let released = self
+            .0
+            .iter()
+            .filter(|owner| std::rc::Rc::strong_count(owner) == 2)
+            .map(|owner| owner.id)
+            .collect::<Vec<_>>();
         self.0.clear();
-        // A region destructor can drop further leases. Never run it while
-        // borrowing the deferred registry or during thread-local teardown.
-        let Ok(regions) = LEASED_REGIONS.try_with(|slot| std::mem::take(&mut *slot.borrow_mut()))
-        else {
-            return;
-        };
-        let (live, dead): (Vec<_>, Vec<_>) = regions
-            .into_iter()
-            .partition(|region| std::rc::Rc::strong_count(&region.lease) > 1);
-        LEASED_REGIONS.with(|slot| slot.borrow_mut().extend(live));
-        drop(dead);
+        for id in released {
+            let Ok(dead) = LEASED_REGIONS.try_with(|slot| slot.borrow_mut().remove(&id)) else {
+                continue;
+            };
+            drop(dead); // Destructors can release other scopes; no registry borrow crosses Drop.
+        }
     }
 }
 #[cfg(feature = "no-gc")]
-pub fn close_region(mut region: Box<Region>) {
+pub fn close_region(region: Box<Region>) {
     pop_region_guard();
+    close_scratch_region(region);
+}
+#[cfg(feature = "no-gc")]
+pub(crate) fn close_scratch_region(mut region: Box<Region>) {
     if region.published {
         region.retire();
-        RETIRED_REGIONS.with(|slot| slot.borrow_mut().push(*region));
-    } else if std::rc::Rc::strong_count(&region.lease) > 1 {
+        RETIRED_REGIONS.with(|slot| slot.borrow_mut().push(region));
+    } else if region
+        .lease
+        .as_ref()
+        .is_some_and(|owner| std::rc::Rc::strong_count(owner) > 1)
+    {
         region.retire();
-        LEASED_REGIONS.with(|slot| slot.borrow_mut().push(*region));
+        LEASED_REGIONS.with(|slot| slot.borrow_mut().insert(region.id, region));
     }
 }
+#[cfg(feature = "no-gc")]
+fn live_regions() -> Vec<*mut Region> {
+    let mut regions = crate::alloc_ctx::live_regions();
+    REGION_STACK.with(|stack| regions.extend(stack.borrow().iter().copied()));
+    regions
+}
+#[cfg(feature = "no-gc")]
+fn find_owner(address: usize) -> Option<std::rc::Rc<LeaseOwner>> {
+    let indexed = REGION_OWNERS.with(|index| {
+        let index = index.borrow();
+        let (_, (end, owner)) = index.range(..=address).next_back()?;
+        (address < *end).then(|| owner.upgrade()).flatten()
+    });
+    if indexed.is_some() {
+        return indexed;
+    }
+    // A fresh scope has no sharing metadata or address entries yet.
+    for ptr in live_regions() {
+        let region = unsafe { &mut *ptr };
+        if region.contains(address) {
+            return Some(region.owner());
+        }
+    }
+    None
+}
+#[cfg(feature = "no-gc")]
+fn index_chunk(chunk: &Chunk, owner: &std::rc::Rc<LeaseOwner>) {
+    let base = chunk.data.as_ptr() as usize;
+    REGION_OWNERS.with(|index| {
+        index.borrow_mut().insert(
+            base,
+            (base + chunk.layout.size(), std::rc::Rc::downgrade(owner)),
+        );
+    });
+}
+#[cfg(feature = "no-gc")]
+fn unindex_chunk(chunk: &Chunk) {
+    let _ = REGION_OWNERS.try_with(|index| {
+        index.borrow_mut().remove(&(chunk.data.as_ptr() as usize));
+    });
+}
 
-// A durable opaque value may retain its own backing scopes. Immutable values
-// are copied instead; no-gc task spawns use temporary leases, not this path.
+#[cfg(feature = "no-gc")]
+fn retain_owner(owner: &std::rc::Rc<LeaseOwner>) {
+    // The owner reference pins this box in either a live scope or the deferred table.
+    unsafe { &mut *owner.region }.published = true;
+    let deferred = LEASED_REGIONS.with(|slot| slot.borrow_mut().remove(&owner.id));
+    if let Some(region) = deferred {
+        RETIRED_REGIONS.with(|slot| slot.borrow_mut().push(region));
+    }
+}
 #[cfg(feature = "no-gc")]
 pub(crate) fn retain_containing(address: usize) {
-    fn contains(region: &Region, address: usize) -> bool {
-        region.chunks.iter().any(|chunk| {
-            let base = chunk.data.as_ptr() as usize;
-            address >= base && address < base + chunk.layout.size()
-        })
+    if let Some(owner) = find_owner(address) {
+        retain_owner(&owner);
     }
-    REGION_STACK.with(|slot| {
-        for &ptr in slot.borrow().iter() {
-            // SAFETY: live registered regions; no other thread can use them.
-            let region = unsafe { &mut *ptr };
-            if contains(region, address) {
-                region.published = true;
-            }
-        }
-    });
-    LEASED_REGIONS.with(|slot| {
-        let mut regions = slot.borrow_mut();
-        let mut index = 0;
-        while index < regions.len() {
-            if contains(&regions[index], address) {
-                let region = regions.swap_remove(index);
-                RETIRED_REGIONS.with(|retired| retired.borrow_mut().push(region));
-            } else {
-                index += 1;
-            }
-        }
-    });
 }
 
 /// Trace every retired region's objects (their heap children must stay
@@ -716,6 +898,11 @@ pub(crate) fn trace_active_regions(visitor: &mut crate::MarkVisitor) {
 /// The returned `GcPtr` is only valid while the region is alive.  The caller
 /// must ensure the pointer does not outlive the region.
 pub unsafe fn try_alloc_in_region<T: Trace + 'static>(value: T) -> Option<GcPtr<T>> {
+    #[cfg(feature = "no-gc")]
+    {
+        Some(crate::alloc_ctx::alloc_in_ctx(value))
+    }
+    #[cfg(not(feature = "no-gc"))]
     REGION_STACK.with(|stack| {
         let stack = stack.borrow();
         if let Some(&region_ptr) = stack.last() {
@@ -1235,6 +1422,42 @@ mod lease_tests {
         }
     }
     #[test]
+    fn allocation_guard_pins_a_closed_destination_and_its_later_chunks() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let scratch = crate::alloc_ctx::ScratchGuard::new();
+        let _value = crate::GcPtr::new(Probe(drops.clone()));
+        let snapshot = AllocationSnapshot::capture();
+        drop(scratch);
+        let context = snapshot.enter();
+        drop(snapshot);
+        for _ in 0..2000 {
+            let _ = crate::GcPtr::new(Probe(drops.clone()));
+        }
+        assert_eq!(drops.get(), 0);
+        drop(context);
+        assert_eq!(drops.get(), 2001);
+    }
+    #[test]
+    fn popped_scratch_cannot_receive_dynamic_or_static_allocations() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let outer = crate::alloc_ctx::ScratchGuard::new();
+        let mut inner = crate::alloc_ctx::ScratchGuard::new();
+        let _temporary = crate::GcPtr::new(Probe(drops.clone()));
+        inner.pop_for_return();
+        let returned = unsafe { try_alloc_in_region(Probe(drops.clone())) }.unwrap();
+        let permanent = {
+            let _static_scope = crate::alloc_ctx::StaticCtxGuard::new();
+            unsafe { try_alloc_in_region(Probe(drops.clone())) }.unwrap()
+        };
+        drop(inner);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(returned.get().0.get(), 1);
+        assert!(permanent.is_static_alloc());
+        drop(outer);
+        assert_eq!(drops.get(), 2);
+        assert_eq!(permanent.get().0.get(), 2);
+    }
+    #[test]
     fn closed_scratch_scope_is_reclaimed_after_its_last_task_lease() {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let scratch = crate::alloc_ctx::ScratchGuard::new();
@@ -1252,4 +1475,9 @@ mod lease_tests {
         drop(inherited);
         assert_eq!(drops.get(), 1);
     }
+}
+
+#[cfg(feature = "no-gc")]
+pub(crate) fn is_permanent_address(address: usize) -> bool {
+    find_owner(address).is_some_and(|owner| unsafe { &*owner.region }.published)
 }

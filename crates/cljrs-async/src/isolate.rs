@@ -74,11 +74,7 @@ impl Isolate {
                     .build()
                     .expect("isolate runtime");
                 let local = tokio::task::LocalSet::new();
-                let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
-                let result = crate::fiber::run_root(&rt, &local, &mut carrier, body);
-                carrier.swap_with_current();
-                drop(local);
-                carrier.swap_with_current();
+                let result = crate::fiber::run_root_owned(&rt, local, body);
                 result.expect("isolate root failed");
             })
             .expect("isolate: failed to spawn OS thread")

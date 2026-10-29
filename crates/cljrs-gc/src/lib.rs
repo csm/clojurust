@@ -249,14 +249,26 @@ pub struct MarkVisitor {
 #[derive(Default)]
 pub struct MarkVisitor {
     retaining: Option<std::collections::HashSet<usize>>,
+    collecting: Option<region::RegionLease>,
 }
 
-/// Retain only regions reached by an opaque published value in no-gc mode.
+/// Retain only regions reached by a published value in no-gc mode.
 #[cfg(feature = "no-gc")]
 pub fn retain_regions_for(value: &impl Trace) {
     value.trace(&mut MarkVisitor {
         retaining: Some(Default::default()),
+        collecting: None,
     });
+}
+
+#[cfg(feature = "no-gc")]
+fn leases_for(value: &impl Trace) -> region::RegionLease {
+    let mut visitor = MarkVisitor {
+        retaining: Some(Default::default()),
+        collecting: Some(Default::default()),
+    };
+    value.trace(&mut visitor);
+    visitor.collecting.take().unwrap()
 }
 
 #[cfg(not(feature = "no-gc"))]
@@ -330,7 +342,11 @@ impl GcVisitor for MarkVisitor {
         if !visited.insert(address) {
             return;
         }
-        region::retain_containing(address);
+        if let Some(lease) = &mut self.collecting {
+            lease.add_address(address);
+        } else {
+            region::retain_containing(address);
+        }
         ptr.get().trace(self);
     }
 }
@@ -512,14 +528,16 @@ impl<T: Trace + 'static> GcPtr<T> {
         a.0 == b.0
     }
 
-    /// Return `true` if this pointer was allocated by the global `StaticArena`.
+    /// Return `true` for static storage or a permanently retained backing scope.
     ///
     /// Available in no-gc builds for publication decisions and
     /// write-site assertions in `Atom::reset` / `Var::bind` to catch
     /// region-local values being stored in program-lifetime containers.
     #[cfg(feature = "no-gc")]
     pub fn is_static_alloc(&self) -> bool {
-        alloc_ctx::invocation_is_active() || static_arena::is_static_addr(self.0.as_ptr() as usize)
+        alloc_ctx::invocation_is_active()
+            || static_arena::is_static_addr(self.0.as_ptr() as usize)
+            || region::is_permanent_address(self.0.as_ptr() as usize)
     }
 }
 

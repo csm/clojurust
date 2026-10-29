@@ -803,3 +803,8 @@ Thus a failed compiled future remains catchable through `@` with its exception d
 resource-limit signal. These signals use a per-fiber slot separate from thrown
 Clojure values. Compiled catch clauses bypass this slot. Native closure adapters,
 JIT/OSR dispatch, and AOT entry points preserve the original error category.
+
+Generated native harnesses return resource-limit errors through the root fiber.
+They print the error and exit with status 1 after context cleanup and GC-statistics output.
+The compiled `try` bridge preserves resource errors across catch and finally clauses.
+A finally-only clause rethrows the original exception after successful cleanup.

@@ -54,8 +54,13 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/region.rs",
+        "REGION_OWNERS",
+        Thread("weak address index for regions shared by fibers"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
         "LEASED_REGIONS",
-        Thread("no-gc scratch scopes retained only by in-flight tasks"),
+        Thread("closed no-gc scopes retained by tasks or destination ownership"),
     ),
     (
         "cljrs-gc/src/region.rs",

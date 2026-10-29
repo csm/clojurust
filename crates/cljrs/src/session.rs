@@ -445,9 +445,7 @@ impl Drop for AsyncDriver {
     fn drop(&mut self) {
         // Legacy tasks must unwind with their carrier root stacks installed.
         let local = std::mem::replace(&mut self.local, tokio::task::LocalSet::new());
-        self.carrier.get_mut().swap_with_current();
-        drop(local);
-        self.carrier.get_mut().swap_with_current();
+        cljrs_async::fiber::drop_local_with_carrier(local, self.carrier.get_mut());
     }
 }
 
@@ -568,9 +566,11 @@ mod gc_config_tests {
 
     #[test]
     fn soft_only_sets_the_soft_limit() {
-        let (config, memory) = gc_limits(Some(64), None).unwrap();
-        assert_eq!(config.soft_limit(), 64 * MB);
-        assert!(config.hard_limit() >= 64 * MB);
+        let (_config, memory) = gc_limits(Some(64), None).unwrap();
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.soft_limit(), 64 * MB);
+        #[cfg(not(feature = "no-gc"))]
+        assert!(_config.hard_limit() >= 64 * MB);
         assert!(
             memory.is_none(),
             "the soft limit does not configure the governor"
@@ -579,9 +579,11 @@ mod gc_config_tests {
 
     #[test]
     fn both_limits_are_kept() {
-        let (config, memory) = gc_limits(Some(64), Some(128)).unwrap();
-        assert_eq!(config.soft_limit(), 64 * MB);
-        assert_eq!(config.hard_limit(), 128 * MB);
+        let (_config, memory) = gc_limits(Some(64), Some(128)).unwrap();
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.soft_limit(), 64 * MB);
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.hard_limit(), 128 * MB);
         let memory = memory.expect("a hard limit configures the governor");
         assert_eq!(memory.hard_limit, 128 * MB);
         assert_eq!(

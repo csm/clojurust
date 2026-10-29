@@ -205,6 +205,8 @@ impl Fiber {
         cljrs_gc::region::poison_active_regions();
         #[cfg(feature = "no-gc")]
         let lease = cljrs_gc::region::RegionLease::capture_active();
+        #[cfg(feature = "no-gc")]
+        let allocation = cljrs_gc::region::AllocationSnapshot::capture();
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
         // Register captures in the fiber's detached state, not the caller's.
@@ -218,6 +220,10 @@ impl Fiber {
             id,
             yielder: std::ptr::null(),
             root: false,
+            #[cfg(feature = "no-gc")]
+            _captures: lease.clone(),
+            #[cfg(feature = "no-gc")]
+            allocation: allocation.clone(),
         };
         task.state.swap_with_current();
         task.roots_guard = Some(root_values(&task.roots));
@@ -228,15 +234,14 @@ impl Fiber {
                 let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
                 #[cfg(feature = "no-gc")]
                 let _lease_scope = lease.enter();
+                #[cfg(feature = "no-gc")]
+                let _allocation_scope = allocation.enter();
                 let result = body();
                 #[cfg(feature = "no-gc")]
-                let result = match result {
-                    Ok(value) => Ok(cljrs_value::publish::publish_value(value)),
-                    Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
-                        cljrs_value::publish::publish_value(value),
-                    )),
-                    other => other,
-                };
+                match &result {
+                    Ok(value) | Err(EvalError::Thrown(value)) => allocation.protect(value),
+                    _ => {}
+                }
                 result
             })
         });
@@ -263,6 +268,10 @@ pub struct FiberTask {
     id: FiberId,
     yielder: *const Yielder<(), Park>,
     root: bool,
+    #[cfg(feature = "no-gc")]
+    _captures: cljrs_gc::region::RegionLease,
+    #[cfg(feature = "no-gc")]
+    allocation: cljrs_gc::region::AllocationSnapshot,
 }
 
 impl FiberTask {
@@ -352,6 +361,16 @@ impl Future for FiberTask {
         }
         this.state.swap_with_current();
         if result.is_ready() {
+            #[cfg(feature = "no-gc")]
+            let _handoff = this._captures.enter();
+            #[cfg(feature = "no-gc")]
+            if let Poll::Ready(Ok(value) | Err(EvalError::Thrown(value))) = &result {
+                if this.root {
+                    this.allocation.protect(value);
+                } else {
+                    cljrs_gc::region::RegionLease::for_value(value).protect_current();
+                }
+            }
             if !this.root {
                 this.state = MutatorState::fresh();
             }
@@ -389,6 +408,8 @@ pub struct FiberResult {
     state: MutatorState,
     guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
     _roots: Box<[Value]>,
+    #[cfg(feature = "no-gc")]
+    leases: Vec<cljrs_gc::region::RegionLease>,
 }
 
 impl FiberResult {
@@ -398,6 +419,11 @@ impl FiberResult {
             Err(EvalError::Recur(values)) => values.clone().into_boxed_slice(),
             _ => Box::new([]),
         };
+        #[cfg(feature = "no-gc")]
+        let leases = roots
+            .iter()
+            .map(cljrs_gc::region::RegionLease::for_value)
+            .collect();
         let mut state = MutatorState::fresh();
         state.swap_with_current();
         let guard = root_values(&roots);
@@ -407,10 +433,16 @@ impl FiberResult {
             state,
             guard: Some(guard),
             _roots: roots,
+            #[cfg(feature = "no-gc")]
+            leases,
         }
     }
 
     pub fn into_result(mut self) -> EvalResult {
+        #[cfg(feature = "no-gc")]
+        for lease in &self.leases {
+            lease.protect_current();
+        }
         self.result.take().unwrap()
     }
 }
@@ -436,8 +468,24 @@ pub fn spawn_rooted(
     body: impl FnOnce() -> EvalResult + 'static,
 ) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
     let task = Fiber::with_roots(roots, body)?.into_task();
+    #[cfg(feature = "no-gc")]
+    let allocation = task.allocation.clone();
     Ok(tokio::task::spawn_local(async move {
-        FiberResult::new(task.await)
+        #[cfg(feature = "no-gc")]
+        let result = {
+            let mut task = task;
+            let result = std::future::poll_fn(|cx| {
+                let _context = allocation.enter();
+                Pin::new(&mut task).poll(cx)
+            })
+            .await;
+            // Capture result storage while the completed task still pins its
+            // original scopes. The JoinHandle can outlive those lexical scopes.
+            FiberResult::new(result)
+        };
+        #[cfg(not(feature = "no-gc"))]
+        let result = FiberResult::new(task.await);
+        result
     }))
 }
 
@@ -477,4 +525,45 @@ pub fn run_root(
     }
     let mut drive = Drive { task, carrier };
     local.block_on(rt, &mut drive.task)
+}
+
+/// Destroy local tasks with their carrier state installed, restoring the caller
+/// even if task destruction unwinds.
+pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut MutatorState) {
+    carrier.swap_with_current();
+    struct Restore<'a>(&'a mut MutatorState);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.0.swap_with_current();
+        }
+    }
+    let _restore = Restore(carrier);
+    drop(local);
+}
+
+/// Drive one root and destroy its executor with the matching carrier state.
+pub fn run_root_owned(
+    rt: &tokio::runtime::Runtime,
+    local: tokio::task::LocalSet,
+    body: impl FnOnce() -> EvalResult,
+) -> EvalResult {
+    struct Driver {
+        local: Option<tokio::task::LocalSet>,
+        carrier: MutatorState,
+    }
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            drop_local_with_carrier(self.local.take().unwrap(), &mut self.carrier);
+        }
+    }
+    let mut driver = Driver {
+        local: Some(local),
+        carrier: MutatorState::fresh(),
+    };
+    run_root(
+        rt,
+        driver.local.as_ref().unwrap(),
+        &mut driver.carrier,
+        body,
+    )
 }

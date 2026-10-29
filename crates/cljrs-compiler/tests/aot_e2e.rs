@@ -3017,6 +3017,8 @@ fn aot_root_fiber_supports_blocking_surface() {
       (println (a/<!! (a/io-thread (sleep 1) :io)))
       (println (try @(future (throw (ex-info "failure" {:x :caught})))
                     (catch Exception e (:x (ex-data e)))))
+      (println (try (try (throw (ex-info "original" {})) (finally nil))
+                    (catch Exception e :rethrow)))
       (defn -main []
         (println (binding [*x* :conveyed] @(future *x*))))
     "#,
@@ -3025,6 +3027,7 @@ fn aot_root_fiber_supports_blocking_surface() {
     assert!(stdout.contains(":io"), "{stdout}");
     assert!(stdout.contains(":conveyed"), "{stdout}");
     assert!(stdout.contains(":caught"), "{stdout}");
+    assert!(stdout.contains(":rethrow"), "{stdout}");
 }
 
 #[test]
@@ -3057,4 +3060,72 @@ fn aot_test_harness_runs_blocking_test_bodies() {
         .unwrap();
     let stdout = run_binary("fiber_tests", &bin);
     assert!(stdout.contains("2 passed, 0 failed, 0 errors"), "{stdout}");
+}
+
+#[test]
+fn test_aot_resource_failure_exits_cleanly_and_dumps_stats() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    let crate_dir = project.path().join("gas-extension");
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "gas_extension"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+cljrs-interop = {{ path = {:?} }}
+cljrs-runtime = {{ path = {:?} }}
+"#,
+            workspace.join("cljrs-interop").canonicalize().unwrap(),
+            workspace.join("cljrs-runtime").canonicalize().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        crate_dir.join("src/lib.rs"),
+        r#"
+#[unsafe(no_mangle)]
+pub extern "C" fn gas_init(_registry: *mut cljrs_interop::Registry) {
+    std::mem::forget(cljrs_runtime::env::gas::GasGuard::install(
+        cljrs_runtime::env::gas::GasMeter::new(0)));
+}
+"#,
+    )
+    .unwrap();
+    let source = project.path().join("main.cljrs");
+    let binary = project.path().join("resource-failure");
+    let stats = project.path().join("gc-stats.txt");
+    std::fs::write(&source, "(println :unreachable)\n").unwrap();
+    let config = cljrs_project::config::RustConfig {
+        crate_dir,
+        init_fn: Some("gas_extension::gas_init".into()),
+    };
+    let session = common::session(vec![]).rust_config(Some(config));
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || cljrs_compiler::aot::compile_file(&source, &binary, &session)
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let output = Command::new(binary)
+        .env("CLJRS_GC_STATS", &stats)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("gas exhausted"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("stack backtrace"), "{stderr}");
+    assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
 }

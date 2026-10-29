@@ -961,6 +961,12 @@ cljrs_gc::mutator_slot!("cljrs-compiler/RT_REGION_STACK", refcell RT_REGION_STAC
 /// pass one.
 #[inline]
 fn region_alloc_box<T: cljrs_gc::Trace + 'static>(handle: *mut Region, val: T) -> GcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = handle;
+        GcPtr::new(val)
+    }
+    #[cfg(not(feature = "no-gc"))]
     if handle.is_null() {
         alloc_inner_coll(val)
     } else {
@@ -975,6 +981,12 @@ fn region_alloc_box<T: cljrs_gc::Trace + 'static>(handle: *mut Region, val: T) -
 /// rules as [`region_alloc_box`]).
 #[inline]
 fn region_box_val(handle: *mut Region, v: Value) -> *const Value {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = handle;
+        box_val(v)
+    }
+    #[cfg(not(feature = "no-gc"))]
     if handle.is_null() {
         box_coll_val(v)
     } else {
@@ -3967,66 +3979,66 @@ pub unsafe extern "C" fn rt_try(
     let region_depth = cljrs_gc::region::region_stack_depth();
     let rt_region_depth = RT_REGION_STACK.with(|s| s.borrow().len());
 
-    // Call the body.
-    let body_result = cljrs_runtime::env::callback::invoke(&body, vec![]);
-
-    // Check for thrown exception (set by rt_throw in compiled code).
-    let ret = if resource_error_pending() || cljrs_runtime::env::gas::is_exhausted() {
-        let _ = take_pending_exception();
-        unwind_regions_to(region_depth, rt_region_depth);
-        rt_const_nil()
-    } else if let Some(thrown_ptr) = take_pending_exception() {
-        // Unwind any regions opened inside the try body.
-        unwind_regions_to(region_depth, rt_region_depth);
-        // Exception was thrown from compiled code.
-        if !matches!(catch, Value::Nil) {
-            let thrown_val = unsafe { val_ref(thrown_ptr) }.clone();
-            match cljrs_runtime::env::callback::invoke(&catch, vec![thrown_val]) {
-                Ok(v) => box_val(v),
-                Err(error) => signal_error(error),
-            }
-        } else {
-            rt_const_nil()
+    fn complete(result: cljrs_value::ValueResult<Value>) -> cljrs_value::ValueResult<Value> {
+        let resource = take_pending_resource_error();
+        let thrown = take_pending_exception_value();
+        if let Some(error) = resource {
+            return Err(error);
         }
-    } else {
-        match body_result {
-            Ok(val) => box_val(val),
-            Err(val_err) => {
-                // Unwind any regions opened inside the try body.
-                unwind_regions_to(region_depth, rt_region_depth);
-                // Body returned a ValueError (e.g. thrown via interpreter).
-                // Neither gas exhaustion nor a memory-limit fault is
-                // catchable; the fault stays in its slot for the entry seam.
-                if matches!(
-                    &val_err,
-                    cljrs_value::ValueError::GasExhausted
-                        | cljrs_value::ValueError::MemoryLimitExceeded(_)
-                ) {
-                    signal_error(val_err)
-                } else if !matches!(catch, Value::Nil) {
-                    let thrown_val = match val_err {
-                        cljrs_value::ValueError::Thrown(v) => v,
-                        other => Value::Str(GcPtr::new(other.to_string())),
-                    };
-                    match cljrs_runtime::env::callback::invoke(&catch, vec![thrown_val]) {
-                        Ok(v) => box_val(v),
-                        Err(error) => signal_error(error),
-                    }
-                } else {
-                    rt_const_nil()
-                }
-            }
+        if cljrs_runtime::env::gas::is_exhausted() {
+            return Err(cljrs_value::ValueError::GasExhausted);
         }
-    };
-
-    // Always run finally.
-    if !matches!(finally, Value::Nil)
-        && let Err(error) = cljrs_runtime::env::callback::invoke(&finally, vec![])
-    {
-        signal_error(error);
+        if let Some(value) = thrown {
+            return Err(cljrs_value::ValueError::Thrown(value));
+        }
+        result
     }
-
-    ret
+    fn is_resource(error: &cljrs_value::ValueError) -> bool {
+        matches!(
+            error,
+            cljrs_value::ValueError::GasExhausted | cljrs_value::ValueError::MemoryLimitExceeded(_)
+        )
+    }
+    let inputs = [body, catch, finally];
+    let _inputs = cljrs_runtime::env::gc_roots::root_values(&inputs);
+    let [body, catch, finally] = &inputs;
+    let mut outcome = complete(cljrs_runtime::env::callback::invoke(body, vec![]));
+    if outcome.is_err() {
+        unwind_regions_to(region_depth, rt_region_depth);
+    }
+    if !matches!(catch, Value::Nil)
+        && let Err(error) = outcome
+    {
+        outcome = if is_resource(&error) {
+            Err(error)
+        } else {
+            let thrown = match error {
+                cljrs_value::ValueError::Thrown(value) => value,
+                other => Value::Str(GcPtr::new(other.to_string())),
+            };
+            complete(cljrs_runtime::env::callback::invoke(catch, vec![thrown]))
+        };
+    }
+    // Keep the original outcome out of the TLS exception slots while finally
+    // executes. A finally-only try must rethrow, and a successful finally must
+    // not consume the earlier exception through a native adapter.
+    let roots = match &outcome {
+        Ok(value) | Err(cljrs_value::ValueError::Thrown(value)) => vec![value.clone()],
+        _ => vec![],
+    };
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
+    if !matches!(finally, Value::Nil) {
+        let cleanup = complete(cljrs_runtime::env::callback::invoke(finally, vec![]));
+        if let Err(error) = cleanup
+            && !outcome.as_ref().err().is_some_and(is_resource)
+        {
+            outcome = Err(error);
+        }
+    }
+    match outcome {
+        Ok(value) => box_val(value),
+        Err(error) => signal_error(error),
+    }
 }
 
 // ── More HOFs ───────────────────────────────────────────────────────────────
@@ -5678,6 +5690,112 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn explicit_native_allocators_obey_popped_scratch_and_static_destinations() {
+        let outer = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let mut inner = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let handle = rt_region_start();
+        inner.pop_for_return();
+        let element = Value::Long(42);
+        let items = [&element as *const Value];
+        let returned = unsafe { rt_region_alloc_vector(handle, items.as_ptr(), 1) };
+        let permanent = {
+            let _static_scope = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            unsafe { rt_region_alloc_vector(handle, items.as_ptr(), 1) }
+        };
+        rt_region_end(handle);
+        drop(inner);
+        assert_eq!(unsafe { val_ref(returned) }.to_string(), "[42]");
+        drop(outer);
+        let Value::Vector(vector) = (unsafe { val_ref(permanent) }) else {
+            panic!("not a vector")
+        };
+        assert!(vector.is_static_alloc());
+        assert_eq!(vector.get().iter().next(), Some(&Value::Long(42)));
+    }
+
+    #[test]
+    fn compiled_try_preserves_flag_only_gas_and_finally_throws() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let _context = cljrs_runtime::env::callback::install_eval_context_guard(
+                    runtime.globals().clone(),
+                    "user".into(),
+                );
+                let body = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "flag-only-gas",
+                    Arity::Fixed(0),
+                    |_| {
+                        assert!(!cljrs_runtime::env::gas::charge(1));
+                        Ok(Value::Nil)
+                    },
+                )));
+                let caught = std::rc::Rc::new(std::cell::Cell::new(false));
+                let flag = caught.clone();
+                let catcher = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "catch",
+                    Arity::Fixed(1),
+                    move |_| {
+                        flag.set(true);
+                        Ok(Value::Nil)
+                    },
+                )));
+                let nil = Value::Nil;
+                {
+                    let _gas = cljrs_runtime::env::gas::GasGuard::install(
+                        cljrs_runtime::env::gas::GasMeter::new(0),
+                    );
+                    let ptr = unsafe { rt_try(&body, &catcher, &nil) };
+                    assert!(!caught.get());
+                    assert!(matches!(
+                        compiled_result(ptr),
+                        Err(ValueError::GasExhausted)
+                    ));
+                }
+                let throwing = |n| {
+                    Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "throw",
+                        Arity::Fixed(0),
+                        move |_| Err(ValueError::Thrown(Value::Long(n))),
+                    )))
+                };
+                let original = throwing(10);
+                let cleanup = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "cleanup",
+                    Arity::Fixed(0),
+                    |_| Ok(Value::Nil),
+                )));
+                let ptr = unsafe { rt_try(&original, &nil, &cleanup) };
+                assert!(matches!(
+                    compiled_result(ptr),
+                    Err(ValueError::Thrown(Value::Long(10)))
+                ));
+                let replacement = throwing(20);
+                let ptr = unsafe { rt_try(&original, &nil, &replacement) };
+                assert!(matches!(
+                    compiled_result(ptr),
+                    Err(ValueError::Thrown(Value::Long(20)))
+                ));
+                let resource = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "resource",
+                    Arity::Fixed(0),
+                    |_| Err(ValueError::GasExhausted),
+                )));
+                let ptr = unsafe { rt_try(&resource, &nil, &replacement) };
+                assert!(matches!(
+                    compiled_result(ptr),
+                    Err(ValueError::GasExhausted)
+                ));
+                assert!(take_pending_exception_value().is_none());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn resource_limits_bypass_compiled_catch_and_survive_deref_and_adapters() {
         std::thread::Builder::new()

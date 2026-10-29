@@ -440,22 +440,16 @@ impl Var {
     }
 
     pub fn bind(&self, v: Value) {
-        // In no-gc debug builds: assert the value being stored in this
-        // program-lifetime Var came from the StaticArena, not a scratch region.
-        // A region-local pointer would dangle after the function returns.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Var::bind({}/{}) received a region-local value — store violations \
-             indicate a missing StaticCtxGuard around the value expression",
-            self.namespace,
-            self.name
-        );
         // GC builds: heap-promotion fallback — a region-allocated value bound
         // to a program-lifetime var is deep-copied to the heap (or the active
         // regions are retired when it cannot be).  One depth check when no
         // region is open.
-        let v = crate::publish::publish_value(v);
+        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
+        // Static destinations must retain every non-static source after publication.
+        #[cfg(all(feature = "no-gc", debug_assertions))]
+        debug_assert!(
+            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
+        );
         // Replace the binding, holding the lock only across the swap.  The
         // previous value (if any) is handed to the JIT rebind hook so it can
         // reclaim native code compiled for a now-superseded definition
@@ -531,6 +525,9 @@ impl Atom {
     pub fn new(v: Value) -> Self {
         // Heap-promotion fallback (GC builds): an atom is program-lifetime
         // shared state, so its initial value must not be region-allocated.
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&v).protect_current();
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
@@ -545,16 +542,13 @@ impl Atom {
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // In no-gc debug builds: assert the new value came from the StaticArena.
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
+        // Static destinations must retain every non-static source after publication.
         #[cfg(all(feature = "no-gc", debug_assertions))]
         debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Atom::reset() received a region-local value — the new-value \
-             expression must be computed inside a StaticCtxGuard (i.e. inside \
-             the swap! / reset! call) so it is allocated in the static arena"
+            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
         );
-        // GC builds: heap-promotion fallback (see `Var::bind`).
-        let v = crate::publish::publish_value(v);
         let mut guard = self.value.lock().unwrap();
         *guard = v.clone();
         v
@@ -1155,7 +1149,7 @@ impl LazySeq {
         };
         let result = match thunk.force() {
             Ok(result) => {
-                let result = crate::publish::publish_value(result);
+                let result = crate::publish::publish_for_owner(result, self as *const _ as usize);
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 Ok(result)
             }
@@ -1231,6 +1225,9 @@ pub struct Volatile {
 impl Volatile {
     pub fn new(v: Value) -> Self {
         // GC builds: heap-promotion fallback (see `Var::bind`).
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&v).protect_current();
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
             value: TrackedMutex::new(v),
@@ -1242,15 +1239,13 @@ impl Volatile {
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // In no-gc debug builds: assert the new value came from the StaticArena.
+        // GC builds: heap-promotion fallback (see `Var::bind`).
+        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
+        // Static destinations must retain every non-static source after publication.
         #[cfg(all(feature = "no-gc", debug_assertions))]
         debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Volatile::reset() received a region-local value — ensure the \
-             new-value expression is inside a StaticCtxGuard (vreset! handles this)"
+            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
         );
-        // GC builds: heap-promotion fallback (see `Var::bind`).
-        let v = crate::publish::publish_value(v);
         *self.value.lock().unwrap() = v.clone();
         v
     }
@@ -1334,7 +1329,9 @@ impl Delay {
             lazy: None,
             delay: Some(self),
         };
-        let result = thunk.force().map(crate::publish::publish_value);
+        let result = thunk
+            .force()
+            .map(|value| crate::publish::publish_for_owner(value, self as *const _ as usize));
         *self.state.lock().unwrap() = match &result {
             Ok(value) => DelayState::Forced(value.clone()),
             Err(error) => DelayState::Error(error.clone()),
@@ -1397,7 +1394,12 @@ impl CljxPromise {
     pub fn deliver(&self, v: Value) {
         // GC builds: heap-promotion fallback — the promise may outlive (and be
         // read from outside) any region scope active at delivery time.
-        let v = crate::publish::publish_value(v);
+        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
+        // Static destinations must retain every non-static source after publication.
+        #[cfg(all(feature = "no-gc", debug_assertions))]
+        debug_assert!(
+            !cljrs_gc::is_static_addr(self as *const _ as usize) || value_gcptr_is_static(&v)
+        );
         let mut guard = self.value.lock().unwrap();
         if guard.is_none() {
             *guard = Some(v);
@@ -1545,6 +1547,14 @@ impl CljxFuture {
             }
         };
         self.mark_observed();
+        drop(state);
+        #[cfg(feature = "no-gc")]
+        match &value {
+            Ok(value) | Err(crate::ValueError::Thrown(value)) => {
+                cljrs_gc::region::RegionLease::for_value(value).protect_current()
+            }
+            _ => {}
+        }
         Some(value)
     }
 

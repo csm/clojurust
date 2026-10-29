@@ -74,6 +74,8 @@ struct ChannelState {
 #[derive(Debug)]
 pub struct CljChannel {
     state: Mutex<ChannelState>,
+    #[cfg(feature = "no-gc")]
+    owner: cljrs_gc::region::AllocationOwner,
 }
 
 #[derive(Debug)]
@@ -142,8 +144,11 @@ impl Future for Select<'_> {
                 }
             }
         }
-        if let Some(result) = self.selection.result.borrow_mut().take() {
+        let completed = self.selection.result.borrow_mut().take();
+        if let Some(result) = completed {
             self.selection.take_order.set(None);
+            #[cfg(feature = "no-gc")]
+            cljrs_gc::region::RegionLease::for_value(&result.0).protect_current();
             return Poll::Ready(result);
         }
         if let Some(default) = self.default.take() {
@@ -155,7 +160,7 @@ impl Future for Select<'_> {
                 .iter()
                 .enumerate()
                 .map(|(index, op)| {
-                    let value = op.value().cloned().map(cljrs_value::publish::publish_value);
+                    let value = op.value().cloned().map(|value| op.channel().publish(value));
                     let mut state = op.channel().state.lock().unwrap();
                     let id = state.next_waiter;
                     state.next_waiter += 1;
@@ -291,9 +296,21 @@ impl ChannelState {
 }
 
 impl CljChannel {
+    fn publish(&self, value: Value) -> Value {
+        #[cfg(feature = "no-gc")]
+        {
+            self.owner.protect(&value);
+            value
+        }
+        #[cfg(not(feature = "no-gc"))]
+        {
+            cljrs_value::publish::publish_value(value)
+        }
+    }
     // Selection tokens are isolate-local. Commit under the state lock, then
     // wake only the tasks whose operations completed.
     fn attempt(&self, put: Option<&Value>, selection: &Rc<Selection>, index: usize) -> bool {
+        let put = put.map(|value| self.publish(value.clone()));
         let mut state = self.state.lock().unwrap();
         let mut wakes = state.service();
         let result = if let Some(value) = put {
@@ -304,16 +321,11 @@ impl CljChannel {
             {
                 let order = state.value_order();
                 peer.take_order.set(Some(order));
-                wakes.extend(peer.finish(
-                    cljrs_value::publish::publish_value(value.clone()),
-                    waiter.index,
-                ));
+                wakes.extend(peer.finish(value, waiter.index));
                 Some(Value::Bool(true))
             } else if state.capacity > 0 && state.queue.len() < state.capacity {
                 let order = state.value_order();
-                state
-                    .queue
-                    .insert(order, cljrs_value::publish::publish_value(value.clone()));
+                state.queue.insert(order, value);
                 Some(Value::Bool(true))
             } else {
                 None
@@ -348,6 +360,8 @@ impl CljChannel {
     /// Create a channel. `capacity == 0` is a rendezvous (unbuffered) channel.
     pub fn new(capacity: usize) -> Self {
         Self {
+            #[cfg(feature = "no-gc")]
+            owner: cljrs_gc::region::AllocationOwner::current(),
             state: Mutex::new(ChannelState {
                 queue: BTreeMap::new(),
                 next_value: 0,
@@ -384,7 +398,12 @@ impl CljChannel {
     pub(crate) fn try_take(&self) -> Option<Value> {
         let selection = Selection::new();
         self.attempt(None, &selection, 0);
-        selection.result.borrow_mut().take().map(|(value, _)| value)
+        let completed = selection.result.borrow_mut().take();
+        completed.map(|(value, _)| {
+            #[cfg(feature = "no-gc")]
+            cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+            value
+        })
     }
 
     /// Non-blocking buffered put (capacity >= 1).
@@ -404,6 +423,7 @@ impl CljChannel {
 
     /// Offer a value into a rendezvous channel's single slot.
     pub(crate) fn rv_offer(&self, v: &Value) -> RvOffer {
+        let value = self.publish(v.clone());
         let mut st = self.state.lock().unwrap();
         if st.closed {
             return RvOffer::Closed;
@@ -411,8 +431,7 @@ impl CljChannel {
         if st.queue.is_empty() {
             // GC builds: heap-promotion fallback (see `try_put_buffered`).
             let order = st.value_order();
-            st.queue
-                .insert(order, cljrs_value::publish::publish_value(v.clone()));
+            st.queue.insert(order, value);
             let wakes = st.service();
             drop(st);
             wake(wakes);

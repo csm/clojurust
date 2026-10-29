@@ -19,73 +19,19 @@ pub mod type_hint;
 pub mod types;
 pub mod value;
 
-/// No-gc publication copies immutable scratch data into the static arena.
+/// No-gc publication traces backing scopes without evaluating user code.
 #[cfg(feature = "no-gc")]
 pub mod publish {
-    fn copyable(value: &crate::clone::SerializedValue) -> bool {
-        use crate::clone::SerializedValue::*;
-        match value {
-            Nil
-            | Bool(_)
-            | Long(_)
-            | Double(_)
-            | BigInt(_)
-            | BigDecimal(_)
-            | Ratio(_)
-            | Char(_)
-            | Str(_)
-            | Uuid(_)
-            | Pattern(_)
-            | Symbol { .. }
-            | Keyword { .. }
-            | SharedAtom(_)
-            | ByteBlob(_) => true,
-            List(values) | Vector(values) | HashSet(values) | Queue(values) => {
-                values.iter().all(copyable)
-            }
-            ArrayMap(entries)
-            | HashMap(entries)
-            | TypeInstance {
-                fields: entries, ..
-            } => entries
-                .iter()
-                .all(|(key, value)| copyable(key) && copyable(value)),
-            Cons { head, tail } => copyable(head) && copyable(tail),
-            WithMeta { value, meta } => copyable(value) && copyable(meta),
-            Reduced(value) => copyable(value),
-            // Mutable identities and custom sorted comparators stay intact.
-            _ => false,
-        }
-    }
-
     pub fn publish_value(value: crate::Value) -> crate::Value {
-        if cljrs_gc::alloc_ctx::invocation_is_active() {
-            return value;
+        if !cljrs_gc::alloc_ctx::invocation_is_active() {
+            cljrs_gc::retain_regions_for(&value);
         }
-        // Persistent sinks already evaluate their contents in a static context.
-        // Opaque callables still need a capture walk even when their box is static.
-        if crate::types::value_gcptr_is_static(&value)
-            && !matches!(
-                value,
-                crate::Value::Fn(_)
-                    | crate::Value::Macro(_)
-                    | crate::Value::NativeFunction(_)
-                    | crate::Value::BoundFn(_)
-                    | crate::Value::WithMeta(..)
-                    | crate::Value::Reduced(_)
-            )
-        {
-            return value;
+        value
+    }
+    pub fn publish_for_owner(value: crate::Value, address: usize) -> crate::Value {
+        if !cljrs_gc::alloc_ctx::invocation_is_active() {
+            cljrs_gc::region::AllocationOwner::for_address(address).protect(&value);
         }
-        if let Ok(wire) = crate::clone::serialize(&value)
-            && copyable(&wire)
-        {
-            let _static_context = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-            return crate::clone::deserialize(wire);
-        }
-        // Preserve identity for mutable/opaque values. Retain their actual
-        // backing regions, rather than every region in the calling computation.
-        cljrs_gc::retain_regions_for(&value);
         value
     }
 }

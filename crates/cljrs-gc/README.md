@@ -37,14 +37,12 @@ stack as a root (`region::trace_active_regions`), so heap objects reachable
 only through a live region are still kept alive.  `GcPtr::raw()` masks the tag
 on every dereference; `GcPtr::is_region_alloc()` exposes it.
 
-**`no-gc` build:** every function call and every `loop` iteration pushes a
-scratch `Region`; intermediates are freed when the scope exits.  Return values
-and `recur` arguments are evaluated in the caller's context (the
-"return-expression-in-caller" mechanism).  Static-sink expressions (`def`,
-`defn`, `defmacro`, `atom`, `agent`, `volatile!`, `reset!`, `vreset!`,
-`swap!`, `vswap!`, `alter-var-root`, `intern`) go to the global `StaticArena`
-and live for the program lifetime.
-No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
+**`no-gc` build:** every function call and every `loop` iteration pushes a scratch `Region`.
+The evaluator transfers ownership of returned backing scopes into the caller before the scratch guard exits.
+Unused intermediates are freed when their scope exits.
+Static expressions use the global `StaticArena` and live for the program lifetime.
+Publication traces backing scopes without evaluating lazy sequences or copying values.
+There is no `GcHeap` or stop-the-world collection.
 
 An isolated invocation can instead install `alloc_ctx::InvocationGuard`. In
 that profile every allocation uses one bounded region; nested `ScratchGuard`
@@ -178,7 +176,7 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn is_region_alloc(&self) -> bool  // true if bump-allocated in a Region
 
     // no-gc + debug_assertions only:
-    pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena
+    pub fn is_static_alloc(&self) -> bool  // true for static or permanently retained storage
 }
 impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
@@ -739,13 +737,21 @@ No-gc task captures use `region::RegionLease::capture_active() -> RegionLease`.
 or fiber execution. Completion and cancellation release these leases.
 Closed regions remain in a deferred registry only while a task can use them.
 The last lease frees their storage and releases the governor charge.
-`ScratchGuard` keeps each scope registered through tail evaluation.
+`ScratchGuard` keeps each scope discoverable through result ownership transfer.
 
-Immutable no-gc publications copy into static storage. Opaque publications call
-`retain_regions_for(value: &impl Trace)` to retain their actual backing regions.
-This path preserves mutable identity without retaining unrelated caller scopes.
+No-gc publication preserves value identity and laziness. `retain_regions_for(value: &impl Trace)`
+retains only actual backing scopes for program-lifetime destinations.
+`RegionLease::for_value(value)` traces those scopes without evaluating user code.
+`RegionLease::protect_current()` transfers their ownership into the current destination scope.
+`AllocationOwner::current()` and `for_address(address)` return weak destination handles.
+Their `protect(value)` method keeps source scopes alive for that destination's lifetime.
+`AllocationSnapshot::capture()` retains a task's allocation destination.
+Its `enter()` method installs that destination until the returned `alloc_ctx::ContextGuard` drops.
+Its `protect(value)` method transfers result ownership into the captured destination.
+Ordinary scratch scopes create no lease metadata until sharing occurs.
+The address index and deferred-region map avoid full scans when a lease drops.
 Bounded isolated allocation invocations retain their original lifetime rules.
 
 `static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available
-in release no-gc builds for publication decisions. No-gc `MarkVisitor` implements
-`Default` and traverses values only for explicit region retention.
+in release no-gc builds for publication decisions.
+No-gc `MarkVisitor` implements `Default` and traverses values only for explicit ownership transfer.

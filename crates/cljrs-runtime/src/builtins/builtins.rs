@@ -5252,6 +5252,8 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
     let newval = args[2].clone();
     match &args[0] {
         Value::ObjectArray(a) => {
+            let newval =
+                cljrs_value::publish::publish_for_owner(newval, a.get() as *const _ as usize);
             let mut guard = a.get().0.lock().unwrap();
             if idx >= guard.len() {
                 return Err(ValueError::IndexOutOfBounds {

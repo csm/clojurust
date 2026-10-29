@@ -27,7 +27,7 @@ src/
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
   parking.rs                     — optional executor hooks, notification events, borrowed future parking, and Send-only blocking work
-  publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
+  publish.rs                     — (Phase 10.5, GC builds; scope ownership under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
   realization.rs                 — fallible boundaries for equality, hashing, and formatting through Rust traits
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
@@ -561,8 +561,8 @@ pub fn publish_value(v: Value) -> Value;
 The runtime safety net for bump regions coexisting with the tracing GC:
 correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
-`CljxPromise::deliver`, and `cljrs-async`'s channel puts.  Under `no-gc` the
-module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
+`CljxPromise::deliver`, and `cljrs-async`'s channel puts.
+Under `no-gc`, the barrier transfers ownership of actual backing scopes without copying values.
 
 ### `Namespace` (Phase 4)
 
@@ -1020,9 +1020,9 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
-In `no-gc` builds, `publish::publish_value` reuses static values and copies
-immutable scratch data into static storage. Mutable and opaque values retain
-only their actual backing regions. Publication preserves array and var identities.
+In `no-gc` builds, `publish::publish_value` retains actual backing regions for a program-lifetime destination.
+`publish::publish_for_owner(value, address)` transfers backing scopes into the destination object's region.
+Publication preserves identity and laziness. It does not copy values or evaluate user code.
 Isolated allocation invocations keep their bounded lifetime rules.
 
 `NativeFn::captures: Vec<Value>` records managed values retained by an opaque

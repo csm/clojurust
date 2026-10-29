@@ -2211,13 +2211,11 @@ edition = "2024"
                             // If -main is ^:async it returns a Future; await it on the
                             // current LocalSet so all spawned go-blocks drain to completion.
                             if let Err(e) = cljrs_async::fiber::park_on(cljrs_async::eval_async::await_value(main_result)) {
-                                eprintln!("cljrs: error in -main: {e:?}");
-                                std::process::exit(1);
+                                return Err(e);
                             }
                         }
                         Err(e) => {
-                            eprintln!("cljrs: error in -main: {e:?}");
-                            std::process::exit(1);
+                            return Err(e);
                         }
                     }
                 }
@@ -2336,6 +2334,7 @@ unsafe extern "C" {{
 {ns_init_externs}}}
 
 fn run() -> cljrs_runtime::env::error::EvalResult {{
+    let outcome = (|| -> cljrs_runtime::env::error::EvalResult {{
     // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
     // cannot parse is a hard error, matching `cljrs -X`: someone asked for
     // diagnostics and must not be left silently without them.
@@ -2369,7 +2368,7 @@ fn run() -> cljrs_runtime::env::error::EvalResult {{
     // initializers instead of interpreting source.
 {compiled_ns}{native_init}
 {ns_setup}    // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_runtime::env::callback::push_eval_context(&env);
+    let _context = cljrs_runtime::env::callback::install_eval_context_guard(env.globals.clone(), env.current_ns.clone());
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
@@ -2379,16 +2378,13 @@ fn run() -> cljrs_runtime::env::error::EvalResult {{
     // A memory-limit fault raised in compiled code (strict mode) that no
     // later collection cleared ends the program like an interpreter error.
     if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{
-        eprintln!("cljrs: {{fault}}");
-        std::process::exit(1);
+        return Err(cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault));
     }}
 {main_call}
-    // Pop the eval context.
-    cljrs_runtime::env::callback::pop_eval_context();
-
-    // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
-    cljrs_gc::dump_stats_from_env();
     Ok(Value::Nil)
+    }})();
+    cljrs_gc::dump_stats_from_env();
+    outcome
 }}
 
 fn main() {{
@@ -2406,12 +2402,10 @@ fn main() {{
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();
-            let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
-            let result = cljrs_async::fiber::run_root(&rt, &local, &mut carrier, run);
-            carrier.swap_with_current();
-            drop(local);
-            carrier.swap_with_current();
-            result.expect("root fiber failed");
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {{
+                eprintln!("cljrs: {{error}}");
+                std::process::exit(1);
+            }}
         }})
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {{
@@ -3026,12 +3020,10 @@ fn main() {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all().build().expect("Tokio runtime");
             let local = tokio::task::LocalSet::new();
-            let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
-            let result = cljrs_async::fiber::run_root(&rt, &local, &mut carrier, run);
-            carrier.swap_with_current();
-            drop(local);
-            carrier.swap_with_current();
-            result.expect("root fiber failed");
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {
+                eprintln!("cljrs: {error}");
+                std::process::exit(1);
+            }
         })
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {

@@ -617,9 +617,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         bind_fn_params(arity, &current_args, &mut env)?;
 
         // Eval body, catching Recur.
-        // Under no-gc: push a scratch region; evaluate all-but-last in it,
-        // then pop scratch before the tail expression so the return value
-        // lands in the caller's allocation context.
+        // Under no-gc: evaluate in scratch, then transfer the return value's
+        // backing scopes into the caller before the scratch guard exits.
         #[cfg(not(feature = "no-gc"))]
         let result = eval_body_recur_fn(&arity.body, &mut env);
         #[cfg(feature = "no-gc")]
@@ -746,26 +745,34 @@ fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult 
     Ok(result)
 }
 
-/// Under `no-gc`: evaluate body forms with the scratch region active for all
-/// non-tail forms, then pop the scratch before the tail expression so the
-/// return value (or `recur` args) are allocated in the caller's context.
+/// Evaluate the body in scratch, then transfer returned backing scopes to the
+/// caller. Tail control-flow forms keep their unused temporaries in scratch.
 #[cfg(feature = "no-gc")]
 fn eval_body_with_scratch(
     body: &[cljrs_reader::Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
     env: &mut Env,
 ) -> EvalResult {
-    if body.is_empty() {
-        scratch.pop_for_return();
-        return Ok(Value::Nil);
+    let mut result = Ok(Value::Nil);
+    for form in body {
+        result = eval(form, env);
+        if result.is_err() {
+            break;
+        }
     }
-    // Eval all non-tail forms in the scratch region.
-    for form in &body[..body.len() - 1] {
-        eval(form, env)?;
-    }
-    // Pop scratch so the tail expression allocates in the caller's context.
     scratch.pop_for_return();
-    eval(&body[body.len() - 1], env)
+    match &result {
+        Ok(value) | Err(EvalError::Thrown(value)) => {
+            cljrs_gc::region::RegionLease::for_value(value).protect_current()
+        }
+        Err(EvalError::Recur(values)) => {
+            for value in values {
+                cljrs_gc::region::RegionLease::for_value(value).protect_current();
+            }
+        }
+        _ => {}
+    }
+    result
 }
 
 /// Select the matching arity for the given argument count.
