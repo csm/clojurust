@@ -328,6 +328,7 @@ pub fn publish_for_named_slot(value: Value, address: usize, slot: String) -> Val
         if cljrs_gc::alloc_ctx::invocation_is_active() {
             return value;
         }
+        let (value, _compact) = compact_scalar(value);
         let lease = cljrs_gc::region::RegionLease::for_value(&value);
         cljrs_gc::region::AllocationOwner::for_address(address).set_slot(address, slot, &lease);
         value
