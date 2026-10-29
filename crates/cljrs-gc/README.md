@@ -787,3 +787,32 @@ Task capture excludes temporary read scopes. Callers must declare captured manag
 Low-level embedders can use a read scope to bound temporary reads outside the evaluator.
 Keep the scope alive while using borrowed results. Discard the results before dropping the scope.
 Without an enclosing caller scope, raw escaping results receive program-lifetime ownership.
+
+
+### No-GC borrowed reads and mutable storage
+
+`RegionLease::protect_read()` requires a current read scope or scratch destination for non-empty leases.
+It rejects unscoped borrowed reads instead of retaining their source arenas forever.
+`AllocationOwner::adopt` remains a durable store operation.
+
+`SlotId` identifies a mutable field with `Index(usize)` or `Named(String)`.
+It implements `From<usize>`, `From<String>`, `Clone`, `Debug`, equality, and ordering.
+`AllocationOwner::set_slot(address, slot: impl Into<SlotId>, &RegionLease)` replaces one field's ownership.
+`read_slot(address, slot)` borrows that cached ownership. `clear_slots(address)` releases an object's fields at destruction.
+Static fields own leases; regional fields use counted edges. Both release overwritten values.
+
+`ReadContext` owns the read scopes of one asynchronous computation and implements `Default`.
+`enter(&mut self) -> ReadContextGuard<'_>` installs that context for one poll.
+The guard restores the polling caller's scopes on drop, including unwind.
+Contexts and guards remain on their creating thread.
+
+`Trace::init_ownership(&self)` is a default no-GC allocation hook.
+Managed allocators call it after constructing the pointee. Mutable containers use it to establish their initial field leases.
+The hook must not park or evaluate user code.
+
+`GcPtr::identity_eq(a, b) -> bool` compares logical object identity.
+In native GC builds, this is pointer identity.
+No-GC boxes also hold a unique 64-bit identity.
+`unsafe GcPtr::clone_immutable(&self) -> Self`, available under no-GC, copies an immutable scalar with that identity.
+The pointee must contain no mutable state, and its clone must represent the same value.
+`GcPtr::ptr_eq` continues to compare physical allocation addresses.

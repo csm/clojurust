@@ -64,6 +64,11 @@ impl PersistentHashMap {
         self.order.get(seq).map(|(_, v)| v)
     }
 
+    #[cfg(feature = "no-gc")]
+    pub(crate) fn canonical_key(&self, key: &Value) -> Option<Value> {
+        self.index.get_key_value(key).map(|(key, _)| key.clone())
+    }
+
     pub fn contains_key(&self, key: &Value) -> bool {
         self.index.contains_key(key)
     }
@@ -73,12 +78,12 @@ impl PersistentHashMap {
     /// Re-associating a key that is already present keeps its original
     /// insertion position; a brand-new key is appended at the end.
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        if let Some(seq) = self.index.get(&key) {
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
             let seq = *seq;
             let n = self.count();
             Self {
                 index: self.index.clone(),
-                order: self.order.insert(seq, (key, value)),
+                order: self.order.insert(seq, (stored_key.clone(), value)),
                 next_seq: self.next_seq,
                 charge: self.charge.derive(n, n, rb_path_bytes::<OrderEntry>(n)),
             }
@@ -96,8 +101,8 @@ impl PersistentHashMap {
 
     // Only used when neither hashing nor equality can realize user code.
     pub(crate) fn assoc_mut(&mut self, key: Value, value: Value) {
-        if let Some(seq) = self.index.get(&key).copied() {
-            self.order.insert_mut(seq, (key, value));
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
+            self.order.insert_mut(*seq, (stored_key.clone(), value));
         } else {
             let seq = self.next_seq;
             self.index.insert_mut(key.clone(), seq);

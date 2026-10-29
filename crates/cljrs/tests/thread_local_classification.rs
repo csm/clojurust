@@ -33,6 +33,11 @@ const NO_GC: bool = cfg!(feature = "no-gc");
 const CLASSIFICATION: &[(&str, &str, Class)] = &[
     (
         "cljrs-gc/src/region.rs",
+        "STATIC_SLOTS",
+        Thread("ownership of static mutable storage slots"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
         "READ_SCOPES",
         FiberWhen("cljrs-gc/READ_SCOPES", NO_GC),
     ),

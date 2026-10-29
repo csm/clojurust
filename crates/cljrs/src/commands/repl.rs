@@ -53,6 +53,8 @@ fn run_repl(globals: Arc<GlobalEnv>) {
                 } else if line.starts_with(":quit") {
                     break;
                 } else {
+                    #[cfg(feature = "no-gc")]
+                    let _reads = cljrs_gc::region::ReadScope::enter();
                     match session::eval_in(&mut env, &line, "<repl>") {
                         Ok(Value::Nil) => println!("nil"),
                         Ok(v) => println!("{}", v),
@@ -109,6 +111,8 @@ fn run_repl(globals: Arc<GlobalEnv>) {
         if depth <= 0 && !input_buf.trim().is_empty() {
             depth = 0;
             let src = std::mem::take(&mut input_buf);
+            #[cfg(feature = "no-gc")]
+            let _reads = cljrs_gc::region::ReadScope::enter();
             match session::eval_in(&mut env, &src, "<repl>") {
                 Ok(Value::Nil) => {}
                 Ok(v) => println!("{}", v),

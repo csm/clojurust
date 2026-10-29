@@ -820,3 +820,10 @@ Compiled atom reset and swap use the interpreter update functions.
 They share validators, watches, resource errors, and return ownership with interpreted calls.
 Fused fallbacks compose a Result-valued global-call helper, so a failed first call prevents the next call.
 Compiled closures share an `Arc<[Value]>` between execution and tracing.
+
+
+The `rt_identical` bridge uses `Value::identical`, including no-GC immutable scalar identity across relocation.
+Object-array ABI reads and writes use the same indexed ownership barriers as interpreter array operations.
+
+Under no-GC, standalone Rust callers of the runtime ABI must keep a `region::ReadScope` alive while using borrowed results.
+Runtime evaluation and fiber drivers establish the required scopes.

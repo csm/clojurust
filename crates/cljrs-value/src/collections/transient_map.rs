@@ -20,6 +20,8 @@ pub struct TransientMap {
     persisted: Mutex<bool>,
     revision: AtomicU64,
     keys_may_realize: AtomicBool,
+    #[cfg(feature = "no-gc")]
+    ownership: super::OwnershipSlots,
 }
 
 impl TransientMap {
@@ -28,6 +30,8 @@ impl TransientMap {
             map: Mutex::new(PersistentHashMap::empty()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(false),
         }
     }
@@ -37,6 +41,8 @@ impl TransientMap {
             map: Mutex::new(map.clone()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(
                 !(map.iter().all(|(key, _)| crate::realization::is_inert(key))),
             ),
@@ -92,10 +98,29 @@ impl TransientMap {
             &key,
             |map| map.assoc_mut(key.clone(), value.clone()),
             |map| map.assoc(key.clone(), value.clone()),
-        )
+        )?;
+        #[cfg(feature = "no-gc")]
+        {
+            let key = self
+                .lookup(&key, |map| map.canonical_key(&key))
+                .expect("associated key");
+            let slot = self.ownership.id(&key);
+            let lease = cljrs_gc::region::RegionLease::for_values(&[key, value]);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                slot,
+                &lease,
+            );
+        }
+        Ok(())
     }
     pub fn dissoc(&self, key: &Value) -> ValueResult<()> {
-        self.update(key, |map| map.dissoc_mut(key), |map| map.dissoc(key))
+        self.update(key, |map| map.dissoc_mut(key), |map| map.dissoc(key))?;
+        #[cfg(feature = "no-gc")]
+        if let Some(slot) = self.ownership.remove(key) {
+            crate::publish::publish_for_slot(Value::Nil, self as *const _ as usize, slot);
+        }
+        Ok(())
     }
 
     pub fn persistent(&self) -> ValueResult<PersistentHashMap> {
@@ -105,7 +130,10 @@ impl TransientMap {
             return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
-        Ok(map.clone())
+        let result = map.clone();
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+        Ok(result)
     }
 
     fn lookup<T>(&self, key: &Value, operation: impl Fn(&PersistentHashMap) -> T) -> T {
@@ -119,11 +147,23 @@ impl TransientMap {
     }
     pub fn find(&self, key: &Value) -> Option<(Value, Value)> {
         self.lookup(key, |map| {
-            map.get(key).map(|value| (key.clone(), value.clone()))
+            map.get(key).map(|value| {
+                #[cfg(feature = "no-gc")]
+                cljrs_gc::region::RegionLease::for_values(&[key.clone(), value.clone()])
+                    .protect_read();
+                (key.clone(), value.clone())
+            })
         })
     }
     pub fn get(&self, key: &Value) -> Option<Value> {
-        self.lookup(key, |map| map.get(key).cloned())
+        self.lookup(key, |map| {
+            let value = map.get(key).cloned();
+            #[cfg(feature = "no-gc")]
+            if let Some(value) = &value {
+                cljrs_gc::region::RegionLease::for_value(value).protect_read();
+            }
+            value
+        })
     }
     pub fn contains_key(&self, key: &Value) -> bool {
         self.lookup(key, |map| map.contains_key(key))
@@ -141,6 +181,8 @@ impl Clone for TransientMap {
             map: Mutex::new(self.map.lock().unwrap().clone()),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
@@ -161,6 +203,21 @@ impl ClojureHash for TransientMap {
 }
 
 impl cljrs_gc::Trace for TransientMap {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        for (key, value) in self.map.lock().unwrap().iter() {
+            let slot = self.ownership.id(key);
+            let lease = cljrs_gc::region::RegionLease::for_values(&[key.clone(), value.clone()]);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                slot,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let map = self.map.lock().unwrap();
@@ -180,5 +237,11 @@ impl cljrs_gc::Trace for TransientMap {
 impl Default for TransientMap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TransientMap {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
     }
 }

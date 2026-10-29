@@ -635,11 +635,14 @@ pub unsafe extern "C" fn rt_aget(arr: *const Value, idx: *const Value) -> *const
     }
     match arr {
         Value::ObjectArray(a) => {
+            cljrs_value::publish::read_slot(a.get() as *const _ as usize, i as usize);
             let g = a.get().0.lock().unwrap();
             if i < 0 || i as usize >= g.len() {
                 return throw_index_oob(i, g.len());
             }
-            box_val(g[i as usize].clone())
+            let value = g[i as usize].clone();
+            drop(g);
+            box_val(value)
         }
         Value::LongArray(a) => load!(a, |v: &i64| Value::Long(*v)),
         Value::IntArray(a) => load!(a, |v: &i32| Value::Long(*v as i64)),
@@ -688,12 +691,17 @@ pub unsafe extern "C" fn rt_aset(
     }
     match arr_v {
         Value::ObjectArray(a) => {
-            let mut g = a.get().0.lock().unwrap();
-            if i < 0 || i as usize >= g.len() {
-                return throw_index_oob(i, g.len());
+            let count = a.get().0.lock().unwrap().len();
+            if i < 0 || i as usize >= count {
+                return throw_index_oob(i, count);
             }
-            g[i as usize] = val_v.clone();
-            val
+            let value = cljrs_value::publish::publish_for_slot(
+                val_v.clone(),
+                a.get() as *const _ as usize,
+                i as usize,
+            );
+            a.get().0.lock().unwrap()[i as usize] = value.clone();
+            box_val(value)
         }
         Value::LongArray(a) => store!(a.get().lock().unwrap(), |v: &Value| match v {
             Value::Long(n) => Some(*n),
@@ -2917,7 +2925,7 @@ pub unsafe extern "C" fn rt_is_map(v: *const Value) -> *const Value {
 #[unsafe(no_mangle)]
 #[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_identical(a: *const Value, b: *const Value) -> *const Value {
-    intern_bool(std::ptr::eq(a, b))
+    intern_bool(unsafe { val_ref(a) }.identical(unsafe { val_ref(b) }))
 }
 
 // ── Str ─────────────────────────────────────────────────────────────────────
@@ -5329,6 +5337,8 @@ mod tests {
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let _mutator = cljrs_gc::register_mutator();
+                #[cfg(feature = "no-gc")]
+                let _reads = cljrs_gc::region::ReadScope::nested();
                 let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
@@ -5626,6 +5636,33 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[test]
+    fn compiled_identity_compares_values_instead_of_box_addresses() {
+        let left = Value::string("same allocation");
+        let alias = left.clone();
+        let equal = Value::string("same allocation");
+        assert_eq!(
+            compiled_result(unsafe { rt_identical(&left, &alias) }).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            compiled_result(unsafe { rt_identical(&left, &equal) }).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            compiled_result(unsafe { rt_identical(&Value::Long(42), &Value::Long(42)) }).unwrap(),
+            Value::Bool(true)
+        );
+        let array = Value::ObjectArray(GcPtr::new(cljrs_value::ObjectArray::new(vec![Value::Nil])));
+        #[cfg(feature = "no-gc")]
+        let _caller = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let input = Value::string("stored scalar");
+        let stored = compiled_result(unsafe { rt_aset(&array, &Value::Long(0), &input) }).unwrap();
+        let read = compiled_result(unsafe { rt_aget(&array, &Value::Long(0)) }).unwrap();
+        assert!(input.identical(&stored));
+        assert!(input.identical(&read));
+    }
+
     #[test]
     fn compiled_atom_callbacks_confirm_memory_faults() {
         std::thread::Builder::new()

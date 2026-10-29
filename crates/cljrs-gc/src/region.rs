@@ -222,7 +222,7 @@ impl Region {
         }
         #[cfg(feature = "no-gc")]
         unsafe {
-            ptr::write(gc_box, GcBox { value });
+            ptr::write(gc_box, GcBox::new(value));
         }
 
         self.drops.push(DropEntry {
@@ -242,7 +242,9 @@ impl Region {
         }
         #[cfg(feature = "no-gc")]
         {
-            GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
+            let pointer = GcPtr(unsafe { NonNull::new_unchecked(gc_box) });
+            pointer.get().init_ownership();
+            pointer
         }
     }
 
@@ -590,6 +592,7 @@ struct LeaseOwner {
     dependents: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
     dependencies: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
     dependency_counts: RefCell<std::collections::BTreeMap<u64, usize>>,
+    slots: RefCell<std::collections::BTreeMap<(usize, SlotId), RegionDependency>>,
 }
 #[cfg(feature = "no-gc")]
 impl Drop for LeaseOwner {
@@ -630,6 +633,7 @@ impl Region {
             dependents: RefCell::new(Default::default()),
             dependencies: RefCell::new(Default::default()),
             dependency_counts: RefCell::new(Default::default()),
+            slots: RefCell::new(Default::default()),
         });
         self.lease = Some(owner.clone());
         for chunk in &self.chunks {
@@ -652,6 +656,7 @@ thread_local! {
     // Boxes keep allocation targets stable after their lexical scope closes.
     static LEASED_REGIONS: RefCell<std::collections::BTreeMap<u64, Box<Region>>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+    static STATIC_SLOTS: RefCell<std::collections::BTreeMap<(usize, SlotId), RegionLease>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static READ_SCOPES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
     static LEASE_SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Isolate-local address index shared by its fibers; entries do not own regions.
@@ -661,6 +666,26 @@ thread_local! {
 crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<RegionLease>);
 #[cfg(feature = "no-gc")]
 crate::mutator_slot!("cljrs-gc/READ_SCOPES", refcell READ_SCOPES: Vec<RegionLease>);
+
+/// Identifies one independently replaceable field of a managed object.
+#[cfg(feature = "no-gc")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlotId {
+    Index(usize),
+    Named(String),
+}
+#[cfg(feature = "no-gc")]
+impl From<usize> for SlotId {
+    fn from(value: usize) -> Self {
+        Self::Index(value)
+    }
+}
+#[cfg(feature = "no-gc")]
+impl From<String> for SlotId {
+    fn from(value: String) -> Self {
+        Self::Named(value)
+    }
+}
 
 /// Weak cached backing scopes for a region-owned container.
 #[cfg(feature = "no-gc")]
@@ -704,6 +729,31 @@ impl Drop for ReadScope {
             let lease = READ_SCOPES.with(|scopes| scopes.borrow_mut().pop());
             drop(lease);
         }
+    }
+}
+
+/// Read leases owned by one asynchronous task, independent of the polling caller.
+#[cfg(feature = "no-gc")]
+pub struct ReadContext(Vec<RegionLease>);
+#[cfg(feature = "no-gc")]
+impl Default for ReadContext {
+    fn default() -> Self {
+        Self(vec![RegionLease::default()])
+    }
+}
+#[cfg(feature = "no-gc")]
+impl ReadContext {
+    pub fn enter(&mut self) -> ReadContextGuard<'_> {
+        READ_SCOPES.with(|scopes| std::mem::swap(&mut *scopes.borrow_mut(), &mut self.0));
+        ReadContextGuard(self)
+    }
+}
+#[cfg(feature = "no-gc")]
+pub struct ReadContextGuard<'a>(&'a mut ReadContext);
+#[cfg(feature = "no-gc")]
+impl Drop for ReadContextGuard<'_> {
+    fn drop(&mut self) {
+        READ_SCOPES.with(|scopes| std::mem::swap(&mut *scopes.borrow_mut(), &mut self.0.0));
     }
 }
 
@@ -788,6 +838,14 @@ impl RegionLease {
             }
         }
     }
+    /// Borrow a value only within an explicit read or scratch scope.
+    pub fn protect_read(&self) {
+        assert!(
+            self.0.is_empty() || ReadScope::is_active() || !crate::alloc_ctx::is_static_context(),
+            "a borrowed no-gc value requires ReadScope; use an owning snapshot outside evaluation"
+        );
+        self.protect_current();
+    }
     pub fn protect_current(&self) {
         if self.0.is_empty() {
             return;
@@ -843,6 +901,80 @@ impl AllocationOwner {
     }
     pub fn protect(&self, value: &impl Trace) {
         self.adopt(&RegionLease::for_value(value));
+    }
+    /// Replace the ownership of one mutable object slot.
+    pub fn set_slot(&self, address: usize, slot: impl Into<SlotId>, lease: &RegionLease) {
+        let key = (address, slot.into());
+        if self.is_permanent() {
+            let previous = STATIC_SLOTS.with(|slots| {
+                let mut slots = slots.borrow_mut();
+                if lease.0.is_empty() {
+                    slots.remove(&key)
+                } else {
+                    slots.insert(key, lease.clone())
+                }
+            });
+            drop(previous);
+        } else if let Some(owner) = self.0.upgrade() {
+            let edges = self.replaceable(lease);
+            let previous = {
+                let mut slots = owner.slots.borrow_mut();
+                if lease.0.is_empty() {
+                    slots.remove(&key)
+                } else {
+                    slots.insert(key, edges)
+                }
+            };
+            drop(previous);
+        }
+    }
+    /// Release every cached field when its containing object is destroyed.
+    pub fn clear_slots(&self, address: usize) {
+        if self.is_permanent() {
+            let removed = STATIC_SLOTS.try_with(|slots| {
+                let mut slots = slots.borrow_mut();
+                let keys = slots
+                    .range((address, SlotId::Index(0))..)
+                    .take_while(|((owner, _), _)| *owner == address)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| slots.remove(&key))
+                    .collect::<Vec<_>>()
+            });
+            drop(removed);
+        } else if let Some(owner) = self.0.upgrade() {
+            let removed = {
+                let mut slots = owner.slots.borrow_mut();
+                let keys = slots
+                    .range((address, SlotId::Index(0))..)
+                    .take_while(|((owner, _), _)| *owner == address)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| slots.remove(&key))
+                    .collect::<Vec<_>>()
+            };
+            drop(removed);
+        }
+    }
+    /// Borrow a cached slot value into the caller's read scope.
+    pub fn read_slot(&self, address: usize, slot: impl Into<SlotId>) {
+        let key = (address, slot.into());
+        let lease = if self.is_permanent() {
+            STATIC_SLOTS.with(|slots| slots.borrow().get(&key).cloned())
+        } else {
+            self.0.upgrade().and_then(|owner| {
+                owner
+                    .slots
+                    .borrow()
+                    .get(&key)
+                    .map(RegionDependency::snapshot)
+            })
+        };
+        if let Some(lease) = lease {
+            lease.protect_read();
+        }
     }
     /// Store backing scopes for the destination's full lifetime.
     pub fn adopt(&self, lease: &RegionLease) {
@@ -1149,16 +1281,19 @@ pub(crate) fn close_scratch_region(mut region: Box<Region>) {
 #[cfg(feature = "no-gc")]
 fn live_regions() -> Vec<*mut Region> {
     let mut regions = crate::alloc_ctx::live_regions();
-    REGION_STACK.with(|stack| regions.extend(stack.borrow().iter().copied()));
+    let _ = REGION_STACK.try_with(|stack| regions.extend(stack.borrow().iter().copied()));
     regions
 }
 #[cfg(feature = "no-gc")]
 fn find_owner(address: usize) -> Option<std::rc::Rc<LeaseOwner>> {
-    let indexed = REGION_OWNERS.with(|index| {
-        let index = index.borrow();
-        let (_, (end, owner)) = index.range(..=address).next_back()?;
-        (address < *end).then(|| owner.upgrade()).flatten()
-    });
+    let indexed = REGION_OWNERS
+        .try_with(|index| {
+            let index = index.borrow();
+            let (_, (end, owner)) = index.range(..=address).next_back()?;
+            (address < *end).then(|| owner.upgrade()).flatten()
+        })
+        .ok()
+        .flatten();
     if indexed.is_some() {
         return indexed;
     }

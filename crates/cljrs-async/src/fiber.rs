@@ -214,6 +214,8 @@ impl Fiber {
             lease
         };
         let reports = crate::channel::FailureReports::current();
+        #[cfg(feature = "no-gc")]
+        let result_lease = std::rc::Rc::new(RefCell::new(cljrs_gc::region::RegionLease::default()));
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
         // Register captures in the fiber's detached state, not the caller's.
@@ -227,6 +229,10 @@ impl Fiber {
             id,
             yielder: std::ptr::null(),
             root: false,
+            #[cfg(feature = "no-gc")]
+            result_lease: result_lease.clone(),
+            #[cfg(feature = "no-gc")]
+            owned_result: false,
             #[cfg(feature = "no-gc")]
             _captures: lease.clone(),
             #[cfg(feature = "no-gc")]
@@ -244,10 +250,14 @@ impl Fiber {
                 let _lease_scope = lease.enter();
                 #[cfg(feature = "no-gc")]
                 let _allocation_scope = allocation.enter();
+                #[cfg(feature = "no-gc")]
+                let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
                 let result = body();
                 #[cfg(feature = "no-gc")]
                 match &result {
-                    Ok(value) | Err(EvalError::Thrown(value)) => allocation.protect(value),
+                    Ok(value) | Err(EvalError::Thrown(value)) => {
+                        *result_lease.borrow_mut() = cljrs_gc::region::RegionLease::for_value(value)
+                    }
                     _ => {}
                 }
                 result
@@ -276,6 +286,10 @@ pub struct FiberTask {
     id: FiberId,
     yielder: *const Yielder<(), Park>,
     root: bool,
+    #[cfg(feature = "no-gc")]
+    result_lease: std::rc::Rc<RefCell<cljrs_gc::region::RegionLease>>,
+    #[cfg(feature = "no-gc")]
+    owned_result: bool,
     #[cfg(feature = "no-gc")]
     _captures: cljrs_gc::region::RegionLease,
     #[cfg(feature = "no-gc")]
@@ -372,12 +386,8 @@ impl Future for FiberTask {
             #[cfg(feature = "no-gc")]
             let _handoff = this._captures.enter();
             #[cfg(feature = "no-gc")]
-            if let Poll::Ready(Ok(value) | Err(EvalError::Thrown(value))) = &result {
-                if this.root {
-                    this.allocation.protect(value);
-                } else {
-                    cljrs_gc::region::RegionLease::for_value(value).protect_current();
-                }
+            if !this.root && !this.owned_result {
+                this.result_lease.borrow().protect_current();
             }
             if !this.root {
                 this.state = MutatorState::fresh();
@@ -482,6 +492,7 @@ pub fn spawn_rooted(
         #[cfg(feature = "no-gc")]
         let result = {
             let mut task = task;
+            task.owned_result = true;
             let result = std::future::poll_fn(|cx| {
                 let _context = allocation.enter();
                 Pin::new(&mut task).poll(cx)
@@ -543,7 +554,13 @@ pub fn run_root(
         }
     }
     let mut drive = Drive { task, carrier };
-    local.block_on(rt, &mut drive.task)
+    let result = local.block_on(rt, &mut drive.task);
+    #[cfg(feature = "no-gc")]
+    let ownership = drive.task.result_lease.borrow().clone();
+    drop(drive);
+    #[cfg(feature = "no-gc")]
+    ownership.protect_current();
+    result
 }
 
 /// Destroy local tasks with their carrier state installed, restoring the caller

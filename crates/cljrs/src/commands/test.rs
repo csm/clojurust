@@ -39,6 +39,8 @@ struct NsTestResult {
 }
 
 pub fn run(args: Args, versioning: VersioningFlags) -> miette::Result<i32> {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::enter();
     let gc_config = session::build_gc_config(args.gc_soft_limit_mb, args.gc_hard_limit_mb)?;
     let globals = session::setup_globals(args.src_paths, gc_config, versioning);
 

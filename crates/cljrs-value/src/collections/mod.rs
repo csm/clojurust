@@ -23,6 +23,38 @@ pub use transient_set::TransientSet;
 pub use transient_vector::TransientVector;
 pub use vector::PersistentVector;
 
+#[cfg(feature = "no-gc")]
+#[derive(Debug)]
+pub(crate) struct OwnershipSlots(std::cell::RefCell<(PersistentHashMap, usize)>);
+#[cfg(feature = "no-gc")]
+impl Default for OwnershipSlots {
+    fn default() -> Self {
+        Self(std::cell::RefCell::new((PersistentHashMap::empty(), 0)))
+    }
+}
+#[cfg(feature = "no-gc")]
+impl OwnershipSlots {
+    pub fn id(&self, key: &crate::Value) -> usize {
+        let (mut indices, next) = self.0.borrow().clone();
+        if let Some(crate::Value::Long(index)) = indices.get(key) {
+            return *index as usize;
+        }
+        indices.assoc_mut(key.clone(), crate::Value::Long(next as i64));
+        *self.0.borrow_mut() = (indices, next + 1);
+        next
+    }
+    pub fn remove(&self, key: &crate::Value) -> Option<usize> {
+        let (mut indices, next) = self.0.borrow().clone();
+        let crate::Value::Long(index) = indices.get(key)? else {
+            unreachable!()
+        };
+        let index = *index as usize;
+        indices.dissoc_mut(key);
+        *self.0.borrow_mut() = (indices, next);
+        Some(index)
+    }
+}
+
 // Stable host storage, traced through a per-mutator shadow stack. Snapshots
 // do not create managed boxes or keep whole allocation frames alive.
 #[cfg(not(feature = "no-gc"))]
@@ -57,10 +89,14 @@ pub(crate) struct Snapshot<T: cljrs_gc::Trace + 'static> {
     data: Box<T>,
     #[cfg(feature = "no-gc")]
     data: T,
+    #[cfg(feature = "no-gc")]
+    _lease: cljrs_gc::region::RegionLease,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl<T: cljrs_gc::Trace + 'static> Snapshot<T> {
     pub(crate) fn new(data: T) -> Self {
+        #[cfg(feature = "no-gc")]
+        let lease = cljrs_gc::region::RegionLease::for_value(&data);
         #[cfg(not(feature = "no-gc"))]
         let data = {
             let data = Box::new(data);
@@ -73,6 +109,8 @@ impl<T: cljrs_gc::Trace + 'static> Snapshot<T> {
         };
         Self {
             data,
+            #[cfg(feature = "no-gc")]
+            _lease: lease,
             _not_send: std::marker::PhantomData,
         }
     }

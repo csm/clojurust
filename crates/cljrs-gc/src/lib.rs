@@ -77,6 +77,10 @@ pub fn is_static_addr(addr: usize) -> bool {
 /// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
 ///   separately when it is allocated.
 pub trait Trace {
+    /// Initialize independent no-GC ownership slots after allocation.
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {}
+
     fn trace(&self, visitor: &mut MarkVisitor);
 
     fn gc_size_extra(&self) -> usize {
@@ -230,8 +234,18 @@ pub use self::nogc_box::GcBox;
 mod nogc_box {
     use crate::Trace;
 
+    static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     pub struct GcBox<T: Trace + 'static> {
         pub value: T,
+        pub(crate) identity: u64,
+    }
+    impl<T: Trace + 'static> GcBox<T> {
+        pub(crate) fn new(value: T) -> Self {
+            Self {
+                value,
+                identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            }
+        }
     }
 }
 
@@ -526,6 +540,35 @@ impl<T: Trace + 'static> GcPtr<T> {
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
+    }
+
+    /// Compare logical object identity, including relocated immutable scalar boxes.
+    pub fn identity_eq(a: &Self, b: &Self) -> bool {
+        #[cfg(feature = "no-gc")]
+        {
+            unsafe { (*a.raw()).identity == (*b.raw()).identity }
+        }
+        #[cfg(not(feature = "no-gc"))]
+        {
+            Self::ptr_eq(a, b)
+        }
+    }
+
+    /// Copy an immutable scalar into the current allocation destination.
+    ///
+    /// # Safety
+    /// The pointee must be immutable, and its clone must represent the same
+    /// value without mutable state. Both allocations retain one logical identity.
+    #[cfg(feature = "no-gc")]
+    pub unsafe fn clone_immutable(&self) -> Self
+    where
+        T: Clone,
+    {
+        let copy = Self::new(self.get().clone());
+        unsafe {
+            (*copy.raw()).identity = (*self.raw()).identity;
+        }
+        copy
     }
 
     /// Return `true` for static storage or a permanently retained backing scope.

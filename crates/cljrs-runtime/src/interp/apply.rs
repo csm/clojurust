@@ -755,7 +755,7 @@ fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult 
 /// Evaluate the body in scratch, then transfer returned backing scopes to the
 /// caller. Tail control-flow forms keep their unused temporaries in scratch.
 #[cfg(feature = "no-gc")]
-fn eval_body_with_scratch(
+pub(crate) fn eval_body_with_scratch(
     body: &[cljrs_reader::Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
     recur_lease: &mut cljrs_gc::region::RegionLease,
@@ -769,19 +769,7 @@ fn eval_body_with_scratch(
         }
     }
     scratch.pop_for_return();
-    match result {
-        Ok(value) => Ok(cljrs_value::publish::publish_return(value)),
-        Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
-            cljrs_value::publish::publish_return(value),
-        )),
-        Err(EvalError::Recur(values)) => {
-            // Recur is local to this trampoline, even when its caller is static.
-            // Acquire the next lease before releasing the previous iteration.
-            *recur_lease = cljrs_gc::region::RegionLease::for_values(&values);
-            Err(EvalError::Recur(values))
-        }
-        other => other,
-    }
+    crate::interp::eval::publish_result(result, Some(recur_lease))
 }
 
 /// Select the matching arity for the given argument count.

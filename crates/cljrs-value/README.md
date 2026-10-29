@@ -1033,8 +1033,9 @@ The evaluator publishes only its final escaping result after that read scope end
 Recur values use a replaceable trampoline lease.
 
 `publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
-Every payload keeps its original identity and structural sharing.
-A live payload retains its source arena, including other allocations in that arena.
+Collections keep their allocation identity and structural sharing.
+Small strings, UUIDs, BigInts, and ratios can move into compact arenas while keeping their logical identity.
+Other live payloads retain their source arenas, including other allocations in those arenas.
 Replacing or consuming the payload releases that ownership after its last reader finishes.
 Permanent destinations own their current payload lease. Regional destinations use counted, replaceable ownership edges and cache weak snapshots.
 Ownership tracing records mutable container scopes without snapshotting their current contents.
@@ -1073,3 +1074,40 @@ capture isolate-local Values. Transaction host wrappers capture serialized host 
 `CljxFuture::new_local()` records the executor thread. A pending local future
 rejects synchronous carrier dereference with a catchable error. `CljxFuture::new()`
 retains blocking behavior for manual futures and producers on another thread.
+
+
+### Borrowed values and field ownership
+
+`Value::identical(&self, other: &Value) -> bool` implements Clojure identity for every execution tier.
+Immutable scalar relocation preserves identity; collection and mutable-object identity remains allocation-based.
+`UuidValue` also implements `Clone`.
+
+`Var::snapshot() -> Option<publish::ValueSnapshot>` owns a root snapshot under no-GC.
+Atom and volatile snapshots have the same ownership contract.
+Use snapshots for Rust code that needs values across replacement without a read scope.
+For borrowed `deref`, metadata, validator, and watch reads, keep a `region::ReadScope` alive while using the values.
+A leased borrowed read without a scope fails explicitly. Native GC callers must continue to register GC roots.
+
+`Atom::add_watch(key: Value, callback: Value)` and `Var::add_watch` retain callback ownership.
+Their `remove_watch(key: &Value)` methods release removed ownership.
+`Atom::protect_watches()` and `Var::protect_watches()` borrow the cached watch values for callback delivery.
+`ValueLease::for_values(values: &[Value], owner: &AllocationOwner) -> ValueLease` prepares a shared field policy.
+`ValueLease::protect_read()` borrows cached backing scopes and requires the caller's read scope.
+
+`publish::publish_for_slot(value: Value, address: usize, slot: usize) -> Value` replaces one indexed field's lease.
+`publish_for_named_slot(value: Value, address: usize, slot: String) -> Value` supports named fields such as protocol methods.
+`publish_for_owner` uses indexed slot zero for a single-field container.
+`publish::read_slot(address: usize, slot: usize)` protects a cached field value for its reader.
+`publish::clear_slots(address: usize)` releases fields at object destruction.
+Native GC builds use the ordinary promotion barrier for these stores.
+
+Arrays, transients, lazy cells, delays, promises, and futures maintain independent no-GC field ownership.
+Initial managed allocation invokes `Trace::init_ownership`; ordinary ownership tracing skips these mutable contents.
+Collection snapshots own their backing leases during operations that can park or mutate the original collection.
+Native containers that store managed values must use the same publication and read barriers.
+
+
+`publish::read_named_slot(address: usize, slot: String)` borrows a named cached field.
+`MultiFn::method(key: &str) -> Option<Value>` borrows a registered implementation before returning it.
+Multimethod implementations, dispatch values, and preference values use independent named storage slots.
+Replacing or removing a method releases its lease after existing readers finish.

@@ -185,9 +185,7 @@ fn do_load(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<()> {
             // form's evaluation are rooted.  Frame pops between forms,
             // allowing GC to collect temporaries from previous forms.
             let _alloc_frame = cljrs_gc::push_alloc_frame();
-            (*globals)
-                .eval(&form, &mut env)
-                .map_err(|e| annotate(e, ns_name))?;
+            crate::interp::eval::eval_discard(&form, &mut env).map_err(|e| annotate(e, ns_name))?;
         }
     }
     // Restore *ns* to the caller's namespace.

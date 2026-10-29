@@ -123,9 +123,13 @@ mod publication_review_tests {
             let Value::Uuid(returned) = returned else {
                 unreachable!()
             };
-            assert!(GcPtr::ptr_eq(&uuid, &returned));
+            assert!(!GcPtr::ptr_eq(&uuid, &returned));
+            assert!(GcPtr::identity_eq(&uuid, &returned));
         }
-        assert!(!dropped.get());
+        assert!(
+            dropped.get(),
+            "a scalar kept unrelated source temporaries alive"
+        );
         let snapshot = atom.get().snapshot();
         let Value::Uuid(uuid) = &snapshot.value else {
             unreachable!()
@@ -283,6 +287,76 @@ mod publication_review_tests {
             drop(scope);
             assert!(dropped.get(), "an obsolete Var root remained permanent");
         }
+    }
+
+    #[test]
+    fn unscoped_reads_require_an_owning_snapshot_without_pinning_sources() {
+        let atom = GcPtr::new(Atom::new(Value::Nil));
+        let var = GcPtr::new(Var::new("user", "scoped"));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let value = Value::NativeObject(gc_native_object(Counted {
+                traces: Default::default(),
+                dropped: dropped.clone(),
+            }));
+            atom.get().reset(value.clone());
+            var.get().bind(value);
+        }
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| atom.get().deref())).is_err()
+        );
+        let snapshot = var.get().snapshot().unwrap();
+        atom.get().reset(Value::Nil);
+        var.get().bind(Value::Nil);
+        assert!(!dropped.get());
+        assert!(matches!(snapshot.value, Value::NativeObject(_)));
+        drop(snapshot);
+        assert!(
+            dropped.get(),
+            "an unscoped read permanently pinned the payload"
+        );
+    }
+
+    #[test]
+    fn indexed_storage_releases_overwritten_sources_and_failed_deliveries() {
+        let _container = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let array = GcPtr::new(ObjectArray::new(vec![Value::Nil; 2]));
+        let mut previous: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
+        for _ in 0..100 {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let value = Value::NativeObject(gc_native_object(Counted {
+                    traces: Default::default(),
+                    dropped: dropped.clone(),
+                }));
+                let value = publish::publish_for_slot(value, array.get() as *const _ as usize, 0);
+                array.get().0.lock().unwrap()[0] = value;
+            }
+            if let Some(previous) = previous {
+                assert!(previous.get());
+            }
+            previous = Some(dropped);
+        }
+        let value = publish::publish_for_slot(Value::Nil, array.get() as *const _ as usize, 0);
+        array.get().0.lock().unwrap()[0] = value;
+        assert!(previous.unwrap().get());
+        let promise = CljxPromise::new();
+        promise.deliver(Value::Long(1));
+        let discarded = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            promise.deliver(Value::NativeObject(gc_native_object(Counted {
+                traces: Default::default(),
+                dropped: discarded.clone(),
+            })));
+        }
+        assert!(
+            discarded.get(),
+            "an unsuccessful promise delivery retained its candidate"
+        );
+        assert_eq!(promise.deref_blocking(), Value::Long(1));
     }
 
     #[test]

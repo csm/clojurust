@@ -303,16 +303,63 @@ pub fn publish_value(value: Value) -> Value {
 
 #[cfg(feature = "no-gc")]
 pub fn publish_for_owner(value: Value, address: usize) -> Value {
+    publish_for_slot(value, address, 0)
+}
+
+/// Publish one independently replaceable mutable field or array index.
+#[cfg(feature = "no-gc")]
+pub fn publish_for_slot(value: Value, address: usize, slot: usize) -> Value {
     if cljrs_gc::alloc_ctx::invocation_is_active() {
         return value;
     }
-    let owner = cljrs_gc::region::AllocationOwner::for_address(address);
-    if owner.is_permanent() {
-        publish_value(value)
-    } else {
-        owner.protect(&value);
+    let (value, _compact) = compact_scalar(value);
+    let lease = cljrs_gc::region::RegionLease::for_value(&value);
+    cljrs_gc::region::AllocationOwner::for_address(address).set_slot(address, slot, &lease);
+    value
+}
+#[cfg(not(feature = "no-gc"))]
+pub fn publish_for_slot(value: Value, _address: usize, _slot: usize) -> Value {
+    publish_value(value)
+}
+/// Publish a field identified by a stable application key.
+pub fn publish_for_named_slot(value: Value, address: usize, slot: String) -> Value {
+    #[cfg(feature = "no-gc")]
+    {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return value;
+        }
+        let lease = cljrs_gc::region::RegionLease::for_value(&value);
+        cljrs_gc::region::AllocationOwner::for_address(address).set_slot(address, slot, &lease);
         value
     }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        let _ = (address, slot);
+        publish_value(value)
+    }
+}
+/// Protect a previously published slot while its caller uses the returned value.
+pub fn read_slot(address: usize, slot: usize) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).read_slot(address, slot);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = (address, slot);
+}
+
+/// Borrow a named field while its returned value is in use.
+pub fn read_named_slot(address: usize, slot: String) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).read_slot(address, slot);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = (address, slot);
+}
+
+/// Release cached slots before their containing object is destroyed.
+pub fn clear_slots(address: usize) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).clear_slots(address);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = address;
 }
 
 /// A payload snapshot held across a callback or replacement.
@@ -324,7 +371,7 @@ pub struct ValueSnapshot {
 impl ValueSnapshot {
     pub fn protect_current(&self) {
         #[cfg(feature = "no-gc")]
-        self.lease.protect_current();
+        self.lease.protect_read();
     }
 }
 
@@ -366,12 +413,52 @@ impl ValueLease {
             .cloned()
             .unwrap_or_else(|| self.scoped.snapshot())
     }
+    pub fn protect_read(&self) {
+        if let Some(lease) = &self.owned {
+            lease.protect_read();
+        } else {
+            self.scoped.snapshot().protect_read();
+        }
+    }
     pub fn protect_current(&self) {
         if let Some(lease) = &self.owned {
             lease.protect_current();
         } else {
             self.scoped.snapshot().protect_current();
         }
+    }
+}
+
+// Immutable leaf copies retain their logical identity. Collections and mutable
+// values keep their allocation identity and structural sharing unchanged.
+#[cfg(feature = "no-gc")]
+fn compact_scalar(value: Value) -> (Value, Option<cljrs_gc::alloc_ctx::ScratchGuard>) {
+    macro_rules! copy_leaf {
+        ($pointer:expr, $variant:path) => {{
+            let pointer = $pointer;
+            if pointer.is_static_alloc() {
+                return ($variant(pointer), None);
+            }
+            let arena = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            // SAFETY: each matched type is an immutable scalar with a value-preserving Clone.
+            let copy = unsafe { pointer.clone_immutable() };
+            return ($variant(copy), Some(arena));
+        }};
+    }
+    match value {
+        Value::Str(p) if p.get().len() <= 4096 => copy_leaf!(p, Value::Str),
+        Value::Uuid(p) => copy_leaf!(p, Value::Uuid),
+        Value::BigInt(p) if p.get().bits() <= 32768 => copy_leaf!(p, Value::BigInt),
+        Value::Ratio(p)
+            if p.get()
+                .numer()
+                .bits()
+                .saturating_add(p.get().denom().bits())
+                <= 32768 =>
+        {
+            copy_leaf!(p, Value::Ratio)
+        }
+        other => (other, None),
     }
 }
 
@@ -385,6 +472,7 @@ pub fn prepare_for_owner(
     if cljrs_gc::alloc_ctx::invocation_is_active() {
         return (value, Default::default());
     }
+    let (value, _compact) = compact_scalar(value);
     let lease = RegionLease::for_value(&value);
     let cached = ValueLease::from_lease(lease, owner);
     (value, cached)

@@ -22,14 +22,26 @@ pub fn var_key_of(var: &GcPtr<Var>) -> VarKey {
 struct BindingFrame {
     values: HashMap<VarKey, Value>,
     #[cfg(feature = "no-gc")]
-    owner: cljrs_gc::region::AllocationOwner,
+    leases: HashMap<VarKey, cljrs_value::publish::ValueLease>,
 }
 impl BindingFrame {
     fn new(values: HashMap<VarKey, Value>) -> Self {
+        #[cfg(feature = "no-gc")]
+        let (values, leases) = {
+            let mut output = HashMap::new();
+            let mut leases = HashMap::new();
+            for (key, value) in values {
+                let (value, lease) =
+                    cljrs_value::publish::prepare_for_owner(value, &Default::default());
+                output.insert(key, value);
+                leases.insert(key, lease);
+            }
+            (output, leases)
+        };
         Self {
             values,
             #[cfg(feature = "no-gc")]
-            owner: cljrs_gc::region::AllocationOwner::current(),
+            leases,
         }
     }
 }
@@ -55,7 +67,8 @@ impl Drop for BindingGuard {
 
 /// Push a new dynamic binding frame; return a guard that pops it on drop.
 pub fn push_frame(bindings: HashMap<VarKey, Value>) -> BindingGuard {
-    BINDING_STACK.with(|s| s.borrow_mut().push(BindingFrame::new(bindings)));
+    let frame = BindingFrame::new(bindings);
+    BINDING_STACK.with(|s| s.borrow_mut().push(frame));
     BindingGuard
 }
 
@@ -68,7 +81,13 @@ pub fn take_frame(guard: BindingGuard) -> HashMap<VarKey, Value> {
     BINDING_STACK.with(|s| {
         s.borrow_mut()
             .pop()
-            .map(|frame| frame.values)
+            .map(|frame| {
+                #[cfg(feature = "no-gc")]
+                for lease in frame.leases.values() {
+                    lease.protect_read();
+                }
+                frame.values
+            })
             .unwrap_or_default()
     })
 }
@@ -86,10 +105,14 @@ fn pop_frame() {
 pub fn deref_var(var: &GcPtr<Var>) -> Option<Value> {
     let key = var_key_of(var);
     let tl = BINDING_STACK.with(|s| {
-        s.borrow()
-            .iter()
-            .rev()
-            .find_map(|frame| frame.values.get(&key).cloned())
+        s.borrow().iter().rev().find_map(|frame| {
+            let value = frame.values.get(&key)?.clone();
+            #[cfg(feature = "no-gc")]
+            if let Some(lease) = frame.leases.get(&key) {
+                lease.protect_read();
+            }
+            Some(value)
+        })
     });
     tl.or_else(|| var.get().deref())
 }
@@ -115,27 +138,19 @@ pub fn set_thread_local(var: &GcPtr<Var>, val: Value) -> bool {
             stack
                 .borrow()
                 .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, frame)| frame.values.contains_key(&key))
-                .map(|(index, frame)| (index, frame.owner.clone()))
+                .rposition(|frame| frame.values.contains_key(&key))
         });
-        if let Some((index, owner)) = target {
-            // The binding frame can outlive this function's scratch scope.
-            // Trace outside the stack borrow; values can contain bound functions.
-            let val = if owner.is_permanent() {
-                cljrs_value::publish::publish_value(val)
-            } else {
-                owner.protect(&val);
-                val
-            };
-            BINDING_STACK.with(|stack| {
-                stack.borrow_mut()[index].values.insert(key, val);
-            });
-            true
-        } else {
-            false
-        }
+        let Some(index) = target else {
+            return false;
+        };
+        let (value, lease) = cljrs_value::publish::prepare_for_owner(val, &Default::default());
+        let old = BINDING_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            stack[index].values.insert(key, value);
+            stack[index].leases.insert(key, lease)
+        });
+        drop(old);
+        true
     }
     #[cfg(not(feature = "no-gc"))]
     BINDING_STACK.with(|s| {
@@ -157,14 +172,21 @@ pub fn capture_current() -> Vec<HashMap<VarKey, Value>> {
     BINDING_STACK.with(|s| {
         s.borrow()
             .iter()
-            .map(|frame| frame.values.clone())
+            .map(|frame| {
+                #[cfg(feature = "no-gc")]
+                for lease in frame.leases.values() {
+                    lease.protect_read();
+                }
+                frame.values.clone()
+            })
             .collect()
     })
 }
 
 /// Install a previously captured snapshot on the current (new) thread.
 pub fn install_frames(frames: Vec<HashMap<VarKey, Value>>) {
-    BINDING_STACK.with(|s| *s.borrow_mut() = frames.into_iter().map(BindingFrame::new).collect());
+    let frames = frames.into_iter().map(BindingFrame::new).collect();
+    BINDING_STACK.with(|s| *s.borrow_mut() = frames);
 }
 
 // ── GC root tracing ───────────────────────────────────────────────────────────

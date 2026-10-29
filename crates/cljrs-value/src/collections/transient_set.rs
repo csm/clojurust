@@ -12,6 +12,8 @@ pub struct TransientSet {
     persisted: Mutex<bool>,
     revision: AtomicU64,
     keys_may_realize: AtomicBool,
+    #[cfg(feature = "no-gc")]
+    ownership: super::OwnershipSlots,
 }
 
 impl TransientSet {
@@ -20,6 +22,8 @@ impl TransientSet {
             set: Mutex::new(PersistentHashSet::empty()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(false),
         }
     }
@@ -29,6 +33,8 @@ impl TransientSet {
             set: Mutex::new(set.clone()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(!(set.iter().all(crate::realization::is_inert))),
         }
     }
@@ -84,10 +90,32 @@ impl TransientSet {
                 set.conj_mut(value.clone());
             },
             |set| set.conj(value.clone()),
-        )
+        )?;
+        #[cfg(feature = "no-gc")]
+        {
+            let value = self
+                .set
+                .lock()
+                .unwrap()
+                .canonical_key(&value)
+                .expect("conjoined key");
+            let slot = self.ownership.id(&value);
+            let lease = cljrs_gc::region::RegionLease::for_value(&value);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                slot,
+                &lease,
+            );
+        }
+        Ok(())
     }
     pub fn disj(&self, value: &Value) -> ValueResult<()> {
-        self.update(value, |set| set.disj_mut(value), |set| set.disj(value))
+        self.update(value, |set| set.disj_mut(value), |set| set.disj(value))?;
+        #[cfg(feature = "no-gc")]
+        if let Some(slot) = self.ownership.remove(value) {
+            crate::publish::publish_for_slot(Value::Nil, self as *const _ as usize, slot);
+        }
+        Ok(())
     }
 
     pub fn persistent(&self) -> ValueResult<PersistentHashSet> {
@@ -97,7 +125,10 @@ impl TransientSet {
             return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
-        Ok(set.clone())
+        let result = set.clone();
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+        Ok(result)
     }
 
     pub fn count(&self) -> usize {
@@ -122,6 +153,8 @@ impl Clone for TransientSet {
             set: Mutex::new(self.set.lock().unwrap().clone()),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
             keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
@@ -139,6 +172,21 @@ impl ClojureHash for TransientSet {
 }
 
 impl cljrs_gc::Trace for TransientSet {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        for value in self.set.lock().unwrap().iter() {
+            let slot = self.ownership.id(value);
+            let lease = cljrs_gc::region::RegionLease::for_value(value);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                slot,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let set = self.set.lock().unwrap();
@@ -157,5 +205,11 @@ impl cljrs_gc::Trace for TransientSet {
 impl Default for TransientSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TransientSet {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
     }
 }

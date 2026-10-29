@@ -81,3 +81,8 @@ edge to a package, so one edge left at its defaults re-enables `regex-full` for
 the whole graph. `deps` has to be off as well for the size win to land, since
 `cljrs-project/vcs` pulls `regex` in through `pgp`. See
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+
+The `no-gc` feature forwards GC-less allocation to runtime, value, and allocator dependencies.
+Each request owns a temporary read scope. Sessions retain independent leases for `*1`, `*2`, `*3`, and `*e`.
+Closing a session releases these leases and clears its internal retained-value roots.

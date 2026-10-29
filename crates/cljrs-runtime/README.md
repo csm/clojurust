@@ -679,6 +679,7 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 - `current_is_async() -> bool` — whether the innermost context is inside an `^:async` body
 - `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context. Honors `^:async` dispatch (via `apply::dispatch_if_async`) so a native/compiled caller of an `^:async` fn gets a `Value::Future`, not a synchronously-run body
 - `with_eval_context(f)` — run a closure with a temporary `Env` built from the innermost context
+- `eval_error_to_value_error(error: EvalError) -> ValueError` — preserve thrown values and resource errors; confirm memory faults for compiled entry points
 
 ### `async_hook` submodule
 
@@ -1757,11 +1758,22 @@ Update callbacks and watches hold temporary leases for the previous contents.
 
 The no-GC evaluator bounds temporary reads with `region::ReadScope`.
 The public evaluator enters this scope once. Recursive form evaluation uses the direct interpreter entry.
-Each call, loop iteration, and discarded `do` statement bounds its own temporary reads.
+Each call and loop iteration bounds its own temporary reads.
+Body statements share the enclosing allocation and read scope. This permits updates to outer mutable containers.
 Only the final escaping result receives program-lifetime publication.
 Definition expressions use scratch storage. Namespace and Var containers remain permanent, while Var payloads use replaceable leases.
 Protocol method registration transfers function ownership before it stores the implementation.
 Atom and volatile update callbacks use cached snapshots for previous contents.
 Their returned values acquire caller ownership, including shared children from earlier versions.
-All cell payloads preserve structural sharing and identity. Replacement releases obsolete ownership edges.
+Cell payloads preserve structural sharing and identity. Small immutable scalar copies retain a stable logical identity.
+Replacement releases obsolete ownership edges.
 Native and IR closures share one immutable capture slice between execution and tracing.
+
+
+`interp::eval::eval_discard(form: &Form, env: &mut Env) -> EvalResult<()>` evaluates an ignored form result.
+No-GC builds use one temporary arena for the form and publish errors before releasing it.
+Namespace loading and bootstrap evaluation use this entry point.
+`interp::eval::publish_result(result: EvalResult, recur: Option<&mut RegionLease>) -> EvalResult` is available under no-GC.
+It applies the shared return, thrown-value, and recur ownership policy before a producing scope closes.
+Definition initializers and function bodies use this policy, including early errors.
+Dynamic binding frames own one replaceable lease per variable.

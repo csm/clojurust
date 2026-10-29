@@ -106,6 +106,7 @@ fn builtin_alts(args: &[Value]) -> ValueResult<Value> {
 /// Await all `futures` concurrently; return `[value index]` of the first to
 /// complete. An empty input resolves to `nil`. A future that completes with an
 /// ordinary error contributes `nil`; resource-limit errors propagate.
+#[allow(clippy::result_large_err)]
 async fn alts_select(futures: Vec<Value>) -> EvalResult {
     if futures.is_empty() {
         return Ok(Value::Nil);

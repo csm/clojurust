@@ -41,6 +41,11 @@ impl PersistentHashSet {
         self.index.is_empty()
     }
 
+    #[cfg(feature = "no-gc")]
+    pub(crate) fn canonical_key(&self, key: &Value) -> Option<Value> {
+        self.index.get_key_value(key).map(|(key, _)| key.clone())
+    }
+
     pub fn contains(&self, val: &Value) -> bool {
         self.index.contains_key(val)
     }

@@ -150,8 +150,10 @@ impl StaticArena {
         let gc_box = raw as *mut GcBox<T>;
         // SAFETY: raw is properly aligned and sized for GcBox<T>.
         // We intentionally omit running Drop on the value — static lifetime.
-        unsafe { std::ptr::write(gc_box, GcBox { value }) };
-        GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
+        unsafe { std::ptr::write(gc_box, GcBox::new(value)) };
+        let pointer = GcPtr(unsafe { NonNull::new_unchecked(gc_box) });
+        pointer.get().init_ownership();
+        pointer
     }
 
     /// Allocate `value` directly (no `GcBox` wrapper) and return a
@@ -178,8 +180,10 @@ impl StaticArena {
         };
         let gc_box = raw as *mut GcBox<T>;
         // SAFETY: raw is properly aligned and sized for GcBox<T>.
-        unsafe { std::ptr::write(gc_box, GcBox { value }) };
-        Ok(GcPtr(unsafe { NonNull::new_unchecked(gc_box) }))
+        unsafe { std::ptr::write(gc_box, GcBox::new(value)) };
+        let pointer = GcPtr(unsafe { NonNull::new_unchecked(gc_box) });
+        pointer.get().init_ownership();
+        Ok(pointer)
     }
 
     /// Fallible [`Self::alloc_val`].

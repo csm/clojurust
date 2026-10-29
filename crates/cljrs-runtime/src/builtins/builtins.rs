@@ -3151,59 +3151,7 @@ fn builtin_gte(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
-    macro_rules! peq {
-        ($a:expr, $b:expr) => {
-            GcPtr::ptr_eq($a, $b)
-        };
-    }
-    let same = match (&args[0], &args[1]) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Uuid(a), Value::Uuid(b)) => peq!(a, b),
-        (Value::BigInt(a), Value::BigInt(b)) => peq!(a, b),
-        (Value::BigDecimal(a), Value::BigDecimal(b)) => peq!(a, b),
-        (Value::Ratio(a), Value::Ratio(b)) => peq!(a, b),
-        (Value::Str(a), Value::Str(b)) => peq!(a, b),
-        (Value::Symbol(a), Value::Symbol(b)) => peq!(a, b),
-        (Value::Keyword(a), Value::Keyword(b)) => a.get() == b.get(),
-        (Value::List(a), Value::List(b)) => peq!(a, b),
-        (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
-        (Value::Map(a), Value::Map(b)) => match (a, b) {
-            (MapValue::Array(a), MapValue::Array(b)) => peq!(a, b),
-            (MapValue::Hash(a), MapValue::Hash(b)) => peq!(a, b),
-            (MapValue::Sorted(a), MapValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Set(a), Value::Set(b)) => match (a, b) {
-            (SetValue::Hash(a), SetValue::Hash(b)) => peq!(a, b),
-            (SetValue::Sorted(a), SetValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Queue(a), Value::Queue(b)) => peq!(a, b),
-        (Value::NativeFunction(a), Value::NativeFunction(b)) => peq!(a, b),
-        (Value::Fn(a), Value::Fn(b)) => peq!(a, b),
-        (Value::Macro(a), Value::Macro(b)) => peq!(a, b),
-        (Value::Var(a), Value::Var(b)) => peq!(a, b),
-        (Value::Atom(a), Value::Atom(b)) => peq!(a, b),
-        (Value::Namespace(a), Value::Namespace(b)) => peq!(a, b),
-        (Value::LazySeq(a), Value::LazySeq(b)) => peq!(a, b),
-        (Value::Cons(a), Value::Cons(b)) => peq!(a, b),
-        (Value::Protocol(a), Value::Protocol(b)) => peq!(a, b),
-        (Value::ProtocolFn(a), Value::ProtocolFn(b)) => peq!(a, b),
-        (Value::MultiFn(a), Value::MultiFn(b)) => peq!(a, b),
-        (Value::Volatile(a), Value::Volatile(b)) => peq!(a, b),
-        (Value::Delay(a), Value::Delay(b)) => peq!(a, b),
-        (Value::Promise(a), Value::Promise(b)) => peq!(a, b),
-        (Value::Future(a), Value::Future(b)) => peq!(a, b),
-        (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
-        (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
-        (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
-        _ => false,
-    };
-    Ok(Value::Bool(same))
+    Ok(Value::Bool(args[0].identical(&args[1])))
 }
 
 fn builtin_compare(args: &[Value]) -> ValueResult<Value> {
@@ -5198,6 +5146,7 @@ fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
         let idx = numeric_as_i64(idx_val)? as usize;
         current = match &current {
             Value::ObjectArray(a) => {
+                cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
                 let g = a.get().0.lock().unwrap();
                 at(g.get(idx).cloned(), idx, g.len(), |v| v)?
             }
@@ -5252,8 +5201,12 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
     let newval = args[2].clone();
     match &args[0] {
         Value::ObjectArray(a) => {
+            let count = a.get().0.lock().unwrap().len();
+            if idx >= count {
+                return Err(ValueError::IndexOutOfBounds { idx, count });
+            }
             let newval =
-                cljrs_value::publish::publish_for_owner(newval, a.get() as *const _ as usize);
+                cljrs_value::publish::publish_for_slot(newval, a.get() as *const _ as usize, idx);
             let mut guard = a.get().0.lock().unwrap();
             if idx >= guard.len() {
                 return Err(ValueError::IndexOutOfBounds {
@@ -8156,9 +8109,19 @@ fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
     if !over_values.contains(&over) {
         over_values.push(over);
         drop(prefers);
+        let first = cljrs_value::publish::publish_for_named_slot(
+            args[1].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[1]),
+        );
+        let second = cljrs_value::publish::publish_for_named_slot(
+            args[2].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[2]),
+        );
         let mut preference_vals = mf.get().preference_vals.lock().unwrap();
-        preference_vals.insert(format!("{}", args[1]), args[1].clone());
-        preference_vals.insert(format!("{}", args[2]), args[2].clone());
+        preference_vals.insert(format!("{}", args[1]), first);
+        preference_vals.insert(format!("{}", args[2]), second);
         drop(preference_vals);
         mf.get().bump_method_generation();
     }
@@ -8178,6 +8141,16 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
     let key = format!("{}", args[1]);
     let removed = mf.get().methods.lock().unwrap().remove(&key).is_some();
     mf.get().dispatch_vals.lock().unwrap().remove(&key);
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("method:{key}"),
+    );
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
     if removed {
         mf.get().bump_method_generation();
     }
@@ -8204,7 +8177,10 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
             .unwrap_or_else(|| Value::string(k.clone()));
         m = m.assoc(dispatch_val, v.clone());
     }
-    Ok(Value::Map(m))
+    let value = Value::Map(m);
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::RegionLease::for_value(&value).protect_read();
+    Ok(value)
 }
 
 fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
@@ -8456,16 +8432,18 @@ fn builtin_add_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    mf.get()
-        .methods
-        .lock()
-        .unwrap()
-        .insert(key.clone(), args[2].clone());
-    mf.get()
-        .dispatch_vals
-        .lock()
-        .unwrap()
-        .insert(key, args[1].clone());
+    let method = cljrs_value::publish::publish_for_named_slot(
+        args[2].clone(),
+        mf.get() as *const _ as usize,
+        format!("method:{key}"),
+    );
+    let dispatch = cljrs_value::publish::publish_for_named_slot(
+        args[1].clone(),
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
+    mf.get().methods.lock().unwrap().insert(key.clone(), method);
+    mf.get().dispatch_vals.lock().unwrap().insert(key, dispatch);
     mf.get().bump_method_generation();
     Ok(Value::MultiFn(mf))
 }
@@ -8576,8 +8554,11 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             };
-            let function =
-                cljrs_value::publish::publish_for_owner(f.clone(), proto as *const _ as usize);
+            let function = cljrs_value::publish::publish_for_named_slot(
+                f.clone(),
+                proto as *const _ as usize,
+                format!("{}:{type_tag}{method_name}", type_tag.len()),
+            );
             prepared.push((method_name, function));
         }
         let mut impls = proto.impls.lock().unwrap();

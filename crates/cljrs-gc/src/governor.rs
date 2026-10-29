@@ -999,8 +999,7 @@ impl IsolateAccount {
         let region = self.region.get();
         debug_assert!(
             bytes <= region,
-            "isolate {} retired {bytes} region bytes with only {region} charged",
-            self.control.id
+            "retired region bytes exceed the charged region bytes"
         );
         let bytes = bytes.min(region);
         self.region.set(region - bytes);

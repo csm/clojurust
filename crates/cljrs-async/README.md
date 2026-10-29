@@ -640,3 +640,11 @@ A take moves that lease to the selection. Cancellation restores it with the queu
 The consumer acquires ownership before the selection releases its lease.
 Permanent and regional channels release consumed payloads after their last consumer releases them.
 Channel ownership tracing skips replaceable queue contents, which manage their own leases.
+
+
+No-GC task polls install their own `region::ReadContext` and restore the polling caller's context afterwards.
+Read leases therefore remain with a suspended task when its caller's form ends.
+Public async evaluation and awaiting use the same poll-scoped ownership rule.
+Fiber results use a handoff lease while mutator state is restored.
+A root result borrows into the restored caller's read scope, when present.
+Owned `FiberResult` values keep their leases without permanent carrier publication.

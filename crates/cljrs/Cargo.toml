@@ -64,6 +64,7 @@ no-gc = [
     "cljrs-stdlib/no-gc",
     # Weak: only forwarded when the optional `async` feature pulls the package in.
     "cljrs-async?/no-gc",
+    "cljrs-nrepl/no-gc",
 ]
 enable-rustyline = ["rustyline"]
 async   = ["dep:cljrs-async", "dep:cljrs-io", "dep:tokio"]

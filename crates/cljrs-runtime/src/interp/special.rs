@@ -63,13 +63,13 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
     let target = parse_def(args, env)?;
-    #[cfg(feature = "no-gc")]
-    let _payload_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
-    let val = match target.value_form {
-        Some(form) => eval(form, env)?,
-        None => Value::Nil,
-    };
-    intern_def(target, val, env)
+    crate::interp::eval::with_scratch(|| {
+        let val = match target.value_form {
+            Some(form) => eval(form, env)?,
+            None => Value::Nil,
+        };
+        intern_def(target, val, env)
+    })
 }
 
 /// A parsed `(def name "doc"? value?)`: everything but the value itself.
@@ -739,13 +739,26 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     let patterns: Vec<Form> = bindings.iter().step_by(2).cloned().collect();
     let mut current_vals: Vec<Value> = Vec::new();
 
-    // Evaluate initial values.
-    for i in (1..bindings.len()).step_by(2) {
-        current_vals.push(eval(&bindings[i], env)?);
-    }
-
     #[cfg(feature = "no-gc")]
-    let mut recur_lease = cljrs_gc::region::RegionLease::default();
+    let mut initial_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+    for i in (1..bindings.len()).step_by(2) {
+        match eval(&bindings[i], env) {
+            Ok(value) => current_vals.push(value),
+            Err(error) => {
+                #[cfg(feature = "no-gc")]
+                {
+                    initial_scope.pop_for_return();
+                    return crate::interp::eval::publish_result(Err(error), None);
+                }
+                #[cfg(not(feature = "no-gc"))]
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::for_values(&current_vals);
+    #[cfg(feature = "no-gc")]
+    drop(initial_scope);
     loop {
         // Root current_vals so they survive GC — they're not yet bound in env.
         let _vals_root = crate::env::gc_roots::root_values(&current_vals);
@@ -783,7 +796,12 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
             #[cfg(not(feature = "no-gc"))]
             let result = eval_body_recur(body, env);
             #[cfg(feature = "no-gc")]
-            let result = eval_body_with_scratch_loop(body, &mut scratch, &mut recur_lease, env);
+            let result = crate::interp::apply::eval_body_with_scratch(
+                body,
+                &mut scratch,
+                &mut recur_lease,
+                env,
+            );
 
             result
         });
@@ -824,38 +842,6 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
         result = eval(form, env)?;
     }
     Ok(result)
-}
-
-/// Evaluate the body in scratch, then transfer returned backing scopes to the
-/// caller. Tail control-flow forms keep their unused temporaries in scratch.
-#[cfg(feature = "no-gc")]
-fn eval_body_with_scratch_loop(
-    body: &[Form],
-    scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
-    recur_lease: &mut cljrs_gc::region::RegionLease,
-    env: &mut Env,
-) -> EvalResult {
-    let mut result = Ok(Value::Nil);
-    for form in body {
-        result = eval(form, env);
-        if result.is_err() {
-            break;
-        }
-    }
-    scratch.pop_for_return();
-    match result {
-        Ok(value) => Ok(cljrs_value::publish::publish_return(value)),
-        Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
-            cljrs_value::publish::publish_return(value),
-        )),
-        Err(EvalError::Recur(values)) => {
-            // Recur is local to this trampoline, even when its caller is static.
-            // Acquire the next lease before releasing the previous iteration.
-            *recur_lease = cljrs_gc::region::RegionLease::for_values(&values);
-            Err(EvalError::Recur(values))
-        }
-        other => other,
-    }
 }
 
 // ── quote ─────────────────────────────────────────────────────────────────────
@@ -1195,6 +1181,10 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
 // ── defn ──────────────────────────────────────────────────────────────────────
 
 pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
+    crate::interp::eval::with_scratch(|| eval_defn_inner(args, env, private))
+}
+
+fn eval_defn_inner(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
     // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
     let name_form = args
         .first()
@@ -1228,8 +1218,6 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
-    #[cfg(feature = "no-gc")]
-    let _payload_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let mut fn_val = eval_fn(&fn_args, env)?;
     if is_async && let Value::Fn(ref mut f) = fn_val {
         f.get_mut().is_async = true;
@@ -2403,9 +2391,10 @@ fn register_impls_for_tag(
                     None => continue,
                 };
                 let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
-                let fn_val = cljrs_value::publish::publish_for_owner(
+                let fn_val = cljrs_value::publish::publish_for_named_slot(
                     fn_val,
                     proto.get() as *const _ as usize,
+                    format!("{}:{type_tag}{method_name}", type_tag.len()),
                 );
                 let mut impls = proto.get().impls.lock().unwrap();
                 impls

@@ -507,6 +507,11 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
                     ))
                 })?;
             drop(impls);
+            #[cfg(feature = "no-gc")]
+            cljrs_value::publish::read_named_slot(
+                pf_ref.protocol.get() as *const _ as usize,
+                format!("{}:{tag}{}", tag.len(), pf_ref.method_name),
+            );
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }
@@ -516,7 +521,7 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
             let _dispatch_root = crate::env::gc_roots::root_value(&dispatch_val);
             cljrs_gc::safepoint();
             let key = format!("{}", dispatch_val);
-            let exact = mf_ref.methods.lock().unwrap().get(&key).cloned();
+            let exact = mf_ref.method(&key);
             let impl_fn = match exact {
                 Some(f) => f,
                 None => {
@@ -555,18 +560,12 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
                             resolved
                         }
                     };
-                    mf_ref
-                        .methods
-                        .lock()
-                        .unwrap()
-                        .get(&method_key)
-                        .cloned()
-                        .ok_or_else(|| {
-                            EvalError::Runtime(format!(
-                                "No method in multimethod '{}' for dispatch value {}",
-                                mf_ref.name, key
-                            ))
-                        })?
+                    mf_ref.method(&method_key).ok_or_else(|| {
+                        EvalError::Runtime(format!(
+                            "No method in multimethod '{}' for dispatch value {}",
+                            mf_ref.name, key
+                        ))
+                    })?
                 }
             };
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);

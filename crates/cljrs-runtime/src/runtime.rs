@@ -188,6 +188,8 @@ impl RuntimeBuilder {
     /// itself always tree-walks, because nothing can be lowered before
     /// `clojure.core` exists.
     pub fn build(self) -> Result<Runtime, BuildError> {
+        #[cfg(feature = "no-gc")]
+        let _reads = cljrs_gc::region::ReadScope::enter();
         // Register this thread with the process memory governor (under its
         // thread name, unless already registered) before the first allocation.
         let _ = cljrs_gc::governor::current_control();
@@ -283,7 +285,7 @@ fn eval_embedded(globals: &Arc<GlobalEnv>, src: &str, origin: &str) -> Result<()
     let mut env = Env::new(globals.clone(), "clojure.core");
     for form in forms {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        if let Err(e) = eval::eval(&form, &mut env) {
+        if let Err(e) = eval::eval_discard(&form, &mut env) {
             eprintln!("[{origin} warning] {}: {:?}", form.span.start, e);
         }
     }

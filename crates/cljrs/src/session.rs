@@ -111,6 +111,8 @@ pub fn setup_globals(
     gc_config: Arc<GcConfig>,
     versioning: VersioningFlags,
 ) -> Arc<GlobalEnv> {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::enter();
     let runtime = cljrs_runtime::Runtime::builder()
         .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
         .source_paths(src_paths)
@@ -340,6 +342,8 @@ pub fn run_source(
     args: &[String],
 ) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::enter();
     eval_in(&mut env, src, filename)?;
     call_main_if_defined(&mut env, args)?;
     Ok(())
@@ -423,9 +427,16 @@ pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value
     let forms = parser.parse_all().map_err(miette::Report::from)?;
 
     let mut result = Value::Nil;
-    for form in forms {
+    let count = forms.len();
+    for (index, form) in forms.into_iter().enumerate() {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        result = eval_form(&form, env).map_err(format_eval_error)?;
+        if index + 1 < count {
+            #[cfg(feature = "no-gc")]
+            let _reads = cljrs_gc::region::ReadScope::nested();
+            eval_form(&form, env).map_err(format_eval_error)?;
+        } else {
+            result = eval_form(&form, env).map_err(format_eval_error)?;
+        }
     }
     Ok(result)
 }

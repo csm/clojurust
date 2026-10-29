@@ -265,17 +265,19 @@ pub(crate) fn current_region() -> Option<*mut Region> {
     })
 }
 pub(crate) fn live_regions() -> Vec<*mut Region> {
-    ALLOC_CTX.with(|ctx| {
-        ctx.borrow()
-            .iter()
-            .filter_map(|entry| match entry {
-                AllocCtx::Region(ptr) | AllocCtx::Inactive(ptr) | AllocCtx::Invocation(ptr) => {
-                    Some(*ptr)
-                }
-                _ => None,
-            })
-            .collect()
-    })
+    ALLOC_CTX
+        .try_with(|ctx| {
+            ctx.borrow()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AllocCtx::Region(ptr) | AllocCtx::Inactive(ptr) | AllocCtx::Invocation(ptr) => {
+                        Some(*ptr)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 /// True when allocations have program lifetime rather than a scratch destination.
 pub fn is_static_context() -> bool {

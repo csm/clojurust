@@ -27,6 +27,7 @@ impl TransientVector {
         if *self.persisted.lock().unwrap() {
             return Err(ValueError::TransientAlreadyPersisted);
         }
+        let v = crate::publish::publish_for_slot(v, self as *const _ as usize, self.count());
         let mut vector = self.vector.lock().unwrap();
         vector.push_back_mut(v);
         Ok(())
@@ -38,6 +39,9 @@ impl TransientVector {
         }
         let mut vector = self.vector.lock().unwrap();
         if vector.drop_last_mut() {
+            let index = vector.len();
+            drop(vector);
+            crate::publish::publish_for_slot(Value::Nil, self as *const _ as usize, index);
             Ok(())
         } else {
             Err(ValueError::OutOfRange)
@@ -48,14 +52,17 @@ impl TransientVector {
         if *self.persisted.lock().unwrap() {
             return Err(ValueError::TransientAlreadyPersisted);
         }
-        let mut vector = self.vector.lock().unwrap();
-        if index > vector.len() {
-            return Err(ValueError::IndexOutOfBounds {
-                idx: index,
-                count: vector.len(),
-            });
+        let count = self.count();
+        if index > count {
+            return Err(ValueError::IndexOutOfBounds { idx: index, count });
         }
-        vector.set_mut(index, v);
+        let v = crate::publish::publish_for_slot(v, self as *const _ as usize, index);
+        let mut vector = self.vector.lock().unwrap();
+        if index == count {
+            vector.push_back_mut(v);
+        } else {
+            vector.set_mut(index, v);
+        }
         Ok(())
     }
 
@@ -64,6 +71,7 @@ impl TransientVector {
     }
 
     pub fn get(&self, index: usize) -> Option<Value> {
+        crate::publish::read_slot(self as *const _ as usize, index);
         self.vector.lock().unwrap().get(index).cloned()
     }
 
@@ -74,7 +82,10 @@ impl TransientVector {
             return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
-        Ok(PersistentVector::from_vector(vector.clone()))
+        let result = PersistentVector::from_vector(vector.clone());
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+        Ok(result)
     }
 }
 
@@ -100,6 +111,20 @@ impl Clone for TransientVector {
 }
 
 impl cljrs_gc::Trace for TransientVector {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        for (index, value) in self.vector.lock().unwrap().iter().enumerate() {
+            let lease = cljrs_gc::region::RegionLease::for_value(value);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                index,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let vec = self.vector.lock().unwrap();
@@ -118,5 +143,11 @@ impl cljrs_gc::Trace for TransientVector {
 impl Default for TransientVector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TransientVector {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
     }
 }

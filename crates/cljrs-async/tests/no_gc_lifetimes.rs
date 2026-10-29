@@ -480,3 +480,129 @@ fn spawned_tasks_keep_actual_captures_without_inheriting_unrelated_reads() {
         ));
     });
 }
+
+#[test]
+fn definitions_transients_and_mutable_slots_preserve_escapes_and_bound_retention() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        use cljrs_value::{Arity, NativeFn, NativeObject, Value};
+        #[derive(Debug)]
+        struct Probe(std::rc::Rc<std::cell::Cell<usize>>);
+        impl cljrs_gc::Trace for Probe { fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {} }
+        impl Drop for Probe { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        impl NativeObject for Probe {
+            fn type_tag(&self) -> &str { "ReviewProbe" }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        let runtime = cljrs_runtime::Runtime::builder().execution_mode(cljrs_runtime::ExecutionMode::TreeWalk).build().unwrap();
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = dropped.clone();
+        runtime.globals().intern("user", "make-probe".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(NativeFn::with_closure("make-probe", Arity::Fixed(0), move |_| Ok(Value::NativeObject(cljrs_value::gc_native_object(Probe(observed.clone()))))))));
+        let observed = dropped.clone();
+        runtime.globals().intern("user", "drop-count".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(NativeFn::with_closure("drop-count", Arity::Fixed(0), move |_| Ok(Value::Long(observed.get() as i64))))));
+        runtime.globals().intern("user", "probe?".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(NativeFn::new("probe?", Arity::Fixed(1), |args| Ok(Value::Bool(matches!(&args[0], Value::NativeObject(object) if object.get().type_tag() == "ReviewProbe")))))));
+        let mut env = Env::new(runtime.globals().clone(), "user");
+        let source = r#"
+          (assert (= {:k "v"} (try (def broken (throw (ex-info "boom" {:k (str "v")}))) (catch Exception e (ex-data e)))))
+          (assert (= {:k "attribute"} (try (defn broken-fn {:x (throw (ex-info "boom" {:k (str "attribute")}))} [] nil) (catch Exception e (ex-data e)))))
+          (assert (= ["a"] (let [t (transient [])] (conj! t (str "a")) (persistent! t))))
+          (assert (= {"key" "new"} (let [t (transient {})] (assoc! t (str "key") (str "old")) (assoc! t (str "key") (str "new")) (persistent! t))))
+          (assert (= #{"a"} (let [t (transient #{})] (conj! t (str "a")) (conj! t (str "a")) (persistent! t))))
+          (defmulti retained-method identity)
+          (defn install-retained [label] (defmethod retained-method :x [_] label))
+          (install-retained (str "method" " alive"))
+          (assert (= "method alive" (retained-method :x)))
+          (let [snapshot (methods retained-method)]
+            (remove-method user/retained-method :x)
+            (assert (= "method alive" ((get snapshot :x) :x))))
+          (defmethod retained-method :x [_] (remove-method user/retained-method :x) (str "after" " removal"))
+          (assert (= "after removal" (retained-method :x)))
+          (def scalar-cache (atom nil))
+          (let [text (str "identity" " stays") stored (reset! scalar-cache text)]
+            (assert (identical? text stored)) (assert (identical? text @scalar-cache)))
+          (defn churn-array []
+            (let [array (object-array 1)]
+              (dotimes [i 100] (aset array 0 (make-probe)) (assert (= i (drop-count)))))
+            nil)
+          (churn-array)
+          (assert (= 100 (drop-count)))
+          (def ^:dynamic *item* nil)
+          (defn churn-binding []
+            (binding [*item* nil]
+              (dotimes [i 100] (set! *item* (make-probe)) (assert (= (+ 100 i) (drop-count)))))
+            nil)
+          (churn-binding)
+          (assert (= 200 (drop-count)))
+          (defn transient-alias []
+            (let [t (transient {})]
+              (assoc! t :x (make-probe))
+              (let [old (get t :x)] (assoc! t :x nil) (assert (probe? old))))
+            nil)
+          (transient-alias)
+          (assert (= 201 (drop-count)))
+        "#;
+        for form in cljrs_reader::Parser::new(source.into(), "<review-seven>".into()).parse_all().unwrap() {
+            cljrs_runtime::interp::eval::eval_discard(&form, &mut env).unwrap();
+        }
+        let form = cljrs_reader::Parser::new("(vec (range 100))".into(), "<discarded>".into()).parse_one().unwrap().unwrap();
+        cljrs_runtime::interp::eval::eval_discard(&form, &mut env).unwrap();
+        let retired = || cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap();
+        let baseline = retired();
+        for _ in 0..100 { cljrs_runtime::interp::eval::eval_discard(&form, &mut env).unwrap(); assert_eq!(retired(), baseline); }
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn asynchronous_read_leases_survive_the_polling_forms_scope() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    #[derive(Debug)]
+    struct Probe(std::rc::Rc<std::cell::Cell<bool>>);
+    impl cljrs_gc::Trace for Probe {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    impl cljrs_value::NativeObject for Probe {
+        fn type_tag(&self) -> &str {
+            "ReadProbe"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        use cljrs_value::Value;
+        let caller = cljrs_gc::region::ReadScope::enter().unwrap();
+        let atom = cljrs_gc::GcPtr::new(cljrs_value::Atom::new(Value::Nil));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            atom.get().reset(Value::NativeObject(cljrs_value::gc_native_object(Probe(dropped.clone()))));
+        }
+        let captured = atom.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let future = cljrs_async::spawn_future_with_roots(vec![Value::Atom(atom.clone())], async move {
+            let value = captured.get().deref();
+            started.send(()).unwrap();
+            wait.await.unwrap();
+            assert!(matches!(value, Value::NativeObject(object) if object.get().type_tag() == "ReadProbe"));
+            Ok(Value::Nil)
+        });
+        ready.await.unwrap();
+        drop(caller);
+        atom.get().reset(Value::Nil);
+        assert!(!dropped.get(), "a suspended task borrowed its poller's read scope");
+        release.send(()).unwrap();
+        cljrs_async::await_value(future).await.unwrap();
+        assert!(dropped.get());
+    });
+}

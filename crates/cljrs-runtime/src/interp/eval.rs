@@ -23,6 +23,23 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
     with_read_scope(|| eval_unscoped(form, env))
 }
 
+/// Evaluate a form whose successful result will be discarded by the caller.
+pub fn eval_discard(form: &Form, env: &mut Env) -> EvalResult<()> {
+    #[cfg(feature = "no-gc")]
+    let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+    let result = eval_unscoped(form, env);
+    #[cfg(feature = "no-gc")]
+    {
+        scratch.pop_for_return();
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => publish_result(Err(error), None).map(drop),
+        }
+    }
+    #[cfg(not(feature = "no-gc"))]
+    result.map(drop)
+}
+
 pub(crate) fn with_read_scope(body: impl FnOnce() -> EvalResult) -> EvalResult {
     #[cfg(feature = "no-gc")]
     let scope = cljrs_gc::region::ReadScope::enter();
@@ -30,20 +47,45 @@ pub(crate) fn with_read_scope(body: impl FnOnce() -> EvalResult) -> EvalResult {
     #[cfg(feature = "no-gc")]
     if let Some(scope) = scope {
         let _borrowed = scope.finish();
-        return match result {
-            Ok(value) => Ok(cljrs_value::publish::publish_return(value)),
-            Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
-                cljrs_value::publish::publish_return(value),
-            )),
-            Err(EvalError::Recur(values)) => Err(EvalError::Recur(
-                values
-                    .into_iter()
-                    .map(cljrs_value::publish::publish_return)
-                    .collect(),
-            )),
-            other => other,
-        };
+        return publish_result(result, None);
     }
+    result
+}
+
+/// Transfer every value-bearing outcome before its producing scope closes.
+#[cfg(feature = "no-gc")]
+pub fn publish_result(
+    result: EvalResult,
+    recur: Option<&mut cljrs_gc::region::RegionLease>,
+) -> EvalResult {
+    use cljrs_value::publish::publish_return;
+    match result {
+        Ok(value) => Ok(publish_return(value)),
+        Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(publish_return(value))),
+        Err(EvalError::Recur(values)) => {
+            if let Some(lease) = recur {
+                *lease = cljrs_gc::region::RegionLease::for_values(&values);
+            } else {
+                for value in &values {
+                    cljrs_gc::region::RegionLease::for_value(value).protect_current();
+                }
+            }
+            Err(EvalError::Recur(values))
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn with_scratch(body: impl FnOnce() -> EvalResult) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+    let result = body();
+    #[cfg(feature = "no-gc")]
+    {
+        scratch.pop_for_return();
+        publish_result(result, None)
+    }
+    #[cfg(not(feature = "no-gc"))]
     result
 }
 
@@ -431,32 +473,11 @@ pub fn deref_value(v: Value) -> EvalResult {
 
 /// Evaluate a sequence of forms and return the value of the last one.
 pub fn eval_body(forms: &[Form], env: &mut Env) -> EvalResult {
-    let Some((last, discarded)) = forms.split_last() else {
-        return Ok(Value::Nil);
-    };
-    for form in discarded {
-        #[cfg(feature = "no-gc")]
-        let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
-        let result = eval_unscoped(form, env);
-        #[cfg(feature = "no-gc")]
-        if result.is_err() {
-            scratch.pop_for_return();
-            return match result {
-                Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(
-                    cljrs_value::publish::publish_return(value),
-                )),
-                Err(EvalError::Recur(values)) => Err(EvalError::Recur(
-                    values
-                        .into_iter()
-                        .map(cljrs_value::publish::publish_return)
-                        .collect(),
-                )),
-                other => other,
-            };
-        }
-        result?;
+    let mut result = Value::Nil;
+    for form in forms {
+        result = eval_unscoped(form, env)?;
     }
-    eval_unscoped(last, env)
+    Ok(result)
 }
 
 // ── reader cond ───────────────────────────────────────────────────────────────
@@ -526,7 +547,7 @@ mod tests {
         let forms = parser.parse_all().map_err(EvalError::Read)?;
         let mut result = Value::Nil;
         for form in forms {
-            result = eval_unscoped(&form, env)?;
+            result = eval(&form, env)?;
         }
         Ok(result)
     }

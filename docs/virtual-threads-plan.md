@@ -543,4 +543,14 @@ Read scopes end with each call or iteration. Stores retain ownership independent
 Global Var reads reuse cached leases without allocating a snapshot for every lookup.
 Declared task captures exclude unrelated read leases. Executor report registries stay with their carrier and fibers.
 Compiled atom callback errors use the shared conversion helper, including runtime memory-fault confirmation.
-Publication preserves identity. A live payload can retain unrelated allocations in its source arena until its last owner releases it.
+Publication preserves identity. Small immutable scalars use compact arenas with stable logical identities.
+Other live payloads can retain unrelated allocations in their source arena until their last owner releases it.
+
+
+Seventh-pass review fixes share result publication across definition errors, returns, and recur.
+Body statements share their enclosing scratch scope; discarded source forms use a dedicated evaluation entry point.
+Arrays, transients, lazy cells, delays, promises, futures, multimethods, and dynamic bindings release replaced field ownership.
+Async tasks retain their own read contexts across polls. Unscoped Rust readers use owning snapshots or explicit read scopes.
+Root handoff restores caller ownership before releasing the computation state.
+Small immutable scalar relocation preserves Clojure identity, including compiled identity checks.
+CI fixes cover the newer async error-size lint and diagnostic logging of isolate records.
