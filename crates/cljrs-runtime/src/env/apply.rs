@@ -444,6 +444,7 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
             // and may trigger GC.
             let _caller_root = crate::env::gc_roots::push_env_root(env);
             let _context = crate::env::callback::scoped_eval_context(env);
+            let _native_frame = cljrs_gc::fiber::native_frame(&nf.get().name);
             (nf.get().func)(&args).map_err(crate::env::error::value_error_to_eval_error)
         }
         Value::Fn(f) => {

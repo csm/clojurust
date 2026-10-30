@@ -235,12 +235,23 @@ pub fn force_collect(env: &Env) {
 /// [`EvalError::MemoryLimitExceeded`] otherwise.  Under `no-gc` there is no
 /// collection; region scopes release their memory as they exit.
 #[cfg(feature = "no-gc")]
-pub fn gc_safepoint(_env: &Env) -> EvalResult<()> {
+pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    let _env_root = push_env_root(env);
+    cljrs_gc::fiber::safepoint().map_err(|error| match error {
+        cljrs_gc::fiber::SafepointError::StackOverflow(message) => EvalError::Runtime(message),
+        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::GasExhausted,
+    })?;
     check_memory_fault()
 }
 
 #[cfg(not(feature = "no-gc"))]
 pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    // A competing fiber may collect while this one yields, even without a GC request here.
+    let _env_root = push_env_root(env);
+    cljrs_gc::fiber::safepoint().map_err(|error| match error {
+        cljrs_gc::fiber::SafepointError::StackOverflow(message) => EvalError::Runtime(message),
+        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::GasExhausted,
+    })?;
     // Fast path: no GC activity and no pending fault.
     if !cljrs_gc::governor::runtime_fault_possible()
         && !cljrs_gc::gc_requested()

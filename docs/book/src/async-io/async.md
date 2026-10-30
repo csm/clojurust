@@ -218,3 +218,26 @@ binary can be produced with `cargo build -p cljrs --no-default-features`.
 
 A failed `thread` or `io-thread` body prints an error and closes its result channel.
 Each call uses one fiber. The `io-thread` macro delegates to `thread`.
+
+
+## Fairness and diagnostics on native targets
+
+CPU loops cooperate with other fibers at function and loop safepoints.
+`CLJRS_FIBER_SLICE_US` sets the time slice in microseconds (default 10000).
+The driver yields an expired slice when another fiber is ready.
+Native functions must return to a safepoint or use parking operations to let
+other fibers run.
+
+If native code blocks a carrier while another fiber is ready, the watchdog
+prints the fiber ID and native function name. `CLJRS_FIBER_STALL_MS` sets the
+warning threshold in milliseconds (default 100). Each stall produces one warning.
+
+`--gc-stats` includes live and peak fiber counts, pooled stacks, and reserved
+stack bytes. The memory governor charges active and pooled reservations,
+including guard pages, as `fiber-stack`. These are virtual reservations, not
+resident memory measurements. Strict memory budgets must include the root's
+64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 1024).
+
+A recursion error reports the fiber ID and remaining stack space. Safepoints
+keep a 256 KiB margin for interpreter frames and error construction. Native
+recursion that bypasses safepoints can still hit the fatal guard page.

@@ -147,9 +147,11 @@ pub enum MemoryClass {
     Code,
     /// Other runtime-owned data.
     Runtime,
+    /// Reserved native fiber stacks, including pooled stacks and guard pages.
+    FiberStack,
 }
 
-const CLASS_COUNT: usize = 7;
+const CLASS_COUNT: usize = 8;
 
 impl MemoryClass {
     /// Every memory class, in reporting order.
@@ -161,6 +163,7 @@ impl MemoryClass {
         MemoryClass::Static,
         MemoryClass::Code,
         MemoryClass::Runtime,
+        MemoryClass::FiberStack,
     ];
 
     /// Static, allocation-free name used in diagnostics and errors.
@@ -173,6 +176,7 @@ impl MemoryClass {
             MemoryClass::Static => "static",
             MemoryClass::Code => "code",
             MemoryClass::Runtime => "runtime",
+            MemoryClass::FiberStack => "fiber-stack",
         }
     }
 
@@ -2376,7 +2380,11 @@ impl ProcessMemoryGovernor {
                 .collect()
         };
         isolates.sort_by_key(|i| i.id);
+        let (fiber_count, peak_fiber_count, pooled_fiber_stacks) = crate::fiber::counts();
         MemorySnapshot {
+            fiber_count,
+            peak_fiber_count,
+            pooled_fiber_stacks,
             strict: config.strict,
             soft_limit: config.soft_limit,
             hard_limit: config.hard_limit,
@@ -2481,6 +2489,10 @@ pub struct IsolateSnapshot {
 /// observations; the snapshot as a whole is not a consistent cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySnapshot {
+    /// Unstarted, running, and parked native fibers (excludes completed results).
+    pub fiber_count: usize,
+    pub peak_fiber_count: usize,
+    pub pooled_fiber_stacks: usize,
     /// Strict admission is on.
     pub strict: bool,
     pub soft_limit: usize,
@@ -2580,6 +2592,14 @@ impl fmt::Display for MemorySnapshot {
             f,
             "  Used:                  {} bytes (peak {}), {} bytes free credit",
             self.used_bytes, self.peak_used_bytes, self.free_credit_bytes
+        )?;
+        writeln!(
+            f,
+            "  Fibers:                {} live (peak {}), {} pooled stacks, {} reserved stack bytes",
+            self.fiber_count,
+            self.peak_fiber_count,
+            self.pooled_fiber_stacks,
+            self.class_bytes(MemoryClass::FiberStack)
         )?;
         for class in MemoryClass::ALL {
             let bytes = self.class_bytes(class);

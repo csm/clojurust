@@ -23,8 +23,12 @@ use cljrs_gc::mutator::{MutatorState, assert_parkable};
 use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::env::gc_roots::root_values;
 use cljrs_value::Value;
-use corosensei::stack::DefaultStack;
+use corosensei::stack::{DefaultStack, Stack};
+
+mod scheduler;
+use cljrs_gc::fiber::StackReservation;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
+use scheduler::Scheduling;
 
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
@@ -39,12 +43,13 @@ pub struct FiberId(u64);
 struct Current {
     id: FiberId,
     yielder: *const Yielder<(), Park>,
+    scheduling: *const Scheduling,
 }
 
 thread_local! {
     // Driver metadata, never computation state: set only around resume/unwind.
     static CURRENT: Cell<Option<Current>> = const { Cell::new(None) };
-    static STACK_POOL: RefCell<Vec<(usize, DefaultStack)>> = const { RefCell::new(Vec::new()) };
+    static STACK_POOL: RefCell<Vec<(usize, DefaultStack, StackReservation)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The running fiber, or None on the carrier thread (including future polls).
@@ -136,9 +141,27 @@ pub struct Fiber {
     task: FiberTask,
 }
 
+// The pointee belongs to the live FiberTask; it stays boxed across task moves.
+fn scheduling() -> Option<&'static Scheduling> {
+    CURRENT.with(Cell::get).map(|c| unsafe { &*c.scheduling })
+}
+
 fn install_parking_hooks() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
+        cljrs_gc::fiber::install(cljrs_gc::fiber::Hooks {
+            safepoint: || scheduling().map_or(Ok(()), Scheduling::safepoint),
+            enter_native: |name| {
+                if let Some(s) = scheduling() {
+                    s.native_frame(Some(name));
+                }
+            },
+            exit_native: || {
+                if let Some(s) = scheduling() {
+                    s.native_frame(None);
+                }
+            },
+        });
         cljrs_value::parking::install(cljrs_value::parking::Hooks {
             current: || current().map(|id| id.0),
             park: |future, timeout| {
@@ -190,16 +213,31 @@ impl Fiber {
         bytes: usize,
     ) -> Result<Self, EvalError> {
         install_parking_hooks();
-        let stack = STACK_POOL
-            .with(|pool| {
-                let mut pool = pool.borrow_mut();
-                pool.iter()
-                    .position(|(size, _)| *size == bytes)
-                    .map(|i| pool.swap_remove(i).1)
-            })
-            .map(Ok)
-            .unwrap_or_else(|| DefaultStack::new(bytes))
-            .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
+        let cached = STACK_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.iter()
+                .position(|(size, _, _)| *size == bytes)
+                .map(|i| pool.swap_remove(i))
+        });
+        let (stack, mut reservation) = if let Some((_, stack, mut reservation)) = cached {
+            reservation.set_pooled(false);
+            (stack, reservation)
+        } else {
+            let reservation = StackReservation::new(bytes)
+                .or_else(|_| {
+                    // Idle stacks must not prevent admission of a differently sized stack.
+                    let idle = STACK_POOL.with(|pool| std::mem::take(&mut *pool.borrow_mut()));
+                    drop(idle);
+                    StackReservation::new(bytes)
+                })
+                .map_err(EvalError::MemoryLimitExceeded)?;
+            let stack = DefaultStack::new(bytes)
+                .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
+            (stack, reservation)
+        };
+        reservation
+            .account_actual_bytes(stack.base().get() - stack.limit().get())
+            .map_err(EvalError::MemoryLimitExceeded)?;
         let id = FiberId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
         #[cfg(not(feature = "no-gc"))]
         cljrs_gc::region::poison_active_regions();
@@ -218,9 +256,13 @@ impl Fiber {
         let result_lease = std::rc::Rc::new(RefCell::new(cljrs_gc::region::RegionLease::default()));
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
+        let scheduling = Box::new(Scheduling::new(id, stack.limit().get(), bytes));
+        let scheduling_ptr = &*scheduling as *const Scheduling;
         // Register captures in the fiber's detached state, not the caller's.
         let mut task = FiberTask {
             co: None,
+            scheduling,
+            reservation: Some(reservation),
             state,
             pending: None,
             roots,
@@ -244,7 +286,13 @@ impl Fiber {
         task.state.swap_with_current();
         task.co = Some(unsafe {
             Coroutine::with_stack_unchecked(stack, move |yielder, ()| {
-                CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
+                CURRENT.with(|slot| {
+                    slot.set(Some(Current {
+                        id,
+                        yielder,
+                        scheduling: scheduling_ptr,
+                    }))
+                });
                 let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
                 #[cfg(feature = "no-gc")]
                 let _lease_scope = lease.enter();
@@ -270,6 +318,7 @@ impl Fiber {
         self.task.id
     }
     pub fn into_task(self) -> FiberTask {
+        self.task.scheduling.wake.schedule();
         self.task
     }
 }
@@ -277,6 +326,8 @@ impl Fiber {
 /// A thread-pinned future that drives a stackful fiber.
 pub struct FiberTask {
     co: Option<FiberCoroutine>,
+    scheduling: Box<Scheduling>,
+    reservation: Option<StackReservation>,
     state: MutatorState,
     pending: Option<Park>,
     // Boxed: addresses registered in state must survive moving the task.
@@ -300,10 +351,15 @@ impl FiberTask {
     fn release_stack(&mut self) {
         let co = self.co.take().expect("fiber already completed");
         let stack = co.into_stack();
+        self.scheduling.wake.close();
+        let mut reservation = self.reservation.take().unwrap();
         STACK_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
-            if pool.len() < MAX_POOLED_STACKS {
-                pool.push((self.bytes, stack));
+            if pool.len() < MAX_POOLED_STACKS
+                && cljrs_gc::governor().pressure() == cljrs_gc::PressureLevel::Green
+            {
+                reservation.set_pooled(true);
+                pool.push((self.bytes, stack, reservation));
             }
         });
     }
@@ -317,6 +373,7 @@ impl FiberTask {
                 Some(Current {
                     id: self.id,
                     yielder: self.yielder,
+                    scheduling: &*self.scheduling,
                 })
             });
             co.force_unwind();
@@ -331,6 +388,9 @@ impl Future for FiberTask {
         let this = self.get_mut();
         assert!(this.co.is_some(), "fiber polled after completion");
         assert_parkable();
+        this.scheduling.wake.poll(cx.waker());
+        let waker = std::task::Waker::from(this.scheduling.wake.clone());
+        let cx = &mut Context::from_waker(&waker);
         this.state.swap_with_current();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _current = CurrentGuard::enter(None);
@@ -347,10 +407,15 @@ impl Future for FiberTask {
                         slot.set(Some(Current {
                             id: this.id,
                             yielder: this.yielder,
+                            scheduling: &*this.scheduling,
                         }))
                     });
                 }
-                match this.co.as_mut().unwrap().resume(()) {
+                let outcome = {
+                    let _running = this.scheduling.enter();
+                    this.co.as_mut().unwrap().resume(())
+                };
+                match outcome {
                     CoroutineResult::Return(result) => return Poll::Ready(result),
                     CoroutineResult::Yield(park) => {
                         this.yielder = CURRENT.with(|slot| slot.get().unwrap().yielder);

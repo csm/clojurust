@@ -90,6 +90,7 @@ src/
                     cross-isolate request epoch, RSS emergency pressure signal,
                     load-shedding hooks (ShedHookId, register_shed_hook,
                     unregister_shed_hook), Linux cgroup v2 soft-limit
+  fiber.rs        — optional scheduler hooks, native-frame diagnostics, and governed fiber stack reservations
   mutator.rs      — per-mutator state for virtual threads: MutatorSlot registry
                     (link-time, via inventory), mutator_slot! macro,
                     MutatorState save/restore/swap, TrackedMutex (debug
@@ -390,7 +391,7 @@ isolate-channel messages (`cljrs-async`), and JIT code (`cljrs-compiler`) hold
 a `MemoryCharge`; static allocations are recorded with `charge_permanent`.
 
 ```rust
-pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime }
+pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime, FiberStack }
 pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard (or strict refusal)
 pub enum Admission { Application, Critical }    // <= hard, <= hard + critical reserve
 
@@ -859,3 +860,43 @@ Under no-GC, `GcPtr::get_mut(&mut self) -> GcMut<'_, T>` returns a mutation guar
 Drop acquires ownership of the changed child graph, including when unwinding.
 Cached parents remain valid because the mutated object's region retains its new children.
 Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.
+
+
+## Fiber safepoints and stack accounting (virtual threads Phase 4)
+
+`fiber` has no executor dependency. Native drivers install `Hooks` once with
+`fiber::install(Hooks)`. Before installation, the hooks do nothing.
+
+```rust,ignore
+pub enum SafepointError { StackOverflow(String), Cancelled }
+pub struct Hooks {
+    pub safepoint: fn() -> Result<(), SafepointError>,
+    pub enter_native: fn(&Arc<str>),
+    pub exit_native: fn(),
+}
+pub fn install(hooks: Hooks);
+pub fn safepoint() -> Result<(), SafepointError>;
+pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard;
+pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
+pub struct StackReservation; // Drop releases its charges and live/pool count.
+impl StackReservation {
+    pub fn new(bytes: usize) -> Result<Self, MemoryLimitExceeded>;
+    pub fn account_actual_bytes(&mut self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
+    pub fn set_pooled(&mut self, pooled: bool);
+}
+```
+
+`SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
+ABI frames through the runtime's uncatchable resource-error path.
+`StackReservation::new` applies strict admission before stack allocation.
+`account_actual_bytes` adds page rounding and guard pages after allocation.
+A pooled reservation remains charged as `MemoryClass::FiberStack`.
+Its live count resumes when the driver reuses it. Destroying the pool releases its bytes.
+These bytes measure reserved address space, rather than resident pages.
+
+`MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`, and
+`pooled_fiber_stacks`. Counts cover native fibers across the process, including
+unstarted fibers and root fibers. Completed results do not count as live fibers.
+`class_bytes(MemoryClass::FiberStack)` includes active and pooled reservations.
+The snapshot's `Display` implementation includes these counts and stack bytes,
+so both `--gc-stats` and `stats_report()` show them.

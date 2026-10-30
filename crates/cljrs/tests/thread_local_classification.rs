@@ -51,6 +51,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "THREAD_FAILURES",
         Fiber("cljrs-async/THREAD_FAILURES"),
     ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "SCHEDULER",
+        Thread("isolate ready-task counters and watchdog state"),
+    ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
         "cljrs-gc/src/lib.rs",

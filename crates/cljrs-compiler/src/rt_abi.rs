@@ -203,8 +203,23 @@ fn intern_long(n: i64) -> *const Value {
 /// Emitted at function entry and before recur jumps so that compiled
 /// tight loops cooperate with the garbage collector.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_safepoint() {
+pub extern "C" fn rt_safepoint() -> i8 {
+    if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+        return 0;
+    }
     cljrs_gc::safepoint();
+    match cljrs_gc::fiber::safepoint() {
+        Ok(()) => 1,
+        Err(cljrs_gc::fiber::SafepointError::Cancelled) => {
+            signal_error(cljrs_value::ValueError::GasExhausted);
+            unwind_all_native_regions();
+            0
+        }
+        Err(cljrs_gc::fiber::SafepointError::StackOverflow(message)) => {
+            throw_str(message);
+            0
+        }
+    }
 }
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -3885,7 +3900,10 @@ cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCE
 #[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_throw(val: *const Value) -> *const Value {
     PENDING_EXCEPTION.with(|cell| {
-        *cell.borrow_mut() = Some(val);
+        // Native callers can still evaluate an enclosing expression while
+        // returning the nil sentinel. Preserve the original failure until a
+        // catch boundary consumes it; secondary type errors must not hide it.
+        cell.borrow_mut().get_or_insert(val);
     });
     rt_const_nil()
 }

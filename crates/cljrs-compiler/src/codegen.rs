@@ -532,7 +532,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             }
 
             // GC safepoint at function entry.
-            self.emit_safepoint();
+            self.emit_safepoint()?;
         }
 
         // Translate each block.
@@ -594,7 +594,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let params = self.builder.block_params(dispatch).to_vec();
         self.sm_param = Some(params[0]);
 
-        self.emit_safepoint();
+        self.emit_safepoint()?;
 
         // switch(state): brif chain over the resume-block table.  Entry (state
         // 0) is the default.  All targets are phi-free, so jumps carry no args.
@@ -706,7 +706,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             self.region_param = Some(params[ir_func.params.len()]);
         }
 
-        self.emit_safepoint();
+        self.emit_safepoint()?;
         let entry = self.block_map[&ir_func.blocks[0].id];
         self.builder.ins().jump(entry, &[]);
 
@@ -1324,7 +1324,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             Terminator::RecurJump { target, args } => {
                 // GC safepoint before looping back, so tight recur
                 // loops cooperate with the collector.
-                self.emit_safepoint();
+                self.emit_safepoint()?;
                 let clif_block = self.block_map[target];
                 // Recur args feed the target's phis positionally; coerce each
                 // to its phi's representation (boxing into boxed phis).
@@ -1401,9 +1401,28 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     /// Emit a call to `rt_safepoint()`.
-    fn emit_safepoint(&mut self) {
+    fn emit_safepoint(&mut self) -> CodegenResult<()> {
         let func_ref = self.import_func(self.rt.rt_safepoint);
-        self.builder.ins().call(func_ref, &[]);
+        let call = self.builder.ins().call(func_ref, &[]);
+        let ok = self.builder.inst_results(call)[0];
+        let continue_block = self.builder.create_block();
+        let overflow_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(ok, continue_block, &[], overflow_block, &[]);
+        self.builder.switch_to_block(overflow_block);
+        if self.is_poll_fn {
+            let threw = self
+                .builder
+                .ins()
+                .iconst(types::I32, cljrs_async::state_machine::POLL_THREW as i64);
+            self.builder.ins().return_(&[threw]);
+        } else {
+            let nil = self.call_rt_0(self.rt.rt_const_nil)?;
+            self.builder.ins().return_(&[nil]);
+        }
+        self.builder.switch_to_block(continue_block);
+        Ok(())
     }
 
     /// Charge a weighted basic block and return a type-correct exhaustion
@@ -2586,11 +2605,11 @@ fn declare_runtime_funcs<M: Module>(
     module: &mut M,
     ptr: types::Type,
 ) -> CodegenResult<RuntimeFuncs> {
-    // Declare rt_safepoint: void -> void.  We declare it as returning ptr
-    // (ignored) to keep the signature uniform with declare_rt.
+    // A failed stack-margin check sets the pending exception and returns zero.
     let rt_safepoint = {
         let mut sig = module.make_signature();
         sig.call_conv = CallConv::SystemV;
+        sig.returns.push(AbiParam::new(types::I8));
         module.declare_function("rt_safepoint", Linkage::Import, &sig)?
     };
 

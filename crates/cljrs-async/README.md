@@ -265,6 +265,31 @@ Cancellation unwinds the fiber with its mutator state installed before stack reu
 
 The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
 64 KB minimum. Each isolate pools up to 32 finished stacks.
+Reserved stack bytes, including guard pages and pooled stacks, are charged to
+`MemoryClass::FiberStack`. Strict admission can reject construction with
+`EvalError::MemoryLimitExceeded`. Failed admission releases idle stacks before retrying.
+Stacks are not returned to the pool while the governor reports memory pressure.
+`--gc-stats` and the governor snapshot show live and peak fiber counts, pooled stack
+counts, and reserved stack bytes. The root's 64 MiB reservation uses the same budget.
+
+At interpreter, IR, JIT, and AOT safepoints, a fiber yields after its time slice when
+another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
+Clock checks are batched every 64 safepoints. Yielding waits for runtime locks and
+governor critical sections to end. Root guards preserve environments during the yield.
+Cancellation at an automatic yield returns through native frames using the uncatchable
+resource-error path, so Rust unwinding does not cross those frames.
+
+A process watchdog checks carriers every 10 ms. If a fiber misses safepoints for
+`CLJRS_FIBER_STALL_MS` (default 100 ms) while another fiber is ready, it prints the
+fiber ID and innermost native function name once for that stall. Parked fibers do not
+trigger warnings. Both timing settings accept positive integers; invalid values use defaults.
+
+Safepoints reject recursion when fewer than 256 KiB remain above the stack limit.
+The error names the fiber and reports reserved and remaining bytes. The margin covers
+interpreter frames and error construction; very small reservations cannot run deep Clojure code.
+Native recursion without safepoints can still hit the fatal guard page.
+The driver does not replace platform signal handlers.
+
 Saved mutator states retain precise GC roots. Suspended JIT frames keep their code epochs live.
 
 For captured managed values, use `spawn_rooted(values, body)` or `Fiber::with_roots(values, body)`.
@@ -292,7 +317,8 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl`: async task dispatch and fiber call dispatch with binding, gas, and interrupt conveyance |
 | `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
-| `src/fiber.rs` | Native stackful fibers, stack pool, parking, panic delivery, cancellation, and rooted results |
+| `src/fiber.rs` | Native stackful fibers, governed stack pool, parking, panic delivery, cancellation, and rooted results |
+| `src/fiber/scheduler.rs` | Safepoint time slices, ready-task wakers, stack-margin checks, native-frame names, and carrier watchdog |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
 | `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
@@ -648,3 +674,8 @@ Public async evaluation and awaiting use the same poll-scoped ownership rule.
 Fiber results use a handoff lease while mutator state is restored.
 A root result borrows into the restored caller's read scope, when present.
 Owned `FiberResult` values keep their leases without permanent carrier publication.
+
+
+`tests/fairness.rs` covers CPU-loop fairness in both interpreters, collection during
+automatic yields, stack accounting and pool reuse, cancellation, strict admission,
+stall diagnostics, and recursion errors. These tests also run with `no-gc`.

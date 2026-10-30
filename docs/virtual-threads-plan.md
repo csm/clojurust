@@ -191,9 +191,9 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   Arguments and results cross only after conversion to Rust types that implement `Send + 'static`.
   The form rejects arbitrary Clojure closures and unsupported native adapters.
   `#[cljrs::export(blocking)]` offloads an exported Rust function automatically without the Clojure form.
-- A stall detector: the GC-service task notes when the isolate hasn't reached a safepoint for
-  more than `CLJRS_FIBER_STALL_MS` (default 100 ms) while fibers are runnable, and logs the
-  offending native frame once. This is the equivalent of Loom's `jdk.tracePinnedThreads`.
+- A stall detector: a shared watchdog thread notes when the isolate hasn't reached a safepoint for
+  more than `CLJRS_FIBER_STALL_MS` (default 100 ms) while other fibers are runnable, and logs the
+  offending native frame once. The watchdog runs independently of blocked carriers. This is the equivalent of Loom's `jdk.tracePinnedThreads`.
 
 ---
 
@@ -249,10 +249,11 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 
 ## Stack overflow
 
-- Each fiber's `CALL_DEPTH` limit is derived from its stack reservation, so deep recursion
-  produces the normal clojurust stack-overflow error before hitting the guard page.
-- A guard-page hit (deep native recursion) is fatal in Phase 1, as on the main thread today.
-  Phase 4 investigates a `sigaltstack` handler that reports which fiber overflowed.
+- Each fiber checks its actual remaining stack space at safepoints. A 256 KiB margin
+  lets ordinary recursion return a stack-overflow error that identifies the fiber.
+  The transaction-specific `CALL_DEPTH` budget remains independent of this check.
+- A guard-page hit from native recursion without safepoints remains fatal.
+  Phase 4 keeps platform signal handlers intact and uses safepoint checks for recoverable errors.
 
 ---
 
@@ -483,6 +484,38 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   (fiber stacks charged as a new `MemoryClass::FiberStack`, so the governor can refuse new fibers
   under pressure).
 - Fiber-aware overflow reporting.
+
+**Status: implemented.**
+
+- Interpreter, IR, JIT, and AOT safepoints yield an expired time slice when
+  another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10,000 microseconds.
+  Clock reads are batched every 64 safepoints. Runtime locks and governor critical
+  sections defer yielding. Safepoint environments remain rooted during the switch.
+- Ready-task wakers track queued work, including wakes from other threads.
+  Completion and cancellation remove their ready registrations.
+- A shared watchdog runs outside the carriers. It reports a missing safepoint
+  after `CLJRS_FIBER_STALL_MS` (default 100 ms) only when another fiber is ready.
+  Each stall logs once, with the fiber ID and innermost native function name.
+  Parked waits do not count as stalls.
+- Active and pooled stacks retain `MemoryClass::FiberStack` charges, including
+  page rounding and guard pages. Construction reserves the budget before allocation.
+  Admission failure evicts idle stacks before retrying. Memory pressure prevents pooling.
+  `MemorySnapshot` and `--gc-stats` include live and peak fiber counts, pooled-stack
+  counts, and reserved stack bytes. Root stacks use the same accounting.
+- Safepoints check the actual stack margin and return an error naming the fiber
+  before ordinary recursion reaches the guard page. The 256 KiB margin covers
+  interpreter frames and error construction. Compiled safepoints return a checked
+  status and carry the error through the pending-exception slot.
+- Cancellation at an automatic yield uses the uncatchable resource-error path
+  to return normally through native ABI frames before stack cleanup.
+- The overflow investigation keeps platform signal handlers intact. A native
+  recursion path without safepoints can still hit the fatal guard page; this phase
+  does not attempt signal-handler unwinding or recovery.
+- Regression tests cover both interpreters, published JIT code, AOT binaries,
+  GC during automatic yields, cancellation, stack reuse and strict admission,
+  stall warnings, and overflow reporting. Interpreter and JIT coverage runs in GC
+  and `no-gc` builds. The AOT fixture uses GC: the existing `no-gc` AOT blacklist
+  rejects its escaping function definitions before code generation.
 
 ### Phase 5 — Converge async models
 

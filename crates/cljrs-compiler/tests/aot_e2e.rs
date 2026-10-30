@@ -82,6 +82,29 @@ fn assert_output(name: &str, source: &str, expected: &str) {
     );
 }
 
+// The no-gc AOT blacklist currently rejects these escaping function definitions.
+// The no-gc interpreter and JIT paths are covered by the separate fiber tests.
+#[test]
+#[cfg(not(feature = "no-gc"))]
+fn aot_cpu_loop_yields_and_overflow_names_its_fiber() {
+    assert_output(
+        "fiber_fairness",
+        r#"
+      (ns fiber-fairness)
+      (def finished (atom false))
+      (defn spin [n] (loop [i n] (if (zero? i) 42 (recur (dec i)))))
+      (defn overflow [n] (+ n (overflow (inc n))))
+      (defn -main [& _]
+        (let [cpu (future (let [v (spin 5000000)] (reset! finished true) v))
+              sibling (future (not @finished))]
+          (println @cpu @sibling))
+        (println (try @(future (overflow 0))
+                      (catch Exception e (clojure.string/includes? (str e) "stack overflow in fiber")))))
+    "#,
+        "42 true\ntrue",
+    );
+}
+
 // ── Constants & arithmetic ─────────────────────────────────────────────────
 
 /// The CLI's default extension set always pulls `cljrs-base64` into an AOT

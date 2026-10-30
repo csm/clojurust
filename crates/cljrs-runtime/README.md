@@ -608,7 +608,7 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `root_values(vals: &[Value]) -> ValueRootGuard` — registers a slice of `Value` pointers as GC roots
 - `ValueRootGuard` removes its own entry on drop (not the top one), so guards held across `await`s by different `LocalSet` tasks may drop in any order
 - `root_option_values(vals: &[Option<Value>]) -> OptionValueRootGuard` — registers an `Option<Value>` slice (e.g. IR register file)
-- `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  Under `no-gc` only the fault check runs
+- `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  In both builds it also checks the fiber stack margin and yields an expired time slice when another fiber is ready. Its environment stays rooted across the yield. Under `no-gc` the collection step is omitted
 - `check_memory_fault() -> EvalResult<()>` — the fault check alone (used at the native-code entry seams)
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
@@ -1786,3 +1786,10 @@ Protocol and multimethod dispatch borrow ownership cached beside the implementat
 
 Standalone macro-expansion APIs keep their temporary values in a scratch scope under no-GC.
 They release successful temporary values after building the returned Rust form and publish thrown errors before teardown.
+
+
+Native calls through `env::apply_value` register their function name with
+`cljrs_gc::fiber::native_frame`. The native driver uses this name for stall diagnostics.
+Interpreter and IR safepoints return a fiber-specific stack-overflow error before
+recursion reaches the guard page. Automatic-yield cancellation uses the uncatchable
+resource-error path to return safely through compiled native frames.

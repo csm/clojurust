@@ -838,3 +838,21 @@ A first lookup during a bounded invocation fills an invocation-local table.
 Repeated keyword and versioned-global fills reuse its boxed value without further arena allocation.
 Program caches and compiled slots never receive invocation-owned pointers. The guard clears the table before freeing its arena.
 Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.
+
+
+## Fiber safepoints (virtual threads Phase 4)
+
+`rt_abi::rt_safepoint() -> i8` polls GC coordination, then the optional native
+fiber scheduler. It returns 1 to continue. A stack-margin failure stores a
+catchable pending exception and returns 0. Automatic-yield cancellation stores
+an uncatchable resource error and returns 0. Generated native functions check
+this status at entry and loop back-edges and return their ABI sentinel on failure.
+The wasm import represents this status as `i32`; wasm code discards it because
+wasm retains the existing async model.
+
+`tests/fiber_fairness.rs` checks that published JIT machine code yields during a
+CPU loop and can be cancelled at an automatic yield. The AOT suite checks
+fairness and fiber-specific recursion errors in a GC binary. The existing `no-gc`
+AOT blacklist rejects this fixture's escaping function definitions.
+Pending native exceptions retain the first failure until a catch boundary consumes it,
+so arithmetic on a returned nil sentinel cannot hide a stack-overflow diagnostic.
