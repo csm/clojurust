@@ -31,6 +31,26 @@ const NO_GC: bool = cfg!(feature = "no-gc");
 
 /// `(file relative to crates/, static name, class)`.
 const CLASSIFICATION: &[(&str, &str, Class)] = &[
+    (
+        "cljrs-gc/src/region.rs",
+        "STATIC_SLOTS",
+        Thread("ownership of static mutable storage slots"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "READ_SCOPES",
+        FiberWhen("cljrs-gc/READ_SCOPES", NO_GC),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "READ_EPOCH",
+        FiberWhen("cljrs-gc/READ_EPOCH", NO_GC),
+    ),
+    (
+        "cljrs-async/src/channel.rs",
+        "THREAD_FAILURES",
+        Fiber("cljrs-async/THREAD_FAILURES"),
+    ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
         "cljrs-gc/src/lib.rs",
@@ -54,13 +74,38 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/region.rs",
+        "REGION_OWNERS",
+        Thread("weak address index for regions shared by fibers"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "LEASE_SWEEPING",
+        Thread("isolate-local region ownership sweep guard"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "LEASED_REGIONS",
+        Thread("closed no-gc scopes retained by tasks or destination ownership"),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
+        "INHERITED_LEASES",
+        FiberWhen("cljrs-gc/INHERITED_LEASES", NO_GC),
+    ),
+    (
+        "cljrs-gc/src/region.rs",
         "POISON_WATERMARK",
-        FiberWhen("cljrs-gc/POISON_WATERMARK", !NO_GC),
+        Fiber("cljrs-gc/POISON_WATERMARK"),
     ),
     (
         "cljrs-gc/src/alloc_ctx.rs",
         "ALLOC_CTX",
         FiberWhen("cljrs-gc/ALLOC_CTX", NO_GC),
+    ),
+    (
+        "cljrs-gc/src/alloc_ctx.rs",
+        "INVOCATION_CACHE",
+        FiberWhen("cljrs-gc/INVOCATION_CACHE", NO_GC),
     ),
     (
         "cljrs-gc/src/governor.rs",
@@ -218,6 +263,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-compiler/src/rt_abi.rs",
         "RT_SCRATCH",
         Thread("only live between two adjacent rt_abi calls, which never park"),
+    ),
+    (
+        "cljrs-compiler/src/rt_abi.rs",
+        "PENDING_RESOURCE_ERROR",
+        Fiber("cljrs-compiler/PENDING_RESOURCE_ERROR"),
     ),
     (
         "cljrs-compiler/src/rt_abi.rs",

@@ -30,7 +30,7 @@ fn sq_form(
 ) -> EvalResult {
     match &form.kind {
         // ~expr — evaluate normally.
-        FormKind::Unquote(inner) => crate::interp::eval::eval(inner, env),
+        FormKind::Unquote(inner) => crate::interp::eval::eval_unscoped(inner, env),
 
         // ~@expr at top level is an error.
         FormKind::UnquoteSplice(_) => Err(EvalError::Runtime(
@@ -197,7 +197,7 @@ fn sq_seq(
         match &f.kind {
             FormKind::UnquoteSplice(inner) => {
                 // ~@expr: evaluate and spread.
-                let v = crate::interp::eval::eval(inner, env)?;
+                let v = crate::interp::eval::eval_unscoped(inner, env)?;
                 let items = crate::interp::destructure::value_to_seq_vec(&v)
                     .map_err(crate::env::error::value_error_to_eval_error)?;
                 out.push(Segment::Many(items));

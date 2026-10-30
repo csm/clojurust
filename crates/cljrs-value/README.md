@@ -27,7 +27,7 @@ src/
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
   parking.rs                     — optional executor hooks, notification events, borrowed future parking, and Send-only blocking work
-  publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
+  publish.rs                     — (Phase 10.5, GC builds; scope ownership under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
   shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
   realization.rs                 — fallible boundaries for equality, hashing, and formatting through Rust traits
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
@@ -561,8 +561,9 @@ pub fn publish_value(v: Value) -> Value;
 The runtime safety net for bump regions coexisting with the tracing GC:
 correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
-`CljxPromise::deliver`, and `cljrs-async`'s channel puts.  Under `no-gc` the
-module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
+`CljxPromise::deliver`, and `cljrs-async`'s channel puts.
+Under `no-gc`, regional destinations transfer backing scopes.
+Replaceable cells, Var roots, and channel entries use cached leases. Publication preserves object identity.
 
 ### `Namespace` (Phase 4)
 
@@ -723,7 +724,12 @@ itself is runtime state that does not cross a clone boundary.
 ### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
 
 ```rust
-pub struct Volatile { pub value: Mutex<Value> }
+pub struct Volatile { pub value: TrackedMutex<Value>, /* private ownership state */ }
+impl Volatile {
+    pub fn new(value: Value) -> Self;
+    pub fn deref(&self) -> Value;
+    pub fn reset(&self, value: Value) -> Value;
+}
 
 pub enum DelayState {
     Pending(Rc<dyn Thunk>),
@@ -1019,3 +1025,132 @@ It must convert results after the worker returns.
 checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
+
+In `no-gc` builds, `publish::publish_value` retains backing scopes at explicit program-lifetime boundaries.
+All values preserve identity and laziness; publication does not serialize them.
+`publish::publish_return(value)` transfers results into the caller or its active `ReadScope`.
+The evaluator publishes only its final escaping result after that read scope ends.
+Recur values use a replaceable trampoline lease.
+
+`publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
+Ordinary replaceable stores keep their collection wrappers and structural sharing.
+Definition relocation preserves logical identity and shared aliases.
+Small strings, UUIDs, BigInts, and ratios can move into compact arenas while keeping their logical identity.
+Other live payloads retain their source arenas, including other allocations in those arenas.
+Replacing or consuming the payload releases that ownership after its last reader finishes.
+Permanent destinations own their current payload lease. Regional destinations use counted, replaceable ownership edges and cache weak snapshots.
+Ownership tracing records mutable container scopes without snapshotting their current contents.
+Namespace bindings, protocol implementations, and channel entries retain their contents through their own destination ownership.
+`ValueLease` implements `Default` and `Debug`.
+Its `snapshot() -> RegionLease` method acquires temporary ownership without another value traversal.
+Its `protect_current()` method transfers that cached ownership into the caller.
+
+Atoms, volatiles, and Var roots use this shared preparation path, including initial values and replacements.
+Atom metadata, validators, and watch callbacks have independent replaceable leases. Var metadata and watches do too.
+Use `add_watch` and `remove_watch` to maintain ownership; direct mutation of the public watch vector bypasses these barriers.
+Reads reuse cached leases. Their cost depends on the number of backing scopes, without traversal of collection elements.
+Returned updates acquire caller ownership before the cell can replace its payload.
+`Atom::snapshot()` and `Volatile::snapshot()` return `publish::ValueSnapshot` for callbacks and watches.
+This snapshot exposes `value: Value` and keeps its no-GC backing scopes alive until drop.
+Its `protect_current()` method transfers ownership to the caller. Native GC callers still require normal value roots across collections.
+
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` rejects an unequal initial snapshot before publication.
+The public `value` field remains available for compatibility. Direct writes bypass ownership preparation.
+Use `reset`, `compare_and_set`, or `Var::bind` for writes.
+Scalar vectors maintain a summary so ownership tracing skips their elements.
+Unobserved future failures warn on drop, including resource failures. Internal thread delivery futures count as observed.
+Bounded invocations retain their original allocation rules.
+
+`NativeFn::captures: Arc<[Value]>` records managed values retained by a Rust callable.
+The callable and tracer share one immutable allocation. Compiled and IR adapters use the same capture slice.
+For struct literals, convert an existing capture vector with `.into()`.
+
+`NativeFn::with_captures(name, arity, captures, func) -> NativeFn` declares managed
+captures at construction. The callback receives `(&[Value], &[Value])` for captures
+and call arguments. The callback shares the declared capture slice.
+Keep the public capture handle unchanged after construction. `with_closure` is for Rust callables without managed captures.
+The interop registration helpers require `Send + Sync` host closures, which cannot
+capture isolate-local Values. Transaction host wrappers capture serialized host APIs.
+
+`CljxFuture::new_local()` records the executor thread. A pending local future
+rejects synchronous carrier dereference with a catchable error. `CljxFuture::new()`
+retains blocking behavior for manual futures and producers on another thread.
+
+
+### Borrowed values and field ownership
+
+`Value::identical(&self, other: &Value) -> bool` implements Clojure identity for every execution tier.
+Immutable relocation preserves logical identity, including collection aliases. Mutable objects retain their original allocation.
+`UuidValue` also implements `Clone`.
+
+`Var::snapshot() -> Option<publish::ValueSnapshot>` owns a root snapshot under no-GC.
+Atom and volatile snapshots have the same ownership contract.
+Use snapshots for Rust code that needs values across replacement without a read scope.
+For borrowed `deref`, metadata, validator, and watch reads, keep a `region::ReadScope` alive while using the values.
+Unscoped no-GC host reads receive program-lifetime ownership. Use scopes or snapshots for bounded retention.
+Native GC callers must continue to register GC roots.
+
+`Atom::add_watch(key: Value, callback: Value)` and `Var::add_watch` retain callback ownership.
+Their `remove_watch(key: &Value)` methods release removed ownership.
+`Atom::protect_watches()` and `Var::protect_watches()` borrow the cached watch values for callback delivery.
+`ValueLease::for_values(values: &[Value], owner: &AllocationOwner) -> ValueLease` prepares a shared field policy.
+`ValueLease::protect_read()` borrows cached backing scopes into the caller's scope or allocation destination.
+
+`publish::publish_for_slot(value: Value, address: usize, slot: usize) -> Value` replaces one indexed field's lease.
+`publish_for_named_slot(value: Value, address: usize, slot: String) -> Value` supports named fields such as protocol methods.
+`publish_for_owner` uses indexed slot zero for a single-field container.
+`publish::read_slot(address: usize, slot: usize)` protects a cached field value for its reader.
+`publish::clear_slots(address: usize)` releases fields at object destruction.
+Native GC builds use the ordinary promotion barrier for these stores.
+
+Arrays, transients, lazy cells, delays, promises, and futures maintain independent no-GC field ownership.
+Initial managed allocation invokes `Trace::init_ownership`; ordinary ownership tracing skips these mutable contents.
+Collection snapshots own their backing leases during operations that can park or mutate the original collection.
+Native containers that store managed values must use the same publication and read barriers.
+
+
+`publish::read_named_slot(address: usize, slot: String)` borrows a named cached field.
+`MultiFn::method(key: &str) -> Option<Value>` borrows a registered implementation before returning it.
+Multimethod implementations cache ownership beside their method entries. Dispatch and preference values use independent named slots.
+Replacing or removing a method releases its lease after existing readers finish.
+
+### Definition and transient ownership
+
+No-GC definition stores compact small immutable data and metadata.
+Compaction stops at 128 values or 32 levels. Large strings and numeric leaves keep their existing storage.
+Already compact or static objects are reused. The compact arena is created only when a copy is needed.
+Larger collections retain structural sharing and acquire leases without a rebuild.
+The packer preserves logical identities and shared aliases. It does not force lazy values or clone mutable cells.
+Interpreted function, atom, lazy-cell, delay, and multimethod roots use separate small regions.
+Atoms establish their payload ownership after managed allocation.
+Opaque captures retain their actual backing regions.
+
+`Value::Reduced(Arc<Value>)` and `Value::WithMeta(Arc<Value>, Arc<Value>)` share wrapper identity across clones.
+`Value::identical` handles every boxed variant, including arrays, wrappers, transients, and errors.
+
+`TransientVector::from_persistent(vector: &PersistentVector) -> Self` shares the trie and its scalar summary.
+Managed transient conversion shares initial data and captures its ownership once, without initial per-element slots.
+Later publication and returns reuse that cached ownership without tracing the initial collection.
+Writes acquire slots lazily. Maps and sets reuse their insertion sequence IDs for those slots.
+Key hashing stays in the existing realization-safe mutation path.
+Managed `persistent!` borrows the containing region. Rust stack containers protect the returned graph instead.
+This fallback permits those results to outlive the temporary container.
+
+`Protocol::set_implementation(tag: Arc<str>, method: Arc<str>, value: Value)` installs an implementation and its ownership cache.
+`Protocol::protect_implementation(tag: &str, method: &str)` borrows the cache without formatting a key.
+`MultiFn::set_method(key: String, value: Value)` and `remove_method(key: &str) -> bool` maintain method ownership.
+Use these methods when modifying managed implementation tables.
+`MultiFn::method` reads its cache beside the method table.
+`ValueLease::publish_return()` transfers an update result explicitly.
+Repeated cached reads reuse the caller's lease set without allocating another snapshot.
+
+Definition packing has a fixed work and depth bound. Other replaceable stores preserve collection sharing.
+After an implementation-table update batch, use the existing protocol or multimethod generation invalidation API.
+
+Exception tracing includes data maps, causes, and managed thrown payloads.
+These fields can retain independent backing regions.
+
+Immutable collections and closures cache their backing ownership after the first publication walk.
+Repeated captures of a shared graph stop at its cached root.
+Var root reads acquire leases once per scope epoch and binding generation.
+Rebinding and scope changes invalidate the read cache.

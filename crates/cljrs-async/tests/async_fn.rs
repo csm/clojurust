@@ -288,19 +288,23 @@ fn at_deref_of_future_in_async_fn_errors() {
 }
 
 #[test]
-#[ignore = "no thread-based future exists to deref: clojure.core/future is \
-             undefined by design, and a sync deref of the cooperative \
-             cljrs.core.experimental/future deadlocks"]
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
 fn deref_of_future_in_sync_context_still_works() {
-    // With the async runtime registered, a *sync* (non-^:async) deref of a
-    // thread-based future must still block-and-return, not error.
-    let globals = async_env();
-    let mut env = Env::new(globals, "user");
-    assert_eq!(
-        eval_sync("(deref (future (+ 1 2)))", &mut env),
-        Value::Long(3)
-    );
-    assert_eq!(eval_sync("@(future (* 6 7))", &mut env), Value::Long(42));
+    cljrs_async::isolate::Isolate::new("sync-future")
+        .spawn_root(|| {
+            let globals = async_env();
+            let mut env = Env::new(globals, "user");
+            assert_eq!(
+                eval_sync("(deref (future (+ 1 2)))", &mut env),
+                Value::Long(3)
+            );
+            assert_eq!(eval_sync("@(future (* 6 7))", &mut env), Value::Long(42));
+            Ok(Value::Nil)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
 }
 
 // ── Phase D: timeout, alts, alt ────────────────────────────────────────────

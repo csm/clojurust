@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, make_chan};
-use cljrs_async::eval_async::spawn_future;
+use cljrs_async::eval_async::spawn_future_with_roots;
 use cljrs_async::worker_pool::WorkerPool;
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::GlobalEnv;
@@ -580,7 +580,7 @@ pub fn connect_to(
     let host = host.to_string();
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(vec![promise_val.clone()], async move {
         do_quic_connect(
             host,
             port,
@@ -700,7 +700,9 @@ async fn do_quic_connect(
 pub fn open_stream_on(connection: quinn::Connection, in_buf: usize, out_buf: usize) -> Value {
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move { do_open_stream(connection, in_buf, out_buf, promise).await });
+    spawn_future_with_roots(vec![promise_val.clone()], async move {
+        do_open_stream(connection, in_buf, out_buf, promise).await
+    });
     promise_val
 }
 

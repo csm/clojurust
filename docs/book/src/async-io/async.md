@@ -22,9 +22,9 @@ Two tiers coexist:
 | Tier | Runs on | Used by |
 |---|---|---|
 | Async (single thread) | Tokio `LocalSet` | `^:async` fns, `go`, channels, `timeout`, `alts` |
-| Parallel (thread pool) | OS threads | `future`, `pmap`, `agent` (unchanged core primitives) |
+| Fibers (single thread) | Tokio `LocalSet` | `future`, `thread`, `io-thread`, native root evaluation |
 
-Both tiers produce `Value::Future`, so a caller can `await` or `deref` either.
+`future` returns a future. `thread` and `io-thread` return result channels.
 
 To run Clojure work on more than one core, the single-threaded executor is
 instantiated multiple times as independent **isolates**; see the
@@ -51,24 +51,33 @@ so the compiler can recognise yield points. Its behaviour depends on context:
 - Inside an `^:async` body (driven by the async evaluator), `(await x)` yields
   the executor thread until `x` — a `Future`, a `promise`, or a channel op —
   resolves, then returns the resolved value.
-- Outside any async context, `(await x)` falls back to a **blocking** deref of
-  the value, so the form still works in synchronous code.
+- In an ordinary native fiber, `(await x)` parks until the value settles.
+- Outside a fiber or async context, `(await x)` blocks the OS thread.
 
-`^:async` is *viral*: a function that uses `await` should itself be `^:async`.
+Ordinary native functions can wait in fibers. `^:async` remains available for the async evaluator.
 
 ### `await` vs. `deref`
 
-`deref` / `@` always blocks the calling OS thread. Calling `deref` on a future
-**inside** an `^:async` body is a runtime error:
+In a native fiber, `deref` / `@` parks until the future or promise settles.
+CLI evaluation, REPL, nREPL, tests, and AOT programs start in root fibers.
+An ordinary function can wait through nested calls without async annotations.
 
 ```clojure
-(defn ^:async bad [f]
-  @f)            ; error: use (await ...) instead of deref inside an ^:async function
+(defn answer [] @(future (sleep 10) 42))
+@(future (answer))
+;; => 42
 ```
 
-This enforcement (via the interpreter's async-context flag) prevents the
-classic deadlock where a task blocks the only executor thread waiting on a
-future that can only be resolved by that same thread.
+`future` and `future-call` convey dynamic bindings into each child fiber.
+A child's binding changes stay private to that child. These fibers run
+concurrently on one isolate thread. Isolates provide parallel Clojure execution.
+`future-cancel` cancels the result without interrupting the body.
+
+`go` and `^:async` retain the async evaluator. Their bodies still use `await`.
+A pending local future rejects carrier dereference outside a fiber.
+Synchronous embedders use `fiber::run_root` or `Isolate::spawn_root`.
+Manual futures with producers on other OS threads retain blocking dereference. On wasm32, callers retain the
+async waiting rules.
 
 ## Channels
 
@@ -163,7 +172,7 @@ dispatches to the matching handler:
 |---|---|
 | `(join-all futs)` | await a seq of futures, returning a vector of results (like `Promise.all`) |
 | `(async-pmap f coll)` | spawn `f` over `coll` concurrently and await all results |
-| `(thread f)` / `(thread-call f)` | run `f` on a real OS thread (`spawn_blocking`); deliver its result over a channel |
+| `(thread body...)` / `(io-thread body...)` / `(thread-call f)` | run an ordinary body in a fiber and return a result channel |
 | `(onto-chan! ch coll)` | put every element of `coll` onto `ch`, then close it |
 | `(to-chan! coll)` | return a channel and seed it from `coll` in the background |
 | `(merge chs)` | fan several channels into one |
@@ -206,3 +215,6 @@ binary can be produced with `cargo build -p cljrs --no-default-features`.
 > the GC-service spawn no-ops in that case and should be re-invoked from inside a
 > `LocalSet::run_until` block. `timeout` uses the browser's `setTimeout`
 > (via `gloo-timers`) on `wasm32` instead of `tokio::time::sleep`.
+
+A failed `thread` or `io-thread` body prints an error and closes its result channel.
+Each call uses one fiber. The `io-thread` macro delegates to `thread`.

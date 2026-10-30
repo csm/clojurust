@@ -37,14 +37,13 @@ stack as a root (`region::trace_active_regions`), so heap objects reachable
 only through a live region are still kept alive.  `GcPtr::raw()` masks the tag
 on every dereference; `GcPtr::is_region_alloc()` exposes it.
 
-**`no-gc` build:** every function call and every `loop` iteration pushes a
-scratch `Region`; intermediates are freed when the scope exits.  Return values
-and `recur` arguments are evaluated in the caller's context (the
-"return-expression-in-caller" mechanism).  Static-sink expressions (`def`,
-`defn`, `defmacro`, `atom`, `agent`, `volatile!`, `reset!`, `vreset!`,
-`swap!`, `vswap!`, `alter-var-root`, `intern`) go to the global `StaticArena`
-and live for the program lifetime.
-No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
+**`no-gc` build:** every function call and every `loop` iteration pushes a scratch `Region`.
+The evaluator transfers ownership of returned backing scopes into the caller before the scratch guard exits.
+Unused intermediates are freed when their scope exits.
+Static expressions use the global `StaticArena` and live for the program lifetime.
+Region-local publication transfers backing scopes without evaluating lazy sequences.
+Static publication copies proven finite immutable data and retains opaque backing scopes.
+There is no `GcHeap` or stop-the-world collection.
 
 An isolated invocation can instead install `alloc_ctx::InvocationGuard`. In
 that profile every allocation uses one bounded region; nested `ScratchGuard`
@@ -178,7 +177,7 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn is_region_alloc(&self) -> bool  // true if bump-allocated in a Region
 
     // no-gc + debug_assertions only:
-    pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena
+    pub fn is_static_alloc(&self) -> bool  // true for static or permanently retained storage
 }
 impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
@@ -333,11 +332,15 @@ impl InvocationGuard {
     pub fn object_count(&self) -> usize;
 }
 pub fn invocation_is_active() -> bool;
+pub fn invocation_cache_get(kind: &'static str, key: &str) -> Option<usize>;
+pub fn invocation_cache_insert(kind: &'static str, key: String, address: usize);
 ```
 
 All `GcPtr::new` calls within the guard use its single arena, including calls
 made beneath evaluator scratch/static guards. Copy or serialize results before
 the guard drops.
+The invocation cache holds raw addresses owned by that arena. The guard clears the cache before releasing its storage.
+Callers must keep these addresses out of program caches and compiled call-site slots.
 
 Bump allocator for short-lived objects. ~2.6x faster than `GcHeap::alloc`
 (no mutex, no `Box::new`). Objects are NOT in the GC heap linked list.
@@ -357,7 +360,7 @@ RAII guard that pushes a `Region` onto the thread-local stack. Use with
 pub fn poison_active_regions();
 
 /// True when every active region must remain alive after its scope closes.
-/// Available in GC builds. Publishers can skip graph scans in this state.
+/// Publishers can skip graph scans in this state.
 pub fn active_regions_are_poisoned() -> bool;
 
 /// Close a region whose scope ended: pop the thread-local stack entry, then
@@ -733,3 +736,126 @@ programs and the AOT test harness call it once at exit.
 - Weak references (`WeakGcPtr<T>`) — deferred
 - Safepoint integration with JIT frames — Phase 10+
 - Automatic collection trigger (threshold-based) — deferred
+
+No-gc task captures use `region::RegionLease::capture_active() -> RegionLease`.
+`RegionLease::enter() -> LeaseScope` conveys leases into nested tasks for one poll
+or fiber execution. Completion and cancellation release these leases.
+Closed regions remain in a deferred registry only while a task can use them.
+The last external lease permits storage reclamation and releases the governor charge.
+Weak dependency edges let mutually dependent closed scopes be reclaimed together.
+Reclamation removes both halves of each edge, including entries in live neighbors.
+`ScratchGuard` keeps each scope discoverable through result ownership transfer.
+
+No-gc publication preserves value identity and laziness. `retain_regions_for(value: &impl Trace)`
+retains only actual backing scopes for program-lifetime destinations.
+`RegionLease::for_value(value)` traces those scopes without evaluating user code.
+`RegionLease::for_values<T: Trace>(values: &[T])` leases several values with one visited set.
+`RegionLease` implements `Default`, `Clone`, and `Debug`.
+`RegionLease::protect_current()` borrows backing scopes into the current read scope.
+Without a read scope, it transfers ownership into the current allocation destination.
+`AllocationOwner::current()` and `for_address(address)` return weak destination handles.
+Their `protect(value)` method keeps source scopes alive for that destination's lifetime.
+`AllocationOwner::is_permanent()` identifies a static or permanently retained destination.
+`AllocationSnapshot::capture()` retains a task's allocation destination.
+Its `enter()` method installs that destination until the returned `alloc_ctx::ContextGuard` drops.
+Its `protect(value)` method transfers result ownership into the captured destination.
+Ordinary scratch scopes create no lease metadata until sharing occurs.
+The address index and incoming ownership edges limit cleanup to affected scopes.
+Live callers stop traversal. Task polls do not scan unrelated deferred scopes.
+`alloc_ctx::is_static_context()` identifies a program-lifetime allocation destination.
+Bounded isolated allocation invocations retain their original lifetime rules.
+
+`static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available
+in release no-gc builds for publication decisions.
+No-gc `MarkVisitor` implements `Default` and traverses values only for explicit ownership transfer.
+
+`RegionLease::downgrade() -> WeakRegionLease` caches backing scopes without an external ownership root.
+`WeakRegionLease` implements `Default` and `Debug`. Its `upgrade() -> RegionLease` acquires temporary ownership.
+`AllocationOwner::adopt(&RegionLease)` stores cached ownership for the full destination lifetime.
+Store operations never route ownership into temporary read scopes.
+`AllocationOwner::replaceable(&RegionLease) -> RegionDependency` creates counted edges for one replaceable slot.
+Dropping that slot removes its edges. Other slots and durable stores retain their own edges.
+`RegionDependency` implements `Default` and `Debug`; `snapshot()` acquires a temporary `RegionLease`.
+`RegionLease::extend(&RegionLease)` merges owners with a set indexed by scope ID.
+
+`region::ReadScope::enter() -> Option<ReadScope>` starts the outermost evaluation read scope.
+Nested calls return `None`. Bounded invocations also return `None`.
+`ReadScope::is_active()` identifies an active read scope.
+`ReadScope::epoch() -> u64` identifies the current borrowing lifetime; zero means there is no scope.
+Nested scopes and task polls change the epoch. Fibers save it with their mutator state.
+Var reads use it to acquire ownership once per binding and scope.
+`finish(self) -> RegionLease` removes the scope and returns its leases while the final result escapes.
+Drop releases a scope on unwind. A scope stays on its creating thread.
+Fibers swap this state with their other mutator slots.
+Each scratch guard opens a nested read scope for one call or iteration.
+`pop_for_return()` removes this scope while retaining its leases until result transfer finishes.
+`ReadScope::nested()` also opens a nested scope explicitly.
+Task capture excludes temporary read scopes. Callers must declare captured managed values.
+Low-level embedders can use a read scope to bound temporary reads outside the evaluator.
+Keep the scope alive while using borrowed results. Discard the results before dropping the scope.
+Without an enclosing caller scope, raw escaping results receive program-lifetime ownership.
+
+
+### No-GC borrowed reads and mutable storage
+
+`RegionLease::protect_read()` protects a raw borrowed result in the current read scope or allocation destination.
+Without either, the result receives program-lifetime ownership. Use scopes or owning snapshots to bound host reads.
+`AllocationOwner::adopt` remains a durable store operation.
+
+`SlotId` identifies a mutable field with `Index(usize)` or `Named(String)`.
+It implements `From<usize>`, `From<String>`, `Clone`, `Debug`, equality, and ordering.
+`AllocationOwner::set_slot(address, slot: impl Into<SlotId>, &RegionLease)` replaces one field's ownership.
+`read_slot(address, slot)` borrows that cached ownership. `clear_slots(address)` releases an object's fields at destruction.
+Static fields own leases; regional fields use counted edges. Both release overwritten values.
+
+`ReadContext` owns the read scopes of one asynchronous computation and implements `Default`.
+`enter(&mut self) -> ReadContextGuard<'_>` installs that context for one poll.
+The guard restores the polling caller's scopes on drop, including unwind.
+Contexts and guards remain on their creating thread.
+
+`Trace::init_ownership(&self)` is a default no-GC allocation hook.
+Managed allocators call it after constructing the pointee. Mutable containers use it to establish their initial field leases.
+The hook must not park or evaluate user code.
+
+`GcPtr::identity_eq(a, b) -> bool` compares logical object identity.
+In native GC builds, this is pointer identity.
+No-GC boxes hold a unique 62-bit identity. Two reserved bits store relocation and ownership-cache flags without increasing box size.
+`unsafe GcPtr::clone_immutable(&self) -> Self`, available under no-GC, copies an immutable scalar with that identity.
+The pointee must contain no mutable state, and its clone must represent the same value.
+`GcPtr::ptr_eq` continues to compare physical allocation addresses.
+
+### Compact roots and explicit result publication
+
+`alloc_ctx::ScratchGuard::with_capacity(capacity: usize) -> Self` selects the initial chunk size.
+Later chunks double in size up to the default growth size, or grow enough for a larger object.
+Compact scalar boxes use initial chunks sized to their representation.
+`GcPtr::is_relocated_immutable() -> bool` identifies a compact immutable copy under no-GC.
+Stores reuse these copies instead of copying them again.
+`GcPtr::new_isolated(value: T) -> Self` allocates a separate root region under no-GC.
+The caller's scope owns the result. Static and invocation destinations keep their allocation rules.
+Native GC builds use ordinary allocation.
+`unsafe GcPtr::relocate_immutable(&self, value: T) -> Self` preserves the source identity under no-GC.
+The replacement must represent the same immutable object, including its children's identities.
+
+`RegionLease::for_address(address: usize) -> Self` leases a containing region without tracing the object.
+`RegionLease::publish_return()` explicitly transfers a raw escaping result.
+An unscoped static result has program lifetime. This fallback also applies to unscoped host reads.
+Explicit scopes and owning snapshots permit earlier reclamation.
+`RegionDependency::protect_read()` borrows cached weak sources without constructing an owning snapshot.
+Durable regional dependencies use counted edges held until their destination dies.
+They do not turn replaceable edge counts into permanent markers.
+
+
+`Trace::immutable_children(&self) -> bool` is a default no-GC hook that returns false.
+Return true only when managed child references cannot change through interior mutability.
+Publication visits each immutable object's child graph once and caches counted region dependencies.
+Later walks stop at that object. `GcPtr::get_mut` invalidates its cache before returning mutable access.
+Ownership walks use an explicit work stack, including long Cons chains.
+Mutable containers continue to maintain replaceable field ownership.
+
+
+Under no-GC, `GcPtr::get_mut(&mut self) -> GcMut<'_, T>` returns a mutation guard.
+`GcMut` implements `Deref<Target = T>`, `DerefMut`, and `Drop`.
+Drop acquires ownership of the changed child graph, including when unwinding.
+Cached parents remain valid because the mutated object's region retains its new children.
+Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.

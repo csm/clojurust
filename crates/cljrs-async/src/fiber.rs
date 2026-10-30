@@ -172,15 +172,24 @@ impl Fiber {
     }
 
     /// Keep captured values rooted before the first poll and until completion.
-    /// GC builds retire active regions because opaque closure captures cannot
-    /// be rewritten after promotion. In no-gc builds, allocate captures in a
-    /// static context before constructing a fiber.
+    /// GC builds poison active regions for opaque captures. No-gc builds
+    /// lease those regions only until task completion or cancellation.
     pub fn with_roots(
         roots: Vec<Value>,
         body: impl FnOnce() -> EvalResult + 'static,
     ) -> Result<Self, EvalError> {
+        // SAFETY: this constructor requires a static body.
+        unsafe { Self::with_stack_bytes(roots, body, stack_bytes()?) }
+    }
+
+    // SAFETY: borrowed bodies must be fully driven or dropped before returning
+    // to their caller. Only run_root may use a non-static body.
+    unsafe fn with_stack_bytes(
+        roots: Vec<Value>,
+        body: impl FnOnce() -> EvalResult,
+        bytes: usize,
+    ) -> Result<Self, EvalError> {
         install_parking_hooks();
-        let bytes = stack_bytes()?;
         let stack = STACK_POOL
             .with(|pool| {
                 let mut pool = pool.borrow_mut();
@@ -192,7 +201,21 @@ impl Fiber {
             .unwrap_or_else(|| DefaultStack::new(bytes))
             .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
         let id = FiberId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        #[cfg(not(feature = "no-gc"))]
         cljrs_gc::region::poison_active_regions();
+        #[cfg(feature = "no-gc")]
+        let lease = cljrs_gc::region::RegionLease::capture_active();
+        #[cfg(feature = "no-gc")]
+        let allocation = cljrs_gc::region::AllocationSnapshot::capture();
+        #[cfg(feature = "no-gc")]
+        let lease = {
+            let mut lease = lease;
+            lease.extend(&cljrs_gc::region::RegionLease::for_values(&roots));
+            lease
+        };
+        let reports = crate::channel::FailureReports::current();
+        #[cfg(feature = "no-gc")]
+        let result_lease = std::rc::Rc::new(RefCell::new(cljrs_gc::region::RegionLease::default()));
         let roots = roots.into_boxed_slice();
         let state = MutatorState::fresh();
         // Register captures in the fiber's detached state, not the caller's.
@@ -205,15 +228,41 @@ impl Fiber {
             bytes,
             id,
             yielder: std::ptr::null(),
+            root: false,
+            #[cfg(feature = "no-gc")]
+            result_lease: result_lease.clone(),
+            #[cfg(feature = "no-gc")]
+            owned_result: false,
+            #[cfg(feature = "no-gc")]
+            _captures: lease.clone(),
+            #[cfg(feature = "no-gc")]
+            allocation: allocation.clone(),
         };
         task.state.swap_with_current();
+        reports.install();
         task.roots_guard = Some(root_values(&task.roots));
         task.state.swap_with_current();
-        task.co = Some(Coroutine::with_stack(stack, move |yielder, ()| {
-            CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
-            let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
-            body()
-        }));
+        task.co = Some(unsafe {
+            Coroutine::with_stack_unchecked(stack, move |yielder, ()| {
+                CURRENT.with(|slot| slot.set(Some(Current { id, yielder })));
+                let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
+                #[cfg(feature = "no-gc")]
+                let _lease_scope = lease.enter();
+                #[cfg(feature = "no-gc")]
+                let _allocation_scope = allocation.enter();
+                #[cfg(feature = "no-gc")]
+                let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let result = body();
+                #[cfg(feature = "no-gc")]
+                match &result {
+                    Ok(value) | Err(EvalError::Thrown(value)) => {
+                        *result_lease.borrow_mut() = cljrs_gc::region::RegionLease::for_value(value)
+                    }
+                    _ => {}
+                }
+                result
+            })
+        });
         Ok(Self { task })
     }
 
@@ -236,6 +285,15 @@ pub struct FiberTask {
     bytes: usize,
     id: FiberId,
     yielder: *const Yielder<(), Park>,
+    root: bool,
+    #[cfg(feature = "no-gc")]
+    result_lease: std::rc::Rc<RefCell<cljrs_gc::region::RegionLease>>,
+    #[cfg(feature = "no-gc")]
+    owned_result: bool,
+    #[cfg(feature = "no-gc")]
+    _captures: cljrs_gc::region::RegionLease,
+    #[cfg(feature = "no-gc")]
+    allocation: cljrs_gc::region::AllocationSnapshot,
 }
 
 impl FiberTask {
@@ -325,23 +383,39 @@ impl Future for FiberTask {
         }
         this.state.swap_with_current();
         if result.is_ready() {
-            this.state = MutatorState::fresh();
+            #[cfg(feature = "no-gc")]
+            let _handoff = this._captures.enter();
+            #[cfg(feature = "no-gc")]
+            if !this.root && !this.owned_result {
+                this.result_lease.borrow().publish_return();
+            }
+            if !this.root {
+                this.state = MutatorState::fresh();
+            }
             this.release_stack();
         }
         result
     }
 }
 
-impl Drop for FiberTask {
-    fn drop(&mut self) {
+impl FiberTask {
+    fn cancel(&mut self) {
         if self.co.is_some() {
             self.state.swap_with_current();
             self.unwind();
             self.roots_guard.take();
             self.state.swap_with_current();
-            self.state = MutatorState::fresh();
+            if !self.root {
+                self.state = MutatorState::fresh();
+            }
             self.release_stack();
         }
+    }
+}
+
+impl Drop for FiberTask {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -352,6 +426,8 @@ pub struct FiberResult {
     state: MutatorState,
     guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
     _roots: Box<[Value]>,
+    #[cfg(feature = "no-gc")]
+    leases: Vec<cljrs_gc::region::RegionLease>,
 }
 
 impl FiberResult {
@@ -361,6 +437,11 @@ impl FiberResult {
             Err(EvalError::Recur(values)) => values.clone().into_boxed_slice(),
             _ => Box::new([]),
         };
+        #[cfg(feature = "no-gc")]
+        let leases = roots
+            .iter()
+            .map(cljrs_gc::region::RegionLease::for_value)
+            .collect();
         let mut state = MutatorState::fresh();
         state.swap_with_current();
         let guard = root_values(&roots);
@@ -370,10 +451,16 @@ impl FiberResult {
             state,
             guard: Some(guard),
             _roots: roots,
+            #[cfg(feature = "no-gc")]
+            leases,
         }
     }
 
     pub fn into_result(mut self) -> EvalResult {
+        #[cfg(feature = "no-gc")]
+        for lease in &self.leases {
+            lease.publish_return();
+        }
         self.result.take().unwrap()
     }
 }
@@ -399,7 +486,121 @@ pub fn spawn_rooted(
     body: impl FnOnce() -> EvalResult + 'static,
 ) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
     let task = Fiber::with_roots(roots, body)?.into_task();
+    #[cfg(feature = "no-gc")]
+    let allocation = task.allocation.clone();
     Ok(tokio::task::spawn_local(async move {
-        FiberResult::new(task.await)
+        #[cfg(feature = "no-gc")]
+        let result = {
+            let mut task = task;
+            task.owned_result = true;
+            let result = std::future::poll_fn(|cx| {
+                let _context = allocation.enter();
+                Pin::new(&mut task).poll(cx)
+            })
+            .await;
+            // Capture result storage while the completed task still pins its
+            // original scopes. The JoinHandle can outlive those lexical scopes.
+            FiberResult::new(result)
+        };
+        #[cfg(not(feature = "no-gc"))]
+        let result = FiberResult::new(task.await);
+        result
     }))
+}
+
+/// Drive a borrowed top-level computation on a 64 MiB root stack.
+/// Transfers the host's mutator state into the root and restores it afterward.
+/// `carrier` retains executor task roots between drives on the same LocalSet.
+/// Call outside the Tokio runtime and outside any fiber.
+pub fn run_root(
+    rt: &tokio::runtime::Runtime,
+    local: &tokio::task::LocalSet,
+    carrier: &mut MutatorState,
+    body: impl FnOnce() -> EvalResult,
+) -> EvalResult {
+    assert!(current().is_none(), "nested root fiber");
+    // The root and every task it spawns share this carrier's report registry.
+    carrier.swap_with_current();
+    let reports = crate::channel::FailureReports::current();
+    carrier.swap_with_current();
+    struct RestoreReports(crate::channel::FailureReports);
+    impl Drop for RestoreReports {
+        fn drop(&mut self) {
+            self.0.install();
+        }
+    }
+    let _reports = RestoreReports(reports.install());
+    // SAFETY: the task never escapes this synchronous function. Drive drops
+    // (and unwinds) it on every exit, including executor panics.
+    let mut task =
+        unsafe { Fiber::with_stack_bytes(Vec::new(), body, 64 * 1024 * 1024)? }.into_task();
+    task.state.swap_with_current();
+    task.roots_guard.take();
+    task.state.swap_with_current();
+    task.state = MutatorState::save();
+    task.root = true;
+    carrier.swap_with_current();
+    // Restore both states even if the executor panics. Pending legacy async
+    // tasks retain their carrier roots separately from the host's LIFO guards.
+    struct Drive<'a> {
+        task: FiberTask,
+        carrier: &'a mut MutatorState,
+    }
+    impl Drop for Drive<'_> {
+        fn drop(&mut self) {
+            self.task.cancel();
+            self.carrier.swap_with_current();
+            self.task.state.swap_with_current();
+        }
+    }
+    let mut drive = Drive { task, carrier };
+    let result = local.block_on(rt, &mut drive.task);
+    #[cfg(feature = "no-gc")]
+    let ownership = drive.task.result_lease.borrow().clone();
+    drop(drive);
+    #[cfg(feature = "no-gc")]
+    ownership.publish_return();
+    result
+}
+
+/// Destroy local tasks with their carrier state installed, restoring the caller
+/// even if task destruction unwinds.
+pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut MutatorState) {
+    carrier.swap_with_current();
+    struct Restore<'a>(&'a mut MutatorState);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.0.swap_with_current();
+        }
+    }
+    let _restore = Restore(carrier);
+    drop(local);
+    crate::channel::report_unobserved_thread_failures();
+}
+
+/// Drive one root and destroy its executor with the matching carrier state.
+pub fn run_root_owned(
+    rt: &tokio::runtime::Runtime,
+    local: tokio::task::LocalSet,
+    body: impl FnOnce() -> EvalResult,
+) -> EvalResult {
+    struct Driver {
+        local: Option<tokio::task::LocalSet>,
+        carrier: MutatorState,
+    }
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            drop_local_with_carrier(self.local.take().unwrap(), &mut self.carrier);
+        }
+    }
+    let mut driver = Driver {
+        local: Some(local),
+        carrier: MutatorState::fresh(),
+    };
+    run_root(
+        rt,
+        driver.local.as_ref().unwrap(),
+        &mut driver.carrier,
+        body,
+    )
 }

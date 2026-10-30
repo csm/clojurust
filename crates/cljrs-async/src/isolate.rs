@@ -3,6 +3,36 @@
 
 use std::future::Future;
 
+/// A root evaluation failure that can cross the isolate's OS-thread boundary.
+/// Managed Clojure values remain on their owning thread; ordinary errors carry
+/// their diagnostic text, while resource errors keep their typed details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootError {
+    GasExhausted,
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+    Evaluation(String),
+}
+impl std::fmt::Display for RootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GasExhausted => f.write_str("gas exhausted"),
+            Self::MemoryLimitExceeded(error) => error.fmt(f),
+            Self::Evaluation(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for RootError {}
+impl From<cljrs_runtime::env::error::EvalError> for RootError {
+    fn from(error: cljrs_runtime::env::error::EvalError) -> Self {
+        use cljrs_runtime::env::error::EvalError;
+        match error {
+            EvalError::GasExhausted => Self::GasExhausted,
+            EvalError::MemoryLimitExceeded(error) => Self::MemoryLimitExceeded(error),
+            other => Self::Evaluation(other.to_string()),
+        }
+    }
+}
+
 /// An independent execution context: its own Tokio `current_thread` runtime,
 /// `LocalSet`, and per-isolate GC heap (thread-local).
 ///
@@ -52,6 +82,33 @@ impl Isolate {
                     .expect("isolate: failed to build Tokio runtime");
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&rt, f());
+                drop(local);
+                crate::channel::report_unobserved_thread_failures();
+            })
+            .expect("isolate: failed to spawn OS thread")
+    }
+
+    /// Run a synchronous entry function in a root fiber on a new isolate.
+    /// Blocking Clojure waits park the root and let local tasks make progress.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn_root<F>(self, body: F) -> std::thread::JoinHandle<Result<(), RootError>>
+    where
+        F: FnOnce() -> cljrs_runtime::env::error::EvalResult + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(self.name.clone())
+            .spawn(move || {
+                cljrs_gc::register_current_isolate(&self.name);
+                let _mutator = cljrs_gc::register_mutator();
+                cljrs_gc::HEAP.set_config_from_env();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("isolate runtime");
+                let local = tokio::task::LocalSet::new();
+                crate::fiber::run_root_owned(&rt, local, body)
+                    .map(|_| ())
+                    .map_err(RootError::from)
             })
             .expect("isolate: failed to spawn OS thread")
     }
@@ -72,6 +129,33 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "no-gc"))]
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn root_errors_are_join_results_instead_of_panics() {
+        use cljrs_runtime::env::error::EvalError;
+        let gas = Isolate::new("root-gas")
+            .spawn_root(|| Err(EvalError::GasExhausted))
+            .join()
+            .expect("resource failures must not panic");
+        assert_eq!(gas, Err(RootError::GasExhausted));
+        let fault = cljrs_gc::MemoryLimitExceeded {
+            class: cljrs_gc::MemoryClass::GcHeap,
+            requested: 1,
+            committed: 2,
+            hard_limit: 2,
+        };
+        let memory = Isolate::new("root-memory")
+            .spawn_root(move || Err(EvalError::MemoryLimitExceeded(fault)))
+            .join()
+            .expect("memory-limit failures must not panic");
+        assert_eq!(memory, Err(RootError::MemoryLimitExceeded(fault)));
+        let thrown = Isolate::new("root-throw")
+            .spawn_root(|| Err(EvalError::Thrown(cljrs_value::Value::Long(42))))
+            .join()
+            .expect("Clojure throws must not panic");
+        assert!(matches!(thrown, Err(RootError::Evaluation(_))));
+    }
 
     #[test]
     fn isolate_spawn_runs_to_completion() {

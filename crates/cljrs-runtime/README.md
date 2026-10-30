@@ -679,6 +679,7 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 - `current_is_async() -> bool` — whether the innermost context is inside an `^:async` body
 - `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context. Honors `^:async` dispatch (via `apply::dispatch_if_async`) so a native/compiled caller of an `^:async` fn gets a `Value::Future`, not a synchronously-run body
 - `with_eval_context(f)` — run a closure with a temporary `Env` built from the innermost context
+- `eval_error_to_value_error(error: EvalError) -> ValueError` — preserve thrown values and resource errors; confirm memory faults for compiled entry points
 
 ### `async_hook` submodule
 
@@ -699,11 +700,9 @@ pub const EXPERIMENTAL_SOURCE: &str;                              // experimenta
 pub fn register_experimental(globals: &Arc<GlobalEnv>, ns: &str); // the future family
 ```
 
-`register_experimental` interns the future family (`future-call`, `future?`,
-`future-done?`, `future-cancelled?`, `future-cancel`) into `EXPERIMENTAL_NS`
-rather than `clojure.core`; `EXPERIMENTAL_SOURCE` adds the `future` macro over
-them. See [`cljrs.core.experimental/future`](#cljrscoreexperimentalfuture--cooperative-not-parallel)
-for why they are not in `clojure.core`.
+`register_experimental` adds compatibility names for the core future functions.
+`EXPERIMENTAL_SOURCE` adds the compatibility `future` macro.
+See [Futures on an isolate](#futures-on-an-isolate).
 
 ### Map entries
 
@@ -931,64 +930,32 @@ the async tree-walker). It converts the form *value* back into a `Form`
 environment of the current namespace, so it sees vars but not the caller's
 locals.
 
-### `cljrs.core.experimental/future` — cooperative, not parallel
+### Futures on an isolate
 
-**`clojure.core/future` is deliberately undefined**, along with `future-call`,
-`future?`, `future-done?`, `future-cancelled?` and `future-cancel`. A one-thread
--per-isolate runtime cannot honour that namespace's contract (see below), and
-`clojure.core` is where callers are entitled to assume it holds. Feature probes
-such as the standard test suite's `(when-var-exists future …)` therefore keep
-seeing nothing there, and skip, as they do on any runtime without futures.
-
-The cooperative stand-in lives in `cljrs.core.experimental`, for integrators who
-want it within its real limits:
+`clojure.core` provides `future`, `future-call`, `future?`, `future-done?`,
+`future-cancelled?`, and `future-cancel`. The experimental namespace retains
+these names for compatibility.
 
 ```clojure
-(require '[cljrs.core.experimental :as x])
-(defn ^:async fetch-both [] [(await (x/future (load-a))) (await (x/future (load-b)))])
+(def ^:dynamic *request* nil)
+(binding [*request* :example]
+  @(future [*request* @(future 42)]))
+;; => [:example 42]
 ```
 
-That namespace is registered by `Runtime::build` (natives via
-`builtins::register_experimental`, the `future` macro from
-`builtins/experimental.cljrs`) and is *not* referred into `user`: an explicit
-`require` is the only way in. `(x/future body…)` expands to
-`(cljrs.core.experimental/future-call (fn [] body…))`, which hands the thunk to
-the installed async runtime's executor and returns a `Value::Future`
-immediately. `realized?` stays in `clojure.core` and answers for futures.
+The installed `AsyncRuntime::spawn_fiber_call` hook runs ordinary functions on
+native fibers. Each child receives the caller's dynamic bindings, active gas
+meters, and interrupt flags. The bindings remain private to that child.
+Future dereference parks the calling fiber, including through ordinary functions.
+The CLI and AOT entry points provide root fibers for top-level evaluation.
 
-**How this differs from the JVM, and why.** Every Clojure value is `!Send` —
-`GcPtr` cannot cross a thread, which is what makes per-isolate heaps collectable
-without cross-thread coordination. A future therefore cannot run on another OS
-thread; it is a task on the *caller's* executor. Consequences:
+Fibers share one isolate thread. Isolates provide parallel Clojure execution.
+`future-cancel` cancels the result without interrupting the body. Dereferencing
+a cancelled future raises `future was cancelled`. Cancellation remains sticky
+after the body returns.
 
-- The body does not start until the caller yields. `(let [f (x/future (f!))] …)`
-  runs nothing until something awaits.
-- **Read a future with `(await f)`, never `@f`.** `deref` blocks the one thread
-  the task needs in order to finish, so it hangs. This is the same rule Phase C
-  already enforces inside `^:async` bodies, where `@future` is a runtime error;
-  in sync code it is a hang. `(await f)` has the same shape outside an `^:async`
-  fn: it works at a top-level form (the CLI drives those through the async
-  tree-walker) and hangs from inside an ordinary `defn`. This is the sharp edge
-  that keeps the family out of `clojure.core`.
-- `future-cancel` marks the result cancelled (awaiting it raises) but does not
-  interrupt a task already running, like a JVM future past its interrupt point.
-  Cancellation is *sticky*: a task cancelled mid-body still runs to completion,
-  so its side effects happen, but its result is discarded — `future-cancelled?`
-  never un-becomes true and `await` keeps raising. Every reader of a cancelled
-  future (sync `await`/`deref`, the async tree-walker, the compiled state
-  machine) raises the same catchable error, message `future was cancelled`.
-- **Dynamic bindings are not conveyed.** `binding` is a thread-local stack with
-  an RAII guard, and `future-call` builds a fresh `Env` for the task, so
-  `(binding [*foo* 1] (x/future *foo*))` sees the *root* binding — unlike the JVM,
-  which conveys the caller's frame. The converse also holds: because the stack
-  is per-thread and tasks share the thread, a task polled while another task
-  holds a binding frame across a yield can observe that frame. This is a
-  property of the async substrate rather than of `future` itself, but `future`
-  is what makes it reachable from ordinary code; bind inside the body if the
-  task needs a binding.
-
-Genuine parallelism across threads is the isolate boundary
-(`cljrs-async`'s `Isolate` + `isolate-chan`), where values cross by copy.
+On wasm32, the hook retains LocalSet tasks and the async waiting rules.
+Without an installed async runtime, `future-call` returns an error.
 
 ## Module `interp`
 
@@ -1721,7 +1688,7 @@ The Clojure `locking` macro calls `locking-call` with a zero-argument callback.
 The callback retains the monitor through parks and releases it on return, error, or cancellation.
 `deref`, synchronous `await`, `sleep`, `Thread/sleep`, `slurp`, and `spit` use the optional parking hooks.
 Sequence builtins and macro conversion use `LazySeq::try_realize` to report realization errors without caching carrier wait errors.
-Root entry points do not yet create fibers. Those entry points remain Phase 3 work.
+Native CLI and AOT entry points create root fibers for top-level evaluation.
 
 `env::monitor::monitor_enter(&Value) -> ValueResult<()>` acquires an explicit monitor.
 `env::monitor::monitor_exit(&Value) -> ValueResult<()>` releases one explicit acquisition.
@@ -1763,3 +1730,59 @@ Arguments can contain ordinary Clojure expressions. Their evaluation and convers
 Native inputs and outputs must implement `Send + 'static`.
 Clojure closures and native functions without an adapter are rejected.
 A native fiber parks during worker execution. Outside a fiber, the call runs synchronously.
+
+`AsyncRuntime::spawn_fiber_call(callee, args, env) -> EvalResult` dispatches an
+ordinary function into a fiber. The default implementation delegates to
+`spawn_async_call` for runtimes without fiber support.
+
+`macroexpand_all` expands the operand of reader dereference (`@`). Thus AOT
+and IR lowering expand `@(future ...)` before they compile the future body.
+
+Native JIT and OSR dispatch preserve resource-limit errors through
+`JitBackend::take_pending_resource_error() -> Option<ValueError>` and the matching
+`JitState` method. Gas exhaustion and memory-limit faults bypass Clojure catch clauses.
+
+In `no-gc` builds, dynamic binding frames own one replaceable lease per bound Var.
+A `set!` update replaces that Var's cached ownership.
+Values written by nested calls remain valid after those calls release their scratch storage.
+Object-array writes use the destination ownership barrier before storing an element.
+
+No-GC final raw results retain their backing regions at explicit program-lifetime boundaries.
+Dynamic binding writes compact small immutable scalars and reuse existing compact copies.
+Regional destinations retain backing scopes through ownership edges. Pending sequences and mutable identities preserve their original objects.
+
+No-gc recur values use a lease owned by the function or loop trampoline.
+Each iteration replaces this lease before it releases the previous iteration.
+Atom and volatile updates evaluate in the current allocation context.
+The cells lease new contents and release replaced contents after their last consumer releases them.
+Update callbacks and watches hold temporary leases for the previous contents.
+
+The no-GC evaluator bounds temporary reads with `region::ReadScope`.
+The public evaluator enters this scope once. Recursive form evaluation uses the direct interpreter entry.
+Each call and loop iteration bounds its own temporary reads.
+Body statements share the enclosing allocation and read scope. This permits updates to outer mutable containers.
+Only the final escaping result receives program-lifetime publication.
+Definition expressions use scratch storage. Namespace and Var containers remain permanent, while Var payloads use replaceable leases.
+Protocol method registration transfers function ownership before it stores the implementation.
+Atom and volatile update callbacks use cached snapshots for previous contents.
+Their returned values acquire caller ownership, including shared children from earlier versions.
+Cell payloads preserve structural sharing and identity. Small immutable scalar copies retain a stable logical identity.
+Replacement releases obsolete ownership edges.
+Native and IR closures share one immutable capture slice between execution and tracing.
+
+
+`interp::eval::eval_discard(form: &Form, env: &mut Env) -> EvalResult<()>` evaluates an ignored form result.
+No-GC builds use one temporary arena for the form and publish errors before releasing it.
+Namespace loading and bootstrap evaluation use this entry point.
+`interp::eval::publish_result(result: EvalResult, recur: Option<&mut RegionLease>) -> EvalResult` is available under no-GC.
+It applies the shared return, thrown-value, and recur ownership policy before a producing scope closes.
+Definition initializers and function bodies use this policy, including early errors.
+Dynamic binding frames own one replaceable lease per variable.
+
+No-GC definitions pack immutable data and metadata before the initializer scratch scope closes.
+Function and atom roots use separate small regions. Immutable aliases keep their logical identities.
+Borrowed reads remain scoped; explicit escaping raw results use result publication.
+Protocol and multimethod dispatch borrow ownership cached beside the implementation.
+
+Standalone macro-expansion APIs keep their temporary values in a scratch scope under no-GC.
+They release successful temporary values after building the returned Rust form and publish thrown errors before teardown.

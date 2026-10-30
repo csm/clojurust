@@ -167,6 +167,12 @@ fn region_alloc_val<T: cljrs_gc::Trace + 'static>(
     target: Option<*mut cljrs_gc::region::Region>,
     val: T,
 ) -> cljrs_gc::GcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = target;
+        GcPtr::new(val)
+    }
+    #[cfg(not(feature = "no-gc"))]
     match target {
         // SAFETY: handles are only bound to regions owned by a live
         // `RegionEntry` of this or a caller's frame.
@@ -291,6 +297,10 @@ fn try_osr_enter(slot: &OsrSlot, regs: &Registers, env: &mut Env) -> Option<Eval
     // stashes the thrown value and returns the nil sentinel — surface it as an
     // error while the alloc frame still roots it.
     let pending_exception = env.globals.jit().take_pending_exception();
+    let resource_error = env.globals.jit().take_pending_resource_error();
+    if let Some(error) = resource_error {
+        return Some(Err(crate::env::error::value_error_to_eval_error(error)));
+    }
     if let Err(fault) = crate::env::gc_roots::check_memory_fault() {
         return Some(Err(fault));
     }
@@ -988,7 +998,7 @@ fn alloc_closure(
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
 ) -> EvalResult {
-    let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
+    let captured_values: Arc<[Value]> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
     // Each arity maps to a named subfunction in ir_func.subfunctions.
@@ -1032,6 +1042,7 @@ fn alloc_closure(
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
         blocking_func: None,
+        captures: captured_values.clone(),
         name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {
             cljrs_value::Arity::Fixed(param_counts[0])
@@ -1077,7 +1088,7 @@ fn alloc_closure(
                 let subfunc = &subfuncs[idx];
 
                 // Build full args: captures + call_args (+ rest list for variadic).
-                let mut full_args = captured_values.clone();
+                let mut full_args = captured_values.to_vec();
                 if is_variadic[idx] {
                     let pc = param_counts[idx];
                     // Fixed params.

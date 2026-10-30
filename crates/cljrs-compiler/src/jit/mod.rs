@@ -106,6 +106,10 @@ impl JitBackend for Jit {
         crate::rt_abi::take_pending_exception_value()
     }
 
+    fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        crate::rt_abi::take_pending_resource_error()
+    }
+
     fn deopt_sentinel(&self) -> usize {
         crate::rt_abi::deopt_sentinel_addr()
     }

@@ -360,7 +360,11 @@ impl GlobalEnv {
         if let Some(ns) = map.get(name) {
             return ns.clone();
         }
-        let ns = GcPtr::new(Namespace::new(name));
+        let ns = {
+            #[cfg(feature = "no-gc")]
+            let _static = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            GcPtr::new(Namespace::new(name))
+        };
         map.insert(Arc::from(name), ns.clone());
         ns
     }
@@ -374,7 +378,11 @@ impl GlobalEnv {
             var.get().bind(val);
             return var.clone();
         }
-        let var = GcPtr::new(Var::new(ns_name, name.as_ref()));
+        let var = {
+            #[cfg(feature = "no-gc")]
+            let _static = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            GcPtr::new(Var::new(ns_name, name.as_ref()))
+        };
         var.get().bind(val);
         interns.insert(name, var.clone());
         var

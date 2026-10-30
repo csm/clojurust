@@ -27,6 +27,7 @@ pub struct PersistentHashMap {
     order: RedBlackTreeMapSync<u64, (Value, Value)>,
     next_seq: u64,
     charge: ShareCharge,
+    keys_inert: bool,
 }
 
 /// An entry of the insertion-order tree.
@@ -39,6 +40,7 @@ impl PersistentHashMap {
             next_seq: 0,
             order: RedBlackTreeMapSync::new_sync(),
             charge: ShareCharge::full(),
+            keys_inert: true,
         }
     }
 
@@ -64,6 +66,15 @@ impl PersistentHashMap {
         self.order.get(seq).map(|(_, v)| v)
     }
 
+    pub(crate) fn storage_entry(&self, key: &Value) -> Option<(usize, Value)> {
+        self.index
+            .get_key_value(key)
+            .map(|(stored, sequence)| (*sequence as usize, stored.clone()))
+    }
+    pub(crate) fn keys_inert(&self) -> bool {
+        self.keys_inert
+    }
+
     pub fn contains_key(&self, key: &Value) -> bool {
         self.index.contains_key(key)
     }
@@ -73,14 +84,16 @@ impl PersistentHashMap {
     /// Re-associating a key that is already present keeps its original
     /// insertion position; a brand-new key is appended at the end.
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        if let Some(seq) = self.index.get(&key) {
+        let keys_inert = self.keys_inert && crate::realization::is_inert(&key);
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
             let seq = *seq;
             let n = self.count();
             Self {
                 index: self.index.clone(),
-                order: self.order.insert(seq, (key, value)),
+                order: self.order.insert(seq, (stored_key.clone(), value)),
                 next_seq: self.next_seq,
                 charge: self.charge.derive(n, n, rb_path_bytes::<OrderEntry>(n)),
+                keys_inert,
             }
         } else {
             let seq = self.next_seq;
@@ -90,14 +103,16 @@ impl PersistentHashMap {
                 order: self.order.insert(seq, (key, value)),
                 next_seq: seq + 1,
                 charge: self.charge.derive(n, n + 1, Self::path_bytes(n + 1)),
+                keys_inert,
             }
         }
     }
 
     // Only used when neither hashing nor equality can realize user code.
     pub(crate) fn assoc_mut(&mut self, key: Value, value: Value) {
-        if let Some(seq) = self.index.get(&key).copied() {
-            self.order.insert_mut(seq, (key, value));
+        self.keys_inert &= crate::realization::is_inert(&key);
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
+            self.order.insert_mut(*seq, (stored_key.clone(), value));
         } else {
             let seq = self.next_seq;
             self.index.insert_mut(key.clone(), seq);
@@ -125,6 +140,7 @@ impl PersistentHashMap {
                     order: self.order.remove(seq),
                     next_seq: self.next_seq,
                     charge: self.charge.derive(n, n - 1, Self::path_bytes(n)),
+                    keys_inert: self.keys_inert,
                 }
             }
             None => {
@@ -134,6 +150,7 @@ impl PersistentHashMap {
                     order: self.order.clone(),
                     next_seq: self.next_seq,
                     charge: self.charge.derive(n, n, 0),
+                    keys_inert: self.keys_inert,
                 }
             }
         }
@@ -207,6 +224,10 @@ impl PartialEq for PersistentHashMap {
 }
 
 impl cljrs_gc::Trace for PersistentHashMap {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for (_, (k, v)) in self.order.iter() {
             k.trace(visitor);

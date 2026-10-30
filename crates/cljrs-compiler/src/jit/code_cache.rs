@@ -224,13 +224,13 @@ pub fn reclaimed_bytes() -> u64 {
 // ── Test-only inspection helpers ────────────────────────────────────────────
 
 /// True if `epoch` is currently in the stale (awaiting-reclamation) set.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 pub(crate) fn is_stale(epoch: u64) -> bool {
     cache().lock().unwrap().stale.contains_key(&epoch)
 }
 
 /// True if `epoch` is currently in the live set.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 pub(crate) fn is_live(epoch: u64) -> bool {
     cache().lock().unwrap().live.contains_key(&epoch)
 }

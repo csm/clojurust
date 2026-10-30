@@ -52,6 +52,7 @@ mod tests {
     fn const_native(tag: i64) -> NativeFn {
         NativeFn {
             blocking_func: None,
+            captures: Default::default(),
             name: Arc::from("test-fn"),
             arity: cljrs_value::Arity::Fixed(0),
             func: Arc::new(move |_args| Ok(Value::Long(tag))),

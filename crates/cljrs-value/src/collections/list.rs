@@ -64,6 +64,10 @@ impl PersistentList {
 }
 
 impl cljrs_gc::Trace for PersistentList {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         match self {
             PersistentList::Empty => {}

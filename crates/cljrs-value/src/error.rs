@@ -178,6 +178,12 @@ impl ExceptionInfo {
 
 impl Trace for ExceptionInfo {
     fn trace(&self, visitor: &mut MarkVisitor) {
+        if let Some(data) = &self.data {
+            data.trace(visitor);
+        }
+        if let ValueError::Thrown(value) = &self.error {
+            value.trace(visitor);
+        }
         if let Some(cause) = self.cause.as_ref() {
             visitor.visit(cause);
         }

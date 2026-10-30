@@ -158,19 +158,26 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     // function pointer, bypassing the large apply_value stack frame.
     // Unwrap metadata so a WithMeta-wrapped fn is callable.
     let f = f.unwrap_meta();
-    let result = if let Value::Fn(cljx_fn) = f {
-        // Honor `^:async` dispatch (spawn the body, return a Future) just like
-        // `apply_value` — otherwise a compiled/native caller invoking an async
-        // fn would run its body synchronously and never get a Future.
-        if let Some(fut) = crate::env::apply::dispatch_if_async(f, &args, &env) {
-            Ok(fut)
+    let result = crate::interp::eval::with_read_scope(|| {
+        if let Value::Fn(cljx_fn) = f {
+            // Honor `^:async` dispatch (spawn the body, return a Future) just like
+            // `apply_value` — otherwise a compiled/native caller invoking an async
+            // fn would run its body synchronously and never get a Future.
+            if let Some(fut) = crate::env::apply::dispatch_if_async(f, &args, &env) {
+                Ok(fut)
+            } else {
+                env.call_cljrs_fn(cljx_fn.get(), &args)
+            }
         } else {
-            env.call_cljrs_fn(cljx_fn.get(), &args)
+            crate::env::apply::apply_value(f, args, &mut env)
         }
-    } else {
-        crate::env::apply::apply_value(f, args, &mut env)
-    };
-    result.map_err(|e| match e {
+    });
+    result.map_err(eval_error_to_value_error)
+}
+
+/// Preserve resource faults across Rust and compiled callback boundaries.
+pub fn eval_error_to_value_error(e: crate::env::error::EvalError) -> ValueError {
+    match e {
         crate::env::error::EvalError::Thrown(v) => ValueError::Thrown(v),
         crate::env::error::EvalError::GasExhausted => ValueError::GasExhausted,
         crate::env::error::EvalError::MemoryLimitExceeded(fault) => {
@@ -181,7 +188,7 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
             ValueError::MemoryLimitExceeded(fault)
         }
         other => ValueError::Other(format!("{other}")),
-    })
+    }
 }
 
 fn trace_saved(contexts: &Vec<EvalContext>, visitor: &mut cljrs_gc::MarkVisitor) {

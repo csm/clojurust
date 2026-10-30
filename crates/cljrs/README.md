@@ -273,7 +273,7 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 - The miette error hook is installed at startup so `CljxError` propagated to `main` renders with terminal-linked source snippets.
 - A worker thread is spawned with the configured stack size to run the actual command; the main thread only handles signal/exit setup.
 - The REPL prints results, paginates errors via `miette`, and persists multi-line input across blank prompts.
-- **Top-level async (with the `async` feature).** `session::with_async_driver` builds a single-threaded Tokio runtime + `LocalSet` and stashes it in a thread-local `AsyncDriver` rather than wrapping the whole session in one `block_on`. Each top-level form is then evaluated through `cljrs_async::eval_async` via `LocalSet::block_on` in `eval_form`, so spawned tasks (core.async producers, `^:async` calls, `clojure.rust.io.async` readers/writers) make progress and a top-level `await` resolves. Tasks that outlive a form — e.g. a channel `def`d at one REPL prompt and consumed at the next — stay queued on the shared `LocalSet` and continue on the next form's drive. Note: blocking ops (`<!!`/`>!!`) still park the single executor thread and so are not usable at the top level; use `(await (take! ch))` / `go` instead.
+- **Top-level async (with the `async` feature).** `session::with_async_driver` retains a Tokio runtime, `LocalSet`, and carrier mutator state between forms. On native targets, each form runs in a root fiber through `fiber::run_root`. Top-level future dereferences, `<!!`, and `>!!` park that fiber while other tasks run. Tasks that outlive a form resume during the next drive of the same executor. The wasm32 path uses `eval_async` through `LocalSet::block_on`.
 - `ir viz` runs the AOT pipeline through region optimization (via `cljrs_compiler::aot::lower_file_to_ir`) and hands the resulting `IrFunction` to `commands::ir::viz::render_html`.
 - `ir build` boots a standard environment, walks every var in the requested namespaces, and lowers each function arity with `cljrs_runtime::tiered::lower::lower_arity` into an `IrBundle`. It lives in `commands/ir/mod.rs`; there is no separate pre-build crate or binary. No `cljrs` runtime path loads a bundle — `cljrs_runtime::tiered::load_prebuilt_ir` is the public API an embedder would call to replay one.
 
@@ -617,3 +617,24 @@ fetch and commit-signature verification — and `pgp` pulls `regex` in. A CLI bu
 that way therefore links both engines and is *larger*, not smaller. The engine
 swap only pays off for an embedding that has no `pgp` in its graph; see
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+### Root fibers
+
+With the `async` feature on native targets, `session::eval_form` drives ordinary
+evaluation in a root fiber. This path serves `run`, `eval`, REPL, nREPL, and tests.
+Top-level `@(future ...)` and blocking channel operations park the root fiber.
+`AsyncDriver` retains carrier roots between forms and installs them during task destruction.
+Root evaluation preserves namespace changes, host bindings, output capture, and interrupt state.
+The wasm32 path retains `eval_async`.
+
+`tests/fiber_entrypoints.rs` covers nested future waits through `eval`, `run`, REPL,
+and `clojure.test`.
+
+Root evaluation borrows the caller's Env and Form directly. It preserves lexical
+state on executor unwind and avoids deep Form copies between top-level evaluations.
+
+`session::eval_in_discard(env: &mut Env, src: &str, filename: &str) -> miette::Result<()>` evaluates ignored source results.
+Under no-GC, its read scope ends before the next evaluation.
+The test runner scopes reads to each tested namespace. File evaluation and `-main` have separate scopes.
+IR namespace lowering establishes a read scope before examining function roots.
+Bootstrap scopes end when their initialization functions return; discarded bootstrap forms release their own scratch storage.

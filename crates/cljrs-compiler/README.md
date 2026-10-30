@@ -785,3 +785,56 @@ and process waits. A separate host thread releases each gate after the isolate m
 `tests/blocking_form.rs` checks native call offload, rejection, errors, and cancellation in tree-walk and tiered modes.
 `tests/aot_native_init_e2e.rs` also compiles the core and namespaced `blocking` macros with typed native exports.
 Compiled Clojure closures have no blocking adapter and cannot move across the worker boundary.
+
+### Root fibers in native harnesses
+
+Generated program and test harnesses drive their entry function with
+`cljrs_async::fiber::run_root`. The 64 MiB root stack covers namespace setup,
+preamble evaluation, native initializers, compiled entry code, and `-main`.
+The test harness registers `clojure.core.async` and drives test bodies in the root fiber.
+Synchronous functions can dereference futures and use blocking channel operations.
+`tests/aot_e2e.rs` covers nested future waits, `io-thread`, and dynamic binding conveyance in a native binary.
+
+Compiled closure adapters propagate their pending exception into the normal
+call result. `rt_deref` records future dereference errors in the pending-exception slot.
+Thus a failed compiled future remains catchable through `@` with its exception data.
+
+`rt_abi::take_pending_resource_error() -> Option<ValueError>` consumes a native
+resource-limit signal. These signals use a per-fiber slot separate from thrown
+Clojure values. Compiled catch clauses bypass this slot. Native closure adapters,
+JIT/OSR dispatch, and AOT entry points preserve the original error category.
+
+Generated native harnesses return resource-limit errors through the root fiber.
+They print the error and exit with status 1 after context cleanup and GC-statistics output.
+The compiled `try` bridge preserves resource errors across catch and finally clauses.
+A finally-only clause rethrows the original exception after successful cleanup.
+
+All callback bridges, including compiled `swap!`, fused collection operations, `apply`, bindings, and output capture, preserve callback failures.
+`rt_abi::take_pending_exception_value()` consumes an ordinary pending throw while its native allocation roots remain live.
+Generated program entries consume both ordinary exceptions and resource errors before calling `-main`.
+
+Fused `into` fallbacks stop after a failed `filter`, `mapcat`, or `map` call.
+They preserve both ordinary exceptions and typed resource failures without another interpreter call.
+Call bridges use `signal_error` for every failure, including thrown values.
+Compiled atom reset and swap use the interpreter update functions.
+They share validators, watches, resource errors, and return ownership with interpreted calls.
+Fused fallbacks compose a Result-valued global-call helper, so a failed first call prevents the next call.
+Compiled closures share an `Arc<[Value]>` between execution and tracing.
+
+
+The `rt_identical` bridge uses `Value::identical`, including no-GC immutable scalar identity across relocation.
+Object-array ABI reads and writes use the same indexed ownership barriers as interpreter array operations.
+
+Under no-GC, standalone Rust callers can bound borrowed-result ownership with a `region::ReadScope`.
+Unscoped host results receive program-lifetime ownership.
+Runtime evaluation and fiber drivers establish the required scopes.
+
+The no-GC AOT async-function scan scopes its reads of defined function roots.
+Compiled array stores acquire caller ownership before returning a compact scalar alias.
+The identity ABI handles arrays, metadata wrappers, reduced values, and transients.
+
+Compiled keyword and versioned-value caches use program storage under no-GC.
+A first lookup during a bounded invocation fills an invocation-local table.
+Repeated keyword and versioned-global fills reuse its boxed value without further arena allocation.
+Program caches and compiled slots never receive invocation-owned pointers. The guard clears the table before freeing its arena.
+Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.

@@ -437,6 +437,45 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
 - **Exit:** core.async's `io-thread` examples run unchanged; `@(future …)` at top level and
   inside `future` bodies no longer deadlocks.
 
+**Status: implemented.**
+
+- Native `future` and `future-call` run ordinary functions in fibers.
+  The full future family now lives in `clojure.core`. Experimental names remain compatible.
+- `thread`, `thread-call`, and `io-thread` convey dynamic bindings and return result channels.
+  A non-nil result enters the channel before closure. Nil results only close the channel.
+  Exceptions print a diagnostic before closure. Each call uses one body fiber.
+- Children receive binding snapshots, active gas meters, and interrupt flags.
+  Binding changes stay private to each child.
+- `fiber::run_root` drives top-level evaluation on a 64 MiB stack.
+  It transfers and restores host mutator state, including output capture and nREPL bindings.
+  A separate carrier state retains legacy async roots between drives and during executor destruction.
+- CLI `run`, `eval`, REPL, nREPL, and tests use root evaluation.
+  Generated AOT program and test harnesses also use root fibers.
+  The AOT preamble, namespace initializers, compiled entry, and `-main` can park.
+- Macro expansion traverses reader dereference, so `@(future ...)` compiles correctly.
+  Compiled closure adapters propagate pending exceptions. Future dereference preserves thrown data.
+  Native closure adapters explicitly trace managed captures through `NativeFn::captures`.
+- `no-gc` scratch scopes register their live regions through tail evaluation.
+  Task captures lease scratch scopes until completion or cancellation.
+  Regional publications trace actual backing scopes. Static publications copy proven finite immutable data without realizing lazy sequences.
+  Results transfer scope ownership to their destination. Completed transient results can then release their storage.
+  Monitor entry does not retire no-gc scratch scopes. Ordinary scopes allocate lease metadata only when shared.
+  Bounded isolated allocation invocations cannot spawn Clojure fibers.
+- `fiber_surface.rs` covers nested futures, ordinary function waits, bindings, result-channel closure,
+  cancellation, errors, forced collection, and host state restoration in both interpreter modes.
+  The tests pass in GC and `no-gc` builds.
+  `fiber_entrypoints.rs` covers CLI and nREPL evaluation, including streamed output and session bindings.
+  AOT regressions cover the compiled surface and generated test harness.
+- The book and affected crate READMEs document the native surface.
+  `go`, `^:async`, and wasm32 retain the legacy async evaluator until Phase 5.
+
+Review fixes preserve resource-limit errors in a separate per-fiber slot.
+Compiled catch clauses cannot consume gas exhaustion or memory faults.
+Synchronous embeddings can borrow their Env and Form through `run_root`.
+`Isolate::spawn_root` provides a synchronous isolate entry point.
+Pending local futures reject carrier dereference instead of deadlocking.
+Native embedders declare managed captures with `NativeFn::with_captures`.
+
 ### Phase 4 — Fairness and observability
 
 - Time-slice preemption at safepoints.
@@ -475,3 +514,66 @@ Arbitrary Clojure closure offload remains outside this phase because it requires
 - Shared-heap multi-threading. Parallelism stays isolate-based.
 - Preemption by signal (Go-style asynchronous preemption). Safepoint preemption is enough
   because every tier already polls safepoints.
+
+The Phase 3 review regressions cover dynamic return allocation, lazy and infinite sequence publication,
+large transient task results, monitor entry, dynamic-binding updates, gas-only exhaustion signals, and finally-only exceptions.
+Generated AOT resource failures return exit status 1 after scope cleanup and GC-statistics output.
+Executor teardown uses the shared carrier-state helpers.
+
+Third-pass review regressions cover all callback bridges, uncaught AOT top-level throws,
+failed channel publication, static publication of finite data, and cycles between scope owners.
+Root-isolate failures use a thread-safe result type. Thread result channels preserve resource-limit errors.
+Ownership edges are weak. Cleanup follows affected paths and stops at live owners.
+
+Fourth-pass review regressions cover top-level accumulators, replacement of opaque cell contents,
+consumer aliases, failed CAS publication, stale weak edges, and fused fallback failures.
+Thread result channels preserve typed resource failures. Unread failures report at channel destruction or executor teardown.
+Buffered takes avoid a second publication scan.
+Recur values use trampoline leases. Permanent atom and volatile contents use replaceable leases.
+Program-lifetime opaque publications without a replaceable owner still retain their actual backing scopes.
+
+Fifth-pass review regressions cover returned update aliases, cached reads without value traversal,
+repeated top-level reads and Var rebindings, and release of consumed opaque channel values.
+Compiled atom updates share interpreter validators and watches. Native closures share one capture allocation.
+Handled thread resource failures produce no warning. Unread failures report once, including after collection.
+
+
+Sixth-pass review regressions cover replaceable regional ownership, auxiliary atom slots, and publication identity.
+Read scopes end with each call or iteration. Stores retain ownership independently of these scopes.
+Global Var reads reuse cached leases without allocating a snapshot for every lookup.
+Declared task captures exclude unrelated read leases. Executor report registries stay with their carrier and fibers.
+Compiled atom callback errors use the shared conversion helper, including runtime memory-fault confirmation.
+Publication preserves identity. Small immutable scalars use compact arenas with stable logical identities.
+Other live payloads can retain unrelated allocations in their source arena until their last owner releases it.
+
+
+Seventh-pass review fixes share result publication across definition errors, returns, and recur.
+Body statements share their enclosing scratch scope; discarded source forms use a dedicated evaluation entry point.
+Arrays, transients, lazy cells, delays, promises, futures, multimethods, and dynamic bindings release replaced field ownership.
+Async tasks retain their own read contexts across polls. Unscoped Rust readers use owning snapshots or explicit read scopes.
+Root handoff restores caller ownership before releasing the computation state.
+Small immutable scalar relocation preserves Clojure identity, including compiled identity checks.
+CI fixes cover the newer async error-size lint and diagnostic logging of isolate records.
+
+Eighth-pass review fixes protect array-update aliases and cover identity for all boxed variants.
+Compact scalar storage uses representation-sized chunks and reuses existing compact copies.
+Transient conversion shares its initial collection. Writes use the collection's existing insertion IDs for ownership slots.
+Managed persistence borrows its containing region; Rust stack persistence protects its result graph.
+Protocol and multimethod ownership caches avoid formatted keys during dispatch.
+Definition data and metadata use compact immutable storage. Function and mutable-cell roots use separate small regions.
+Durable regional dependencies use counted edges. Raw program-lifetime publication is explicit.
+IR and AOT scans scope their function reads. Test-runner reads end with each namespace.
+
+Standalone macro expansion and IR lowering use temporary storage. Compiled constant caches keep permanent values outside bounded invocations.
+First cache fills inside an invocation remain invocation-local. Cached compiled protocol calls borrow implementation ownership.
+Exception tracing retains data held in other regions.
+
+
+Ninth-pass review fixes bound definition compaction by size and depth, and preserve large shared payloads.
+Ownership tracing uses an explicit stack. Immutable graphs cache their counted dependencies after the first walk.
+Repeated closure captures stop at shared cached roots. Transients capture initial ownership once and reuse it on returns.
+Region chunks grow geometrically. Relocation and cache flags share the existing identity word.
+Invocation-local keyword and versioned-global tables reuse boxes without publishing invocation pointers into program caches.
+Unscoped host reads retain raw results. Scopes and snapshots provide bounded ownership for callers that need it.
+Var reads acquire backing ownership once per binding and scope epoch.
+Bootstrap has no command-wide read scope. Discarded source forms use separate scratch lifetimes.

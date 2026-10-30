@@ -340,7 +340,7 @@ pub fn run_source(
     args: &[String],
 ) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
-    eval_in(&mut env, src, filename)?;
+    eval_in_discard(&mut env, src, filename)?;
     call_main_if_defined(&mut env, args)?;
     Ok(())
 }
@@ -348,6 +348,8 @@ pub fn run_source(
 /// Call `-main` in the current namespace if it is defined, passing `args` as
 /// individual string arguments. Silently skips if `-main` is not defined.
 fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     // resolve returns nil for undefined symbols; swallow lookup errors defensively.
     let resolved = eval_in(env, "(resolve '-main)", "<main-check>").unwrap_or(Value::Nil);
     if resolved == Value::Nil {
@@ -368,13 +370,23 @@ fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
 /// is a `Future`/`Promise` (e.g. the result of an `^:async` `-main`), this
 /// yields until it resolves; any other value is returned unchanged.
 #[cfg(feature = "async")]
+#[allow(clippy::result_large_err)]
 fn await_main_result(value: Value) -> miette::Result<()> {
     ASYNC_DRIVER.with(|d| {
         let guard = d.borrow();
         match guard.as_ref() {
             Some(drv) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                cljrs_async::fiber::run_root(
+                    &drv.rt,
+                    &drv.local,
+                    &mut drv.carrier.borrow_mut(),
+                    move || cljrs_async::fiber::park_on(cljrs_async::await_value(value)),
+                )
+                .map_err(format_eval_error)?;
+                #[cfg(target_arch = "wasm32")]
                 drv.local
-                    .block_on(&drv.rt, cljrs_async::eval_async::await_value(value))
+                    .block_on(&drv.rt, cljrs_async::await_value(value))
                     .map_err(format_eval_error)?;
                 Ok(())
             }
@@ -407,15 +419,31 @@ fn escape_clojure_string(s: &str) -> String {
     out
 }
 
+/// Evaluate source whose final result is not needed.
+pub fn eval_in_discard(env: &mut Env, src: &str, filename: &str) -> miette::Result<()> {
+    eval_in_mode(env, src, filename, true).map(drop)
+}
+
 /// Evaluate `src` in an existing `Env`. Returns the last value.
 pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
+    eval_in_mode(env, src, filename, false)
+}
+
+fn eval_in_mode(env: &mut Env, src: &str, filename: &str, discard: bool) -> miette::Result<Value> {
     let mut parser = cljrs_reader::Parser::new(src.to_string(), filename.to_string());
     let forms = parser.parse_all().map_err(miette::Report::from)?;
 
     let mut result = Value::Nil;
-    for form in forms {
+    let count = forms.len();
+    for (index, form) in forms.into_iter().enumerate() {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        result = eval_form(&form, env).map_err(format_eval_error)?;
+        if discard || index + 1 < count {
+            #[cfg(feature = "no-gc")]
+            let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            eval_form(&form, env).map_err(format_eval_error)?;
+        } else {
+            result = eval_form(&form, env).map_err(format_eval_error)?;
+        }
     }
     Ok(result)
 }
@@ -426,6 +454,17 @@ pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value
 struct AsyncDriver {
     rt: tokio::runtime::Runtime,
     local: tokio::task::LocalSet,
+    #[cfg(not(target_arch = "wasm32"))]
+    carrier: std::cell::RefCell<cljrs_gc::mutator::MutatorState>,
+}
+
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+impl Drop for AsyncDriver {
+    fn drop(&mut self) {
+        // Legacy tasks must unwind with their carrier root stacks installed.
+        let local = std::mem::replace(&mut self.local, tokio::task::LocalSet::new());
+        cljrs_async::fiber::drop_local_with_carrier(local, self.carrier.get_mut());
+    }
 }
 
 #[cfg(feature = "async")]
@@ -450,18 +489,31 @@ pub fn with_async_driver<T>(f: impl FnOnce() -> T) -> T {
         .build()
         .expect("failed to build Tokio runtime");
     let local = tokio::task::LocalSet::new();
-    ASYNC_DRIVER.with(|d| *d.borrow_mut() = Some(AsyncDriver { rt, local }));
-    let result = f();
-    ASYNC_DRIVER.with(|d| *d.borrow_mut() = None);
-    result
+    ASYNC_DRIVER.with(|d| {
+        *d.borrow_mut() = Some(AsyncDriver {
+            rt,
+            local,
+            #[cfg(not(target_arch = "wasm32"))]
+            carrier: std::cell::RefCell::new(cljrs_gc::mutator::MutatorState::fresh()),
+        })
+    });
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            ASYNC_DRIVER.with(|d| {
+                d.borrow_mut().take();
+            });
+        }
+    }
+    let _cleanup = Cleanup;
+    f()
 }
 
 /// Evaluate a single top-level form.
 ///
-/// With the `async` feature, the form is driven on the shared `LocalSet` via
-/// [`tokio::task::LocalSet::block_on`], so spawned tasks — core.async channel
-/// producers, `^:async` calls, the `cljrs-io` readers/writers — make progress
-/// and a top-level `await` resolves. Tasks that outlive a form (e.g. a producer
+/// With the `async` feature on native targets, a root fiber evaluates the
+/// form on the shared LocalSet. Blocking waits park through ordinary calls.
+/// On wasm32, the async evaluator drives the form. Tasks that outlive a form (e.g. a producer
 /// feeding a channel `def`d in one REPL line and consumed in the next) stay
 /// queued on the `LocalSet` and continue on the next form's drive. Without the
 /// feature it is a plain synchronous `eval`.
@@ -471,9 +523,20 @@ pub fn eval_form(form: &cljrs_reader::Form, env: &mut Env) -> Result<Value, Eval
     ASYNC_DRIVER.with(|d| {
         let guard = d.borrow();
         match guard.as_ref() {
-            Some(drv) => drv
-                .local
-                .block_on(&drv.rt, cljrs_async::eval_async::eval_async(form, env)),
+            Some(drv) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    cljrs_async::fiber::run_root(
+                        &drv.rt,
+                        &drv.local,
+                        &mut drv.carrier.borrow_mut(),
+                        || eval(form, env),
+                    )
+                }
+                #[cfg(target_arch = "wasm32")]
+                drv.local
+                    .block_on(&drv.rt, cljrs_async::eval_async::eval_async(form, env))
+            }
             // No driver installed (shouldn't happen once `main` runs): fall back
             // to a synchronous evaluation rather than panicking.
             None => eval(form, env),
@@ -521,9 +584,11 @@ mod gc_config_tests {
 
     #[test]
     fn soft_only_sets_the_soft_limit() {
-        let (config, memory) = gc_limits(Some(64), None).unwrap();
-        assert_eq!(config.soft_limit(), 64 * MB);
-        assert!(config.hard_limit() >= 64 * MB);
+        let (_config, memory) = gc_limits(Some(64), None).unwrap();
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.soft_limit(), 64 * MB);
+        #[cfg(not(feature = "no-gc"))]
+        assert!(_config.hard_limit() >= 64 * MB);
         assert!(
             memory.is_none(),
             "the soft limit does not configure the governor"
@@ -532,9 +597,11 @@ mod gc_config_tests {
 
     #[test]
     fn both_limits_are_kept() {
-        let (config, memory) = gc_limits(Some(64), Some(128)).unwrap();
-        assert_eq!(config.soft_limit(), 64 * MB);
-        assert_eq!(config.hard_limit(), 128 * MB);
+        let (_config, memory) = gc_limits(Some(64), Some(128)).unwrap();
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.soft_limit(), 64 * MB);
+        #[cfg(not(feature = "no-gc"))]
+        assert_eq!(_config.hard_limit(), 128 * MB);
         let memory = memory.expect("a hard limit configures the governor");
         assert_eq!(memory.hard_limit, 128 * MB);
         assert_eq!(

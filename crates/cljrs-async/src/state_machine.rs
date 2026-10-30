@@ -47,8 +47,6 @@ use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::env::gc_roots::{ValueRootGuard, root_value, root_values};
 use cljrs_value::{CljxFuture, FutureState, Value};
 
-use crate::eval_async::spawn_future;
-
 /// The eval context (globals + namespace) a compiled poll function runs under,
 /// so its `rt_*` global-lookup / call bridges work while the task runs detached
 /// on the executor.
@@ -131,10 +129,12 @@ pub fn check_ready(val: &Value) -> Readiness {
     match val {
         Value::Future(f) => match &*f.get().state.lock().unwrap() {
             FutureState::Done(v) => {
+                cljrs_value::publish::read_slot(f.get() as *const _ as usize, 0);
                 f.get().mark_observed();
                 Readiness::Ready(v.clone())
             }
             FutureState::Failed(v) => {
+                cljrs_value::publish::read_slot(f.get() as *const _ as usize, 0);
                 f.get().mark_observed();
                 Readiness::Failed(v.clone())
             }
@@ -153,7 +153,10 @@ pub fn check_ready(val: &Value) -> Readiness {
             FutureState::Running => Readiness::Pending,
         },
         Value::Promise(p) => match p.get().value.lock().unwrap().as_ref() {
-            Some(v) => Readiness::Ready(v.clone()),
+            Some(v) => {
+                cljrs_value::publish::read_slot(p.get() as *const _ as usize, 0);
+                Readiness::Ready(v.clone())
+            }
             None => Readiness::Pending,
         },
         other => Readiness::Ready(other.clone()),
@@ -239,9 +242,10 @@ pub fn spawn_state_machine(
     args: Vec<Value>,
     eval_ctx: Option<EvalCtx>,
 ) -> Value {
+    let roots = args.clone();
     let mut sm = CljxStateMachine::new(poll_fn, n_slots, args);
     sm.eval_ctx = eval_ctx;
-    spawn_future(CompiledAsyncTask::new(sm))
+    crate::eval_async::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
 }
 
 // ── Compiled poll-function registry ──────────────────────────────────────────

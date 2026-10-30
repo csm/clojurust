@@ -227,7 +227,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                                 // Clojure's `(get m :k default)` evaluates its
                                 // third argument eagerly, so a throwing or
                                 // side-effecting default must still fire here.
-                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
                                 if matches!(bound_val, Value::Nil) {
                                     bound_val = dv;
                                 }
@@ -248,7 +248,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                                 // Clojure's `(get m :k default)` evaluates its
                                 // third argument eagerly, so a throwing or
                                 // side-effecting default must still fire here.
-                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
                                 if matches!(bound_val, Value::Nil) {
                                     bound_val = dv;
                                 }
@@ -276,7 +276,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                                 // Clojure's `(get m :k default)` evaluates its
                                 // third argument eagerly, so a throwing or
                                 // side-effecting default must still fire here.
-                                let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                                let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
                                 if matches!(bound_val, Value::Nil) {
                                     bound_val = dv;
                                 }
@@ -304,7 +304,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 if let FormKind::Symbol(sym) = &k.kind
                     && let Some(d) = defaults.get(sym.as_str())
                 {
-                    let dv = crate::interp::eval::eval(&d.clone(), env)?;
+                    let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
                     if matches!(bound_val, Value::Nil) {
                         bound_val = dv;
                     }

@@ -121,6 +121,8 @@ pub fn lower_via_rust(
     compilable_forms: &[cljrs_reader::Form],
     env: &mut cljrs_runtime::tiered::Env,
 ) -> AotResult<IrFunction> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let ns_arc: Arc<str> = Arc::from(ns);
     // `ns` has already been evaluated into `env`, so its own `def`s, refers and
     // `(:refer-clojure ...)` filter are visible: a name it rebinds must not be
@@ -1836,6 +1838,8 @@ fn lower_namespace(
     init_symbol: &str,
     globals: &Arc<cljrs_runtime::env::env::GlobalEnv>,
 ) -> AotResult<(String, Option<IrFunction>)> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let mut parser = Parser::new(source.to_string(), format!("<{ns_name}>"));
     let forms = parser.parse_all()?;
 
@@ -1917,6 +1921,8 @@ fn compile_async_poll_fns(
         arities: Vec<AritySnap>,
     }
 
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::nested();
     let snaps: Vec<FnSnap> = {
         let ns_map = env.globals.namespaces.read().unwrap();
         let mut out = Vec::new();
@@ -2210,14 +2216,12 @@ edition = "2024"
                         Ok(main_result) => {
                             // If -main is ^:async it returns a Future; await it on the
                             // current LocalSet so all spawned go-blocks drain to completion.
-                            if let Err(e) = cljrs_async::eval_async::await_value(main_result).await {
-                                eprintln!("cljrs: error in -main: {e:?}");
-                                std::process::exit(1);
+                            if let Err(e) = cljrs_async::fiber::park_on(cljrs_async::eval_async::await_value(main_result)) {
+                                return Err(e);
                             }
                         }
                         Err(e) => {
-                            eprintln!("cljrs: error in -main: {e:?}");
-                            std::process::exit(1);
+                            return Err(e);
                         }
                     }
                 }
@@ -2335,7 +2339,8 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 {ns_init_externs}}}
 
-async fn run() {{
+fn run() -> cljrs_runtime::env::error::EvalResult {{
+    let outcome = (|| -> cljrs_runtime::env::error::EvalResult {{
     // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
     // cannot parse is a hard error, matching `cljrs -X`: someone asked for
     // diagnostics and must not be left silently without them.
@@ -2369,22 +2374,26 @@ async fn run() {{
     // initializers instead of interpreting source.
 {compiled_ns}{native_init}
 {ns_setup}    // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_runtime::env::callback::push_eval_context(&env);
+    let _context = cljrs_runtime::env::callback::install_eval_context_guard(env.globals.clone(), env.current_ns.clone());
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
+    if let Some(error) = cljrs_compiler::rt_abi::take_pending_resource_error() {{
+        return Err(cljrs_runtime::env::error::value_error_to_eval_error(error));
+    }}
+    if let Some(thrown) = cljrs_compiler::rt_abi::take_pending_exception_value() {{
+        return Err(cljrs_runtime::env::error::EvalError::Thrown(thrown));
+    }}
     // A memory-limit fault raised in compiled code (strict mode) that no
     // later collection cleared ends the program like an interpreter error.
     if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{
-        eprintln!("cljrs: {{fault}}");
-        std::process::exit(1);
+        return Err(cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault));
     }}
 {main_call}
-    // Pop the eval context.
-    cljrs_runtime::env::callback::pop_eval_context();
-
-    // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
+    Ok(Value::Nil)
+    }})();
     cljrs_gc::dump_stats_from_env();
+    outcome
 }}
 
 fn main() {{
@@ -2402,7 +2411,10 @@ fn main() {{
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, run());
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {{
+                eprintln!("cljrs: {{error}}");
+                std::process::exit(1);
+            }}
         }})
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {{
@@ -2445,10 +2457,10 @@ const HARNESS_RUNTIME_CRATES: &[&str] = &[
 ];
 
 /// Runtime crates the AOT *test* harness links against.  The test harness
-/// links the compiled namespace initializers (so it needs `cljrs-compiler`
-/// for the `rt_*` ABI bridges) but not the async/IO/net/charset stacks —
-/// those namespaces are not registered by the generated test runner.
+/// links compiled namespace initializers and the async runtime for root
+/// fibers and core.async test bodies. IO/net/charset remain host extensions.
 const TEST_HARNESS_RUNTIME_CRATES: &[&str] = &[
+    "cljrs-async",
     "cljrs-types",
     "cljrs-gc",
     "cljrs-value",
@@ -2815,7 +2827,7 @@ use cljrs_value::Value;
     }
 
     code.push_str(
-        r#"fn run() {
+        r#"fn run() -> cljrs_runtime::env::error::EvalResult {
     // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
     // cannot parse is a hard error, matching `cljrs -X`: someone asked for
     // diagnostics and must not be left silently without them.
@@ -2861,6 +2873,8 @@ use cljrs_value::Value;
             ),
         ));
     }
+
+    cljrs_async::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -3002,6 +3016,7 @@ use cljrs_value::Value;
     if total_fail > 0 || total_error > 0 {
         std::process::exit(1);
     }
+    Ok(Value::Nil)
 }
 
 fn main() {
@@ -3010,7 +3025,15 @@ fn main() {
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
     let thread = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
-        .spawn(run)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().expect("Tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {
+                eprintln!("cljrs: {error}");
+                std::process::exit(1);
+            }
+        })
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {
         std::panic::resume_unwind(e);
@@ -3260,7 +3283,8 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-{runtime_deps}"#,
+{runtime_deps}tokio = {{ version = "1", features = ["rt", "time", "net", "io-util"] }}
+"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
     deps.seed_lockfile(&harness_dir)?;
@@ -3335,6 +3359,31 @@ mod tests {
             .parse_all()
             .expect("parse")
             .remove(0)
+    }
+
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn async_poll_scan_reads_owned_function_roots() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let mut env = cljrs_runtime::env::env::Env::new(runtime.globals().clone(), "user");
+                cljrs_runtime::interp::eval::eval(
+                    &parse_one("(defn ^:async scanned [] 42)"),
+                    &mut env,
+                )
+                .unwrap();
+                let mut compiler = Compiler::new().unwrap();
+                assert!(
+                    !compile_async_poll_fns(&mut compiler, &mut env)
+                        .unwrap()
+                        .is_empty()
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// Lowering refuses an anonymous `^:async` fn (a compiled closure cannot

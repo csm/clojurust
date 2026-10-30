@@ -42,6 +42,8 @@ struct Session {
     env: cljrs_runtime::tiered::Env,
     /// Most recent values, indexed as [*1, *2, *3, *e].
     stars: [Value; 4],
+    #[cfg(feature = "no-gc")]
+    ownership: cljrs_gc::region::RegionLease,
 }
 
 impl Session {
@@ -49,6 +51,8 @@ impl Session {
         Session {
             env: cljrs_runtime::tiered::Env::new(globals, "user"),
             stars: [Value::Nil, Value::Nil, Value::Nil, Value::Nil],
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
         }
     }
 }
@@ -74,6 +78,8 @@ impl Engine {
     }
 
     pub(crate) fn handle(&mut self, job: Job, eval_form: &mut impl EvalForm) {
+        #[cfg(feature = "no-gc")]
+        let _reads = cljrs_gc::region::ReadScope::enter();
         let Job {
             req,
             replies,
@@ -182,7 +188,12 @@ impl Engine {
         if let Some(ns) = self.globals.namespaces.read().unwrap().get(STATE_NS) {
             let mut interns = ns.get().interns.lock().unwrap();
             for slot in STAR_SLOTS {
-                interns.remove(format!("{sid}-{slot}").as_str());
+                if let Some(var) = interns.remove(format!("{sid}-{slot}").as_str()) {
+                    #[cfg(feature = "no-gc")]
+                    var.get().bind(Value::Nil);
+                    #[cfg(not(feature = "no-gc"))]
+                    let _ = var;
+                }
             }
         }
         let _ = replies.send(
@@ -338,6 +349,11 @@ impl Engine {
                     session.stars[2] = session.stars[1].clone();
                     session.stars[1] = session.stars[0].clone();
                     session.stars[0] = value;
+                    #[cfg(feature = "no-gc")]
+                    {
+                        session.ownership =
+                            cljrs_gc::region::RegionLease::for_values(&session.stars);
+                    }
                     if let Some(vars) = &star_vars {
                         for (var, val) in vars.iter().zip(session.stars.iter()).take(3) {
                             dynamics::set_thread_local(var, val.clone());
@@ -365,6 +381,11 @@ impl Engine {
                             .build(),
                     );
                     session.stars[3] = e.to_error_value();
+                    #[cfg(feature = "no-gc")]
+                    {
+                        session.ownership =
+                            cljrs_gc::region::RegionLease::for_values(&session.stars);
+                    }
                     if let Some(vars) = &star_vars {
                         dynamics::set_thread_local(&vars[3], session.stars[3].clone());
                     }

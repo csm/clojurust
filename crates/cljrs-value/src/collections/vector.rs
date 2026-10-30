@@ -18,6 +18,15 @@ pub struct PersistentVector {
     inner: rpds::VectorSync<Value>,
     is_map_entry: bool,
     charge: ShareCharge,
+    // Conservative summary, maintained by updates without scanning shared nodes.
+    scalar_only: bool,
+}
+
+pub(crate) fn scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_)
+    )
 }
 
 impl PersistentVector {
@@ -26,12 +35,24 @@ impl PersistentVector {
             inner: rpds::VectorSync::new_sync(),
             is_map_entry: false,
             charge: ShareCharge::full(),
+            scalar_only: true,
         }
     }
 
     pub fn from_vector(vector: rpds::VectorSync<Value>) -> Self {
+        let scalar_only = vector.iter().all(scalar);
+        Self {
+            scalar_only,
+            inner: vector,
+            is_map_entry: false,
+            charge: ShareCharge::full(),
+        }
+    }
+
+    pub(crate) fn from_vector_summary(vector: rpds::VectorSync<Value>, scalar_only: bool) -> Self {
         Self {
             inner: vector,
+            scalar_only,
             is_map_entry: false,
             charge: ShareCharge::full(),
         }
@@ -39,12 +60,14 @@ impl PersistentVector {
 
     /// Build a `[key val]` pair tagged as a map entry.
     pub fn map_entry(key: Value, val: Value) -> Self {
+        let scalar_only = scalar(&key) && scalar(&val);
         let mut inner = rpds::VectorSync::new_sync();
         inner = inner.push_back(key);
         inner = inner.push_back(val);
         Self {
             inner,
             is_map_entry: true,
+            scalar_only,
             charge: ShareCharge::full(),
         }
     }
@@ -64,7 +87,10 @@ impl PersistentVector {
 
     /// Append a value. O(log n) amortized.
     pub fn conj(&self, val: Value) -> Self {
-        self.derived(self.inner.push_back(val))
+        let scalar_only = self.scalar_only && scalar(&val);
+        let mut result = self.derived(self.inner.push_back(val));
+        result.scalar_only = scalar_only;
+        result
     }
 
     /// Return the element at `idx`, or `None` if out of bounds.
@@ -82,7 +108,10 @@ impl PersistentVector {
         if idx == self.inner.len() {
             Some(self.conj(val))
         } else {
-            Some(self.derived(self.inner.set(idx, val)?))
+            let scalar_only = self.scalar_only && scalar(&val);
+            let mut result = self.derived(self.inner.set(idx, val)?);
+            result.scalar_only = scalar_only;
+            Some(result)
         }
     }
 
@@ -102,6 +131,7 @@ impl PersistentVector {
             ),
             inner,
             is_map_entry: false,
+            scalar_only: self.scalar_only,
         }
     }
 
@@ -123,6 +153,10 @@ impl PersistentVector {
         self.inner.iter()
     }
 
+    pub(crate) fn scalar_only(&self) -> bool {
+        self.scalar_only
+    }
+
     pub fn inner(&self) -> &rpds::VectorSync<Value> {
         &self.inner
     }
@@ -131,11 +165,14 @@ impl PersistentVector {
 impl std::iter::FromIterator<Value> for PersistentVector {
     fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
         let mut v = rpds::VectorSync::new_sync();
+        let mut scalar_only = true;
         for item in iter {
+            scalar_only &= scalar(&item);
             v = v.push_back(item);
         }
         Self {
             inner: v,
+            scalar_only,
             is_map_entry: false,
             charge: ShareCharge::full(),
         }
@@ -152,7 +189,14 @@ impl PartialEq for PersistentVector {
 }
 
 impl cljrs_gc::Trace for PersistentVector {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        if self.scalar_only {
+            return;
+        }
         for v in self.inner.iter() {
             v.trace(visitor);
         }

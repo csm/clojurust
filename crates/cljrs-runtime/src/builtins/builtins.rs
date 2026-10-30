@@ -1416,8 +1416,15 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("ensure-reduced", Arity::Fixed(1), builtin_ensure_reduced),
         ("promise", Arity::Fixed(0), builtin_promise),
         ("deliver", Arity::Fixed(2), builtin_deliver),
-        // future/agent: not yet implemented — omitted from namespace
-        // future-done?, future-cancelled?, future-cancel, future-call* are stubs
+        ("future-call", Arity::Fixed(1), builtin_future_call),
+        ("future?", Arity::Fixed(1), builtin_future_q),
+        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
+        (
+            "future-cancelled?",
+            Arity::Fixed(1),
+            builtin_future_cancelled_q,
+        ),
+        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         // agent, await-agent, agent-error, restart-agent are stubs
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
         (
@@ -1763,7 +1770,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("eval", Arity::Fixed(1), builtin_eval_sentinel),
     ];
 
-    intern_builtins(globals, ns, fns, BUILTIN_DOCS);
+    let docs = [BUILTIN_DOCS, EXPERIMENTAL_DOCS].concat();
+    intern_builtins(globals, ns, fns, &docs);
 
     // Math constants.
     globals.intern(
@@ -1794,12 +1802,7 @@ fn intern_builtins(
     }
 }
 
-/// The namespace experimental APIs live in.
-///
-/// Deliberately not referred into `user` and not part of `clojure.core`:
-/// everything here is reachable only by an explicit `require`, so
-/// `(when-var-exists future ...)` and similar feature probes see the same
-/// absence a JVM-less runtime would report.
+/// Compatibility namespace for the original experimental future APIs.
 pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 
 /// Doc meta for the experimental builtins, kept separate from `BUILTIN_DOCS`
@@ -1807,7 +1810,7 @@ pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
     (
         "future-call",
-        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Read it with (await f) from an ^:async fn: (deref f) blocks the one thread the task needs in order to finish.",
+        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Dereferencing parks a calling fiber. Dynamic bindings are conveyed; execution is concurrent on one isolate.",
     ),
     ("future?", "Returns true if x is a future."),
     ("future-done?", "Returns true if the future has settled."),
@@ -1823,9 +1826,7 @@ const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
 
 /// Register the experimental native builtins into `ns` (see [`EXPERIMENTAL_NS`]).
 ///
-/// The future family lives here rather than in `clojure.core` because it cannot
-/// honour `clojure.core/future`'s contract on this runtime — see the crate
-/// README's "Experimental namespace" section.
+/// These names remain available alongside the core future family.
 pub fn register_experimental(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // futures — the executor comes from the installed async runtime
@@ -3150,59 +3151,7 @@ fn builtin_gte(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
-    macro_rules! peq {
-        ($a:expr, $b:expr) => {
-            GcPtr::ptr_eq($a, $b)
-        };
-    }
-    let same = match (&args[0], &args[1]) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Uuid(a), Value::Uuid(b)) => peq!(a, b),
-        (Value::BigInt(a), Value::BigInt(b)) => peq!(a, b),
-        (Value::BigDecimal(a), Value::BigDecimal(b)) => peq!(a, b),
-        (Value::Ratio(a), Value::Ratio(b)) => peq!(a, b),
-        (Value::Str(a), Value::Str(b)) => peq!(a, b),
-        (Value::Symbol(a), Value::Symbol(b)) => peq!(a, b),
-        (Value::Keyword(a), Value::Keyword(b)) => a.get() == b.get(),
-        (Value::List(a), Value::List(b)) => peq!(a, b),
-        (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
-        (Value::Map(a), Value::Map(b)) => match (a, b) {
-            (MapValue::Array(a), MapValue::Array(b)) => peq!(a, b),
-            (MapValue::Hash(a), MapValue::Hash(b)) => peq!(a, b),
-            (MapValue::Sorted(a), MapValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Set(a), Value::Set(b)) => match (a, b) {
-            (SetValue::Hash(a), SetValue::Hash(b)) => peq!(a, b),
-            (SetValue::Sorted(a), SetValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Queue(a), Value::Queue(b)) => peq!(a, b),
-        (Value::NativeFunction(a), Value::NativeFunction(b)) => peq!(a, b),
-        (Value::Fn(a), Value::Fn(b)) => peq!(a, b),
-        (Value::Macro(a), Value::Macro(b)) => peq!(a, b),
-        (Value::Var(a), Value::Var(b)) => peq!(a, b),
-        (Value::Atom(a), Value::Atom(b)) => peq!(a, b),
-        (Value::Namespace(a), Value::Namespace(b)) => peq!(a, b),
-        (Value::LazySeq(a), Value::LazySeq(b)) => peq!(a, b),
-        (Value::Cons(a), Value::Cons(b)) => peq!(a, b),
-        (Value::Protocol(a), Value::Protocol(b)) => peq!(a, b),
-        (Value::ProtocolFn(a), Value::ProtocolFn(b)) => peq!(a, b),
-        (Value::MultiFn(a), Value::MultiFn(b)) => peq!(a, b),
-        (Value::Volatile(a), Value::Volatile(b)) => peq!(a, b),
-        (Value::Delay(a), Value::Delay(b)) => peq!(a, b),
-        (Value::Promise(a), Value::Promise(b)) => peq!(a, b),
-        (Value::Future(a), Value::Future(b)) => peq!(a, b),
-        (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
-        (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
-        (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
-        _ => false,
-    };
-    Ok(Value::Bool(same))
+    Ok(Value::Bool(args[0].identical(&args[1])))
 }
 
 fn builtin_compare(args: &[Value]) -> ValueResult<Value> {
@@ -4507,7 +4456,9 @@ fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
 fn concat_lazy(colls: Vec<Value>) -> Value {
     // Even the zero-arity and all-empty cases are lazy in Clojure. The thunk
     // discovers emptiness when the result is first observed.
-    Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(ConcatThunk { colls }))))
+    Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(ConcatThunk {
+        colls,
+    }))))
 }
 
 /// Thunk for lazy concat: holds remaining collections to iterate.
@@ -4798,7 +4749,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         for item in iter.by_ref() {
             acc = crate::env::callback::invoke(&xf_rf, vec![acc, item])?;
             if let Value::Reduced(inner) = acc {
-                acc = *inner;
+                acc = (*inner).clone();
                 break;
             }
         }
@@ -4808,7 +4759,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         // Call completion arity
         acc = crate::env::callback::invoke(&xf_rf, vec![acc])?;
         if let Value::Reduced(inner) = acc {
-            acc = *inner;
+            acc = (*inner).clone();
         }
         return Ok(acc);
     }
@@ -5197,6 +5148,7 @@ fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
         let idx = numeric_as_i64(idx_val)? as usize;
         current = match &current {
             Value::ObjectArray(a) => {
+                cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
                 let g = a.get().0.lock().unwrap();
                 at(g.get(idx).cloned(), idx, g.len(), |v| v)?
             }
@@ -5251,6 +5203,12 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
     let newval = args[2].clone();
     match &args[0] {
         Value::ObjectArray(a) => {
+            let count = a.get().0.lock().unwrap().len();
+            if idx >= count {
+                return Err(ValueError::IndexOutOfBounds { idx, count });
+            }
+            let newval =
+                cljrs_value::publish::publish_for_slot(newval, a.get() as *const _ as usize, idx);
             let mut guard = a.get().0.lock().unwrap();
             if idx >= guard.len() {
                 return Err(ValueError::IndexOutOfBounds {
@@ -5259,6 +5217,8 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
                 });
             }
             guard[idx] = newval.clone();
+            drop(guard);
+            cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
             Ok(newval)
         }
         Value::IntArray(_) => builtin_aset_int(args),
@@ -6168,7 +6128,7 @@ fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
 fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
     // Actual option parsing (meta/validator) is handled in apply.rs handle_atom_call.
     // This fallback is only hit by direct Value-level calls (e.g. tests via apply).
-    Ok(Value::Atom(GcPtr::new(Atom::new(args[0].clone()))))
+    Ok(Value::Atom(GcPtr::new_isolated(Atom::new(args[0].clone()))))
 }
 
 // ── shared-atom (Phase B3, two-tier ADR) ──────────────────────────────────────
@@ -6222,8 +6182,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
     let key = args[1].clone();
     let f = args[2].clone();
     match &args[0] {
-        Value::Atom(a) => add_watch_to(&a.get().watches, key, f),
-        Value::Var(v) => add_watch_to(&v.get().watches, key, f),
+        Value::Atom(a) => a.get().add_watch(key, f),
+        Value::Var(v) => v.get().add_watch(key, f),
         Value::Agent(a) => add_watch_to(&a.get().watches, key, f),
         v => {
             return Err(ValueError::WrongType {
@@ -6238,8 +6198,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
 fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
     let key = &args[1];
     match &args[0] {
-        Value::Atom(a) => remove_watch_from(&a.get().watches, key),
-        Value::Var(v) => remove_watch_from(&v.get().watches, key),
+        Value::Atom(a) => a.get().remove_watch(key),
+        Value::Var(v) => v.get().remove_watch(key),
         Value::Agent(a) => remove_watch_from(&a.get().watches, key),
         v => {
             return Err(ValueError::WrongType {
@@ -8153,9 +8113,19 @@ fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
     if !over_values.contains(&over) {
         over_values.push(over);
         drop(prefers);
+        let first = cljrs_value::publish::publish_for_named_slot(
+            args[1].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[1]),
+        );
+        let second = cljrs_value::publish::publish_for_named_slot(
+            args[2].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[2]),
+        );
         let mut preference_vals = mf.get().preference_vals.lock().unwrap();
-        preference_vals.insert(format!("{}", args[1]), args[1].clone());
-        preference_vals.insert(format!("{}", args[2]), args[2].clone());
+        preference_vals.insert(format!("{}", args[1]), first);
+        preference_vals.insert(format!("{}", args[2]), second);
         drop(preference_vals);
         mf.get().bump_method_generation();
     }
@@ -8173,8 +8143,18 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    let removed = mf.get().methods.lock().unwrap().remove(&key).is_some();
+    let removed = mf.get().remove_method(&key);
     mf.get().dispatch_vals.lock().unwrap().remove(&key);
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("method:{key}"),
+    );
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
     if removed {
         mf.get().bump_method_generation();
     }
@@ -8201,7 +8181,10 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
             .unwrap_or_else(|| Value::string(k.clone()));
         m = m.assoc(dispatch_val, v.clone());
     }
-    Ok(Value::Map(m))
+    let value = Value::Map(m);
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::RegionLease::for_value(&value).protect_read();
+    Ok(value)
 }
 
 fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
@@ -8237,15 +8220,9 @@ fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Atom(a) => {
-            let mut guard = a.get().value.lock().unwrap();
-            if *guard == args[1] {
-                *guard = args[2].clone();
-                Ok(Value::Bool(true))
-            } else {
-                Ok(Value::Bool(false))
-            }
-        }
+        Value::Atom(a) => Ok(Value::Bool(
+            a.get().compare_and_set(&args[1], args[2].clone()),
+        )),
         Value::SharedAtom(sa) => {
             // Lock-free CAS: succeed only if the live value still equals the
             // expected one, by content, at the moment of the atomic store.
@@ -8321,7 +8298,7 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
 // ── reduced ──────────────────────────────────────────────────────────────────
 
 fn builtin_reduced(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Reduced(Box::new(args[0].clone())))
+    Ok(Value::Reduced(std::sync::Arc::new(args[0].clone())))
 }
 
 fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
@@ -8330,7 +8307,7 @@ fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Reduced(inner) => Ok(*inner.clone()),
+        Value::Reduced(inner) => Ok((**inner).clone()),
         other => Ok(other.clone()),
     }
 }
@@ -8338,7 +8315,7 @@ fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
 fn builtin_ensure_reduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Reduced(_) => Ok(args[0].clone()),
-        other => Ok(Value::Reduced(Box::new(other.clone()))),
+        other => Ok(Value::Reduced(std::sync::Arc::new(other.clone()))),
     }
 }
 
@@ -8432,7 +8409,7 @@ fn builtin_multi_fn(args: &[Value]) -> ValueResult<Value> {
         Some(v) => format!("{v}"),
         None => ":default".to_string(),
     };
-    Ok(Value::MultiFn(GcPtr::new(MultiFn::new(
+    Ok(Value::MultiFn(GcPtr::new_isolated(MultiFn::new(
         name,
         args[1].clone(),
         default_dispatch,
@@ -8459,16 +8436,13 @@ fn builtin_add_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    mf.get()
-        .methods
-        .lock()
-        .unwrap()
-        .insert(key.clone(), args[2].clone());
-    mf.get()
-        .dispatch_vals
-        .lock()
-        .unwrap()
-        .insert(key, args[1].clone());
+    mf.get().set_method(key.clone(), args[2].clone());
+    let dispatch = cljrs_value::publish::publish_for_named_slot(
+        args[1].clone(),
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
+    mf.get().dispatch_vals.lock().unwrap().insert(key, dispatch);
     mf.get().bump_method_generation();
     Ok(Value::MultiFn(mf))
 }
@@ -8566,8 +8540,7 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
             }
         };
         let proto = proto.get();
-        let mut impls = proto.impls.lock().unwrap();
-        let table = impls.entry(type_tag.clone()).or_default();
+        let mut prepared = Vec::new();
         for (k, f) in methods.iter() {
             let method_name: Arc<str> = match k.unwrap_meta() {
                 Value::Keyword(kw) => Arc::from(kw.get().name.as_ref()),
@@ -8580,7 +8553,11 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             };
-            table.insert(method_name, f.clone());
+            let function = f.clone();
+            prepared.push((method_name, function));
+        }
+        for (method, function) in prepared {
+            proto.set_implementation(type_tag.clone(), method, function);
         }
     }
     cljrs_value::bump_protocol_generation();
@@ -8655,7 +8632,7 @@ fn builtin_make_type_instance_mut(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let cell = GcPtr::new(Atom::new(Value::Map(mut_map)));
+    let cell = GcPtr::new_isolated(Atom::new(Value::Map(mut_map)));
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
         type_tag,
         fields,
@@ -8924,8 +8901,7 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
 ///
 /// The task runs on the installed async runtime's executor, which is this
 /// isolate's: cooperative, not parallel, since every Clojure value is `!Send`.
-/// Read the result with `(await f)`; `(deref f)` blocks the one thread the task
-/// needs in order to finish.
+/// Dereferencing parks a calling fiber. Dynamic bindings are conveyed.
 fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = match args {
         [thunk] => thunk.clone(),
@@ -8945,7 +8921,8 @@ fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
         )
     })?;
     let call_env = crate::env::env::Env::new(globals, &ns);
-    Ok(rt.spawn_async_call(thunk, Vec::new(), call_env))
+    rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+        .map_err(|e| ValueError::Other(e.to_string()))
 }
 
 fn builtin_future_q(args: &[Value]) -> ValueResult<Value> {
@@ -9301,23 +9278,14 @@ mod doc_tests {
         }
     }
 
-    /// The future family is deliberately absent from `clojure.core`: it cannot
-    /// honour that namespace's contract on a one-thread-per-isolate runtime, and
-    /// feature probes (`when-var-exists future`) must keep seeing nothing there.
     #[test]
-    fn future_family_is_not_in_clojure_core() {
+    fn future_family_is_in_core_and_experimental_namespace() {
         let globals = test_globals();
         register_experimental(&globals, EXPERIMENTAL_NS);
         for (name, _) in EXPERIMENTAL_DOCS {
-            assert!(
-                globals.lookup_var("clojure.core", name).is_none(),
-                "{name:?} is registered in clojure.core; it belongs in {EXPERIMENTAL_NS}"
-            );
+            assert!(globals.lookup_var("clojure.core", name).is_some());
+            assert!(globals.lookup_var(EXPERIMENTAL_NS, name).is_some());
         }
-        assert!(
-            globals.lookup_var("clojure.core", "future").is_none(),
-            "clojure.core/future is defined; it belongs in {EXPERIMENTAL_NS}"
-        );
     }
 
     #[test]

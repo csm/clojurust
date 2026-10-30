@@ -127,6 +127,7 @@ enum Tier {
     TreeWalk,
     EagerIr,
     Jit,
+    #[cfg(not(feature = "no-gc"))]
     Aot,
 }
 
@@ -136,6 +137,7 @@ impl Tier {
             Self::TreeWalk => "tree-walk",
             Self::EagerIr => "eager-ir",
             Self::Jit => "jit",
+            #[cfg(not(feature = "no-gc"))]
             Self::Aot => "aot",
         }
     }
@@ -203,6 +205,7 @@ fn cli_command(script: &std::path::Path, tier: Tier) -> Command {
                 ])
                 .env("CLJRS_EAGER_LOWER", "1");
         }
+        #[cfg(not(feature = "no-gc"))]
         Tier::Aot => unreachable!("AOT uses its compiled binary"),
     }
     command.arg(script);
@@ -229,6 +232,7 @@ fn run_cli(script: &std::path::Path, tier: Tier) -> Output {
     output
 }
 
+#[cfg(not(feature = "no-gc"))]
 fn run_aot(script: &std::path::Path, binary: &std::path::Path) -> Output {
     let src = script.to_path_buf();
     let bin = binary.to_path_buf();
@@ -287,16 +291,20 @@ fn parse_records(tier: Tier, output: &Output) -> BTreeMap<String, Outcome> {
 fn values_and_errors_match_across_all_execution_tiers() {
     let temp = tempfile::tempdir().expect("temporary harness directory");
     let script = temp.path().join("tier_parity.cljrs");
+    #[cfg(not(feature = "no-gc"))]
     let binary = temp.path().join("tier_parity_aot");
     std::fs::write(&script, PROGRAM).expect("write parity program");
 
     let tree = parse_records(Tier::TreeWalk, &run_cli(&script, Tier::TreeWalk));
     let eager_ir = parse_records(Tier::EagerIr, &run_cli(&script, Tier::EagerIr));
     let jit = parse_records(Tier::Jit, &run_cli(&script, Tier::Jit));
+    // The general escaping-closure fixture is rejected by the no-GC AOT blacklist.
+    #[cfg(not(feature = "no-gc"))]
     let aot = parse_records(Tier::Aot, &run_aot(&script, &binary));
 
     assert_eq!(eager_ir, tree, "eager IR diverged from tree-walk");
     assert_eq!(jit, tree, "JIT diverged from tree-walk");
+    #[cfg(not(feature = "no-gc"))]
     assert_eq!(aot, tree, "AOT diverged from tree-walk");
 
     assert_eq!(tree["mod"], Outcome::Value("2".to_string()));

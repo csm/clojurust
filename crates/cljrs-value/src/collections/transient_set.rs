@@ -12,6 +12,8 @@ pub struct TransientSet {
     persisted: Mutex<bool>,
     revision: AtomicU64,
     keys_may_realize: AtomicBool,
+    #[cfg(feature = "no-gc")]
+    initial: std::cell::RefCell<crate::publish::ValueLease>,
 }
 
 impl TransientSet {
@@ -20,6 +22,8 @@ impl TransientSet {
             set: Mutex::new(PersistentHashSet::empty()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            initial: Default::default(),
             keys_may_realize: AtomicBool::new(false),
         }
     }
@@ -29,25 +33,30 @@ impl TransientSet {
             set: Mutex::new(set.clone()),
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
-            keys_may_realize: AtomicBool::new(!(set.iter().all(crate::realization::is_inert))),
+            #[cfg(feature = "no-gc")]
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                set,
+                &Default::default(),
+            )),
+            keys_may_realize: AtomicBool::new(!set.keys_inert()),
         }
     }
 
-    fn update(
+    fn update<T>(
         &self,
         key: &Value,
-        fast: impl FnOnce(&mut PersistentHashSet),
-        operation: impl Fn(&PersistentHashSet) -> PersistentHashSet,
-    ) -> ValueResult<()> {
+        fast: impl FnOnce(&mut PersistentHashSet) -> T,
+        operation: impl Fn(&PersistentHashSet) -> (PersistentHashSet, T),
+    ) -> ValueResult<T> {
         {
             let mut collection = self.set.lock().unwrap();
             if *self.persisted.lock().unwrap() {
                 return Err(ValueError::TransientAlreadyPersisted);
             }
             if !self.keys_may_realize.load(Ordering::Relaxed) && crate::realization::is_inert(key) {
-                fast(&mut collection);
+                let result = fast(&mut collection);
                 self.revision.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                return Ok(result);
             }
         }
         loop {
@@ -61,7 +70,7 @@ impl TransientSet {
                     self.revision.load(Ordering::Relaxed),
                 )
             };
-            let candidate = operation(snapshot.get());
+            let (candidate, result) = operation(snapshot.get());
             let mut set = self.set.lock().unwrap();
             if *self.persisted.lock().unwrap() {
                 return Err(ValueError::TransientAlreadyPersisted);
@@ -74,20 +83,54 @@ impl TransientSet {
                 self.keys_may_realize.store(true, Ordering::Relaxed);
             }
             self.revision.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(result);
         }
     }
     pub fn conj(&self, value: Value) -> ValueResult<()> {
-        self.update(
+        #[cfg(feature = "no-gc")]
+        let (value, _value_owner) = crate::publish::prepare_for_owner(value, &Default::default());
+        let entry = self.update(
             &value,
             |set| {
                 set.conj_mut(value.clone());
+                set.storage_entry(&value).unwrap()
             },
-            |set| set.conj(value.clone()),
-        )
+            |set| {
+                let candidate = set.conj(value.clone());
+                let entry = candidate.storage_entry(&value).unwrap();
+                (candidate, entry)
+            },
+        )?;
+        #[cfg(feature = "no-gc")]
+        if !cljrs_gc::alloc_ctx::invocation_is_active() {
+            let lease = cljrs_gc::region::RegionLease::for_value(&entry.1);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                entry.0,
+                &lease,
+            );
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = entry;
+        Ok(())
     }
     pub fn disj(&self, value: &Value) -> ValueResult<()> {
-        self.update(value, |set| set.disj_mut(value), |set| set.disj(value))
+        let entry = self.update(
+            value,
+            |set| {
+                let entry = set.storage_entry(value);
+                set.disj_mut(value);
+                entry
+            },
+            |set| (set.disj(value), set.storage_entry(value)),
+        )?;
+        #[cfg(feature = "no-gc")]
+        if let Some((slot, _)) = entry {
+            crate::publish::publish_for_slot(Value::Nil, self as *const _ as usize, slot);
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = entry;
+        Ok(())
     }
 
     pub fn persistent(&self) -> ValueResult<PersistentHashSet> {
@@ -97,7 +140,18 @@ impl TransientSet {
             return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
-        Ok(set.clone())
+        let result = set.clone();
+        #[cfg(feature = "no-gc")]
+        {
+            let address = self as *const _ as usize;
+            if cljrs_gc::region::AllocationOwner::for_address(address).is_permanent() {
+                // Rust stack containers do not have a containing region to lease.
+                cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+            } else {
+                cljrs_gc::region::RegionLease::for_address(address).protect_read();
+            }
+        }
+        Ok(result)
     }
 
     pub fn count(&self) -> usize {
@@ -122,6 +176,11 @@ impl Clone for TransientSet {
             set: Mutex::new(self.set.lock().unwrap().clone()),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             revision: AtomicU64::new(0),
+            #[cfg(feature = "no-gc")]
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                &self.set.lock().unwrap().clone(),
+                &Default::default(),
+            )),
             keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
@@ -139,6 +198,16 @@ impl ClojureHash for TransientSet {
 }
 
 impl cljrs_gc::Trace for TransientSet {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let address = self as *const _ as usize;
+        let owner = cljrs_gc::region::AllocationOwner::for_address(address);
+        let lease = self.initial.borrow().reparent(&owner);
+        *self.initial.borrow_mut() = lease;
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let set = self.set.lock().unwrap();
@@ -157,5 +226,11 @@ impl cljrs_gc::Trace for TransientSet {
 impl Default for TransientSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TransientSet {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
     }
 }

@@ -42,6 +42,38 @@ use cljrs_value::{
     PersistentVector, Value,
 };
 
+// Managed captures must be visible before the first task poll. Keep their
+// shadow roots in a detached state so dropping a task uses the same registry.
+#[cfg(not(feature = "no-gc"))]
+struct CapturedRoots {
+    _values: Box<[Value]>,
+    state: cljrs_gc::mutator::MutatorState,
+    guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
+}
+#[cfg(not(feature = "no-gc"))]
+impl CapturedRoots {
+    fn new(values: Vec<Value>) -> Self {
+        let values = values.into_boxed_slice();
+        let mut state = cljrs_gc::mutator::MutatorState::fresh();
+        state.swap_with_current();
+        let guard = Some(cljrs_runtime::env::gc_roots::root_values(&values));
+        state.swap_with_current();
+        Self {
+            _values: values,
+            state,
+            guard,
+        }
+    }
+}
+#[cfg(not(feature = "no-gc"))]
+impl Drop for CapturedRoots {
+    fn drop(&mut self) {
+        self.state.swap_with_current();
+        self.guard.take();
+        self.state.swap_with_current();
+    }
+}
+
 /// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
 /// task settles on completion. The single delivery point for every async
 /// primitive (`^:async` calls, `timeout`, `alts`).
@@ -55,21 +87,47 @@ pub fn spawn_future<F>(task: F) -> Value
 where
     F: Future<Output = EvalResult> + 'static,
 {
+    spawn_future_with_roots(Vec::new(), task)
+}
+
+/// Spawn a task with explicit managed captures. Use this for borrowed values
+/// that can outlive their current cell binding or evaluation read scope.
+pub fn spawn_future_with_roots<F>(roots: Vec<Value>, task: F) -> Value
+where
+    F: Future<Output = EvalResult> + 'static,
+{
     // GC builds: heap-promotion fallback — the task's captured environment is
     // opaque to the publish-barrier scan, and the task may run after any
     // bump-region scope active right now has closed.  Poison the active
     // regions so they are retired (kept alive) instead of reset; a no-op (one
     // thread-local read) when no region is open, which is the common case.
+    #[cfg(not(feature = "no-gc"))]
     cljrs_gc::region::poison_active_regions();
-    let future = GcPtr::new(CljxFuture::new());
+    #[cfg(feature = "no-gc")]
+    let lease = {
+        let mut lease = cljrs_gc::region::RegionLease::capture_active();
+        lease.extend(&cljrs_gc::region::RegionLease::for_values(&roots));
+        lease
+    };
+    #[cfg(feature = "no-gc")]
+    let allocation = cljrs_gc::region::AllocationSnapshot::capture();
+    let future = GcPtr::new(CljxFuture::new_local());
     let task_future = future.clone();
+    #[cfg(not(feature = "no-gc"))]
+    let captures = {
+        let mut roots = roots;
+        roots.push(Value::Future(task_future.clone()));
+        CapturedRoots::new(roots)
+    };
+    #[cfg(feature = "no-gc")]
+    let _ = roots;
     let gas_meters = cljrs_runtime::env::gas::active_meters();
     let interrupts = cljrs_runtime::env::gas::active_interrupts();
     tokio::task::spawn_local(async move {
-        // Root the result future across GC cycles: the spawning scope's alloc
-        // frame may have dropped before the task gets to run.
-        let anchor = Value::Future(task_future.clone());
-        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+        #[cfg(not(feature = "no-gc"))]
+        let _captures = captures;
+        #[cfg(feature = "no-gc")]
+        let mut reads = cljrs_gc::region::ReadContext::default();
         let mut task = Box::pin(task);
         let result = std::future::poll_fn(|cx| {
             // LocalSet tasks share an OS thread, so TLS state must be scoped
@@ -79,9 +137,19 @@ where
             let _interrupts = cljrs_runtime::env::gas::InterruptScope::enter(&interrupts);
             let _gas_guards = cljrs_runtime::env::gas::install_meters(&gas_meters);
             let _monitors = cljrs_runtime::env::monitor::AsyncMonitorScope::enter();
+            #[cfg(feature = "no-gc")]
+            let _lease_scope = lease.enter();
+            #[cfg(feature = "no-gc")]
+            let _allocation_scope = allocation.enter();
+            #[cfg(feature = "no-gc")]
+            let _reads = reads.enter();
             task.as_mut().poll(cx)
         })
         .await;
+        #[cfg(feature = "no-gc")]
+        let _lease_scope = lease.enter();
+        #[cfg(feature = "no-gc")]
+        let _allocation_scope = allocation.enter();
         settle_future(&task_future, result);
     });
     Value::Future(future)
@@ -89,7 +157,7 @@ where
 
 /// Write a completed result into a future and wake blocking `deref` waiters.
 pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
-    let mut state = future.get().state.lock().unwrap();
+    let state = future.get().state.lock().unwrap();
     // Cancellation is sticky. `future-cancel` does not interrupt the task, so a
     // task cancelled mid-body still runs to completion and lands here; letting
     // it write its result would flip `future-cancelled?` back to false and hand
@@ -98,14 +166,26 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     if matches!(&*state, FutureState::Cancelled) {
         return;
     }
-    *state = match result {
-        Ok(v) => FutureState::Done(v),
+    drop(state);
+    let settled = match result {
+        Ok(v) => FutureState::Done(cljrs_value::publish::publish_for_owner(
+            v,
+            future.get() as *const _ as usize,
+        )),
         // Preserve the thrown value (and any non-Thrown error as a fresh
         // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
         Err(EvalError::GasExhausted) => FutureState::GasExhausted,
         Err(EvalError::MemoryLimitExceeded(fault)) => FutureState::MemoryLimitExceeded(fault),
-        Err(e) => FutureState::Failed(e.to_error_value()),
+        Err(e) => FutureState::Failed(cljrs_value::publish::publish_for_owner(
+            e.to_error_value(),
+            future.get() as *const _ as usize,
+        )),
     };
+    let mut state = future.get().state.lock().unwrap();
+    if matches!(&*state, FutureState::Cancelled) {
+        return;
+    }
+    *state = settled;
     drop(state);
     future.get().cond.notify_all();
     future.get().ready.notify_all();
@@ -164,6 +244,22 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
 
 /// Asynchronously evaluate a single form.
 pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    {
+        let mut reads = cljrs_gc::region::ReadContext::default();
+        let mut evaluation = Box::pin(eval_async_inner(form, env));
+        let result = std::future::poll_fn(|cx| {
+            let _reads = reads.enter();
+            evaluation.as_mut().poll(cx)
+        })
+        .await;
+        cljrs_runtime::interp::eval::publish_result(result, None)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    eval_async_inner(form, env).await
+}
+
+async fn eval_async_inner(form: &Form, env: &mut Env) -> EvalResult {
     // Collection literals may contain `await` sub-expressions (e.g. the
     // return value of a ^:async fn is `[(await x) (await y)]`). Evaluate
     // each element with eval_async so awaits yield cooperatively instead of
@@ -173,7 +269,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                vals.push(Box::pin(eval_async(f, env)).await?);
+                vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))));
         }
@@ -185,7 +281,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
                 .into_owned();
             let mut pairs: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                pairs.push(Box::pin(eval_async(f, env)).await?);
+                pairs.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             let kv_pairs: Vec<(Value, Value)> = pairs
                 .chunks(2)
@@ -197,7 +293,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                vals.push(Box::pin(eval_async(f, env)).await?);
+                vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Set(SetValue::Hash(GcPtr::new(
                 PersistentHashSet::from_iter(vals),
@@ -270,13 +366,29 @@ async fn eval_await_async(args: &[Form], env: &mut Env) -> EvalResult {
     let Some(arg) = args.first() else {
         return Err(EvalError::Runtime("await requires one argument".into()));
     };
-    let val = Box::pin(eval_async(arg, env)).await?;
+    let val = Box::pin(eval_async_inner(arg, env)).await?;
     await_value(val).await
 }
 
 /// Cooperatively await a Clojure value. Futures and promises yield to the
 /// executor until resolved; any other value is returned as-is.
 pub async fn await_value(val: Value) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    {
+        let mut reads = cljrs_gc::region::ReadContext::default();
+        let mut wait = Box::pin(await_value_inner(val));
+        let result = std::future::poll_fn(|cx| {
+            let _reads = reads.enter();
+            wait.as_mut().poll(cx)
+        })
+        .await;
+        cljrs_runtime::interp::eval::publish_result(result, None)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    await_value_inner(val).await
+}
+
+async fn await_value_inner(val: Value) -> EvalResult {
     match val {
         Value::Future(f) => {
             // Root the future across GC cycles: the alloc frame of the scope that
@@ -285,30 +397,8 @@ pub async fn await_value(val: Value) -> EvalResult {
             let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
             loop {
                 let listener = f.get().ready.listen();
-                {
-                    let guard = f.get().state.lock().unwrap();
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(EvalError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(EvalError::GasExhausted);
-                        }
-                        FutureState::MemoryLimitExceeded(fault) => {
-                            f.get().mark_observed();
-                            return Err(EvalError::MemoryLimitExceeded(*fault));
-                        }
-                        FutureState::Cancelled => {
-                            return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {}
-                    }
+                if let Some(result) = f.get().settled_value() {
+                    return result.map_err(cljrs_runtime::env::error::value_error_to_eval_error);
                 }
                 cljrs_runtime::env::gc_roots::async_gc_collect();
                 listener.await;
@@ -319,10 +409,10 @@ pub async fn await_value(val: Value) -> EvalResult {
             let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
             loop {
                 let listener = p.get().ready.listen();
-                {
-                    if let Some(v) = p.get().value.lock().unwrap().as_ref() {
-                        return Ok(v.clone());
-                    }
+                let value = p.get().value.lock().unwrap().clone();
+                if let Some(value) = value {
+                    cljrs_value::publish::read_slot(p.get() as *const _ as usize, 0);
+                    return Ok(value);
                 }
                 cljrs_runtime::env::gc_roots::async_gc_collect();
                 listener.await;
@@ -336,7 +426,7 @@ pub async fn await_value(val: Value) -> EvalResult {
 async fn eval_body_async(forms: &[Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Nil;
     for form in forms {
-        result = Box::pin(eval_async(form, env)).await?;
+        result = Box::pin(eval_async_inner(form, env)).await?;
     }
     Ok(result)
 }
@@ -403,16 +493,16 @@ async fn eval_if_async(args: &[Form], env: &mut Env) -> EvalResult {
     let Some(test_form) = args.first() else {
         return Err(EvalError::Runtime("if requires a test".into()));
     };
-    let test = Box::pin(eval_async(test_form, env)).await?;
+    let test = Box::pin(eval_async_inner(test_form, env)).await?;
     let truthy = !matches!(test, Value::Nil | Value::Bool(false));
     if truthy {
         match args.get(1) {
-            Some(then) => Box::pin(eval_async(then, env)).await,
+            Some(then) => Box::pin(eval_async_inner(then, env)).await,
             None => Ok(Value::Nil),
         }
     } else {
         match args.get(2) {
-            Some(els) => Box::pin(eval_async(els, env)).await,
+            Some(els) => Box::pin(eval_async_inner(els, env)).await,
             None => Ok(Value::Nil),
         }
     }
@@ -430,7 +520,7 @@ async fn eval_let_async(args: &[Form], env: &mut Env) -> EvalResult {
 
     env.push_frame();
     for pair in bindings.chunks(2) {
-        let val = match Box::pin(eval_async(&pair[1], env)).await {
+        let val = match Box::pin(eval_async_inner(&pair[1], env)).await {
             Ok(v) => v,
             Err(e) => {
                 env.pop_frame();
@@ -464,7 +554,7 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
     // Evaluate initial binding values.
     let mut current_vals: Vec<Value> = Vec::with_capacity(patterns.len());
     for form in &init_forms {
-        current_vals.push(Box::pin(eval_async(form, env)).await?);
+        current_vals.push(Box::pin(eval_async_inner(form, env)).await?);
     }
 
     let body = &args[1..];
@@ -552,7 +642,7 @@ async fn eval_recur_async(args: &[Form], env: &mut Env) -> EvalResult {
         // (ptr, len), so it is dropped before `push` can move the storage.
         let val = {
             let _vals_root = cljrs_runtime::env::gc_roots::root_values(&vals);
-            Box::pin(eval_async(form, env)).await?
+            Box::pin(eval_async_inner(form, env)).await?
         };
         vals.push(val);
     }
@@ -586,7 +676,7 @@ async fn eval_def_value_async(form: &Form, env: &mut Env) -> EvalResult {
     {
         let mut ctx: Option<cljrs_gc::alloc_ctx::StaticCtxGuard> = None;
         poll_scoped(
-            Box::pin(eval_async(form, env)),
+            Box::pin(eval_async_inner(form, env)),
             &mut ctx,
             |ctx| *ctx = Some(cljrs_gc::alloc_ctx::StaticCtxGuard::new()),
             |ctx| *ctx = None,
@@ -595,7 +685,7 @@ async fn eval_def_value_async(form: &Form, env: &mut Env) -> EvalResult {
     }
     #[cfg(not(feature = "no-gc"))]
     {
-        Box::pin(eval_async(form, env)).await
+        Box::pin(eval_async_inner(form, env)).await
     }
 }
 
@@ -616,7 +706,7 @@ async fn eval_defonce_async(args: &[Form], env: &mut Env) -> EvalResult {
 async fn eval_and_async(args: &[Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Bool(true);
     for form in args {
-        result = Box::pin(eval_async(form, env)).await?;
+        result = Box::pin(eval_async_inner(form, env)).await?;
         if matches!(result, Value::Nil | Value::Bool(false)) {
             return Ok(result);
         }
@@ -628,7 +718,7 @@ async fn eval_and_async(args: &[Form], env: &mut Env) -> EvalResult {
 async fn eval_or_async(args: &[Form], env: &mut Env) -> EvalResult {
     let mut last = Value::Nil;
     for form in args {
-        last = Box::pin(eval_async(form, env)).await?;
+        last = Box::pin(eval_async_inner(form, env)).await?;
         if !matches!(last, Value::Nil | Value::Bool(false)) {
             return Ok(last);
         }
@@ -639,7 +729,7 @@ async fn eval_or_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// `(throw x)` with a yielding `x`.
 async fn eval_throw_async(args: &[Form], env: &mut Env) -> EvalResult {
     let val = match args.first() {
-        Some(f) => Box::pin(eval_async(f, env)).await?,
+        Some(f) => Box::pin(eval_async_inner(f, env)).await?,
         None => Value::Nil,
     };
     Err(cljrs_runtime::interp::special::throw_value(val))
@@ -653,7 +743,7 @@ async fn eval_set_bang_async(args: &[Form], env: &mut Env) -> EvalResult {
         .first()
         .ok_or_else(|| EvalError::Runtime("set! requires a target".into()))?;
     let val = match args.get(1) {
-        Some(f) => Box::pin(eval_async(f, env)).await?,
+        Some(f) => Box::pin(eval_async_inner(f, env)).await?,
         None => Value::Nil,
     };
     match &target.kind {
@@ -661,7 +751,7 @@ async fn eval_set_bang_async(args: &[Form], env: &mut Env) -> EvalResult {
         _ => match sp::set_bang_field_target(target) {
             Some((field, inst_form)) => {
                 let _val_root = cljrs_runtime::env::gc_roots::root_value(&val);
-                let inst = Box::pin(eval_async(inst_form, env)).await?;
+                let inst = Box::pin(eval_async_inner(inst_form, env)).await?;
                 sp::set_type_instance_field(&inst, field, val.clone())
             }
             None => Err(sp::set_bang_target_error()),
@@ -709,7 +799,7 @@ async fn eval_binding_async(args: &[Form], env: &mut Env) -> EvalResult {
             .ok_or_else(|| EvalError::UnboundSymbol(sym_str.to_string()))?;
         let val = {
             let _vals_root = cljrs_runtime::env::gc_roots::root_values(&vals);
-            Box::pin(eval_async(&pair[1], env)).await?
+            Box::pin(eval_async_inner(&pair[1], env)).await?
         };
         keys.push(dynamics::var_key_of(&var_ptr));
         vals.push(val);
@@ -813,13 +903,13 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
         let Some((target_form, arg_forms)) = args.split_first() else {
             return Err(EvalError::Runtime(format!("{s} requires a target object")));
         };
-        let target = Box::pin(eval_async(target_form, env)).await?;
+        let target = Box::pin(eval_async_inner(target_form, env)).await?;
         let _target_root = cljrs_runtime::env::gc_roots::root_value(&target);
         let mut argv: Vec<Value> = Vec::with_capacity(arg_forms.len());
         for a in arg_forms {
             let val = {
                 let _args_root = cljrs_runtime::env::gc_roots::root_values(&argv);
-                Box::pin(eval_async(a, env)).await?
+                Box::pin(eval_async_inner(a, env)).await?
             };
             argv.push(val);
         }
@@ -843,7 +933,7 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
     for a in args {
         let val = {
             let _args_root = cljrs_runtime::env::gc_roots::root_values(&argv);
-            Box::pin(eval_async(a, env)).await?
+            Box::pin(eval_async_inner(a, env)).await?
         };
         argv.push(val);
     }

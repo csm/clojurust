@@ -59,6 +59,11 @@ pub trait JitBackend: Send + Sync {
     /// silent nil (and cannot leak into the next `rt_try` on this thread).
     fn take_pending_exception(&self) -> Option<Value>;
 
+    /// Take an uncatchable resource-limit error from native code.
+    fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        None
+    }
+
     /// Address of the pointer a failed entry guard returns (Phase 10.6).
     ///
     /// The dispatch seam compares native results against it to detect a

@@ -3003,3 +3003,174 @@ fn test_lazy_realization_errors() {
         "[:count :first :rest :apply :into :equal :hash :print]",
     );
 }
+
+#[test]
+fn aot_root_fiber_supports_blocking_surface() {
+    let stdout = compile_and_run(
+        "root_fiber_surface",
+        r#"
+      (ns fiber-main (:require [clojure.core.async :as a]))
+      (def ^:dynamic *x* :root)
+      (println @(future 42))
+      (println @(future @(future (sleep 1) 42)))
+      (println (deref (future (deref (future (sleep 1) 42)))))
+      (println (a/<!! (a/io-thread (sleep 1) :io)))
+      (println (try @(future (throw (ex-info "failure" {:x :caught})))
+                    (catch Exception e (:x (ex-data e)))))
+      (println (try (try (throw (ex-info "original" {})) (finally nil))
+                    (catch Exception e :rethrow)))
+      (def counter (atom 0))
+      (println (try (swap! counter (fn [_] (throw (ex-info "swap failure" {}))))
+                    (catch Exception e :swap-caught)))
+      (println (try (apply (fn [x] x) []) (catch Exception e :apply-caught)))
+      (defn -main []
+        (println (binding [*x* :conveyed] @(future *x*))))
+    "#,
+    );
+    assert_eq!(stdout.lines().filter(|l| *l == "42").count(), 3, "{stdout}");
+    assert!(stdout.contains(":io"), "{stdout}");
+    assert!(stdout.contains(":conveyed"), "{stdout}");
+    assert!(stdout.contains(":caught"), "{stdout}");
+    assert!(stdout.contains(":rethrow"), "{stdout}");
+    assert!(stdout.contains(":swap-caught"), "{stdout}");
+    assert!(stdout.contains(":apply-caught"), "{stdout}");
+}
+
+#[test]
+fn aot_test_harness_runs_blocking_test_bodies() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("cljrs_fiber_test_harness_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("fiber_test.cljrs"),
+        r#"
+      (ns fiber-test (:require [clojure.test :refer [deftest is]]
+                               [clojure.core.async :as a]))
+      (deftest blocking-test
+        (is (= 42 @(future @(future 42))))
+        (is (= :ready (a/<!! (a/io-thread (sleep 1) :ready)))))
+    "#,
+    )
+    .unwrap();
+    let bin = dir.join("fiber_tests");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let dir = dir.clone();
+            let bin = bin.clone();
+            move || cljrs_compiler::aot::compile_test_harness(&dir, &bin, &[])
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let stdout = run_binary("fiber_tests", &bin);
+    assert!(stdout.contains("2 passed, 0 failed, 0 errors"), "{stdout}");
+}
+
+#[test]
+fn test_aot_resource_failure_exits_cleanly_and_dumps_stats() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    let crate_dir = project.path().join("gas-extension");
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "gas_extension"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+cljrs-interop = {{ path = {:?} }}
+cljrs-runtime = {{ path = {:?} }}
+"#,
+            workspace.join("cljrs-interop").canonicalize().unwrap(),
+            workspace.join("cljrs-runtime").canonicalize().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        crate_dir.join("src/lib.rs"),
+        r#"
+#[unsafe(no_mangle)]
+pub extern "C" fn gas_init(_registry: *mut cljrs_interop::Registry) {
+    std::mem::forget(cljrs_runtime::env::gas::GasGuard::install(
+        cljrs_runtime::env::gas::GasMeter::new(0)));
+}
+"#,
+    )
+    .unwrap();
+    let source = project.path().join("main.cljrs");
+    let binary = project.path().join("resource-failure");
+    let stats = project.path().join("gc-stats.txt");
+    std::fs::write(&source, "(println :unreachable)\n").unwrap();
+    let config = cljrs_project::config::RustConfig {
+        crate_dir,
+        init_fn: Some("gas_extension::gas_init".into()),
+    };
+    let session = common::session(vec![]).rust_config(Some(config));
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || cljrs_compiler::aot::compile_file(&source, &binary, &session)
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let output = Command::new(binary)
+        .env("CLJRS_GC_STATS", &stats)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("gas exhausted"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("stack backtrace"), "{stderr}");
+    assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
+}
+
+#[test]
+fn aot_uncaught_top_level_throw_stops_before_main() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("throw.cljrs");
+    let binary = dir.path().join("throw-bin");
+    let stats = dir.path().join("stats.txt");
+    std::fs::write(
+        &source,
+        r#"
+      (defn -main [] (println :main-must-not-run))
+      (throw (ex-info "top-level boom" {:reason :review}))
+    "#,
+    )
+    .unwrap();
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || cljrs_compiler::aot::compile_file(&source, &binary, &common::session(vec![]))
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let output = Command::new(binary)
+        .env("CLJRS_GC_STATS", &stats)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("top-level boom"), "{stderr}");
+    assert!(!stdout.contains(":main-must-not-run"), "{stdout}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
+}

@@ -7,10 +7,9 @@
 //! * When the top entry is `Region(ptr)`, allocations go into that bump region
 //!   and are freed when the owning [`ScratchGuard`] drops.
 //!
-//! The evaluator pushes a [`ScratchGuard`] on every function call and every
-//! `loop` iteration, and pops it (via [`ScratchGuard::pop_for_return`]) before
-//! evaluating the tail (return) expression so that the return value lands in the
-//! caller's active context.
+//! The evaluator pushes a [`ScratchGuard`] on each function call and loop
+//! iteration. Before the guard drops, it deactivates the scratch destination and
+//! transfers the result's backing scopes into the caller's allocation owner.
 //!
 //! [`StaticCtxGuard`] temporarily forces allocations into the `StaticArena`
 //! regardless of the enclosing region — used for `def`, `atom`, `reset!`, and
@@ -28,6 +27,8 @@ pub(crate) enum AllocCtx {
     Static,
     /// Allocate in the given bump region.
     Region(*mut Region),
+    /// A live tail scope that is no longer an allocation destination.
+    Inactive(*mut Region),
     /// One arena owns every allocation made during an isolated invocation.
     /// Nested function/loop scratch guards and static-sink guards become
     /// no-ops while this entry is active.
@@ -37,18 +38,29 @@ pub(crate) enum AllocCtx {
 // SAFETY: AllocCtx values are only accessed from their owning thread.
 unsafe impl Send for AllocCtx {}
 
+type InvocationCache =
+    std::collections::HashMap<&'static str, std::collections::HashMap<String, usize>>;
+
 thread_local! {
+    /// Boxes cached for the active bounded invocation; cleared with its arena.
+    static INVOCATION_CACHE: RefCell<InvocationCache> = RefCell::new(Default::default());
     /// Thread-local allocation context stack.
     /// Empty ≡ Static (program-startup default).
     pub(crate) static ALLOC_CTX: RefCell<Vec<AllocCtx>> = const { RefCell::new(Vec::new()) };
 }
 crate::mutator_slot!("cljrs-gc/ALLOC_CTX", refcell ALLOC_CTX: Vec<AllocCtx>);
+crate::mutator_slot!("cljrs-gc/INVOCATION_CACHE", refcell INVOCATION_CACHE: InvocationCache);
 
 /// Allocate `value` in the currently active allocation context.
 pub(crate) fn alloc_in_ctx<T: Trace + 'static>(value: T) -> GcPtr<T> {
     ALLOC_CTX.with(|ctx| {
         let ctx = ctx.borrow();
-        match ctx.last() {
+        match ctx
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, AllocCtx::Inactive(_)))
+        {
+            Some(AllocCtx::Inactive(_)) => unreachable!(),
             None | Some(AllocCtx::Static) => static_arena().alloc(value),
             Some(AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr)) => {
                 // SAFETY: The Region pointer is valid while the owning ScratchGuard is live.
@@ -64,7 +76,12 @@ pub(crate) fn alloc_in_ctx<T: Trace + 'static>(value: T) -> GcPtr<T> {
 pub(crate) fn try_alloc_in_ctx<T: Trace + 'static>(value: T) -> Result<GcPtr<T>, AllocError<T>> {
     ALLOC_CTX.with(|ctx| {
         let ctx = ctx.borrow();
-        match ctx.last() {
+        match ctx
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, AllocCtx::Inactive(_)))
+        {
+            Some(AllocCtx::Inactive(_)) => unreachable!(),
             None | Some(AllocCtx::Static) => static_arena().try_alloc(value),
             Some(AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr)) => {
                 // SAFETY: The Region pointer is valid while the owning ScratchGuard is live.
@@ -86,6 +103,26 @@ pub fn invocation_is_active() -> bool {
             .iter()
             .any(|entry| matches!(entry, AllocCtx::Invocation(_)))
     })
+}
+
+/// Look up a raw address cached for the current invocation. Entries expire before its arena.
+pub fn invocation_cache_get(kind: &'static str, key: &str) -> Option<usize> {
+    if !invocation_is_active() {
+        return None;
+    }
+    INVOCATION_CACHE.with(|cache| cache.borrow().get(kind)?.get(key).copied())
+}
+
+/// Cache a raw address owned by the active invocation. It must not enter a program cache.
+pub fn invocation_cache_insert(kind: &'static str, key: String, address: usize) {
+    assert!(invocation_is_active());
+    INVOCATION_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(kind)
+            .or_default()
+            .insert(key, address);
+    });
 }
 
 /// Owns the single bounded arena used by a GC-less isolated invocation.
@@ -133,6 +170,7 @@ impl Drop for InvocationGuard {
             });
             self.in_ctx = false;
         }
+        INVOCATION_CACHE.with(|cache| cache.borrow_mut().clear());
         self.region.reset();
     }
 }
@@ -145,13 +183,12 @@ impl Drop for InvocationGuard {
 /// iteration.  All allocations made between `new()` and `pop_for_return()` land
 /// in the owned scratch region and are freed when this guard drops.
 ///
-/// The "return-expression-in-caller" protocol:
-/// 1. Create `ScratchGuard` → allocations enter the scratch region.
-/// 2. Evaluate all non-tail body forms (intermediates land in scratch).
-/// 3. Call `pop_for_return()` → the scratch is removed from the active context.
-/// 4. Evaluate the tail (return) expression → lands in the caller's context.
-/// 5. `ScratchGuard` drops → scratch memory is reset (intermediates freed).
+/// `pop_for_return()` deactivates allocation while keeping the scope discoverable.
+/// Callers then protect the result's backing scopes in the caller's context.
+/// The guard frees unshared storage when it drops.
 pub struct ScratchGuard {
+    reads: Option<crate::region::ReadScope>,
+    borrowed: crate::region::RegionLease,
     region: Option<Box<Region>>,
     /// Whether the ctx entry is currently on the stack.
     in_ctx: bool,
@@ -159,17 +196,26 @@ pub struct ScratchGuard {
 
 impl ScratchGuard {
     pub fn new() -> Self {
+        Self::with_capacity(4096)
+    }
+
+    /// Create scratch storage with a caller-selected initial chunk size.
+    pub fn with_capacity(capacity: usize) -> Self {
         if invocation_is_active() {
             return Self {
                 region: None,
+                reads: None,
+                borrowed: Default::default(),
                 in_ctx: false,
             };
         }
-        let mut region = Box::new(Region::new());
+        let mut region = Box::new(Region::with_capacity(capacity));
         let ptr = region.as_mut() as *mut Region;
         ALLOC_CTX.with(|ctx| ctx.borrow_mut().push(AllocCtx::Region(ptr)));
         Self {
             region: Some(region),
+            reads: Some(crate::region::ReadScope::nested()),
+            borrowed: Default::default(),
             in_ctx: true,
         }
     }
@@ -180,8 +226,18 @@ impl ScratchGuard {
     /// the stack — the caller's active context.  The scratch region's memory
     /// is still live and readable until `self` drops.
     pub fn pop_for_return(&mut self) {
+        if let Some(reads) = self.reads.take() {
+            self.borrowed = reads.finish();
+        }
         if self.in_ctx {
-            ALLOC_CTX.with(|ctx| ctx.borrow_mut().pop());
+            ALLOC_CTX.with(|ctx| {
+                let mut ctx = ctx.borrow_mut();
+                let Some(AllocCtx::Region(ptr)) = ctx.last_mut() else {
+                    panic!("scratch context out of order")
+                };
+                let ptr = *ptr;
+                *ctx.last_mut().unwrap() = AllocCtx::Inactive(ptr);
+            });
             self.in_ctx = false;
         }
     }
@@ -195,16 +251,69 @@ impl Default for ScratchGuard {
 
 impl Drop for ScratchGuard {
     fn drop(&mut self) {
-        // Pop from ctx if pop_for_return was not yet called.
-        if self.in_ctx {
-            ALLOC_CTX.with(|ctx| ctx.borrow_mut().pop());
-        }
-        // Reset the region: runs destructors on all contained values and
-        // reclaims bump-allocator memory for reuse.
-        if let Some(region) = &mut self.region {
-            region.reset();
+        if let Some(region) = self.region.take() {
+            ALLOC_CTX.with(|ctx| {
+                ctx.borrow_mut().pop();
+            });
+            crate::region::close_scratch_region(region);
         }
     }
+}
+
+/// Install a captured allocation destination for one fiber or task poll.
+pub struct ContextGuard {
+    _owner: crate::region::RegionLease,
+}
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        ALLOC_CTX.with(|ctx| {
+            ctx.borrow_mut().pop();
+        });
+    }
+}
+pub(crate) fn enter_target(
+    region: Option<*mut Region>,
+    owner: crate::region::RegionLease,
+) -> ContextGuard {
+    ALLOC_CTX.with(|ctx| {
+        ctx.borrow_mut()
+            .push(region.map(AllocCtx::Region).unwrap_or(AllocCtx::Static))
+    });
+    ContextGuard { _owner: owner }
+}
+pub(crate) fn current_region() -> Option<*mut Region> {
+    ALLOC_CTX.with(|ctx| {
+        ctx.borrow()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                AllocCtx::Inactive(_) => None,
+                _ => Some(match entry {
+                    AllocCtx::Region(ptr) | AllocCtx::Invocation(ptr) => Some(*ptr),
+                    _ => None,
+                }),
+            })
+            .flatten()
+    })
+}
+pub(crate) fn live_regions() -> Vec<*mut Region> {
+    ALLOC_CTX
+        .try_with(|ctx| {
+            ctx.borrow()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AllocCtx::Region(ptr) | AllocCtx::Inactive(ptr) | AllocCtx::Invocation(ptr) => {
+                        Some(*ptr)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// True when allocations have program lifetime rather than a scratch destination.
+pub fn is_static_context() -> bool {
+    !invocation_is_active() && current_region().is_none_or(|ptr| unsafe { &*ptr }.is_permanent())
 }
 
 // ── StaticCtxGuard ────────────────────────────────────────────────────────────

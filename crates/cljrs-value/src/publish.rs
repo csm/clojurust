@@ -25,16 +25,22 @@
 //! when no region is active, which is the case for virtually every top-level
 //! `def`.
 //!
-//! Only compiled in GC builds; the `no-gc` build keeps its `StaticCtxGuard`
-//! discipline (and debug provenance assertions) instead.
+//! No-gc publication retains backing scopes without copying values. Replaceable
+//! destinations release their ownership edges when the payload changes. Raw
+//! program-lifetime publications retain their actual backing scopes.
 
 use crate::Value;
+#[cfg(not(feature = "no-gc"))]
 use crate::clone::{deserialize, serialize};
+#[cfg(not(feature = "no-gc"))]
 use crate::types::{DelayState, LazySeqState};
+#[cfg(not(feature = "no-gc"))]
 use crate::value::{MapValue, SetValue};
+#[cfg(not(feature = "no-gc"))]
 use cljrs_gc::{GcPtr, Trace};
 
 /// Scan verdict for one value graph.
+#[cfg(not(feature = "no-gc"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scan {
     /// No region-allocated box reachable.
@@ -45,6 +51,7 @@ enum Scan {
     Opaque,
 }
 
+#[cfg(not(feature = "no-gc"))]
 impl Scan {
     fn join(self, other: Scan) -> Scan {
         use Scan::*;
@@ -57,16 +64,15 @@ impl Scan {
 }
 
 /// Tag check for one box.
+#[cfg(not(feature = "no-gc"))]
 fn tag<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
-    if p.is_region_alloc() {
-        Scan::Dirty
-    } else {
-        Scan::Clean
-    }
+    let dirty = p.is_region_alloc();
+    if dirty { Scan::Dirty } else { Scan::Clean }
 }
 
 /// Like [`tag`] but for boxes whose pointee cannot be deep-copied (mutable
 /// identity, closures, native state): a region-tagged box is unrecoverable.
+#[cfg(not(feature = "no-gc"))]
 fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
     if p.is_region_alloc() {
         Scan::Opaque
@@ -75,6 +81,7 @@ fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
     }
 }
 
+#[cfg(not(feature = "no-gc"))]
 fn scan_map(m: &MapValue) -> Scan {
     let mut acc = match m {
         MapValue::Array(p) => tag(p),
@@ -95,6 +102,7 @@ fn scan_map(m: &MapValue) -> Scan {
 /// `Clean` because their contents pass through this same barrier on every
 /// store; heap closures and pending thunks are `Opaque` because their
 /// captured environments are invisible here.
+#[cfg(not(feature = "no-gc"))]
 fn scan(v: &Value) -> Scan {
     use Scan::*;
     match v {
@@ -104,7 +112,6 @@ fn scan(v: &Value) -> Scan {
         | Value::Long(_)
         | Value::Double(_)
         | Value::Char(_)
-        | Value::Uuid(_)
         | Value::ByteBlob(_)
         | Value::SharedAtom(_)
         | Value::Resource(_) => Clean,
@@ -113,6 +120,7 @@ fn scan(v: &Value) -> Scan {
         Value::BigInt(p) => tag(p),
         Value::BigDecimal(p) => tag(p),
         Value::Ratio(p) => tag(p),
+        Value::Uuid(p) => tag(p),
         Value::Str(p) => tag(p),
         Value::Pattern(p) => tag(p),
         Value::Symbol(p) => tag(p),
@@ -154,7 +162,13 @@ fn scan(v: &Value) -> Scan {
         Value::Reduced(inner) => scan(inner),
 
         // Records.
-        Value::TypeInstance(p) => tag(p).join(scan_map(&p.get().fields)),
+        Value::TypeInstance(p) => {
+            if p.get().mutable.is_some() {
+                Opaque
+            } else {
+                tag(p).join(scan_map(&p.get().fields))
+            }
+        }
 
         // Errors: box tag plus the data map / cause chain / thrown value.
         Value::Error(p) => {
@@ -240,6 +254,7 @@ fn scan(v: &Value) -> Scan {
 /// active regions when the value is opaque to the scan.
 ///
 /// Returns the value to store (the original, or its heap-promoted copy).
+#[cfg(not(feature = "no-gc"))]
 pub fn publish_value(v: Value) -> Value {
     // Fast path: no region open on this thread ⇒ nothing reachable from `v`
     // can be region-allocated (region values never outlive their region
@@ -270,9 +285,483 @@ pub fn publish_value(v: Value) -> Value {
     }
 }
 
+/// GC publication uses the same promotion barrier for every destination.
+#[cfg(not(feature = "no-gc"))]
+pub fn publish_for_owner(value: Value, _address: usize) -> Value {
+    publish_value(value)
+}
+
+/// Retain actual backing scopes for an explicit program-lifetime result.
+/// Values preserve their identity and laziness.
+#[cfg(feature = "no-gc")]
+pub fn publish_value(value: Value) -> Value {
+    if !cljrs_gc::alloc_ctx::invocation_is_active() {
+        cljrs_gc::retain_regions_for(&value);
+    }
+    value
+}
+
+#[cfg(feature = "no-gc")]
+pub fn publish_for_owner(value: Value, address: usize) -> Value {
+    publish_for_slot(value, address, 0)
+}
+
+/// Publish one independently replaceable mutable field or array index.
+#[cfg(feature = "no-gc")]
+pub fn publish_for_slot(value: Value, address: usize, slot: usize) -> Value {
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return value;
+    }
+    let (value, _compact) = compact_scalar(value);
+    let lease = cljrs_gc::region::RegionLease::for_value(&value);
+    cljrs_gc::region::AllocationOwner::for_address(address).set_slot(address, slot, &lease);
+    value
+}
+#[cfg(not(feature = "no-gc"))]
+pub fn publish_for_slot(value: Value, _address: usize, _slot: usize) -> Value {
+    publish_value(value)
+}
+/// Publish a field identified by a stable application key.
+pub fn publish_for_named_slot(value: Value, address: usize, slot: String) -> Value {
+    #[cfg(feature = "no-gc")]
+    {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return value;
+        }
+        let (value, _compact) = compact_scalar(value);
+        let lease = cljrs_gc::region::RegionLease::for_value(&value);
+        cljrs_gc::region::AllocationOwner::for_address(address).set_slot(address, slot, &lease);
+        value
+    }
+    #[cfg(not(feature = "no-gc"))]
+    {
+        let _ = (address, slot);
+        publish_value(value)
+    }
+}
+/// Protect a previously published slot while its caller uses the returned value.
+pub fn read_slot(address: usize, slot: usize) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).read_slot(address, slot);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = (address, slot);
+}
+
+/// Borrow a named field while its returned value is in use.
+pub fn read_named_slot(address: usize, slot: String) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).read_slot(address, slot);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = (address, slot);
+}
+
+/// Release cached slots before their containing object is destroyed.
+pub fn clear_slots(address: usize) {
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::AllocationOwner::for_address(address).clear_slots(address);
+    #[cfg(not(feature = "no-gc"))]
+    let _ = address;
+}
+
+/// A payload snapshot held across a callback or replacement.
+pub struct ValueSnapshot {
+    pub value: Value,
+    #[cfg(feature = "no-gc")]
+    pub(crate) lease: cljrs_gc::region::RegionLease,
+}
+impl ValueSnapshot {
+    pub fn protect_current(&self) {
+        #[cfg(feature = "no-gc")]
+        self.lease.protect_read();
+    }
+}
+
+/// Cached backing scopes for a replaceable payload. Regional containers use
+/// replaceable weak edges, while permanent containers own their current payload.
+#[cfg(feature = "no-gc")]
+#[derive(Debug, Default)]
+pub struct ValueLease {
+    owned: Option<cljrs_gc::region::RegionLease>,
+    scoped: cljrs_gc::region::RegionDependency,
+}
+#[cfg(feature = "no-gc")]
+impl ValueLease {
+    pub(crate) fn for_trace(
+        value: &impl cljrs_gc::Trace,
+        owner: &cljrs_gc::region::AllocationOwner,
+    ) -> Self {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Self::default();
+        }
+        Self::from_lease(cljrs_gc::region::RegionLease::for_value(value), owner)
+    }
+    pub fn for_values(values: &[Value], owner: &cljrs_gc::region::AllocationOwner) -> Self {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Self::default();
+        }
+        Self::from_lease(cljrs_gc::region::RegionLease::for_values(values), owner)
+    }
+    fn from_lease(
+        lease: cljrs_gc::region::RegionLease,
+        owner: &cljrs_gc::region::AllocationOwner,
+    ) -> Self {
+        if owner.is_permanent() {
+            Self {
+                owned: Some(lease),
+                scoped: Default::default(),
+            }
+        } else {
+            Self {
+                scoped: owner.replaceable(&lease),
+                owned: None,
+            }
+        }
+    }
+    pub fn snapshot(&self) -> cljrs_gc::region::RegionLease {
+        self.owned
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.scoped.snapshot())
+    }
+    pub(crate) fn reparent(&self, owner: &cljrs_gc::region::AllocationOwner) -> Self {
+        Self::from_lease(self.snapshot(), owner)
+    }
+    pub fn protect_read(&self) {
+        if let Some(lease) = &self.owned {
+            lease.protect_read();
+        } else {
+            self.scoped.protect_read();
+        }
+    }
+    pub fn publish_return(&self) {
+        if let Some(lease) = &self.owned {
+            lease.publish_return();
+        } else {
+            self.scoped.snapshot().publish_return();
+        }
+    }
+    pub fn protect_current(&self) {
+        if let Some(lease) = &self.owned {
+            lease.protect_current();
+        } else {
+            self.scoped.snapshot().protect_current();
+        }
+    }
+}
+
+// Immutable leaf copies retain their logical identity. Collections and mutable
+// values keep their allocation identity and structural sharing unchanged.
+#[cfg(feature = "no-gc")]
+fn compact_scalar(value: Value) -> (Value, Option<cljrs_gc::alloc_ctx::ScratchGuard>) {
+    macro_rules! copy_leaf {
+        ($pointer:expr, $variant:path) => {{
+            let pointer = $pointer;
+            if pointer.is_static_alloc() || pointer.is_relocated_immutable() {
+                return ($variant(pointer), None);
+            }
+            let arena = cljrs_gc::alloc_ctx::ScratchGuard::with_capacity(
+                std::mem::size_of_val(pointer.get()) + 32,
+            );
+            // SAFETY: each matched type is an immutable scalar with a value-preserving Clone.
+            let copy = unsafe { pointer.clone_immutable() };
+            return ($variant(copy), Some(arena));
+        }};
+    }
+    match value {
+        Value::Str(p) if p.get().len() <= 4096 => copy_leaf!(p, Value::Str),
+        Value::Uuid(p) => copy_leaf!(p, Value::Uuid),
+        Value::BigInt(p) if p.get().bits() <= 32768 => copy_leaf!(p, Value::BigInt),
+        Value::Ratio(p)
+            if p.get()
+                .numer()
+                .bits()
+                .saturating_add(p.get().denom().bits())
+                <= 32768 =>
+        {
+            copy_leaf!(p, Value::Ratio)
+        }
+        other => (other, None),
+    }
+}
+
+#[cfg(feature = "no-gc")]
+pub(crate) fn prepare_definition(
+    value: Value,
+    owner: &cljrs_gc::region::AllocationOwner,
+) -> (Value, ValueLease) {
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return prepare_for_owner(value, owner);
+    }
+    // Bound compaction by both work and depth. Large/shared payloads keep
+    // their persistent representation and acquire ownership without rebuilding it.
+    fn worth_copying(value: &Value) -> bool {
+        let mut pending = vec![(value.clone(), 0usize)];
+        let mut remaining = 128usize;
+        let mut needs_copy = false;
+        while let Some((value, depth)) = pending.pop() {
+            if remaining == 0 || depth > 32 {
+                return false;
+            }
+            remaining -= 1;
+            macro_rules! leaf {
+                ($p:expr, $bounded:expr) => {{
+                    let p = $p;
+                    if !p.is_static_alloc() && !p.is_relocated_immutable() {
+                        if !$bounded {
+                            return false;
+                        }
+                        needs_copy = true;
+                    }
+                }};
+            }
+            macro_rules! children {
+                ($p:expr, $iter:expr) => {{
+                    let p = $p;
+                    if !p.is_static_alloc() && !p.is_relocated_immutable() {
+                        needs_copy = true;
+                        for child in $iter(&p) {
+                            if pending.len() >= remaining {
+                                return false;
+                            }
+                            pending.push((child, depth + 1));
+                        }
+                    }
+                }};
+            }
+            match value {
+                Value::Str(p) => {
+                    let bounded = p.get().len() <= 4096;
+                    leaf!(p, bounded);
+                }
+                Value::BigInt(p) => {
+                    let bounded = p.get().bits() <= 32768;
+                    leaf!(p, bounded);
+                }
+                Value::Ratio(p) => {
+                    let bounded = p
+                        .get()
+                        .numer()
+                        .bits()
+                        .saturating_add(p.get().denom().bits())
+                        <= 32768;
+                    leaf!(p, bounded);
+                }
+                Value::BigDecimal(p) => {
+                    let bounded = p.get().digits() <= 9865;
+                    leaf!(p, bounded);
+                }
+                Value::Uuid(p) => leaf!(p, true),
+                Value::Symbol(p) => leaf!(p, true),
+                Value::Keyword(p) => leaf!(p, true),
+                Value::Cons(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::CljxCons>| [
+                    p.get().head.clone(),
+                    p.get().tail.clone()
+                ]),
+                Value::Vector(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentVector>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::List(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentList>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::Queue(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentQueue>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::Map(crate::MapValue::Array(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentArrayMap>| p
+                        .get()
+                        .iter()
+                        .take(65)
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>())
+                }
+                Value::Map(crate::MapValue::Hash(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentHashMap>| p
+                        .get()
+                        .iter()
+                        .take(65)
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>())
+                }
+                Value::Set(crate::SetValue::Hash(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentHashSet>| p
+                        .get()
+                        .iter()
+                        .take(129)
+                        .cloned()
+                        .collect::<Vec<_>>())
+                }
+                _ => {}
+            }
+        }
+        needs_copy
+    }
+    if !worth_copying(&value) {
+        return prepare_for_owner(value, owner);
+    }
+    let _compact = cljrs_gc::alloc_ctx::ScratchGuard::with_capacity(256);
+    fn copy(value: Value, memo: &mut std::collections::HashMap<usize, Value>) -> Value {
+        macro_rules! leaf {
+            ($pointer:expr, $variant:path) => {{
+                let p = $pointer;
+                if p.is_static_alloc() || p.is_relocated_immutable() {
+                    return $variant(p);
+                }
+                let address = p.get() as *const _ as usize;
+                if let Some(value) = memo.get(&address) {
+                    return value.clone();
+                }
+                // SAFETY: this is an immutable leaf; cloning preserves its value.
+                let value = $variant(unsafe { p.clone_immutable() });
+                memo.insert(address, value.clone());
+                value
+            }};
+        }
+        macro_rules! collection {
+            ($pointer:expr, $variant:expr, $data:expr) => {{
+                let p = $pointer;
+                let address = p.get() as *const _ as usize;
+                if p.is_static_alloc() || p.is_relocated_immutable() {
+                    ($variant)(p)
+                } else if let Some(value) = memo.get(&address) {
+                    value.clone()
+                } else {
+                    let data = $data(&p, memo);
+                    // SAFETY: only immutable collections are rebuilt; every child's identity is preserved.
+                    let value = ($variant)(unsafe { p.relocate_immutable(data) });
+                    memo.insert(address, value.clone());
+                    value
+                }
+            }};
+        }
+        match value {
+            Value::Str(p) => leaf!(p, Value::Str),
+            Value::Uuid(p) => leaf!(p, Value::Uuid),
+            Value::BigInt(p) => leaf!(p, Value::BigInt),
+            Value::BigDecimal(p) => leaf!(p, Value::BigDecimal),
+            Value::Ratio(p) => leaf!(p, Value::Ratio),
+            Value::Symbol(p) => leaf!(p, Value::Symbol),
+            Value::Keyword(p) => leaf!(p, Value::Keyword),
+            Value::Queue(p) => collection!(
+                p,
+                Value::Queue,
+                |p: &cljrs_gc::GcPtr<crate::PersistentQueue>, memo: &mut _| {
+                    p.get()
+                        .iter()
+                        .cloned()
+                        .fold(crate::PersistentQueue::empty(), |queue, value| {
+                            queue.conj(copy(value, memo))
+                        })
+                }
+            ),
+            Value::Cons(p) => collection!(
+                p,
+                Value::Cons,
+                |p: &cljrs_gc::GcPtr<crate::CljxCons>, memo: &mut _| crate::CljxCons {
+                    head: copy(p.get().head.clone(), memo),
+                    tail: copy(p.get().tail.clone(), memo)
+                }
+            ),
+            Value::List(p) => collection!(
+                p,
+                Value::List,
+                |p: &cljrs_gc::GcPtr<crate::PersistentList>, memo: &mut _| {
+                    crate::PersistentList::from_iter(p.get().iter().cloned().map(|v| copy(v, memo)))
+                }
+            ),
+            Value::Vector(p) => collection!(
+                p,
+                Value::Vector,
+                |p: &cljrs_gc::GcPtr<crate::PersistentVector>, memo: &mut _| {
+                    let values: Vec<_> = p.get().iter().cloned().map(|v| copy(v, memo)).collect();
+                    if p.get().is_map_entry() {
+                        crate::PersistentVector::map_entry(values[0].clone(), values[1].clone())
+                    } else {
+                        crate::PersistentVector::from_iter(values)
+                    }
+                }
+            ),
+            Value::Map(crate::MapValue::Array(p)) => collection!(
+                p,
+                |p| Value::Map(crate::MapValue::Array(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentArrayMap>, memo: &mut _| {
+                    let crate::collections::array_map::AssocResult::Array(map) =
+                        crate::PersistentArrayMap::from_pairs(
+                            p.get()
+                                .iter()
+                                .map(|(k, v)| (copy(k.clone(), memo), copy(v.clone(), memo))),
+                        )
+                    else {
+                        unreachable!("compaction preserves map keys")
+                    };
+                    map
+                }
+            ),
+            Value::Map(crate::MapValue::Hash(p)) => collection!(
+                p,
+                |p| Value::Map(crate::MapValue::Hash(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentHashMap>, memo: &mut _| {
+                    crate::PersistentHashMap::from_pairs(
+                        p.get()
+                            .iter()
+                            .map(|(k, v)| (copy(k.clone(), memo), copy(v.clone(), memo))),
+                    )
+                }
+            ),
+            Value::Set(crate::SetValue::Hash(p)) => collection!(
+                p,
+                |p| Value::Set(crate::SetValue::Hash(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentHashSet>, memo: &mut _| {
+                    crate::PersistentHashSet::from_iter(
+                        p.get().iter().cloned().map(|v| copy(v, memo)),
+                    )
+                }
+            ),
+            other => other,
+        }
+    }
+    let value = copy(value, &mut Default::default());
+    prepare_for_owner(value, owner)
+}
+
+/// Prepare a replaceable payload without copying identity-bearing values.
+#[cfg(feature = "no-gc")]
+pub fn prepare_for_owner(
+    value: Value,
+    owner: &cljrs_gc::region::AllocationOwner,
+) -> (Value, ValueLease) {
+    use cljrs_gc::region::RegionLease;
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return (value, Default::default());
+    }
+    let (value, _compact) = compact_scalar(value);
+    let lease = RegionLease::for_value(&value);
+    let cached = ValueLease::from_lease(lease, owner);
+    (value, cached)
+}
+
+/// Transfer a result into its caller without retaining unrelated scratch data.
+#[cfg(feature = "no-gc")]
+pub fn publish_return(value: Value) -> Value {
+    if cljrs_gc::alloc_ctx::is_static_context() && !cljrs_gc::region::ReadScope::is_active() {
+        publish_value(value)
+    } else {
+        cljrs_gc::region::RegionLease::for_value(&value).protect_current();
+        value
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 mod tests {
     use super::*;
     use crate::PersistentVector;

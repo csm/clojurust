@@ -247,3 +247,37 @@ fn memory_limit_fault_survives_future_settlement() {
         ));
     });
 }
+
+#[test]
+fn declared_task_captures_survive_collection_before_the_first_poll() {
+    block_on_local(async {
+        let globals = async_env();
+        let env = Env::new(globals, "user");
+        let frame = cljrs_gc::push_alloc_frame();
+        let capture = Value::string("declared capture");
+        let future =
+            cljrs_async::spawn_future_with_roots(vec![capture.clone()], async move { Ok(capture) });
+        let _future_root = cljrs_runtime::env::gc_roots::root_value(&future);
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let done = completed.clone();
+        cljrs_async::spawn_future(async move {
+            done.set(true);
+            Ok(Value::Nil)
+        });
+        drop(frame);
+        cljrs_runtime::env::gc_roots::force_collect(&env);
+        cljrs_runtime::env::gc_roots::force_collect(&env);
+        assert_eq!(
+            cljrs_async::await_value(future.clone())
+                .await
+                .unwrap()
+                .to_string(),
+            "\"declared capture\""
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            completed.get(),
+            "an ignored task lost its result cell before polling"
+        );
+    });
+}

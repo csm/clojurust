@@ -8,7 +8,9 @@ use cljrs_runtime::interp::apply::select_arity;
 use cljrs_value::{NativeObjectBox, PersistentList, Value};
 
 use crate::channel::CljChannel;
-use crate::eval_async::{run_async_fn, spawn_future};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::eval_async::spawn_future;
+use crate::eval_async::{run_async_fn, spawn_future_with_roots};
 use crate::state_machine::{
     lookup_poll_fn, lookup_poll_fn_named, mark_compile_attempted, spawn_state_machine,
 };
@@ -81,12 +83,23 @@ impl AsyncRuntime for AsyncRuntimeImpl {
         // `spawn_future` keeps the task on the current LocalSet thread, so the
         // `!Send` Clojure values (env, args, GcPtrs) never cross threads, and
         // delivers the body's result into the returned Future.
-        spawn_future(async move { run_async_fn(callee, args, &env).await })
+        let mut roots = args.clone();
+        roots.push(callee.clone());
+        spawn_future_with_roots(roots, async move { run_async_fn(callee, args, &env).await })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::result_large_err)]
+    fn spawn_fiber_call(&self, callee: Value, args: Vec<Value>, env: Env) -> EvalResult {
+        Ok(spawn_future(
+            call_fiber(callee, args, env, Vec::new())?.into_task(),
+        ))
     }
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
-        Ok(ch.take_blocking())
+        cljrs_value::parking::block_on(ch.take_result())
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
     }
 
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()> {
@@ -97,6 +110,41 @@ impl AsyncRuntime for AsyncRuntimeImpl {
             Err(EvalError::Runtime("chan-put: channel is closed".into()))
         }
     }
+}
+
+/// Build a call fiber without an intermediate future cell or delivery fiber.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+pub(crate) fn call_fiber(
+    callee: Value,
+    args: Vec<Value>,
+    mut env: Env,
+    mut roots: Vec<Value>,
+) -> Result<crate::fiber::Fiber, EvalError> {
+    use cljrs_runtime::env::{dynamics, gas};
+    #[cfg(feature = "no-gc")]
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return Err(EvalError::Runtime(
+            "cannot spawn a fiber from an isolated allocation invocation".into(),
+        ));
+    }
+    let bindings = dynamics::capture_current();
+    let meters = gas::active_meters();
+    let interrupts = gas::active_interrupts();
+    roots.push(callee.clone());
+    roots.extend(args.iter().cloned());
+    roots.extend(
+        env.frames
+            .iter()
+            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
+    );
+    roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
+    crate::fiber::Fiber::with_roots(roots, move || {
+        dynamics::install_frames(bindings);
+        let _interrupts = gas::InterruptScope::enter(&interrupts);
+        let _meters = gas::install_meters(&meters);
+        cljrs_runtime::env::apply::apply_value(&callee, args, &mut env)
+    })
 }
 
 /// Pack args for a compiled (native) async state machine.

@@ -11,7 +11,7 @@ use crate::env::env::{Env, RequireRefer, RequireSpec};
 use crate::env::error::{EvalError, EvalResult};
 use crate::env::loader::load_ns;
 use crate::interp::destructure::bind_pattern;
-use crate::interp::eval::{eval, eval_body, is_special_form};
+use crate::interp::eval::{eval_body, eval_unscoped as eval, is_special_form};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -63,17 +63,13 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
     let target = parse_def(args, env)?;
-    let val = match target.value_form {
-        Some(form) => {
-            // Under no-gc: def value expressions go to the StaticArena since the
-            // Var must outlive all scratch regions.
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-            eval(form, env)?
-        }
-        None => Value::Nil,
-    };
-    intern_def(target, val, env)
+    crate::interp::eval::with_scratch(|| {
+        let val = match target.value_form {
+            Some(form) => eval(form, env)?,
+            None => Value::Nil,
+        };
+        intern_def(target, val, env)
+    })
 }
 
 /// A parsed `(def name "doc"? value?)`: everything but the value itself.
@@ -283,7 +279,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Eagerly lower each arity to IR if the compiler is ready.
     //eager_lower_fn(&cljrs_fn, env);
 
-    let mut ptr = GcPtr::new(cljrs_fn);
+    let mut ptr = GcPtr::new_isolated(cljrs_fn);
     // For named anonymous functions (fn g ...), store a back-pointer so that
     // the self-reference returned from the body is pointer-equal to the outer
     // binding — required for `(= f (f))` to be `true`.
@@ -743,11 +739,26 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     let patterns: Vec<Form> = bindings.iter().step_by(2).cloned().collect();
     let mut current_vals: Vec<Value> = Vec::new();
 
-    // Evaluate initial values.
+    #[cfg(feature = "no-gc")]
+    let mut initial_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
     for i in (1..bindings.len()).step_by(2) {
-        current_vals.push(eval(&bindings[i], env)?);
+        match eval(&bindings[i], env) {
+            Ok(value) => current_vals.push(value),
+            Err(error) => {
+                #[cfg(feature = "no-gc")]
+                {
+                    initial_scope.pop_for_return();
+                    return crate::interp::eval::publish_result(Err(error), None);
+                }
+                #[cfg(not(feature = "no-gc"))]
+                return Err(error);
+            }
+        }
     }
-
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::for_values(&current_vals);
+    #[cfg(feature = "no-gc")]
+    drop(initial_scope);
     loop {
         // Root current_vals so they survive GC — they're not yet bound in env.
         let _vals_root = crate::env::gc_roots::root_values(&current_vals);
@@ -780,12 +791,17 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                 bind_pattern(pat, val.clone(), env)?;
             }
 
-            // Under no-gc: pop scratch before tail expression so the return value
-            // or recur args are allocated in the enclosing scope's context.
+            // Under no-gc: transfer return/recur backing scopes into the
+            // enclosing destination before this iteration releases scratch.
             #[cfg(not(feature = "no-gc"))]
             let result = eval_body_recur(body, env);
             #[cfg(feature = "no-gc")]
-            let result = eval_body_with_scratch_loop(body, &mut scratch, env);
+            let result = crate::interp::apply::eval_body_with_scratch(
+                body,
+                &mut scratch,
+                &mut recur_lease,
+                env,
+            );
 
             result
         });
@@ -802,8 +818,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
-                // new_vals were evaluated in the caller's context (scratch was
-                // popped before the tail form), so they survive the reset.
+                // Ownership of new_vals was transferred to the enclosing
+                // destination, so they survive this iteration's scratch guard.
                 current_vals = new_vals;
             }
             Err(e) => return Err(e),
@@ -826,28 +842,6 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
         result = eval(form, env)?;
     }
     Ok(result)
-}
-
-/// Under `no-gc`: eval loop body with scratch-region semantics.
-///
-/// Evaluates all non-tail forms inside the scratch region, then pops the
-/// scratch before the tail (return/recur) expression so it lands in the
-/// caller's context.
-#[cfg(feature = "no-gc")]
-fn eval_body_with_scratch_loop(
-    body: &[Form],
-    scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
-    env: &mut Env,
-) -> EvalResult {
-    if body.is_empty() {
-        scratch.pop_for_return();
-        return Ok(Value::Nil);
-    }
-    for form in &body[..body.len() - 1] {
-        eval(form, env)?;
-    }
-    scratch.pop_for_return();
-    eval(&body[body.len() - 1], env)
 }
 
 // ── quote ─────────────────────────────────────────────────────────────────────
@@ -1187,6 +1181,10 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
 // ── defn ──────────────────────────────────────────────────────────────────────
 
 pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
+    crate::interp::eval::with_scratch(|| eval_defn_inner(args, env, private))
+}
+
+fn eval_defn_inner(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
     // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
     let name_form = args
         .first()
@@ -1220,10 +1218,6 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
-    // Under no-gc: the Fn object must live in the StaticArena since the Var
-    // intern outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let mut fn_val = eval_fn(&fn_args, env)?;
     if is_async && let Value::Fn(ref mut f) = fn_val {
         f.get_mut().is_async = true;
@@ -1332,7 +1326,7 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
         Value::Fn(f) => {
             let mut mfn = f.get().clone();
             mfn.is_macro = true;
-            Value::Macro(GcPtr::new(mfn))
+            Value::Macro(GcPtr::new_isolated(mfn))
         }
         other => other,
     };
@@ -1925,7 +1919,8 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
     for (_, fn_val) in &built {
         if let Value::Fn(ptr) = fn_val {
             let mut ptr = ptr.clone();
-            let f = ptr.get_mut();
+            #[allow(unused_mut)]
+            let mut f = ptr.get_mut();
             for i in 0..f.closed_over_names.len() {
                 let captured = f.closed_over_names[i].clone();
                 if let Some((_, real)) = built.iter().find(|(n, _)| *n == captured) {
@@ -2044,7 +2039,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
     }
     // Name metadata belongs on the var `defprotocol` binds, not here.
     let (name, _) = require_sym_meta(args, 0, "protocol*", env)?;
-    let specs = crate::interp::eval::eval(&args[1], env)?;
+    let specs = crate::interp::eval::eval_unscoped(&args[1], env)?;
     let specs: Vec<Value> = match specs.unwrap_meta() {
         Value::Vector(v) => v.get().iter().cloned().collect(),
         Value::Nil => Vec::new(),
@@ -2061,7 +2056,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
         .collect::<EvalResult<Vec<_>>>()?;
     let extend_via_metadata = match args.get(2) {
         Some(f) => !matches!(
-            crate::interp::eval::eval(f, env)?,
+            crate::interp::eval::eval_unscoped(f, env)?,
             Value::Nil | Value::Bool(false)
         ),
         None => false,
@@ -2196,7 +2191,7 @@ fn build_impl_fn(
         false,
         Arc::clone(&env.current_ns),
     );
-    Ok(Value::Fn(GcPtr::new(cljrs_fn)))
+    Ok(Value::Fn(GcPtr::new_isolated(cljrs_fn)))
 }
 
 // ── binding ───────────────────────────────────────────────────────────────────
@@ -2397,12 +2392,9 @@ fn register_impls_for_tag(
                     None => continue,
                 };
                 let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
-                let mut impls = proto.get().impls.lock().unwrap();
-                impls
-                    .entry(type_tag.clone())
-                    .or_default()
-                    .insert(method_name, fn_val);
-                drop(impls);
+                proto
+                    .get()
+                    .set_implementation(type_tag.clone(), method_name, fn_val);
                 cljrs_value::bump_protocol_generation();
             }
             _ => {}

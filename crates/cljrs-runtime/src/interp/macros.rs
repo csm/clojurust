@@ -10,8 +10,45 @@ use std::sync::Arc;
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult};
 
-/// Expand a form one step.  Returns the same form if it is not a macro call.
+fn with_expansion_reads(body: impl FnOnce() -> EvalResult<Form>) -> EvalResult<Form> {
+    #[cfg(feature = "no-gc")]
+    let scratch = if !cljrs_gc::region::ReadScope::is_active()
+        && !cljrs_gc::alloc_ctx::invocation_is_active()
+    {
+        Some(cljrs_gc::alloc_ctx::ScratchGuard::new())
+    } else {
+        None
+    };
+    let result = body();
+    #[cfg(feature = "no-gc")]
+    if let Some(mut scratch) = scratch {
+        scratch.pop_for_return();
+        return match result {
+            Ok(form) => Ok(form),
+            Err(error) => match crate::interp::eval::publish_result(Err(error), None) {
+                Err(error) => Err(error),
+                Ok(_) => unreachable!(),
+            },
+        };
+    }
+    result
+}
+
+/// Expand a form once, owning borrowed values until the returned form is built.
 pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    with_expansion_reads(|| macroexpand_1_inner(form, env))
+}
+/// Expand the head to a fixed point within a scoped ownership boundary.
+pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    with_expansion_reads(|| macroexpand_inner(form, env))
+}
+/// Expand every eligible subform within a scoped ownership boundary.
+pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
+    with_expansion_reads(|| macroexpand_all_inner(form, env))
+}
+
+/// Expand a form one step.  Returns the same form if it is not a macro call.
+fn macroexpand_1_inner(form: &Form, env: &mut Env) -> EvalResult<Form> {
     // Only expand list forms whose head is a macro symbol.
     if let FormKind::List(parts) = &form.kind
         && let Some(FormKind::Symbol(s)) = parts.first().map(|f| &f.kind)
@@ -80,7 +117,7 @@ pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
 }
 
 /// Fully expand a form until the head is no longer a macro.
-pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
+fn macroexpand_inner(form: &Form, env: &mut Env) -> EvalResult<Form> {
     let mut current = form.clone();
     loop {
         // `macroexpand_1` returns an unchanged clone for non-macro forms.  Do
@@ -96,7 +133,7 @@ pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
             return Ok(current);
         }
 
-        let expanded = macroexpand_1(&current, env)?;
+        let expanded = macroexpand_1_inner(&current, env)?;
         if expanded == current {
             return Ok(current);
         }
@@ -108,9 +145,9 @@ pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
 ///
 /// First expands the top-level form, then walks into sub-forms.
 /// Special forms like `quote` are not walked into.
-pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
+fn macroexpand_all_inner(form: &Form, env: &mut Env) -> EvalResult<Form> {
     // First, expand the top level.
-    let expanded = macroexpand(form, env)?;
+    let expanded = macroexpand_inner(form, env)?;
 
     let span = expanded.span.clone();
     let kind = match &expanded.kind {
@@ -133,7 +170,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                             // Single arity: (fn* [params] body...)
                             new_parts.push(parts[1].clone()); // params
                             for p in &parts[2..] {
-                                new_parts.push(macroexpand_all(p, env)?);
+                                new_parts.push(macroexpand_all_inner(p, env)?);
                             }
                         } else {
                             // Multi-arity: (fn* ([params] body) ...)
@@ -144,7 +181,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                                         new_arity.push(params.clone()); // param vector
                                     }
                                     for p in arity_parts.iter().skip(1) {
-                                        new_arity.push(macroexpand_all(p, env)?);
+                                        new_arity.push(macroexpand_all_inner(p, env)?);
                                     }
                                     new_parts.push(Form::new(
                                         FormKind::List(new_arity),
@@ -170,7 +207,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                                 if i % 2 == 0 {
                                     new_bindings.push(b.clone()); // binding name
                                 } else {
-                                    new_bindings.push(macroexpand_all(b, env)?);
+                                    new_bindings.push(macroexpand_all_inner(b, env)?);
                                 }
                             }
                             new_parts.push(Form::new(
@@ -181,7 +218,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                             new_parts.push(parts[1].clone());
                         }
                         for p in &parts[2..] {
-                            new_parts.push(macroexpand_all(p, env)?);
+                            new_parts.push(macroexpand_all_inner(p, env)?);
                         }
                     }
                     FormKind::List(new_parts)
@@ -191,7 +228,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
                     // Generic: expand all sub-forms
                     let new_parts = parts
                         .iter()
-                        .map(|p| macroexpand_all(p, env))
+                        .map(|p| macroexpand_all_inner(p, env))
                         .collect::<EvalResult<Vec<_>>>()?;
                     FormKind::List(new_parts)
                 }
@@ -200,24 +237,27 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
         FormKind::Vector(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| macroexpand_all_inner(i, env))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Vector(new_items)
         }
         FormKind::Map(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| macroexpand_all_inner(i, env))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Map(new_items)
         }
         FormKind::Set(items) => {
             let new_items = items
                 .iter()
-                .map(|i| macroexpand_all(i, env))
+                .map(|i| macroexpand_all_inner(i, env))
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Set(new_items)
         }
+        // Reader dereference evaluates its operand, so nested macros must
+        // expand before IR/AOT lowering just as in an explicit deref call.
+        FormKind::Deref(inner) => FormKind::Deref(Box::new(macroexpand_all_inner(inner, env)?)),
         // Atoms, keywords, strings, etc. — no sub-forms.
         _ => return Ok(expanded),
     };

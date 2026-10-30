@@ -57,10 +57,14 @@ pub(crate) struct Snapshot<T: cljrs_gc::Trace + 'static> {
     data: Box<T>,
     #[cfg(feature = "no-gc")]
     data: T,
+    #[cfg(feature = "no-gc")]
+    _lease: cljrs_gc::region::RegionLease,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl<T: cljrs_gc::Trace + 'static> Snapshot<T> {
     pub(crate) fn new(data: T) -> Self {
+        #[cfg(feature = "no-gc")]
+        let lease = cljrs_gc::region::RegionLease::for_value(&data);
         #[cfg(not(feature = "no-gc"))]
         let data = {
             let data = Box::new(data);
@@ -73,6 +77,8 @@ impl<T: cljrs_gc::Trace + 'static> Snapshot<T> {
         };
         Self {
             data,
+            #[cfg(feature = "no-gc")]
+            _lease: lease,
             _not_send: std::marker::PhantomData,
         }
     }

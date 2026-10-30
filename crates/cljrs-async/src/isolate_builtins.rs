@@ -43,7 +43,7 @@ use cljrs_value::{
     ValueResult, gc_native_object,
 };
 
-use crate::eval_async::spawn_future;
+use crate::eval_async::spawn_future_with_roots;
 use crate::isolate_channel::{
     IsolateReceiver, IsolateRecv, IsolateSender, isolate_channel, isolate_channel_with_limit,
 };
@@ -214,7 +214,7 @@ fn builtin_isolate_poll(args: &[Value]) -> ValueResult<Value> {
 /// the channel is closed and drained. Parks (yields) while the channel is empty.
 fn builtin_isolate_take(args: &[Value]) -> ValueResult<Value> {
     let rx = rx_arg(args)?;
-    Ok(spawn_future(async move {
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
         loop {
             let status = {
                 let mut guard = rx_ref(rx.get())

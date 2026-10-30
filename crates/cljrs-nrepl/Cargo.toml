@@ -17,6 +17,7 @@ small-regex = ["cljrs-value/small-regex", "cljrs-runtime/small-regex"]
 
 # Pass-through for cljrs-runtime's git-backed dependency support.
 deps = ["cljrs-runtime/deps"]
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-runtime/no-gc"]
 
 [dependencies]
 cljrs-runtime = { workspace = true }

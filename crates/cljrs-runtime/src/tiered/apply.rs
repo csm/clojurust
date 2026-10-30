@@ -415,6 +415,10 @@ fn call_jit_native(
     // (while the alloc frame still roots it), exactly as Tier-1 would have
     // propagated it — and so a stale slot cannot misfire a later `rt_try`.
     let pending_exception = caller_env.globals.jit().take_pending_exception();
+    let resource_error = caller_env.globals.jit().take_pending_resource_error();
+    if let Some(error) = resource_error {
+        return Err(crate::env::error::value_error_to_eval_error(error));
+    }
     if gas_exhausted {
         return Err(crate::env::error::EvalError::GasExhausted);
     }
