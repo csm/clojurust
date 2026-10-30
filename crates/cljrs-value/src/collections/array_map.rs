@@ -198,6 +198,10 @@ impl PartialEq for PersistentArrayMap {
 }
 
 impl cljrs_gc::Trace for PersistentArrayMap {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for v in self.entries.iter() {
             v.trace(visitor);

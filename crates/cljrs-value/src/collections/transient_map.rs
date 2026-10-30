@@ -21,7 +21,7 @@ pub struct TransientMap {
     revision: AtomicU64,
     keys_may_realize: AtomicBool,
     #[cfg(feature = "no-gc")]
-    initial: PersistentHashMap,
+    initial: std::cell::RefCell<crate::publish::ValueLease>,
 }
 
 impl TransientMap {
@@ -31,7 +31,7 @@ impl TransientMap {
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            initial: PersistentHashMap::empty(),
+            initial: Default::default(),
             keys_may_realize: AtomicBool::new(false),
         }
     }
@@ -42,7 +42,10 @@ impl TransientMap {
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            initial: map.clone(),
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                map,
+                &Default::default(),
+            )),
             keys_may_realize: AtomicBool::new(!map.keys_inert()),
         }
     }
@@ -207,7 +210,10 @@ impl Clone for TransientMap {
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            initial: self.map.lock().unwrap().clone(),
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                &self.map.lock().unwrap().clone(),
+                &Default::default(),
+            )),
             keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
@@ -229,9 +235,14 @@ impl ClojureHash for TransientMap {
 
 impl cljrs_gc::Trace for TransientMap {
     #[cfg(feature = "no-gc")]
-    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        self.initial.trace(visitor);
+    fn init_ownership(&self) {
+        let address = self as *const _ as usize;
+        let owner = cljrs_gc::region::AllocationOwner::for_address(address);
+        let lease = self.initial.borrow().reparent(&owner);
+        *self.initial.borrow_mut() = lease;
     }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {

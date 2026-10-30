@@ -171,6 +171,10 @@ pub struct ProtocolFn {
 }
 
 impl cljrs_gc::Trace for ProtocolFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         visitor.visit(&self.protocol);
@@ -456,6 +460,8 @@ fn refresh_watch_lease(
 /// and lives on the binding stack, not in the var root.
 #[derive(Debug)]
 pub struct Var {
+    #[cfg(feature = "no-gc")]
+    read_epoch: std::cell::Cell<u64>,
     pub namespace: Arc<str>,
     pub name: Arc<str>,
     pub value: TrackedMutex<Option<Value>>,
@@ -481,6 +487,8 @@ impl Var {
             namespace: namespace.into(),
             name: name.into(),
             value: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            read_epoch: Default::default(),
             #[cfg(feature = "no-gc")]
             value_lease: Default::default(),
             shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
@@ -528,6 +536,8 @@ impl Var {
             name: name.into(),
             value: TrackedMutex::new(local),
             #[cfg(feature = "no-gc")]
+            read_epoch: Default::default(),
+            #[cfg(feature = "no-gc")]
             value_lease: std::cell::RefCell::new(lease),
             shared_root,
             is_macro,
@@ -559,7 +569,12 @@ impl Var {
     pub fn deref(&self) -> Option<Value> {
         let value = self.value.lock().unwrap().clone();
         #[cfg(feature = "no-gc")]
-        self.value_lease.borrow().protect_read();
+        {
+            let epoch = cljrs_gc::region::ReadScope::epoch();
+            if epoch == 0 || self.read_epoch.replace(epoch) != epoch {
+                self.value_lease.borrow().protect_read();
+            }
+        }
         value
     }
 
@@ -583,6 +598,8 @@ impl Var {
     }
 
     pub fn bind(&self, v: Value) {
+        #[cfg(feature = "no-gc")]
+        self.read_epoch.set(0);
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         #[cfg(feature = "no-gc")]
@@ -1169,6 +1186,10 @@ impl std::fmt::Debug for NativeFn {
 }
 
 impl cljrs_gc::Trace for NativeFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for value in self.captures.iter() {
             value.trace(visitor);
@@ -1274,6 +1295,10 @@ impl CljxFn {
 }
 
 impl cljrs_gc::Trace for CljxFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         for v in &self.closed_over_vals {
@@ -1310,6 +1335,10 @@ pub struct BoundFn {
 }
 
 impl cljrs_gc::Trace for BoundFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.wrapped.trace(visitor);
         for val in self.captured_bindings.values() {
@@ -1567,6 +1596,10 @@ pub struct CljxCons {
 }
 
 impl cljrs_gc::Trace for CljxCons {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.head.trace(visitor);
         self.tail.trace(visitor);

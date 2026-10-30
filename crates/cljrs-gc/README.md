@@ -332,11 +332,15 @@ impl InvocationGuard {
     pub fn object_count(&self) -> usize;
 }
 pub fn invocation_is_active() -> bool;
+pub fn invocation_cache_get(kind: &'static str, key: &str) -> Option<usize>;
+pub fn invocation_cache_insert(kind: &'static str, key: String, address: usize);
 ```
 
 All `GcPtr::new` calls within the guard use its single arena, including calls
 made beneath evaluator scratch/static guards. Copy or serialize results before
 the guard drops.
+The invocation cache holds raw addresses owned by that arena. The guard clears the cache before releasing its storage.
+Callers must keep these addresses out of program caches and compiled call-site slots.
 
 Bump allocator for short-lived objects. ~2.6x faster than `GcHeap::alloc`
 (no mutex, no `Box::new`). Objects are NOT in the GC heap linked list.
@@ -777,6 +781,9 @@ Dropping that slot removes its edges. Other slots and durable stores retain thei
 `region::ReadScope::enter() -> Option<ReadScope>` starts the outermost evaluation read scope.
 Nested calls return `None`. Bounded invocations also return `None`.
 `ReadScope::is_active()` identifies an active read scope.
+`ReadScope::epoch() -> u64` identifies the current borrowing lifetime; zero means there is no scope.
+Nested scopes and task polls change the epoch. Fibers save it with their mutator state.
+Var reads use it to acquire ownership once per binding and scope.
 `finish(self) -> RegionLease` removes the scope and returns its leases while the final result escapes.
 Drop releases a scope on unwind. A scope stays on its creating thread.
 Fibers swap this state with their other mutator slots.
@@ -791,8 +798,8 @@ Without an enclosing caller scope, raw escaping results receive program-lifetime
 
 ### No-GC borrowed reads and mutable storage
 
-`RegionLease::protect_read()` requires a current read scope or scratch destination for non-empty leases.
-It rejects unscoped borrowed reads instead of retaining their source arenas forever.
+`RegionLease::protect_read()` protects a raw borrowed result in the current read scope or allocation destination.
+Without either, the result receives program-lifetime ownership. Use scopes or owning snapshots to bound host reads.
 `AllocationOwner::adopt` remains a durable store operation.
 
 `SlotId` identifies a mutable field with `Index(usize)` or `Named(String)`.
@@ -812,7 +819,7 @@ The hook must not park or evaluate user code.
 
 `GcPtr::identity_eq(a, b) -> bool` compares logical object identity.
 In native GC builds, this is pointer identity.
-No-GC boxes also hold a unique 64-bit identity.
+No-GC boxes hold a unique 62-bit identity. Two reserved bits store relocation and ownership-cache flags without increasing box size.
 `unsafe GcPtr::clone_immutable(&self) -> Self`, available under no-GC, copies an immutable scalar with that identity.
 The pointee must contain no mutable state, and its clone must represent the same value.
 `GcPtr::ptr_eq` continues to compare physical allocation addresses.
@@ -820,7 +827,8 @@ The pointee must contain no mutable state, and its clone must represent the same
 ### Compact roots and explicit result publication
 
 `alloc_ctx::ScratchGuard::with_capacity(capacity: usize) -> Self` selects the initial chunk size.
-Later chunks honor that size. Compact scalar boxes use chunks sized to their representation.
+Later chunks double in size up to the default growth size, or grow enough for a larger object.
+Compact scalar boxes use initial chunks sized to their representation.
 `GcPtr::is_relocated_immutable() -> bool` identifies a compact immutable copy under no-GC.
 Stores reuse these copies instead of copying them again.
 `GcPtr::new_isolated(value: T) -> Self` allocates a separate root region under no-GC.
@@ -831,8 +839,23 @@ The replacement must represent the same immutable object, including its children
 
 `RegionLease::for_address(address: usize) -> Self` leases a containing region without tracing the object.
 `RegionLease::publish_return()` explicitly transfers a raw escaping result.
-An unscoped static result has program lifetime. Borrowed reads require a read scope or a regional destination.
-`protect_current` does not implicitly publish a borrowed static read.
+An unscoped static result has program lifetime. This fallback also applies to unscoped host reads.
+Explicit scopes and owning snapshots permit earlier reclamation.
 `RegionDependency::protect_read()` borrows cached weak sources without constructing an owning snapshot.
 Durable regional dependencies use counted edges held until their destination dies.
 They do not turn replaceable edge counts into permanent markers.
+
+
+`Trace::immutable_children(&self) -> bool` is a default no-GC hook that returns false.
+Return true only when managed child references cannot change through interior mutability.
+Publication visits each immutable object's child graph once and caches counted region dependencies.
+Later walks stop at that object. `GcPtr::get_mut` invalidates its cache before returning mutable access.
+Ownership walks use an explicit work stack, including long Cons chains.
+Mutable containers continue to maintain replaceable field ownership.
+
+
+Under no-GC, `GcPtr::get_mut(&mut self) -> GcMut<'_, T>` returns a mutation guard.
+`GcMut` implements `Deref<Target = T>`, `DerefMut`, and `Drop`.
+Drop acquires ownership of the changed child graph, including when unwinding.
+Cached parents remain valid because the mutated object's region retains its new children.
+Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.

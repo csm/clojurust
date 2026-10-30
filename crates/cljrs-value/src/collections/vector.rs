@@ -189,6 +189,10 @@ impl PartialEq for PersistentVector {
 }
 
 impl cljrs_gc::Trace for PersistentVector {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         if self.scalar_only {
             return;

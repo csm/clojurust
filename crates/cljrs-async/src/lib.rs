@@ -53,8 +53,6 @@ const ERROR_SOURCE: &str = include_str!("clojure_rust_error.cljrs");
 /// Must be called from within a Tokio `LocalSet` context for spawned tasks to
 /// run. Idempotent: the namespace is built only once.
 pub fn init(globals: &Arc<cljrs_runtime::env::env::GlobalEnv>) {
-    #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::enter();
     globals.set_async_runtime(Arc::new(AsyncRuntimeImpl::new()));
     runtime::spawn_gc_service();
 

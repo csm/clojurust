@@ -1423,6 +1423,10 @@ impl Value {
 }
 
 impl cljrs_gc::Trace for Value {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         match self {

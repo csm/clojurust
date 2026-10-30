@@ -346,7 +346,7 @@ impl Region {
         if aligned + layout.size() <= self.end {
             None
         } else {
-            Some(self.chunks[0].layout.size().max(layout.size() * 2))
+            Some(self.growth_size(layout.size()))
         }
     }
 
@@ -383,6 +383,13 @@ impl Region {
         self.accounted_bytes = self.accounted_bytes.saturating_add(requested);
     }
 
+    fn growth_size(&self, size: usize) -> usize {
+        let previous = self.chunks.last().unwrap().layout.size();
+        previous
+            .max(previous.saturating_mul(2).min(DEFAULT_CHUNK_SIZE))
+            .max(size.saturating_mul(2))
+    }
+
     /// Allocate a new chunk large enough, then bump-allocate from it.
     fn grow_and_alloc(&mut self, layout: Layout) -> *mut u8 {
         let size = layout.size();
@@ -393,7 +400,7 @@ impl Region {
                 requested: size,
             });
         }
-        let chunk_size = self.chunks[0].layout.size().max(size * 2);
+        let chunk_size = self.growth_size(size);
         let chunk = Chunk::new(chunk_size, layout.align());
         if self.retired && chunk.charged {
             crate::governor::with_registered_account(|account| {
@@ -660,6 +667,7 @@ thread_local! {
     static INHERITED_LEASES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
     static STATIC_SLOTS: RefCell<std::collections::BTreeMap<(usize, SlotId), RegionLease>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     static READ_SCOPES: RefCell<Vec<RegionLease>> = const { RefCell::new(Vec::new()) };
+    static READ_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LEASE_SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Isolate-local address index shared by its fibers; entries do not own regions.
     static REGION_OWNERS: RefCell<std::collections::BTreeMap<usize, (usize, std::rc::Weak<LeaseOwner>)>> = const { RefCell::new(std::collections::BTreeMap::new()) };
@@ -668,6 +676,8 @@ thread_local! {
 crate::mutator_slot!("cljrs-gc/INHERITED_LEASES", refcell INHERITED_LEASES: Vec<RegionLease>);
 #[cfg(feature = "no-gc")]
 crate::mutator_slot!("cljrs-gc/READ_SCOPES", refcell READ_SCOPES: Vec<RegionLease>);
+#[cfg(feature = "no-gc")]
+crate::mutator_slot!("cljrs-gc/READ_EPOCH", cell READ_EPOCH: u64);
 
 /// Identifies one independently replaceable field of a managed object.
 #[cfg(feature = "no-gc")]
@@ -705,15 +715,32 @@ impl WeakRegionLease {
 pub struct ReadScope(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 #[cfg(feature = "no-gc")]
 impl ReadScope {
+    /// Identity of the current borrowing scope; zero means there is no scope.
+    pub fn epoch() -> u64 {
+        READ_EPOCH.with(std::cell::Cell::get)
+    }
+    fn refresh() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let active = Self::is_active();
+        READ_EPOCH.with(|epoch| {
+            epoch.set(if active {
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                0
+            })
+        });
+    }
     pub fn enter() -> Option<Self> {
         if Self::is_active() || crate::alloc_ctx::invocation_is_active() {
             return None;
         }
         READ_SCOPES.with(|scopes| scopes.borrow_mut().push(Default::default()));
+        Self::refresh();
         Some(Self(true, std::marker::PhantomData))
     }
     pub fn nested() -> Self {
         READ_SCOPES.with(|scopes| scopes.borrow_mut().push(Default::default()));
+        Self::refresh();
         Self(true, std::marker::PhantomData)
     }
     pub fn is_active() -> bool {
@@ -721,7 +748,12 @@ impl ReadScope {
     }
     pub fn finish(mut self) -> RegionLease {
         self.0 = false;
-        READ_SCOPES.with(|scopes| scopes.borrow_mut().pop().expect("balanced read scope"))
+        {
+            let lease =
+                READ_SCOPES.with(|scopes| scopes.borrow_mut().pop().expect("balanced read scope"));
+            Self::refresh();
+            lease
+        }
     }
 }
 #[cfg(feature = "no-gc")]
@@ -729,6 +761,7 @@ impl Drop for ReadScope {
     fn drop(&mut self) {
         if self.0 {
             let lease = READ_SCOPES.with(|scopes| scopes.borrow_mut().pop());
+            Self::refresh();
             drop(lease);
         }
     }
@@ -747,6 +780,7 @@ impl Default for ReadContext {
 impl ReadContext {
     pub fn enter(&mut self) -> ReadContextGuard<'_> {
         READ_SCOPES.with(|scopes| std::mem::swap(&mut *scopes.borrow_mut(), &mut self.0));
+        ReadScope::refresh();
         ReadContextGuard(self)
     }
 }
@@ -756,6 +790,7 @@ pub struct ReadContextGuard<'a>(&'a mut ReadContext);
 impl Drop for ReadContextGuard<'_> {
     fn drop(&mut self) {
         READ_SCOPES.with(|scopes| std::mem::swap(&mut *scopes.borrow_mut(), &mut self.0.0));
+        ReadScope::refresh();
     }
 }
 
@@ -846,12 +881,8 @@ impl RegionLease {
             }
         }
     }
-    /// Borrow a value only within an explicit read or scratch scope.
+    /// Protect a borrowed value in the active scope, or retain an unscoped host result.
     pub fn protect_read(&self) {
-        assert!(
-            self.0.is_empty() || ReadScope::is_active() || !crate::alloc_ctx::is_static_context(),
-            "a borrowed no-gc value requires ReadScope; use an owning snapshot outside evaluation"
-        );
         self.protect_current();
     }
     pub fn protect_current(&self) {
@@ -868,21 +899,11 @@ impl RegionLease {
         }) {
             return;
         }
-        assert!(
-            !crate::alloc_ctx::is_static_context(),
-            "a borrowed no-gc value requires ReadScope; use explicit result publication or an owning snapshot"
-        );
         AllocationOwner::current().adopt(self);
     }
-    /// Transfer an escaping raw result, including an explicit program-lifetime result.
+    /// Transfer an escaping raw result, including an unscoped host result.
     pub fn publish_return(&self) {
-        if crate::alloc_ctx::is_static_context() && !ReadScope::is_active() {
-            for owner in &self.0 {
-                retain_owner(owner);
-            }
-        } else {
-            self.protect_current();
-        }
+        self.protect_current();
     }
     pub fn enter(&self) -> LeaseScope {
         INHERITED_LEASES.with(|stack| stack.borrow_mut().push(self.clone()));
@@ -1928,6 +1949,48 @@ mod lease_tests {
             self.0.set(self.0.get() + 1);
         }
     }
+    #[test]
+    fn small_regions_grow_geometrically() {
+        let mut region = Region::with_capacity(64);
+        for i in 0..10000 {
+            region.alloc(i as i64);
+        }
+        assert!(
+            region.chunks.len() < 64,
+            "small regions grew in fixed tiny chunks"
+        );
+        for pair in region.chunks.windows(2) {
+            assert!(
+                pair[1].layout.size()
+                    >= pair[0]
+                        .layout
+                        .size()
+                        .saturating_mul(2)
+                        .min(DEFAULT_CHUNK_SIZE)
+            );
+        }
+    }
+
+    #[test]
+    fn scope_epochs_change_across_nested_reads_and_task_polls() {
+        assert_eq!(ReadScope::epoch(), 0);
+        let outer = ReadScope::enter().unwrap();
+        let first = ReadScope::epoch();
+        let inner = ReadScope::nested();
+        assert_ne!(ReadScope::epoch(), first);
+        drop(inner);
+        assert_ne!(ReadScope::epoch(), first);
+        let mut task = ReadContext::default();
+        let caller = ReadScope::epoch();
+        {
+            let _poll = task.enter();
+            assert_ne!(ReadScope::epoch(), caller);
+        }
+        assert_ne!(ReadScope::epoch(), caller);
+        drop(outer);
+        assert_eq!(ReadScope::epoch(), 0);
+    }
+
     #[test]
     fn released_dependents_remove_their_weak_edges() {
         struct Edge(crate::GcPtr<Probe>);

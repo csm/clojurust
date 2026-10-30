@@ -107,6 +107,10 @@ impl PartialEq for PersistentQueue {
 }
 
 impl cljrs_gc::Trace for PersistentQueue {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         // front: Arc<PersistentList> — trace through to find embedded GcPtrs
         self.front.trace(visitor);

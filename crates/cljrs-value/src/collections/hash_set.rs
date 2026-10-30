@@ -169,6 +169,10 @@ impl PartialEq for PersistentHashSet {
 }
 
 impl cljrs_gc::Trace for PersistentHashSet {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for (_, v) in self.order.iter() {
             v.trace(visitor);

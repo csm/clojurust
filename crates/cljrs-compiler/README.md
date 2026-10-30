@@ -825,7 +825,8 @@ Compiled closures share an `Arc<[Value]>` between execution and tracing.
 The `rt_identical` bridge uses `Value::identical`, including no-GC immutable scalar identity across relocation.
 Object-array ABI reads and writes use the same indexed ownership barriers as interpreter array operations.
 
-Under no-GC, standalone Rust callers of the runtime ABI must keep a `region::ReadScope` alive while using borrowed results.
+Under no-GC, standalone Rust callers can bound borrowed-result ownership with a `region::ReadScope`.
+Unscoped host results receive program-lifetime ownership.
 Runtime evaluation and fiber drivers establish the required scopes.
 
 The no-GC AOT async-function scan scopes its reads of defined function roots.
@@ -833,5 +834,7 @@ Compiled array stores acquire caller ownership before returning a compact scalar
 The identity ABI handles arrays, metadata wrappers, reduced values, and transients.
 
 Compiled keyword and versioned-value caches use program storage under no-GC.
-A first lookup during a bounded invocation returns invocation-local storage and leaves the cache empty.
+A first lookup during a bounded invocation fills an invocation-local table.
+Repeated keyword and versioned-global fills reuse its boxed value without further arena allocation.
+Program caches and compiled slots never receive invocation-owned pointers. The guard clears the table before freeing its arena.
 Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.

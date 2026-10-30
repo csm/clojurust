@@ -1087,13 +1087,14 @@ Immutable relocation preserves logical identity, including collection aliases. M
 Atom and volatile snapshots have the same ownership contract.
 Use snapshots for Rust code that needs values across replacement without a read scope.
 For borrowed `deref`, metadata, validator, and watch reads, keep a `region::ReadScope` alive while using the values.
-A leased borrowed read without a scope fails explicitly. Native GC callers must continue to register GC roots.
+Unscoped no-GC host reads receive program-lifetime ownership. Use scopes or snapshots for bounded retention.
+Native GC callers must continue to register GC roots.
 
 `Atom::add_watch(key: Value, callback: Value)` and `Var::add_watch` retain callback ownership.
 Their `remove_watch(key: &Value)` methods release removed ownership.
 `Atom::protect_watches()` and `Var::protect_watches()` borrow the cached watch values for callback delivery.
 `ValueLease::for_values(values: &[Value], owner: &AllocationOwner) -> ValueLease` prepares a shared field policy.
-`ValueLease::protect_read()` borrows cached backing scopes and requires the caller's read scope.
+`ValueLease::protect_read()` borrows cached backing scopes into the caller's scope or allocation destination.
 
 `publish::publish_for_slot(value: Value, address: usize, slot: usize) -> Value` replaces one indexed field's lease.
 `publish_for_named_slot(value: Value, address: usize, slot: String) -> Value` supports named fields such as protocol methods.
@@ -1115,7 +1116,10 @@ Replacing or removing a method releases its lease after existing readers finish.
 
 ### Definition and transient ownership
 
-No-GC definition stores pack immutable data and metadata into compact arenas.
+No-GC definition stores compact small immutable data and metadata.
+Compaction stops at 128 values or 32 levels. Large strings and numeric leaves keep their existing storage.
+Already compact or static objects are reused. The compact arena is created only when a copy is needed.
+Larger collections retain structural sharing and acquire leases without a rebuild.
 The packer preserves logical identities and shared aliases. It does not force lazy values or clone mutable cells.
 Interpreted function, atom, lazy-cell, delay, and multimethod roots use separate small regions.
 Atoms establish their payload ownership after managed allocation.
@@ -1125,7 +1129,8 @@ Opaque captures retain their actual backing regions.
 `Value::identical` handles every boxed variant, including arrays, wrappers, transients, and errors.
 
 `TransientVector::from_persistent(vector: &PersistentVector) -> Self` shares the trie and its scalar summary.
-Managed transient conversion shares initial data without tracing its elements or creating initial per-element slots.
+Managed transient conversion shares initial data and captures its ownership once, without initial per-element slots.
+Later publication and returns reuse that cached ownership without tracing the initial collection.
 Writes acquire slots lazily. Maps and sets reuse their insertion sequence IDs for those slots.
 Key hashing stays in the existing realization-safe mutation path.
 Managed `persistent!` borrows the containing region. Rust stack containers protect the returned graph instead.
@@ -1139,8 +1144,13 @@ Use these methods when modifying managed implementation tables.
 `ValueLease::publish_return()` transfers an update result explicitly.
 Repeated cached reads reuse the caller's lease set without allocating another snapshot.
 
-Definition packing scans immutable data once. Other replaceable stores preserve collection sharing.
+Definition packing has a fixed work and depth bound. Other replaceable stores preserve collection sharing.
 After an implementation-table update batch, use the existing protocol or multimethod generation invalidation API.
 
 Exception tracing includes data maps, causes, and managed thrown payloads.
 These fields can retain independent backing regions.
+
+Immutable collections and closures cache their backing ownership after the first publication walk.
+Repeated captures of a shared graph stop at its cached root.
+Var root reads acquire leases once per scope epoch and binding generation.
+Rebinding and scope changes invalidate the read cache.

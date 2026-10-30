@@ -224,6 +224,10 @@ impl PartialEq for PersistentHashMap {
 }
 
 impl cljrs_gc::Trace for PersistentHashMap {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for (_, (k, v)) in self.order.iter() {
             k.trace(visitor);

@@ -386,6 +386,15 @@ pub struct ValueLease {
 }
 #[cfg(feature = "no-gc")]
 impl ValueLease {
+    pub(crate) fn for_trace(
+        value: &impl cljrs_gc::Trace,
+        owner: &cljrs_gc::region::AllocationOwner,
+    ) -> Self {
+        if cljrs_gc::alloc_ctx::invocation_is_active() {
+            return Self::default();
+        }
+        Self::from_lease(cljrs_gc::region::RegionLease::for_value(value), owner)
+    }
     pub fn for_values(values: &[Value], owner: &cljrs_gc::region::AllocationOwner) -> Self {
         if cljrs_gc::alloc_ctx::invocation_is_active() {
             return Self::default();
@@ -483,22 +492,119 @@ pub(crate) fn prepare_definition(
     if cljrs_gc::alloc_ctx::invocation_is_active() {
         return prepare_for_owner(value, owner);
     }
-    if !matches!(
-        &value,
-        Value::Str(_)
-            | Value::Uuid(_)
-            | Value::BigInt(_)
-            | Value::BigDecimal(_)
-            | Value::Ratio(_)
-            | Value::Symbol(_)
-            | Value::Keyword(_)
-            | Value::Queue(_)
-            | Value::Cons(_)
-            | Value::List(_)
-            | Value::Vector(_)
-            | Value::Map(crate::MapValue::Array(_) | crate::MapValue::Hash(_))
-            | Value::Set(crate::SetValue::Hash(_))
-    ) {
+    // Bound compaction by both work and depth. Large/shared payloads keep
+    // their persistent representation and acquire ownership without rebuilding it.
+    fn worth_copying(value: &Value) -> bool {
+        let mut pending = vec![(value.clone(), 0usize)];
+        let mut remaining = 128usize;
+        let mut needs_copy = false;
+        while let Some((value, depth)) = pending.pop() {
+            if remaining == 0 || depth > 32 {
+                return false;
+            }
+            remaining -= 1;
+            macro_rules! leaf {
+                ($p:expr, $bounded:expr) => {{
+                    let p = $p;
+                    if !p.is_static_alloc() && !p.is_relocated_immutable() {
+                        if !$bounded {
+                            return false;
+                        }
+                        needs_copy = true;
+                    }
+                }};
+            }
+            macro_rules! children {
+                ($p:expr, $iter:expr) => {{
+                    let p = $p;
+                    if !p.is_static_alloc() && !p.is_relocated_immutable() {
+                        needs_copy = true;
+                        for child in $iter(&p) {
+                            if pending.len() >= remaining {
+                                return false;
+                            }
+                            pending.push((child, depth + 1));
+                        }
+                    }
+                }};
+            }
+            match value {
+                Value::Str(p) => {
+                    let bounded = p.get().len() <= 4096;
+                    leaf!(p, bounded);
+                }
+                Value::BigInt(p) => {
+                    let bounded = p.get().bits() <= 32768;
+                    leaf!(p, bounded);
+                }
+                Value::Ratio(p) => {
+                    let bounded = p
+                        .get()
+                        .numer()
+                        .bits()
+                        .saturating_add(p.get().denom().bits())
+                        <= 32768;
+                    leaf!(p, bounded);
+                }
+                Value::BigDecimal(p) => {
+                    let bounded = p.get().digits() <= 9865;
+                    leaf!(p, bounded);
+                }
+                Value::Uuid(p) => leaf!(p, true),
+                Value::Symbol(p) => leaf!(p, true),
+                Value::Keyword(p) => leaf!(p, true),
+                Value::Cons(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::CljxCons>| [
+                    p.get().head.clone(),
+                    p.get().tail.clone()
+                ]),
+                Value::Vector(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentVector>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::List(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentList>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::Queue(p) => children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentQueue>| p
+                    .get()
+                    .iter()
+                    .take(129)
+                    .cloned()
+                    .collect::<Vec<_>>()),
+                Value::Map(crate::MapValue::Array(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentArrayMap>| p
+                        .get()
+                        .iter()
+                        .take(65)
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>())
+                }
+                Value::Map(crate::MapValue::Hash(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentHashMap>| p
+                        .get()
+                        .iter()
+                        .take(65)
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>())
+                }
+                Value::Set(crate::SetValue::Hash(p)) => {
+                    children!(p, |p: &cljrs_gc::GcPtr<crate::PersistentHashSet>| p
+                        .get()
+                        .iter()
+                        .take(129)
+                        .cloned()
+                        .collect::<Vec<_>>())
+                }
+                _ => {}
+            }
+        }
+        needs_copy
+    }
+    if !worth_copying(&value) {
         return prepare_for_owner(value, owner);
     }
     let _compact = cljrs_gc::alloc_ctx::ScratchGuard::with_capacity(256);

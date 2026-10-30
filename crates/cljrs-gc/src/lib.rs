@@ -81,6 +81,13 @@ pub trait Trace {
     #[cfg(feature = "no-gc")]
     fn init_ownership(&self) {}
 
+    /// Whether this object's managed child references never change after allocation.
+    /// No-GC publication can cache their ownership after its first graph walk.
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        false
+    }
+
     fn trace(&self, visitor: &mut MarkVisitor);
 
     fn gc_size_extra(&self) -> usize {
@@ -234,18 +241,27 @@ pub use self::nogc_box::GcBox;
 mod nogc_box {
     use crate::Trace;
 
+    pub(crate) const RELOCATED: u64 = 1 << 63;
+    pub(crate) const OWNED: u64 = 1 << 62;
+    pub(crate) const ID_MASK: u64 = OWNED - 1;
     static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     pub struct GcBox<T: Trace + 'static> {
         pub value: T,
-        pub(crate) identity: u64,
-        pub(crate) relocated: bool,
+        pub(crate) identity: std::sync::atomic::AtomicU64,
     }
     impl<T: Trace + 'static> GcBox<T> {
         pub(crate) fn new(value: T) -> Self {
             Self {
                 value,
-                identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                relocated: false,
+                identity: std::sync::atomic::AtomicU64::new(
+                    NEXT_IDENTITY
+                        .fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |id| (id < ID_MASK).then_some(id + 1),
+                        )
+                        .expect("managed identity space exhausted"),
+                ),
             }
         }
     }
@@ -266,15 +282,20 @@ pub struct MarkVisitor {
 pub struct MarkVisitor {
     retaining: Option<std::collections::HashSet<usize>>,
     collecting: Option<region::RegionLease>,
+    pending: Vec<PendingTrace>,
+    destination: Option<region::AllocationOwner>,
+    completed: Vec<*const std::sync::atomic::AtomicU64>,
 }
 
 /// Retain only regions reached by a published value in no-gc mode.
 #[cfg(feature = "no-gc")]
 pub fn retain_regions_for(value: &impl Trace) {
-    value.trace(&mut MarkVisitor {
+    let mut visitor = MarkVisitor {
         retaining: Some(Default::default()),
-        collecting: None,
-    });
+        ..Default::default()
+    };
+    value.trace(&mut visitor);
+    visitor.drain_owned();
 }
 
 #[cfg(feature = "no-gc")]
@@ -282,8 +303,10 @@ fn leases_for(value: &impl Trace) -> region::RegionLease {
     let mut visitor = MarkVisitor {
         retaining: Some(Default::default()),
         collecting: Some(Default::default()),
+        ..Default::default()
     };
     value.trace(&mut visitor);
+    visitor.drain_owned();
     visitor.collecting.take().unwrap()
 }
 
@@ -349,21 +372,70 @@ impl MarkVisitor {
 }
 
 #[cfg(feature = "no-gc")]
+struct PendingTrace {
+    pointer: *const u8,
+    trace: unsafe fn(*const u8, &mut MarkVisitor),
+    destination: Option<region::AllocationOwner>,
+}
+#[cfg(feature = "no-gc")]
+impl MarkVisitor {
+    fn drain_owned(&mut self) {
+        while let Some(pending) = self.pending.pop() {
+            self.destination = pending.destination;
+            // SAFETY: the collected lease and the producer's scope keep queued objects live.
+            unsafe { (pending.trace)(pending.pointer, self) };
+        }
+        for identity in self.completed.drain(..) {
+            // Commit only after the complete graph walk succeeds.
+            unsafe { &*identity }.fetch_or(nogc_box::OWNED, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+#[cfg(feature = "no-gc")]
 impl GcVisitor for MarkVisitor {
     fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
-        let Some(visited) = &mut self.retaining else {
-            return;
-        };
-        let address = ptr.0.as_ptr() as usize;
-        if !visited.insert(address) {
+        if self.retaining.is_none() {
             return;
         }
+        let address = ptr.0.as_ptr() as usize;
+        let source = region::RegionLease::for_address(address);
+        if let Some(destination) = &self.destination {
+            destination.adopt(&source);
+        }
         if let Some(lease) = &mut self.collecting {
-            lease.add_address(address);
+            lease.extend(&source);
         } else {
             region::retain_containing(address);
         }
-        ptr.get().trace(self);
+        if !self.retaining.as_mut().unwrap().insert(address) {
+            return;
+        }
+        let immutable = ptr.get().immutable_children();
+        if immutable
+            && unsafe {
+                (*ptr.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    & nogc_box::OWNED
+                    != 0
+            }
+        {
+            return;
+        }
+        unsafe fn trace<T: Trace + 'static>(raw: *const u8, visitor: &mut MarkVisitor) {
+            unsafe { &*(raw as *const T) }.trace(visitor);
+        }
+        let destination = if immutable {
+            self.completed.push(unsafe { &(*ptr.raw()).identity });
+            Some(region::AllocationOwner::for_address(address))
+        } else {
+            self.destination.clone()
+        };
+        self.pending.push(PendingTrace {
+            pointer: ptr.get() as *const T as *const u8,
+            trace: trace::<T>,
+            destination,
+        });
     }
 }
 
@@ -525,6 +597,7 @@ impl<T: Trace + 'static> GcPtr<T> {
         unsafe { &(*self.raw()).value }
     }
 
+    #[cfg(not(feature = "no-gc"))]
     pub fn get_mut(&mut self) -> &mut T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
@@ -540,6 +613,14 @@ impl<T: Trace + 'static> GcPtr<T> {
         unsafe { &mut (*self.raw()).value }
     }
 
+    /// Mutate an object and refresh its backing ownership when the guard drops.
+    #[cfg(feature = "no-gc")]
+    pub fn get_mut(&mut self) -> GcMut<'_, T> {
+        unsafe { &(*self.raw()).identity }
+            .fetch_and(!nogc_box::OWNED, std::sync::atomic::Ordering::Relaxed);
+        GcMut { pointer: self }
+    }
+
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
     }
@@ -548,7 +629,16 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn identity_eq(a: &Self, b: &Self) -> bool {
         #[cfg(feature = "no-gc")]
         {
-            unsafe { (*a.raw()).identity == (*b.raw()).identity }
+            unsafe {
+                (*a.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK
+                    == (*b.raw())
+                        .identity
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        & nogc_box::ID_MASK
+            }
         }
         #[cfg(not(feature = "no-gc"))]
         {
@@ -564,8 +654,9 @@ impl<T: Trace + 'static> GcPtr<T> {
             let mut scratch =
                 alloc_ctx::ScratchGuard::with_capacity(std::mem::size_of::<GcBox<T>>() + 32);
             let pointer = Self::new(value);
-            let mut lease = region::RegionLease::for_address(pointer.raw() as usize);
-            lease.extend(&region::RegionLease::for_value(pointer.get()));
+            let lease = region::RegionLease::for_address(pointer.raw() as usize);
+            region::AllocationOwner::for_address(pointer.raw() as usize)
+                .adopt(&region::RegionLease::for_value(pointer.get()));
             scratch.pop_for_return();
             lease.protect_current();
             return pointer;
@@ -581,8 +672,14 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub unsafe fn relocate_immutable(&self, value: T) -> Self {
         let copy = Self::new(value);
         unsafe {
-            (*copy.raw()).identity = (*self.raw()).identity;
-            (*copy.raw()).relocated = true;
+            (*copy.raw()).identity.store(
+                ((*self.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK)
+                    | nogc_box::RELOCATED,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         copy
     }
@@ -590,7 +687,13 @@ impl<T: Trace + 'static> GcPtr<T> {
     /// True if this immutable box was relocated for compact storage.
     #[cfg(feature = "no-gc")]
     pub fn is_relocated_immutable(&self) -> bool {
-        unsafe { (*self.raw()).relocated }
+        unsafe {
+            (*self.raw())
+                .identity
+                .load(std::sync::atomic::Ordering::Relaxed)
+                & nogc_box::RELOCATED
+                != 0
+        }
     }
 
     /// Copy an immutable scalar into the current allocation destination.
@@ -605,8 +708,14 @@ impl<T: Trace + 'static> GcPtr<T> {
     {
         let copy = Self::new(self.get().clone());
         unsafe {
-            (*copy.raw()).identity = (*self.raw()).identity;
-            (*copy.raw()).relocated = true;
+            (*copy.raw()).identity.store(
+                ((*self.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK)
+                    | nogc_box::RELOCATED,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         copy
     }
@@ -621,6 +730,34 @@ impl<T: Trace + 'static> GcPtr<T> {
         alloc_ctx::invocation_is_active()
             || static_arena::is_static_addr(self.0.as_ptr() as usize)
             || region::is_permanent_address(self.0.as_ptr() as usize)
+    }
+}
+
+/// Mutable no-GC access that refreshes child ownership before releasing the borrow.
+#[cfg(feature = "no-gc")]
+pub struct GcMut<'a, T: Trace + 'static> {
+    pointer: &'a mut GcPtr<T>,
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> std::ops::Deref for GcMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.pointer.get()
+    }
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> std::ops::DerefMut for GcMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut (*self.pointer.raw()).value }
+    }
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> Drop for GcMut<'_, T> {
+    fn drop(&mut self) {
+        if !alloc_ctx::invocation_is_active() {
+            region::AllocationOwner::for_address(self.pointer.raw() as usize)
+                .adopt(&region::RegionLease::for_value(self.pointer.get()));
+        }
     }
 }
 
@@ -1536,6 +1673,98 @@ mod tests {
 mod nogc_tests {
     use super::*;
     use alloc_ctx::{ScratchGuard, StaticCtxGuard};
+
+    #[test]
+    fn cached_parent_survives_a_child_mutation_into_another_scope() {
+        struct Node {
+            child: Option<GcPtr<Node>>,
+            label: String,
+        }
+        impl Trace for Node {
+            fn immutable_children(&self) -> bool {
+                true
+            }
+            fn trace(&self, visitor: &mut MarkVisitor) {
+                if let Some(child) = &self.child {
+                    visitor.visit(child);
+                }
+            }
+        }
+        struct Root(GcPtr<Node>);
+        impl Trace for Root {
+            fn trace(&self, visitor: &mut MarkVisitor) {
+                visitor.visit(&self.0);
+            }
+        }
+        let (parent, lease) = {
+            let _source = ScratchGuard::new();
+            let mut child = GcPtr::new(Node {
+                child: None,
+                label: "middle".into(),
+            });
+            let parent = GcPtr::new(Node {
+                child: Some(child.clone()),
+                label: "parent".into(),
+            });
+            let lease = region::RegionLease::for_value(&Root(parent.clone()));
+            {
+                let _new_source = ScratchGuard::new();
+                child.get_mut().child = Some(GcPtr::new(Node {
+                    child: None,
+                    label: "new".into(),
+                }));
+            }
+            // This stops at the cached parent. The child's mutation guard must
+            // have acquired the newly referenced region independently.
+            let cached = region::RegionLease::for_value(&Root(parent.clone()));
+            drop(lease);
+            (parent, cached)
+        };
+        assert_eq!(
+            parent
+                .get()
+                .child
+                .as_ref()
+                .unwrap()
+                .get()
+                .child
+                .as_ref()
+                .unwrap()
+                .get()
+                .label,
+            "new"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn invocation_caches_follow_their_mutator_and_expire_before_reuse() {
+        let first = alloc_ctx::InvocationGuard::new(4096);
+        alloc_ctx::invocation_cache_insert("test", "same".into(), 1);
+        let mut other = mutator::MutatorState::fresh();
+        other.swap_with_current();
+        {
+            let _second = alloc_ctx::InvocationGuard::new(4096);
+            assert!(alloc_ctx::invocation_cache_get("test", "same").is_none());
+            alloc_ctx::invocation_cache_insert("test", "same".into(), 2);
+        }
+        other.swap_with_current();
+        assert_eq!(alloc_ctx::invocation_cache_get("test", "same"), Some(1));
+        drop(first);
+        let _next = alloc_ctx::InvocationGuard::new(4096);
+        assert!(alloc_ctx::invocation_cache_get("test", "same").is_none());
+    }
+
+    #[test]
+    fn immutable_flags_do_not_grow_boxes_or_change_identity() {
+        assert_eq!(std::mem::size_of::<GcBox<i64>>(), 16);
+        let _source = ScratchGuard::new();
+        let original = GcPtr::new(String::from("compact"));
+        let copy = unsafe { original.clone_immutable() };
+        assert!(copy.is_relocated_immutable());
+        assert!(!original.is_relocated_immutable());
+        assert!(GcPtr::identity_eq(&original, &copy));
+    }
 
     #[test]
     fn alloc_in_static_context() {

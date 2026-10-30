@@ -210,7 +210,7 @@ mod publication_review_tests {
     }
 
     #[test]
-    fn scalar_storage_uses_small_chunks_and_transient_conversion_does_not_trace_elements() {
+    fn scalar_storage_uses_small_chunks_and_transient_returns_reuse_initial_ownership() {
         let _mutator = cljrs_gc::register_mutator();
         let array = GcPtr::new(ObjectArray::new(vec![Value::Nil; 1000]));
         let retired =
@@ -242,11 +242,16 @@ mod publication_review_tests {
         }));
         let original = PersistentVector::from_iter(std::iter::repeat_n(value, 10000));
         let transient = GcPtr::new(collections::TransientVector::from_persistent(&original));
+        let initial = traces.get();
+        assert_eq!(initial, 1, "initial ownership must be captured once");
+        for _ in 0..1000 {
+            publish::publish_return(Value::TransientVector(transient.clone()));
+        }
         let _persistent = transient.get().persistent().unwrap();
         assert_eq!(
             traces.get(),
-            0,
-            "transient conversion walked the initial graph"
+            initial,
+            "transient returns retraced the initial graph"
         );
     }
 
@@ -399,32 +404,121 @@ mod publication_review_tests {
     }
 
     #[test]
-    fn unscoped_reads_require_an_owning_snapshot_without_pinning_sources() {
-        let atom = GcPtr::new(Atom::new(Value::Nil));
-        let var = GcPtr::new(Var::new("user", "scoped"));
+    fn unscoped_host_reads_retain_raw_results_and_scoped_snapshots_release() {
+        std::thread::spawn(|| {
+            let atom = GcPtr::new(Atom::new(Value::Nil));
+            let var = GcPtr::new(Var::new("user", "host-read"));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let value = Value::string("host payload");
+                atom.get().reset(value.clone());
+                var.get().bind(value);
+            }
+            let raw = atom.get().deref();
+            let root = var.get().deref().unwrap();
+            atom.get().reset(Value::Nil);
+            var.get().bind(Value::Nil);
+            assert_eq!(raw.to_string(), "\"host payload\"");
+            assert_eq!(root.to_string(), "\"host payload\"");
+        })
+        .join()
+        .unwrap();
+
+        let var = GcPtr::new(Var::new("user", "snapshot"));
         let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
         {
             let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
-            let value = Value::NativeObject(gc_native_object(Counted {
-                traces: Default::default(),
-                dropped: dropped.clone(),
-            }));
-            atom.get().reset(value.clone());
-            var.get().bind(value);
+            var.get()
+                .bind(Value::NativeObject(gc_native_object(Counted {
+                    traces: Default::default(),
+                    dropped: dropped.clone(),
+                })));
         }
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| atom.get().deref())).is_err()
-        );
         let snapshot = var.get().snapshot().unwrap();
-        atom.get().reset(Value::Nil);
         var.get().bind(Value::Nil);
         assert!(!dropped.get());
-        assert!(matches!(snapshot.value, Value::NativeObject(_)));
         drop(snapshot);
-        assert!(
-            dropped.get(),
-            "an unscoped read permanently pinned the payload"
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn large_and_deep_definition_payloads_keep_their_storage() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let large = Value::string("x".repeat(1024 * 1024));
+                let atom = Atom::new(large.clone());
+                let Value::Str(before) = large else {
+                    unreachable!()
+                };
+                let Value::Str(after) = atom.snapshot().value else {
+                    unreachable!()
+                };
+                assert!(GcPtr::ptr_eq(&before, &after), "large string was copied");
+                let large = Value::Vector(GcPtr::new(PersistentVector::from_iter(
+                    (0..10000).map(Value::Long),
+                )));
+                let atom = Atom::new(large.clone());
+                let Value::Vector(before) = large else {
+                    unreachable!()
+                };
+                let Value::Vector(after) = atom.snapshot().value else {
+                    unreachable!()
+                };
+                assert!(
+                    GcPtr::ptr_eq(&before, &after),
+                    "large shared vector was rebuilt"
+                );
+                let mut chain = Value::Nil;
+                for i in 0..30000 {
+                    chain = Value::Cons(GcPtr::new(CljxCons {
+                        head: Value::Long(i),
+                        tail: chain,
+                    }));
+                }
+                let atom = Atom::new(chain);
+                let mut current = atom.snapshot().value;
+                let mut count = 0;
+                while let Value::Cons(cons) = current {
+                    count += 1;
+                    current = cons.get().tail.clone();
+                }
+                assert_eq!(count, 30000);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_captured_graphs_are_walked_only_once() {
+        let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let traces = std::rc::Rc::new(std::cell::Cell::new(0));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let object = Value::NativeObject(gc_native_object(Counted {
+            traces: traces.clone(),
+            dropped: dropped.clone(),
+        }));
+        let captured = Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            std::iter::repeat_n(object, 10000),
+        )));
+        for _ in 0..1000 {
+            let _call = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let closure = GcPtr::new_isolated(NativeFn::with_captures(
+                "capture",
+                Arity::Fixed(0),
+                vec![captured.clone()],
+                |values, _| Ok(values[0].clone()),
+            ));
+            publish::publish_return(Value::NativeFunction(closure));
+        }
+        assert_eq!(
+            traces.get(),
+            1,
+            "closure creation retraced the shared graph"
         );
+        assert!(!dropped.get());
     }
 
     #[test]

@@ -111,8 +111,6 @@ pub fn setup_globals(
     gc_config: Arc<GcConfig>,
     versioning: VersioningFlags,
 ) -> Arc<GlobalEnv> {
-    #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::enter();
     let runtime = cljrs_runtime::Runtime::builder()
         .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
         .source_paths(src_paths)
@@ -351,7 +349,7 @@ pub fn run_source(
 /// individual string arguments. Silently skips if `-main` is not defined.
 fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
     #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::nested();
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     // resolve returns nil for undefined symbols; swallow lookup errors defensively.
     let resolved = eval_in(env, "(resolve '-main)", "<main-check>").unwrap_or(Value::Nil);
     if resolved == Value::Nil {
@@ -423,13 +421,15 @@ fn escape_clojure_string(s: &str) -> String {
 
 /// Evaluate source whose final result is not needed.
 pub fn eval_in_discard(env: &mut Env, src: &str, filename: &str) -> miette::Result<()> {
-    #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::nested();
-    eval_in(env, src, filename).map(drop)
+    eval_in_mode(env, src, filename, true).map(drop)
 }
 
 /// Evaluate `src` in an existing `Env`. Returns the last value.
 pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value> {
+    eval_in_mode(env, src, filename, false)
+}
+
+fn eval_in_mode(env: &mut Env, src: &str, filename: &str, discard: bool) -> miette::Result<Value> {
     let mut parser = cljrs_reader::Parser::new(src.to_string(), filename.to_string());
     let forms = parser.parse_all().map_err(miette::Report::from)?;
 
@@ -437,9 +437,9 @@ pub fn eval_in(env: &mut Env, src: &str, filename: &str) -> miette::Result<Value
     let count = forms.len();
     for (index, form) in forms.into_iter().enumerate() {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        if index + 1 < count {
+        if discard || index + 1 < count {
             #[cfg(feature = "no-gc")]
-            let _reads = cljrs_gc::region::ReadScope::nested();
+            let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
             eval_form(&form, env).map_err(format_eval_error)?;
         } else {
             result = eval_form(&form, env).map_err(format_eval_error)?;

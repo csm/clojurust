@@ -11,7 +11,7 @@ pub struct TransientVector {
     persisted: Mutex<bool>,
     scalar_only: AtomicBool,
     #[cfg(feature = "no-gc")]
-    initial: rpds::VectorSync<Value>,
+    initial: std::cell::RefCell<crate::publish::ValueLease>,
 }
 
 impl TransientVector {
@@ -29,7 +29,10 @@ impl TransientVector {
         TransientVector {
             vector: Mutex::new(vector.clone()),
             #[cfg(feature = "no-gc")]
-            initial: vector.clone(),
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                &PersistentVector::from_vector_summary(vector.clone(), false),
+                &Default::default(),
+            )),
             persisted: Mutex::new(false),
             scalar_only: AtomicBool::new(false),
         }
@@ -98,6 +101,8 @@ impl TransientVector {
     }
 
     pub fn get(&self, index: usize) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.initial.borrow().protect_read();
         crate::publish::read_slot(self as *const _ as usize, index);
         self.vector.lock().unwrap().get(index).cloned()
     }
@@ -144,7 +149,10 @@ impl Clone for TransientVector {
         Self {
             vector: Mutex::new(self.vector.lock().unwrap().clone()),
             #[cfg(feature = "no-gc")]
-            initial: self.vector.lock().unwrap().clone(),
+            initial: std::cell::RefCell::new(crate::publish::ValueLease::for_trace(
+                &PersistentVector::from_vector_summary(self.vector.lock().unwrap().clone(), false),
+                &Default::default(),
+            )),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             scalar_only: AtomicBool::new(self.scalar_only.load(Ordering::Relaxed)),
         }
@@ -153,14 +161,14 @@ impl Clone for TransientVector {
 
 impl cljrs_gc::Trace for TransientVector {
     #[cfg(feature = "no-gc")]
-    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
-        if self.scalar_only.load(Ordering::Relaxed) {
-            return;
-        }
-        for value in self.initial.iter() {
-            value.trace(visitor);
-        }
+    fn init_ownership(&self) {
+        let address = self as *const _ as usize;
+        let owner = cljrs_gc::region::AllocationOwner::for_address(address);
+        let lease = self.initial.borrow().reparent(&owner);
+        *self.initial.borrow_mut() = lease;
     }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {

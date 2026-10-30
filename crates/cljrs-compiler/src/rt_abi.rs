@@ -4857,7 +4857,12 @@ fn intern_keyword(name: &str) -> *const Value {
     }
     #[cfg(feature = "no-gc")]
     if cljrs_gc::alloc_ctx::invocation_is_active() {
-        return box_val(Value::Keyword(GcPtr::new(Keyword::parse(name))));
+        if let Some(raw) = cljrs_gc::alloc_ctx::invocation_cache_get("keyword", name) {
+            return raw as *const Value;
+        }
+        let raw = box_val(Value::Keyword(GcPtr::new(Keyword::parse(name))));
+        cljrs_gc::alloc_ctx::invocation_cache_insert("keyword", name.to_owned(), raw as usize);
+        return raw;
     }
     ensure_ic_tracer_registered();
     let mut table = kw_intern_table().write().unwrap();
@@ -4948,6 +4953,10 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
         return raw;
     }
 
+    #[cfg(feature = "no-gc")]
+    if let Some(raw) = cljrs_gc::alloc_ctx::invocation_cache_get("versioned", &key) {
+        return raw as *const Value;
+    }
     let Some((globals, current_ns)) = cljrs_runtime::env::callback::capture_eval_context() else {
         return rt_const_nil();
     };
@@ -4961,7 +4970,9 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
         Ok(val) => {
             #[cfg(feature = "no-gc")]
             if cljrs_gc::alloc_ctx::invocation_is_active() {
-                return box_val(val);
+                let raw = box_val(val);
+                cljrs_gc::alloc_ctx::invocation_cache_insert("versioned", key, raw as usize);
+                return raw;
             }
             #[cfg(feature = "no-gc")]
             let val = cljrs_value::publish::publish_value(val);
@@ -5697,7 +5708,7 @@ mod resource_review_tests {
 
     #[cfg(feature = "no-gc")]
     #[test]
-    fn invocation_keyword_fills_leave_program_caches_empty() {
+    fn invocation_keyword_fills_reuse_invocation_storage() {
         let _invocation = cljrs_gc::alloc_ctx::InvocationGuard::new(4096);
         let name = "review-invocation-keyword";
         let mut slot = 0;
@@ -5707,7 +5718,61 @@ mod resource_review_tests {
             panic!("expected keyword")
         };
         assert_eq!(keyword.get().name.as_ref(), name);
-        assert!(_invocation.accounted_bytes() > 0);
+        let bytes = _invocation.accounted_bytes();
+        for _ in 0..10000 {
+            let again = unsafe { rt_kw_ic_fill(name.as_ptr(), name.len() as u64, &mut slot) };
+            assert_eq!(pointer, again);
+        }
+        assert_eq!(bytes, _invocation.accounted_bytes());
+        assert_eq!(
+            slot, 0,
+            "program slot must never contain an invocation pointer"
+        );
+    }
+
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn invocation_versioned_loads_reuse_boxes_without_filling_program_slots() {
+        let globals =
+            cljrs_runtime::env::env::GlobalEnv::new(cljrs_runtime::ExecutionMode::TreeWalk);
+        let ns = "review.invocation.cache";
+        let name = "answer@abcdef012345";
+        globals.cache_versioned(ns, "answer", "abcdef012345", Value::Long(42));
+        let _context =
+            cljrs_runtime::env::callback::install_eval_context_guard(globals, "user".into());
+        {
+            let invocation = cljrs_gc::alloc_ctx::InvocationGuard::new(4096);
+            let mut slot = 0;
+            let mut load = || unsafe {
+                rt_load_global_versioned_ic(
+                    ns.as_ptr(),
+                    ns.len() as u64,
+                    name.as_ptr(),
+                    name.len() as u64,
+                    &mut slot,
+                )
+            };
+            let first = load();
+            assert_eq!(unsafe { &*first }, &Value::Long(42));
+            let bytes = invocation.accounted_bytes();
+            for _ in 0..10000 {
+                assert_eq!(first, load());
+            }
+            assert_eq!(bytes, invocation.accounted_bytes());
+            assert_eq!(slot, 0);
+            assert!(
+                !versioned_ic_table()
+                    .read()
+                    .unwrap()
+                    .contains_key(&format!("{ns}/{name}"))
+            );
+        }
+        let invocation = cljrs_gc::alloc_ctx::InvocationGuard::new(4096);
+        assert!(
+            cljrs_gc::alloc_ctx::invocation_cache_get("versioned", &format!("{ns}/{name}"))
+                .is_none()
+        );
+        assert_eq!(invocation.accounted_bytes(), 0);
     }
 
     #[test]

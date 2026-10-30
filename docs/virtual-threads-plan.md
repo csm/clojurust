@@ -567,3 +567,13 @@ IR and AOT scans scope their function reads. Test-runner reads end with each nam
 Standalone macro expansion and IR lowering use temporary storage. Compiled constant caches keep permanent values outside bounded invocations.
 First cache fills inside an invocation remain invocation-local. Cached compiled protocol calls borrow implementation ownership.
 Exception tracing retains data held in other regions.
+
+
+Ninth-pass review fixes bound definition compaction by size and depth, and preserve large shared payloads.
+Ownership tracing uses an explicit stack. Immutable graphs cache their counted dependencies after the first walk.
+Repeated closure captures stop at shared cached roots. Transients capture initial ownership once and reuse it on returns.
+Region chunks grow geometrically. Relocation and cache flags share the existing identity word.
+Invocation-local keyword and versioned-global tables reuse boxes without publishing invocation pointers into program caches.
+Unscoped host reads retain raw results. Scopes and snapshots provide bounded ownership for callers that need it.
+Var reads acquire backing ownership once per binding and scope epoch.
+Bootstrap has no command-wide read scope. Discarded source forms use separate scratch lifetimes.

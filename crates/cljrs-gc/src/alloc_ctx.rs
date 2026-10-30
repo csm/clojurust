@@ -38,12 +38,17 @@ pub(crate) enum AllocCtx {
 // SAFETY: AllocCtx values are only accessed from their owning thread.
 unsafe impl Send for AllocCtx {}
 
+type InvocationCache =
+    std::collections::HashMap<&'static str, std::collections::HashMap<String, usize>>;
+
 thread_local! {
     /// Thread-local allocation context stack.
     /// Empty ≡ Static (program-startup default).
+    static INVOCATION_CACHE: RefCell<InvocationCache> = RefCell::new(Default::default());
     pub(crate) static ALLOC_CTX: RefCell<Vec<AllocCtx>> = const { RefCell::new(Vec::new()) };
 }
 crate::mutator_slot!("cljrs-gc/ALLOC_CTX", refcell ALLOC_CTX: Vec<AllocCtx>);
+crate::mutator_slot!("cljrs-gc/INVOCATION_CACHE", refcell INVOCATION_CACHE: InvocationCache);
 
 /// Allocate `value` in the currently active allocation context.
 pub(crate) fn alloc_in_ctx<T: Trace + 'static>(value: T) -> GcPtr<T> {
@@ -99,6 +104,26 @@ pub fn invocation_is_active() -> bool {
     })
 }
 
+/// Look up a raw address cached for the current invocation. Entries expire before its arena.
+pub fn invocation_cache_get(kind: &'static str, key: &str) -> Option<usize> {
+    if !invocation_is_active() {
+        return None;
+    }
+    INVOCATION_CACHE.with(|cache| cache.borrow().get(kind)?.get(key).copied())
+}
+
+/// Cache a raw address owned by the active invocation. It must not enter a program cache.
+pub fn invocation_cache_insert(kind: &'static str, key: String, address: usize) {
+    assert!(invocation_is_active());
+    INVOCATION_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(kind)
+            .or_default()
+            .insert(key, address);
+    });
+}
+
 /// Owns the single bounded arena used by a GC-less isolated invocation.
 ///
 /// Every `GcPtr::new` within the guard's dynamic extent lands in this arena.
@@ -144,6 +169,7 @@ impl Drop for InvocationGuard {
             });
             self.in_ctx = false;
         }
+        INVOCATION_CACHE.with(|cache| cache.borrow_mut().clear());
         self.region.reset();
     }
 }

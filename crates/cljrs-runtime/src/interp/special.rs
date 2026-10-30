@@ -1919,7 +1919,8 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
     for (_, fn_val) in &built {
         if let Value::Fn(ptr) = fn_val {
             let mut ptr = ptr.clone();
-            let f = ptr.get_mut();
+            #[allow(unused_mut)]
+            let mut f = ptr.get_mut();
             for i in 0..f.closed_over_names.len() {
                 let captured = f.closed_over_names[i].clone();
                 if let Some((_, real)) = built.iter().find(|(n, _)| *n == captured) {

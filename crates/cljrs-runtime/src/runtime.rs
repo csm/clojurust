@@ -188,8 +188,6 @@ impl RuntimeBuilder {
     /// itself always tree-walks, because nothing can be lowered before
     /// `clojure.core` exists.
     pub fn build(self) -> Result<Runtime, BuildError> {
-        #[cfg(feature = "no-gc")]
-        let _reads = cljrs_gc::region::ReadScope::enter();
         // Register this thread with the process memory governor (under its
         // thread name, unless already registered) before the first allocation.
         let _ = cljrs_gc::governor::current_control();
