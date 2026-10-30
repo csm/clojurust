@@ -21,6 +21,9 @@ use crate::Value;
 /// Inner map type for protocol implementations: method_name → impl fn.
 pub type MethodMap = HashMap<Arc<str>, Value>;
 
+#[cfg(feature = "no-gc")]
+type ImplementationOwnership = HashMap<Arc<str>, HashMap<Arc<str>, crate::publish::ValueLease>>;
+
 /// A Clojure protocol — an interface-like construct with named methods.
 #[derive(Debug)]
 pub struct Protocol {
@@ -29,6 +32,8 @@ pub struct Protocol {
     pub methods: Vec<ProtocolMethod>,
     /// type_tag → { method_name → impl fn }
     pub impls: TrackedMutex<HashMap<Arc<str>, MethodMap>>,
+    #[cfg(feature = "no-gc")]
+    impl_ownership: std::cell::RefCell<ImplementationOwnership>,
     /// `(defprotocol Name :extend-via-metadata true ...)` — when set, protocol
     /// dispatch consults the dispatch value's metadata (keyed by this
     /// protocol's `ProtocolFn`s) before falling back to type-tag impls.
@@ -47,8 +52,53 @@ impl Protocol {
             ns,
             methods,
             impls: TrackedMutex::new(HashMap::new()),
+            #[cfg(feature = "no-gc")]
+            impl_ownership: Default::default(),
             extend_via_metadata,
         }
+    }
+}
+
+impl Protocol {
+    /// Install an implementation and its replaceable ownership cache.
+    pub fn set_implementation(&self, tag: Arc<str>, method: Arc<str>, value: Value) {
+        #[cfg(feature = "no-gc")]
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        self.impls
+            .lock()
+            .unwrap()
+            .entry(tag.clone())
+            .or_default()
+            .insert(method.clone(), value);
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self
+                .impl_ownership
+                .borrow_mut()
+                .entry(tag)
+                .or_default()
+                .insert(method, lease);
+            drop(previous);
+        }
+    }
+    /// Borrow a cached implementation without allocating a composite key.
+    pub fn protect_implementation(&self, tag: &str, method: &str) {
+        #[cfg(feature = "no-gc")]
+        if let Some(lease) = self
+            .impl_ownership
+            .borrow()
+            .get(tag)
+            .and_then(|methods| methods.get(method))
+        {
+            lease.protect_read();
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = (tag, method);
     }
 }
 
@@ -147,6 +197,8 @@ pub struct MultiFn {
     pub default_dispatch: String,
     method_generation: std::sync::atomic::AtomicU64,
     method_cache: TrackedMutex<MultiFnMethodCache>,
+    #[cfg(feature = "no-gc")]
+    method_ownership: std::cell::RefCell<HashMap<String, crate::publish::ValueLease>>,
 }
 
 #[derive(Debug, Default)]
@@ -168,6 +220,8 @@ impl MultiFn {
             default_dispatch,
             method_generation: std::sync::atomic::AtomicU64::new(0),
             method_cache: TrackedMutex::new(MultiFnMethodCache::default()),
+            #[cfg(feature = "no-gc")]
+            method_ownership: Default::default(),
         }
     }
 
@@ -175,10 +229,37 @@ impl MultiFn {
     pub fn method(&self, key: &str) -> Option<Value> {
         let value = self.methods.lock().unwrap().get(key).cloned();
         #[cfg(feature = "no-gc")]
-        if value.is_some() {
-            crate::publish::read_named_slot(self as *const _ as usize, format!("method:{key}"));
+        if let Some(lease) = self.method_ownership.borrow().get(key) {
+            lease.protect_read();
         }
         value
+    }
+
+    /// Replace one method and its cached backing scopes.
+    pub fn set_method(&self, key: String, value: Value) {
+        #[cfg(feature = "no-gc")]
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        self.methods.lock().unwrap().insert(key.clone(), value);
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self.method_ownership.borrow_mut().insert(key, lease);
+            drop(previous);
+        }
+    }
+    /// Remove a method, releasing its cache after existing readers finish.
+    pub fn remove_method(&self, key: &str) -> bool {
+        let removed = self.methods.lock().unwrap().remove(key).is_some();
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self.method_ownership.borrow_mut().remove(key);
+            drop(previous);
+        }
+        removed
     }
 
     /// Current generation of this multimethod's method and preference tables.
@@ -248,8 +329,11 @@ impl Drop for MultiFn {
 impl cljrs_gc::Trace for MultiFn {
     #[cfg(feature = "no-gc")]
     fn init_ownership(&self) {
+        let methods = self.methods.lock().unwrap().clone();
+        for (key, value) in methods {
+            self.set_method(key, value);
+        }
         for (prefix, table) in [
-            ("method", &self.methods),
             ("dispatch", &self.dispatch_vals),
             ("prefer", &self.preference_vals),
         ] {
@@ -431,7 +515,7 @@ impl Var {
         #[cfg(feature = "no-gc")]
         let (local, lease) = match local {
             Some(value) => {
-                let (value, lease) = crate::publish::prepare_for_owner(
+                let (value, lease) = crate::publish::prepare_definition(
                     value,
                     &cljrs_gc::region::AllocationOwner::current(),
                 );
@@ -504,7 +588,7 @@ impl Var {
         #[cfg(feature = "no-gc")]
         let previous_lease = self.value_lease.borrow().snapshot();
         #[cfg(feature = "no-gc")]
-        let (v, lease) = crate::publish::prepare_for_owner(
+        let (v, lease) = crate::publish::prepare_definition(
             v,
             &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
         );
@@ -568,7 +652,7 @@ impl Var {
         #[cfg(not(feature = "no-gc"))]
         let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
         #[cfg(feature = "no-gc")]
-        let (m, lease) = crate::publish::prepare_for_owner(
+        let (m, lease) = crate::publish::prepare_definition(
             m,
             &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
         );
@@ -585,6 +669,14 @@ impl Var {
 }
 
 impl cljrs_gc::Trace for Var {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
+
     #[cfg(feature = "no-gc")]
     fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
@@ -637,7 +729,7 @@ impl Atom {
         // shared state, so its initial value must not be region-allocated.
         #[cfg(feature = "no-gc")]
         let (v, lease) =
-            crate::publish::prepare_for_owner(v, &cljrs_gc::region::AllocationOwner::current());
+            crate::publish::prepare_definition(v, &cljrs_gc::region::AllocationOwner::current());
         #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
@@ -679,7 +771,7 @@ impl Atom {
             &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
         );
         #[cfg(feature = "no-gc")]
-        lease.protect_current();
+        lease.publish_return();
         *self.value.lock().unwrap() = v.clone();
         #[cfg(feature = "no-gc")]
         {
@@ -773,6 +865,13 @@ impl Atom {
 }
 
 impl cljrs_gc::Trace for Atom {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
     #[cfg(feature = "no-gc")]
     fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
@@ -1521,7 +1620,7 @@ impl Volatile {
             &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
         );
         #[cfg(feature = "no-gc")]
-        lease.protect_current();
+        lease.publish_return();
         *self.value.lock().unwrap() = v.clone();
         #[cfg(feature = "no-gc")]
         {
@@ -1538,6 +1637,14 @@ impl std::fmt::Debug for Volatile {
 }
 
 impl cljrs_gc::Trace for Volatile {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
+
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         #[cfg(not(feature = "no-gc"))]
         {

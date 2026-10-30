@@ -22,7 +22,7 @@ pub struct PersistentVector {
     scalar_only: bool,
 }
 
-fn scalar(value: &Value) -> bool {
+pub(crate) fn scalar(value: &Value) -> bool {
     matches!(
         value,
         Value::Nil | Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::Char(_)
@@ -44,6 +44,15 @@ impl PersistentVector {
         Self {
             scalar_only,
             inner: vector,
+            is_map_entry: false,
+            charge: ShareCharge::full(),
+        }
+    }
+
+    pub(crate) fn from_vector_summary(vector: rpds::VectorSync<Value>, scalar_only: bool) -> Self {
+        Self {
+            inner: vector,
+            scalar_only,
             is_map_entry: false,
             charge: ShareCharge::full(),
         }
@@ -142,6 +151,10 @@ impl PersistentVector {
     /// Iterate over elements in index order.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.inner.iter()
+    }
+
+    pub(crate) fn scalar_only(&self) -> bool {
+        self.scalar_only
     }
 
     pub fn inner(&self) -> &rpds::VectorSync<Value> {

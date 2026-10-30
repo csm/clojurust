@@ -1,31 +1,55 @@
 use crate::hash::hash_combine_ordered;
 use crate::{ClojureHash, PersistentVector, Value, ValueError, ValueResult};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug)]
 pub struct TransientVector {
     vector: Mutex<rpds::VectorSync<Value>>,
     persisted: Mutex<bool>,
+    scalar_only: AtomicBool,
+    #[cfg(feature = "no-gc")]
+    initial: rpds::VectorSync<Value>,
 }
 
 impl TransientVector {
     pub fn new() -> TransientVector {
         TransientVector {
             vector: Mutex::new(Default::default()),
+            #[cfg(feature = "no-gc")]
+            initial: Default::default(),
             persisted: Mutex::new(false),
+            scalar_only: AtomicBool::new(true),
         }
     }
 
     pub fn new_from_vector(vector: &rpds::VectorSync<Value>) -> TransientVector {
         TransientVector {
             vector: Mutex::new(vector.clone()),
+            #[cfg(feature = "no-gc")]
+            initial: vector.clone(),
             persisted: Mutex::new(false),
+            scalar_only: AtomicBool::new(false),
         }
+    }
+
+    /// Share a persistent vector and its cached scalar summary.
+    pub fn from_persistent(vector: &PersistentVector) -> Self {
+        let result = Self::new_from_vector(vector.inner());
+        result
+            .scalar_only
+            .store(vector.scalar_only(), Ordering::Relaxed);
+        result
     }
 
     pub fn append(&self, v: Value) -> ValueResult<()> {
         if *self.persisted.lock().unwrap() {
             return Err(ValueError::TransientAlreadyPersisted);
+        }
+        if !super::vector::scalar(&v) {
+            self.scalar_only.store(false, Ordering::Relaxed);
         }
         let v = crate::publish::publish_for_slot(v, self as *const _ as usize, self.count());
         let mut vector = self.vector.lock().unwrap();
@@ -56,6 +80,9 @@ impl TransientVector {
         if index > count {
             return Err(ValueError::IndexOutOfBounds { idx: index, count });
         }
+        if !super::vector::scalar(&v) {
+            self.scalar_only.store(false, Ordering::Relaxed);
+        }
         let v = crate::publish::publish_for_slot(v, self as *const _ as usize, index);
         let mut vector = self.vector.lock().unwrap();
         if index == count {
@@ -82,9 +109,20 @@ impl TransientVector {
             return Err(ValueError::TransientAlreadyPersisted);
         }
         *persisted = true;
-        let result = PersistentVector::from_vector(vector.clone());
+        let result = PersistentVector::from_vector_summary(
+            vector.clone(),
+            self.scalar_only.load(Ordering::Relaxed),
+        );
         #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+        {
+            let address = self as *const _ as usize;
+            if cljrs_gc::region::AllocationOwner::for_address(address).is_permanent() {
+                // Rust stack containers do not have a containing region to lease.
+                cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+            } else {
+                cljrs_gc::region::RegionLease::for_address(address).protect_read();
+            }
+        }
         Ok(result)
     }
 }
@@ -105,25 +143,24 @@ impl Clone for TransientVector {
     fn clone(&self) -> Self {
         Self {
             vector: Mutex::new(self.vector.lock().unwrap().clone()),
+            #[cfg(feature = "no-gc")]
+            initial: self.vector.lock().unwrap().clone(),
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
+            scalar_only: AtomicBool::new(self.scalar_only.load(Ordering::Relaxed)),
         }
     }
 }
 
 impl cljrs_gc::Trace for TransientVector {
     #[cfg(feature = "no-gc")]
-    fn init_ownership(&self) {
-        for (index, value) in self.vector.lock().unwrap().iter().enumerate() {
-            let lease = cljrs_gc::region::RegionLease::for_value(value);
-            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
-                self as *const _ as usize,
-                index,
-                &lease,
-            );
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        if self.scalar_only.load(Ordering::Relaxed) {
+            return;
+        }
+        for value in self.initial.iter() {
+            value.trace(visitor);
         }
     }
-    #[cfg(feature = "no-gc")]
-    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {

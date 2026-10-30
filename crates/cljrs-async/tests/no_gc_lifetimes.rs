@@ -503,6 +503,13 @@ fn definitions_transients_and_mutable_slots_preserve_escapes_and_bound_retention
         runtime.globals().intern("user", "probe?".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(NativeFn::new("probe?", Arity::Fixed(1), |args| Ok(Value::Bool(matches!(&args[0], Value::NativeObject(object) if object.get().type_tag() == "ReviewProbe")))))));
         let mut env = Env::new(runtime.globals().clone(), "user");
         let source = r#"
+              (let [a (object-array 1) s (aset a 0 (str "returned-" 42))]
+                (aset a 0 nil)
+                (assert (= "returned-42" s)))
+              (doseq [v [(object-array 1) (int-array 1) (transient [])
+                          (with-meta [1] {:m 1}) (reduced 1) #"x" (ex-info "x" {})]]
+                (assert (identical? v v)))
+
           (assert (= {:k "v"} (try (def broken (throw (ex-info "boom" {:k (str "v")}))) (catch Exception e (ex-data e)))))
           (assert (= {:k "attribute"} (try (defn broken-fn {:x (throw (ex-info "boom" {:k (str "attribute")}))} [] nil) (catch Exception e (ex-data e)))))
           (assert (= ["a"] (let [t (transient [])] (conj! t (str "a")) (persistent! t))))

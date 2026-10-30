@@ -387,7 +387,7 @@ impl Future for FiberTask {
             let _handoff = this._captures.enter();
             #[cfg(feature = "no-gc")]
             if !this.root && !this.owned_result {
-                this.result_lease.borrow().protect_current();
+                this.result_lease.borrow().publish_return();
             }
             if !this.root {
                 this.state = MutatorState::fresh();
@@ -459,7 +459,7 @@ impl FiberResult {
     pub fn into_result(mut self) -> EvalResult {
         #[cfg(feature = "no-gc")]
         for lease in &self.leases {
-            lease.protect_current();
+            lease.publish_return();
         }
         self.result.take().unwrap()
     }
@@ -559,7 +559,7 @@ pub fn run_root(
     let ownership = drive.task.result_lease.borrow().clone();
     drop(drive);
     #[cfg(feature = "no-gc")]
-    ownership.protect_current();
+    ownership.publish_return();
     result
 }
 

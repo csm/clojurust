@@ -4456,7 +4456,9 @@ fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
 fn concat_lazy(colls: Vec<Value>) -> Value {
     // Even the zero-arity and all-empty cases are lazy in Clojure. The thunk
     // discovers emptiness when the result is first observed.
-    Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(ConcatThunk { colls }))))
+    Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(ConcatThunk {
+        colls,
+    }))))
 }
 
 /// Thunk for lazy concat: holds remaining collections to iterate.
@@ -4747,7 +4749,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         for item in iter.by_ref() {
             acc = crate::env::callback::invoke(&xf_rf, vec![acc, item])?;
             if let Value::Reduced(inner) = acc {
-                acc = *inner;
+                acc = (*inner).clone();
                 break;
             }
         }
@@ -4757,7 +4759,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         // Call completion arity
         acc = crate::env::callback::invoke(&xf_rf, vec![acc])?;
         if let Value::Reduced(inner) = acc {
-            acc = *inner;
+            acc = (*inner).clone();
         }
         return Ok(acc);
     }
@@ -5215,6 +5217,8 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
                 });
             }
             guard[idx] = newval.clone();
+            drop(guard);
+            cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
             Ok(newval)
         }
         Value::IntArray(_) => builtin_aset_int(args),
@@ -6124,7 +6128,7 @@ fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
 fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
     // Actual option parsing (meta/validator) is handled in apply.rs handle_atom_call.
     // This fallback is only hit by direct Value-level calls (e.g. tests via apply).
-    Ok(Value::Atom(GcPtr::new(Atom::new(args[0].clone()))))
+    Ok(Value::Atom(GcPtr::new_isolated(Atom::new(args[0].clone()))))
 }
 
 // ── shared-atom (Phase B3, two-tier ADR) ──────────────────────────────────────
@@ -8139,7 +8143,7 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    let removed = mf.get().methods.lock().unwrap().remove(&key).is_some();
+    let removed = mf.get().remove_method(&key);
     mf.get().dispatch_vals.lock().unwrap().remove(&key);
     cljrs_value::publish::publish_for_named_slot(
         Value::Nil,
@@ -8294,7 +8298,7 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
 // ── reduced ──────────────────────────────────────────────────────────────────
 
 fn builtin_reduced(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Reduced(Box::new(args[0].clone())))
+    Ok(Value::Reduced(std::sync::Arc::new(args[0].clone())))
 }
 
 fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
@@ -8303,7 +8307,7 @@ fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Reduced(inner) => Ok(*inner.clone()),
+        Value::Reduced(inner) => Ok((**inner).clone()),
         other => Ok(other.clone()),
     }
 }
@@ -8311,7 +8315,7 @@ fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
 fn builtin_ensure_reduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Reduced(_) => Ok(args[0].clone()),
-        other => Ok(Value::Reduced(Box::new(other.clone()))),
+        other => Ok(Value::Reduced(std::sync::Arc::new(other.clone()))),
     }
 }
 
@@ -8405,7 +8409,7 @@ fn builtin_multi_fn(args: &[Value]) -> ValueResult<Value> {
         Some(v) => format!("{v}"),
         None => ":default".to_string(),
     };
-    Ok(Value::MultiFn(GcPtr::new(MultiFn::new(
+    Ok(Value::MultiFn(GcPtr::new_isolated(MultiFn::new(
         name,
         args[1].clone(),
         default_dispatch,
@@ -8432,17 +8436,12 @@ fn builtin_add_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    let method = cljrs_value::publish::publish_for_named_slot(
-        args[2].clone(),
-        mf.get() as *const _ as usize,
-        format!("method:{key}"),
-    );
+    mf.get().set_method(key.clone(), args[2].clone());
     let dispatch = cljrs_value::publish::publish_for_named_slot(
         args[1].clone(),
         mf.get() as *const _ as usize,
         format!("dispatch:{key}"),
     );
-    mf.get().methods.lock().unwrap().insert(key.clone(), method);
     mf.get().dispatch_vals.lock().unwrap().insert(key, dispatch);
     mf.get().bump_method_generation();
     Ok(Value::MultiFn(mf))
@@ -8554,16 +8553,12 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             };
-            let function = cljrs_value::publish::publish_for_named_slot(
-                f.clone(),
-                proto as *const _ as usize,
-                format!("{}:{type_tag}{method_name}", type_tag.len()),
-            );
+            let function = f.clone();
             prepared.push((method_name, function));
         }
-        let mut impls = proto.impls.lock().unwrap();
-        let table = impls.entry(type_tag.clone()).or_default();
-        table.extend(prepared);
+        for (method, function) in prepared {
+            proto.set_implementation(type_tag.clone(), method, function);
+        }
     }
     cljrs_value::bump_protocol_generation();
     Ok(Value::Nil)
@@ -8637,7 +8632,7 @@ fn builtin_make_type_instance_mut(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let cell = GcPtr::new(Atom::new(Value::Map(mut_map)));
+    let cell = GcPtr::new_isolated(Atom::new(Value::Map(mut_map)));
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
         type_tag,
         fields,

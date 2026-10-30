@@ -169,6 +169,11 @@ pub struct ScratchGuard {
 
 impl ScratchGuard {
     pub fn new() -> Self {
+        Self::with_capacity(4096)
+    }
+
+    /// Create scratch storage with a caller-selected initial chunk size.
+    pub fn with_capacity(capacity: usize) -> Self {
         if invocation_is_active() {
             return Self {
                 region: None,
@@ -177,7 +182,7 @@ impl ScratchGuard {
                 in_ctx: false,
             };
         }
-        let mut region = Box::new(Region::new());
+        let mut region = Box::new(Region::with_capacity(capacity));
         let ptr = region.as_mut() as *mut Region;
         ALLOC_CTX.with(|ctx| ctx.borrow_mut().push(AllocCtx::Region(ptr)));
         Self {

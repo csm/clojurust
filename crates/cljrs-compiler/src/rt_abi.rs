@@ -701,6 +701,7 @@ pub unsafe extern "C" fn rt_aset(
                 i as usize,
             );
             a.get().0.lock().unwrap()[i as usize] = value.clone();
+            cljrs_value::publish::read_slot(a.get() as *const _ as usize, i as usize);
             box_val(value)
         }
         Value::LongArray(a) => store!(a.get().lock().unwrap(), |v: &Value| match v {
@@ -3231,8 +3232,14 @@ pub unsafe extern "C" fn rt_transient(coll: *const Value) -> *const Value {
     let coll = unsafe { val_ref(coll) }.unwrap_meta();
     match coll {
         Value::Vector(v) => box_val(Value::TransientVector(GcPtr::new(
-            TransientVector::new_from_vector(v.get().inner()),
+            TransientVector::from_persistent(v.get()),
         ))),
+        Value::Map(MapValue::Array(m)) => {
+            let map = cljrs_value::PersistentHashMap::from_array_map(m.get());
+            box_val(Value::TransientMap(GcPtr::new(TransientMap::new_from_map(
+                &map,
+            ))))
+        }
         Value::Map(MapValue::Hash(m)) => box_val(Value::TransientMap(GcPtr::new(
             TransientMap::new_from_map(m.get()),
         ))),
@@ -4848,6 +4855,10 @@ fn intern_keyword(name: &str) -> *const Value {
     if let Some(v) = kw_intern_table().read().unwrap().get(name) {
         return v.0.get() as *const Value;
     }
+    #[cfg(feature = "no-gc")]
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return box_val(Value::Keyword(GcPtr::new(Keyword::parse(name))));
+    }
     ensure_ic_tracer_registered();
     let mut table = kw_intern_table().write().unwrap();
     // Re-check under the write lock so a racing intern of the same name
@@ -4855,6 +4866,8 @@ fn intern_keyword(name: &str) -> *const Value {
     if let Some(v) = table.get(name) {
         return v.0.get() as *const Value;
     }
+    #[cfg(feature = "no-gc")]
+    let _storage = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let ptr = GcPtr::new(Value::Keyword(GcPtr::new(Keyword::parse(name))));
     let raw = ptr.get() as *const Value;
     table.insert(name.to_string(), SharedVal(ptr));
@@ -4880,6 +4893,10 @@ pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usiz
     let interned = intern_keyword(name);
     // Plain (possibly racy) store: every filler stores the same interned
     // pointer, and aligned 8-byte stores cannot tear.
+    #[cfg(feature = "no-gc")]
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return interned;
+    }
     unsafe { *slot = interned as usize };
     interned
 }
@@ -4942,6 +4959,12 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
         commit,
     ) {
         Ok(val) => {
+            #[cfg(feature = "no-gc")]
+            if cljrs_gc::alloc_ctx::invocation_is_active() {
+                return box_val(val);
+            }
+            #[cfg(feature = "no-gc")]
+            let val = cljrs_value::publish::publish_value(val);
             ensure_ic_tracer_registered();
             let mut table = versioned_ic_table().write().unwrap();
             // Re-check under the write lock so a racing resolution of the
@@ -4952,6 +4975,8 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
                 unsafe { *slot = raw as usize };
                 return raw;
             }
+            #[cfg(feature = "no-gc")]
+            let _storage = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let ptr = GcPtr::new(val);
             let raw = ptr.get() as *const Value;
             table.insert(key, SharedVal(ptr));
@@ -5043,6 +5068,11 @@ pub unsafe extern "C" fn rt_call_ic(
                     && cljrs_runtime::env::apply::type_tag_matches(dispatch_val, &entry.tag)
                 {
                     let impl_fn = entry.impl_fn.clone();
+                    #[cfg(feature = "no-gc")]
+                    pf_ref
+                        .protocol
+                        .get()
+                        .protect_implementation(&entry.tag, &pf_ref.method_name);
                     drop(guard);
                     jit_stats::PROTO_IC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return invoke_boxed(&impl_fn, unsafe { collect_args(args, nargs as i64) });
@@ -5063,6 +5093,11 @@ pub unsafe extern "C" fn rt_call_ic(
                 .cloned()
         };
         if let Some(impl_fn) = impl_fn {
+            #[cfg(feature = "no-gc")]
+            pf_ref
+                .protocol
+                .get()
+                .protect_implementation(&tag, &pf_ref.method_name);
             ensure_ic_tracer_registered();
             let entry = ProtoIcEntry {
                 callee: callee_id,
@@ -5636,6 +5671,45 @@ mod resource_review_tests {
                 | (ValueError::MemoryLimitExceeded(_), ResourceError::Memory(_))
         ));
     }
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn compiled_keyword_constants_survive_the_filling_calls_scope() {
+        let mut slot = 0;
+        let name = "review-owned-keyword";
+        let pointer;
+        {
+            let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            pointer = unsafe { rt_kw_ic_fill(name.as_ptr(), name.len() as u64, &mut slot) };
+        }
+        let Value::Keyword(keyword) = (unsafe { &*pointer }) else {
+            panic!("expected keyword")
+        };
+        assert_eq!(keyword.get().name.as_ref(), name);
+        let map = Value::Map(MapValue::from_pairs(vec![(
+            unsafe { &*pointer }.clone(),
+            Value::Long(42),
+        )]));
+        assert_eq!(
+            compiled_result(unsafe { rt_get(&map, pointer) }).unwrap(),
+            Value::Long(42)
+        );
+    }
+
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn invocation_keyword_fills_leave_program_caches_empty() {
+        let _invocation = cljrs_gc::alloc_ctx::InvocationGuard::new(4096);
+        let name = "review-invocation-keyword";
+        let mut slot = 0;
+        let pointer = unsafe { rt_kw_ic_fill(name.as_ptr(), name.len() as u64, &mut slot) };
+        assert_eq!(slot, 0);
+        let Value::Keyword(keyword) = (unsafe { &*pointer }) else {
+            panic!("expected keyword")
+        };
+        assert_eq!(keyword.get().name.as_ref(), name);
+        assert!(_invocation.accounted_bytes() > 0);
+    }
+
     #[test]
     fn compiled_identity_compares_values_instead_of_box_addresses() {
         let left = Value::string("same allocation");
@@ -5658,9 +5732,25 @@ mod resource_review_tests {
         let _caller = cljrs_gc::alloc_ctx::ScratchGuard::new();
         let input = Value::string("stored scalar");
         let stored = compiled_result(unsafe { rt_aset(&array, &Value::Long(0), &input) }).unwrap();
-        let read = compiled_result(unsafe { rt_aget(&array, &Value::Long(0)) }).unwrap();
+        compiled_result(unsafe { rt_aset(&array, &Value::Long(0), &Value::string("replacement")) })
+            .unwrap();
         assert!(input.identical(&stored));
+        assert_eq!(stored.to_string(), "\"stored scalar\"");
+        compiled_result(unsafe { rt_aset(&array, &Value::Long(0), &input) }).unwrap();
+        let read = compiled_result(unsafe { rt_aget(&array, &Value::Long(0)) }).unwrap();
         assert!(input.identical(&read));
+        let wrapped =
+            Value::Vector(GcPtr::new(PersistentVector::empty())).with_meta(Value::Long(1));
+        let reduced = Value::Reduced(std::sync::Arc::new(Value::Long(3)));
+        let transient =
+            Value::TransientVector(GcPtr::new(cljrs_value::collections::TransientVector::new()));
+        for value in [array, wrapped, reduced, transient] {
+            let alias = value.clone();
+            assert_eq!(
+                compiled_result(unsafe { rt_identical(&value, &alias) }).unwrap(),
+                Value::Bool(true)
+            );
+        }
     }
 
     #[test]

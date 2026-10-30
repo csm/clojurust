@@ -144,7 +144,7 @@ pub enum Value {
     ByteBlob(std::sync::Arc<ByteBlob>),
 
     // ── Reduced (early termination sentinel for reduce/transduce) ───────────
-    Reduced(Box<Value>),
+    Reduced(Arc<Value>),
 
     // ── Other ─────────────────────────────────────────────────────────────────
     Namespace(GcPtr<Namespace>),
@@ -178,7 +178,7 @@ pub enum Value {
 
     // ── Metadata wrapper ─────────────────────────────────────────────────────
     /// A value with attached metadata. Transparent for equality, hashing, display.
-    WithMeta(Box<Value>, Box<Value>),
+    WithMeta(Arc<Value>, Arc<Value>),
 
     // Errors
     Error(GcPtr<ExceptionInfo>),
@@ -1146,7 +1146,7 @@ impl Value {
     pub fn identical(&self, other: &Value) -> bool {
         macro_rules! peq {
             ($a:expr, $b:expr) => {
-                GcPtr::ptr_eq($a, $b)
+                GcPtr::identity_eq($a, $b)
             };
         }
         match (self, other) {
@@ -1194,6 +1194,29 @@ impl Value {
             (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
             (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
             (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
+            (Value::BoundFn(a), Value::BoundFn(b)) => peq!(a, b),
+            (Value::ObjectArray(a), Value::ObjectArray(b)) => peq!(a, b),
+            (Value::IntArray(a), Value::IntArray(b)) => peq!(a, b),
+            (Value::LongArray(a), Value::LongArray(b)) => peq!(a, b),
+            (Value::ShortArray(a), Value::ShortArray(b)) => peq!(a, b),
+            (Value::ByteArray(a), Value::ByteArray(b)) => peq!(a, b),
+            (Value::FloatArray(a), Value::FloatArray(b)) => peq!(a, b),
+            (Value::DoubleArray(a), Value::DoubleArray(b)) => peq!(a, b),
+            (Value::BooleanArray(a), Value::BooleanArray(b)) => peq!(a, b),
+            (Value::CharArray(a), Value::CharArray(b)) => peq!(a, b),
+            (Value::TransientMap(a), Value::TransientMap(b)) => peq!(a, b),
+            (Value::TransientSet(a), Value::TransientSet(b)) => peq!(a, b),
+            (Value::TransientVector(a), Value::TransientVector(b)) => peq!(a, b),
+            (Value::Error(a), Value::Error(b)) => peq!(a, b),
+            (Value::Pattern(a), Value::Pattern(b)) => peq!(a, b),
+            (Value::Matcher(a), Value::Matcher(b)) => peq!(a, b),
+            (Value::SharedAtom(a), Value::SharedAtom(b)) => Arc::ptr_eq(a, b),
+            (Value::ByteBlob(a), Value::ByteBlob(b)) => Arc::ptr_eq(a, b),
+            (Value::Resource(a), Value::Resource(b)) => Arc::ptr_eq(&a.0, &b.0),
+            (Value::Reduced(a), Value::Reduced(b)) => Arc::ptr_eq(a, b),
+            (Value::WithMeta(a, am), Value::WithMeta(b, bm)) => {
+                Arc::ptr_eq(a, b) && Arc::ptr_eq(am, bm)
+            }
             _ => false,
         }
     }
@@ -1270,8 +1293,8 @@ impl Value {
     /// Return a new value with metadata attached.
     pub fn with_meta(self, meta: Value) -> Value {
         match self {
-            Value::WithMeta(inner, _) => Value::WithMeta(inner, Box::new(meta)),
-            other => Value::WithMeta(Box::new(other), Box::new(meta)),
+            Value::WithMeta(inner, _) => Value::WithMeta(inner, Arc::new(meta)),
+            other => Value::WithMeta(Arc::new(other), Arc::new(meta)),
         }
     }
 }

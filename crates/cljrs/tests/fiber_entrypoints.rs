@@ -236,3 +236,19 @@ fn executor_panic_preserves_the_callers_environment() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn ir_build_reads_defined_functions_outside_evaluation() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("core.ir.bin");
+    finish(
+        command()
+            .args(["ir", "build", "--ns", "clojure.core", "-o"])
+            .arg(&output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}

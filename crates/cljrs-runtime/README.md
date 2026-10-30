@@ -1742,12 +1742,13 @@ Native JIT and OSR dispatch preserve resource-limit errors through
 `JitBackend::take_pending_resource_error() -> Option<ValueError>` and the matching
 `JitState` method. Gas exhaustion and memory-limit faults bypass Clojure catch clauses.
 
-In `no-gc` builds, dynamic binding frames record their allocation destination.
-A `set!` update retains its backing scopes for that frame's lifetime.
+In `no-gc` builds, dynamic binding frames own one replaceable lease per bound Var.
+A `set!` update replaces that Var's cached ownership.
 Values written by nested calls remain valid after those calls release their scratch storage.
 Object-array writes use the destination ownership barrier before storing an element.
 
-No-gc final results and dynamic-binding writes copy finite immutable data at explicit program-lifetime boundaries.
+No-GC final raw results retain their backing regions at explicit program-lifetime boundaries.
+Dynamic binding writes compact small immutable scalars and reuse existing compact copies.
 Regional destinations retain backing scopes through ownership edges. Pending sequences and mutable identities preserve their original objects.
 
 No-gc recur values use a lease owned by the function or loop trampoline.
@@ -1777,3 +1778,11 @@ Namespace loading and bootstrap evaluation use this entry point.
 It applies the shared return, thrown-value, and recur ownership policy before a producing scope closes.
 Definition initializers and function bodies use this policy, including early errors.
 Dynamic binding frames own one replaceable lease per variable.
+
+No-GC definitions pack immutable data and metadata before the initializer scratch scope closes.
+Function and atom roots use separate small regions. Immutable aliases keep their logical identities.
+Borrowed reads remain scoped; explicit escaping raw results use result publication.
+Protocol and multimethod dispatch borrow ownership cached beside the implementation.
+
+Standalone macro-expansion APIs keep their temporary values in a scratch scope under no-GC.
+They release successful temporary values after building the returned Rust form and publish thrown errors before teardown.

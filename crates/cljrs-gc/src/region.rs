@@ -346,7 +346,7 @@ impl Region {
         if aligned + layout.size() <= self.end {
             None
         } else {
-            Some(DEFAULT_CHUNK_SIZE.max(layout.size() * 2))
+            Some(self.chunks[0].layout.size().max(layout.size() * 2))
         }
     }
 
@@ -393,7 +393,7 @@ impl Region {
                 requested: size,
             });
         }
-        let chunk_size = DEFAULT_CHUNK_SIZE.max(size * 2);
+        let chunk_size = self.chunks[0].layout.size().max(size * 2);
         let chunk = Chunk::new(chunk_size, layout.align());
         if self.retired && chunk.charged {
             crate::governor::with_registered_account(|account| {
@@ -593,6 +593,7 @@ struct LeaseOwner {
     dependencies: RefCell<std::collections::BTreeMap<u64, std::rc::Weak<LeaseOwner>>>,
     dependency_counts: RefCell<std::collections::BTreeMap<u64, usize>>,
     slots: RefCell<std::collections::BTreeMap<(usize, SlotId), RegionDependency>>,
+    durable: RefCell<std::collections::BTreeMap<u64, RegionDependency>>,
 }
 #[cfg(feature = "no-gc")]
 impl Drop for LeaseOwner {
@@ -634,6 +635,7 @@ impl Region {
             dependencies: RefCell::new(Default::default()),
             dependency_counts: RefCell::new(Default::default()),
             slots: RefCell::new(Default::default()),
+            durable: RefCell::new(Default::default()),
         });
         self.lease = Some(owner.clone());
         for chunk in &self.chunks {
@@ -803,6 +805,12 @@ impl RegionLease {
         owners.dedup_by_key(|owner| owner.id);
         Self::new(owners)
     }
+    /// Lease one containing region without traversing its managed object.
+    pub fn for_address(address: usize) -> Self {
+        let mut lease = Self::default();
+        lease.add_address(address);
+        lease
+    }
     pub fn for_value(value: &impl Trace) -> Self {
         crate::leases_for(value)
     }
@@ -860,7 +868,21 @@ impl RegionLease {
         }) {
             return;
         }
+        assert!(
+            !crate::alloc_ctx::is_static_context(),
+            "a borrowed no-gc value requires ReadScope; use explicit result publication or an owning snapshot"
+        );
         AllocationOwner::current().adopt(self);
+    }
+    /// Transfer an escaping raw result, including an explicit program-lifetime result.
+    pub fn publish_return(&self) {
+        if crate::alloc_ctx::is_static_context() && !ReadScope::is_active() {
+            for owner in &self.0 {
+                retain_owner(owner);
+            }
+        } else {
+            self.protect_current();
+        }
     }
     pub fn enter(&self) -> LeaseScope {
         INHERITED_LEASES.with(|stack| stack.borrow_mut().push(self.clone()));
@@ -979,33 +1001,18 @@ impl AllocationOwner {
     /// Store backing scopes for the destination's full lifetime.
     pub fn adopt(&self, lease: &RegionLease) {
         if let Some(owner) = self.0.upgrade() {
-            if owner.permanent.get() {
-                for source in &lease.0 {
-                    retain_owner(source);
-                }
-                return;
-            }
-            let mut dependencies = owner.dependencies.borrow_mut();
             for source in &lease.0 {
-                if source.id == owner.id || source.permanent.get() {
+                if source.id == owner.id
+                    || source.permanent.get()
+                    || owner.durable.borrow().contains_key(&source.id)
+                {
                     continue;
                 }
-                owner
-                    .dependency_counts
-                    .borrow_mut()
-                    .insert(source.id, usize::MAX);
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    dependencies.entry(source.id)
-                {
-                    entry.insert(std::rc::Rc::downgrade(source));
-                    source
-                        .dependents
-                        .borrow_mut()
-                        .insert(owner.id, std::rc::Rc::downgrade(&owner));
-                }
+                let source_lease = RegionLease::new(vec![source.clone()]);
+                let edge = self.replaceable(&source_lease);
+                owner.durable.borrow_mut().insert(source.id, edge);
             }
         } else {
-            // A static sink has program lifetime. Keep only actual backing scopes.
             for source in &lease.0 {
                 retain_owner(source);
             }
@@ -1024,6 +1031,22 @@ impl RegionDependency {
     pub fn snapshot(&self) -> RegionLease {
         self.sources.upgrade()
     }
+    /// Borrow cached weak sources without constructing an owning snapshot.
+    pub fn protect_read(&self) {
+        if !ReadScope::is_active() {
+            return self.snapshot().protect_read();
+        }
+        READ_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let scope = scopes.last_mut().unwrap();
+            for owner in self.sources.0.iter().filter_map(std::rc::Weak::upgrade) {
+                if !owner.permanent.get() && scope.1.insert(owner.id) {
+                    owner.external.set(owner.external.get() + 1);
+                    scope.0.push(owner);
+                }
+            }
+        });
+    }
 }
 #[cfg(feature = "no-gc")]
 impl AllocationOwner {
@@ -1037,9 +1060,7 @@ impl AllocationOwner {
             }
             let mut counts = owner.dependency_counts.borrow_mut();
             let count = counts.entry(source.id).or_default();
-            if *count != usize::MAX {
-                *count += 1;
-            }
+            *count += 1;
             owner
                 .dependencies
                 .borrow_mut()
@@ -1070,9 +1091,6 @@ impl Drop for RegionDependency {
             let Some(count) = counts.get_mut(&source.id) else {
                 continue;
             };
-            if *count == usize::MAX {
-                continue;
-            }
             *count -= 1;
             if *count == 0 {
                 counts.remove(&source.id);

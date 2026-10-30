@@ -279,7 +279,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Eagerly lower each arity to IR if the compiler is ready.
     //eager_lower_fn(&cljrs_fn, env);
 
-    let mut ptr = GcPtr::new(cljrs_fn);
+    let mut ptr = GcPtr::new_isolated(cljrs_fn);
     // For named anonymous functions (fn g ...), store a back-pointer so that
     // the self-reference returned from the body is pointer-equal to the outer
     // binding — required for `(= f (f))` to be `true`.
@@ -1326,7 +1326,7 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
         Value::Fn(f) => {
             let mut mfn = f.get().clone();
             mfn.is_macro = true;
-            Value::Macro(GcPtr::new(mfn))
+            Value::Macro(GcPtr::new_isolated(mfn))
         }
         other => other,
     };
@@ -2190,7 +2190,7 @@ fn build_impl_fn(
         false,
         Arc::clone(&env.current_ns),
     );
-    Ok(Value::Fn(GcPtr::new(cljrs_fn)))
+    Ok(Value::Fn(GcPtr::new_isolated(cljrs_fn)))
 }
 
 // ── binding ───────────────────────────────────────────────────────────────────
@@ -2391,17 +2391,9 @@ fn register_impls_for_tag(
                     None => continue,
                 };
                 let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
-                let fn_val = cljrs_value::publish::publish_for_named_slot(
-                    fn_val,
-                    proto.get() as *const _ as usize,
-                    format!("{}:{type_tag}{method_name}", type_tag.len()),
-                );
-                let mut impls = proto.get().impls.lock().unwrap();
-                impls
-                    .entry(type_tag.clone())
-                    .or_default()
-                    .insert(method_name, fn_val);
-                drop(impls);
+                proto
+                    .get()
+                    .set_implementation(type_tag.clone(), method_name, fn_val);
                 cljrs_value::bump_protocol_generation();
             }
             _ => {}

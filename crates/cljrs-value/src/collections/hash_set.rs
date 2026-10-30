@@ -21,6 +21,7 @@ pub struct PersistentHashSet {
     order: RedBlackTreeMapSync<u64, Value>,
     next_seq: u64,
     charge: ShareCharge,
+    keys_inert: bool,
 }
 
 impl PersistentHashSet {
@@ -30,6 +31,7 @@ impl PersistentHashSet {
             order: RedBlackTreeMapSync::new_sync(),
             next_seq: 0,
             charge: ShareCharge::full(),
+            keys_inert: true,
         }
     }
 
@@ -41,9 +43,13 @@ impl PersistentHashSet {
         self.index.is_empty()
     }
 
-    #[cfg(feature = "no-gc")]
-    pub(crate) fn canonical_key(&self, key: &Value) -> Option<Value> {
-        self.index.get_key_value(key).map(|(key, _)| key.clone())
+    pub(crate) fn storage_entry(&self, key: &Value) -> Option<(usize, Value)> {
+        self.index
+            .get_key_value(key)
+            .map(|(stored, sequence)| (*sequence as usize, stored.clone()))
+    }
+    pub(crate) fn keys_inert(&self) -> bool {
+        self.keys_inert
     }
 
     pub fn contains(&self, val: &Value) -> bool {
@@ -54,6 +60,7 @@ impl PersistentHashSet {
     ///
     /// If `val` is already present, its original insertion position is kept.
     pub fn conj(&self, val: Value) -> Self {
+        let keys_inert = self.keys_inert && crate::realization::is_inert(&val);
         if self.index.contains_key(&val) {
             return self.unchanged();
         }
@@ -64,10 +71,12 @@ impl PersistentHashSet {
             order: self.order.insert(seq, val),
             next_seq: seq + 1,
             charge: self.charge.derive(n, n + 1, Self::path_bytes(n + 1)),
+            keys_inert,
         }
     }
 
     pub fn conj_mut(&mut self, val: Value) -> &mut Self {
+        self.keys_inert &= crate::realization::is_inert(&val);
         if !self.index.contains_key(&val) {
             let seq = self.next_seq;
             self.index.insert_mut(val.clone(), seq);
@@ -96,6 +105,7 @@ impl PersistentHashSet {
                     order: self.order.remove(seq),
                     next_seq: self.next_seq,
                     charge: self.charge.derive(n, n - 1, Self::path_bytes(n)),
+                    keys_inert: self.keys_inert,
                 }
             }
             None => self.unchanged(),
@@ -110,6 +120,7 @@ impl PersistentHashSet {
             order: self.order.clone(),
             next_seq: self.next_seq,
             charge: self.charge.derive(n, n, 0),
+            keys_inert: self.keys_inert,
         }
     }
 

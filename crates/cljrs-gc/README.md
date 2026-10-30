@@ -816,3 +816,23 @@ No-GC boxes also hold a unique 64-bit identity.
 `unsafe GcPtr::clone_immutable(&self) -> Self`, available under no-GC, copies an immutable scalar with that identity.
 The pointee must contain no mutable state, and its clone must represent the same value.
 `GcPtr::ptr_eq` continues to compare physical allocation addresses.
+
+### Compact roots and explicit result publication
+
+`alloc_ctx::ScratchGuard::with_capacity(capacity: usize) -> Self` selects the initial chunk size.
+Later chunks honor that size. Compact scalar boxes use chunks sized to their representation.
+`GcPtr::is_relocated_immutable() -> bool` identifies a compact immutable copy under no-GC.
+Stores reuse these copies instead of copying them again.
+`GcPtr::new_isolated(value: T) -> Self` allocates a separate root region under no-GC.
+The caller's scope owns the result. Static and invocation destinations keep their allocation rules.
+Native GC builds use ordinary allocation.
+`unsafe GcPtr::relocate_immutable(&self, value: T) -> Self` preserves the source identity under no-GC.
+The replacement must represent the same immutable object, including its children's identities.
+
+`RegionLease::for_address(address: usize) -> Self` leases a containing region without tracing the object.
+`RegionLease::publish_return()` explicitly transfers a raw escaping result.
+An unscoped static result has program lifetime. Borrowed reads require a read scope or a regional destination.
+`protect_current` does not implicitly publish a borrowed static read.
+`RegionDependency::protect_read()` borrows cached weak sources without constructing an owning snapshot.
+Durable regional dependencies use counted edges held until their destination dies.
+They do not turn replaceable edge counts into permanent markers.

@@ -240,7 +240,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
             // so stacked annotations never nest `WithMeta`.
             if meta.requests_async() && form.unmeta().is_fn_form() {
                 let target = match &mut value {
-                    Value::WithMeta(inner, _) => inner.as_mut(),
+                    Value::WithMeta(inner, _) => Arc::make_mut(inner),
                     other => other,
                 };
                 if let Value::Fn(f) = target {
@@ -457,7 +457,7 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Volatile(vol) => Ok(vol.get().deref()),
         Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
         Value::Agent(a) => Ok(a.get().get_state()),
-        Value::Reduced(inner) => Ok(*inner),
+        Value::Reduced(inner) => Ok((*inner).clone()),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
         Value::Future(f) => f
             .get()

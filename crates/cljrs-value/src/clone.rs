@@ -752,10 +752,11 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
 /// `serialize` time, so nothing in `SerializedValue` requires runtime checks.
 pub fn deserialize(sv: SerializedValue) -> Value {
     match sv {
-        SerializedValue::WithMeta { value, meta } => {
-            Value::WithMeta(Box::new(deserialize(*value)), Box::new(deserialize(*meta)))
-        }
-        SerializedValue::Reduced(inner) => Value::Reduced(Box::new(deserialize(*inner))),
+        SerializedValue::WithMeta { value, meta } => Value::WithMeta(
+            std::sync::Arc::new(deserialize(*value)),
+            std::sync::Arc::new(deserialize(*meta)),
+        ),
+        SerializedValue::Reduced(inner) => Value::Reduced(std::sync::Arc::new(deserialize(*inner))),
 
         SerializedValue::Nil => Value::Nil,
         SerializedValue::Bool(b) => Value::Bool(b),
@@ -1083,8 +1084,11 @@ mod tests {
 
     #[test]
     fn reduced_roundtrip() {
-        let v = Value::Reduced(Box::new(Value::Long(55)));
-        assert_eq!(roundtrip(&v), Value::Reduced(Box::new(Value::Long(55))));
+        let v = Value::Reduced(std::sync::Arc::new(Value::Long(55)));
+        assert_eq!(
+            roundtrip(&v),
+            Value::Reduced(std::sync::Arc::new(Value::Long(55)))
+        );
     }
 
     #[test]

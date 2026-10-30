@@ -220,7 +220,7 @@ impl Future for Select<'_> {
         if let Some(result) = completed {
             self.selection.take_order.set(None);
             #[cfg(feature = "no-gc")]
-            self.selection.lease.borrow().protect_current();
+            self.selection.lease.borrow().publish_return();
             return Poll::Ready(result);
         }
         if let Some(default) = self.default.take() {
@@ -572,7 +572,7 @@ impl CljChannel {
         let completed = selection.result.borrow_mut().take();
         completed.map(|(value, _)| {
             #[cfg(feature = "no-gc")]
-            selection.lease.borrow().protect_current();
+            selection.lease.borrow().publish_return();
             value
         })
     }

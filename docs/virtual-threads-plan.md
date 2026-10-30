@@ -554,3 +554,16 @@ Async tasks retain their own read contexts across polls. Unscoped Rust readers u
 Root handoff restores caller ownership before releasing the computation state.
 Small immutable scalar relocation preserves Clojure identity, including compiled identity checks.
 CI fixes cover the newer async error-size lint and diagnostic logging of isolate records.
+
+Eighth-pass review fixes protect array-update aliases and cover identity for all boxed variants.
+Compact scalar storage uses representation-sized chunks and reuses existing compact copies.
+Transient conversion shares its initial collection. Writes use the collection's existing insertion IDs for ownership slots.
+Managed persistence borrows its containing region; Rust stack persistence protects its result graph.
+Protocol and multimethod ownership caches avoid formatted keys during dispatch.
+Definition data and metadata use compact immutable storage. Function and mutable-cell roots use separate small regions.
+Durable regional dependencies use counted edges. Raw program-lifetime publication is explicit.
+IR and AOT scans scope their function reads. Test-runner reads end with each namespace.
+
+Standalone macro expansion and IR lowering use temporary storage. Compiled constant caches keep permanent values outside bounded invocations.
+First cache fills inside an invocation remain invocation-local. Cached compiled protocol calls borrow implementation ownership.
+Exception tracing retains data held in other regions.

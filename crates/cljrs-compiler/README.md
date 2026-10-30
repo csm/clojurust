@@ -827,3 +827,11 @@ Object-array ABI reads and writes use the same indexed ownership barriers as int
 
 Under no-GC, standalone Rust callers of the runtime ABI must keep a `region::ReadScope` alive while using borrowed results.
 Runtime evaluation and fiber drivers establish the required scopes.
+
+The no-GC AOT async-function scan scopes its reads of defined function roots.
+Compiled array stores acquire caller ownership before returning a compact scalar alias.
+The identity ABI handles arrays, metadata wrappers, reduced values, and transients.
+
+Compiled keyword and versioned-value caches use program storage under no-GC.
+A first lookup during a bounded invocation returns invocation-local storage and leaves the cache empty.
+Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.

@@ -632,3 +632,9 @@ and `clojure.test`.
 
 Root evaluation borrows the caller's Env and Form directly. It preserves lexical
 state on executor unwind and avoids deep Form copies between top-level evaluations.
+
+`session::eval_in_discard(env: &mut Env, src: &str, filename: &str) -> miette::Result<()>` evaluates ignored source results.
+Under no-GC, its read scope ends before the next evaluation.
+The test runner scopes reads to each tested namespace. File evaluation and `-main` have separate scopes.
+IR namespace lowering establishes a read scope before examining function roots.
+Bootstrap scopes end when their initialization functions return; discarded bootstrap forms release their own scratch storage.

@@ -1033,7 +1033,8 @@ The evaluator publishes only its final escaping result after that read scope end
 Recur values use a replaceable trampoline lease.
 
 `publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
-Collections keep their allocation identity and structural sharing.
+Ordinary replaceable stores keep their collection wrappers and structural sharing.
+Definition relocation preserves logical identity and shared aliases.
 Small strings, UUIDs, BigInts, and ratios can move into compact arenas while keeping their logical identity.
 Other live payloads retain their source arenas, including other allocations in those arenas.
 Replacing or consuming the payload releases that ownership after its last reader finishes.
@@ -1079,7 +1080,7 @@ retains blocking behavior for manual futures and producers on another thread.
 ### Borrowed values and field ownership
 
 `Value::identical(&self, other: &Value) -> bool` implements Clojure identity for every execution tier.
-Immutable scalar relocation preserves identity; collection and mutable-object identity remains allocation-based.
+Immutable relocation preserves logical identity, including collection aliases. Mutable objects retain their original allocation.
 `UuidValue` also implements `Clone`.
 
 `Var::snapshot() -> Option<publish::ValueSnapshot>` owns a root snapshot under no-GC.
@@ -1109,5 +1110,37 @@ Native containers that store managed values must use the same publication and re
 
 `publish::read_named_slot(address: usize, slot: String)` borrows a named cached field.
 `MultiFn::method(key: &str) -> Option<Value>` borrows a registered implementation before returning it.
-Multimethod implementations, dispatch values, and preference values use independent named storage slots.
+Multimethod implementations cache ownership beside their method entries. Dispatch and preference values use independent named slots.
 Replacing or removing a method releases its lease after existing readers finish.
+
+### Definition and transient ownership
+
+No-GC definition stores pack immutable data and metadata into compact arenas.
+The packer preserves logical identities and shared aliases. It does not force lazy values or clone mutable cells.
+Interpreted function, atom, lazy-cell, delay, and multimethod roots use separate small regions.
+Atoms establish their payload ownership after managed allocation.
+Opaque captures retain their actual backing regions.
+
+`Value::Reduced(Arc<Value>)` and `Value::WithMeta(Arc<Value>, Arc<Value>)` share wrapper identity across clones.
+`Value::identical` handles every boxed variant, including arrays, wrappers, transients, and errors.
+
+`TransientVector::from_persistent(vector: &PersistentVector) -> Self` shares the trie and its scalar summary.
+Managed transient conversion shares initial data without tracing its elements or creating initial per-element slots.
+Writes acquire slots lazily. Maps and sets reuse their insertion sequence IDs for those slots.
+Key hashing stays in the existing realization-safe mutation path.
+Managed `persistent!` borrows the containing region. Rust stack containers protect the returned graph instead.
+This fallback permits those results to outlive the temporary container.
+
+`Protocol::set_implementation(tag: Arc<str>, method: Arc<str>, value: Value)` installs an implementation and its ownership cache.
+`Protocol::protect_implementation(tag: &str, method: &str)` borrows the cache without formatting a key.
+`MultiFn::set_method(key: String, value: Value)` and `remove_method(key: &str) -> bool` maintain method ownership.
+Use these methods when modifying managed implementation tables.
+`MultiFn::method` reads its cache beside the method table.
+`ValueLease::publish_return()` transfers an update result explicitly.
+Repeated cached reads reuse the caller's lease set without allocating another snapshot.
+
+Definition packing scans immutable data once. Other replaceable stores preserve collection sharing.
+After an implementation-table update batch, use the existing protocol or multimethod generation invalidation API.
+
+Exception tracing includes data maps, causes, and managed thrown payloads.
+These fields can retain independent backing regions.

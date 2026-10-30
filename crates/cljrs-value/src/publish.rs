@@ -414,11 +414,21 @@ impl ValueLease {
             .cloned()
             .unwrap_or_else(|| self.scoped.snapshot())
     }
+    pub(crate) fn reparent(&self, owner: &cljrs_gc::region::AllocationOwner) -> Self {
+        Self::from_lease(self.snapshot(), owner)
+    }
     pub fn protect_read(&self) {
         if let Some(lease) = &self.owned {
             lease.protect_read();
         } else {
-            self.scoped.snapshot().protect_read();
+            self.scoped.protect_read();
+        }
+    }
+    pub fn publish_return(&self) {
+        if let Some(lease) = &self.owned {
+            lease.publish_return();
+        } else {
+            self.scoped.snapshot().publish_return();
         }
     }
     pub fn protect_current(&self) {
@@ -437,10 +447,12 @@ fn compact_scalar(value: Value) -> (Value, Option<cljrs_gc::alloc_ctx::ScratchGu
     macro_rules! copy_leaf {
         ($pointer:expr, $variant:path) => {{
             let pointer = $pointer;
-            if pointer.is_static_alloc() {
+            if pointer.is_static_alloc() || pointer.is_relocated_immutable() {
                 return ($variant(pointer), None);
             }
-            let arena = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let arena = cljrs_gc::alloc_ctx::ScratchGuard::with_capacity(
+                std::mem::size_of_val(pointer.get()) + 32,
+            );
             // SAFETY: each matched type is an immutable scalar with a value-preserving Clone.
             let copy = unsafe { pointer.clone_immutable() };
             return ($variant(copy), Some(arena));
@@ -461,6 +473,157 @@ fn compact_scalar(value: Value) -> (Value, Option<cljrs_gc::alloc_ctx::ScratchGu
         }
         other => (other, None),
     }
+}
+
+#[cfg(feature = "no-gc")]
+pub(crate) fn prepare_definition(
+    value: Value,
+    owner: &cljrs_gc::region::AllocationOwner,
+) -> (Value, ValueLease) {
+    if cljrs_gc::alloc_ctx::invocation_is_active() {
+        return prepare_for_owner(value, owner);
+    }
+    if !matches!(
+        &value,
+        Value::Str(_)
+            | Value::Uuid(_)
+            | Value::BigInt(_)
+            | Value::BigDecimal(_)
+            | Value::Ratio(_)
+            | Value::Symbol(_)
+            | Value::Keyword(_)
+            | Value::Queue(_)
+            | Value::Cons(_)
+            | Value::List(_)
+            | Value::Vector(_)
+            | Value::Map(crate::MapValue::Array(_) | crate::MapValue::Hash(_))
+            | Value::Set(crate::SetValue::Hash(_))
+    ) {
+        return prepare_for_owner(value, owner);
+    }
+    let _compact = cljrs_gc::alloc_ctx::ScratchGuard::with_capacity(256);
+    fn copy(value: Value, memo: &mut std::collections::HashMap<usize, Value>) -> Value {
+        macro_rules! leaf {
+            ($pointer:expr, $variant:path) => {{
+                let p = $pointer;
+                if p.is_static_alloc() || p.is_relocated_immutable() {
+                    return $variant(p);
+                }
+                let address = p.get() as *const _ as usize;
+                if let Some(value) = memo.get(&address) {
+                    return value.clone();
+                }
+                // SAFETY: this is an immutable leaf; cloning preserves its value.
+                let value = $variant(unsafe { p.clone_immutable() });
+                memo.insert(address, value.clone());
+                value
+            }};
+        }
+        macro_rules! collection {
+            ($pointer:expr, $variant:expr, $data:expr) => {{
+                let p = $pointer;
+                let address = p.get() as *const _ as usize;
+                if p.is_static_alloc() || p.is_relocated_immutable() {
+                    ($variant)(p)
+                } else if let Some(value) = memo.get(&address) {
+                    value.clone()
+                } else {
+                    let data = $data(&p, memo);
+                    // SAFETY: only immutable collections are rebuilt; every child's identity is preserved.
+                    let value = ($variant)(unsafe { p.relocate_immutable(data) });
+                    memo.insert(address, value.clone());
+                    value
+                }
+            }};
+        }
+        match value {
+            Value::Str(p) => leaf!(p, Value::Str),
+            Value::Uuid(p) => leaf!(p, Value::Uuid),
+            Value::BigInt(p) => leaf!(p, Value::BigInt),
+            Value::BigDecimal(p) => leaf!(p, Value::BigDecimal),
+            Value::Ratio(p) => leaf!(p, Value::Ratio),
+            Value::Symbol(p) => leaf!(p, Value::Symbol),
+            Value::Keyword(p) => leaf!(p, Value::Keyword),
+            Value::Queue(p) => collection!(
+                p,
+                Value::Queue,
+                |p: &cljrs_gc::GcPtr<crate::PersistentQueue>, memo: &mut _| {
+                    p.get()
+                        .iter()
+                        .cloned()
+                        .fold(crate::PersistentQueue::empty(), |queue, value| {
+                            queue.conj(copy(value, memo))
+                        })
+                }
+            ),
+            Value::Cons(p) => collection!(
+                p,
+                Value::Cons,
+                |p: &cljrs_gc::GcPtr<crate::CljxCons>, memo: &mut _| crate::CljxCons {
+                    head: copy(p.get().head.clone(), memo),
+                    tail: copy(p.get().tail.clone(), memo)
+                }
+            ),
+            Value::List(p) => collection!(
+                p,
+                Value::List,
+                |p: &cljrs_gc::GcPtr<crate::PersistentList>, memo: &mut _| {
+                    crate::PersistentList::from_iter(p.get().iter().cloned().map(|v| copy(v, memo)))
+                }
+            ),
+            Value::Vector(p) => collection!(
+                p,
+                Value::Vector,
+                |p: &cljrs_gc::GcPtr<crate::PersistentVector>, memo: &mut _| {
+                    let values: Vec<_> = p.get().iter().cloned().map(|v| copy(v, memo)).collect();
+                    if p.get().is_map_entry() {
+                        crate::PersistentVector::map_entry(values[0].clone(), values[1].clone())
+                    } else {
+                        crate::PersistentVector::from_iter(values)
+                    }
+                }
+            ),
+            Value::Map(crate::MapValue::Array(p)) => collection!(
+                p,
+                |p| Value::Map(crate::MapValue::Array(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentArrayMap>, memo: &mut _| {
+                    let crate::collections::array_map::AssocResult::Array(map) =
+                        crate::PersistentArrayMap::from_pairs(
+                            p.get()
+                                .iter()
+                                .map(|(k, v)| (copy(k.clone(), memo), copy(v.clone(), memo))),
+                        )
+                    else {
+                        unreachable!("compaction preserves map keys")
+                    };
+                    map
+                }
+            ),
+            Value::Map(crate::MapValue::Hash(p)) => collection!(
+                p,
+                |p| Value::Map(crate::MapValue::Hash(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentHashMap>, memo: &mut _| {
+                    crate::PersistentHashMap::from_pairs(
+                        p.get()
+                            .iter()
+                            .map(|(k, v)| (copy(k.clone(), memo), copy(v.clone(), memo))),
+                    )
+                }
+            ),
+            Value::Set(crate::SetValue::Hash(p)) => collection!(
+                p,
+                |p| Value::Set(crate::SetValue::Hash(p)),
+                |p: &cljrs_gc::GcPtr<crate::PersistentHashSet>, memo: &mut _| {
+                    crate::PersistentHashSet::from_iter(
+                        p.get().iter().cloned().map(|v| copy(v, memo)),
+                    )
+                }
+            ),
+            other => other,
+        }
+    }
+    let value = copy(value, &mut Default::default());
+    prepare_for_owner(value, owner)
 }
 
 /// Prepare a replaceable payload without copying identity-bearing values.

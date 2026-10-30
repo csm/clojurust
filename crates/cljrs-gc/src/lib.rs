@@ -238,12 +238,14 @@ mod nogc_box {
     pub struct GcBox<T: Trace + 'static> {
         pub value: T,
         pub(crate) identity: u64,
+        pub(crate) relocated: bool,
     }
     impl<T: Trace + 'static> GcBox<T> {
         pub(crate) fn new(value: T) -> Self {
             Self {
                 value,
                 identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                relocated: false,
             }
         }
     }
@@ -554,6 +556,43 @@ impl<T: Trace + 'static> GcPtr<T> {
         }
     }
 
+    /// Allocate a root in a separate region sized to its box.
+    /// The caller's scope owns the result; invocation and static destinations retain their rules.
+    pub fn new_isolated(value: T) -> Self {
+        #[cfg(feature = "no-gc")]
+        if !alloc_ctx::is_static_context() && !alloc_ctx::invocation_is_active() {
+            let mut scratch =
+                alloc_ctx::ScratchGuard::with_capacity(std::mem::size_of::<GcBox<T>>() + 32);
+            let pointer = Self::new(value);
+            let mut lease = region::RegionLease::for_address(pointer.raw() as usize);
+            lease.extend(&region::RegionLease::for_value(pointer.get()));
+            scratch.pop_for_return();
+            lease.protect_current();
+            return pointer;
+        }
+        Self::new(value)
+    }
+
+    /// Relocate an immutable value while preserving its logical identity.
+    ///
+    /// # Safety
+    /// `value` must represent the same immutable object, including the identities of its children.
+    #[cfg(feature = "no-gc")]
+    pub unsafe fn relocate_immutable(&self, value: T) -> Self {
+        let copy = Self::new(value);
+        unsafe {
+            (*copy.raw()).identity = (*self.raw()).identity;
+            (*copy.raw()).relocated = true;
+        }
+        copy
+    }
+
+    /// True if this immutable box was relocated for compact storage.
+    #[cfg(feature = "no-gc")]
+    pub fn is_relocated_immutable(&self) -> bool {
+        unsafe { (*self.raw()).relocated }
+    }
+
     /// Copy an immutable scalar into the current allocation destination.
     ///
     /// # Safety
@@ -567,6 +606,7 @@ impl<T: Trace + 'static> GcPtr<T> {
         let copy = Self::new(self.get().clone());
         unsafe {
             (*copy.raw()).identity = (*self.raw()).identity;
+            (*copy.raw()).relocated = true;
         }
         copy
     }

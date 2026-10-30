@@ -121,6 +121,8 @@ pub fn lower_via_rust(
     compilable_forms: &[cljrs_reader::Form],
     env: &mut cljrs_runtime::tiered::Env,
 ) -> AotResult<IrFunction> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let ns_arc: Arc<str> = Arc::from(ns);
     // `ns` has already been evaluated into `env`, so its own `def`s, refers and
     // `(:refer-clojure ...)` filter are visible: a name it rebinds must not be
@@ -1836,6 +1838,8 @@ fn lower_namespace(
     init_symbol: &str,
     globals: &Arc<cljrs_runtime::env::env::GlobalEnv>,
 ) -> AotResult<(String, Option<IrFunction>)> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let mut parser = Parser::new(source.to_string(), format!("<{ns_name}>"));
     let forms = parser.parse_all()?;
 
@@ -1917,6 +1921,8 @@ fn compile_async_poll_fns(
         arities: Vec<AritySnap>,
     }
 
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::nested();
     let snaps: Vec<FnSnap> = {
         let ns_map = env.globals.namespaces.read().unwrap();
         let mut out = Vec::new();
@@ -3353,6 +3359,31 @@ mod tests {
             .parse_all()
             .expect("parse")
             .remove(0)
+    }
+
+    #[cfg(feature = "no-gc")]
+    #[test]
+    fn async_poll_scan_reads_owned_function_roots() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+                let mut env = cljrs_runtime::env::env::Env::new(runtime.globals().clone(), "user");
+                cljrs_runtime::interp::eval::eval(
+                    &parse_one("(defn ^:async scanned [] 42)"),
+                    &mut env,
+                )
+                .unwrap();
+                let mut compiler = Compiler::new().unwrap();
+                assert!(
+                    !compile_async_poll_fns(&mut compiler, &mut env)
+                        .unwrap()
+                        .is_empty()
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// Lowering refuses an anonymous `^:async` fn (a compiled closure cannot

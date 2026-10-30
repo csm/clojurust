@@ -144,7 +144,9 @@ pub fn make_lazy_seq_from_fn(
             globals,
             ns,
         };
-        return Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))));
+        return Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+            thunk,
+        )))));
     }
     // Anything else with type-name "fn" is acceptable; route through
     // apply_value at force-time.  Reject non-callable values up front.
@@ -159,7 +161,9 @@ pub fn make_lazy_seq_from_fn(
         globals,
         ns,
     };
-    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
+    Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+        thunk,
+    )))))
 }
 
 impl cljrs_gc::Trace for ClosureThunk {
@@ -921,7 +925,9 @@ pub fn handle_make_lazy_seq(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         globals: env.globals.clone(),
         ns: env.current_ns.clone(),
     };
-    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
+    Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Handle `(make-delay f)` — wraps a zero-arg fn in a Delay.
@@ -948,7 +954,9 @@ fn handle_make_delay(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         globals: env.globals.clone(),
         ns: env.current_ns.clone(),
     };
-    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+    Ok(Value::Delay(GcPtr::new_isolated(Delay::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Handle `(vswap! vol f & args)` — apply f to current volatile value and store.
@@ -1104,7 +1112,7 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     }
 
-    let atom = GcPtr::new(Atom::new(initial));
+    let atom = GcPtr::new_isolated(Atom::new(initial));
     if let Some(m) = meta_opt {
         atom.get()
             .set_meta(if m == Value::Nil { None } else { Some(m) });
@@ -1557,7 +1565,9 @@ pub fn make_delay_from_fn(
         }
     };
     let thunk = ClosureThunk { f, globals, ns };
-    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+    Ok(Value::Delay(GcPtr::new_isolated(Delay::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Execute `alter-var-root` with already-evaluated args: `[var, f, extra...]`.

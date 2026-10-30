@@ -508,10 +508,10 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
                 })?;
             drop(impls);
             #[cfg(feature = "no-gc")]
-            cljrs_value::publish::read_named_slot(
-                pf_ref.protocol.get() as *const _ as usize,
-                format!("{}:{tag}{}", tag.len(), pf_ref.method_name),
-            );
+            pf_ref
+                .protocol
+                .get()
+                .protect_implementation(&tag, &pf_ref.method_name);
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }

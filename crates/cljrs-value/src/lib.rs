@@ -142,6 +142,115 @@ mod publication_review_tests {
     }
 
     #[test]
+    fn exception_payloads_own_data_from_another_scope() {
+        let var = GcPtr::new(Var::new("user", "error-payload"));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let _data = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let object = Value::NativeObject(gc_native_object(Counted {
+                traces: Default::default(),
+                dropped: dropped.clone(),
+            }));
+            let data = MapValue::from_pairs(vec![(Value::Long(1), object)]);
+            let _error = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            var.get().bind(Value::Error(GcPtr::new(ExceptionInfo::new(
+                ValueError::Other("owned".into()),
+                "owned".into(),
+                Some(data),
+                None,
+            ))));
+        }
+        assert!(!dropped.get(), "the error lost its data region");
+        {
+            let _reads = cljrs_gc::region::ReadScope::nested();
+            let Value::Error(error) = var.get().deref().unwrap() else {
+                panic!("expected error")
+            };
+            var.get().bind(Value::Nil);
+            assert!(matches!(
+                error.get().data().unwrap().get(&Value::Long(1)),
+                Some(Value::NativeObject(_))
+            ));
+        }
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn definition_roots_release_initializer_temporaries() {
+        for atom in [false, true] {
+            let var = GcPtr::new(Var::new("user", "packed"));
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            {
+                let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                let _temporary = GcPtr::new(Probe(dropped.clone()));
+                let payload =
+                    Value::Vector(GcPtr::new(PersistentVector::from_iter([Value::Long(42)])));
+                let value = if atom {
+                    Value::Atom(GcPtr::new_isolated(Atom::new(payload.clone())))
+                } else {
+                    payload.clone()
+                };
+                var.get().bind(value);
+                if !atom {
+                    assert!(payload.identical(&var.get().deref().unwrap()));
+                }
+            }
+            assert!(
+                dropped.get(),
+                "a definition retained an unrelated initializer temporary"
+            );
+            let _reads = cljrs_gc::region::ReadScope::nested();
+            let value = var.get().deref().unwrap();
+            let value = match value {
+                Value::Atom(atom) => atom.get().deref(),
+                value => value,
+            };
+            assert_eq!(value.to_string(), "[42]");
+        }
+    }
+
+    #[test]
+    fn scalar_storage_uses_small_chunks_and_transient_conversion_does_not_trace_elements() {
+        let _mutator = cljrs_gc::register_mutator();
+        let array = GcPtr::new(ObjectArray::new(vec![Value::Nil; 1000]));
+        let retired =
+            || cljrs_gc::governor::with_current_account(|a| a.retired_region_bytes()).unwrap();
+        let before = retired();
+        for index in 0..1000 {
+            let _source = cljrs_gc::alloc_ctx::ScratchGuard::new();
+            let value = publish::publish_for_slot(
+                Value::string("x"),
+                array.get() as *const _ as usize,
+                index,
+            );
+            array.get().0.lock().unwrap()[index] = value;
+        }
+        assert!(
+            retired() - before <= 128 * 1000,
+            "scalar copies reserved full-sized scratch chunks"
+        );
+        for index in 0..1000 {
+            let value =
+                publish::publish_for_slot(Value::Nil, array.get() as *const _ as usize, index);
+            array.get().0.lock().unwrap()[index] = value;
+        }
+        let _scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
+        let traces = std::rc::Rc::new(std::cell::Cell::new(0));
+        let value = Value::NativeObject(gc_native_object(Counted {
+            traces: traces.clone(),
+            dropped: Default::default(),
+        }));
+        let original = PersistentVector::from_iter(std::iter::repeat_n(value, 10000));
+        let transient = GcPtr::new(collections::TransientVector::from_persistent(&original));
+        let _persistent = transient.get().persistent().unwrap();
+        assert_eq!(
+            traces.get(),
+            0,
+            "transient conversion walked the initial graph"
+        );
+    }
+
+    #[test]
     fn returned_updates_protect_shared_children_after_the_cell_is_replaced() {
         let atom = GcPtr::new(Atom::new(Value::Nil));
         let dropped = std::rc::Rc::new(std::cell::Cell::new(false));

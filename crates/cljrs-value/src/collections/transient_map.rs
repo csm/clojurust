@@ -21,7 +21,7 @@ pub struct TransientMap {
     revision: AtomicU64,
     keys_may_realize: AtomicBool,
     #[cfg(feature = "no-gc")]
-    ownership: super::OwnershipSlots,
+    initial: PersistentHashMap,
 }
 
 impl TransientMap {
@@ -31,7 +31,7 @@ impl TransientMap {
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            ownership: Default::default(),
+            initial: PersistentHashMap::empty(),
             keys_may_realize: AtomicBool::new(false),
         }
     }
@@ -42,28 +42,26 @@ impl TransientMap {
             persisted: Mutex::new(false),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            ownership: Default::default(),
-            keys_may_realize: AtomicBool::new(
-                !(map.iter().all(|(key, _)| crate::realization::is_inert(key))),
-            ),
+            initial: map.clone(),
+            keys_may_realize: AtomicBool::new(!map.keys_inert()),
         }
     }
 
-    fn update(
+    fn update<T>(
         &self,
         key: &Value,
-        fast: impl FnOnce(&mut PersistentHashMap),
-        operation: impl Fn(&PersistentHashMap) -> PersistentHashMap,
-    ) -> ValueResult<()> {
+        fast: impl FnOnce(&mut PersistentHashMap) -> T,
+        operation: impl Fn(&PersistentHashMap) -> (PersistentHashMap, T),
+    ) -> ValueResult<T> {
         {
             let mut collection = self.map.lock().unwrap();
             if *self.persisted.lock().unwrap() {
                 return Err(ValueError::TransientAlreadyPersisted);
             }
             if !self.keys_may_realize.load(Ordering::Relaxed) && crate::realization::is_inert(key) {
-                fast(&mut collection);
+                let result = fast(&mut collection);
                 self.revision.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                return Ok(result);
             }
         }
         loop {
@@ -77,7 +75,7 @@ impl TransientMap {
                     self.revision.load(Ordering::Relaxed),
                 )
             };
-            let candidate = operation(snapshot.get());
+            let (candidate, result) = operation(snapshot.get());
             let mut map = self.map.lock().unwrap();
             if *self.persisted.lock().unwrap() {
                 return Err(ValueError::TransientAlreadyPersisted);
@@ -90,36 +88,55 @@ impl TransientMap {
                 self.keys_may_realize.store(true, Ordering::Relaxed);
             }
             self.revision.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(result);
         }
     }
     pub fn assoc(&self, key: Value, value: Value) -> ValueResult<()> {
-        self.update(
+        #[cfg(feature = "no-gc")]
+        let (key, _key_owner) = crate::publish::prepare_for_owner(key, &Default::default());
+        #[cfg(feature = "no-gc")]
+        let (value, _value_owner) = crate::publish::prepare_for_owner(value, &Default::default());
+        let entry = self.update(
             &key,
-            |map| map.assoc_mut(key.clone(), value.clone()),
-            |map| map.assoc(key.clone(), value.clone()),
+            |map| {
+                map.assoc_mut(key.clone(), value.clone());
+                map.storage_entry(&key).unwrap()
+            },
+            |map| {
+                let candidate = map.assoc(key.clone(), value.clone());
+                let entry = candidate.storage_entry(&key).unwrap();
+                (candidate, entry)
+            },
         )?;
         #[cfg(feature = "no-gc")]
-        {
-            let key = self
-                .lookup(&key, |map| map.canonical_key(&key))
-                .expect("associated key");
-            let slot = self.ownership.id(&key);
-            let lease = cljrs_gc::region::RegionLease::for_values(&[key, value]);
+        if !cljrs_gc::alloc_ctx::invocation_is_active() {
+            let lease = cljrs_gc::region::RegionLease::for_values(&[entry.1, value]);
             cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
                 self as *const _ as usize,
-                slot,
+                entry.0,
                 &lease,
             );
         }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = entry;
         Ok(())
     }
     pub fn dissoc(&self, key: &Value) -> ValueResult<()> {
-        self.update(key, |map| map.dissoc_mut(key), |map| map.dissoc(key))?;
+        let entry = self.update(
+            key,
+            |map| {
+                let entry = map.storage_entry(key);
+                map.dissoc_mut(key);
+                entry
+            },
+            |map| (map.dissoc(key), map.storage_entry(key)),
+        )?;
         #[cfg(feature = "no-gc")]
-        if let Some(slot) = self.ownership.remove(key) {
+        if let Some((slot, _)) = entry {
             crate::publish::publish_for_slot(Value::Nil, self as *const _ as usize, slot);
         }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = entry;
         Ok(())
     }
 
@@ -132,7 +149,15 @@ impl TransientMap {
         *persisted = true;
         let result = map.clone();
         #[cfg(feature = "no-gc")]
-        cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+        {
+            let address = self as *const _ as usize;
+            if cljrs_gc::region::AllocationOwner::for_address(address).is_permanent() {
+                // Rust stack containers do not have a containing region to lease.
+                cljrs_gc::region::RegionLease::for_value(&result).protect_read();
+            } else {
+                cljrs_gc::region::RegionLease::for_address(address).protect_read();
+            }
+        }
         Ok(result)
     }
 
@@ -182,7 +207,7 @@ impl Clone for TransientMap {
             persisted: Mutex::new(*self.persisted.lock().unwrap()),
             revision: AtomicU64::new(0),
             #[cfg(feature = "no-gc")]
-            ownership: Default::default(),
+            initial: self.map.lock().unwrap().clone(),
             keys_may_realize: AtomicBool::new(self.keys_may_realize.load(Ordering::Relaxed)),
         }
     }
@@ -204,19 +229,9 @@ impl ClojureHash for TransientMap {
 
 impl cljrs_gc::Trace for TransientMap {
     #[cfg(feature = "no-gc")]
-    fn init_ownership(&self) {
-        for (key, value) in self.map.lock().unwrap().iter() {
-            let slot = self.ownership.id(key);
-            let lease = cljrs_gc::region::RegionLease::for_values(&[key.clone(), value.clone()]);
-            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
-                self as *const _ as usize,
-                slot,
-                &lease,
-            );
-        }
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        self.initial.trace(visitor);
     }
-    #[cfg(feature = "no-gc")]
-    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {

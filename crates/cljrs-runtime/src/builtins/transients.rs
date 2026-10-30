@@ -8,11 +8,10 @@ use cljrs_value::{MapValue, Value, ValueError, ValueResult};
 pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
     match &args[0].unwrap_meta() {
         Value::Map(MapValue::Array(m)) => {
-            let map = TransientMap::new();
-            for (k, v) in m.get().iter() {
-                map.assoc(k.clone(), v.clone())?;
-            }
-            Ok(Value::TransientMap(GcPtr::new(map)))
+            let map = cljrs_value::PersistentHashMap::from_array_map(m.get());
+            Ok(Value::TransientMap(GcPtr::new(TransientMap::new_from_map(
+                &map,
+            ))))
         }
         Value::Map(MapValue::Hash(m)) => Ok(Value::TransientMap(GcPtr::new(
             TransientMap::new_from_map(m.get()),
@@ -21,7 +20,7 @@ pub fn builtin_transient(args: &[Value]) -> ValueResult<Value> {
             TransientSet::new_from_set(s.get()),
         ))),
         Value::Vector(v) => Ok(Value::TransientVector(GcPtr::new(
-            TransientVector::new_from_vector(v.get().inner()),
+            TransientVector::from_persistent(v.get()),
         ))),
         Value::TransientMap(_) | Value::TransientVector(_) | Value::TransientSet(_) => {
             Err(ValueError::Other("value is already transient".into()))

@@ -342,9 +342,7 @@ pub fn run_source(
     args: &[String],
 ) -> miette::Result<()> {
     let mut env = Env::new(globals, "user");
-    #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::enter();
-    eval_in(&mut env, src, filename)?;
+    eval_in_discard(&mut env, src, filename)?;
     call_main_if_defined(&mut env, args)?;
     Ok(())
 }
@@ -352,6 +350,8 @@ pub fn run_source(
 /// Call `-main` in the current namespace if it is defined, passing `args` as
 /// individual string arguments. Silently skips if `-main` is not defined.
 fn call_main_if_defined(env: &mut Env, args: &[String]) -> miette::Result<()> {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::nested();
     // resolve returns nil for undefined symbols; swallow lookup errors defensively.
     let resolved = eval_in(env, "(resolve '-main)", "<main-check>").unwrap_or(Value::Nil);
     if resolved == Value::Nil {
@@ -419,6 +419,13 @@ fn escape_clojure_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Evaluate source whose final result is not needed.
+pub fn eval_in_discard(env: &mut Env, src: &str, filename: &str) -> miette::Result<()> {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::nested();
+    eval_in(env, src, filename).map(drop)
 }
 
 /// Evaluate `src` in an existing `Env`. Returns the last value.
