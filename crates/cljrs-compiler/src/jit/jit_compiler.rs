@@ -186,6 +186,10 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
     #[rustfmt::skip]
     let symbols: &[(&str, *const u8)] = &[
         sym!(rt_safepoint),
+        sym!(rt_error_pending),
+        sym!(rt_native_frame_depth),
+        sym!(rt_native_frame_cleanup),
+        sym!(rt_async_fail),
         sym!(rt_const_nil),
         sym!(rt_const_true),
         sym!(rt_const_false),
@@ -362,6 +366,98 @@ mod async_poll_tests {
     use cljrs_ir::{Block, Const, Inst, KnownFn, Terminator};
     use cljrs_value::Value;
     use std::sync::Arc;
+
+    #[test]
+    fn poll_errors_preserve_their_kind_clean_regions_and_do_not_poison_later_calls() {
+        use cljrs_async::state_machine::CompiledAsyncTask;
+        use cljrs_runtime::env::{env::Env, error::EvalError};
+        use cljrs_value::{Arity, NativeFn, ValueError};
+
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let side_effects = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counter = side_effects.clone();
+            globals.intern("user", "after-error".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(
+                NativeFn::with_closure("after-error", Arity::Fixed(0), move |_| {
+                    counter.set(counter.get() + 1);
+                    Ok(Value::Long(0))
+                }))));
+            let mut ir = IrFunction::new(Some("review_poll".into()), None);
+            ir.is_async_poll_fn = true;
+            let block = ir.fresh_block();
+            ir.async_resume_blocks.push(block);
+            let fail = ir.fresh_var();
+            let after = ir.fresh_var();
+            let region = ir.fresh_var();
+            let result = ir.fresh_var();
+            let ignored = ir.fresh_var();
+            let one = ir.fresh_var();
+            let sum = ir.fresh_var();
+            ir.blocks.push(Block {
+                id: block, phis: vec![],
+                insts: vec![
+                    Inst::LoadGlobal(fail, "user".into(), "review-fail".into()),
+                    Inst::LoadGlobal(after, "user".into(), "after-error".into()),
+                    Inst::RegionStart(region),
+                    Inst::Call(result, fail, vec![]),
+                    Inst::Call(ignored, after, vec![]),
+                    Inst::Const(one, Const::Long(1)),
+                    Inst::CallKnown(sum, KnownFn::Add, vec![result, one]),
+                    Inst::RegionEnd(region),
+                ], terminator: Terminator::Return(sum),
+            });
+            let compiled = compile_jit_poll("review_poll", &ir).unwrap();
+            let poll = unsafe { std::mem::transmute::<*const (), cljrs_async::state_machine::PollFn>(compiled.fn_ptr) };
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            for kind in 0..3 {
+                globals.intern("user", "review-fail".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(
+                    NativeFn::with_closure("review-fail", Arity::Fixed(0), move |_| match kind {
+                        0 => Err(ValueError::Thrown(Value::string("original failure"))),
+                        1 => Err(ValueError::GasExhausted),
+                        _ => Err(ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
+                            class: cljrs_gc::MemoryClass::GcHeap, requested: 1, committed: 2, hard_limit: 1,
+                        })),
+                    }))));
+                let outer = crate::rt_abi::rt_region_start();
+                let depth = crate::rt_abi::rt_native_frame_depth();
+                let gc_depth = cljrs_gc::region::region_stack_depth();
+                let mut sm = CljxStateMachine::new(poll, 0, vec![]);
+                sm.pending = Value::string("stale awaited value");
+                sm.eval_ctx = Some((globals.clone(), "user".into()));
+                let error = local.block_on(&rt, CompiledAsyncTask::new(sm)).unwrap_err();
+                match kind {
+                    0 => assert!(matches!(error, EvalError::Thrown(value) if value == Value::string("original failure"))),
+                    1 => assert!(matches!(error, EvalError::GasExhausted)),
+                    _ => assert!(matches!(error, EvalError::MemoryLimitExceeded(_))),
+                }
+                assert_eq!(side_effects.get(), 0, "ran a call after a failed native call");
+                assert_eq!(crate::rt_abi::rt_native_frame_depth(), depth);
+                assert_eq!(cljrs_gc::region::region_stack_depth(), gc_depth);
+                crate::rt_abi::rt_region_end(outer);
+                assert_eq!(crate::rt_abi::rt_error_pending(), 0);
+                assert_eq!(crate::rt_abi::rt_safepoint(), 1);
+                let fresh = Value::string("fresh failure");
+                unsafe { crate::rt_abi::rt_throw(&fresh); }
+                assert_eq!(crate::rt_abi::take_pending_exception_value(), Some(fresh));
+                cljrs_runtime::env::gc_roots::force_collect(&Env::new(globals.clone(), "user"));
+            }
+            {
+                let _gas = cljrs_runtime::env::gas::GasGuard::install(
+                    cljrs_runtime::env::gas::GasMeter::new(0));
+                let mut sm = CljxStateMachine::new(poll, 0, vec![]);
+                sm.eval_ctx = Some((globals.clone(), "user".into()));
+                assert!(matches!(local.block_on(&rt, CompiledAsyncTask::new(sm)), Err(EvalError::GasExhausted)));
+            }
+            assert_eq!(crate::rt_abi::rt_error_pending(), 0);
+            unsafe {
+                crate::rt_abi::rt_throw(&Value::Long(1));
+                crate::rt_abi::rt_throw(&Value::Long(2));
+            }
+            assert_eq!(crate::rt_abi::take_pending_exception_value(), Some(Value::Long(2)));
+        }).unwrap().join().unwrap();
+    }
 
     /// Build the IR for `(defn ^:async f [x] (+ (await x) 1))`.
     fn build_async_ir() -> IrFunction {

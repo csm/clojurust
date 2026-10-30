@@ -264,7 +264,7 @@ Panics in the body or parked future become `EvalError::Runtime`.
 Cancellation unwinds the fiber with its mutator state installed before stack reuse.
 
 The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
-64 KB minimum. Each isolate pools up to 32 finished stacks.
+512 KB minimum. Smaller values are rejected before stack allocation. Each isolate pools up to 32 finished stacks.
 Reserved stack bytes, including guard pages and pooled stacks, are charged to
 `MemoryClass::FiberStack`. Strict admission can reject construction with
 `EvalError::MemoryLimitExceeded`. Failed admission releases idle stacks before retrying.
@@ -274,10 +274,13 @@ counts, and reserved stack bytes. The root's 64 MiB reservation uses the same bu
 
 At interpreter, IR, JIT, and AOT safepoints, a fiber yields after its time slice when
 another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
-Clock checks are batched every 64 safepoints. Yielding waits for runtime locks and
-governor critical sections to end. Root guards preserve environments during the yield.
-Cancellation at an automatic yield returns through native frames using the uncatchable
-resource-error path, so Rust unwinding does not cross those frames.
+Clock checks are batched every 64 safepoints. Yielding waits for runtime locks, borrowed mutator slots, and
+governor critical sections to end in every build. It also defers during Rust unwinding.
+Root guards protect environments only during an actual yield.
+Cancellation at an automatic yield uses a private resume token. It returns through
+native frames using the uncatchable resource-error path, then resumes Rust unwinding
+at the outer computation boundary. Cleanup cannot suspend a cancelled fiber.
+Other panic payloads retain their original message and type.
 
 A process watchdog checks carriers every 10 ms. If a fiber misses safepoints for
 `CLJRS_FIBER_STALL_MS` (default 100 ms) while another fiber is ready, it prints the
@@ -290,7 +293,9 @@ separate fake stack, so a local variable's address cannot measure this margin.
 The error names the fiber and reports reserved and remaining bytes. The margin covers
 interpreter frames and error construction; very small reservations cannot run deep Clojure code.
 Native recursion without safepoints can still hit the fatal guard page.
-The driver does not replace platform signal handlers.
+The driver does not replace platform signal handlers. Native diagnostic names are
+cached per isolate; warm calls update a frame token and an atomic name index without
+locking the watchdog mutex or cloning the name.
 
 Saved mutator states retain precise GC roots. Suspended JIT frames keep their code epochs live.
 

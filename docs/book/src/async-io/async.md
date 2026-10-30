@@ -236,7 +236,7 @@ warning threshold in milliseconds (default 100). Each stall produces one warning
 stack bytes. The memory governor charges active and pooled reservations,
 including guard pages, as `fiber-stack`. These are virtual reservations, not
 resident memory measurements. Strict memory budgets must include the root's
-64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 1024).
+64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 1024, minimum 512).
 
 A recursion error reports the fiber ID and remaining stack space. Safepoints
 keep a 256 KiB margin for interpreter frames and error construction. Native

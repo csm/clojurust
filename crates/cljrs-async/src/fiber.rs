@@ -34,7 +34,19 @@ const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-type FiberCoroutine = Coroutine<(), Park, EvalResult>;
+#[derive(Clone, Copy)]
+enum Resume {
+    Run,
+    Cancel,
+}
+#[derive(Debug)]
+struct Cancelled;
+
+fn resume_cancelled() -> ! {
+    std::panic::resume_unwind(Box::new(Cancelled))
+}
+
+type FiberCoroutine = Coroutine<Resume, Park, EvalResult>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FiberId(u64);
@@ -42,7 +54,7 @@ pub struct FiberId(u64);
 #[derive(Clone, Copy)]
 struct Current {
     id: FiberId,
-    yielder: *const Yielder<(), Park>,
+    yielder: *const Yielder<Resume, Park>,
     scheduling: *const Scheduling,
 }
 
@@ -63,10 +75,10 @@ fn stack_bytes() -> Result<usize, EvalError> {
             .parse::<usize>()
             .ok()
             .and_then(|kb| kb.checked_mul(1024))
-            .filter(|bytes| *bytes >= 64 * 1024)
+            .filter(|bytes| *bytes >= 512 * 1024)
             .ok_or_else(|| {
                 EvalError::Runtime(
-                    "CLJRS_FIBER_STACK_KB must be at least 64 and fit in usize".into(),
+                    "CLJRS_FIBER_STACK_KB must be at least 512 and fit in usize".into(),
                 )
             }),
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STACK_BYTES),
@@ -80,6 +92,7 @@ fn stack_bytes() -> Result<usize, EvalError> {
 struct Park {
     ptr: *mut (),
     poll: unsafe fn(*mut (), &mut Context<'_>) -> Poll<()>,
+    automatic: bool,
 }
 
 impl Park {
@@ -93,6 +106,7 @@ impl Park {
             // SAFETY: the pointee stays pinned until the park returns.
             ptr: unsafe { future.get_unchecked_mut() } as *mut F as *mut (),
             poll: poll::<F>,
+            automatic: false,
         }
     }
 }
@@ -101,6 +115,13 @@ impl Park {
 /// Panics outside a fiber or when a runtime lock/critical section is held.
 /// Managed values retained by the future must have precise GC root guards.
 pub fn park_on<F: Future>(future: F) -> F::Output {
+    park_on_impl(future, false)
+}
+
+fn park_on_impl<F: Future>(future: F, automatic: bool) -> F::Output {
+    if scheduling().is_some_and(Scheduling::is_cancelled) {
+        resume_cancelled();
+    }
     assert_parkable();
     let current = CURRENT
         .with(Cell::get)
@@ -115,10 +136,13 @@ pub fn park_on<F: Future>(future: F) -> F::Output {
             }
             Poll::Pending => Poll::Pending,
         }));
-        let park = Park::new(wait.as_mut());
+        let mut park = Park::new(wait.as_mut());
+        park.automatic = automatic;
         // SAFETY: CURRENT is installed only while this coroutine is resumed or
         // unwound; its Yielder remains at a stable address on its own stack.
-        unsafe { &*current.yielder }.suspend(park);
+        if matches!(unsafe { &*current.yielder }.suspend(park), Resume::Cancel) {
+            resume_cancelled();
+        }
     }
     output.expect("fiber resumed before its park future completed")
 }
@@ -146,19 +170,28 @@ fn scheduling() -> Option<&'static Scheduling> {
     CURRENT.with(Cell::get).map(|c| unsafe { &*c.scheduling })
 }
 
+fn yield_slice() -> Result<(), cljrs_gc::fiber::SafepointError> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        park_on_impl(tokio::task::yield_now(), true)
+    })) {
+        Ok(()) => Ok(()),
+        Err(payload) if payload.is::<Cancelled>() => {
+            Err(cljrs_gc::fiber::SafepointError::Cancelled)
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn install_parking_hooks() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         cljrs_gc::fiber::install(cljrs_gc::fiber::Hooks {
-            safepoint: || scheduling().map_or(Ok(()), Scheduling::safepoint),
-            enter_native: |name| {
+            safepoint: || scheduling().map_or(Ok(false), Scheduling::safepoint),
+            yield_now: yield_slice,
+            enter_native: |name| scheduling().map_or(0, |s| s.enter_native(name)),
+            exit_native: |previous| {
                 if let Some(s) = scheduling() {
-                    s.native_frame(Some(name));
-                }
-            },
-            exit_native: || {
-                if let Some(s) = scheduling() {
-                    s.native_frame(None);
+                    s.exit_native(previous);
                 }
             },
         });
@@ -285,7 +318,7 @@ impl Fiber {
         task.roots_guard = Some(root_values(&task.roots));
         task.state.swap_with_current();
         task.co = Some(unsafe {
-            Coroutine::with_stack_unchecked(stack, move |yielder, ()| {
+            Coroutine::with_stack_unchecked(stack, move |yielder, _resume: Resume| {
                 CURRENT.with(|slot| {
                     slot.set(Some(Current {
                         id,
@@ -301,6 +334,11 @@ impl Fiber {
                 #[cfg(feature = "no-gc")]
                 let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
                 let result = body();
+                // Cancellation returns through foreign frames as an uncatchable
+                // error, then resumes Rust unwinding at this safe boundary.
+                if (&*scheduling_ptr).is_cancelled() {
+                    resume_cancelled();
+                }
                 #[cfg(feature = "no-gc")]
                 match &result {
                     Ok(value) | Err(EvalError::Thrown(value)) => {
@@ -335,7 +373,7 @@ pub struct FiberTask {
     roots_guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
     bytes: usize,
     id: FiberId,
-    yielder: *const Yielder<(), Park>,
+    yielder: *const Yielder<Resume, Park>,
     root: bool,
     #[cfg(feature = "no-gc")]
     result_lease: std::rc::Rc<RefCell<cljrs_gc::region::RegionLease>>,
@@ -365,7 +403,7 @@ impl FiberTask {
     }
 
     fn unwind(&mut self) {
-        self.pending = None;
+        let automatic = self.pending.take().is_some_and(|park| park.automatic);
         if let Some(co) = &mut self.co {
             let _current = CurrentGuard::enter(if self.yielder.is_null() {
                 None
@@ -376,7 +414,18 @@ impl FiberTask {
                     scheduling: &*self.scheduling,
                 })
             });
-            co.force_unwind();
+            if automatic {
+                self.scheduling.cancel();
+                let outcome = catch_unwind(AssertUnwindSafe(|| co.resume(Resume::Cancel)));
+                match outcome {
+                    Err(payload) if payload.is::<Cancelled>() => {}
+                    Err(payload) => std::panic::resume_unwind(payload),
+                    Ok(CoroutineResult::Return(_)) => {}
+                    Ok(CoroutineResult::Yield(_)) => unreachable!("cancelled fiber suspended"),
+                }
+            } else {
+                co.force_unwind();
+            }
         }
     }
 }
@@ -413,7 +462,7 @@ impl Future for FiberTask {
                 }
                 let outcome = {
                     let _running = this.scheduling.enter();
-                    this.co.as_mut().unwrap().resume(())
+                    this.co.as_mut().unwrap().resume(Resume::Run)
                 };
                 match outcome {
                     CoroutineResult::Return(result) => return Poll::Ready(result),

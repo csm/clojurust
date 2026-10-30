@@ -1,6 +1,7 @@
 //! Ready-task tracking and a watchdog that can observe a blocked carrier.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Wake, Waker};
@@ -34,6 +35,7 @@ fn stack_pointer() -> usize {
 
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
+    static NATIVE_NAMES: RefCell<HashMap<Arc<str>, usize>> = RefCell::new(HashMap::new());
 }
 
 pub(super) struct Scheduler {
@@ -41,13 +43,14 @@ pub(super) struct Scheduler {
     running: Mutex<Option<Running>>,
     slice: Duration,
     stall: Duration,
+    names: Mutex<Vec<Arc<str>>>,
+    native: AtomicUsize,
 }
 
 struct Running {
     id: FiberId,
     heartbeat: Instant,
     reported: bool,
-    native: Option<Arc<str>>,
     wake: Weak<TaskWake>,
 }
 
@@ -68,6 +71,8 @@ impl Scheduler {
     fn new() -> Arc<Self> {
         let scheduler = Arc::new(Self {
             ready: AtomicUsize::new(0),
+            names: Mutex::new(Vec::new()),
+            native: AtomicUsize::new(0),
             running: Mutex::new(None),
             slice: duration_env("CLJRS_FIBER_SLICE_US", 10_000, true),
             stall: duration_env("CLJRS_FIBER_STALL_MS", 100, false),
@@ -123,8 +128,11 @@ impl Scheduler {
             "cljrs: fiber {} stalled its isolate for {:?}; native frame: {} (other fibers runnable)",
             run.id.0,
             now.duration_since(run.heartbeat),
-            run.native
-                .as_deref()
+            self.names
+                .lock()
+                .unwrap()
+                .get(self.native.load(Ordering::Relaxed).wrapping_sub(1))
+                .map(AsRef::as_ref)
                 .unwrap_or("<Rust body without safepoints>")
         ))
     }
@@ -204,7 +212,7 @@ pub(super) struct Scheduling {
     slice_start: Cell<Instant>,
     ticks: Cell<u32>,
     cancelled: Cell<bool>,
-    native: RefCell<Vec<Arc<str>>>,
+    native: Cell<usize>,
 }
 
 impl Scheduling {
@@ -217,39 +225,59 @@ impl Scheduling {
             slice_start: Cell::new(Instant::now()),
             ticks: Cell::new(0),
             cancelled: Cell::new(false),
-            native: RefCell::new(Vec::new()),
+            native: Cell::new(0),
         }
     }
 
     pub(super) fn enter(&self) -> RunGuard<'_> {
         let now = Instant::now();
         self.slice_start.set(now);
+        self.wake
+            .scheduler
+            .native
+            .store(self.native.get(), Ordering::Relaxed);
         *self.wake.scheduler.running.lock().unwrap() = Some(Running {
             id: self.id,
             heartbeat: now,
             reported: false,
-            native: self.native.borrow().last().cloned(),
             wake: Arc::downgrade(&self.wake),
         });
         RunGuard(self)
     }
 
-    pub(super) fn native_frame(&self, name: Option<&Arc<str>>) {
-        let frame = {
-            let mut frames = self.native.borrow_mut();
-            if let Some(name) = name {
-                frames.push(name.clone());
-            } else {
-                frames.pop();
+    pub(super) fn enter_native(&self, name: &Arc<str>) -> usize {
+        let id = NATIVE_NAMES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(name) {
+                return *id;
             }
-            frames.last().cloned()
-        };
-        if let Some(run) = self.wake.scheduler.running.lock().unwrap().as_mut() {
-            run.native = frame;
-        }
+            let mut names = self.wake.scheduler.names.lock().unwrap();
+            names.push(name.clone());
+            let id = names.len();
+            cache.insert(name.clone(), id);
+            id
+        });
+        let previous = self.native.replace(id);
+        self.wake.scheduler.native.store(id, Ordering::Relaxed);
+        previous
     }
 
-    pub(super) fn safepoint(&self) -> Result<(), SafepointError> {
+    pub(super) fn exit_native(&self, previous: usize) {
+        self.native.set(previous);
+        self.wake
+            .scheduler
+            .native
+            .store(previous, Ordering::Relaxed);
+    }
+
+    pub(super) fn cancel(&self) {
+        self.cancelled.set(true);
+    }
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+
+    pub(super) fn safepoint(&self) -> Result<bool, SafepointError> {
         if self.cancelled.get() {
             return Err(SafepointError::Cancelled);
         }
@@ -265,32 +293,18 @@ impl Scheduling {
         let ticks = self.ticks.get().wrapping_add(1);
         self.ticks.set(ticks);
         if !ticks.is_multiple_of(64) {
-            return Ok(());
+            return Ok(false);
         }
         let now = Instant::now();
         if let Some(run) = self.wake.scheduler.running.lock().unwrap().as_mut() {
             run.heartbeat = now;
             run.reported = false;
         }
-        if now.duration_since(self.slice_start.get()) >= self.wake.scheduler.slice
-            && self.wake.scheduler.other_ready(&self.wake)
-            && cljrs_gc::mutator::guards_held() == 0
-            && !cljrs_gc::governor::in_critical_section()
-        {
-            cljrs_gc::mutator::assert_parkable();
-            // Forced cancellation must not unwind across JIT/AOT C ABI frames.
-            // Carry it out as an uncatchable resource failure instead, so those
-            // frames return normally and the fiber's Rust scopes can clean up.
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::park_on(tokio::task::yield_now());
-            }))
-            .is_err()
-            {
-                self.cancelled.set(true);
-                return Err(SafepointError::Cancelled);
-            }
-        }
-        Ok(())
+        Ok(
+            now.duration_since(self.slice_start.get()) >= self.wake.scheduler.slice
+                && self.wake.scheduler.other_ready(&self.wake)
+                && cljrs_gc::mutator::can_park(),
+        )
     }
 }
 
@@ -310,6 +324,120 @@ impl Drop for Scheduling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static TEST_BORROW: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    cljrs_gc::mutator_slot!("cljrs-async/TEST_BORROW", refcell TEST_BORROW: Vec<u8>);
+
+    fn expire_slice() {
+        let current = super::super::scheduling().unwrap();
+        current
+            .slice_start
+            .set(Instant::now() - Duration::from_secs(1));
+        current.ticks.set(63);
+    }
+
+    #[test]
+    fn optional_yields_defer_for_locks_borrows_and_critical_sections() {
+        use std::rc::Rc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let ran = Rc::new(Cell::new(false));
+            let observed = ran.clone();
+            let first = super::super::spawn(move || {
+                let mutex = cljrs_gc::mutator::TrackedMutex::new(());
+                {
+                    let _held = mutex.lock().unwrap();
+                    expire_slice();
+                    cljrs_gc::fiber::safepoint().unwrap();
+                    assert!(!observed.get());
+                }
+                TEST_BORROW.with(|slot| {
+                    let _borrow = slot.borrow_mut();
+                    expire_slice();
+                    cljrs_gc::fiber::safepoint().unwrap();
+                    assert!(!observed.get());
+                });
+                {
+                    let _critical = cljrs_gc::enter_critical();
+                    expire_slice();
+                    cljrs_gc::fiber::safepoint().unwrap();
+                    assert!(!observed.get());
+                }
+                expire_slice();
+                let mut rooted = false;
+                cljrs_gc::fiber::safepoint_with(|yield_now| {
+                    rooted = true;
+                    yield_now()
+                })
+                .unwrap();
+                assert!(rooted && observed.get());
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap();
+            let peer = super::super::spawn(move || {
+                ran.set(true);
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap();
+            first.await.unwrap().into_result().unwrap();
+            peer.await.unwrap().into_result().unwrap();
+            cljrs_gc::fiber::safepoint_with(|_| panic!("rooted a carrier safepoint")).unwrap();
+        });
+    }
+
+    #[test]
+    fn automatic_yield_preserves_unrelated_panic_payloads() {
+        let payload = std::panic::catch_unwind(super::super::yield_slice).unwrap_err();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("outside a fiber"), "{message}");
+    }
+
+    #[test]
+    fn cancellation_does_not_resume_user_code_or_park_during_cleanup() {
+        use std::rc::Rc;
+        struct Cleanup(Rc<Cell<bool>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.set(true);
+                super::super::park_on(std::future::pending::<()>());
+                panic!("cancelled cleanup resumed");
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let cleaned = Rc::new(Cell::new(false));
+            let done = cleaned.clone();
+            let first = super::super::spawn(move || {
+                let _cleanup = Cleanup(done);
+                expire_slice();
+                cljrs_gc::fiber::safepoint()
+                    .map_err(|_| cljrs_runtime::env::error::EvalError::GasExhausted)?;
+                panic!("cancelled body continued");
+            })
+            .unwrap();
+            let abort = first.abort_handle();
+            let peer = super::super::spawn(move || {
+                abort.abort();
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap();
+            assert!(first.await.err().unwrap().is_cancelled());
+            peer.await.unwrap().into_result().unwrap();
+            assert!(cleaned.get());
+        });
+    }
 
     #[test]
     fn stack_pointer_stays_within_the_machine_stack_across_resumes() {

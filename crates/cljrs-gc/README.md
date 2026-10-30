@@ -93,8 +93,8 @@ src/
   fiber.rs        — optional scheduler hooks, native-frame diagnostics, and governed fiber stack reservations
   mutator.rs      — per-mutator state for virtual threads: MutatorSlot registry
                     (link-time, via inventory), mutator_slot! macro,
-                    MutatorState save/restore/swap, TrackedMutex (debug
-                    guard counting) and assert_parkable()
+                    MutatorState save/restore/swap, TrackedMutex guard counting
+                    in every build, can_park() and assert_parkable()
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects,
                     isolate-boundary crossings (bytes copied + serialize time)
@@ -605,7 +605,8 @@ pub struct MutatorSlot {
     pub init: fn() -> Box<dyn Any>,      // a fresh mutator's value
     pub swap: fn(&mut dyn Any),          // exchange with the thread-local
     pub trace: fn(&dyn Any, &mut MarkVisitor), // detached GC roots
-    pub check: fn(),                    // check borrow discipline before swapping
+    pub check: fn(),                    // assert borrow discipline before swapping
+    pub can_swap: fn() -> bool,          // non-panicking borrow preflight
 }
 pub fn slots() -> &'static [&'static MutatorSlot]; // sorted by name
 pub fn slot_names() -> Vec<&'static str>;
@@ -622,8 +623,9 @@ impl MutatorState {
     pub fn swap_with_current(&mut self); // exchange (scheduler resume/park)
 }
 
-pub fn guards_held() -> usize;           // TrackedMutex guards held (debug builds)
-pub fn assert_parkable();                // check slot borrows; debug: guards and critical sections
+pub fn guards_held() -> usize;           // TrackedMutex guards held in every build
+pub fn can_park() -> bool;               // optional yield: locks, borrows, critical sections, unwinding
+pub fn assert_parkable();                // explicit park: assert lock/borrow/critical discipline
 pub struct TrackedMutex<T>;              // std::sync::Mutex API subset; guards are counted
 pub struct TrackedMutexGuard<'a, T>;
 ```
@@ -870,12 +872,15 @@ Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.
 ```rust,ignore
 pub enum SafepointError { StackOverflow(String), Cancelled }
 pub struct Hooks {
-    pub safepoint: fn() -> Result<(), SafepointError>,
-    pub enter_native: fn(&Arc<str>),
-    pub exit_native: fn(),
+    pub safepoint: fn() -> Result<bool, SafepointError>, // true when a yield is due
+    pub yield_now: fn() -> Result<(), SafepointError>,
+    pub enter_native: fn(&Arc<str>) -> usize, // previous frame token
+    pub exit_native: fn(usize),
 }
 pub fn install(hooks: Hooks);
 pub fn safepoint() -> Result<(), SafepointError>;
+pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointError>)
+    -> Result<(), SafepointError>) -> Result<(), SafepointError>;
 pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard;
 pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
 pub struct StackReservation; // Drop releases its charges and live/pool count.
@@ -888,6 +893,9 @@ impl StackReservation {
 
 `SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
 ABI frames through the runtime's uncatchable resource-error path.
+The fiber resumes Rust cancellation at its outer computation boundary.
+`safepoint_with` runs its callback only when an automatic yield will happen.
+The interpreter uses it to root the current environment during that yield.
 `StackReservation::new` applies strict admission before stack allocation.
 `account_actual_bytes` adds page rounding and guard pages after allocation.
 A pooled reservation remains charged as `MemoryClass::FiberStack`.
@@ -900,3 +908,12 @@ unstarted fibers and root fibers. Completed results do not count as live fibers.
 `class_bytes(MemoryClass::FiberStack)` includes active and pooled reservations.
 The snapshot's `Display` implementation includes these counts and stack bytes,
 so both `--gc-stats` and `stats_report()` show them.
+
+
+Strict stack admission deliberately uses the full reservation. A 48 MiB hard limit
+cannot admit the default 64 MiB root stack. A 256 MiB budget must leave room for
+that root, each live child stack, guard pages, and managed values. This conservative
+contract bounds stack address-space commitments and can reject mostly idle fibers.
+Observe-only mode reports the same bytes without refusing stack reservations.
+Resident-page sampling is not used for admission because it cannot reserve space
+for a stack's later growth. This follows the Phase 4 plan's explicit stack-budget contract.

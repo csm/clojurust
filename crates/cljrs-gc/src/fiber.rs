@@ -13,9 +13,10 @@ pub enum SafepointError {
 }
 
 pub struct Hooks {
-    pub safepoint: fn() -> Result<(), SafepointError>,
-    pub enter_native: fn(&Arc<str>),
-    pub exit_native: fn(),
+    pub safepoint: fn() -> Result<bool, SafepointError>,
+    pub yield_now: fn() -> Result<(), SafepointError>,
+    pub enter_native: fn(&Arc<str>) -> usize,
+    pub exit_native: fn(usize),
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -30,22 +31,39 @@ pub fn install(hooks: Hooks) {
 
 /// Cooperate with the scheduler and check the running fiber's stack margin.
 pub fn safepoint() -> Result<(), SafepointError> {
-    HOOKS.get().map_or(Ok(()), |h| (h.safepoint)())
+    safepoint_with(|yield_now| yield_now())
+}
+
+/// Install temporary roots only if the scheduler is about to yield.
+pub fn safepoint_with(
+    around_yield: impl FnOnce(fn() -> Result<(), SafepointError>) -> Result<(), SafepointError>,
+) -> Result<(), SafepointError> {
+    if let Some(hooks) = HOOKS.get()
+        && (hooks.safepoint)()?
+    {
+        around_yield(hooks.yield_now)
+    } else {
+        Ok(())
+    }
 }
 
 /// Name the innermost native call for stall diagnostics. May span parks.
 pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard {
-    if let Some(hooks) = HOOKS.get() {
-        (hooks.enter_native)(name);
+    let previous = HOOKS.get().map_or(0, |hooks| (hooks.enter_native)(name));
+    NativeFrameGuard {
+        previous,
+        _thread: std::marker::PhantomData,
     }
-    NativeFrameGuard(std::marker::PhantomData)
 }
 
-pub struct NativeFrameGuard(std::marker::PhantomData<std::rc::Rc<()>>);
+pub struct NativeFrameGuard {
+    previous: usize,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 impl Drop for NativeFrameGuard {
     fn drop(&mut self) {
         if let Some(hooks) = HOOKS.get() {
-            (hooks.exit_native)();
+            (hooks.exit_native)(self.previous);
         }
     }
 }

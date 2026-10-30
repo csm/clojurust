@@ -854,5 +854,18 @@ wasm retains the existing async model.
 CPU loop and can be cancelled at an automatic yield. The AOT suite checks
 fairness and fiber-specific recursion errors in a GC binary. The existing `no-gc`
 AOT blacklist rejects this fixture's escaping function definitions.
-Pending native exceptions retain the first failure until a catch boundary consumes it,
-so arithmetic on a returned nil sentinel cannot hide a stack-overflow diagnostic.
+Generated call sites test for a pending error before consuming a failed call's nil
+sentinel or running another operation. `rt_throw` stores an owned, traced value and
+replaces an earlier throw. Poll functions transfer typed errors out of TLS before
+returning; later invocations on the same carrier start with clear error slots.
+
+Additional native bridges:
+
+- `rt_error_pending() -> u8` checks for a pending exception or resource error.
+- `rt_native_frame_depth() -> usize` records a function's native region checkpoint.
+- `rt_native_frame_cleanup(depth: usize)` closes only regions opened above that checkpoint on an error exit.
+- `rt_async_fail(sm: *mut CljxStateMachine) -> i32` consumes TLS errors and stores the correct poll result. Memory faults retain their typed delivery through the confirmed governor slot.
+
+The codegen uses the same cleanup on safepoint, gas, and post-call failures. It
+preserves caller-owned regions. Tests exercise thrown values, gas exhaustion,
+memory faults, skipped side effects, and subsequent calls on the same carrier.

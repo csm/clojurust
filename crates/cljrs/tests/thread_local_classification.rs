@@ -56,6 +56,16 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "SCHEDULER",
         Thread("isolate ready-task counters and watchdog state"),
     ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "NATIVE_NAMES",
+        Thread("isolate-local cache of immutable native diagnostic names"),
+    ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "TEST_BORROW",
+        Thread("unit-test fixture"),
+    ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
         "cljrs-gc/src/lib.rs",

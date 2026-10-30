@@ -321,7 +321,7 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   `current` on native targets. Tokio's `LocalSet` drives each fiber on its isolate thread.
 - `park_on` keeps the future pinned on the fiber stack. The future can borrow local values.
   The driver polls it with the fiber's mutator state installed.
-- Stacks default to 1 MB. `CLJRS_FIBER_STACK_KB` accepts at least 64 KB. Each isolate pools
+- Stacks default to 1 MB. `CLJRS_FIBER_STACK_KB` requires at least 512 KB; smaller settings fail during construction. Each isolate pools
   up to 32 finished stacks. Root entry points remain unchanged until Phase 3.
 - Each `MutatorState` registers weakly with its isolate. Slot callbacks trace saved shadow
   roots, allocation roots, regions, bindings, eval contexts, watch errors, and pending exceptions.
@@ -489,8 +489,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 
 - Interpreter, IR, JIT, and AOT safepoints yield an expired time slice when
   another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10,000 microseconds.
-  Clock reads are batched every 64 safepoints. Runtime locks and governor critical
-  sections defer yielding. Safepoint environments remain rooted during the switch.
+  Clock reads are batched every 64 safepoints. Runtime locks, borrowed mutator slots, and governor critical
+  sections defer yielding in every build. Safepoint environments are rooted only during a switch.
 - Ready-task wakers track queued work, including wakes from other threads.
   Completion and cancellation remove their ready registrations.
 - A shared watchdog runs outside the carriers. It reports a missing safepoint
@@ -509,8 +509,15 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   Margin checks read the machine stack register, since ASan can move locals to a
   separate fake stack. ASan CI enables this mode explicitly and covers the machine
   stack probe across coroutine resumes, plus the Phase 4 fairness and overflow tests.
-- Cancellation at an automatic yield uses the uncatchable resource-error path
-  to return normally through native ABI frames before stack cleanup.
+- Automatic-yield cancellation uses a private resume token and the uncatchable
+  resource-error path to return normally through native ABI frames. It resumes Rust
+  cancellation at the outer computation boundary. Other panics are rethrown unchanged;
+  cancellation cleanup cannot suspend again.
+- Generated call sites check errors before consuming a nil sentinel. Error exits
+  release only regions opened by that compiled function. Poll functions consume TLS
+  errors into their in-band result and preserve typed gas and memory failures.
+- Warm native diagnostic calls update an isolate-cached name index without a watchdog
+  mutex or per-call Arc clones. Environment rooting happens only for actual yields.
 - The overflow investigation keeps platform signal handlers intact. A native
   recursion path without safepoints can still hit the fatal guard page; this phase
   does not attempt signal-handler unwinding or recovery.

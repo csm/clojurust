@@ -10,6 +10,60 @@ use cljrs_gc::{GcPtr, MemoryClass};
 use cljrs_runtime::env::{env::Env, error::EvalError};
 use cljrs_value::{Arity, NativeFn, Value};
 
+#[test]
+fn configured_stacks_reject_unsafe_sizes_before_execution() {
+    const CHILD: &str = "CLJRS_REVIEW_STACK_MINIMUM";
+    if std::env::var_os(CHILD).is_none() {
+        for size in ["64", "128", "256", "512"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "configured_stacks_reject_unsafe_sizes_before_execution",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CLJRS_FIBER_STACK_KB", size)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{size} KiB: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    if std::env::var("CLJRS_FIBER_STACK_KB").unwrap() != "512" {
+        let error = Fiber::new(|| Ok(Value::Nil))
+            .err()
+            .expect("unsafe stack accepted");
+        assert!(error.to_string().contains("at least 512"), "{error:?}");
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let form = cljrs_reader::Parser::new("(+ 1 2)".into(), "<small-stack>".into())
+                .parse_all()
+                .unwrap()
+                .remove(0);
+            run(async {
+                let task = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(
+                        &form,
+                        &mut Env::new(runtime.globals().clone(), "user"),
+                    )
+                })
+                .unwrap();
+                assert_eq!(task.await.unwrap().into_result().unwrap(), Value::Long(3));
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 fn run(body: impl std::future::Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()

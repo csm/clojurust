@@ -204,7 +204,7 @@ fn intern_long(n: i64) -> *const Value {
 /// tight loops cooperate with the garbage collector.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_safepoint() -> i8 {
-    if resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()) {
+    if rt_error_pending() != 0 {
         return 0;
     }
     cljrs_gc::safepoint();
@@ -212,13 +212,43 @@ pub extern "C" fn rt_safepoint() -> i8 {
         Ok(()) => 1,
         Err(cljrs_gc::fiber::SafepointError::Cancelled) => {
             signal_error(cljrs_value::ValueError::GasExhausted);
-            unwind_all_native_regions();
             0
         }
         Err(cljrs_gc::fiber::SafepointError::StackOverflow(message)) => {
             throw_str(message);
             0
         }
+    }
+}
+
+/// Non-consuming error test for generated call sites.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_error_pending() -> u8 {
+    u8::from(resource_error_pending() || PENDING_EXCEPTION.with(|slot| slot.borrow().is_some()))
+}
+
+/// Record the native region depth on entry to one compiled function.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_native_frame_depth() -> usize {
+    RT_REGION_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Close only the regions owned by a compiled function's skipped exit path.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_native_frame_cleanup(depth: usize) {
+    loop {
+        let region = RT_REGION_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() > depth {
+                stack.pop()
+            } else {
+                None
+            }
+        });
+        let Some(region) = region else {
+            break;
+        };
+        cljrs_gc::region::close_region(region);
     }
 }
 
@@ -1222,21 +1252,6 @@ fn unwind_regions_to(gc_depth: usize, rt_depth: usize) {
     // (interpreter frames clean their own regions on unwind, so this is
     // normally a no-op).
     cljrs_gc::region::unwind_region_stack_to(gc_depth);
-}
-
-/// Close every region opened by native code on this thread.
-///
-/// Gas exhaustion crosses the entire compiled call stack, so no native frame
-/// will execute its matching `RegionEnd`. Interpreter-owned region-stack
-/// entries are deliberately left alone.
-fn unwind_all_native_regions() {
-    loop {
-        let region = RT_REGION_STACK.with(|stack| stack.borrow_mut().pop());
-        match region {
-            Some(region) => cljrs_gc::region::close_region(region),
-            None => break,
-        }
-    }
 }
 
 // ── Scratch buffer ──────────────────────────────────────────────────────────
@@ -3884,9 +3899,9 @@ pub unsafe extern "C" fn rt_with_bindings(
 // When rt_throw is called, it stores the exception here and returns a
 // sentinel. rt_try checks this after calling the body function.
 thread_local! {
-    static PENDING_EXCEPTION: std::cell::RefCell<Option<*const Value>> = const { std::cell::RefCell::new(None) };
+    static PENDING_EXCEPTION: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
 }
-cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCEPTION: Option<*const Value>, trace trace_saved_exception);
+cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCEPTION: Option<Value>, trace trace_saved_exception);
 
 /// `(throw val)` — throws a Clojure value as an exception.
 ///
@@ -3899,30 +3914,22 @@ cljrs_gc::mutator_slot!("cljrs-compiler/PENDING_EXCEPTION", refcell PENDING_EXCE
 #[unsafe(no_mangle)]
 #[cljrs_export_macro::catch_realization(throw_str)]
 pub unsafe extern "C" fn rt_throw(val: *const Value) -> *const Value {
-    PENDING_EXCEPTION.with(|cell| {
-        // Native callers can still evaluate an enclosing expression while
-        // returning the nil sentinel. Preserve the original failure until a
-        // catch boundary consumes it; secondary type errors must not hide it.
-        cell.borrow_mut().get_or_insert(val);
-    });
+    let value = unsafe { val_ref(val) }.clone();
+    #[cfg(feature = "no-gc")]
+    let value = cljrs_value::publish::publish_return(value);
+    #[cfg(not(feature = "no-gc"))]
+    let value = cljrs_value::publish::publish_value(value);
+    PENDING_EXCEPTION.with(|cell| *cell.borrow_mut() = Some(value));
     rt_const_nil()
 }
 
-/// Check if a thrown exception is pending and clear it.
-fn take_pending_exception() -> Option<*const Value> {
+fn take_pending_exception() -> Option<Value> {
     PENDING_EXCEPTION.with(|cell| cell.borrow_mut().take())
 }
 
-/// Take (and clear) the thread's pending exception as an owned `Value`.
-///
-/// Reached from the JIT-native dispatch seam through
-/// [`JitBackend::take_pending_exception`](cljrs_runtime::tiered::backend::JitBackend::take_pending_exception)
-/// right after native code returns, so an uncaught throw propagates to the
-/// interpreter caller instead of being swallowed as nil.  The caller must
-/// invoke this while the JIT frame's alloc roots are still live (the pending
-/// pointer targets a Value boxed inside the native frame).
+/// Consume the current mutator's owned, precisely traced exception value.
 pub fn take_pending_exception_value() -> Option<Value> {
-    take_pending_exception().map(|ptr| unsafe { val_ref(ptr) }.clone())
+    take_pending_exception()
 }
 
 /// `(try body (catch Ex e handler) (finally cleanup))` — exception handling.
@@ -4582,6 +4589,10 @@ pub fn anchor_rt_symbols() {
     std::hint::black_box(rt_kw_ic_fill as *const () as usize);
     std::hint::black_box(rt_load_global_versioned_ic as *const () as usize);
     std::hint::black_box(rt_call_ic as *const () as usize);
+    std::hint::black_box(rt_error_pending as *const () as usize);
+    std::hint::black_box(rt_native_frame_depth as *const () as usize);
+    std::hint::black_box(rt_native_frame_cleanup as *const () as usize);
+    std::hint::black_box(rt_async_fail as *const () as usize);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4695,11 +4706,8 @@ pub extern "C" fn rt_box_bool(b: u8) -> *const Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_gas_charge(cost: u64) -> u8 {
     let charged = !resource_error_pending() && cljrs_runtime::env::gas::charge(cost);
-    if !charged {
-        if !resource_error_pending() {
-            signal_error(cljrs_value::ValueError::GasExhausted);
-        }
-        unwind_all_native_regions();
+    if !charged && !resource_error_pending() {
+        signal_error(cljrs_value::ValueError::GasExhausted);
     }
     u8::from(charged)
 }
@@ -5282,6 +5290,27 @@ pub extern "C" fn rt_async_set_result(sm: *mut CljxStateMachine, val: *const Val
     sm.pending = v;
 }
 
+/// Move a generated poll function's TLS error into its in-band result and clear TLS.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_async_fail(sm: *mut CljxStateMachine) -> i32 {
+    let sm = unsafe { &mut *sm };
+    let resource = take_pending_resource_error();
+    let thrown = take_pending_exception_value();
+    if let Some(error) = resource {
+        sm.pending = Value::Nil;
+        return match error {
+            cljrs_value::ValueError::GasExhausted => cljrs_async::state_machine::POLL_GAS_EXHAUSTED,
+            cljrs_value::ValueError::MemoryLimitExceeded(fault) => {
+                cljrs_gc::governor::confirm_runtime_fault(fault);
+                cljrs_async::state_machine::POLL_THREW
+            }
+            _ => unreachable!("resource slot contained a catchable error"),
+        };
+    }
+    sm.pending = thrown.unwrap_or(Value::Nil);
+    cljrs_async::state_machine::POLL_THREW
+}
+
 #[cfg(test)]
 mod async_sm_tests {
     use super::*;
@@ -5675,11 +5704,10 @@ mod tests {
     }
 }
 
-fn trace_saved_exception(value: &Option<*const Value>, visitor: &mut cljrs_gc::MarkVisitor) {
+fn trace_saved_exception(value: &Option<Value>, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
-    if let Some(ptr) = value {
-        // SAFETY: the compiled caller's exception slot remains live while parked.
-        unsafe { &**ptr }.trace(visitor);
+    if let Some(value) = value {
+        value.trace(visitor);
     }
 }
 
