@@ -285,6 +285,8 @@ fiber ID and innermost native function name once for that stall. Parked fibers d
 trigger warnings. Both timing settings accept positive integers; invalid values use defaults.
 
 Safepoints reject recursion when fewer than 256 KiB remain above the stack limit.
+The check reads the machine stack register; ASan can place local variables on a
+separate fake stack, so a local variable's address cannot measure this margin.
 The error names the fiber and reports reserved and remaining bytes. The margin covers
 interpreter frames and error construction; very small reservations cannot run deep Clojure code.
 Native recursion without safepoints can still hit the fatal guard page.

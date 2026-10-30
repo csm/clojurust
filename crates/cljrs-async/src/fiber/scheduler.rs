@@ -9,6 +9,29 @@ use std::time::{Duration, Instant};
 use super::FiberId;
 use cljrs_gc::fiber::SafepointError;
 
+/// Read the machine stack, rather than an ASan fake-stack local's address.
+#[inline(always)]
+fn stack_pointer() -> usize {
+    let pointer: usize;
+    // SAFETY: each instruction only copies the current stack register. It
+    // neither accesses memory nor changes the stack or condition flags.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "x86")]
+        std::arch::asm!("mov {}, esp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+        std::arch::asm!("mov {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        std::arch::asm!("mv {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "loongarch64")]
+        std::arch::asm!("move {}, $sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "powerpc64")]
+        std::arch::asm!("mr {}, 1", out(reg) pointer, options(nomem, nostack, preserves_flags));
+    }
+    pointer
+}
+
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
 }
@@ -230,10 +253,9 @@ impl Scheduling {
         if self.cancelled.get() {
             return Err(SafepointError::Cancelled);
         }
-        let marker = 0u8;
         // Reserve space for error construction and unwinding, including the
         // guard page (Stack::limit includes it). No signal-handler unwinding.
-        let remaining = (&marker as *const u8 as usize).saturating_sub(self.limit);
+        let remaining = stack_pointer().saturating_sub(self.limit);
         if remaining < 256 * 1024 {
             return Err(SafepointError::StackOverflow(format!(
                 "stack overflow in fiber {} ({} reserved bytes, {remaining} bytes remaining)",
@@ -288,6 +310,27 @@ impl Drop for Scheduling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_pointer_stays_within_the_machine_stack_across_resumes() {
+        use corosensei::stack::{DefaultStack, Stack};
+        use corosensei::{Coroutine, CoroutineResult};
+
+        let stack = DefaultStack::new(1024 * 1024).unwrap();
+        let bounds = stack.limit().get()..stack.base().get();
+        let mut coroutine = Coroutine::with_stack(stack, |yielder, ()| {
+            yielder.suspend(stack_pointer());
+            stack_pointer()
+        });
+        let CoroutineResult::Yield(before) = coroutine.resume(()) else {
+            panic!("coroutine did not suspend");
+        };
+        let CoroutineResult::Return(after) = coroutine.resume(()) else {
+            panic!("coroutine did not return");
+        };
+        assert!(bounds.contains(&before));
+        assert!(bounds.contains(&after));
+    }
 
     #[test]
     fn ready_registration_is_idempotent_and_closes_after_remote_wakes() {

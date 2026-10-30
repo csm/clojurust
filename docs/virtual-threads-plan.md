@@ -506,6 +506,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   before ordinary recursion reaches the guard page. The 256 KiB margin covers
   interpreter frames and error construction. Compiled safepoints return a checked
   status and carry the error through the pending-exception slot.
+  Margin checks read the machine stack register, since ASan can move locals to a
+  separate fake stack. ASan CI enables this mode explicitly and covers the machine
+  stack probe across coroutine resumes, plus the Phase 4 fairness and overflow tests.
 - Cancellation at an automatic yield uses the uncatchable resource-error path
   to return normally through native ABI frames before stack cleanup.
 - The overflow investigation keeps platform signal handlers intact. A native
