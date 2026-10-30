@@ -42,9 +42,10 @@ type InvocationCache =
     std::collections::HashMap<&'static str, std::collections::HashMap<String, usize>>;
 
 thread_local! {
+    /// Boxes cached for the active bounded invocation; cleared with its arena.
+    static INVOCATION_CACHE: RefCell<InvocationCache> = RefCell::new(Default::default());
     /// Thread-local allocation context stack.
     /// Empty ≡ Static (program-startup default).
-    static INVOCATION_CACHE: RefCell<InvocationCache> = RefCell::new(Default::default());
     pub(crate) static ALLOC_CTX: RefCell<Vec<AllocCtx>> = const { RefCell::new(Vec::new()) };
 }
 crate::mutator_slot!("cljrs-gc/ALLOC_CTX", refcell ALLOC_CTX: Vec<AllocCtx>);

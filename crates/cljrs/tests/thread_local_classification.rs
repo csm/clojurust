@@ -42,6 +42,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         FiberWhen("cljrs-gc/READ_SCOPES", NO_GC),
     ),
     (
+        "cljrs-gc/src/region.rs",
+        "READ_EPOCH",
+        FiberWhen("cljrs-gc/READ_EPOCH", NO_GC),
+    ),
+    (
         "cljrs-async/src/channel.rs",
         "THREAD_FAILURES",
         Fiber("cljrs-async/THREAD_FAILURES"),
@@ -96,6 +101,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-gc/src/alloc_ctx.rs",
         "ALLOC_CTX",
         FiberWhen("cljrs-gc/ALLOC_CTX", NO_GC),
+    ),
+    (
+        "cljrs-gc/src/alloc_ctx.rs",
+        "INVOCATION_CACHE",
+        FiberWhen("cljrs-gc/INVOCATION_CACHE", NO_GC),
     ),
     (
         "cljrs-gc/src/governor.rs",
