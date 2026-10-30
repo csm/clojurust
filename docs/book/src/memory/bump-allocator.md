@@ -150,6 +150,7 @@ lifetime.
 The `no-gc` Cargo feature disables tracing collection. Calls and loop iterations
 use scratch regions. Returned values retain their backing storage through
 ownership leases. Replaced values release that ownership after their last reader.
+This configuration is currently experimental and may panic.
 
 Namespace and Var containers use program storage. Their current payloads have
 replaceable leases. Immutable definition data and metadata use compact arenas.
