@@ -5401,8 +5401,8 @@ mod tests {
             if signature.contains("extern \"C\"") && signature.contains("-> *const Value") {
                 checked += 1;
                 assert!(
-                    signature.contains("catch_realization(throw_str)"),
-                    "missing boundary: {signature}"
+                    signature.contains("catch_realization(throw_str, signal_error)"),
+                    "missing realization or cancellation boundary: {signature}"
                 );
             }
         }
