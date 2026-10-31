@@ -179,9 +179,13 @@ user-level catch. A memory-limit fault (strict governor mode) likewise settles a
 `EvalError::MemoryLimitExceeded`; `check_ready` reports it as
 `Readiness::MemoryLimitExceeded`, and a compiled poll that sees it confirms
 the fault in the runtime-fault slot, which `CompiledAsyncTask::poll` checks
-after every poll. Fiber cancellation settles as `FutureState::Interrupted`, is
-re-raised as `EvalError::Cancelled`, and reaches compiled polls as
-`Readiness::Cancelled` / `POLL_CANCELLED`, so it is never reported as gas exhaustion. Every `spawn_future` captures the complete active meter stack
+after every poll. Fiber cancellation settles as `FutureState::Interrupted`, so it is never reported as
+gas exhaustion. Awaiters receive the same catchable cancellation exception as for
+`future-cancel` (`Readiness::Failed` in compiled polls), so a healthy consumer can
+handle it instead of inheriting uncatchable cancellation; an awaiter that is itself
+cancelled stops at its own park. Interrupted futures, like cancelled ones, are not
+reported when discarded unread. A compiled poll that is itself cancelled returns
+`POLL_CANCELLED`. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.
 
@@ -282,9 +286,12 @@ delivery futures, timers, I/O bridges) all run. `CLJRS_FIBER_SLICE_US` defaults 
 Clock checks are batched every 64 safepoints. Yielding waits for runtime locks, borrowed mutator slots, and
 governor critical sections to end in every build. It also defers during Rust unwinding.
 Root guards protect environments only during an actual yield.
-Cancellation at an automatic yield uses a private resume token. It returns through
-native frames using the uncatchable resource-error path, then resumes Rust unwinding
-at the outer computation boundary. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
+Cancelling a started fiber resumes it with a private token, whether it is suspended
+at an automatic yield or an explicit park. An automatic yield returns the uncatchable
+resource error; an explicit park raises a private unwind that the nearest `NativeFn`
+wrapper or C-ABI bridge turns into `ValueError::Cancelled`. Either way cancellation
+returns through native frames as an error, then resumes Rust unwinding at the outer
+computation boundary. A fiber that never started is dropped without running code. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
 An explicit park during cleanup cannot suspend the fiber; it unwinds to the nearest
 `NativeFn` or C-ABI boundary as `ValueError::Cancelled`.
 Other panic payloads retain their original message and type.
@@ -302,10 +309,10 @@ The error names the fiber and reports reserved and remaining bytes. The margin c
 interpreter frames and error construction; very small reservations cannot run deep Clojure code.
 Native recursion without safepoints can still hit the fatal guard page.
 The driver does not replace platform signal handlers. Native diagnostic names are
-interned by content per isolate; warm calls hit a per-thread cache keyed by the name's
-allocation and update a frame token and an atomic name index without locking the
-watchdog mutex. Both tables are bounded at 4096 entries: the cache is cleared when full,
-and names past the bound share a `<native function>` entry.
+interned by content in one process-wide table, bounded at 4096 names; names past the
+bound share a `<native function>` entry. Each `NativeFn` caches its id in
+`diagnostic_id`, so a warm call costs an atomic load and an atomic store, with no lock
+or name lookup.
 
 Saved mutator states retain precise GC roots. Suspended JIT frames keep their code epochs live.
 
@@ -628,6 +635,8 @@ Cancellation releases monitors and retracts pending channel operations.
 An unconsumed committed take returns its value to the channel in FIFO order.
 Channel transfers wake only the selected tasks. Pending buffered puts fill free slots in registration order.
 Interrupted thunks return to their pending state so realization waiters can retry.
+A thunk that fails because its fiber is being cancelled also returns to pending,
+and realization re-raises the cancellation instead of caching an error.
 Legacy async tasks reject explicit monitor calls, including calls through synchronous helpers.
 Carrier waits on a fiber-owned monitor or realization on the same thread fail before they can block the executor.
 Channel waiters register their wakers before readiness checks. Channel closure wakes every pending operation.

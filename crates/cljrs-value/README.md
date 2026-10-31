@@ -663,12 +663,14 @@ pub type BlockingResult = Box<dyn Any + Send>;
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
 pub struct Hooks {
     pub current: fn() -> Option<u64>,
+    pub cancelled: fn() -> bool,
     pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
     pub sleep: fn(Duration),
     pub blocking: fn(BlockingJob) -> BlockingResult,
 }
 pub fn install(hooks: Hooks);
 pub fn current() -> Option<u64>;
+pub fn cancelled() -> bool; // the running fiber is being cancelled
 pub fn park<F: Future>(future: F) -> F::Output;
 pub fn block_on<F: Future>(future: F) -> F::Output;
 pub fn sleep(duration: Duration);
@@ -1068,6 +1070,8 @@ Unobserved future failures warn on drop, including resource failures. Internal t
 Bounded invocations retain their original allocation rules.
 
 `NativeFn::captures: Arc<[Value]>` records managed values retained by a Rust callable.
+`NativeFn::diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId` caches the function's
+watchdog name id; struct literals set it to `Default::default()`.
 The callable and tracer share one immutable allocation. Compiled and IR adapters use the same capture slice.
 For struct literals, convert an existing capture vector with `.into()`.
 

@@ -315,7 +315,8 @@ fn watchdog_reports_a_blocked_native_frame_once() {
     }
     run(async {
         let blocker = fiber::spawn(|| {
-            let _native = cljrs_gc::fiber::native_frame(&"blocking-test-native".into());
+            let _native =
+                cljrs_gc::fiber::native_frame(&"blocking-test-native".into(), &Default::default());
             std::thread::sleep(Duration::from_millis(150));
             Ok(Value::Nil)
         })
@@ -418,4 +419,59 @@ fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
     assert_eq!(snapshot.pooled_fiber_stacks, 0);
     assert_eq!(snapshot.reserved_fiber_stack_bytes, 0);
     assert_eq!(code.bytes(), requested);
+}
+
+#[test]
+fn cancelled_realization_leaves_shared_lazy_values_pending() {
+    use cljrs_value::types::{Delay, LazySeq, Thunk};
+
+    // The first force parks until cancelled, converting the cancellation to a
+    // thunk error as a NativeFn boundary inside the thunk would; later forces
+    // succeed.
+    #[derive(Debug)]
+    struct ParkOnce(Cell<u32>);
+    impl cljrs_gc::Trace for ParkOnce {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParkOnce {
+        fn force(&self) -> Result<Value, String> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })
+                .map_err(|error| error.to_string())?;
+                unreachable!("pending park resumed");
+            }
+            Ok(Value::Long(42))
+        }
+    }
+
+    run(async {
+        let delay = Rc::new(Delay::new(Box::new(ParkOnce(Cell::new(0)))));
+        let lazy = Rc::new(LazySeq::new(Box::new(ParkOnce(Cell::new(0)))));
+        for target in ["delay", "lazy"] {
+            let (d, l) = (delay.clone(), lazy.clone());
+            let task = fiber::spawn(move || {
+                let _ = match target {
+                    "delay" => d.force(),
+                    _ => l.try_realize(),
+                };
+                panic!("cancelled realization returned normally");
+            })
+            .unwrap();
+            tokio::task::yield_now().await;
+            task.abort();
+            assert!(task.await.err().unwrap().is_cancelled());
+        }
+        // Healthy readers re-run the thunk instead of seeing a cached error.
+        let (d, l) = (delay.clone(), lazy.clone());
+        let reader = fiber::spawn(move || {
+            assert_eq!(d.force(), Ok(Value::Long(42)));
+            assert_eq!(l.try_realize(), Ok(Value::Long(42)));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        reader.await.unwrap().into_result().unwrap();
+    });
 }

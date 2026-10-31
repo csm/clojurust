@@ -61,11 +61,6 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-async/src/fiber/scheduler.rs",
-        "NATIVE_NAMES",
-        Thread("isolate-local cache of immutable native diagnostic names"),
-    ),
-    (
-        "cljrs-async/src/fiber/scheduler.rs",
         "TEST_BORROW",
         FiberTest("cljrs-async/TEST_BORROW"),
     ),

@@ -16,7 +16,7 @@ pub struct Hooks {
     pub safepoint: fn() -> Result<bool, SafepointError>,
     pub yield_now: fn() -> Result<(), SafepointError>,
     pub reclaim_stacks: fn(),
-    pub enter_native: fn(&Arc<str>) -> usize,
+    pub enter_native: fn(&Arc<str>, &NativeDiagnosticId) -> usize,
     pub exit_native: fn(usize),
 }
 
@@ -55,9 +55,32 @@ pub(crate) fn reclaim_idle_stacks() {
     }
 }
 
+/// A native function's lazily assigned diagnostic name id, stored with the
+/// function so warm calls need no name lookup. Zero means unassigned.
+#[derive(Debug, Default)]
+pub struct NativeDiagnosticId(AtomicUsize);
+
+impl NativeDiagnosticId {
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, id: usize) {
+        self.0.store(id, Ordering::Relaxed);
+    }
+}
+
+impl Clone for NativeDiagnosticId {
+    fn clone(&self) -> Self {
+        Self(AtomicUsize::new(self.get()))
+    }
+}
+
 /// Name the innermost native call for stall diagnostics. May span parks.
-pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard {
-    let previous = HOOKS.get().map_or(0, |hooks| (hooks.enter_native)(name));
+/// `id` caches the name's diagnostic id across calls.
+pub fn native_frame(name: &Arc<str>, id: &NativeDiagnosticId) -> NativeFrameGuard {
+    let previous = HOOKS
+        .get()
+        .map_or(0, |hooks| (hooks.enter_native)(name, id));
     NativeFrameGuard {
         previous,
         _thread: std::marker::PhantomData,

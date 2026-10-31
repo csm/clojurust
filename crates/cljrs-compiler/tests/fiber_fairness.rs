@@ -219,3 +219,80 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn cancelling_an_explicit_park_inside_an_abi_bridge_returns_an_error() {
+    const CHILD: &str = "CLJRS_CANCEL_EXPLICIT_PARK_ABI";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cancelling_an_explicit_park_inside_an_abi_bridge_returns_an_error",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use cljrs_compiler::rt_abi;
+    use cljrs_gc::GcPtr;
+    use cljrs_value::ValueError;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.into_globals();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, async {
+                let parked = Rc::new(Cell::new(false));
+                let completed = Rc::new(Cell::new(false));
+                let flag = parked.clone();
+                let done = completed.clone();
+                let task = fiber::spawn(move || {
+                    let _ctx = cljrs_runtime::env::callback::install_eval_context_guard(
+                        globals,
+                        "user".into(),
+                    );
+                    let promise = Value::Promise(GcPtr::new(cljrs_value::CljxPromise::new()));
+                    let _root = cljrs_runtime::env::gc_roots::root_value(&promise);
+                    flag.set(true);
+                    // An explicit (non-automatic) park inside an extern-C bridge.
+                    unsafe {
+                        rt_abi::rt_deref(&promise);
+                    }
+                    assert!(matches!(
+                        rt_abi::take_pending_resource_error(),
+                        Some(ValueError::Cancelled)
+                    ));
+                    done.set(true);
+                    Err(cljrs_runtime::env::error::EvalError::Cancelled)
+                })
+                .unwrap();
+                let abort = task.abort_handle();
+                let peer = fiber::spawn(move || {
+                    while !parked.get() {
+                        fiber::park_on(tokio::task::yield_now());
+                    }
+                    abort.abort();
+                    Ok(Value::Nil)
+                })
+                .unwrap();
+                assert!(task.await.err().unwrap().is_cancelled());
+                peer.await.unwrap().into_result().unwrap();
+                assert!(completed.get(), "cancellation escaped the native ABI");
+                assert_eq!(rt_abi::rt_error_pending(), 0);
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

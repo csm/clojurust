@@ -110,7 +110,6 @@ fn stack_bytes() -> Result<usize, EvalError> {
 struct Park {
     ptr: *mut (),
     poll: unsafe fn(*mut (), &mut Context<'_>) -> Poll<()>,
-    automatic: bool,
 }
 
 impl Park {
@@ -124,7 +123,6 @@ impl Park {
             // SAFETY: the pointee stays pinned until the park returns.
             ptr: unsafe { future.get_unchecked_mut() } as *mut F as *mut (),
             poll: poll::<F>,
-            automatic: false,
         }
     }
 }
@@ -133,10 +131,10 @@ impl Park {
 /// Panics outside a fiber or when a runtime lock/critical section is held.
 /// Managed values retained by the future must have precise GC root guards.
 pub fn park_on<F: Future>(future: F) -> F::Output {
-    park_on_impl(future, false)
+    park_on_impl(future)
 }
 
-fn park_on_impl<F: Future>(future: F, automatic: bool) -> F::Output {
+fn park_on_impl<F: Future>(future: F) -> F::Output {
     if scheduling().is_some_and(Scheduling::is_cancelled) {
         resume_cancelled();
     }
@@ -154,8 +152,7 @@ fn park_on_impl<F: Future>(future: F, automatic: bool) -> F::Output {
             }
             Poll::Pending => Poll::Pending,
         }));
-        let mut park = Park::new(wait.as_mut());
-        park.automatic = automatic;
+        let park = Park::new(wait.as_mut());
         // SAFETY: CURRENT is installed only while this coroutine is resumed or
         // unwound; its Yielder remains at a stable address on its own stack.
         if matches!(unsafe { &*current.yielder }.suspend(park), Resume::Cancel) {
@@ -189,7 +186,7 @@ fn scheduling() -> Option<&'static Scheduling> {
 }
 
 fn yield_slice() -> Result<(), cljrs_gc::fiber::SafepointError> {
-    catch_cancelled(|| park_on_impl(tokio::task::yield_now(), true))
+    catch_cancelled(|| park_on_impl(tokio::task::yield_now()))
         .map_err(|_| cljrs_gc::fiber::SafepointError::Cancelled)
 }
 
@@ -200,7 +197,7 @@ fn install_parking_hooks() {
             safepoint: || scheduling().map_or(Ok(false), Scheduling::safepoint),
             yield_now: yield_slice,
             reclaim_stacks: reclaim_idle_stacks,
-            enter_native: |name| scheduling().map_or(0, |s| s.enter_native(name)),
+            enter_native: |name, id| scheduling().map_or(0, |s| s.enter_native(name, id)),
             exit_native: |previous| {
                 if let Some(s) = scheduling() {
                     s.exit_native(previous);
@@ -214,6 +211,7 @@ fn install_parking_hooks() {
         }));
         cljrs_value::parking::install(cljrs_value::parking::Hooks {
             current: || current().map(|id| id.0),
+            cancelled: || scheduling().is_some_and(Scheduling::is_cancelled),
             park: |future, timeout| {
                 park_on(async {
                     match timeout {
@@ -416,7 +414,14 @@ impl FiberTask {
     }
 
     fn unwind(&mut self) {
-        let automatic = self.pending.take().is_some_and(|park| park.automatic);
+        // Every suspended fiber, whether parked explicitly or at an automatic
+        // yield, resumes with a cancellation token. Explicit parks raise the
+        // private Cancelled payload, which NativeFn wrappers and C-ABI bridges
+        // turn into an uncatchable error, so nothing unwinds through foreign
+        // frames. Only a fiber that never started is force-unwound: that
+        // runs no user code.
+        self.pending.take();
+        let started = !self.yielder.is_null();
         if let Some(co) = &mut self.co {
             let _current = CurrentGuard::enter(if self.yielder.is_null() {
                 None
@@ -427,7 +432,7 @@ impl FiberTask {
                     scheduling: &*self.scheduling,
                 })
             });
-            if automatic {
+            if started {
                 self.scheduling.cancel();
                 let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
                 match outcome {

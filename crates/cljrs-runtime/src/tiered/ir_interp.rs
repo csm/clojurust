@@ -1042,6 +1042,7 @@ fn alloc_closure(
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
         blocking_func: None,
+        diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {

@@ -1077,6 +1077,8 @@ pub enum Arity {
 
 pub struct NativeFn {
     pub name: Arc<str>,
+    /// Lazily assigned watchdog name id (`Default::default()` when building).
+    pub diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId,
     pub arity: Arity,
     pub func: NativeFnFunc,
     /// Managed values retained by the opaque callable closure.
@@ -1093,6 +1095,7 @@ impl NativeFn {
             arity,
             blocking_func: None,
             captures: Default::default(),
+            diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
                 crate::parking::catch_cancelled(|| {
                     crate::realization::catch(|| func(args))
@@ -1114,6 +1117,7 @@ impl NativeFn {
             arity,
             blocking_func: None,
             captures: Default::default(),
+            diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
                 crate::parking::catch_cancelled(|| {
                     crate::realization::catch(|| func(args))
@@ -1510,6 +1514,9 @@ impl LazySeq {
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 Ok(result)
             }
+            // A cancelled realizer leaves the thunk Pending (via the guard)
+            // for other readers and resumes cancellation, not a cached error.
+            Err(_) if crate::parking::cancelled() => crate::parking::resume_cancelled(),
             Err(msg) => {
                 *self.state.lock().unwrap() = LazySeqState::Error(msg.clone());
                 Err(msg)
@@ -1764,6 +1771,10 @@ impl Delay {
         let result = thunk
             .force()
             .map(|value| crate::publish::publish_for_owner(value, self as *const _ as usize));
+        if result.is_err() && crate::parking::cancelled() {
+            // As for lazy seqs: leave the thunk Pending for other readers.
+            crate::parking::resume_cancelled();
+        }
         *self.state.lock().unwrap() = match &result {
             Ok(value) => DelayState::Forced(value.clone()),
             Err(error) => DelayState::Error(error.clone()),
@@ -2019,9 +2030,11 @@ impl CljxFuture {
             FutureState::Done(v) => Ok(v.clone()),
             FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
             FutureState::GasExhausted => Err(ValueError::GasExhausted),
-            FutureState::Interrupted => Err(ValueError::Cancelled),
             FutureState::MemoryLimitExceeded(f) => Err(ValueError::MemoryLimitExceeded(*f)),
-            FutureState::Cancelled => {
+            // A producer interrupted by fiber cancellation reaches awaiters as
+            // the same catchable error as `future-cancel`. A cancelled
+            // awaiter stops at its own park; healthy ones can handle it.
+            FutureState::Cancelled | FutureState::Interrupted => {
                 drop(state);
                 return Some(Err(ValueError::Thrown(Self::cancelled_error())));
             }
@@ -2105,8 +2118,8 @@ impl Drop for CljxFuture {
             && let Ok(state) = self.state.lock()
             && matches!(
                 &*state,
+                // Interruption is deliberate, like `future-cancel`: no warning.
                 FutureState::Failed(_)
-                    | FutureState::Interrupted
                     | FutureState::GasExhausted
                     | FutureState::MemoryLimitExceeded(_)
             )

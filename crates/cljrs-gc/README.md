@@ -634,6 +634,15 @@ Slots are collected at link time, so a crate's slots exist only in binaries
 that link that crate. Before a switch changes state, it checks every slot for active borrows.
 A borrowed `RefCell` causes a panic before any slot changes.
 
+`assert_parkable` runs at every explicit park and at the start of every fiber poll.
+Since Phase 4 it enforces, in release builds as well as debug builds, that no
+`TrackedMutex` guard is held and no governor critical section is open. Earlier
+releases checked these only in debug builds, so a host that drives or polls a fiber
+while holding a runtime lock now panics instead of risking a carrier deadlock: the
+fiber could block on that same non-reentrant lock. Release the guard before
+`block_on`, `run_root`, or polling a fiber. Optional automatic yields use
+`can_park()` and defer instead.
+
 Each detached state registers weakly with its isolate. Collection traces saved slot values
 through callbacks declared with `mutator_slot!(..., trace trace_saved)`.
 The callback takes `&T` and `&mut MarkVisitor`.
@@ -875,14 +884,15 @@ pub struct Hooks {
     pub safepoint: fn() -> Result<bool, SafepointError>, // true when a yield is due
     pub yield_now: fn() -> Result<(), SafepointError>,
     pub reclaim_stacks: fn(), // drop idle pooled stacks on every carrier
-    pub enter_native: fn(&Arc<str>) -> usize, // previous frame token
+    pub enter_native: fn(&Arc<str>, &NativeDiagnosticId) -> usize, // previous frame token
     pub exit_native: fn(usize),
 }
 pub fn install(hooks: Hooks);
 pub fn safepoint() -> Result<(), SafepointError>;
 pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointError>)
     -> Result<(), SafepointError>) -> Result<(), SafepointError>;
-pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard;
+pub struct NativeDiagnosticId; // Default (0 = unassigned) + Clone + Debug; get()/set(usize)
+pub fn native_frame(name: &Arc<str>, id: &NativeDiagnosticId) -> NativeFrameGuard;
 pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
 pub const STACK_COMMIT_ESTIMATE: usize; // 64 KiB budgeted per stack
 pub struct StackReservation; // Drop releases its charges and live/pool count.

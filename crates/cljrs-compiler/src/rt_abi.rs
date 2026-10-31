@@ -2120,6 +2120,7 @@ pub unsafe extern "C" fn rt_make_fn(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name: name.clone(),
         arity: cljrs_value::Arity::Fixed(param_count),
@@ -2199,6 +2200,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name: name.clone(),
         arity: cljrs_value::Arity::Variadic { min: fixed_count },
@@ -2307,6 +2309,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     let fn_name = name.clone();
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name,
         arity,
@@ -5282,7 +5285,6 @@ pub extern "C" fn rt_async_poll_ready(sm: *mut CljxStateMachine) -> i32 {
             2
         }
         Readiness::GasExhausted => cljrs_async::state_machine::POLL_GAS_EXHAUSTED,
-        Readiness::Cancelled => cljrs_async::state_machine::POLL_CANCELLED,
         // The poll ABI has no memory-fault code: report a throw and confirm
         // the fault in its slot, which the async task checks after every
         // poll before it looks at the code.

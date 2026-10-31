@@ -1790,8 +1790,8 @@ Standalone macro-expansion APIs keep their temporary values in a scratch scope u
 They release successful temporary values after building the returned Rust form and publish thrown errors before teardown.
 
 
-Native calls through `env::apply_value` register their function name with
-`cljrs_gc::fiber::native_frame`. The native driver uses this name for stall diagnostics.
+Native calls through `env::apply_value` register their function name and cached
+`diagnostic_id` with `cljrs_gc::fiber::native_frame`. The native driver uses this name for stall diagnostics.
 Interpreter and IR safepoints return a fiber-specific stack-overflow error before
 recursion reaches the guard page. Automatic-yield cancellation uses the uncatchable
 resource-error path to return safely through compiled native frames.

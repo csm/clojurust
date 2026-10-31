@@ -33,6 +33,8 @@ pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
 
 pub struct Hooks {
     pub current: fn() -> Option<u64>,
+    /// True while the running fiber is being cancelled.
+    pub cancelled: fn() -> bool,
     pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
     pub sleep: fn(Duration),
     pub blocking: fn(BlockingJob) -> BlockingResult,
@@ -44,6 +46,12 @@ pub fn install(hooks: Hooks) {
 }
 pub fn current() -> Option<u64> {
     HOOKS.get().and_then(|h| (h.current)())
+}
+
+/// True while the running fiber is being cancelled. Cached state (lazy seqs,
+/// delays) must not record a failure caused by cancellation.
+pub fn cancelled() -> bool {
+    HOOKS.get().is_some_and(|h| (h.cancelled)())
 }
 
 /// Run Send-only native work off the isolate while a fiber waits. Conversion

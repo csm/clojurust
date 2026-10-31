@@ -119,8 +119,6 @@ pub enum Readiness {
     Failed(Value),
     /// The awaited computation exhausted its evaluation budget.
     GasExhausted,
-    /// The producer was interrupted by fiber cancellation.
-    Cancelled,
     /// The awaited computation failed with a managed-memory limit fault.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
@@ -144,7 +142,7 @@ pub fn check_ready(val: &Value) -> Readiness {
             }
             FutureState::Interrupted => {
                 f.get().mark_observed();
-                Readiness::Cancelled
+                Readiness::Failed(CljxFuture::cancelled_error())
             }
             FutureState::GasExhausted => {
                 f.get().mark_observed();
@@ -383,7 +381,6 @@ mod tests {
                     POLL_THREW
                 }
                 Readiness::GasExhausted => POLL_GAS_EXHAUSTED,
-                Readiness::Cancelled => POLL_CANCELLED,
                 Readiness::MemoryLimitExceeded(fault) => {
                     cljrs_gc::governor::confirm_runtime_fault(fault);
                     POLL_THREW

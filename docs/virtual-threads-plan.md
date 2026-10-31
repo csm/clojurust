@@ -491,6 +491,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   ready non-fiber LocalSet tasks cannot starve either. `CLJRS_FIBER_SLICE_US` defaults to 10,000 microseconds.
   Clock reads are batched every 64 safepoints. Runtime locks, borrowed mutator slots, and governor critical
   sections defer yielding in every build. Safepoint environments are rooted only during a switch.
+  Explicit parks and fiber polls assert the same discipline in release builds too (it was
+  debug-only before): hosts must release `TrackedMutex` guards before driving a fiber.
 - Ready-task wakers track queued work, including wakes from other threads.
   Completion and cancellation remove their ready registrations.
 - A shared watchdog runs outside the carriers. It reports a missing safepoint
@@ -512,17 +514,18 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   Margin checks read the machine stack register, since ASan can move locals to a
   separate fake stack. ASan CI enables this mode explicitly and covers the machine
   stack probe across coroutine resumes, plus the Phase 4 fairness and overflow tests.
-- Automatic-yield cancellation uses a private resume token and the uncatchable
-  resource-error path to return normally through native ABI frames. It resumes Rust
+- Cancellation of a started fiber, at an automatic yield or an explicit park, uses a
+  private resume token and the uncatchable resource-error path to return normally
+  through native ABI frames (explicit parks convert at the nearest native boundary). It resumes Rust
   cancellation at the outer computation boundary. Other panics are rethrown unchanged;
   cancellation cleanup runs without further automatic yields, and an explicit park
   there unwinds to the nearest native boundary as a typed `Cancelled` error.
 - Generated call sites check errors before consuming a nil sentinel. Error exits
   release only regions opened by that compiled function. Poll functions consume TLS
   errors into their in-band result and preserve typed gas and memory failures.
-- Warm native diagnostic calls update an isolate-cached name index without a watchdog
-  mutex or per-call Arc clones. Names are interned by content and both name tables are
-  bounded, so runtime-built closures cannot grow them without limit. Environment rooting
+- Warm native diagnostic calls read a name id cached on the `NativeFn` and publish it
+  with one atomic store: no lock, lookup, or Arc clone. Names are interned by content in
+  a bounded process-wide table, so runtime-built closures cannot grow it without limit. Environment rooting
   happens only for actual yields.
 - The overflow investigation keeps platform signal handlers intact. A native
   recursion path without safepoints can still hit the fatal guard page; this phase

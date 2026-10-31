@@ -1,6 +1,6 @@
 //! Ready-task tracking and a watchdog that can observe a blocked carrier.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -35,9 +35,6 @@ fn stack_pointer() -> usize {
 
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
-    // Keyed by the name's allocation; the Weak keeps that address from being
-    // reused while the entry exists. Cleared when it reaches its bound.
-    static NATIVE_NAMES: RefCell<HashMap<usize, (Weak<str>, usize)>> = RefCell::new(HashMap::new());
 }
 
 pub(super) struct Scheduler {
@@ -45,7 +42,6 @@ pub(super) struct Scheduler {
     running: Mutex<Option<Running>>,
     slice: Duration,
     stall: Duration,
-    names: Mutex<NativeNames>,
     native: AtomicUsize,
 }
 
@@ -69,11 +65,12 @@ fn duration_env(name: &str, default: u64, micros: bool) -> Duration {
     }
 }
 
-/// Bound on distinct diagnostic names per isolate and on cached name
-/// allocations per thread. Runtime-built closures allocate fresh names.
+/// Bound on distinct diagnostic names. Runtime-built closures allocate
+/// fresh names, so names are interned by content.
 const MAX_NATIVE_NAMES: usize = 4096;
 
-/// Isolate-wide native diagnostic names; ids are 1-based indexes into `list`.
+/// Process-wide native diagnostic names; ids are 1-based indexes into `list`
+/// and are cached on each `NativeFn`, so only a function's first call locks.
 #[derive(Default)]
 struct NativeNames {
     list: Vec<Arc<str>>,
@@ -97,6 +94,11 @@ impl NativeNames {
         self.ids.insert(name.clone(), self.list.len());
         self.list.len()
     }
+}
+
+fn native_names() -> &'static Mutex<NativeNames> {
+    static NAMES: OnceLock<Mutex<NativeNames>> = OnceLock::new();
+    NAMES.get_or_init(Default::default)
 }
 
 struct Watches {
@@ -190,7 +192,6 @@ impl Scheduler {
     fn new() -> Arc<Self> {
         let scheduler = Arc::new(Self {
             ready: AtomicUsize::new(0),
-            names: Mutex::new(NativeNames::default()),
             native: AtomicUsize::new(0),
             running: Mutex::new(None),
             slice: duration_env("CLJRS_FIBER_SLICE_US", 10_000, true),
@@ -224,7 +225,7 @@ impl Scheduler {
             "cljrs: fiber {} stalled its isolate for {:?}; native frame: {} (other fibers runnable)",
             run.id.0,
             now.duration_since(run.heartbeat),
-            self.names
+            native_names()
                 .lock()
                 .unwrap()
                 .list
@@ -335,34 +336,43 @@ impl Scheduling {
     pub(super) fn enter(&self) -> RunGuard<'_> {
         let now = Instant::now();
         self.slice_start.set(now);
-        self.wake
+        let native = self
+            .wake
             .scheduler
             .native
-            .store(self.native.get(), Ordering::Relaxed);
-        *self.wake.scheduler.running.lock().unwrap() = Some(Running {
-            id: self.id,
-            heartbeat: now,
-            reported: false,
-            wake: Arc::downgrade(&self.wake),
-        });
+            .swap(self.native.get(), Ordering::Relaxed);
+        // A fiber may drive or drop another on the same carrier; the guard
+        // restores the outer fiber's entry when the inner resume returns.
+        let outer = self
+            .wake
+            .scheduler
+            .running
+            .lock()
+            .unwrap()
+            .replace(Running {
+                id: self.id,
+                heartbeat: now,
+                reported: false,
+                wake: Arc::downgrade(&self.wake),
+            });
         watchdog().notify_running();
-        RunGuard(self)
+        RunGuard {
+            scheduling: self,
+            outer,
+            native,
+        }
     }
 
-    pub(super) fn enter_native(&self, name: &Arc<str>) -> usize {
-        let id = NATIVE_NAMES.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = Arc::as_ptr(name).cast::<()>() as usize;
-            if let Some((_, id)) = cache.get(&key) {
-                return *id;
-            }
-            if cache.len() >= MAX_NATIVE_NAMES {
-                cache.clear();
-            }
-            let id = self.wake.scheduler.names.lock().unwrap().intern(name);
-            cache.insert(key, (Arc::downgrade(name), id));
-            id
-        });
+    pub(super) fn enter_native(
+        &self,
+        name: &Arc<str>,
+        cached: &cljrs_gc::fiber::NativeDiagnosticId,
+    ) -> usize {
+        let mut id = cached.get();
+        if id == 0 {
+            id = native_names().lock().unwrap().intern(name);
+            cached.set(id);
+        }
         let previous = self.native.replace(id);
         self.wake.scheduler.native.store(id, Ordering::Relaxed);
         previous
@@ -419,10 +429,22 @@ impl Scheduling {
     }
 }
 
-pub(super) struct RunGuard<'a>(&'a Scheduling);
+pub(super) struct RunGuard<'a> {
+    scheduling: &'a Scheduling,
+    outer: Option<Running>,
+    native: usize,
+}
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        *self.0.wake.scheduler.running.lock().unwrap() = None;
+        let scheduler = &self.scheduling.wake.scheduler;
+        let outer = self.outer.take().map(|mut run| {
+            // The outer fiber was waiting on this resume, not stalled.
+            run.heartbeat = Instant::now();
+            run.reported = false;
+            run
+        });
+        *scheduler.running.lock().unwrap() = outer;
+        scheduler.native.store(self.native, Ordering::Relaxed);
     }
 }
 
@@ -437,7 +459,7 @@ mod tests {
     use super::*;
 
     thread_local! {
-        static TEST_BORROW: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static TEST_BORROW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     cljrs_gc::mutator_slot!("cljrs-async/TEST_BORROW", refcell TEST_BORROW: Vec<u8>);
 
@@ -456,17 +478,28 @@ mod tests {
         }
         assert_eq!(names.list.len(), MAX_NATIVE_NAMES + 1);
         assert_eq!(&*names.list[MAX_NATIVE_NAMES], "<native function>");
+    }
 
+    #[test]
+    fn native_frames_cache_their_name_id_on_the_function() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, async {
             super::super::spawn(|| {
-                for _ in 0..2 * MAX_NATIVE_NAMES {
-                    let _frame = cljrs_gc::fiber::native_frame(&Arc::from("closure"));
-                }
-                assert!(NATIVE_NAMES.with(|cache| cache.borrow().len()) <= MAX_NATIVE_NAMES);
+                let id = cljrs_gc::fiber::NativeDiagnosticId::default();
+                let name: Arc<str> = Arc::from("cached-native");
+                drop(cljrs_gc::fiber::native_frame(&name, &id));
+                let assigned = id.get();
+                assert_ne!(assigned, 0);
+                // Warm calls reuse the cached id; the frame publishes it.
+                let _frame = cljrs_gc::fiber::native_frame(&name, &id);
+                assert_eq!(id.get(), assigned);
+                assert_eq!(
+                    SCHEDULER.with(|s| s.native.load(Ordering::Relaxed)),
+                    assigned
+                );
                 Ok(cljrs_value::Value::Nil)
             })
             .unwrap()
@@ -474,6 +507,38 @@ mod tests {
             .unwrap()
             .into_result()
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn nested_resumes_restore_the_outer_running_fiber() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let outer = super::super::Fiber::new(|| {
+                let running_id =
+                    || SCHEDULER.with(|s| s.running.lock().unwrap().as_ref().map(|run| run.id));
+                let outer_id = running_id().expect("outer fiber not running");
+                let _native =
+                    cljrs_gc::fiber::native_frame(&Arc::from("outer-native"), &Default::default());
+                let native = SCHEDULER.with(|s| s.native.load(Ordering::Relaxed));
+                // Drive another fiber to completion on this carrier.
+                let mut inner = std::pin::pin!(
+                    super::super::Fiber::new(|| { Ok(cljrs_value::Value::Nil) })
+                        .unwrap()
+                        .into_task()
+                );
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(inner.as_mut().poll(&mut cx).is_ready());
+                assert_eq!(running_id(), Some(outer_id));
+                assert_eq!(SCHEDULER.with(|s| s.native.load(Ordering::Relaxed)), native);
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap();
+            outer.into_task().await.unwrap();
         });
     }
 

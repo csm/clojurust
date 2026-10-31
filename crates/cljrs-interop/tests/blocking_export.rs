@@ -33,6 +33,7 @@ fn blocking_exports_convert_values_on_the_caller_thread() {
     );
     cljrs_value::parking::install(cljrs_value::parking::Hooks {
         current: || Some(1),
+        cancelled: || false,
         park: |_, _| unreachable!(),
         sleep: |_| unreachable!(),
         blocking: |job| {

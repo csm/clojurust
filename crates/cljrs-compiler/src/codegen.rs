@@ -1261,23 +1261,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 );
                 self.emit_poll_failure_return(exhausted);
 
-                // Cancellation also returns in-band without binding a stale value.
-                self.builder.switch_to_block(ready_block);
-                let cancelled_block = self.builder.create_block();
-                let resolved_block = self.builder.create_block();
-                let is_cancelled = self.builder.ins().icmp_imm(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    code,
-                    cljrs_async::state_machine::POLL_CANCELLED as i64,
-                );
-                self.builder
-                    .ins()
-                    .brif(is_cancelled, cancelled_block, &[], resolved_block, &[]);
-                self.builder.switch_to_block(cancelled_block);
-                self.emit_poll_failure_return(code);
-
                 // Ready → bind the resolved value; the continuation emits here.
-                self.builder.switch_to_block(resolved_block);
+                self.builder.switch_to_block(ready_block);
                 let result = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, result);
