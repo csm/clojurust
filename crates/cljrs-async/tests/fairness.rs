@@ -78,6 +78,62 @@ fn run(body: impl std::future::Future<Output = ()>) {
 }
 
 #[test]
+fn expired_slices_yield_to_ready_non_fiber_tasks() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let ready = Rc::new(Cell::new(false));
+            let observed = ready.clone();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            globals.intern(
+                "user",
+                "stop?".into(),
+                Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "stop?",
+                    Arity::Fixed(0),
+                    move |_| {
+                        Ok(if observed.get() {
+                            Value::string("signalled")
+                        } else if Instant::now() >= deadline {
+                            Value::string("deadline")
+                        } else {
+                            Value::Nil
+                        })
+                    },
+                ))),
+            );
+            let form = cljrs_reader::Parser::new(
+                "(loop [] (or (stop?) (recur)))".into(),
+                "<non-fiber-fairness>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let spinner = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(&form, &mut Env::new(globals, "user"))
+                })
+                .unwrap();
+                // A plain LocalSet task, and no sibling fiber.
+                let signal = ready.clone();
+                let task = tokio::task::spawn_local(async move { signal.set(true) });
+                let result = spinner.await.unwrap().into_result().unwrap();
+                assert_eq!(
+                    result,
+                    Value::string("signalled"),
+                    "CPU loop starved a ready non-fiber task"
+                );
+                task.await.unwrap();
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn cpu_loops_yield_in_both_interpreters_and_preserve_roots() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)

@@ -224,13 +224,14 @@ Each call uses one fiber. The `io-thread` macro delegates to `thread`.
 
 CPU loops cooperate with other fibers at function and loop safepoints.
 `CLJRS_FIBER_SLICE_US` sets the time slice in microseconds (default 10000).
-The driver yields an expired slice when another fiber is ready.
+The driver yields whenever a slice expires, so other fibers and async tasks run.
 Native functions must return to a safepoint or use parking operations to let
 other fibers run.
 
 If native code blocks a carrier while another fiber is ready, the watchdog
 prints the fiber ID and native function name. `CLJRS_FIBER_STALL_MS` sets the
 warning threshold in milliseconds (default 100). Each stall produces one warning.
+Only waiting fibers are detected; a stall that delays only other async tasks is silent.
 
 `--gc-stats` includes live and peak fiber counts, pooled stacks, and reserved
 stack bytes. The memory governor charges active and pooled reservations,

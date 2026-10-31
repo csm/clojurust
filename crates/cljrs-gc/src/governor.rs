@@ -1404,7 +1404,11 @@ impl MemoryCharge {
 impl Drop for MemoryCharge {
     fn drop(&mut self) {
         self.governor.sub(self.class, self.bytes);
-        self.governor.evaluate(None, false);
+        // Inside an admission reclaim the caller may hold its own locks, so
+        // shed hooks must not run; the next evaluation observes the release.
+        if !QUIET_RELEASE.with(Cell::get) {
+            self.governor.evaluate(None, false);
+        }
     }
 }
 
@@ -1462,6 +1466,22 @@ pub enum Admission {
 
 thread_local! {
     static CRITICAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set while `admit` drops idle fiber stacks; never spans a park.
+    static QUIET_RELEASE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `release` (which drops charges) without re-evaluating pressure, so no
+/// shed hook runs under an allocating caller's locks. Used by `admit` to
+/// reclaim idle fiber stacks.
+fn release_quietly(release: impl FnOnce()) {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUIET_RELEASE.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET_RELEASE.with(|quiet| quiet.replace(true)));
+    release();
 }
 
 /// While alive, the calling thread's grants use [`Admission::Critical`] and
@@ -2110,10 +2130,11 @@ impl ProcessMemoryGovernor {
             let next = match prev.checked_add(bytes) {
                 Some(n) if n <= limit => n,
                 _ if !reclaimed => {
-                    // No governor or cache lock is held here. Idle stacks are
-                    // reclaimable regardless of the requesting memory class.
+                    // Idle stacks are reclaimable regardless of the requesting
+                    // memory class. Their charges release without running
+                    // pressure hooks, since the caller may hold locks.
                     reclaimed = true;
-                    crate::fiber::reclaim_idle_stacks();
+                    release_quietly(crate::fiber::reclaim_idle_stacks);
                     prev = self.committed.load(Ordering::Relaxed);
                     continue;
                 }
@@ -3635,6 +3656,30 @@ mod tests {
 
         acc.charge(4 * MIB);
         assert_eq!(g.pressure(), PressureLevel::Red, "RSS raises Yellow to Red");
+    }
+
+    /// Charges released during admission (idle-stack reclaim) update the
+    /// counters but defer the pressure evaluation, so no hook runs inline.
+    #[test]
+    fn quiet_releases_defer_shed_hooks() {
+        use std::sync::atomic::AtomicUsize;
+        let g = strict(4 * MIB, 8 * MIB, 64 * KIB);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        g.register_shed_hook(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        let charge = g.reserve_shared(MemoryClass::Code, 5 * MIB).unwrap();
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        let before = calls.load(Ordering::Relaxed);
+        release_quietly(|| drop(charge));
+        assert_eq!(calls.load(Ordering::Relaxed), before, "hook ran inline");
+        assert_eq!(g.class_bytes(MemoryClass::Code), 0);
+        assert!(!QUIET_RELEASE.with(Cell::get));
+        // The next ordinary evaluation observes the release.
+        drop(g.reserve_shared(MemoryClass::Code, 1).unwrap());
+        assert_eq!(g.pressure(), PressureLevel::Green);
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1);
     }
 
     /// Load-shedding hooks fire on pressure transitions.

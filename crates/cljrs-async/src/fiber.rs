@@ -451,8 +451,7 @@ impl Future for FiberTask {
         assert!(this.co.is_some(), "fiber polled after completion");
         assert_parkable();
         this.scheduling.wake.poll(cx.waker());
-        let waker = std::task::Waker::from(this.scheduling.wake.clone());
-        let cx = &mut Context::from_waker(&waker);
+        let cx = &mut Context::from_waker(&this.scheduling.waker);
         this.state.swap_with_current();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _current = CurrentGuard::enter(None);

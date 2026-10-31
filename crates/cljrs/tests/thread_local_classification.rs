@@ -132,6 +132,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/governor.rs",
+        "QUIET_RELEASE",
+        Thread("set only while admit drops idle stacks, which never parks"),
+    ),
+    (
+        "cljrs-gc/src/governor.rs",
         "FAULT",
         Thread("isolate-wide memory fault"),
     ),

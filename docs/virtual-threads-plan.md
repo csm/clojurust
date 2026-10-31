@@ -487,8 +487,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 
 **Status: implemented.**
 
-- Interpreter, IR, JIT, and AOT safepoints yield an expired time slice when
-  another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10,000 microseconds.
+- Interpreter, IR, JIT, and AOT safepoints yield whenever a time slice expires, so
+  ready non-fiber LocalSet tasks cannot starve either. `CLJRS_FIBER_SLICE_US` defaults to 10,000 microseconds.
   Clock reads are batched every 64 safepoints. Runtime locks, borrowed mutator slots, and governor critical
   sections defer yielding in every build. Safepoint environments are rooted only during a switch.
 - Ready-task wakers track queued work, including wakes from other threads.
@@ -496,7 +496,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - A shared watchdog runs outside the carriers. It reports a missing safepoint
   after `CLJRS_FIBER_STALL_MS` (default 100 ms) only when another fiber is ready.
   Each stall logs once, with the fiber ID and innermost native function name.
-  Parked waits do not count as stalls.
+  Parked waits do not count as stalls. Non-fiber tasks are not tracked, so a stall
+  that delays only them is not reported.
 - Active and pooled stacks retain `MemoryClass::FiberStack` charges: a 64 KiB commit
   estimate plus page rounding and guard pages, since the OS commits stack pages lazily.
   Construction reserves the budget before allocation. A strict admission of any class
@@ -520,7 +521,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   release only regions opened by that compiled function. Poll functions consume TLS
   errors into their in-band result and preserve typed gas and memory failures.
 - Warm native diagnostic calls update an isolate-cached name index without a watchdog
-  mutex or per-call Arc clones. Environment rooting happens only for actual yields.
+  mutex or per-call Arc clones. Names are interned by content and both name tables are
+  bounded, so runtime-built closures cannot grow them without limit. Environment rooting
+  happens only for actual yields.
 - The overflow investigation keeps platform signal handlers intact. A native
   recursion path without safepoints can still hit the fatal guard page; this phase
   does not attempt signal-handler unwinding or recovery.

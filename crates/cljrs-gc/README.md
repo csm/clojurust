@@ -908,6 +908,8 @@ rounding and guard pages after allocation, and records the full reservation in
 resumes when the driver reuses it. Destroying the pool releases its bytes.
 When a strict admission of any class would exceed the hard limit, the governor
 calls `reclaim_stacks` once and retries, so idle stacks never block other work.
+Charges dropped during that reclaim skip pressure evaluation, so no shed hook runs
+inside the admission while the caller may hold locks; the next evaluation observes them.
 
 `MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`,
 `pooled_fiber_stacks`, and `reserved_fiber_stack_bytes`. Counts cover native fibers

@@ -276,8 +276,9 @@ pressure also drains the pool. Stacks are not returned to the pool under pressur
 `--gc-stats` and the governor snapshot show live and peak fiber counts, pooled stack
 counts, and reserved stack bytes. The root's 64 MiB reservation uses the same accounting.
 
-At interpreter, IR, JIT, and AOT safepoints, a fiber yields after its time slice when
-another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
+At interpreter, IR, JIT, and AOT safepoints, a fiber yields to the LocalSet whenever its
+time slice expires, so ready fibers and other tasks (compiled async state machines,
+delivery futures, timers, I/O bridges) all run. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
 Clock checks are batched every 64 safepoints. Yielding waits for runtime locks, borrowed mutator slots, and
 governor critical sections to end in every build. It also defers during Rust unwinding.
 Root guards protect environments only during an actual yield.
@@ -291,7 +292,8 @@ Other panic payloads retain their original message and type.
 A process watchdog thread sleeps on a condition variable while no fiber is running, and otherwise checks once per stall interval. If a fiber misses safepoints for
 `CLJRS_FIBER_STALL_MS` (default 100 ms) while another fiber is ready, it prints the
 fiber ID and innermost native function name once for that stall. Parked fibers do not
-trigger warnings. Both timing settings accept positive integers; invalid values use defaults.
+trigger warnings. Only fiber readiness is tracked, so a stall that delays only non-fiber
+tasks is not reported. Both timing settings accept positive integers; invalid values use defaults.
 
 Safepoints reject recursion when fewer than 256 KiB remain above the stack limit.
 The check reads the machine stack register; ASan can place local variables on a
@@ -300,8 +302,10 @@ The error names the fiber and reports reserved and remaining bytes. The margin c
 interpreter frames and error construction; very small reservations cannot run deep Clojure code.
 Native recursion without safepoints can still hit the fatal guard page.
 The driver does not replace platform signal handlers. Native diagnostic names are
-cached per isolate; warm calls update a frame token and an atomic name index without
-locking the watchdog mutex or cloning the name.
+interned by content per isolate; warm calls hit a per-thread cache keyed by the name's
+allocation and update a frame token and an atomic name index without locking the
+watchdog mutex. Both tables are bounded at 4096 entries: the cache is cleared when full,
+and names past the bound share a `<native function>` entry.
 
 Saved mutator states retain precise GC roots. Suspended JIT frames keep their code epochs live.
 

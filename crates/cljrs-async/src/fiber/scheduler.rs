@@ -35,7 +35,9 @@ fn stack_pointer() -> usize {
 
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
-    static NATIVE_NAMES: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    // Keyed by the name's allocation; the Weak keeps that address from being
+    // reused while the entry exists. Cleared when it reaches its bound.
+    static NATIVE_NAMES: RefCell<HashMap<usize, (Weak<str>, usize)>> = RefCell::new(HashMap::new());
 }
 
 pub(super) struct Scheduler {
@@ -43,7 +45,7 @@ pub(super) struct Scheduler {
     running: Mutex<Option<Running>>,
     slice: Duration,
     stall: Duration,
-    names: Mutex<Vec<Arc<str>>>,
+    names: Mutex<NativeNames>,
     native: AtomicUsize,
 }
 
@@ -64,6 +66,36 @@ fn duration_env(name: &str, default: u64, micros: bool) -> Duration {
         Duration::from_micros(n)
     } else {
         Duration::from_millis(n)
+    }
+}
+
+/// Bound on distinct diagnostic names per isolate and on cached name
+/// allocations per thread. Runtime-built closures allocate fresh names.
+const MAX_NATIVE_NAMES: usize = 4096;
+
+/// Isolate-wide native diagnostic names; ids are 1-based indexes into `list`.
+#[derive(Default)]
+struct NativeNames {
+    list: Vec<Arc<str>>,
+    ids: HashMap<Arc<str>, usize>,
+}
+
+impl NativeNames {
+    /// Intern by content, so equal names from fresh allocations share an id.
+    /// Past the bound, new names share one overflow entry.
+    fn intern(&mut self, name: &Arc<str>) -> usize {
+        if let Some(id) = self.ids.get(name) {
+            return *id;
+        }
+        if self.list.len() >= MAX_NATIVE_NAMES {
+            if self.list.len() == MAX_NATIVE_NAMES {
+                self.list.push("<native function>".into());
+            }
+            return self.list.len();
+        }
+        self.list.push(name.clone());
+        self.ids.insert(name.clone(), self.list.len());
+        self.list.len()
     }
 }
 
@@ -158,7 +190,7 @@ impl Scheduler {
     fn new() -> Arc<Self> {
         let scheduler = Arc::new(Self {
             ready: AtomicUsize::new(0),
-            names: Mutex::new(Vec::new()),
+            names: Mutex::new(NativeNames::default()),
             native: AtomicUsize::new(0),
             running: Mutex::new(None),
             slice: duration_env("CLJRS_FIBER_SLICE_US", 10_000, true),
@@ -195,6 +227,7 @@ impl Scheduler {
             self.names
                 .lock()
                 .unwrap()
+                .list
                 .get(self.native.load(Ordering::Relaxed).wrapping_sub(1))
                 .map(AsRef::as_ref)
                 .unwrap_or("<Rust body without safepoints>")
@@ -231,7 +264,9 @@ impl TaskWake {
 
     pub(super) fn poll(&self, parent: &Waker) {
         let mut state = self.state.lock().unwrap();
-        state.parent = Some(parent.clone());
+        if !state.parent.as_ref().is_some_and(|w| w.will_wake(parent)) {
+            state.parent = Some(parent.clone());
+        }
         if self.queued.swap(false, Ordering::Relaxed) {
             self.scheduler.ready.fetch_sub(1, Ordering::Relaxed);
         }
@@ -270,6 +305,8 @@ impl Wake for TaskWake {
 
 pub(super) struct Scheduling {
     pub(super) wake: Arc<TaskWake>,
+    /// `wake` as a Waker, built once rather than on every poll.
+    pub(super) waker: Waker,
     id: FiberId,
     limit: usize,
     bytes: usize,
@@ -281,8 +318,10 @@ pub(super) struct Scheduling {
 
 impl Scheduling {
     pub(super) fn new(id: FiberId, limit: usize, bytes: usize) -> Self {
+        let wake = TaskWake::new(SCHEDULER.with(Arc::clone));
         Self {
-            wake: TaskWake::new(SCHEDULER.with(Arc::clone)),
+            waker: Waker::from(wake.clone()),
+            wake,
             id,
             limit,
             bytes,
@@ -314,13 +353,14 @@ impl Scheduling {
         let id = NATIVE_NAMES.with(|cache| {
             let mut cache = cache.borrow_mut();
             let key = Arc::as_ptr(name).cast::<()>() as usize;
-            if let Some(id) = cache.get(&key) {
+            if let Some((_, id)) = cache.get(&key) {
                 return *id;
             }
-            let mut names = self.wake.scheduler.names.lock().unwrap();
-            names.push(name.clone());
-            let id = names.len();
-            cache.insert(key, id);
+            if cache.len() >= MAX_NATIVE_NAMES {
+                cache.clear();
+            }
+            let id = self.wake.scheduler.names.lock().unwrap().intern(name);
+            cache.insert(key, (Arc::downgrade(name), id));
             id
         });
         let previous = self.native.replace(id);
@@ -369,9 +409,11 @@ impl Scheduling {
             run.heartbeat = now;
             run.reported = false;
         }
+        // Yield on every expired slice. Ready fibers are tracked, but other
+        // LocalSet work (async state machines, delivery futures, timers, I/O
+        // bridges) is not, and must not starve behind a CPU-bound fiber.
         Ok(
             now.duration_since(self.slice_start.get()) >= self.wake.scheduler.slice
-                && self.wake.scheduler.other_ready(&self.wake)
                 && cljrs_gc::mutator::can_park(),
         )
     }
@@ -398,6 +440,42 @@ mod tests {
         static TEST_BORROW: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
     cljrs_gc::mutator_slot!("cljrs-async/TEST_BORROW", refcell TEST_BORROW: Vec<u8>);
+
+    #[test]
+    fn native_name_tables_stay_bounded() {
+        let mut names = NativeNames::default();
+        // Fresh allocations of one name share an id.
+        let first = names.intern(&Arc::from("partial-wrapper"));
+        for _ in 0..10_000 {
+            assert_eq!(names.intern(&Arc::from("partial-wrapper")), first);
+        }
+        assert_eq!(names.list.len(), 1);
+        // Distinct names stop growing at the bound and share an overflow id.
+        for i in 0..2 * MAX_NATIVE_NAMES {
+            names.intern(&Arc::from(format!("generated-{i}")));
+        }
+        assert_eq!(names.list.len(), MAX_NATIVE_NAMES + 1);
+        assert_eq!(&*names.list[MAX_NATIVE_NAMES], "<native function>");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            super::super::spawn(|| {
+                for _ in 0..2 * MAX_NATIVE_NAMES {
+                    let _frame = cljrs_gc::fiber::native_frame(&Arc::from("closure"));
+                }
+                assert!(NATIVE_NAMES.with(|cache| cache.borrow().len()) <= MAX_NATIVE_NAMES);
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap()
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        });
+    }
 
     fn expire_slice() {
         let current = super::super::scheduling().unwrap();
