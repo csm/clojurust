@@ -344,9 +344,6 @@ impl Scheduling {
     }
 
     pub(super) fn safepoint(&self) -> Result<bool, SafepointError> {
-        if self.cancelled.get() {
-            return Err(SafepointError::Cancelled);
-        }
         // Reserve space for error construction and unwinding, including the
         // guard page (Stack::limit includes it). No signal-handler unwinding.
         let remaining = stack_pointer().saturating_sub(self.limit);
@@ -355,6 +352,12 @@ impl Scheduling {
                 "stack overflow in fiber {} ({} reserved bytes, {remaining} bytes remaining)",
                 self.id.0, self.bytes
             )));
+        }
+        // The cancelled automatic yield already delivered the error. Let
+        // cleanup (finally blocks) run to completion without yielding again;
+        // an explicit park there unwinds to the nearest native boundary.
+        if self.cancelled.get() {
+            return Ok(false);
         }
         let ticks = self.ticks.get().wrapping_add(1);
         self.ticks.set(ticks);

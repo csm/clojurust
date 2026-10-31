@@ -126,6 +126,8 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
                 for kind in 0..3 {
                     let attempted = Rc::new(Cell::new(false));
                     let completed = Rc::new(Cell::new(false));
+                    let started = Rc::new(Cell::new(false));
+                    let running = started.clone();
                     let flag = attempted.clone();
                     let done = completed.clone();
                     let body_globals = globals.clone();
@@ -138,7 +140,8 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
                             let body = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
                                 "spin",
                                 Arity::Fixed(0),
-                                |_| {
+                                move |_| {
+                                    running.set(true);
                                     while rt_abi::rt_safepoint() != 0 {}
                                     Ok(Value::Nil)
                                 },
@@ -189,6 +192,10 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
                         .unwrap();
                     let abort = task.abort_handle();
                     let peer = fiber::spawn(move || {
+                        // Cancel only once the body is spinning inside `rt_try`.
+                        while !started.get() {
+                            fiber::park_on(tokio::task::yield_now());
+                        }
                         abort.abort();
                         Ok(Value::Nil)
                     })

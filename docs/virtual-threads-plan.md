@@ -514,7 +514,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - Automatic-yield cancellation uses a private resume token and the uncatchable
   resource-error path to return normally through native ABI frames. It resumes Rust
   cancellation at the outer computation boundary. Other panics are rethrown unchanged;
-  cancellation cleanup cannot suspend again.
+  cancellation cleanup runs without further automatic yields, and an explicit park
+  there unwinds to the nearest native boundary as a typed `Cancelled` error.
 - Generated call sites check errors before consuming a nil sentinel. Error exits
   release only regions opened by that compiled function. Poll functions consume TLS
   errors into their in-band result and preserve typed gas and memory failures.

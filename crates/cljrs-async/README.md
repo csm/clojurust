@@ -283,7 +283,9 @@ governor critical sections to end in every build. It also defers during Rust unw
 Root guards protect environments only during an actual yield.
 Cancellation at an automatic yield uses a private resume token. It returns through
 native frames using the uncatchable resource-error path, then resumes Rust unwinding
-at the outer computation boundary. Cleanup cannot suspend a cancelled fiber.
+at the outer computation boundary. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
+An explicit park during cleanup cannot suspend the fiber; it unwinds to the nearest
+`NativeFn` or C-ABI boundary as `ValueError::Cancelled`.
 Other panic payloads retain their original message and type.
 
 A process watchdog thread sleeps on a condition variable while no fiber is running, and otherwise checks once per stall interval. If a fiber misses safepoints for
