@@ -11,35 +11,40 @@ use cljrs_runtime::env::{env::Env, error::EvalError};
 use cljrs_value::{Arity, NativeFn, Value};
 
 #[test]
-fn configured_stacks_reject_unsafe_sizes_before_execution() {
+fn configured_stacks_clamp_unsafe_sizes_before_execution() {
     const CHILD: &str = "CLJRS_REVIEW_STACK_MINIMUM";
     if std::env::var_os(CHILD).is_none() {
-        for size in ["64", "128", "256", "512"] {
+        for size in ["64", "128", "256", "512", "junk"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "configured_stacks_reject_unsafe_sizes_before_execution",
+                    "configured_stacks_clamp_unsafe_sizes_before_execution",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
                 .env("CLJRS_FIBER_STACK_KB", size)
                 .output()
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "{size} KiB: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{size} KiB: {stderr}");
+            let warnings = stderr.matches("below the 512 KiB minimum").count();
+            let expected = usize::from(!matches!(size, "512" | "junk"));
+            assert_eq!(warnings, expected, "{size} KiB: {stderr}");
         }
         return;
     }
-    if std::env::var("CLJRS_FIBER_STACK_KB").unwrap() != "512" {
+    if std::env::var("CLJRS_FIBER_STACK_KB").unwrap() == "junk" {
         let error = Fiber::new(|| Ok(Value::Nil))
             .err()
-            .expect("unsafe stack accepted");
-        assert!(error.to_string().contains("at least 512"), "{error:?}");
+            .expect("unparseable stack size accepted");
+        assert!(
+            error.to_string().contains("CLJRS_FIBER_STACK_KB"),
+            "{error:?}"
+        );
         return;
     }
+    // Two fibers: the clamp warning is printed once per process.
+    drop(Fiber::new(|| Ok(Value::Nil)).unwrap());
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
@@ -163,8 +168,16 @@ fn stack_charges_cover_pool_reuse_completion_and_cancellation() {
     let bytes = allocated.class_bytes(MemoryClass::FiberStack);
     // Only the commit estimate and guard pages are budgeted, not the reservation.
     assert!(bytes > 0 && bytes < 1024 * 1024, "{bytes}");
+    // corosensei's `limit()` sits below the guard page, so at least one guard
+    // page beyond the 1 MiB request is both reserved and budgeted.
+    let page = 4096;
     assert!(
-        allocated.reserved_fiber_stack_bytes >= baseline.reserved_fiber_stack_bytes + 1024 * 1024
+        allocated.reserved_fiber_stack_bytes
+            >= baseline.reserved_fiber_stack_bytes + 1024 * 1024 + page
+    );
+    assert!(
+        bytes >= cljrs_gc::fiber::STACK_COMMIT_ESTIMATE + page,
+        "{bytes}"
     );
     drop(fiber);
     let pooled = governor.snapshot();

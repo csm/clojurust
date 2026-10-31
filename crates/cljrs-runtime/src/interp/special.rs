@@ -1106,11 +1106,23 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
     // Always run finally.  Its normal (Ok) value is discarded — `try` returns
     // the body/catch result — but an exception thrown from `finally` supersedes
     // the pending result or exception (matching JVM/Clojure semantics).
-    if !fin_body.is_empty() {
-        eval_body(fin_body, env)?;
+    // An uncatchable resource error is never superseded, so a throwing
+    // `finally` cannot make it catchable (the compiled `rt_try` agrees).
+    if !fin_body.is_empty()
+        && let Err(error) = eval_body(fin_body, env)
+        && !matches!(&result, Err(pending) if is_resource_error(pending))
+    {
+        return Err(error);
     }
 
     result
+}
+
+fn is_resource_error(error: &EvalError) -> bool {
+    matches!(
+        error,
+        EvalError::GasExhausted | EvalError::Cancelled | EvalError::MemoryLimitExceeded(_)
+    )
 }
 
 /// The class name or `:default` keyword naming what a `catch` clause catches.

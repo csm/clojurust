@@ -1240,7 +1240,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .builder
                     .ins()
                     .iconst(types::I32, cljrs_async::state_machine::POLL_THREW as i64);
-                self.builder.ins().return_(&[threw]);
+                self.emit_poll_failure_return(threw);
 
                 // Gas exhaustion is not a catchable thrown value.
                 self.builder.switch_to_block(cont2);
@@ -1259,7 +1259,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     types::I32,
                     cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
                 );
-                self.builder.ins().return_(&[exhausted]);
+                self.emit_poll_failure_return(exhausted);
 
                 // Cancellation also returns in-band without binding a stale value.
                 self.builder.switch_to_block(ready_block);
@@ -1274,7 +1274,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .ins()
                     .brif(is_cancelled, cancelled_block, &[], resolved_block, &[]);
                 self.builder.switch_to_block(cancelled_block);
-                self.builder.ins().return_(&[code]);
+                self.emit_poll_failure_return(code);
 
                 // Ready → bind the resolved value; the continuation emits here.
                 self.builder.switch_to_block(resolved_block);
@@ -1438,6 +1438,17 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let function = self.import_func(self.rt.rt_error_flag_ptr);
         let call = self.builder.ins().call(function, &[]);
         self.error_flag = Some(self.builder.inst_results(call)[0]);
+    }
+
+    /// Return an in-band poll failure code, first closing the regions this
+    /// invocation opened, as every other error exit does.
+    fn emit_poll_failure_return(&mut self, code: cranelift_codegen::ir::Value) {
+        let depth = self
+            .frame_depth
+            .expect("compiled function without region checkpoint");
+        let function = self.import_func(self.rt.rt_native_frame_cleanup);
+        self.builder.ins().call(function, &[depth]);
+        self.builder.ins().return_(&[code]);
     }
 
     fn emit_error_return(&mut self) -> CodegenResult<()> {

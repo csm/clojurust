@@ -29,14 +29,15 @@ fn thread_resource_failures_reach_every_consumer_and_bypass_catch() {
         return;
     }
     std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
-        for memory in [false, true] {
+        for kind in ["gas", "memory", "cancelled"] {
             for read in ["(a/<!! ch)", "@(a/take! ch)", "(a/alts!! [ch])", "(do (sleep 1) (a/poll! ch))"] {
                 let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
                 runtime.globals().intern("user", "limit".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(
-                    NativeFn::with_closure("limit", Arity::Fixed(0), move |_| {
-                        if memory { Err(ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
-                            class: cljrs_gc::MemoryClass::GcHeap, requested: 1, committed: 2, hard_limit: 2 })) }
-                        else { Err(ValueError::GasExhausted) }
+                    NativeFn::with_closure("limit", Arity::Fixed(0), move |_| match kind {
+                        "memory" => Err(ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
+                            class: cljrs_gc::MemoryClass::GcHeap, requested: 1, committed: 2, hard_limit: 2 })),
+                        "cancelled" => Err(ValueError::Cancelled),
+                        _ => Err(ValueError::GasExhausted),
                     }))));
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let local = tokio::task::LocalSet::new();
@@ -51,8 +52,11 @@ fn thread_resource_failures_reach_every_consumer_and_bypass_catch() {
                 let env = Env::new(runtime.globals().clone(), "user");
                 cljrs_runtime::env::gc_roots::force_collect(&env);
                 cljrs_runtime::env::gc_roots::force_collect(&env);
-                if memory { assert!(matches!(result, Err(EvalError::MemoryLimitExceeded(_))), "{read}: {result:?}"); }
-                else { assert!(matches!(result, Err(EvalError::GasExhausted)), "{read}: {result:?}"); }
+                match kind {
+                    "memory" => assert!(matches!(result, Err(EvalError::MemoryLimitExceeded(_))), "{read}: {result:?}"),
+                    "cancelled" => assert!(matches!(result, Err(EvalError::Cancelled)), "{read}: {result:?}"),
+                    _ => assert!(matches!(result, Err(EvalError::GasExhausted)), "{read}: {result:?}"),
+                }
             }
         }
     }).unwrap().join().unwrap();

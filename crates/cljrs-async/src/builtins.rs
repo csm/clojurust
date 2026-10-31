@@ -351,8 +351,9 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
                 chan_ref(result_ch.get()).try_put_buffered(&value);
             }
             Ok(_) => {}
-            Err(EvalError::Cancelled) => {
+            Err(error @ EvalError::Cancelled) => {
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Cancelled);
+                return Err(error);
             }
             Err(error @ EvalError::GasExhausted) => {
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);

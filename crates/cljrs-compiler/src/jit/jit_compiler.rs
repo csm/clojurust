@@ -462,6 +462,79 @@ mod async_poll_tests {
         }).unwrap().join().unwrap();
     }
 
+    #[test]
+    fn failed_await_exits_close_regions_opened_by_the_poll() {
+        use cljrs_async::state_machine::CompiledAsyncTask;
+        use cljrs_runtime::env::error::EvalError;
+        use cljrs_value::FutureState;
+
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut ir = IrFunction::new(Some("review_await_region".into()), None);
+                ir.is_async_poll_fn = true;
+                let block = ir.fresh_block();
+                ir.async_resume_blocks.push(block);
+                let region = ir.fresh_var();
+                let awaited = ir.fresh_var();
+                ir.blocks.push(Block {
+                    id: block,
+                    phis: vec![],
+                    insts: vec![
+                        Inst::RegionStart(region),
+                        Inst::AsyncResume {
+                            dst: awaited,
+                            kind: cljrs_ir::SuspendKind::Await,
+                        },
+                        Inst::RegionEnd(region),
+                    ],
+                    terminator: Terminator::Return(awaited),
+                });
+                let compiled = compile_jit_poll("review_await_region", &ir).unwrap();
+                let poll = unsafe {
+                    std::mem::transmute::<*const (), cljrs_async::state_machine::PollFn>(
+                        compiled.fn_ptr,
+                    )
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                for state in [
+                    FutureState::Failed(Value::string("awaited failure")),
+                    FutureState::GasExhausted,
+                    FutureState::Interrupted,
+                ] {
+                    let future = cljrs_value::CljxFuture::new();
+                    *future.state.lock().unwrap() = state;
+                    let outer = crate::rt_abi::rt_region_start();
+                    let depth = crate::rt_abi::rt_native_frame_depth();
+                    let gc_depth = cljrs_gc::region::region_stack_depth();
+                    let mut sm = CljxStateMachine::new(poll, 0, vec![]);
+                    sm.pending = Value::Future(cljrs_gc::GcPtr::new(future));
+                    let error = local.block_on(&rt, CompiledAsyncTask::new(sm)).unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            EvalError::Thrown(_) | EvalError::GasExhausted | EvalError::Cancelled
+                        ),
+                        "{error:?}"
+                    );
+                    assert_eq!(crate::rt_abi::rt_native_frame_depth(), depth, "{error:?}");
+                    assert_eq!(
+                        cljrs_gc::region::region_stack_depth(),
+                        gc_depth,
+                        "{error:?}"
+                    );
+                    crate::rt_abi::rt_region_end(outer);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// Build the IR for `(defn ^:async f [x] (+ (await x) 1))`.
     fn build_async_ir() -> IrFunction {
         let mut f = IrFunction::new(Some(Arc::from("await_plus_one")), None);

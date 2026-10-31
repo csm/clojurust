@@ -72,18 +72,33 @@ pub fn current() -> Option<FiberId> {
     CURRENT.with(|current| current.get().map(|c| c.id))
 }
 
+const MIN_STACK_BYTES: usize = 512 * 1024;
+
 fn stack_bytes() -> Result<usize, EvalError> {
     match std::env::var("CLJRS_FIBER_STACK_KB") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .and_then(|kb| kb.checked_mul(1024))
-            .filter(|bytes| *bytes >= 512 * 1024)
-            .ok_or_else(|| {
-                EvalError::Runtime(
-                    "CLJRS_FIBER_STACK_KB must be at least 512 and fit in usize".into(),
-                )
-            }),
+        Ok(value) => {
+            let bytes = value
+                .parse::<usize>()
+                .ok()
+                .and_then(|kb| kb.checked_mul(1024))
+                .ok_or_else(|| {
+                    EvalError::Runtime(
+                        "CLJRS_FIBER_STACK_KB must be a size that fits in usize".into(),
+                    )
+                })?;
+            if bytes < MIN_STACK_BYTES {
+                // Smaller stacks cannot hold the safepoint margin. Clamp, as
+                // earlier releases accepted these values.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "warning: CLJRS_FIBER_STACK_KB={value} is below the 512 KiB minimum; using 512"
+                    );
+                });
+                return Ok(MIN_STACK_BYTES);
+            }
+            Ok(bytes)
+        }
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STACK_BYTES),
         Err(_) => Err(EvalError::Runtime("invalid CLJRS_FIBER_STACK_KB".into())),
     }
@@ -264,6 +279,8 @@ impl Fiber {
                 .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
             (stack, reservation)
         };
+        // corosensei's `limit()` is the bottom of the mapping, below the guard
+        // page, so this span includes the guard and page rounding.
         reservation
             .account_actual_bytes(bytes, stack.base().get() - stack.limit().get())
             .map_err(EvalError::MemoryLimitExceeded)?;

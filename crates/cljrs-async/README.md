@@ -266,7 +266,7 @@ Panics in the body or parked future become `EvalError::Runtime`.
 Cancellation unwinds the fiber with its mutator state installed before stack reuse.
 
 The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
-512 KB minimum. Smaller values are rejected before stack allocation. A process-wide pool
+512 KB minimum. Smaller values are clamped to 512 KB with a one-time warning; unparseable values fail construction. A process-wide pool
 keeps up to 32 finished stacks for any carrier.
 Each active or pooled stack charges `MemoryClass::FiberStack` with a 64 KiB commit
 estimate plus guard pages, not its full reservation. Strict admission can reject
