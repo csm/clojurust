@@ -88,7 +88,11 @@ impl ChannelFailure {
     fn error(self) -> cljrs_value::ValueError {
         match self {
             Self::Gas => cljrs_value::ValueError::GasExhausted,
-            Self::Cancelled => cljrs_value::ValueError::Cancelled,
+            // Like an interrupted future: readers that are not themselves
+            // cancelled get the catchable cancellation exception.
+            Self::Cancelled => {
+                cljrs_value::ValueError::Thrown(cljrs_value::CljxFuture::cancelled_error())
+            }
             Self::Memory(error) => cljrs_value::ValueError::MemoryLimitExceeded(error),
         }
     }

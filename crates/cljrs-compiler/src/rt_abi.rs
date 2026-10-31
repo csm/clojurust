@@ -6423,8 +6423,15 @@ mod resource_review_tests {
                     unsafe {
                         rt_deref(&Value::Future(future));
                     }
-                    assert!(take_pending_exception_value().is_none());
-                    assert_kind(compiled_result(rt_const_nil()).unwrap_err(), kind);
+                    if matches!(kind, ResourceError::Cancelled) {
+                        // An interrupted producer reaches a healthy awaiter as
+                        // the catchable cancellation exception.
+                        assert!(take_pending_exception_value().is_some());
+                        assert!(take_pending_resource_error().is_none());
+                    } else {
+                        assert!(take_pending_exception_value().is_none());
+                        assert_kind(compiled_result(rt_const_nil()).unwrap_err(), kind);
+                    }
                 }
                 unsafe extern "C" fn gas_body() -> *const Value {
                     signal_error(ValueError::GasExhausted)

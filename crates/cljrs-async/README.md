@@ -183,7 +183,8 @@ after every poll. Fiber cancellation settles as `FutureState::Interrupted`, so i
 gas exhaustion. Awaiters receive the same catchable cancellation exception as for
 `future-cancel` (`Readiness::Failed` in compiled polls), so a healthy consumer can
 handle it instead of inheriting uncatchable cancellation; an awaiter that is itself
-cancelled stops at its own park. Interrupted futures, like cancelled ones, are not
+cancelled stops at its own park. Readers of a cancelled `thread` body's result channel
+get the same catchable exception. Interrupted futures, like cancelled ones, are not
 reported when discarded unread. A compiled poll that is itself cancelled returns
 `POLL_CANCELLED`. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
