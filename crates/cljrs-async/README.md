@@ -179,7 +179,9 @@ user-level catch. A memory-limit fault (strict governor mode) likewise settles a
 `EvalError::MemoryLimitExceeded`; `check_ready` reports it as
 `Readiness::MemoryLimitExceeded`, and a compiled poll that sees it confirms
 the fault in the runtime-fault slot, which `CompiledAsyncTask::poll` checks
-after every poll. Every `spawn_future` captures the complete active meter stack
+after every poll. Fiber cancellation settles as `FutureState::Interrupted`, is
+re-raised as `EvalError::Cancelled`, and reaches compiled polls as
+`Readiness::Cancelled` / `POLL_CANCELLED`, so it is never reported as gas exhaustion. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.
 
@@ -264,13 +266,15 @@ Panics in the body or parked future become `EvalError::Runtime`.
 Cancellation unwinds the fiber with its mutator state installed before stack reuse.
 
 The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
-512 KB minimum. Smaller values are rejected before stack allocation. Each isolate pools up to 32 finished stacks.
-Reserved stack bytes, including guard pages and pooled stacks, are charged to
-`MemoryClass::FiberStack`. Strict admission can reject construction with
-`EvalError::MemoryLimitExceeded`. Failed admission releases idle stacks before retrying.
-Stacks are not returned to the pool while the governor reports memory pressure.
+512 KB minimum. Smaller values are rejected before stack allocation. A process-wide pool
+keeps up to 32 finished stacks for any carrier.
+Each active or pooled stack charges `MemoryClass::FiberStack` with a 64 KiB commit
+estimate plus guard pages, not its full reservation. Strict admission can reject
+construction with `EvalError::MemoryLimitExceeded`. A strict admission of any memory
+class that would exceed the hard limit first releases every idle stack, and memory
+pressure also drains the pool. Stacks are not returned to the pool under pressure.
 `--gc-stats` and the governor snapshot show live and peak fiber counts, pooled stack
-counts, and reserved stack bytes. The root's 64 MiB reservation uses the same budget.
+counts, and reserved stack bytes. The root's 64 MiB reservation uses the same accounting.
 
 At interpreter, IR, JIT, and AOT safepoints, a fiber yields after its time slice when
 another fiber is ready. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
@@ -282,7 +286,7 @@ native frames using the uncatchable resource-error path, then resumes Rust unwin
 at the outer computation boundary. Cleanup cannot suspend a cancelled fiber.
 Other panic payloads retain their original message and type.
 
-A process watchdog checks carriers every 10 ms. If a fiber misses safepoints for
+A process watchdog thread sleeps on a condition variable while no fiber is running, and otherwise checks once per stall interval. If a fiber misses safepoints for
 `CLJRS_FIBER_STALL_MS` (default 100 ms) while another fiber is ready, it prints the
 fiber ID and innermost native function name once for that stall. Parked fibers do not
 trigger warnings. Both timing settings accept positive integers; invalid values use defaults.
@@ -323,7 +327,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 |---|---|
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl`: async task dispatch and fiber call dispatch with binding, gas, and interrupt conveyance |
-| `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
+| `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED`/`POLL_CANCELLED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
 | `src/fiber.rs` | Native stackful fibers, governed stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/fiber/scheduler.rs` | Safepoint time slices, ready-task wakers, stack-margin checks, native-frame names, and carrier watchdog |
 | `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
@@ -385,6 +389,7 @@ pub mod isolate {
     }
     pub enum RootError {
         GasExhausted,
+        Cancelled,
         MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
         Evaluation(String),
     }

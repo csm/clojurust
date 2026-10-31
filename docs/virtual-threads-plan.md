@@ -497,11 +497,13 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   after `CLJRS_FIBER_STALL_MS` (default 100 ms) only when another fiber is ready.
   Each stall logs once, with the fiber ID and innermost native function name.
   Parked waits do not count as stalls.
-- Active and pooled stacks retain `MemoryClass::FiberStack` charges, including
-  page rounding and guard pages. Construction reserves the budget before allocation.
-  Admission failure evicts idle stacks before retrying. Memory pressure prevents pooling.
+- Active and pooled stacks retain `MemoryClass::FiberStack` charges: a 64 KiB commit
+  estimate plus page rounding and guard pages, since the OS commits stack pages lazily.
+  Construction reserves the budget before allocation. A strict admission of any class
+  that would exceed the hard limit evicts idle stacks from the process-wide pool before
+  retrying. Memory pressure drains the pool and prevents pooling.
   `MemorySnapshot` and `--gc-stats` include live and peak fiber counts, pooled-stack
-  counts, and reserved stack bytes. Root stacks use the same accounting.
+  counts, and reserved stack address space. Root stacks use the same accounting.
 - Safepoints check the actual stack margin and return an error naming the fiber
   before ordinary recursion reaches the guard page. The 256 KiB margin covers
   interpreter frames and error construction. Compiled safepoints return a checked

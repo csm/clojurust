@@ -24,6 +24,7 @@ static HOOKS: OnceLock<Hooks> = OnceLock::new();
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static POOLED: AtomicUsize = AtomicUsize::new(0);
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the native driver once. Without a driver safepoints are no-ops.
 pub fn install(hooks: Hooks) {
@@ -75,33 +76,49 @@ impl Drop for NativeFrameGuard {
     }
 }
 
-/// Governor charge for reserved stack bytes, retained while the stack is pooled.
+/// Bytes of each stack charged to the governor as committed memory. Stacks
+/// are reserved address space committed lazily by the OS, so charging the
+/// whole reservation would refuse work far below real resident memory.
+pub const STACK_COMMIT_ESTIMATE: usize = 64 * 1024;
+
+/// Governor charge for a fiber stack, retained while the stack is pooled.
+/// The charge covers the commit estimate plus guard pages and page rounding;
+/// the full reservation is reported separately.
 pub struct StackReservation {
     _charge: MemoryCharge,
     pooled: bool,
     overhead: Option<MemoryCharge>,
+    reserved: usize,
 }
 
 impl StackReservation {
     pub fn new(bytes: usize) -> Result<Self, MemoryLimitExceeded> {
-        let charge = governor().reserve_shared(MemoryClass::FiberStack, bytes)?;
+        let charge =
+            governor().reserve_shared(MemoryClass::FiberStack, bytes.min(STACK_COMMIT_ESTIMATE))?;
         let live = LIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PEAK.fetch_max(live, Ordering::Relaxed);
+        RESERVED.fetch_add(bytes, Ordering::Relaxed);
         Ok(Self {
             _charge: charge,
             pooled: false,
             overhead: None,
+            reserved: bytes,
         })
     }
 
-    /// Charge page rounding and guard pages after the OS reports the bounds.
-    pub fn account_actual_bytes(&mut self, bytes: usize) -> Result<(), MemoryLimitExceeded> {
-        let charged = self._charge.bytes() + self.overhead.as_ref().map_or(0, MemoryCharge::bytes);
-        if bytes <= charged {
-            return Ok(());
+    /// Charge guard pages and page rounding beyond the requested size, after
+    /// the OS reports the bounds of the `requested`-byte stack.
+    pub fn account_actual_bytes(
+        &mut self,
+        requested: usize,
+        actual: usize,
+    ) -> Result<(), MemoryLimitExceeded> {
+        if actual > self.reserved {
+            RESERVED.fetch_add(actual - self.reserved, Ordering::Relaxed);
+            self.reserved = actual;
         }
-        let extra = bytes - self._charge.bytes();
-        if extra > 0 {
+        let extra = actual.saturating_sub(requested);
+        if extra > self.overhead.as_ref().map_or(0, MemoryCharge::bytes) {
             self.overhead = Some(governor().reserve_shared(MemoryClass::FiberStack, extra)?);
         }
         Ok(())
@@ -125,12 +142,18 @@ impl StackReservation {
 
 impl Drop for StackReservation {
     fn drop(&mut self) {
+        RESERVED.fetch_sub(self.reserved, Ordering::Relaxed);
         if self.pooled {
             POOLED.fetch_sub(1, Ordering::Relaxed);
         } else {
             LIVE.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Reserved address space of active and pooled fiber stacks.
+pub fn reserved_stack_bytes() -> usize {
+    RESERVED.load(Ordering::Relaxed)
 }
 
 pub(crate) fn counts() -> (usize, usize, usize) {

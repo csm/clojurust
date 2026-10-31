@@ -265,7 +265,7 @@ impl Fiber {
             (stack, reservation)
         };
         reservation
-            .account_actual_bytes(stack.base().get() - stack.limit().get())
+            .account_actual_bytes(bytes, stack.base().get() - stack.limit().get())
             .map_err(EvalError::MemoryLimitExceeded)?;
         let id = FiberId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
         #[cfg(not(feature = "no-gc"))]

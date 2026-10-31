@@ -433,7 +433,8 @@ installed by `cljrs-tx`.
   the original variant and its plain message (no `runtime error:` prefix) so
   `(catch :default e ..)` / `ex-message` / `ex-data` behave the same as for a
   user `throw` / `ex-info`. A `ValueError::Thrown` re-surfaces the exact value.
-  `ValueError::GasExhausted` and `ValueError::MemoryLimitExceeded` map to their
+  `ValueError::GasExhausted`, `ValueError::Cancelled`, and
+  `ValueError::MemoryLimitExceeded` map to their
   uncatchable `EvalError` counterparts (the latter also clears the thread's
   runtime-fault slot).
 
@@ -458,6 +459,7 @@ propagate complete nested scopes to async polls, `charge(cost) -> bool` consumes
 an all-or-nothing checkpoint, and
 `take_exhausted() -> bool` transfers a native-tier exhaustion signal back to
 the evaluator. `EvalError::GasExhausted` is the dedicated caller-facing error.
+Fiber cancellation is the separate, equally uncatchable `EvalError::Cancelled`.
 Exhaustion state is scoped per guard, so an exhausted inner evaluation cannot
 poison a healthy outer evaluation after the inner guard drops.
 

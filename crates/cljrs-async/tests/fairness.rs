@@ -161,12 +161,20 @@ fn stack_charges_cover_pool_reuse_completion_and_cancellation() {
     let allocated = governor.snapshot();
     assert_eq!(allocated.fiber_count, baseline.fiber_count + 1);
     let bytes = allocated.class_bytes(MemoryClass::FiberStack);
-    assert!(bytes >= 1024 * 1024);
+    // Only the commit estimate and guard pages are budgeted, not the reservation.
+    assert!(bytes > 0 && bytes < 1024 * 1024, "{bytes}");
+    assert!(
+        allocated.reserved_fiber_stack_bytes >= baseline.reserved_fiber_stack_bytes + 1024 * 1024
+    );
     drop(fiber);
     let pooled = governor.snapshot();
     assert_eq!(pooled.fiber_count, baseline.fiber_count);
     assert_eq!(pooled.pooled_fiber_stacks, baseline.pooled_fiber_stacks + 1);
     assert_eq!(pooled.class_bytes(MemoryClass::FiberStack), bytes);
+    assert_eq!(
+        pooled.reserved_fiber_stack_bytes,
+        allocated.reserved_fiber_stack_bytes
+    );
     run(async {
         let task = fiber::spawn(|| {
             fiber::park_on(std::future::pending::<()>());
@@ -182,24 +190,35 @@ fn stack_charges_cover_pool_reuse_completion_and_cancellation() {
     });
     assert_eq!(governor.snapshot().fiber_count, baseline.fiber_count);
     assert!(cljrs_gc::stats_report().contains("reserved stack bytes"));
-    let mut config = cljrs_gc::MemoryConfig::with_limits(512 * 1024, 768 * 1024).unwrap();
+    let hard = 768 * 1024;
+    let mut config = cljrs_gc::MemoryConfig::with_limits(512 * 1024, hard).unwrap();
     config.strict = true;
     governor.configure(config).unwrap();
-    // The idle stack is reclaimed before refusing another reservation.
-    // Request a different size so this cannot reuse an already charged stack.
+    // A 64 MiB root reservation is admitted under a much smaller hard limit.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
-    let error = fiber::run_root(&rt, &local, &mut carrier, || Ok(Value::Nil)).unwrap_err();
+    fiber::run_root(&rt, &local, &mut carrier, || Ok(Value::Nil)).unwrap();
+    // Exhaust the budget. Idle stacks are reclaimed before refusing it.
+    let committed = governor.snapshot().committed_bytes;
+    let _filler = governor
+        .reserve_shared(MemoryClass::Code, hard - committed + 1)
+        .unwrap();
+    assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
+    assert_eq!(governor.snapshot().pooled_fiber_stacks, 0);
+    let committed = governor.snapshot().committed_bytes;
+    let _rest = governor
+        .reserve_shared(MemoryClass::Code, hard - committed)
+        .unwrap();
+    let error = Fiber::new(|| Ok(Value::Nil)).err().unwrap();
     assert!(
         matches!(error, EvalError::MemoryLimitExceeded(ref fault) if fault.class == MemoryClass::FiberStack),
         "{error:?}"
     );
     assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
-    assert_eq!(governor.snapshot().pooled_fiber_stacks, 0);
 }
 
 #[test]
@@ -295,13 +314,9 @@ fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
         return;
     };
     let mib = 1024 * 1024;
-    let (soft, hard, requested) = if mode == "root" {
-        (120 * mib, 128 * mib, 96 * mib)
-    } else {
-        (1800 * 1024, 2 * mib, 1500 * 1024)
-    };
+    let hard = 2 * mib;
     let governor = cljrs_gc::governor();
-    let mut config = cljrs_gc::MemoryConfig::with_limits(soft, hard).unwrap();
+    let mut config = cljrs_gc::MemoryConfig::with_limits(1800 * 1024, hard).unwrap();
     config.strict = true;
     governor.configure(config).unwrap();
     let root = mode == "root";
@@ -320,12 +335,18 @@ fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
     })
     .join()
     .unwrap();
-    assert_eq!(governor.snapshot().pooled_fiber_stacks, 1);
-    assert!(governor.class_bytes(MemoryClass::FiberStack) >= if root { 64 * mib } else { mib });
+    let snapshot = governor.snapshot();
+    assert_eq!(snapshot.pooled_fiber_stacks, 1);
+    assert!(snapshot.reserved_fiber_stack_bytes >= if root { 64 * mib } else { mib });
+    assert!(governor.class_bytes(MemoryClass::FiberStack) > 0);
+    // Fits only once the other carrier's idle stack releases its charge.
+    let requested = hard - snapshot.committed_bytes + 1;
     let code = governor
         .reserve_shared(MemoryClass::Code, requested)
         .unwrap();
     assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
-    assert_eq!(governor.snapshot().pooled_fiber_stacks, 0);
+    let snapshot = governor.snapshot();
+    assert_eq!(snapshot.pooled_fiber_stacks, 0);
+    assert_eq!(snapshot.reserved_fiber_stack_bytes, 0);
     assert_eq!(code.bytes(), requested);
 }

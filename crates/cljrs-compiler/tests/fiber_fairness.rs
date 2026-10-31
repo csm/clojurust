@@ -150,7 +150,7 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
                                         0 => cljrs_value::parking::sleep(Duration::from_secs(60)),
                                         1 => {
                                             cljrs_value::parking::block_on(
-                                                cljrs_async::channel::Channel::new(0).take(),
+                                                cljrs_async::channel::CljChannel::new(0).take(),
                                             );
                                         }
                                         _ => {
@@ -193,7 +193,7 @@ fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
                         Ok(Value::Nil)
                     })
                     .unwrap();
-                    assert!(task.await.unwrap_err().is_cancelled());
+                    assert!(task.await.err().unwrap().is_cancelled());
                     peer.await.unwrap().into_result().unwrap();
                     assert!(attempted.get(), "finally was skipped: {kind}");
                     assert!(

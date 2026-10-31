@@ -874,6 +874,7 @@ pub enum SafepointError { StackOverflow(String), Cancelled }
 pub struct Hooks {
     pub safepoint: fn() -> Result<bool, SafepointError>, // true when a yield is due
     pub yield_now: fn() -> Result<(), SafepointError>,
+    pub reclaim_stacks: fn(), // drop idle pooled stacks on every carrier
     pub enter_native: fn(&Arc<str>) -> usize, // previous frame token
     pub exit_native: fn(usize),
 }
@@ -883,12 +884,15 @@ pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointErro
     -> Result<(), SafepointError>) -> Result<(), SafepointError>;
 pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard;
 pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
+pub const STACK_COMMIT_ESTIMATE: usize; // 64 KiB budgeted per stack
 pub struct StackReservation; // Drop releases its charges and live/pool count.
 impl StackReservation {
     pub fn new(bytes: usize) -> Result<Self, MemoryLimitExceeded>;
-    pub fn account_actual_bytes(&mut self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
+    pub fn account_actual_bytes(&mut self, requested: usize, actual: usize)
+        -> Result<(), MemoryLimitExceeded>;
     pub fn set_pooled(&mut self, pooled: bool);
 }
+pub fn reserved_stack_bytes() -> usize; // active and pooled reservations
 ```
 
 `SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
@@ -897,23 +901,26 @@ The fiber resumes Rust cancellation at its outer computation boundary.
 `safepoint_with` runs its callback only when an automatic yield will happen.
 The interpreter uses it to root the current environment during that yield.
 `StackReservation::new` applies strict admission before stack allocation.
-`account_actual_bytes` adds page rounding and guard pages after allocation.
-A pooled reservation remains charged as `MemoryClass::FiberStack`.
-Its live count resumes when the driver reuses it. Destroying the pool releases its bytes.
-These bytes measure reserved address space, rather than resident pages.
+It charges `MemoryClass::FiberStack` with at most `STACK_COMMIT_ESTIMATE` bytes,
+because the OS commits stack pages lazily. `account_actual_bytes` adds page
+rounding and guard pages after allocation, and records the full reservation in
+`reserved_stack_bytes`. A pooled reservation keeps its charge. Its live count
+resumes when the driver reuses it. Destroying the pool releases its bytes.
+When a strict admission of any class would exceed the hard limit, the governor
+calls `reclaim_stacks` once and retries, so idle stacks never block other work.
 
-`MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`, and
-`pooled_fiber_stacks`. Counts cover native fibers across the process, including
-unstarted fibers and root fibers. Completed results do not count as live fibers.
-`class_bytes(MemoryClass::FiberStack)` includes active and pooled reservations.
+`MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`,
+`pooled_fiber_stacks`, and `reserved_fiber_stack_bytes`. Counts cover native fibers
+across the process, including unstarted fibers and root fibers. Completed results do
+not count as live fibers. `class_bytes(MemoryClass::FiberStack)` is the budgeted
+charge of active and pooled stacks; `reserved_fiber_stack_bytes` is their address space.
 The snapshot's `Display` implementation includes these counts and stack bytes,
 so both `--gc-stats` and `stats_report()` show them.
 
 
-Strict stack admission deliberately uses the full reservation. A 48 MiB hard limit
-cannot admit the default 64 MiB root stack. A 256 MiB budget must leave room for
-that root, each live child stack, guard pages, and managed values. This conservative
-contract bounds stack address-space commitments and can reject mostly idle fibers.
-Observe-only mode reports the same bytes without refusing stack reservations.
-Resident-page sampling is not used for admission because it cannot reserve space
-for a stack's later growth. This follows the Phase 4 plan's explicit stack-budget contract.
+Strict stack admission budgets the commit estimate, not the reservation. A small
+hard limit still admits the default 64 MiB root stack, and thousands of mostly idle
+fibers do not push the governor into pressure that collection cannot relieve. A
+fiber whose recursion commits more than the estimate is under-counted; the stack
+margin check and guard page bound that growth. Observe-only mode reports the same
+bytes without refusing stack reservations.

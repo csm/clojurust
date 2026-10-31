@@ -2394,6 +2394,7 @@ impl ProcessMemoryGovernor {
             fiber_count,
             peak_fiber_count,
             pooled_fiber_stacks,
+            reserved_fiber_stack_bytes: crate::fiber::reserved_stack_bytes(),
             strict: config.strict,
             soft_limit: config.soft_limit,
             hard_limit: config.hard_limit,
@@ -2502,6 +2503,9 @@ pub struct MemorySnapshot {
     pub fiber_count: usize,
     pub peak_fiber_count: usize,
     pub pooled_fiber_stacks: usize,
+    /// Reserved address space of active and pooled stacks. Only the commit
+    /// estimate and guard pages count toward `MemoryClass::FiberStack`.
+    pub reserved_fiber_stack_bytes: usize,
     /// Strict admission is on.
     pub strict: bool,
     pub soft_limit: usize,
@@ -2608,7 +2612,7 @@ impl fmt::Display for MemorySnapshot {
             self.fiber_count,
             self.peak_fiber_count,
             self.pooled_fiber_stacks,
-            self.class_bytes(MemoryClass::FiberStack)
+            self.reserved_fiber_stack_bytes
         )?;
         for class in MemoryClass::ALL {
             let bytes = self.class_bytes(class);

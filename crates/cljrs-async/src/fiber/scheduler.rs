@@ -74,9 +74,16 @@ struct Watches {
 struct Watchdog {
     state: Mutex<Watches>,
     changed: Condvar,
+    /// Set before each scan; cleared once the scan finds a running fiber.
+    idle: AtomicBool,
 }
 impl Watchdog {
-    fn notify(&self) {
+    /// Called after publishing a running fiber. Only an idle watchdog, which
+    /// may wait without a timeout, needs the lock and signal.
+    fn notify_running(&self) {
+        if !self.idle.swap(false, Ordering::SeqCst) {
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
         self.changed.notify_one();
@@ -84,6 +91,8 @@ impl Watchdog {
 
     fn run(&self) {
         loop {
+            // A run published after this store sees `idle` and signals.
+            self.idle.store(true, Ordering::SeqCst);
             let (generation, live) = {
                 let mut state = self.state.lock().unwrap();
                 state.schedulers.retain(|s| s.strong_count() > 0);
@@ -104,6 +113,9 @@ impl Watchdog {
                 if scheduler.running.lock().unwrap().is_some() {
                     interval = Some(interval.map_or(scheduler.stall, |n| n.min(scheduler.stall)));
                 }
+            }
+            if interval.is_some() {
+                self.idle.store(false, Ordering::SeqCst);
             }
             // Generation closes the race between the scan and waiting. Idle
             // processes sleep without a timer; active carriers need at most
@@ -130,6 +142,7 @@ fn watchdog() -> &'static Arc<Watchdog> {
                 generation: 0,
             }),
             changed: Condvar::new(),
+            idle: AtomicBool::new(true),
         });
         let registry = watches.clone();
         // A LocalSet timer cannot run while its own carrier is blocked.
@@ -157,7 +170,6 @@ impl Scheduler {
             .unwrap()
             .schedulers
             .push(Arc::downgrade(&scheduler));
-        watchdog().notify();
         scheduler
     }
 
@@ -250,7 +262,6 @@ impl Wake for TaskWake {
             }
             state.parent.clone()
         };
-        watchdog().notify();
         if let Some(parent) = parent {
             parent.wake();
         }
@@ -295,7 +306,7 @@ impl Scheduling {
             reported: false,
             wake: Arc::downgrade(&self.wake),
         });
-        watchdog().notify();
+        watchdog().notify_running();
         RunGuard(self)
     }
 
@@ -367,7 +378,6 @@ pub(super) struct RunGuard<'a>(&'a Scheduling);
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         *self.0.wake.scheduler.running.lock().unwrap() = None;
-        watchdog().notify();
     }
 }
 

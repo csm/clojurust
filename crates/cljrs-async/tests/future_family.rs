@@ -212,6 +212,7 @@ fn both_await_paths_report_cancellation_the_same_way() {
                     cljrs_async::state_machine::Readiness::Pending => "Pending".to_string(),
                     cljrs_async::state_machine::Readiness::GasExhausted =>
                         "GasExhausted".to_string(),
+                    cljrs_async::state_machine::Readiness::Cancelled => "Cancelled".to_string(),
                     cljrs_async::state_machine::Readiness::MemoryLimitExceeded(f) =>
                         format!("MemoryLimitExceeded({f})"),
                 }
