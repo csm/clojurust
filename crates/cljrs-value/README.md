@@ -21,7 +21,7 @@ plus all persistent (immutable, structurally shared) collection types.  The
 src/
   lib.rs                         — module declarations and re-exports
   clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
-  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)`, uncatchable like `GasExhausted`), ValueResult<T> alias
+  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` and `Cancelled`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
@@ -674,6 +674,8 @@ pub fn block_on<F: Future>(future: F) -> F::Output;
 pub fn sleep(duration: Duration);
 pub fn blocking<F, T>(job: F) -> T
 where F: FnOnce() -> T + Send + 'static, T: Send + 'static;
+pub fn resume_cancelled() -> !; // unwind a cancelled fiber with a private payload
+pub fn catch_cancelled<T>(operation: impl FnOnce() -> T) -> ValueResult<T>;
 
 pub struct Event { /* Default + Debug */ }
 impl Event {
@@ -690,6 +692,10 @@ Native fibers install the executor hooks once. This crate does not depend on Tok
 `park` accepts borrowed futures inside a fiber. `block_on` also supports notification futures outside a fiber with an OS-thread wait.
 `sleep` and `blocking` keep their direct behavior outside fibers.
 Managed values require precise roots across a park and cannot cross worker threads.
+A park in a cancelled fiber unwinds with `resume_cancelled`. `catch_cancelled` turns
+only that payload into `ValueError::Cancelled` and rethrows every other panic.
+`NativeFn` wrappers and C-ABI bridges use it so cancellation never unwinds through
+foreign frames.
 
 A listener registers before its caller checks the protected condition.
 `notify_all` wakes every listener, and listener destruction removes its waker.
@@ -752,7 +758,7 @@ pub struct CljxPromise {
 
 pub struct CljxFuture {
     pub ready: parking::Event,
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Interrupted | ...
                                     // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }

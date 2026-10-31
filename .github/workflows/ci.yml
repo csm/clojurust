@@ -78,7 +78,9 @@ jobs:
       # Keep the 5,000-fiber full-collection stress loop practical under ASan.
       CARGO_PROFILE_TEST_OPT_LEVEL: 1
       # no-gc deliberately retains static arenas for the process lifetime.
-      ASAN_OPTIONS: detect_leaks=0
+      # Exercise fake-stack placement explicitly: stack-margin checks must
+      # measure the machine stack even when locals live on ASan's fake stack.
+      ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -91,4 +93,4 @@ jobs:
         run: >-
           cargo test -p cljrs-async --target x86_64-unknown-linux-gnu
           --no-default-features --features ${{ matrix.features }}
-          --test fiber --test parking -- --test-threads=1
+          --lib --test fiber --test parking --test fairness -- --test-threads=1

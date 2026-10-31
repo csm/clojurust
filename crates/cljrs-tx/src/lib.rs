@@ -168,6 +168,10 @@ pub enum TxError {
     Evaluation(String),
     #[error("transaction gas exhausted")]
     GasExhausted,
+
+    /// Execution was cancelled; the gas budget was not exhausted.
+    #[error("execution cancelled")]
+    Cancelled,
     #[error("transaction call depth exceeded")]
     DepthExceeded,
     #[error("transaction attempted a forbidden effect: {0}")]
@@ -314,6 +318,7 @@ fn host_native(entry: &HostEntry) -> Value {
 fn map_eval_error(error: EvalError) -> TxError {
     match error {
         EvalError::GasExhausted => TxError::GasExhausted,
+        EvalError::Cancelled => TxError::Cancelled,
         EvalError::ForbiddenEffect(operation) => TxError::ForbiddenEffect(operation),
         other => {
             let text = other.to_string();

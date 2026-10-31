@@ -141,11 +141,13 @@ The conversion callback stays on the isolate and needs no `Send` bound.
 | `quote 1` | Generate token streams |
 | `proc-macro2 1` | Span-aware token manipulation |
 
-### `#[catch_realization(handler)]`
+### `#[catch_realization(handler[, cancel_handler])]`
 
 `catch_realization(handler: TokenStream, item: TokenStream) -> TokenStream`
 wraps a function in `cljrs_value::realization::catch`.
 The handler takes an error string and returns the function result type.
-The compiler uses `#[catch_realization(throw_str)]` on boxed runtime ABI bridges.
+An optional second handler also wraps the body in `cljrs_value::parking::catch_cancelled`
+and receives the resulting `ValueError::Cancelled`.
+The compiler uses `#[catch_realization(throw_str, signal_error)]` on boxed runtime ABI bridges.
 A realization error becomes a pending Clojure exception before the function returns across the C ABI.
 Other panics continue unwinding.

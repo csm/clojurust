@@ -433,7 +433,8 @@ installed by `cljrs-tx`.
   the original variant and its plain message (no `runtime error:` prefix) so
   `(catch :default e ..)` / `ex-message` / `ex-data` behave the same as for a
   user `throw` / `ex-info`. A `ValueError::Thrown` re-surfaces the exact value.
-  `ValueError::GasExhausted` and `ValueError::MemoryLimitExceeded` map to their
+  `ValueError::GasExhausted`, `ValueError::Cancelled`, and
+  `ValueError::MemoryLimitExceeded` map to their
   uncatchable `EvalError` counterparts (the latter also clears the thread's
   runtime-fault slot).
 
@@ -458,6 +459,7 @@ propagate complete nested scopes to async polls, `charge(cost) -> bool` consumes
 an all-or-nothing checkpoint, and
 `take_exhausted() -> bool` transfers a native-tier exhaustion signal back to
 the evaluator. `EvalError::GasExhausted` is the dedicated caller-facing error.
+Fiber cancellation is the separate, equally uncatchable `EvalError::Cancelled`.
 Exhaustion state is scoped per guard, so an exhausted inner evaluation cannot
 poison a healthy outer evaluation after the inner guard drops.
 
@@ -608,7 +610,7 @@ Manages GC root registration for the interpreter's Rust call stack. Public API:
 - `root_values(vals: &[Value]) -> ValueRootGuard` — registers a slice of `Value` pointers as GC roots
 - `ValueRootGuard` removes its own entry on drop (not the top one), so guards held across `await`s by different `LocalSet` tasks may drop in any order
 - `root_option_values(vals: &[Option<Value>]) -> OptionValueRootGuard` — registers an `Option<Value>` slice (e.g. IR register file)
-- `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  Under `no-gc` only the fault check runs
+- `gc_safepoint(env: &Env) -> EvalResult<()>` — interpreter-level safepoint: parks if collection in progress, or initiates collection on memory pressure; then resolves the thread's pending memory fault (`cljrs_gc::resolve_runtime_fault`) and returns `EvalError::MemoryLimitExceeded` if committed memory is still above the hard limit.  In both builds it also checks the fiber stack margin and yields whenever its time slice expires. It roots the environment only when the scheduler will yield. Runtime locks, borrowed mutator slots, and critical sections defer automatic yields in every build. Under `no-gc` the collection step is omitted
 - `check_memory_fault() -> EvalResult<()>` — the fault check alone (used at the native-code entry seams)
 - `force_collect(env: &Env)` — immediately initiates a GC collection bypassing memory-pressure threshold
 - `async_gc_collect()` — services a pending GC request from a Tokio `LocalSet` task at a cooperative yield point; safe to call when no other tasks are polling, so thread-local root stacks are stable and fully describe all suspended-task `GcPtr`s
@@ -1786,3 +1788,10 @@ Protocol and multimethod dispatch borrow ownership cached beside the implementat
 
 Standalone macro-expansion APIs keep their temporary values in a scratch scope under no-GC.
 They release successful temporary values after building the returned Rust form and publish thrown errors before teardown.
+
+
+Native calls through `env::apply_value` register their function name with
+`cljrs_gc::fiber::native_frame`. The native driver uses this name for stall diagnostics.
+Interpreter and IR safepoints return a fiber-specific stack-overflow error before
+recursion reaches the guard page. Automatic-yield cancellation uses the uncatchable
+resource-error path to return safely through compiled native frames.

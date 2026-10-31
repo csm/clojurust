@@ -34,7 +34,7 @@ pub struct TxLimits {
     pub call_depth: u64,
 }
 
-pub enum TxError { /* read, boundary, evaluation, budget, and policy errors */ }
+pub enum TxError { /* read, boundary, evaluation, budget, cancellation, and policy errors */ }
 
 pub trait HostFn: Send + Sync {
     fn call(&self, args: &[SerializedValue]) -> Result<SerializedValue, String>;

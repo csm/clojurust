@@ -147,9 +147,11 @@ pub enum MemoryClass {
     Code,
     /// Other runtime-owned data.
     Runtime,
+    /// Reserved native fiber stacks, including pooled stacks and guard pages.
+    FiberStack,
 }
 
-const CLASS_COUNT: usize = 7;
+const CLASS_COUNT: usize = 8;
 
 impl MemoryClass {
     /// Every memory class, in reporting order.
@@ -161,6 +163,7 @@ impl MemoryClass {
         MemoryClass::Static,
         MemoryClass::Code,
         MemoryClass::Runtime,
+        MemoryClass::FiberStack,
     ];
 
     /// Static, allocation-free name used in diagnostics and errors.
@@ -173,6 +176,7 @@ impl MemoryClass {
             MemoryClass::Static => "static",
             MemoryClass::Code => "code",
             MemoryClass::Runtime => "runtime",
+            MemoryClass::FiberStack => "fiber-stack",
         }
     }
 
@@ -1400,7 +1404,11 @@ impl MemoryCharge {
 impl Drop for MemoryCharge {
     fn drop(&mut self) {
         self.governor.sub(self.class, self.bytes);
-        self.governor.evaluate(None, false);
+        // Inside an admission reclaim the caller may hold its own locks, so
+        // shed hooks must not run; the next evaluation observes the release.
+        if !QUIET_RELEASE.with(Cell::get) {
+            self.governor.evaluate(None, false);
+        }
     }
 }
 
@@ -1458,6 +1466,22 @@ pub enum Admission {
 
 thread_local! {
     static CRITICAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set while `admit` drops idle fiber stacks; never spans a park.
+    static QUIET_RELEASE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `release` (which drops charges) without re-evaluating pressure, so no
+/// shed hook runs under an allocating caller's locks. Used by `admit` to
+/// reclaim idle fiber stacks.
+fn release_quietly(release: impl FnOnce()) {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUIET_RELEASE.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET_RELEASE.with(|quiet| quiet.replace(true)));
+    release();
 }
 
 /// While alive, the calling thread's grants use [`Admission::Critical`] and
@@ -2101,9 +2125,19 @@ impl ProcessMemoryGovernor {
         // A compare-and-swap loop, so concurrent grants never commit past
         // `limit`.
         let mut prev = self.committed.load(Ordering::Relaxed);
+        let mut reclaimed = false;
         loop {
             let next = match prev.checked_add(bytes) {
                 Some(n) if n <= limit => n,
+                _ if !reclaimed => {
+                    // Idle stacks are reclaimable regardless of the requesting
+                    // memory class. Their charges release without running
+                    // pressure hooks, since the caller may hold locks.
+                    reclaimed = true;
+                    release_quietly(crate::fiber::reclaim_idle_stacks);
+                    prev = self.committed.load(Ordering::Relaxed);
+                    continue;
+                }
                 _ => {
                     return Err(MemoryLimitExceeded {
                         class,
@@ -2376,7 +2410,12 @@ impl ProcessMemoryGovernor {
                 .collect()
         };
         isolates.sort_by_key(|i| i.id);
+        let (fiber_count, peak_fiber_count, pooled_fiber_stacks) = crate::fiber::counts();
         MemorySnapshot {
+            fiber_count,
+            peak_fiber_count,
+            pooled_fiber_stacks,
+            reserved_fiber_stack_bytes: crate::fiber::reserved_stack_bytes(),
             strict: config.strict,
             soft_limit: config.soft_limit,
             hard_limit: config.hard_limit,
@@ -2481,6 +2520,13 @@ pub struct IsolateSnapshot {
 /// observations; the snapshot as a whole is not a consistent cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySnapshot {
+    /// Unstarted, running, and parked native fibers (excludes completed results).
+    pub fiber_count: usize,
+    pub peak_fiber_count: usize,
+    pub pooled_fiber_stacks: usize,
+    /// Reserved address space of active and pooled stacks. Only the commit
+    /// estimate and guard pages count toward `MemoryClass::FiberStack`.
+    pub reserved_fiber_stack_bytes: usize,
     /// Strict admission is on.
     pub strict: bool,
     pub soft_limit: usize,
@@ -2580,6 +2626,14 @@ impl fmt::Display for MemorySnapshot {
             f,
             "  Used:                  {} bytes (peak {}), {} bytes free credit",
             self.used_bytes, self.peak_used_bytes, self.free_credit_bytes
+        )?;
+        writeln!(
+            f,
+            "  Fibers:                {} live (peak {}), {} pooled stacks, {} reserved stack bytes",
+            self.fiber_count,
+            self.peak_fiber_count,
+            self.pooled_fiber_stacks,
+            self.reserved_fiber_stack_bytes
         )?;
         for class in MemoryClass::ALL {
             let bytes = self.class_bytes(class);
@@ -3602,6 +3656,30 @@ mod tests {
 
         acc.charge(4 * MIB);
         assert_eq!(g.pressure(), PressureLevel::Red, "RSS raises Yellow to Red");
+    }
+
+    /// Charges released during admission (idle-stack reclaim) update the
+    /// counters but defer the pressure evaluation, so no hook runs inline.
+    #[test]
+    fn quiet_releases_defer_shed_hooks() {
+        use std::sync::atomic::AtomicUsize;
+        let g = strict(4 * MIB, 8 * MIB, 64 * KIB);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        g.register_shed_hook(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        let charge = g.reserve_shared(MemoryClass::Code, 5 * MIB).unwrap();
+        assert_eq!(g.pressure(), PressureLevel::Yellow);
+        let before = calls.load(Ordering::Relaxed);
+        release_quietly(|| drop(charge));
+        assert_eq!(calls.load(Ordering::Relaxed), before, "hook ran inline");
+        assert_eq!(g.class_bytes(MemoryClass::Code), 0);
+        assert!(!QUIET_RELEASE.with(Cell::get));
+        // The next ordinary evaluation observes the release.
+        drop(g.reserve_shared(MemoryClass::Code, 1).unwrap());
+        assert_eq!(g.pressure(), PressureLevel::Green);
+        assert_eq!(calls.load(Ordering::Relaxed), before + 1);
     }
 
     /// Load-shedding hooks fire on pressure transitions.

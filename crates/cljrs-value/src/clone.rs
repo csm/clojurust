@@ -454,6 +454,7 @@ pub enum SerializedErrorKind {
     Unsupported,
     Other(String),
     GasExhausted,
+    Cancelled,
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     OutOfRange,
     TransientAlreadyPersisted,
@@ -475,6 +476,7 @@ impl SerializedErrorKind {
             SerializedErrorKind::IndexOutOfBounds { .. }
             | SerializedErrorKind::OddMap { .. }
             | SerializedErrorKind::Unsupported
+            | SerializedErrorKind::Cancelled
             | SerializedErrorKind::GasExhausted
             | SerializedErrorKind::MemoryLimitExceeded(_)
             | SerializedErrorKind::OutOfRange
@@ -722,6 +724,7 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
         ValueError::Unsupported => SerializedErrorKind::Unsupported,
         ValueError::Other(s) => SerializedErrorKind::Other(s.clone()),
         ValueError::GasExhausted => SerializedErrorKind::GasExhausted,
+        ValueError::Cancelled => SerializedErrorKind::Cancelled,
         ValueError::MemoryLimitExceeded(e) => SerializedErrorKind::MemoryLimitExceeded(*e),
         ValueError::OutOfRange => SerializedErrorKind::OutOfRange,
         ValueError::TransientAlreadyPersisted => SerializedErrorKind::TransientAlreadyPersisted,
@@ -911,6 +914,7 @@ fn deserialize_error(se: SerializedError) -> crate::error::ExceptionInfo {
         SerializedErrorKind::Unsupported => ValueError::Unsupported,
         SerializedErrorKind::Other(s) => ValueError::Other(s),
         SerializedErrorKind::GasExhausted => ValueError::GasExhausted,
+        SerializedErrorKind::Cancelled => ValueError::Cancelled,
         SerializedErrorKind::MemoryLimitExceeded(e) => ValueError::MemoryLimitExceeded(e),
         SerializedErrorKind::OutOfRange => ValueError::OutOfRange,
         SerializedErrorKind::TransientAlreadyPersisted => ValueError::TransientAlreadyPersisted,

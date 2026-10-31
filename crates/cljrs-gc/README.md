@@ -90,10 +90,11 @@ src/
                     cross-isolate request epoch, RSS emergency pressure signal,
                     load-shedding hooks (ShedHookId, register_shed_hook,
                     unregister_shed_hook), Linux cgroup v2 soft-limit
+  fiber.rs        — optional scheduler hooks, native-frame diagnostics, and governed fiber stack reservations
   mutator.rs      — per-mutator state for virtual threads: MutatorSlot registry
                     (link-time, via inventory), mutator_slot! macro,
-                    MutatorState save/restore/swap, TrackedMutex (debug
-                    guard counting) and assert_parkable()
+                    MutatorState save/restore/swap, TrackedMutex guard counting
+                    in every build, can_park() and assert_parkable()
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects,
                     isolate-boundary crossings (bytes copied + serialize time)
@@ -390,7 +391,7 @@ isolate-channel messages (`cljrs-async`), and JIT code (`cljrs-compiler`) hold
 a `MemoryCharge`; static allocations are recorded with `charge_permanent`.
 
 ```rust
-pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime }
+pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime, FiberStack }
 pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard (or strict refusal)
 pub enum Admission { Application, Critical }    // <= hard, <= hard + critical reserve
 
@@ -604,7 +605,8 @@ pub struct MutatorSlot {
     pub init: fn() -> Box<dyn Any>,      // a fresh mutator's value
     pub swap: fn(&mut dyn Any),          // exchange with the thread-local
     pub trace: fn(&dyn Any, &mut MarkVisitor), // detached GC roots
-    pub check: fn(),                    // check borrow discipline before swapping
+    pub check: fn(),                    // assert borrow discipline before swapping
+    pub can_swap: fn() -> bool,          // non-panicking borrow preflight
 }
 pub fn slots() -> &'static [&'static MutatorSlot]; // sorted by name
 pub fn slot_names() -> Vec<&'static str>;
@@ -621,8 +623,9 @@ impl MutatorState {
     pub fn swap_with_current(&mut self); // exchange (scheduler resume/park)
 }
 
-pub fn guards_held() -> usize;           // TrackedMutex guards held (debug builds)
-pub fn assert_parkable();                // check slot borrows; debug: guards and critical sections
+pub fn guards_held() -> usize;           // TrackedMutex guards held in every build
+pub fn can_park() -> bool;               // optional yield: locks, borrows, critical sections, unwinding
+pub fn assert_parkable();                // explicit park: assert lock/borrow/critical discipline
 pub struct TrackedMutex<T>;              // std::sync::Mutex API subset; guards are counted
 pub struct TrackedMutexGuard<'a, T>;
 ```
@@ -859,3 +862,67 @@ Under no-GC, `GcPtr::get_mut(&mut self) -> GcMut<'_, T>` returns a mutation guar
 Drop acquires ownership of the changed child graph, including when unwinding.
 Cached parents remain valid because the mutated object's region retains its new children.
 Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.
+
+
+## Fiber safepoints and stack accounting (virtual threads Phase 4)
+
+`fiber` has no executor dependency. Native drivers install `Hooks` once with
+`fiber::install(Hooks)`. Before installation, the hooks do nothing.
+
+```rust,ignore
+pub enum SafepointError { StackOverflow(String), Cancelled }
+pub struct Hooks {
+    pub safepoint: fn() -> Result<bool, SafepointError>, // true when a yield is due
+    pub yield_now: fn() -> Result<(), SafepointError>,
+    pub reclaim_stacks: fn(), // drop idle pooled stacks on every carrier
+    pub enter_native: fn(&Arc<str>) -> usize, // previous frame token
+    pub exit_native: fn(usize),
+}
+pub fn install(hooks: Hooks);
+pub fn safepoint() -> Result<(), SafepointError>;
+pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointError>)
+    -> Result<(), SafepointError>) -> Result<(), SafepointError>;
+pub fn native_frame(name: &Arc<str>) -> NativeFrameGuard;
+pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
+pub const STACK_COMMIT_ESTIMATE: usize; // 64 KiB budgeted per stack
+pub struct StackReservation; // Drop releases its charges and live/pool count.
+impl StackReservation {
+    pub fn new(bytes: usize) -> Result<Self, MemoryLimitExceeded>;
+    pub fn account_actual_bytes(&mut self, requested: usize, actual: usize)
+        -> Result<(), MemoryLimitExceeded>;
+    pub fn set_pooled(&mut self, pooled: bool);
+}
+pub fn reserved_stack_bytes() -> usize; // active and pooled reservations
+```
+
+`SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
+ABI frames through the runtime's uncatchable resource-error path.
+The fiber resumes Rust cancellation at its outer computation boundary.
+`safepoint_with` runs its callback only when an automatic yield will happen.
+The interpreter uses it to root the current environment during that yield.
+`StackReservation::new` applies strict admission before stack allocation.
+It charges `MemoryClass::FiberStack` with at most `STACK_COMMIT_ESTIMATE` bytes,
+because the OS commits stack pages lazily. `account_actual_bytes` adds page
+rounding and guard pages after allocation, and records the full reservation in
+`reserved_stack_bytes`. A pooled reservation keeps its charge. Its live count
+resumes when the driver reuses it. Destroying the pool releases its bytes.
+When a strict admission of any class would exceed the hard limit, the governor
+calls `reclaim_stacks` once and retries, so idle stacks never block other work.
+Charges dropped during that reclaim skip pressure evaluation, so no shed hook runs
+inside the admission while the caller may hold locks; the next evaluation observes them.
+
+`MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`,
+`pooled_fiber_stacks`, and `reserved_fiber_stack_bytes`. Counts cover native fibers
+across the process, including unstarted fibers and root fibers. Completed results do
+not count as live fibers. `class_bytes(MemoryClass::FiberStack)` is the budgeted
+charge of active and pooled stacks; `reserved_fiber_stack_bytes` is their address space.
+The snapshot's `Display` implementation includes these counts and stack bytes,
+so both `--gc-stats` and `stats_report()` show them.
+
+
+Strict stack admission budgets the commit estimate, not the reservation. A small
+hard limit still admits the default 64 MiB root stack, and thousands of mostly idle
+fibers do not push the governor into pressure that collection cannot relieve. A
+fiber whose recursion commits more than the estimate is under-counted; the stack
+margin check and guard page bound that growth. Observe-only mode reports the same
+bytes without refusing stack reservations.

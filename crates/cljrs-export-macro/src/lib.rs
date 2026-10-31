@@ -369,14 +369,25 @@ fn is_unit_type(ty: &Type) -> bool {
 /// The argument names a function that converts an error string to the ABI result.
 #[proc_macro_attribute]
 pub fn catch_realization(handler: TokenStream, item: TokenStream) -> TokenStream {
-    let handler = parse_macro_input!(handler as syn::Path);
+    let handlers = parse_macro_input!(handler with syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated);
+    let handler = &handlers[0];
     let mut function = parse_macro_input!(item as ItemFn);
     let body = function.block;
-    function.block = Box::new(syn::parse_quote!({
+    let wrapped = quote!({
         match cljrs_value::realization::catch(|| #body) {
             Ok(value) => value,
             Err(message) => #handler(message),
         }
-    }));
+    });
+    function.block = if let Some(cancel_handler) = handlers.get(1) {
+        Box::new(syn::parse_quote!({
+            match cljrs_value::parking::catch_cancelled(|| #wrapped) {
+                Ok(value) => value,
+                Err(error) => #cancel_handler(error),
+            }
+        }))
+    } else {
+        Box::new(syn::parse_quote!(#wrapped))
+    };
     quote!(#function).into()
 }

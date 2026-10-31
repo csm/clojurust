@@ -42,7 +42,7 @@
 //!
 //! A fiber that parks while holding a runtime lock deadlocks the next fiber
 //! on the same thread.  [`TrackedMutex`] counts held guards per thread in
-//! debug builds and [`assert_parkable`] checks the count (and the governor's
+//! every build and [`assert_parkable`] checks the count (and the governor's
 //! critical-section depth) is zero at a park point.
 
 use std::any::Any;
@@ -67,6 +67,8 @@ pub struct MutatorSlot {
     pub trace: fn(&dyn Any, &mut crate::MarkVisitor),
     /// Check borrow discipline before any slot is exchanged.
     pub check: fn(),
+    /// Non-panicking borrow check for optional automatic yields.
+    pub can_swap: fn() -> bool,
 }
 
 inventory::collect!(MutatorSlot);
@@ -98,6 +100,9 @@ pub fn slot_names() -> Vec<&'static str> {
 macro_rules! mutator_slot {
     ($name:literal, refcell $tl:ident : $ty:ty $(, trace $tracer:path)?) => {
         const _: () = {
+            fn can_swap() -> bool {
+                $tl.with(|cell| cell.try_borrow_mut().is_ok())
+            }
             fn check() {
                 $tl.with(|cell| {
                     let _borrow = cell.try_borrow_mut().expect(concat!(
@@ -128,13 +133,14 @@ macro_rules! mutator_slot {
                 $( $tracer(value.downcast_ref::<$ty>().expect("mutator trace type mismatch"), visitor); )?
             }
             $crate::mutator::inventory::submit! {
-                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check }
+                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check, can_swap }
             }
         };
     };
     ($name:literal, cell $tl:ident : $ty:ty $(, trace $tracer:path)?) => {
         const _: () = {
             fn check() {}
+            fn can_swap() -> bool { true }
             fn init() -> ::std::boxed::Box<dyn ::std::any::Any> {
                 ::std::boxed::Box::new(<$ty as ::std::default::Default>::default())
             }
@@ -154,7 +160,7 @@ macro_rules! mutator_slot {
                 $( $tracer(value.downcast_ref::<$ty>().expect("mutator trace type mismatch"), visitor); )?
             }
             $crate::mutator::inventory::submit! {
-                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check }
+                $crate::mutator::MutatorSlot { name: $name, init, swap, trace, check, can_swap }
             }
         };
     };
@@ -257,29 +263,33 @@ thread_local! {
     static GUARDS_HELD: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Number of [`TrackedMutex`] guards the current thread holds.  Always zero
-/// in release builds, where guards are not counted.
+/// Number of runtime mutex guards held on this thread, in every build.
 pub fn guards_held() -> usize {
     GUARDS_HELD.with(Cell::get)
 }
 
-/// Assert that the running computation may park: it holds no runtime lock
-/// and is not inside a governor critical section (debug builds). Borrowed
-/// mutator slots are rejected in every build, before a switch changes state.
+/// Whether an optional automatic yield can safely switch mutator state.
+/// Borrowed slots, runtime locks, and critical sections defer the yield.
+pub fn can_park() -> bool {
+    !std::thread::panicking()
+        && guards_held() == 0
+        && !crate::governor::in_critical_section()
+        && slots().iter().all(|slot| (slot.can_swap)())
+}
+
+/// Assert that an explicit park can switch mutator state, in every build.
 #[track_caller]
 pub fn assert_parkable() {
     check_slots();
-    if cfg!(debug_assertions) {
-        let held = guards_held();
-        assert!(
-            held == 0,
-            "fiber parked while holding {held} runtime lock guard(s)"
-        );
-        assert!(
-            !crate::governor::in_critical_section(),
-            "fiber parked inside a governor critical section"
-        );
-    }
+    let held = guards_held();
+    assert!(
+        held == 0,
+        "fiber parked while holding {held} runtime lock guard(s)"
+    );
+    assert!(
+        !crate::governor::in_critical_section(),
+        "fiber parked inside a governor critical section"
+    );
 }
 
 fn check_slots() {
@@ -288,7 +298,7 @@ fn check_slots() {
     }
 }
 
-/// A `std::sync::Mutex` whose guards are counted per thread in debug builds,
+/// A `std::sync::Mutex` whose guards are counted per thread in every build,
 /// so a park point can assert no runtime lock is held across it.
 ///
 /// Mirrors the subset of the `std::sync::Mutex` API the runtime uses.
@@ -351,20 +361,16 @@ pub struct TrackedMutexGuard<'a, T: ?Sized> {
 
 impl<'a, T: ?Sized> TrackedMutexGuard<'a, T> {
     fn new(guard: std::sync::MutexGuard<'a, T>) -> Self {
-        if cfg!(debug_assertions) {
-            GUARDS_HELD.with(|n| n.set(n.get() + 1));
-        }
+        GUARDS_HELD.with(|n| n.set(n.get() + 1));
         Self { guard }
     }
 }
 
 impl<T: ?Sized> Drop for TrackedMutexGuard<'_, T> {
     fn drop(&mut self) {
-        if cfg!(debug_assertions) {
-            // `try_with`: a guard dropped during thread teardown must not
-            // panic on the already-destroyed counter.
-            let _ = GUARDS_HELD.try_with(|n| n.set(n.get().saturating_sub(1)));
-        }
+        // A guard dropped during thread teardown must not panic if the
+        // counter was already destroyed.
+        let _ = GUARDS_HELD.try_with(|n| n.set(n.get().saturating_sub(1)));
     }
 }
 
@@ -454,16 +460,14 @@ mod tests {
         {
             let g = m.lock().unwrap();
             assert_eq!(*g, 5);
-            if cfg!(debug_assertions) {
-                assert_eq!(guards_held(), before + 1);
-            }
+            assert_eq!(guards_held(), before + 1);
+            assert!(!can_park());
         }
         assert_eq!(guards_held(), before);
         assert_parkable();
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "runtime lock guard")]
     fn parking_with_a_guard_held_panics() {
         let m = TrackedMutex::new(());

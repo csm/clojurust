@@ -22,6 +22,9 @@ enum Class {
     /// Per-mutator, but only compiled in some configurations (the slot is
     /// checked only when it exists).
     FiberWhen(&'static str, bool),
+    /// Per-mutator slot declared only in a crate's own `#[cfg(test)]` code,
+    /// so it is never linked into this binary.
+    FiberTest(&'static str),
     /// Shared by every fiber on the thread; the reason it is safe.
     Thread(&'static str),
 }
@@ -50,6 +53,21 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-async/src/channel.rs",
         "THREAD_FAILURES",
         Fiber("cljrs-async/THREAD_FAILURES"),
+    ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "SCHEDULER",
+        Thread("isolate ready-task counters and watchdog state"),
+    ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "NATIVE_NAMES",
+        Thread("isolate-local cache of immutable native diagnostic names"),
+    ),
+    (
+        "cljrs-async/src/fiber/scheduler.rs",
+        "TEST_BORROW",
+        FiberTest("cljrs-async/TEST_BORROW"),
     ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
@@ -114,6 +132,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-gc/src/governor.rs",
+        "QUIET_RELEASE",
+        Thread("set only while admit drops idle stacks, which never parks"),
+    ),
+    (
+        "cljrs-gc/src/governor.rs",
         "FAULT",
         Thread("isolate-wide memory fault"),
     ),
@@ -151,11 +174,6 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-async/src/fiber.rs",
         "CURRENT",
         Thread("driver metadata installed around resume and unwind"),
-    ),
-    (
-        "cljrs-async/src/fiber.rs",
-        "STACK_POOL",
-        Thread("bounded pool of unused stacks on this isolate"),
     ),
     (
         "cljrs-runtime/src/env/monitor.rs",
@@ -268,6 +286,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-compiler/src/rt_abi.rs",
         "PENDING_RESOURCE_ERROR",
         Fiber("cljrs-compiler/PENDING_RESOURCE_ERROR"),
+    ),
+    (
+        "cljrs-compiler/src/rt_abi.rs",
+        "ERROR_PENDING",
+        Fiber("cljrs-compiler/ERROR_PENDING"),
     ),
     (
         "cljrs-compiler/src/rt_abi.rs",
@@ -554,6 +577,14 @@ fn per_mutator_thread_locals_are_registered_slots() {
             Fiber(slot) => slot,
             FiberWhen(slot, true) => slot,
             FiberWhen(_, false) => continue,
+            FiberTest(slot) => {
+                let src = std::fs::read_to_string(crates_dir().join(file)).unwrap();
+                assert!(
+                    src.contains(&format!("mutator_slot!(\"{slot}\"")),
+                    "{file}: {name} is classified per-mutator but `{slot}` is not declared there"
+                );
+                continue;
+            }
             Thread(reason) => {
                 assert!(!reason.is_empty(), "{file}: {name} needs a reason");
                 continue;

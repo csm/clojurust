@@ -8,6 +8,26 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+/// Private unwind payload for infallible Rust parking APIs.
+#[derive(Debug)]
+struct Cancelled;
+
+/// Stop an infallible parking call. Native and ABI boundaries must use
+/// `catch_cancelled` before returning through foreign frames.
+pub fn resume_cancelled() -> ! {
+    std::panic::resume_unwind(Box::new(Cancelled))
+}
+
+/// Convert only a parking cancellation into a typed error. Preserve all other
+/// panic payloads, including coroutine forced unwinds.
+pub fn catch_cancelled<T>(operation: impl FnOnce() -> T) -> crate::ValueResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(value) => Ok(value),
+        Err(payload) if payload.is::<Cancelled>() => Err(crate::ValueError::Cancelled),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 pub type BlockingResult = Box<dyn Any + Send>;
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
 
