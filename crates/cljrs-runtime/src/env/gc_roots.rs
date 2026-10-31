@@ -248,7 +248,7 @@ fn fiber_safepoint(env: &Env) -> EvalResult<()> {
     })
     .map_err(|error| match error {
         cljrs_gc::fiber::SafepointError::StackOverflow(message) => EvalError::Runtime(message),
-        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::GasExhausted,
+        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::Cancelled,
     })
 }
 

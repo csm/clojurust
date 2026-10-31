@@ -187,6 +187,7 @@ fn register_rt_abi_symbols(builder: &mut JITBuilder) {
     let symbols: &[(&str, *const u8)] = &[
         sym!(rt_safepoint),
         sym!(rt_error_pending),
+        sym!(rt_error_flag_ptr),
         sym!(rt_native_frame_depth),
         sym!(rt_native_frame_cleanup),
         sym!(rt_async_fail),
@@ -411,11 +412,12 @@ mod async_poll_tests {
             let poll = unsafe { std::mem::transmute::<*const (), cljrs_async::state_machine::PollFn>(compiled.fn_ptr) };
             let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
             let local = tokio::task::LocalSet::new();
-            for kind in 0..3 {
+            for kind in 0..4 {
                 globals.intern("user", "review-fail".into(), Value::NativeFunction(cljrs_gc::GcPtr::new(
                     NativeFn::with_closure("review-fail", Arity::Fixed(0), move |_| match kind {
                         0 => Err(ValueError::Thrown(Value::string("original failure"))),
                         1 => Err(ValueError::GasExhausted),
+                        3 => Err(ValueError::Cancelled),
                         _ => Err(ValueError::MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded {
                             class: cljrs_gc::MemoryClass::GcHeap, requested: 1, committed: 2, hard_limit: 1,
                         })),
@@ -430,6 +432,7 @@ mod async_poll_tests {
                 match kind {
                     0 => assert!(matches!(error, EvalError::Thrown(value) if value == Value::string("original failure"))),
                     1 => assert!(matches!(error, EvalError::GasExhausted)),
+                    3 => assert!(matches!(error, EvalError::Cancelled)),
                     _ => assert!(matches!(error, EvalError::MemoryLimitExceeded(_))),
                 }
                 assert_eq!(side_effects.get(), 0, "ran a call after a failed native call");

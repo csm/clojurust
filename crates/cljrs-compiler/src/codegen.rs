@@ -40,7 +40,7 @@ pub type CodegenResult<T> = Result<T, CodegenError>;
 /// Cached `FuncId`s for runtime bridge functions.
 struct RuntimeFuncs {
     rt_safepoint: FuncId,
-    rt_error_pending: FuncId,
+    rt_error_flag_ptr: FuncId,
     rt_native_frame_depth: FuncId,
     rt_native_frame_cleanup: FuncId,
     rt_async_fail: FuncId,
@@ -369,6 +369,7 @@ impl<M: Module> Compiler<M> {
                     is_poll_fn: ir_func.is_async_poll_fn,
                     sm_param: None,
                     frame_depth: None,
+                    error_flag: None,
                 };
                 translator.translate(ir_func)?;
             }
@@ -487,6 +488,7 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     /// The poll function's `*mut CljxStateMachine` parameter (state-machine ABI).
     sm_param: Option<cranelift_codegen::ir::Value>,
     frame_depth: Option<cranelift_codegen::ir::Value>,
+    error_flag: Option<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
@@ -1259,8 +1261,23 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 );
                 self.builder.ins().return_(&[exhausted]);
 
-                // Ready → bind the resolved value; the continuation emits here.
+                // Cancellation also returns in-band without binding a stale value.
                 self.builder.switch_to_block(ready_block);
+                let cancelled_block = self.builder.create_block();
+                let resolved_block = self.builder.create_block();
+                let is_cancelled = self.builder.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    code,
+                    cljrs_async::state_machine::POLL_CANCELLED as i64,
+                );
+                self.builder
+                    .ins()
+                    .brif(is_cancelled, cancelled_block, &[], resolved_block, &[]);
+                self.builder.switch_to_block(cancelled_block);
+                self.builder.ins().return_(&[code]);
+
+                // Ready → bind the resolved value; the continuation emits here.
+                self.builder.switch_to_block(resolved_block);
                 let result = self.call_rt_1(self.rt.rt_async_take_result, sm)?;
                 let var = self.ensure_var(*dst);
                 self.builder.def_var(var, result);
@@ -1418,6 +1435,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let function = self.import_func(self.rt.rt_native_frame_depth);
         let call = self.builder.ins().call(function, &[]);
         self.frame_depth = Some(self.builder.inst_results(call)[0]);
+        let function = self.import_func(self.rt.rt_error_flag_ptr);
+        let call = self.builder.ins().call(function, &[]);
+        self.error_flag = Some(self.builder.inst_results(call)[0]);
     }
 
     fn emit_error_return(&mut self) -> CodegenResult<()> {
@@ -1453,9 +1473,15 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     }
 
     fn emit_error_check(&mut self) -> CodegenResult<()> {
-        let function = self.import_func(self.rt.rt_error_pending);
-        let call = self.builder.ins().call(function, &[]);
-        let error = self.builder.inst_results(call)[0];
+        let address = self
+            .error_flag
+            .expect("compiled function without error flag");
+        let error = self.builder.ins().load(
+            types::I8,
+            cranelift_codegen::ir::MemFlags::trusted(),
+            address,
+            0,
+        );
         self.branch_on_error(error)
     }
 
@@ -1593,25 +1619,16 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             Const::Bool(true) => self.call_rt_0(self.rt.rt_const_true),
             Const::Bool(false) => self.call_rt_0(self.rt.rt_const_false),
             Const::Long(n) => {
-                let func_ref = self.import_func(self.rt.rt_const_long);
                 let arg = self.builder.ins().iconst(types::I64, *n);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                self.emit_error_check()?;
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_long, arg)
             }
             Const::Double(f) => {
-                let func_ref = self.import_func(self.rt.rt_const_double);
                 let arg = self.builder.ins().f64const(*f);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                self.emit_error_check()?;
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_double, arg)
             }
             Const::Char(ch) => {
-                let func_ref = self.import_func(self.rt.rt_const_char);
                 let arg = self.builder.ins().iconst(types::I32, *ch as i64);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                self.emit_error_check()?;
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_char, arg)
             }
             Const::Str(s) => self.emit_string_const(self.rt.rt_const_string, s),
             Const::Regex(s) => self.emit_string_const(self.rt.rt_const_regex, s),
@@ -2694,7 +2711,7 @@ fn declare_runtime_funcs<M: Module>(
 
     Ok(RuntimeFuncs {
         rt_safepoint,
-        rt_error_pending: declare_rt(module, "rt_error_pending", &[], types::I8)?,
+        rt_error_flag_ptr: declare_rt(module, "rt_error_flag_ptr", &[], ptr)?,
         rt_native_frame_depth: declare_rt(module, "rt_native_frame_depth", &[], ptr)?,
         rt_native_frame_cleanup: declare_rt_void(module, "rt_native_frame_cleanup", &[ptr])?,
         rt_async_fail: declare_rt(module, "rt_async_fail", &[ptr], types::I32)?,

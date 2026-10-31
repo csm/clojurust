@@ -170,7 +170,7 @@ pub const RT_IMPORTS: &[RtImport] = &[
     RtImport {
         name: "rt_safepoint",
         params: &[],
-        results: &[I32],
+        results: &[],
     },
     // ── Constant materialization ─────────────────────────────────────────────
     RtImport {

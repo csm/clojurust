@@ -487,7 +487,6 @@ fn emit_one(
         };
         // GC safepoint at function entry (mirrors the native backend).
         em.call_import("rt_safepoint")?;
-        em.ins(&Instruction::Drop);
         em.emit_node(structured)?;
     }
     // A guaranteed-valid terminator: every real path already returned, so this
@@ -1002,7 +1001,6 @@ impl Emitter<'_> {
                 // Back-edge safepoint: the loop label is the continue target, so
                 // emitting here runs it on every iteration.
                 self.call_import("rt_safepoint")?;
-                self.ins(&Instruction::Drop);
                 self.emit_node(body)?;
                 self.labels.pop();
                 self.ins(&Instruction::End);

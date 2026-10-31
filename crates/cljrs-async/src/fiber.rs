@@ -12,10 +12,13 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(feature = "no-gc")]
+use std::cell::RefCell;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
@@ -33,18 +36,19 @@ use scheduler::Scheduling;
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static STACK_POOL: Mutex<Vec<(usize, DefaultStack, StackReservation)>> = Mutex::new(Vec::new());
+
+fn reclaim_idle_stacks() {
+    let idle = std::mem::take(&mut *STACK_POOL.lock().unwrap());
+    drop(idle);
+}
 
 #[derive(Clone, Copy)]
 enum Resume {
     Run,
     Cancel,
 }
-#[derive(Debug)]
-struct Cancelled;
-
-fn resume_cancelled() -> ! {
-    std::panic::resume_unwind(Box::new(Cancelled))
-}
+use cljrs_value::parking::{catch_cancelled, resume_cancelled};
 
 type FiberCoroutine = Coroutine<Resume, Park, EvalResult>;
 
@@ -61,7 +65,6 @@ struct Current {
 thread_local! {
     // Driver metadata, never computation state: set only around resume/unwind.
     static CURRENT: Cell<Option<Current>> = const { Cell::new(None) };
-    static STACK_POOL: RefCell<Vec<(usize, DefaultStack, StackReservation)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The running fiber, or None on the carrier thread (including future polls).
@@ -171,15 +174,8 @@ fn scheduling() -> Option<&'static Scheduling> {
 }
 
 fn yield_slice() -> Result<(), cljrs_gc::fiber::SafepointError> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        park_on_impl(tokio::task::yield_now(), true)
-    })) {
-        Ok(()) => Ok(()),
-        Err(payload) if payload.is::<Cancelled>() => {
-            Err(cljrs_gc::fiber::SafepointError::Cancelled)
-        }
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    catch_cancelled(|| park_on_impl(tokio::task::yield_now(), true))
+        .map_err(|_| cljrs_gc::fiber::SafepointError::Cancelled)
 }
 
 fn install_parking_hooks() {
@@ -188,6 +184,7 @@ fn install_parking_hooks() {
         cljrs_gc::fiber::install(cljrs_gc::fiber::Hooks {
             safepoint: || scheduling().map_or(Ok(false), Scheduling::safepoint),
             yield_now: yield_slice,
+            reclaim_stacks: reclaim_idle_stacks,
             enter_native: |name| scheduling().map_or(0, |s| s.enter_native(name)),
             exit_native: |previous| {
                 if let Some(s) = scheduling() {
@@ -195,6 +192,11 @@ fn install_parking_hooks() {
                 }
             },
         });
+        cljrs_gc::governor().register_shed_hook(std::sync::Arc::new(|pressure| {
+            if pressure != cljrs_gc::PressureLevel::Green {
+                reclaim_idle_stacks();
+            }
+        }));
         cljrs_value::parking::install(cljrs_value::parking::Hooks {
             current: || current().map(|id| id.0),
             park: |future, timeout| {
@@ -246,24 +248,18 @@ impl Fiber {
         bytes: usize,
     ) -> Result<Self, EvalError> {
         install_parking_hooks();
-        let cached = STACK_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
+        let cached = {
+            let mut pool = STACK_POOL.lock().unwrap();
             pool.iter()
                 .position(|(size, _, _)| *size == bytes)
                 .map(|i| pool.swap_remove(i))
-        });
+        };
         let (stack, mut reservation) = if let Some((_, stack, mut reservation)) = cached {
             reservation.set_pooled(false);
             (stack, reservation)
         } else {
-            let reservation = StackReservation::new(bytes)
-                .or_else(|_| {
-                    // Idle stacks must not prevent admission of a differently sized stack.
-                    let idle = STACK_POOL.with(|pool| std::mem::take(&mut *pool.borrow_mut()));
-                    drop(idle);
-                    StackReservation::new(bytes)
-                })
-                .map_err(EvalError::MemoryLimitExceeded)?;
+            let reservation =
+                StackReservation::new(bytes).map_err(EvalError::MemoryLimitExceeded)?;
             let stack = DefaultStack::new(bytes)
                 .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
             (stack, reservation)
@@ -391,15 +387,15 @@ impl FiberTask {
         let stack = co.into_stack();
         self.scheduling.wake.close();
         let mut reservation = self.reservation.take().unwrap();
-        STACK_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
+        {
+            let mut pool = STACK_POOL.lock().unwrap();
             if pool.len() < MAX_POOLED_STACKS
                 && cljrs_gc::governor().pressure() == cljrs_gc::PressureLevel::Green
             {
                 reservation.set_pooled(true);
                 pool.push((self.bytes, stack, reservation));
             }
-        });
+        }
     }
 
     fn unwind(&mut self) {
@@ -416,10 +412,10 @@ impl FiberTask {
             });
             if automatic {
                 self.scheduling.cancel();
-                let outcome = catch_unwind(AssertUnwindSafe(|| co.resume(Resume::Cancel)));
+                let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
                 match outcome {
-                    Err(payload) if payload.is::<Cancelled>() => {}
-                    Err(payload) => std::panic::resume_unwind(payload),
+                    Err(cljrs_value::ValueError::Cancelled) => {}
+                    Err(_) => unreachable!(),
                     Ok(CoroutineResult::Return(_)) => {}
                     Ok(CoroutineResult::Yield(_)) => unreachable!("cancelled fiber suspended"),
                 }

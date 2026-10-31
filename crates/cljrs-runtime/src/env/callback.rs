@@ -180,6 +180,7 @@ pub fn eval_error_to_value_error(e: crate::env::error::EvalError) -> ValueError 
     match e {
         crate::env::error::EvalError::Thrown(v) => ValueError::Thrown(v),
         crate::env::error::EvalError::GasExhausted => ValueError::GasExhausted,
+        crate::env::error::EvalError::Cancelled => ValueError::Cancelled,
         crate::env::error::EvalError::MemoryLimitExceeded(fault) => {
             // Compiled callers drop most errors on the floor; keep the
             // fault in the runtime-fault slot so the compiled-code entry

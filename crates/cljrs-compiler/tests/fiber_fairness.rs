@@ -89,3 +89,126 @@ fn compiled_cpu_loop_yields_to_a_ready_fiber() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn cancellation_during_native_finally_parks_stays_inside_abi_boundaries() {
+    const CHILD: &str = "CLJRS_CANCEL_FINALLY_ABI";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cancellation_during_native_finally_parks_stays_inside_abi_boundaries",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use cljrs_compiler::rt_abi;
+    use cljrs_gc::GcPtr;
+    use cljrs_value::{Arity, NativeFn, ValueError};
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.into_globals();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, async {
+                for kind in 0..3 {
+                    let attempted = Rc::new(Cell::new(false));
+                    let completed = Rc::new(Cell::new(false));
+                    let flag = attempted.clone();
+                    let done = completed.clone();
+                    let body_globals = globals.clone();
+                    let task =
+                        fiber::spawn(move || {
+                            let _ctx = cljrs_runtime::env::callback::install_eval_context_guard(
+                                body_globals,
+                                "user".into(),
+                            );
+                            let body = Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                                "spin",
+                                Arity::Fixed(0),
+                                |_| {
+                                    while rt_abi::rt_safepoint() != 0 {}
+                                    Ok(Value::Nil)
+                                },
+                            )));
+                            let finally = Value::NativeFunction(GcPtr::new(
+                                NativeFn::with_closure("cleanup", Arity::Fixed(0), move |_| {
+                                    flag.set(true);
+                                    match kind {
+                                        0 => cljrs_value::parking::sleep(Duration::from_secs(60)),
+                                        1 => {
+                                            cljrs_value::parking::block_on(
+                                                cljrs_async::channel::Channel::new(0).take(),
+                                            );
+                                        }
+                                        _ => {
+                                            // This infallible wait is directly inside an extern-C
+                                            // bridge, rather than inside another NativeFn wrapper.
+                                            let promise = Value::Promise(GcPtr::new(
+                                                cljrs_value::CljxPromise::new(),
+                                            ));
+                                            unsafe {
+                                                rt_abi::rt_deref(&promise);
+                                            }
+                                            assert!(matches!(
+                                                rt_abi::take_pending_resource_error(),
+                                                Some(ValueError::Cancelled)
+                                            ));
+                                            return Err(ValueError::Cancelled);
+                                        }
+                                    }
+                                    panic!("cancelled cleanup resumed after an explicit park")
+                                }),
+                            ));
+                            let roots = [body, finally];
+                            let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
+                            unsafe {
+                                rt_abi::rt_try(&roots[0], &Value::Nil, &roots[1]);
+                            }
+                            assert!(matches!(
+                                rt_abi::take_pending_resource_error(),
+                                Some(ValueError::Cancelled)
+                            ));
+                            assert_eq!(rt_abi::rt_error_pending(), 0);
+                            assert!(rt_abi::take_pending_exception_value().is_none());
+                            done.set(true);
+                            Err(cljrs_runtime::env::error::EvalError::Cancelled)
+                        })
+                        .unwrap();
+                    let abort = task.abort_handle();
+                    let peer = fiber::spawn(move || {
+                        abort.abort();
+                        Ok(Value::Nil)
+                    })
+                    .unwrap();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                    peer.await.unwrap().into_result().unwrap();
+                    assert!(attempted.get(), "finally was skipped: {kind}");
+                    assert!(
+                        completed.get(),
+                        "cancellation escaped the native ABI: {kind}"
+                    );
+                    assert_eq!(
+                        rt_abi::rt_error_pending(),
+                        0,
+                        "fiber leaked its error flag to the carrier"
+                    );
+                }
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

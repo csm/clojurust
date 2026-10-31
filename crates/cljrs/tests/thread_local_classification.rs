@@ -168,11 +168,6 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         Thread("driver metadata installed around resume and unwind"),
     ),
     (
-        "cljrs-async/src/fiber.rs",
-        "STACK_POOL",
-        Thread("bounded pool of unused stacks on this isolate"),
-    ),
-    (
         "cljrs-runtime/src/env/monitor.rs",
         "HELD_MONITORS",
         Fiber("cljrs-runtime/HELD_MONITORS"),
@@ -283,6 +278,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "cljrs-compiler/src/rt_abi.rs",
         "PENDING_RESOURCE_ERROR",
         Fiber("cljrs-compiler/PENDING_RESOURCE_ERROR"),
+    ),
+    (
+        "cljrs-compiler/src/rt_abi.rs",
+        "ERROR_PENDING",
+        Fiber("cljrs-compiler/ERROR_PENDING"),
     ),
     (
         "cljrs-compiler/src/rt_abi.rs",

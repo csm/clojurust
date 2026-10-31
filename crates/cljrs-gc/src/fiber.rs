@@ -15,6 +15,7 @@ pub enum SafepointError {
 pub struct Hooks {
     pub safepoint: fn() -> Result<bool, SafepointError>,
     pub yield_now: fn() -> Result<(), SafepointError>,
+    pub reclaim_stacks: fn(),
     pub enter_native: fn(&Arc<str>) -> usize,
     pub exit_native: fn(usize),
 }
@@ -44,6 +45,12 @@ pub fn safepoint_with(
         around_yield(hooks.yield_now)
     } else {
         Ok(())
+    }
+}
+
+pub(crate) fn reclaim_idle_stacks() {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.reclaim_stacks)();
     }
 }
 

@@ -2105,9 +2105,18 @@ impl ProcessMemoryGovernor {
         // A compare-and-swap loop, so concurrent grants never commit past
         // `limit`.
         let mut prev = self.committed.load(Ordering::Relaxed);
+        let mut reclaimed = false;
         loop {
             let next = match prev.checked_add(bytes) {
                 Some(n) if n <= limit => n,
+                _ if !reclaimed => {
+                    // No governor or cache lock is held here. Idle stacks are
+                    // reclaimable regardless of the requesting memory class.
+                    reclaimed = true;
+                    crate::fiber::reclaim_idle_stacks();
+                    prev = self.committed.load(Ordering::Relaxed);
+                    continue;
+                }
                 _ => {
                     return Err(MemoryLimitExceeded {
                         class,

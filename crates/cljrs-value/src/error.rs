@@ -41,6 +41,10 @@ pub enum ValueError {
     #[error("gas exhausted")]
     GasExhausted,
 
+    /// Execution was cancelled; the gas budget was not exhausted.
+    #[error("execution cancelled")]
+    Cancelled,
+
     /// The process memory governor refused a governed allocation (strict
     /// mode).  Like `GasExhausted`, it is not catchable by Clojure code.
     #[error("{0}")]
@@ -96,6 +100,7 @@ impl ExceptionInfo {
             ValueError::Unsupported => "Unsupported",
             ValueError::Other(_) => "Other",
             ValueError::GasExhausted => "GasExhausted",
+            ValueError::Cancelled => "Cancelled",
             ValueError::MemoryLimitExceeded(_) => "MemoryLimitExceeded",
             ValueError::OutOfRange => "OutOfRange",
             ValueError::TransientAlreadyPersisted => "TransientAlreadyPersisted",

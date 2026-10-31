@@ -1094,8 +1094,10 @@ impl NativeFn {
             blocking_func: None,
             captures: Default::default(),
             func: Arc::new(move |args| {
-                crate::realization::catch(|| func(args))
-                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
             }),
         }
     }
@@ -1113,8 +1115,10 @@ impl NativeFn {
             blocking_func: None,
             captures: Default::default(),
             func: Arc::new(move |args| {
-                crate::realization::catch(|| func(args))
-                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
             }),
         }
     }
@@ -1145,8 +1149,10 @@ impl NativeFn {
     ) -> Self {
         let mut native = Self::with_closure(name, arity, func);
         native.blocking_func = Some(Arc::new(move |args| {
-            crate::realization::catch(|| blocking_func(args))
-                .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            crate::parking::catch_cancelled(|| {
+                crate::realization::catch(|| blocking_func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            })?
         }));
         native
     }
@@ -1940,6 +1946,8 @@ pub enum FutureState {
     /// The future exhausted the evaluation budget. Kept distinct from a
     /// thrown value so user-level catch clauses cannot intercept it.
     GasExhausted,
+    /// The producer was interrupted by fiber cancellation (uncatchable).
+    Interrupted,
     /// The future's body failed with a managed-memory limit fault (strict
     /// governor mode). Kept distinct for the same reason as `GasExhausted`.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
@@ -2011,6 +2019,7 @@ impl CljxFuture {
             FutureState::Done(v) => Ok(v.clone()),
             FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
             FutureState::GasExhausted => Err(ValueError::GasExhausted),
+            FutureState::Interrupted => Err(ValueError::Cancelled),
             FutureState::MemoryLimitExceeded(f) => Err(ValueError::MemoryLimitExceeded(*f)),
             FutureState::Cancelled => {
                 drop(state);
@@ -2097,6 +2106,7 @@ impl Drop for CljxFuture {
             && matches!(
                 &*state,
                 FutureState::Failed(_)
+                    | FutureState::Interrupted
                     | FutureState::GasExhausted
                     | FutureState::MemoryLimitExceeded(_)
             )

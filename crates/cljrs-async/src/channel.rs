@@ -81,12 +81,14 @@ enum Publication {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ChannelFailure {
     Gas,
+    Cancelled,
     Memory(cljrs_gc::MemoryLimitExceeded),
 }
 impl ChannelFailure {
     fn error(self) -> cljrs_value::ValueError {
         match self {
             Self::Gas => cljrs_value::ValueError::GasExhausted,
+            Self::Cancelled => cljrs_value::ValueError::Cancelled,
             Self::Memory(error) => cljrs_value::ValueError::MemoryLimitExceeded(error),
         }
     }

@@ -123,7 +123,11 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
         .collect();
     let ((result, idx), _, _) = futures_util::future::select_all(branches).await;
     let value = match result {
-        Err(error @ (EvalError::GasExhausted | EvalError::MemoryLimitExceeded(_))) => {
+        Err(
+            error @ (EvalError::GasExhausted
+            | EvalError::Cancelled
+            | EvalError::MemoryLimitExceeded(_)),
+        ) => {
             return Err(error);
         }
         other => other.unwrap_or(Value::Nil),
@@ -347,6 +351,9 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
                 chan_ref(result_ch.get()).try_put_buffered(&value);
             }
             Ok(_) => {}
+            Err(EvalError::Cancelled) => {
+                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Cancelled);
+            }
             Err(error @ EvalError::GasExhausted) => {
                 chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);
                 return Err(error);

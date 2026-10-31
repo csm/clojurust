@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,7 @@ fn stack_pointer() -> usize {
 
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
-    static NATIVE_NAMES: RefCell<HashMap<Arc<str>, usize>> = RefCell::new(HashMap::new());
+    static NATIVE_NAMES: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 }
 
 pub(super) struct Scheduler {
@@ -67,6 +67,80 @@ fn duration_env(name: &str, default: u64, micros: bool) -> Duration {
     }
 }
 
+struct Watches {
+    schedulers: Vec<Weak<Scheduler>>,
+    generation: u64,
+}
+struct Watchdog {
+    state: Mutex<Watches>,
+    changed: Condvar,
+}
+impl Watchdog {
+    fn notify(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.generation = state.generation.wrapping_add(1);
+        self.changed.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let (generation, live) = {
+                let mut state = self.state.lock().unwrap();
+                state.schedulers.retain(|s| s.strong_count() > 0);
+                (
+                    state.generation,
+                    state
+                        .schedulers
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let mut interval: Option<Duration> = None;
+            for scheduler in live {
+                if let Some(message) = scheduler.stall_message(Instant::now()) {
+                    eprintln!("{message}");
+                }
+                if scheduler.running.lock().unwrap().is_some() {
+                    interval = Some(interval.map_or(scheduler.stall, |n| n.min(scheduler.stall)));
+                }
+            }
+            // Generation closes the race between the scan and waiting. Idle
+            // processes sleep without a timer; active carriers need at most
+            // one inspection per configured stall interval.
+            let state = self.state.lock().unwrap();
+            if state.generation != generation {
+                continue;
+            }
+            if let Some(interval) = interval {
+                drop(self.changed.wait_timeout(state, interval).unwrap());
+            } else {
+                drop(self.changed.wait(state).unwrap());
+            }
+        }
+    }
+}
+
+fn watchdog() -> &'static Arc<Watchdog> {
+    static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
+    WATCHDOG.get_or_init(|| {
+        let watches = Arc::new(Watchdog {
+            state: Mutex::new(Watches {
+                schedulers: Vec::new(),
+                generation: 0,
+            }),
+            changed: Condvar::new(),
+        });
+        let registry = watches.clone();
+        // A LocalSet timer cannot run while its own carrier is blocked.
+        std::thread::Builder::new()
+            .name("cljrs-fiber-watchdog".into())
+            .spawn(move || registry.run())
+            .expect("cannot start fiber watchdog");
+        watches
+    })
+}
+
 impl Scheduler {
     fn new() -> Arc<Self> {
         let scheduler = Arc::new(Self {
@@ -77,35 +151,13 @@ impl Scheduler {
             slice: duration_env("CLJRS_FIBER_SLICE_US", 10_000, true),
             stall: duration_env("CLJRS_FIBER_STALL_MS", 100, false),
         });
-        static WATCHES: OnceLock<Arc<Mutex<Vec<Weak<Scheduler>>>>> = OnceLock::new();
-        let watches = WATCHES.get_or_init(|| {
-            let watches = Arc::new(Mutex::new(Vec::<Weak<Scheduler>>::new()));
-            let registry = watches.clone();
-            // A LocalSet timer cannot run while its own carrier is blocked.
-            std::thread::Builder::new()
-                .name("cljrs-fiber-watchdog".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(Duration::from_millis(10));
-                        let live = {
-                            let mut registry = registry.lock().unwrap();
-                            registry.retain(|s| s.strong_count() > 0);
-                            registry
-                                .iter()
-                                .filter_map(Weak::upgrade)
-                                .collect::<Vec<_>>()
-                        };
-                        for scheduler in live {
-                            if let Some(message) = scheduler.stall_message(Instant::now()) {
-                                eprintln!("{message}");
-                            }
-                        }
-                    }
-                })
-                .expect("cannot start fiber watchdog");
-            watches
-        });
-        watches.lock().unwrap().push(Arc::downgrade(&scheduler));
+        watchdog()
+            .state
+            .lock()
+            .unwrap()
+            .schedulers
+            .push(Arc::downgrade(&scheduler));
+        watchdog().notify();
         scheduler
     }
 
@@ -198,6 +250,7 @@ impl Wake for TaskWake {
             }
             state.parent.clone()
         };
+        watchdog().notify();
         if let Some(parent) = parent {
             parent.wake();
         }
@@ -242,19 +295,21 @@ impl Scheduling {
             reported: false,
             wake: Arc::downgrade(&self.wake),
         });
+        watchdog().notify();
         RunGuard(self)
     }
 
     pub(super) fn enter_native(&self, name: &Arc<str>) -> usize {
         let id = NATIVE_NAMES.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if let Some(id) = cache.get(name) {
+            let key = Arc::as_ptr(name).cast::<()>() as usize;
+            if let Some(id) = cache.get(&key) {
                 return *id;
             }
             let mut names = self.wake.scheduler.names.lock().unwrap();
             names.push(name.clone());
             let id = names.len();
-            cache.insert(name.clone(), id);
+            cache.insert(key, id);
             id
         });
         let previous = self.native.replace(id);
@@ -312,6 +367,7 @@ pub(super) struct RunGuard<'a>(&'a Scheduling);
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         *self.0.wake.scheduler.running.lock().unwrap() = None;
+        watchdog().notify();
     }
 }
 

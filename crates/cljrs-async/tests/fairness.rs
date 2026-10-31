@@ -271,3 +271,61 @@ fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
         }
     }).unwrap().join().unwrap();
 }
+
+#[test]
+fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
+    const CHILD: &str = "CLJRS_IDLE_STACK_RECLAIM";
+    let Ok(mode) = std::env::var(CHILD) else {
+        for mode in ["child", "root"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "idle_stacks_are_reclaimed_for_other_classes_across_carriers",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let mib = 1024 * 1024;
+    let (soft, hard, requested) = if mode == "root" {
+        (120 * mib, 128 * mib, 96 * mib)
+    } else {
+        (1800 * 1024, 2 * mib, 1500 * 1024)
+    };
+    let governor = cljrs_gc::governor();
+    let mut config = cljrs_gc::MemoryConfig::with_limits(soft, hard).unwrap();
+    config.strict = true;
+    governor.configure(config).unwrap();
+    let root = mode == "root";
+    std::thread::spawn(move || {
+        if root {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+            fiber::run_root(&rt, &local, &mut carrier, || Ok(Value::Nil)).unwrap();
+        } else {
+            drop(Fiber::new(|| Ok(Value::Nil)).unwrap());
+        }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(governor.snapshot().pooled_fiber_stacks, 1);
+    assert!(governor.class_bytes(MemoryClass::FiberStack) >= if root { 64 * mib } else { mib });
+    let code = governor
+        .reserve_shared(MemoryClass::Code, requested)
+        .unwrap();
+    assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
+    assert_eq!(governor.snapshot().pooled_fiber_stacks, 0);
+    assert_eq!(code.bytes(), requested);
+}
