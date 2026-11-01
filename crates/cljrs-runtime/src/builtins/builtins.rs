@@ -1894,8 +1894,9 @@ impl Iterator for ValueIter {
                         // Not every consumer calls `take_error`; ending the
                         // iteration would hand a truncated result to code in
                         // a cancelled fiber. Continue as the cancellation
-                        // unwind, which the enclosing NativeFn boundary turns
-                        // back into the typed error.
+                        // unwind, which the enclosing NativeFn boundary (or
+                        // `value_to_seq`, for the evaluator) turns back into
+                        // the typed error.
                         Err(ValueError::Cancelled) => cljrs_value::parking::resume_cancelled(),
                         Err(error) => {
                             self.error = Some(error);
@@ -2061,12 +2062,17 @@ pub(crate) fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
         | Value::DoubleArray(_)
         | Value::Str(_)
         | Value::TypeInstance(_) => {
-            let mut iter = ValueIter::new(v.clone());
-            let result: Vec<Value> = iter.by_ref().collect();
-            if let Some(err) = iter.take_error() {
-                return Err(err);
-            }
-            Ok(result)
+            // The evaluator calls this directly (`apply`), outside any
+            // NativeFn boundary, so catch the iterator's cancellation unwind
+            // here: callers get a typed error and `finally` still runs.
+            cljrs_value::parking::catch_cancelled(|| {
+                let mut iter = ValueIter::new(v.clone());
+                let result: Vec<Value> = iter.by_ref().collect();
+                match iter.take_error() {
+                    Some(err) => Err(err),
+                    None => Ok(result),
+                }
+            })?
         }
         Value::Nil => Ok(Vec::new()),
         _ => Err(ValueError::WrongType {

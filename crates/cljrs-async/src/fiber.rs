@@ -12,9 +12,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::cell::Cell;
-#[cfg(feature = "no-gc")]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
@@ -398,11 +396,7 @@ pub struct FiberTask {
 
 impl FiberTask {
     fn release_stack(&mut self) {
-        let Some(co) = self.co.take() else {
-            // The suspended stack was leaked by `unwind`.
-            self.scheduling.wake.close();
-            return;
-        };
+        let co = self.co.take().expect("fiber already completed");
         let stack = co.into_stack();
         self.scheduling.wake.close();
         let mut reservation = self.reservation.take().unwrap();
@@ -424,30 +418,12 @@ impl FiberTask {
         // turn into an uncatchable error, so nothing unwinds through foreign
         // frames. Cleanup then runs as this fiber: its scheduling context is
         // entered, as for a normal resume. Fibers that never started or have
-        // already finished run no code.
+        // already finished run no code. Callers ensure the carrier can park
+        // (see `cancel`), so cleanup never runs under a caller's locks.
         self.pending.take();
         let Some(co) = &mut self.co else { return };
         if !co.started() || co.done() {
             co.force_unwind();
-            return;
-        }
-        if !cljrs_gc::mutator::can_park() {
-            // Dropped where cleanup cannot run (runtime lock held, critical
-            // section, borrowed slot, unwinding). A forced unwind could cross
-            // extern "C" or JIT frames and abort, so leak the suspended stack
-            // instead. Parks hold no runtime locks or slot borrows, so its
-            // frames retain nothing the carrier needs; the stack and its
-            // reservation stay allocated and charged.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "cljrs: fiber {} dropped where it could not be cancelled; \
-                     its stack was leaked",
-                    self.id.0
-                );
-            });
-            std::mem::forget(self.co.take());
-            std::mem::forget(self.reservation.take());
             return;
         }
         let _current = CurrentGuard::enter(Some(Current {
@@ -474,6 +450,7 @@ impl Future for FiberTask {
         let this = self.get_mut();
         assert!(this.co.is_some(), "fiber polled after completion");
         assert_parkable();
+        run_deferred_cancels();
         this.scheduling.wake.poll(cx.waker());
         let cx = &mut Context::from_waker(&this.scheduling.waker);
         this.state.swap_with_current();
@@ -550,6 +527,22 @@ impl Future for FiberTask {
 
 impl FiberTask {
     fn cancel(&mut self) {
+        let suspended = self
+            .co
+            .as_ref()
+            .is_some_and(|co| co.started() && !co.done());
+        if suspended && !cljrs_gc::mutator::can_park() {
+            // Dropped where its cleanup cannot run now (a runtime lock held,
+            // a critical section, a borrowed slot, or unwinding). A forced
+            // unwind could cross extern "C" or JIT frames and abort, and
+            // leaking would strand guards held across the park (lazy-seq
+            // realization, monitors). Queue it; it is cancelled as soon as
+            // this carrier can park.
+            let id = self.id;
+            let task = std::mem::replace(self, FiberTask::empty(id));
+            DEFERRED_CANCELS.with(|queue| queue.borrow_mut().0.push(task));
+            return;
+        }
         if self.co.is_some() {
             self.state.swap_with_current();
             self.unwind();
@@ -559,7 +552,69 @@ impl FiberTask {
                 self.state = MutatorState::fresh();
             }
             self.release_stack();
+            run_deferred_cancels();
         }
+    }
+
+    /// A completed placeholder left behind when a task is moved out to be
+    /// cancelled later. Dropping it does nothing.
+    fn empty(id: FiberId) -> Self {
+        Self {
+            co: None,
+            scheduling: Box::new(Scheduling::new(id, 0, 0)),
+            reservation: None,
+            state: MutatorState::fresh(),
+            pending: None,
+            roots: Box::new([]),
+            roots_guard: None,
+            bytes: 0,
+            id,
+            yielder: std::ptr::null(),
+            root: false,
+            #[cfg(feature = "no-gc")]
+            result_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            owned_result: false,
+            #[cfg(feature = "no-gc")]
+            _captures: Default::default(),
+            #[cfg(feature = "no-gc")]
+            allocation: Default::default(),
+        }
+    }
+}
+
+/// Fibers whose cancellation was deferred because they were dropped where
+/// the carrier could not park. Their detached mutator states stay registered
+/// with the isolate, so queued roots are still traced.
+#[derive(Default)]
+struct DeferredCancels(Vec<FiberTask>);
+impl Drop for DeferredCancels {
+    fn drop(&mut self) {
+        // Thread teardown: thread-locals the cleanup needs may already be
+        // gone, so the remaining stacks are leaked rather than resumed.
+        for task in self.0.drain(..) {
+            std::mem::forget(task);
+        }
+    }
+}
+
+thread_local! {
+    // Carrier driver state, like STACK_POOL: never a computation's state.
+    static DEFERRED_CANCELS: RefCell<DeferredCancels> = RefCell::new(DeferredCancels::default());
+}
+
+/// Cancel queued fibers once the carrier can park. Runs at every fiber poll
+/// and after every completed cancellation.
+fn run_deferred_cancels() {
+    while cljrs_gc::mutator::can_park() {
+        let Some(task) = DEFERRED_CANCELS
+            .try_with(|queue| queue.borrow_mut().0.pop())
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        drop(task);
     }
 }
 

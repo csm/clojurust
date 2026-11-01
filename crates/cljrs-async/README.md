@@ -300,10 +300,11 @@ returns through native frames as an error, then resumes Rust unwinding at the ou
 computation boundary. Cleanup runs as the cancelled fiber, with its scheduling context
 entered. A fiber that never started or already finished runs no code. A suspended fiber
 dropped where it could not park (a runtime lock held, a critical section, a borrowed slot,
-or during unwinding) runs no cleanup either: its stack is leaked, with a one-time
-warning, because a forced unwind could cross `extern "C"` or JIT frames and abort. Parks
-hold no runtime locks or slot borrows, so the leaked frames retain nothing the carrier
-needs; the stack and its reservation stay charged. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
+or during unwinding) is queued on its carrier instead: a forced unwind could cross
+`extern "C"` or JIT frames and abort, and leaking would strand guards held across the park
+(lazy-seq realization, monitors). The queue is drained, each fiber cancelled normally, at
+the next fiber poll or completed cancellation on that carrier. Queued fibers keep their
+detached mutator state, so their roots stay traced; any left at thread exit are leaked. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
 An explicit park during cleanup cannot suspend the fiber; it unwinds to the nearest
 `NativeFn` or C-ABI boundary as `ValueError::Cancelled`.
 Other panic payloads retain their original message and type.

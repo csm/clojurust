@@ -911,14 +911,19 @@ impl SerializedValue {
 pub enum CloneError {
     NotShareable { type_name: &'static str },
     Disconnected,
-    /// Realizing a lazy seq was interrupted by fiber cancellation; callers
-    /// surface it as the uncatchable `ValueError::Cancelled`.
+    /// Realizing a lazy seq was interrupted by fiber cancellation, or ran out
+    /// of gas; callers surface these as the uncatchable `ValueError` kinds.
     Cancelled,
+    GasExhausted,
     /// A byte-bounded isolate channel has no room for the message.
     Full { bytes: usize, queued: usize, limit: usize },
     /// The strict process governor refused the message's queue charge.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
+
+/// The uncatchable `ValueError` for a resource-limit CloneError (cancellation,
+/// gas, memory); `None` for ordinary boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
 /// closures, native resources, and other non-shareable types.

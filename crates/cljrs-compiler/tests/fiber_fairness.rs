@@ -312,7 +312,6 @@ fn dropping_a_fiber_parked_in_an_abi_bridge_under_a_lock_does_not_abort() {
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
-        assert!(stderr.contains("its stack was leaked"), "{stderr}");
         return;
     }
     use cljrs_compiler::rt_abi;
@@ -352,8 +351,12 @@ fn dropping_a_fiber_parked_in_an_abi_bridge_under_a_lock_does_not_abort() {
                 let lock = cljrs_gc::mutator::TrackedMutex::new(());
                 let guard = lock.lock().unwrap();
                 drop(task);
-                drop(guard);
                 assert!(!cleaned.get(), "cleanup ran under a runtime lock");
+                drop(guard);
+                // The deferred cancellation runs at the next fiber poll and
+                // returns through the bridge as an error, not an abort.
+                fiber::spawn(|| Ok(Value::Nil)).unwrap().await.unwrap();
+                assert!(cleaned.get(), "deferred cleanup never ran");
             });
         })
         .unwrap()

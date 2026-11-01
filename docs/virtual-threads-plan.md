@@ -517,7 +517,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - Cancellation of a started fiber, at an automatic yield or an explicit park, uses a
   private resume token and the uncatchable resource-error path to return normally
   through native ABI frames (explicit parks convert at the nearest native boundary). It resumes Rust
-  cancellation at the outer computation boundary. Other panics are rethrown unchanged;
+  cancellation at the outer computation boundary. A fiber dropped where the carrier
+  cannot park is queued and cancelled at the carrier's next fiber poll, never
+  force-unwound. Other panics are rethrown unchanged;
   cancellation cleanup runs without further automatic yields, and an explicit park
   there unwinds to the nearest native boundary as a typed `Cancelled` error.
 - Generated call sites check errors before consuming a nil sentinel. Error exits

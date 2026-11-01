@@ -526,21 +526,38 @@ fn a_panic_after_parking_reports_instead_of_resuming_a_finished_fiber() {
 }
 
 #[test]
-fn dropping_a_parked_fiber_runs_cleanup_only_where_it_could_park() {
+fn dropping_a_parked_fiber_defers_cleanup_until_it_could_park() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    // The first force parks forever; a later reader's force succeeds.
+    #[derive(Debug)]
+    struct ParksFirst(Cell<u32>);
+    impl cljrs_gc::Trace for ParksFirst {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParksFirst {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })?;
+            }
+            Ok(Value::Long(42))
+        }
+    }
     run(async {
         for locked in [false, true] {
             let cleaned = Rc::new(Cell::new(false));
             let flag = cleaned.clone();
+            let lazy = Rc::new(LazySeq::new(Box::new(ParksFirst(Cell::new(0)))));
+            let realizing = lazy.clone();
             let mut task = Box::pin(
                 Fiber::new(move || {
-                    // Cancellation of an explicit park arrives as an error at
-                    // the nearest native boundary; code after it is cleanup.
-                    let parked = cljrs_value::parking::catch_cancelled(|| {
-                        fiber::park_on(std::future::pending::<()>())
-                    });
+                    // Parked inside a realization: its guard must run when
+                    // the fiber is cancelled.
+                    let realized = realizing.try_realize();
                     flag.set(true);
-                    parked.map_err(cljrs_runtime::env::error::value_error_to_eval_error)?;
-                    Ok(Value::Nil)
+                    realized.map_err(cljrs_runtime::env::error::value_error_to_eval_error)
                 })
                 .unwrap()
                 .into_task(),
@@ -550,12 +567,89 @@ fn dropping_a_parked_fiber_runs_cleanup_only_where_it_could_park() {
             let lock = cljrs_gc::mutator::TrackedMutex::new(());
             let guard = locked.then(|| lock.lock().unwrap());
             drop(task);
+            // Under a runtime lock, cleanup must not run inside the drop.
+            assert_eq!(cleaned.get(), !locked, "cleanup ran under a runtime lock");
             drop(guard);
-            assert_eq!(
-                cleaned.get(),
-                !locked,
-                "cleanup ran under a runtime lock: {locked}"
-            );
+            // The next fiber poll on this carrier runs the deferred cleanup.
+            fiber::spawn(|| Ok(Value::Nil)).unwrap().await.unwrap();
+            assert!(cleaned.get(), "deferred cleanup never ran: {locked}");
+            // The realization was released, not stranded in Realizing.
+            let reader = lazy.clone();
+            let value = fiber::spawn(move || {
+                reader
+                    .try_realize()
+                    .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+            })
+            .unwrap()
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+            assert_eq!(value, Value::Long(42));
         }
     });
+}
+
+#[test]
+fn cancellation_while_apply_spreads_a_lazy_seq_still_runs_finally() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    #[derive(Debug)]
+    struct Parks;
+    impl cljrs_gc::Trace for Parks {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for Parks {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            cljrs_value::parking::catch_cancelled(|| fiber::park_on(std::future::pending::<()>()))?;
+            Ok(Value::Nil)
+        }
+    }
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap();
+            let globals = runtime.globals().clone();
+            let released = Rc::new(Cell::new(false));
+            let flag = released.clone();
+            globals.intern(
+                "user",
+                "release!".into(),
+                Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "release!",
+                    Arity::Fixed(0),
+                    move |_| {
+                        flag.set(true);
+                        Ok(Value::Nil)
+                    },
+                ))),
+            );
+            globals.intern(
+                "user",
+                "parked".into(),
+                Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(Parks)))),
+            );
+            let form = cljrs_reader::Parser::new(
+                "(try (apply vector parked) (finally (release!)))".into(),
+                "<apply-finally>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let task = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(&form, &mut Env::new(globals, "user"))
+                })
+                .unwrap();
+                tokio::task::yield_now().await;
+                task.abort();
+                assert!(task.await.err().unwrap().is_cancelled());
+            });
+            assert!(released.get(), "finally was skipped by the cancellation");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

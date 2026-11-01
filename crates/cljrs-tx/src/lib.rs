@@ -276,6 +276,7 @@ fn execute_inner(
         .map_err(map_eval_error)?;
     let result = serialize(&result).map_err(|error| match error {
         CloneError::Cancelled => TxError::Cancelled,
+        CloneError::GasExhausted => TxError::GasExhausted,
         other => TxError::Clone(other),
     })?;
     validate_pure_data(&result).map_err(TxError::InvalidResult)?;
@@ -298,11 +299,15 @@ fn host_native(entry: &HostEntry) -> Value {
         Arc::clone(&entry.name),
         Arity::Variadic { min: 0 },
         move |args| {
-            let args: Vec<SerializedValue> =
-                args.iter()
-                    .map(serialize)
-                    .collect::<Result<_, _>>()
-                    .map_err(|error| ValueError::Other(format!("host call argument: {error}")))?;
+            let args: Vec<SerializedValue> = args
+                .iter()
+                .map(serialize)
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                // Cancellation and resource limits stay uncatchable.
+                cljrs_value::clone::resource_value_error(&error)
+                    .unwrap_or_else(|| ValueError::Other(format!("host call argument: {error}")))
+            })?;
             for arg in &args {
                 validate_pure_data(arg).map_err(|what| {
                     ValueError::Other(format!("host call argument is not pure data: {what}"))

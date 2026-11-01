@@ -379,7 +379,6 @@ impl Scheduling {
             scheduling: self,
             outer,
             native,
-            entered: now,
         }
     }
 
@@ -453,7 +452,6 @@ pub(super) struct RunGuard<'a> {
     scheduling: &'a Scheduling,
     outer: Option<Running>,
     native: usize,
-    entered: Instant,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
@@ -463,7 +461,8 @@ impl Drop for RunGuard<'_> {
         // without a safepoint counts. Repeated short inner resumes therefore
         // still let a stalled outer fiber be reported.
         let outer = self.outer.take().map(|mut run| {
-            run.heartbeat += self.entered.elapsed();
+            // `enter` set this resume's `slice_start`; nothing else changes it.
+            run.heartbeat += self.scheduling.slice_start.get().elapsed();
             run
         });
         *scheduler.running.lock().unwrap() = outer;

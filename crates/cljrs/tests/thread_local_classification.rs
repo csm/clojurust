@@ -55,6 +55,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         Fiber("cljrs-async/THREAD_FAILURES"),
     ),
     (
+        "cljrs-async/src/fiber.rs",
+        "DEFERRED_CANCELS",
+        Thread("carrier queue of dropped fibers awaiting cancellation; each keeps its own state"),
+    ),
+    (
         "cljrs-async/src/fiber/scheduler.rs",
         "SCHEDULER",
         Thread("isolate ready-task counters and watchdog state"),

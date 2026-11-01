@@ -73,6 +73,9 @@ pub enum CloneError {
     /// Realizing a lazy value was interrupted by fiber cancellation; callers
     /// must surface it as `ValueError::Cancelled`, which stays uncatchable.
     Cancelled,
+    /// Realizing a lazy value exhausted the gas budget; callers surface it
+    /// as the uncatchable `ValueError::GasExhausted`.
+    GasExhausted,
     /// The process memory governor refused the message's queue charge
     /// (strict mode).
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
@@ -98,6 +101,7 @@ impl std::fmt::Display for CloneError {
             }
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
             CloneError::Cancelled => write!(f, "execution cancelled"),
+            CloneError::GasExhausted => write!(f, "gas exhausted"),
             CloneError::MemoryLimitExceeded(e) => e.fmt(f),
             CloneError::Full {
                 bytes,
@@ -492,6 +496,18 @@ impl SerializedErrorKind {
 
 // ── serialize ─────────────────────────────────────────────────────────────────
 
+/// The `ValueError` a caller surfaces for a resource-limit `CloneError`
+/// (cancellation, gas, memory), so it stays uncatchable; `None` for ordinary
+/// boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError> {
+    match error {
+        CloneError::Cancelled => Some(ValueError::Cancelled),
+        CloneError::GasExhausted => Some(ValueError::GasExhausted),
+        CloneError::MemoryLimitExceeded(fault) => Some(ValueError::MemoryLimitExceeded(*fault)),
+        _ => None,
+    }
+}
+
 /// Serialize a `Value` into a `Send + Sync` wire form suitable for crossing an
 /// isolate boundary. Returns [`CloneError`] for non-shareable values.
 pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
@@ -603,9 +619,10 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
 
         // ── Lazy sequences: realize first ──
         Value::LazySeq(p) => serialize(&p.get().try_realize().map_err(|error| match error {
-            // Cancellation and memory faults keep their identity, so they are
-            // not turned into a catchable "not shareable" error.
+            // Resource errors and cancellation keep their identity, so they
+            // are not turned into a catchable "not shareable" error.
             ValueError::Cancelled => CloneError::Cancelled,
+            ValueError::GasExhausted => CloneError::GasExhausted,
             ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
             _ => not_shareable("lazy seq whose realization failed"),
         })?),

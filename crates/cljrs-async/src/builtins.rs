@@ -130,8 +130,11 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
         .collect();
     let ((result, idx, interrupted), _, _) = futures_util::future::select_all(branches).await;
     let value = match result {
-        // Settle as Interrupted, like `take!`: awaiters get the catchable
-        // cancellation exception, and an unread result is not reported.
+        // Return the uncatchable `Cancelled`, like `take!`. Run as a spawned
+        // future (`alts`), the select then settles as Interrupted, so its
+        // awaiters see the catchable cancellation exception and an unread
+        // result is not reported. A direct caller of `alts_select` receives
+        // `Cancelled` itself.
         Err(_) if interrupted => return Err(EvalError::Cancelled),
         Err(
             error @ (EvalError::GasExhausted
