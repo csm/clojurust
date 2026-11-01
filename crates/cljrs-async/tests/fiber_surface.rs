@@ -167,21 +167,21 @@ fn pending_local_future_rejects_carrier_waits_and_root_can_borrow_env() {
             );
             let error = cljrs_runtime::tiered::eval(&forms[0], &mut env).unwrap_err();
             assert!(error.to_string().contains("outside a fiber"), "{error}");
-            // A regular function called by a legacy go body must also reject the
-            // carrier wait instead of pinning the async evaluator.
+            // Phase 5: a go body runs on its own fiber, so a regular function it
+            // calls may park on a pending future.
             let forms = cljrs_reader::Parser::new(
                 "(defn ordinary [] @(future 42)) (await (clojure.core.async/go (ordinary)))".into(),
                 "<legacy>".into(),
             )
             .parse_all()
             .unwrap();
-            cljrs_async::eval_async::eval_async(&forms[0], &mut env)
+            cljrs_async::fiber::eval_form(&forms[0], &mut env)
                 .await
                 .unwrap();
-            let error = cljrs_async::eval_async::eval_async(&forms[1], &mut env)
+            let value = cljrs_async::fiber::eval_form(&forms[1], &mut env)
                 .await
-                .unwrap_err();
-            assert!(error.to_string().contains("outside a fiber"), "{error}");
+                .unwrap();
+            assert_eq!(value.to_string(), "42");
         })
         .join()
         .unwrap();

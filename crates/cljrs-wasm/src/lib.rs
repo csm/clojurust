@@ -6,7 +6,8 @@ use std::sync::Arc;
 use tokio::task::LocalSet;
 use wasm_bindgen::prelude::*;
 
-use cljrs_async::eval_async::{await_value, eval_async as eval_form_async};
+use cljrs_async::await_value;
+use cljrs_async::eval_async::eval_async as eval_form_async;
 use cljrs_reader::Parser;
 use cljrs_runtime::builtins::builtins::{pop_output_capture, push_output_capture};
 use cljrs_runtime::env::env::{Env, GlobalEnv};

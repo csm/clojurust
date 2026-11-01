@@ -39,7 +39,6 @@ src/
     jit_compiler.rs — `compile_jit` / `compile_jit_poll`: build a `JITModule`, register rt_abi symbols, call shared codegen
     jit_worker.rs   — background compile thread; maps Tier-1 type profiles to per-parameter specializations
     code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints; each module holds a governor `MemoryClass::Code` charge (`reserve_reported`: reported, never denied, even in strict mode) for its machine code until it is reclaimed
-    async_jit.rs    — `^:async` arity activation: lower → state machine → native poll fn
     osr_integration.rs — (test-only) end-to-end OSR entry compile + call
   wasm/         — (feature `wasm-aot`) AOT Clojure → WebAssembly backend (second backend over the same IR)
     mod.rs      — public API (`compile_function`, `compile_bundle`, `WasmBackend`, `WasmError`); browser tier model
@@ -370,7 +369,7 @@ pub mod code_cache {
 
 `install` registers a `Jit` on the runtime's `JitState`
 (`cljrs_runtime::tiered::backend::JitBackend`) — enqueue, OSR enqueue,
-mark-stale, pending-exception, deopt-sentinel, and async-compile in one
+mark-stale, pending-exception, and deopt-sentinel in one
 object, per runtime.  The first call also creates the process-wide pieces:
 the compile queue, the `cljrs-jit-worker` thread, the var-rebind hook, and
 the stop-the-world reclaim hook.  All per-arity state (counters, argument
@@ -378,8 +377,8 @@ profiles, published pointers, OSR entries) belongs to the runtime, not to
 this module; this module owns the compiled machine code.
 
 Everything else here is crate-private: `jit_compiler::compile_jit` (and
-`compile_jit_poll` for `^:async` state machines), `jit_worker`, and
-`async_jit`.
+`compile_jit_poll`, test-only, for the `^:async` state-machine ABI) and
+`jit_worker`.
 
 Environment: `CLJRS_JIT_THRESHOLD` (Tier-1 calls before compiling, default
 1000), `CLJRS_OSR_THRESHOLD` (loop back-edges before an OSR-entry compile),
@@ -589,18 +588,14 @@ instantiating the AOT module against it (passing the runtime's reserved bases
 through `WasmLayout`), and wiring the IR interpreter in as the dynamic-code tier
 is the remaining runtime-side step.
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → generate Cargo harness → `cargo build --release` → copy binary.
 
-**Async activation (Phase H):** `compile_async_poll_fns` introspects the
-`^:async` fns the program defined (their `def` forms are evaluated into the
-compile-time env first), lowers each arity to a state machine (`is_async`, no
-region pass — a region scope can't span a suspend), compiles a poll function
-(`declare_poll_function`) into the same object module, and records
-`(ns, name, arity, symbol, n_slots)`. The harness declares each symbol `extern
-"C"` and calls `cljrs_async::state_machine::register_poll_fn_named` after
-`cljrs_async::init`, so `^:async` dispatch runs native. Unsupported bodies
-(channels/spawn/`throw`/regions), capturing closures, and fns with inner
-closures fall back to the `eval_async` tree-walker.
+**`^:async` functions are not compiled to state machines.** Their bodies stay
+interpreted, and each call runs its body on a fiber (`docs/virtual-threads-plan.md`
+Phase 5), where `await` parks. TODO.md Phase H (async state machines) is closed:
+neither the JIT nor the AOT driver lowers `^:async` arities to poll functions.
+`codegen`'s poll-function ABI and `jit_compiler::compile_jit_poll` (test-only)
+remain only for the `cljrs_ir::lower::lower_async` unit coverage.
 
 **Versioned namespaces are snapshotted at compile time.** Versioned requires
 execute during expansion (fetching the pinned source from git); a discovery
@@ -831,7 +826,6 @@ Under no-GC, standalone Rust callers can bound borrowed-result ownership with a 
 Unscoped host results receive program-lifetime ownership.
 Runtime evaluation and fiber drivers establish the required scopes.
 
-The no-GC AOT async-function scan scopes its reads of defined function roots.
 Compiled array stores acquire caller ownership before returning a compact scalar alias.
 The identity ABI handles arrays, metadata wrappers, reduced values, and transients.
 

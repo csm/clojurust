@@ -4,8 +4,9 @@
 //! a `Value::Future` immediately and resolve on the `LocalSet` executor, so they
 //! compose with `await` exactly like an `^:async` call. `close!`, `poll!`, and
 //! `offer!` act on a channel synchronously and return their result directly.
-//! `async-spawn` runs a thunk on the `LocalSet` as an async task (the runtime
-//! backing the `go` macro).
+//! `async-spawn` runs a thunk concurrently (the runtime backing the `go` macro):
+//! on a fiber on native targets, as a colored task on wasm32. On native targets
+//! `<!`, `>!`, and `alts!` are the parking `<!!`, `>!!`, and `alts!!`.
 
 use rand::seq::SliceRandom;
 use std::future::Future;
@@ -23,7 +24,7 @@ use cljrs_value::{
 };
 
 use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
-use crate::eval_async::{await_value, spawn_future_with_roots};
+use crate::task::{await_value, spawn_future_with_roots};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
 type AltBranch = Pin<Box<dyn Future<Output = (EvalResult, usize, bool)>>>;
@@ -56,6 +57,23 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ("<!!", Arity::Fixed(1), builtin_take_blocking),
         (">!!", Arity::Fixed(2), builtin_put_blocking),
     ];
+    // Phase 5: `go` bodies run on fibers, so the parking ops are ordinary
+    // functions that park the fiber. wasm32 defines them as `await` macros in
+    // `core_async_wasm.cljrs` because its `go` bodies stay colored.
+    #[cfg(not(target_arch = "wasm32"))]
+    let fns = {
+        let mut fns = fns;
+        fns.extend([
+            (
+                "<!",
+                Arity::Fixed(1),
+                builtin_take_blocking as fn(&[Value]) -> ValueResult<Value>,
+            ),
+            (">!", Arity::Fixed(2), builtin_put_blocking),
+            ("alts!", Arity::Variadic { min: 1 }, builtin_alts_blocking),
+        ]);
+        fns
+    };
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
         globals.intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(nf)));
@@ -262,10 +280,12 @@ fn builtin_offer(args: &[Value]) -> ValueResult<Value> {
 
 // ── Phase H: blocking sync-context channel ops (<!! / >!!) ──────────────────
 
-/// `(<!! ch)` — blocking take from a synchronous (non-async) context.
+/// `(<!! ch)` / `(<! ch)` — take from a channel, parking the calling fiber.
 ///
 /// Parks a fiber until data arrives, or blocks the OS thread outside a fiber.
 /// Returns nil on a closed, drained channel. Colored async callers use take!.
+/// A `go` block or `^:async` call returns a future rather than a channel; a
+/// take of a future or promise waits for its value, so `(<!! (go ...))` works.
 fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
     if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
     {
@@ -274,6 +294,10 @@ fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
              use (await (take! ch)) instead"
                 .into(),
         ));
+    }
+    if let Some(pending @ (Value::Future(_) | Value::Promise(_))) = args.first() {
+        return cljrs_runtime::interp::eval::deref_value(pending.clone())
+            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error);
     }
     let ch = channel_arg(args)?;
     cljrs_value::parking::block_on(chan_ref(ch.get()).take_result())
@@ -297,9 +321,10 @@ fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
     Ok(Value::Bool(chan_ref(ch.get()).put_blocking(val)))
 }
 
-/// `(async-spawn thunk)` — run a zero-arg function as an async task on the
-/// `LocalSet`, returning a `Value::Future`. The thunk body runs in an async
-/// context, so `await` inside it yields. This is the runtime behind `go`.
+/// `(async-spawn thunk)` — run a zero-arg function concurrently, returning a
+/// `Value::Future`. This is the runtime behind `go`. Native targets run the
+/// thunk on its own fiber, where `await`, `<!`, and other waits park the fiber.
+/// wasm32 runs it as a colored `eval_async` task.
 fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_runtime::env::callback::capture_eval_context()
@@ -360,7 +385,7 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     #[cfg(not(target_arch = "wasm32"))]
     let _ = rt;
     #[cfg(target_arch = "wasm32")]
-    let body = crate::eval_async::await_value(
+    let body = crate::task::await_value(
         rt.spawn_fiber_call(thunk, Vec::new(), call_env)
             .map_err(|error| ValueError::Other(error.to_string()))?,
     );

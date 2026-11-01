@@ -1,8 +1,9 @@
-//! Phase B integration tests: `^:async` dispatch, `eval_async`, and `await`.
+//! Phase B integration tests: `^:async` dispatch and `await`, run on fibers
+//! (virtual-threads Phase 5) through `fiber::eval_form`.
 
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -83,7 +84,7 @@ fn await_resolves_async_fn_result() {
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync("(defn ^:async dbl [x] (* x 2))", &mut env);
-        let r = eval_async(&parse_one("(await (dbl 21))"), &mut env)
+        let r = eval_form(&parse_one("(await (dbl 21))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(42));
@@ -103,7 +104,7 @@ fn await_inside_let_and_nested_async_calls() {
                  (+ x y)))",
             &mut env,
         );
-        let r = eval_async(&parse_one("(await (add-both 10 20))"), &mut env)
+        let r = eval_form(&parse_one("(await (add-both 10 20))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(32));
@@ -115,7 +116,7 @@ fn anonymous_fn_async_metadata_is_detected() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(let [f (fn ^:async [x] (* x 2))] (await (f 5)))"),
             &mut env,
         )
@@ -143,7 +144,7 @@ fn async_annotation_on_params_after_a_name_is_detected() {
                 "`{src}`: expected Future, got {v:?}"
             );
         }
-        let r = eval_async(&parse_one("(await (h 21))"), &mut env)
+        let r = eval_form(&parse_one("(await (h 21))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(42));
@@ -159,7 +160,7 @@ fn outer_async_annotation_on_anonymous_fn_is_detected() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(let [f ^:async (fn [x] (* x 2))] (await (f 5)))"),
             &mut env,
         )
@@ -212,11 +213,11 @@ fn await_in_if_branch_yields() {
             &mut env,
         );
         eval_sync("(defn ^:async id-async [x] x)", &mut env);
-        let r = eval_async(&parse_one("(await (pick 7))"), &mut env)
+        let r = eval_form(&parse_one("(await (pick 7))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(7));
-        let r0 = eval_async(&parse_one("(await (pick -1))"), &mut env)
+        let r0 = eval_form(&parse_one("(await (pick -1))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r0, Value::Long(0));
@@ -232,7 +233,7 @@ fn awaiting_failed_async_fn_propagates_error() {
             "(defn ^:async boom [] (throw (ex-info \"nope\" {})))",
             &mut env,
         );
-        let r = eval_async(&parse_one("(await (boom))"), &mut env).await;
+        let r = eval_form(&parse_one("(await (boom))"), &mut env).await;
         assert!(r.is_err(), "expected error, got {r:?}");
     });
 }
@@ -259,31 +260,31 @@ fn defn_attr_map_marks_async() {
     });
 }
 
-// ── Phase C: deref enforcement in async context ────────────────────────────
+// ── Phase C (superseded by virtual-threads Phase 5): deref in async bodies ──
+//
+// Native `^:async` bodies run on fibers, so `deref` parks like `await`.
 
 #[test]
-fn deref_of_future_in_async_fn_errors() {
+fn deref_of_future_in_async_fn_parks() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync("(defn ^:async producer [] 42)", &mut env);
-        eval_sync("(defn ^:async bad [] (deref (producer)))", &mut env);
-        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
-        let err = format!("{:?}", r.unwrap_err());
-        assert!(err.contains("await"), "error should steer to await: {err}");
+        eval_sync("(defn ^:async good [] (deref (producer)))", &mut env);
+        let r = eval_form(&parse_one("(await (good))"), &mut env).await;
+        assert_eq!(r.unwrap(), Value::Long(42));
     });
 }
 
 #[test]
-fn at_deref_of_future_in_async_fn_errors() {
+fn at_deref_of_future_in_async_fn_parks() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync("(defn ^:async producer [] 42)", &mut env);
-        eval_sync("(defn ^:async bad [] @(producer))", &mut env);
-        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
-        let err = format!("{:?}", r.unwrap_err());
-        assert!(err.contains("await"), "error should steer to await: {err}");
+        eval_sync("(defn ^:async good [] @(producer))", &mut env);
+        let r = eval_form(&parse_one("(await (good))"), &mut env).await;
+        assert_eq!(r.unwrap(), Value::Long(42));
     });
 }
 
@@ -317,7 +318,7 @@ fn timeout_resolves_to_nil() {
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_ASYNC, &mut env);
-        let r = eval_async(&parse_one("(await (timeout 5))"), &mut env)
+        let r = eval_form(&parse_one("(await (timeout 5))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Nil);
@@ -332,14 +333,14 @@ fn alts_picks_first_ready_value_and_index() {
         eval_sync(REQUIRE_ASYNC, &mut env);
         eval_sync("(defn ^:async producer [] 42)", &mut env);
         // The immediate producer resolves before the 1s timeout: index 0.
-        let val = eval_async(
+        let val = eval_form(
             &parse_one("(first (await (alts [(producer) (timeout 1000)])))"),
             &mut env,
         )
         .await
         .unwrap();
         assert_eq!(val, Value::Long(42));
-        let idx = eval_async(
+        let idx = eval_form(
             &parse_one("(second (await (alts [(producer) (timeout 1000)])))"),
             &mut env,
         )
@@ -356,7 +357,7 @@ fn alts_selects_timeout_when_it_wins() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_ASYNC, &mut env);
         // Only a timeout in the set: it must win at index 0 with value nil.
-        let r = eval_async(&parse_one("(await (alts [(timeout 5)]))"), &mut env)
+        let r = eval_form(&parse_one("(await (alts [(timeout 5)]))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&r), "[nil 0]");
@@ -376,7 +377,7 @@ fn alt_dispatches_to_matching_handler() {
                     (timeout 1000)  (fn [_] [:timed-out])))",
             &mut env,
         );
-        let r = eval_async(&parse_one("(await (runner))"), &mut env)
+        let r = eval_form(&parse_one("(await (runner))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&r), "[:value :got]");
@@ -395,11 +396,11 @@ fn buffered_chan_put_then_take() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_CHAN, &mut env);
         eval_sync("(def ch (chan 4))", &mut env);
-        let put = eval_async(&parse_one("(await (put! ch 42))"), &mut env)
+        let put = eval_form(&parse_one("(await (put! ch 42))"), &mut env)
             .await
             .unwrap();
         assert_eq!(put, Value::Bool(true));
-        let got = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let got = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(got, Value::Long(42));
@@ -414,15 +415,15 @@ fn take_on_closed_channel_yields_nil() {
         eval_sync(REQUIRE_CHAN, &mut env);
         eval_sync("(def ch (chan 1))", &mut env);
         // A buffered value remains takeable after close, then nil.
-        eval_async(&parse_one("(await (put! ch :only))"), &mut env)
+        eval_form(&parse_one("(await (put! ch :only))"), &mut env)
             .await
             .unwrap();
         eval_sync("(close! ch)", &mut env);
-        let first = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let first = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&first), ":only");
-        let second = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let second = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(second, Value::Nil);
@@ -437,7 +438,7 @@ fn put_on_closed_channel_is_false() {
         eval_sync(REQUIRE_CHAN, &mut env);
         eval_sync("(def ch (chan 1))", &mut env);
         eval_sync("(close! ch)", &mut env);
-        let put = eval_async(&parse_one("(await (put! ch 1))"), &mut env)
+        let put = eval_form(&parse_one("(await (put! ch 1))"), &mut env)
             .await
             .unwrap();
         assert_eq!(put, Value::Bool(false));
@@ -471,10 +472,10 @@ fn go_block_passes_value_through_channels() {
             "(go (let [v (await (take! in))] (await (put! out (* v 2)))))",
             &mut env,
         );
-        eval_async(&parse_one("(await (put! in 21))"), &mut env)
+        eval_form(&parse_one("(await (put! in 21))"), &mut env)
             .await
             .unwrap();
-        let r = eval_async(&parse_one("(await (take! out))"), &mut env)
+        let r = eval_form(&parse_one("(await (take! out))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(42));
@@ -492,11 +493,11 @@ fn rendezvous_chan_hands_off_to_taker() {
         // A consumer go block relays the rendezvous value to `out`.
         eval_sync("(go (await (put! out (await (take! ch)))))", &mut env);
         // The put resolves true only once the consumer has taken the value.
-        let put = eval_async(&parse_one("(await (put! ch :hello))"), &mut env)
+        let put = eval_form(&parse_one("(await (put! ch :hello))"), &mut env)
             .await
             .unwrap();
         assert_eq!(put, Value::Bool(true));
-        let r = eval_async(&parse_one("(await (take! out))"), &mut env)
+        let r = eval_form(&parse_one("(await (take! out))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&r), ":hello");
@@ -528,7 +529,7 @@ fn join_all_awaits_all_futures() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         eval_sync("(defn ^:async plus1 [x] (+ x 1))", &mut env);
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(await (join-all [(plus1 1) (plus1 2) (plus1 3)]))"),
             &mut env,
         )
@@ -544,7 +545,7 @@ fn join_all_empty_seq_returns_empty_vector() {
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
-        let r = eval_async(&parse_one("(await (join-all []))"), &mut env)
+        let r = eval_form(&parse_one("(await (join-all []))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&r), "[]");
@@ -558,7 +559,7 @@ fn async_pmap_maps_fn_over_coll() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         eval_sync("(defn ^:async double [x] (* x 2))", &mut env);
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(await (async-pmap double [1 2 3 4]))"),
             &mut env,
         )
@@ -575,7 +576,7 @@ fn thread_macro_puts_result_on_channel() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         eval_sync("(def result-ch (thread (+ 6 7)))", &mut env);
-        let r = eval_async(&parse_one("(await (take! result-ch))"), &mut env)
+        let r = eval_form(&parse_one("(await (take! result-ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(13));
@@ -589,19 +590,19 @@ fn onto_chan_seeds_and_closes_channel() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         eval_sync("(def ch (chan 5))", &mut env);
-        eval_async(&parse_one("(await (onto-chan! ch [10 20 30]))"), &mut env)
+        eval_form(&parse_one("(await (onto-chan! ch [10 20 30]))"), &mut env)
             .await
             .unwrap();
-        let a = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let a = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let b = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let b = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let c = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let c = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let d = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let d = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(a, Value::Long(10));
@@ -618,16 +619,16 @@ fn to_chan_creates_seeded_closed_channel() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         eval_sync("(def ch (to-chan! [:a :b :c]))", &mut env);
-        let a = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let a = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let b = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let b = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let c = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let c = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
-        let d = eval_async(&parse_one("(await (take! ch))"), &mut env)
+        let d = eval_form(&parse_one("(await (take! ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&a), ":a");
@@ -648,7 +649,7 @@ fn merge_combines_two_channels() {
             &mut env,
         );
         // Drain all four values; order is unspecified so sort.
-        let r = eval_async(&parse_one("(await (into [] out))"), &mut env)
+        let r = eval_form(&parse_one("(await (into [] out))"), &mut env)
             .await
             .unwrap();
         let mut vals: Vec<i64> = match &r {
@@ -677,7 +678,7 @@ fn async_reduce_folds_over_channel() {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
         // reduce + on a channel of [1 2 3 4 5].
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(await (reduce + 0 (to-chan! [1 2 3 4 5])))"),
             &mut env,
         )
@@ -693,7 +694,7 @@ fn async_into_drains_channel_to_vector() {
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_F, &mut env);
-        let r = eval_async(
+        let r = eval_form(
             &parse_one("(await (into [] (to-chan! [10 20 30])))"),
             &mut env,
         )
@@ -715,13 +716,13 @@ fn mult_broadcasts_to_two_taps() {
         eval_sync("(def t2  (chan 4))", &mut env);
         eval_sync("(tap! m t1)", &mut env);
         eval_sync("(tap! m t2)", &mut env);
-        eval_async(&parse_one("(await (put! src :ping))"), &mut env)
+        eval_form(&parse_one("(await (put! src :ping))"), &mut env)
             .await
             .unwrap();
-        let v1 = eval_async(&parse_one("(await (take! t1))"), &mut env)
+        let v1 = eval_form(&parse_one("(await (take! t1))"), &mut env)
             .await
             .unwrap();
-        let v2 = eval_async(&parse_one("(await (take! t2))"), &mut env)
+        let v2 = eval_form(&parse_one("(await (take! t2))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&v1), ":ping");
@@ -741,7 +742,7 @@ fn mult_closes_taps_when_source_closes() {
         eval_sync("(tap! m tap)", &mut env);
         eval_sync("(close! src)", &mut env);
         // The mult background loop should close `tap` when source closes.
-        let v = eval_async(&parse_one("(await (take! tap))"), &mut env)
+        let v = eval_form(&parse_one("(await (take! tap))"), &mut env)
             .await
             .unwrap();
         assert_eq!(v, Value::Nil, "tap should be closed when source closes");
@@ -762,10 +763,10 @@ fn untap_removes_a_tap() {
         eval_sync("(tap! m t2)", &mut env);
         eval_sync("(untap! m t1)", &mut env);
         // t1 has been removed; only t2 should receive the value.
-        eval_async(&parse_one("(await (put! src :hello))"), &mut env)
+        eval_form(&parse_one("(await (put! src :hello))"), &mut env)
             .await
             .unwrap();
-        let v2 = eval_async(&parse_one("(await (take! t2))"), &mut env)
+        let v2 = eval_form(&parse_one("(await (take! t2))"), &mut env)
             .await
             .unwrap();
         assert_eq!(pr(&v2), ":hello");
@@ -790,7 +791,7 @@ fn loop_with_await_inside_async_fn() {
             &mut env,
         );
         eval_sync("(def ch (to-chan! [1 2 3 4 5]))", &mut env);
-        let r = eval_async(&parse_one("(await (sum-ch ch))"), &mut env)
+        let r = eval_form(&parse_one("(await (sum-ch ch))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(15));
@@ -904,37 +905,34 @@ fn blocking_take_multiple_values_from_seeded_channel() {
 }
 
 #[test]
-fn take_blocking_errors_inside_async_fn() {
+fn take_blocking_parks_inside_async_fn() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_BLOCKING, &mut env);
         eval_sync("(def ch (chan 1))", &mut env);
-        eval_sync("(defn ^:async bad [] (<!! ch))", &mut env);
-        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
-        assert!(r.is_err());
-        let msg = format!("{:?}", r.unwrap_err());
-        assert!(
-            msg.contains("async"),
-            "error should mention async context: {msg}"
-        );
+        // The consumer parks on the empty channel; the producer then fills it.
+        eval_sync("(defn ^:async consumer [] (<!! ch))", &mut env);
+        eval_sync("(def pending (consumer))", &mut env);
+        eval_form(&parse_one("(>!! ch 7)"), &mut env).await.unwrap();
+        let r = eval_form(&parse_one("(await pending)"), &mut env).await;
+        assert_eq!(r.unwrap(), Value::Long(7));
     });
 }
 
 #[test]
-fn put_blocking_errors_inside_async_fn() {
+fn put_blocking_parks_inside_async_fn() {
     let globals = async_env();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
         eval_sync(REQUIRE_BLOCKING, &mut env);
-        eval_sync("(def ch (chan 1))", &mut env);
-        eval_sync("(defn ^:async bad [] (>!! ch 1))", &mut env);
-        let r = eval_async(&parse_one("(await (bad))"), &mut env).await;
-        assert!(r.is_err());
-        let msg = format!("{:?}", r.unwrap_err());
-        assert!(
-            msg.contains("async"),
-            "error should mention async context: {msg}"
-        );
+        // Rendezvous: the put parks until the take below consumes it.
+        eval_sync("(def ch (chan))", &mut env);
+        eval_sync("(defn ^:async producer [] (>!! ch 1))", &mut env);
+        eval_sync("(def pending (producer))", &mut env);
+        let got = eval_form(&parse_one("(<!! ch)"), &mut env).await;
+        assert_eq!(got.unwrap(), Value::Long(1));
+        let r = eval_form(&parse_one("(await pending)"), &mut env).await;
+        assert_eq!(r.unwrap(), Value::Bool(true));
     });
 }

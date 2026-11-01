@@ -547,6 +547,45 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - Re-evaluate `TODO.md` Phase H (async JIT state machines); fibers make it unnecessary for
   correctness and likely for performance.
 
+**Status: implemented on native targets; wasm32 keeps the colored model (see Platform scope).**
+
+- `go` bodies and `^:async` calls run on fibers. `AsyncRuntime::spawn_async_call` builds a
+  call fiber whose entry runs the callee's body directly (`apply_fn_body`), so the fiber does
+  not dispatch, and spawn, again. The body uses the ordinary evaluator in every interpreter
+  mode. Calls still return a `Future` immediately and convey dynamic bindings, gas meters, and
+  interrupts like `future`.
+- `^:async` keeps its meaning for callers: a call runs concurrently and returns a future. It no
+  longer selects an evaluator, so `deref`, `<!!`, and other waits inside such a body park instead
+  of raising the Phase C "use await" errors. Those errors now apply only on wasm32.
+- `await` is the synchronous special form everywhere on native targets: it parks on a future or
+  promise and returns other values unchanged.
+- `<!`, `>!`, and `alts!` are native functions that alias the parking `<!!`, `>!!`, and
+  `alts!!`. They park in any fiber, including ordinary functions called from a `go` body, as in
+  core.async's virtual-thread mode. A take of a future or promise waits for its value, so
+  `(<!! (go ...))` works although `go` still returns a future rather than a channel.
+  wasm32 defines `<!` and `>!` as macros over `await` (`core_async_wasm.cljrs`).
+- `eval_async` is compiled only for wasm32 (and natively behind the `colored-eval` feature, which `cljrs-wasm` enables so it builds in the workspace). The shared future-delivery helpers moved to
+  `cljrs_async::task`. `fiber::eval_form` evaluates one form on a fiber from async code on the
+  LocalSet; it replaces native uses of `eval_async`. The whole async test corpus runs on fibers.
+- Phase H is closed. No dispatch path consults compiled poll functions: the JIT no longer
+  activates `^:async` arities (`JitBackend::compile_async_arity` and `async_jit.rs` are gone),
+  and the AOT driver no longer compiles or registers poll functions. Fibers suspend JIT and AOT
+  frames as they are, so a state-machine transform adds no correctness and its remaining
+  benefit (smaller suspended state) does not justify a second compilation path. The unused
+  `lower_async` transform, poll-function codegen, and `cljrs_async::state_machine` ABI remain
+  for a follow-up deletion.
+- Debug builds reserve 4 MiB fiber stacks by default; release builds keep 1 MiB.
+  Unoptimized tree-walker frames are several times larger, and macro-heavy `go` bodies such
+  as `alt` exceeded 1 MiB in debug builds. Stack pages are committed lazily.
+- Dynamic bindings: a `go` block now sees the bindings in effect where it starts (core.async
+  semantics). Previously its colored task saw only root bindings.
+- `tests/converged.rs` covers `go` with `<!`/`>!`, parking through ordinary functions and
+  HOFs, `alts!`, `deref` inside `^:async` bodies, concurrent `^:async` rendezvous, the colored
+  spelling, and error delivery, in both interpreter modes with collections at park points.
+  In `no-gc` builds the rendezvous case is ignored: values handed between two parked fibers
+  over a rendezvous channel are released early. The same failure reproduces with plain
+  `future` before this phase, so it is tracked as a separate `no-gc` ownership bug.
+
 ---
 
 ## Costs and risks
@@ -561,7 +600,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - **Hidden thread-local state** added in future code. Mitigated by the classification test.
 - **Lock-across-park bugs** are the most likely source of real-world hangs. Mitigated by the debug
   guard counter and by making realization/monitor waits fiber-aware.
-- **Two async models during transition** (Phases 1–4). Accepted. Phase 5 removes the duplication.
+- **Two async models during transition** (Phases 1–4). Accepted. Phase 5 removed the duplication
+  on native targets; wasm32 keeps the colored evaluator until it can switch stacks.
 
 ## Non-goals
 

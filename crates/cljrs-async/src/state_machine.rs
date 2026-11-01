@@ -124,7 +124,7 @@ pub enum Readiness {
 }
 
 /// Check whether an awaited value has resolved, without blocking.  Mirrors
-/// [`crate::eval_async::await_value`] but for the poll-loop (no `.await`):
+/// [`crate::task::await_value`] but for the poll-loop (no `.await`):
 /// futures/promises report their settled state; any other value is immediately
 /// ready (awaiting a non-future is the identity).
 pub fn check_ready(val: &Value) -> Readiness {
@@ -252,7 +252,7 @@ pub fn spawn_state_machine(
     let roots = args.clone();
     let mut sm = CljxStateMachine::new(poll_fn, n_slots, args);
     sm.eval_ctx = eval_ctx;
-    crate::eval_async::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
+    crate::task::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
 }
 
 // ── Compiled poll-function registry ──────────────────────────────────────────
@@ -343,7 +343,7 @@ pub fn lookup_poll_fn_named(ns: &str, name: &str, arity: usize) -> Option<(PollF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval_async::{await_value, spawn_future};
+    use crate::task::{await_value, spawn_future};
 
     fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
         let rt = tokio::runtime::Builder::new_current_thread()

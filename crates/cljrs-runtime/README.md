@@ -641,7 +641,9 @@ collection.
 ### `apply` submodule
 
 `apply_value` applies an evaluated callee to evaluated args (functions,
-keywords, maps, sets, vars, protocol/multimethod dispatch). For a
+keywords, maps, sets, vars, protocol/multimethod dispatch). `apply_fn_body(callee,
+args, env)` runs a function's body on the current stack without `^:async`
+dispatch; the async runtime calls it from the fiber an `^:async` call spawns. For a
 `Value::ProtocolFn` callee whose protocol has `extend_via_metadata` set (`(defprotocol
 Name :extend-via-metadata true ...)`), dispatch first checks the first arg's
 metadata for an entry keyed by the method's FULLY-QUALIFIED SYMBOL — `ns/method`,
@@ -1158,7 +1160,8 @@ conditional in ANY slot of an `ns` require spec, namespace included, so
 `[#?(:clj clojure.core :cljs cljs.core) :as core]` reads — an option selecting
 no branch is dropped, a namespace selecting none is an error.
 
-**Pieces shared with the async evaluator.** `cljrs-async`'s `eval_async` has its
+**Pieces shared with the async evaluator.** `cljrs-async`'s `eval_async` (wasm32 only; native
+targets run `^:async` bodies on fibers with this evaluator) has its
 own arm for every special form that evaluates a sub-expression in place, because
 running one on the sync path parks the `LocalSet` thread at any `await` inside
 it. To keep those arms from re-implementing the forms, `special.rs` exposes each
@@ -1364,8 +1367,9 @@ pub mod defn_registry {
 3. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
 4. If not cached **or async**: counts the call (`jit_state::record_interp_call`, Phase 10.7 —
    see "Background lowering" below) and falls back to `interp::apply::call_cljrs_fn`
-   (tree-walking).  For `^:async` functions the tree-walking path dispatches to `eval_async`
-   in `cljrs-async`, which cooperatively yields to the Tokio `LocalSet` executor.
+   (tree-walking).  An `^:async` call first dispatches through the async runtime hook: on
+   native targets `cljrs-async` runs the body on a fiber via `env::apply::apply_fn_body`
+   (which skips async dispatch); on wasm32 it runs `eval_async`.
 5. How IR gets into the cache:
    - **Warm-threshold background lowering (default, Phase 10.7)**: when a function's
      tree-walked call count crosses `ir_threshold()` (default 50), the dispatch seam

@@ -7,10 +7,16 @@
 
 ;; (go body...)
 ;;
-;; Spawn `body` as an asynchronous task on the LocalSet executor and return a
-;; Future that delivers the body's value. The body runs in an async context, so
-;; channel operations are used as `(await (take! ch))` / `(await (put! ch v))`.
-(defmacro go [& body]
+;; Run `body` concurrently and return a Future that delivers the body's value.
+;; On native targets the body runs on its own fiber with the ordinary
+;; evaluator: `<!`, `>!`, `alts!`, `await`, and `deref` park the fiber instead
+;; of blocking the isolate, and any function the body calls may park too.
+;; On wasm32 the body is a colored async task, so channel operations are
+;; written `(<! ch)` / `(>! ch v)` (macros over `await`) directly in the body.
+(defmacro go
+  "Runs body concurrently and returns a future of its value. On native targets
+  the body runs on a fiber, where <!, >!, alts!, await, and deref park."
+  [& body]
   (list 'clojure.core.async/async-spawn
         (cons 'fn (cons [] body))))
 

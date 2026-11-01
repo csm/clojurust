@@ -10,6 +10,9 @@
 //! IR tier instead.
 //!
 //! These drive the async path directly, which is where the divergence was.
+//!
+//! Since virtual-threads Phase 5 these cases run on fibers (`fiber::eval_form`);
+//! the colored `eval_async` evaluator they first targeted is wasm32-only.
 
 use std::sync::Arc;
 
@@ -41,7 +44,7 @@ fn eval_async_src(src: &str) -> Result<Value, String> {
     local.block_on(&rt, async {
         let mut result = Value::Nil;
         for form in &forms {
-            result = cljrs_async::eval_async::eval_async(form, &mut env)
+            result = cljrs_async::fiber::eval_form(form, &mut env)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
         }

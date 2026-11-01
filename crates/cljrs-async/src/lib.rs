@@ -13,7 +13,9 @@
 //! ```
 //!
 //! After `init`, `^:async` functions, `await`, and the `clojure.core.async`
-//! primitives implemented so far (`timeout`, `alts`, `alt`) are available.
+//! primitives are available. On native targets `go` bodies and `^:async`
+//! calls run on fibers (`fiber`), so `await` and channel ops park the fiber.
+//! wasm32 keeps the colored `eval_async` evaluator.
 //! The Tokio `current_thread` + `LocalSet` executor must be running on the
 //! calling thread (the CLI sets this up automatically when built with the
 //! `async` feature).
@@ -22,6 +24,7 @@ use std::sync::Arc;
 
 mod builtins;
 pub mod channel;
+#[cfg(any(target_arch = "wasm32", feature = "colored-eval"))]
 pub mod eval_async;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fiber;
@@ -30,17 +33,22 @@ mod isolate_builtins;
 pub mod isolate_channel;
 mod runtime;
 pub mod state_machine;
+pub mod task;
 pub mod worker_pool;
 use runtime::AsyncRuntimeImpl;
 
 // Re-exported so sibling native crates (e.g. `cljrs-io`) can spawn work onto the
 // shared `LocalSet` executor and await Clojure futures/promises without reaching
 // into private modules.
-pub use eval_async::{await_value, spawn_future, spawn_future_with_roots};
+pub use task::{await_value, spawn_future, spawn_future_with_roots};
 
 /// Clojure-level `clojure.core.async` definitions (the `alt` macro), evaluated
 /// on top of the native primitives at `init` time.
 const CORE_ASYNC_SOURCE: &str = include_str!("core_async.cljrs");
+
+/// wasm32-only `<!` / `>!` macros over `await`, for colored `go` bodies.
+#[cfg(target_arch = "wasm32")]
+const CORE_ASYNC_WASM_SOURCE: &str = include_str!("core_async_wasm.cljrs");
 
 /// Error-value helpers (`error?`, `ok?`, `throw-err`) shared by the
 /// channel-based APIs. Loaded as `clojure.rust.error` before `clojure.core.async`
@@ -76,6 +84,8 @@ pub fn init(globals: &Arc<cljrs_runtime::env::env::GlobalEnv>) {
     builtins::register(globals, ns);
     isolate_builtins::register(globals, ns);
     load_source(globals, ns, CORE_ASYNC_SOURCE);
+    #[cfg(target_arch = "wasm32")]
+    load_source(globals, ns, CORE_ASYNC_WASM_SOURCE);
     globals.mark_loaded(ns);
 }
 

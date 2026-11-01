@@ -110,8 +110,8 @@ pub struct IrFunction {
     pub span: Option<Span>,
     pub subfunctions: Vec<IrFunction>,
     /// Whether this function was declared `^:async`.
-    /// Async IR functions fall back to tree-walking `eval_async`; Phase H JIT
-    /// will emit Cranelift state machines with explicit resume points.
+    /// Async IR functions fall back to the tree-walker, which runs their body
+    /// on a fiber (native) or `eval_async` (wasm32). Phase H is closed.
     pub is_async: bool,
     /// Static per-parameter repr seeds from `^long`/`^double` hints (positional
     /// with `params`).  Empty ⇒ no hints.  Preferred over profiled specs.
@@ -196,8 +196,8 @@ be lost and a stray var defined.  The method tree-walks instead, where
 **Async instructions** (Phase H):
 
 - `Await { src, dst }` — yield point inside `^:async` fn; `dst` receives the
-  resolved `Future`/`Promise` value.  IR interpreter uses blocking deref;
-  `eval_async` yields to the Tokio executor.
+  resolved `Future`/`Promise` value.  The IR interpreter derefs, which parks
+  on a fiber.
 - `Spawn { fn_reg, args, dst }` — spawn an `^:async` call as a LocalSet task;
   `dst` receives a `Value::Future` immediately.
 - `ChanTake { chan, dst }` — async take from a channel; parks until a value is

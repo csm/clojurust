@@ -31,7 +31,14 @@ use cljrs_gc::fiber::StackReservation;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use scheduler::Scheduling;
 
+/// Default fiber stack reservation. `go` and `^:async` bodies run the
+/// tree-walker on fibers, and unoptimized builds use several times more stack
+/// per interpreter frame, so debug builds reserve 4 MiB. Pages are committed
+/// lazily, so the larger reservation costs address space, not memory.
+#[cfg(not(debug_assertions))]
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+#[cfg(debug_assertions)]
+const DEFAULT_STACK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static STACK_POOL: Mutex<Vec<(usize, DefaultStack, StackReservation)>> = Mutex::new(Vec::new());
@@ -848,4 +855,34 @@ pub fn run_root_owned(
         &mut driver.carrier,
         body,
     )
+}
+
+/// Evaluate one top-level form on a new fiber from async code that already
+/// runs on the isolate's LocalSet, and return its result.
+///
+/// This is the fiber replacement for the retired native `eval_async` entry
+/// point. The form runs on the ordinary evaluator, so `await`, `deref`, and
+/// channel ops park the fiber. The fiber evaluates in a fresh environment for
+/// `env`'s globals and namespace; a namespace change made by the form (`ns`,
+/// `in-ns`) is copied back into `env`. Lexical frames in `env` are not visible.
+/// Use [`run_root`] instead when the caller is not already inside the runtime.
+pub async fn eval_form(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> EvalResult {
+    let form = form.clone();
+    let globals = env.globals.clone();
+    let start_ns = env.current_ns.clone();
+    let final_ns = std::rc::Rc::new(RefCell::new(start_ns.clone()));
+    let report_ns = final_ns.clone();
+    let task = Fiber::new(move || {
+        let mut fiber_env = cljrs_runtime::env::env::Env::new(globals, &start_ns);
+        let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
+        *report_ns.borrow_mut() = fiber_env.current_ns.clone();
+        result
+    })?
+    .into_task();
+    let result = task.await;
+    env.current_ns = final_ns.borrow().clone();
+    result
 }

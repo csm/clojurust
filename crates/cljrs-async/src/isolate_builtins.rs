@@ -43,10 +43,10 @@ use cljrs_value::{
     ValueResult, gc_native_object,
 };
 
-use crate::eval_async::spawn_future_with_roots;
 use crate::isolate_channel::{
     IsolateReceiver, IsolateRecv, IsolateSender, isolate_channel, isolate_channel_with_limit,
 };
+use crate::task::spawn_future_with_roots;
 
 /// Native type tag for the sending end of a cross-isolate channel.
 pub(crate) const ISOLATE_TX_TAG: &str = "IsolateSender";

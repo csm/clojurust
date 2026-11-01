@@ -5,10 +5,13 @@
 //! resolve it in the other. These tests pin that parity: for each source, the
 //! async evaluator must produce exactly what the sync evaluator produces, and
 //! both must match the hand-inlined spelling.
+//!
+//! Since virtual-threads Phase 5 these cases run on fibers (`fiber::eval_form`);
+//! the colored `eval_async` evaluator they first targeted is wasm32-only.
 
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 
@@ -56,7 +59,7 @@ fn eval_both(src: &str) -> (Result<String, String>, Result<String, String>) {
 
     let asynced = block_on_local(async move {
         let mut env = Env::new(globals, "user");
-        eval_async(&form, &mut env)
+        eval_form(&form, &mut env)
             .await
             .map(|v| format!("{v}"))
             .map_err(|e| e.to_string())

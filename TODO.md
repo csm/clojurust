@@ -458,10 +458,10 @@ Foundations already in place:
 
 *Milestone evidence:* `crates/cljrs/tests/background_lowering.rs` — without `CLJRS_EAGER_LOWER`, a hot fn tiers tree-walk → background-lowered IR → JIT-native mid-run with per-iteration correctness; the debug log shows `background lower published`; rebinding a dependency mid-warm takes effect immediately; the worker runs without `cljrs_jit::init` (`CLJRS_NO_JIT=1`); `--ir-threshold 0` produces no lowering.
 
-### Phase H (deferred) — Async JIT
+### Phase H (closed) — Async JIT
 
-- [ ] Emit Cranelift state machines with explicit resume points for `^:async` functions, integrating with the Tokio executor
-- [ ] Re-evaluate against stackful fibers (`docs/virtual-threads-plan.md` Phase 5), which suspend JIT frames without a state-machine transform
+- [x] ~~Emit Cranelift state machines with explicit resume points for `^:async` functions~~ — not pursued
+- [x] Re-evaluate against stackful fibers (`docs/virtual-threads-plan.md` Phase 5): closed. Fibers suspend every tier, including JIT and AOT frames, without a state-machine transform, so `^:async` bodies run on fibers and no dispatch path uses compiled state machines. The leftover `lower_async` transform, poll-function codegen, and `cljrs_async::state_machine` ABI are now unused by the runtime; delete them in a follow-up
 
 ---
 
