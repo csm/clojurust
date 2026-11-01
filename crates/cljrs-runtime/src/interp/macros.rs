@@ -367,7 +367,12 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
         // Lazy sequences and cons cells: materialize into a list form.
         // This handles macro output like (cons 'do (map ...)).
         Value::LazySeq(ls) => {
-            return value_to_form(&ls.get().try_realize().map_err(EvalError::Runtime)?, span);
+            return value_to_form(
+                &ls.get()
+                    .try_realize()
+                    .map_err(crate::env::error::realize_error_to_eval_error)?,
+                span,
+            );
         }
         Value::Cons(c) => {
             let mut items: Vec<Form> = Vec::new();
@@ -379,7 +384,10 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
                         cur = cell.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        cur = ls.get().try_realize().map_err(EvalError::Runtime)?
+                        cur = ls
+                            .get()
+                            .try_realize()
+                            .map_err(crate::env::error::realize_error_to_eval_error)?
                     }
                     Value::List(l) => {
                         for v in l.get().iter() {

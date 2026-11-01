@@ -872,7 +872,7 @@ mod tests {
                 fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
             }
             impl crate::types::Thunk for T {
-                fn force(&self) -> Result<Value, String> {
+                fn force(&self) -> crate::ValueResult<Value> {
                     Ok(Value::Nil)
                 }
             }

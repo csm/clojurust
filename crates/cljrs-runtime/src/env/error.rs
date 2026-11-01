@@ -99,6 +99,24 @@ impl EvalError {
 /// `(catch Throwable e ..)` bind a value on which `ex-message` / `ex-data`
 /// behave the same as for a user `throw` / `ex-info`. A `ValueError::Thrown`
 /// (a builtin re-throwing a Clojure value) is surfaced as that exact value.
+/// A `Thunk::force` error: cancellation stays typed, so lazy cells do not
+/// cache it; every other failure becomes its message, as before.
+pub fn eval_error_to_thunk_error(error: EvalError) -> ValueError {
+    match error {
+        EvalError::Cancelled => ValueError::Cancelled,
+        other => ValueError::Other(other.to_string()),
+    }
+}
+
+/// A realization error (`LazySeq::try_realize`, `Delay::force`) as a runtime
+/// error, keeping cancellation uncatchable.
+pub fn realize_error_to_eval_error(error: ValueError) -> EvalError {
+    match error {
+        ValueError::Cancelled => EvalError::Cancelled,
+        other => EvalError::Runtime(other.to_string()),
+    }
+}
+
 pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
     match err {
         ValueError::Thrown(v) => EvalError::Thrown(v),

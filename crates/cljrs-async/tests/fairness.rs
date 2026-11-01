@@ -425,22 +425,21 @@ fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
 fn cancelled_realization_leaves_shared_lazy_values_pending() {
     use cljrs_value::types::{Delay, LazySeq, Thunk};
 
-    // The first force parks until cancelled, converting the cancellation to a
-    // thunk error as a NativeFn boundary inside the thunk would; later forces
-    // succeed.
+    // The first force parks until cancelled and returns the typed
+    // cancellation, as a NativeFn boundary inside a Clojure thunk does; later
+    // forces succeed.
     #[derive(Debug)]
     struct ParkOnce(Cell<u32>);
     impl cljrs_gc::Trace for ParkOnce {
         fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
     }
     impl Thunk for ParkOnce {
-        fn force(&self) -> Result<Value, String> {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
             self.0.set(self.0.get() + 1);
             if self.0.get() == 1 {
                 cljrs_value::parking::catch_cancelled(|| {
                     fiber::park_on(std::future::pending::<()>())
-                })
-                .map_err(|error| error.to_string())?;
+                })?;
                 unreachable!("pending park resumed");
             }
             Ok(Value::Long(42))
@@ -453,25 +452,110 @@ fn cancelled_realization_leaves_shared_lazy_values_pending() {
         for target in ["delay", "lazy"] {
             let (d, l) = (delay.clone(), lazy.clone());
             let task = fiber::spawn(move || {
-                let _ = match target {
+                let result = match target {
                     "delay" => d.force(),
                     _ => l.try_realize(),
                 };
-                panic!("cancelled realization returned normally");
+                // The cancellation propagates typed, so a caller holding a
+                // lock returns normally instead of unwinding through it.
+                assert!(matches!(result, Err(cljrs_value::ValueError::Cancelled)));
+                Err(cljrs_runtime::env::error::EvalError::Cancelled)
             })
             .unwrap();
             tokio::task::yield_now().await;
             task.abort();
             assert!(task.await.err().unwrap().is_cancelled());
         }
+        // A real exception raised during cancellation cleanup stays an
+        // ordinary, catchable error rather than turning into cancellation.
+        #[derive(Debug)]
+        struct Fails;
+        impl cljrs_gc::Trace for Fails {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl Thunk for Fails {
+            fn force(&self) -> cljrs_value::ValueResult<Value> {
+                Err(cljrs_value::ValueError::Other("parse failed".into()))
+            }
+        }
+        let checked = Rc::new(Cell::new(false));
+        let flag = checked.clone();
+        let task = fiber::spawn(move || {
+            let parked = cljrs_value::parking::catch_cancelled(|| {
+                fiber::park_on(std::future::pending::<()>())
+            });
+            let failing = Delay::new(Box::new(Fails));
+            assert!(
+                matches!(failing.force(), Err(cljrs_value::ValueError::Other(m)) if m == "parse failed")
+            );
+            flag.set(true);
+            parked.map_err(cljrs_runtime::env::error::value_error_to_eval_error)?;
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        assert!(checked.get(), "cleanup did not run");
         // Healthy readers re-run the thunk instead of seeing a cached error.
         let (d, l) = (delay.clone(), lazy.clone());
         let reader = fiber::spawn(move || {
-            assert_eq!(d.force(), Ok(Value::Long(42)));
-            assert_eq!(l.try_realize(), Ok(Value::Long(42)));
+            assert_eq!(d.force().unwrap(), Value::Long(42));
+            assert_eq!(l.try_realize().unwrap(), Value::Long(42));
             Ok(Value::Nil)
         })
         .unwrap();
         reader.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
+fn a_panic_after_parking_reports_instead_of_resuming_a_finished_fiber() {
+    run(async {
+        let task = fiber::spawn(|| {
+            fiber::park_on(tokio::task::yield_now());
+            panic!("native bug after a park");
+        })
+        .unwrap();
+        let error = task.await.unwrap().into_result().unwrap_err();
+        assert!(
+            matches!(&error, EvalError::Runtime(message) if message.contains("native bug after a park")),
+            "{error}"
+        );
+    });
+}
+
+#[test]
+fn dropping_a_parked_fiber_runs_cleanup_only_where_it_could_park() {
+    run(async {
+        for locked in [false, true] {
+            let cleaned = Rc::new(Cell::new(false));
+            let flag = cleaned.clone();
+            let mut task = Box::pin(
+                Fiber::new(move || {
+                    // Cancellation of an explicit park arrives as an error at
+                    // the nearest native boundary; code after it is cleanup.
+                    let parked = cljrs_value::parking::catch_cancelled(|| {
+                        fiber::park_on(std::future::pending::<()>())
+                    });
+                    flag.set(true);
+                    parked.map_err(cljrs_runtime::env::error::value_error_to_eval_error)?;
+                    Ok(Value::Nil)
+                })
+                .unwrap()
+                .into_task(),
+            );
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(task.as_mut().poll(&mut cx).is_pending());
+            let lock = cljrs_gc::mutator::TrackedMutex::new(());
+            let guard = locked.then(|| lock.lock().unwrap());
+            drop(task);
+            drop(guard);
+            assert_eq!(
+                cleaned.get(),
+                !locked,
+                "cleanup ran under a runtime lock: {locked}"
+            );
+        }
     });
 }

@@ -26,7 +26,7 @@ use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStat
 use crate::eval_async::{await_value, spawn_future_with_roots};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
-type AltBranch = Pin<Box<dyn Future<Output = (EvalResult, usize)>>>;
+type AltBranch = Pin<Box<dyn Future<Output = (EvalResult, usize, bool)>>>;
 
 /// Register the async native functions into the given namespace.
 pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -116,13 +116,22 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
         .enumerate()
         .map(|(i, v)| {
             Box::pin(async move {
-                let result = await_value(v).await;
-                (result, i)
+                let result = await_value(v.clone()).await;
+                // A producer interrupted by cancellation fails the select with
+                // its catchable exception, as every other reader sees it,
+                // rather than contributing nil like an ordinary failure.
+                let interrupted = result.is_err()
+                    && matches!(&v, Value::Future(future) if matches!(
+                        &*future.get().state.lock().unwrap(),
+                        cljrs_value::FutureState::Interrupted
+                    ));
+                (result, i, interrupted)
             }) as AltBranch
         })
         .collect();
-    let ((result, idx), _, _) = futures_util::future::select_all(branches).await;
+    let ((result, idx, interrupted), _, _) = futures_util::future::select_all(branches).await;
     let value = match result {
+        Err(error) if interrupted => return Err(error),
         Err(
             error @ (EvalError::GasExhausted
             | EvalError::Cancelled
@@ -188,10 +197,18 @@ fn builtin_chan(args: &[Value]) -> ValueResult<Value> {
 fn builtin_take(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     Ok(spawn_future_with_roots(args.to_vec(), async move {
-        chan_ref(ch.get())
-            .take_result()
-            .await
-            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+        let channel = chan_ref(ch.get());
+        let value = channel.take().await;
+        match channel.failure_kind() {
+            // Settle as Interrupted, like the cancelled producer: awaiters get
+            // the catchable cancellation exception, and `alts` can tell it
+            // from `future-cancel`. Discarding it unread is not reported.
+            Some(crate::channel::ChannelFailure::Cancelled) => Err(EvalError::Cancelled),
+            Some(failure) => Err(cljrs_runtime::env::error::value_error_to_eval_error(
+                failure.reader_error(),
+            )),
+            None => Ok(value),
+        }
     }))
 }
 

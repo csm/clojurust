@@ -42,6 +42,12 @@ pub enum ValueError {
     GasExhausted,
 
     /// Execution was cancelled; the gas budget was not exhausted.
+    ///
+    /// Reserved for fiber cancellation (`parking::catch_cancelled` and
+    /// cancelled safepoints). It is uncatchable inside the cancelled
+    /// computation, but a future it settles is treated like `future-cancel`:
+    /// awaiters get a catchable exception and an unread one is not reported.
+    /// Native code must not return it for other failures.
     #[error("execution cancelled")]
     Cancelled,
 

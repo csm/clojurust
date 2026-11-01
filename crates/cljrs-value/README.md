@@ -620,7 +620,7 @@ one local name, happens once in `GlobalEnv::set_refer_clojure_filter`.
 
 ```rust
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Result<Value, String>;
+    fn force(&self) -> ValueResult<Value>;
 }
 
 pub struct Realizer { /* isolate thread and optional fiber id */ }
@@ -638,7 +638,7 @@ pub enum LazySeqState {
 pub struct LazySeq { pub state: TrackedMutex<LazySeqState> }
 impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self;
-    pub fn try_realize(&self) -> Result<Value, String>;
+    pub fn try_realize(&self) -> ValueResult<Value>;
     pub fn realize(&self) -> Value;
     pub fn error(&self) -> Option<String>;
 }
@@ -648,12 +648,16 @@ pub struct CljxCons { pub head: Value, pub tail: Value }
 `Thunk` implementations live in `cljrs-runtime`, so this crate needs no evaluator dependency.
 The realization state retains the traced thunk while user code runs without the cell lock.
 Other fibers wait for the result. Cancellation or a panic restores `Pending` and wakes waiters so another reader can retry.
-Normal thunk errors remain cached.
+A thunk reports cancellation as `ValueError::Cancelled`, which is returned typed and never
+cached; returning an error (rather than unwinding) keeps a caller's locks unpoisoned.
+Any other thunk error is cached as its message and returned as `ValueError::Other`, so a
+real exception raised during cancellation cleanup is still an ordinary, catchable error.
 
 `Realizer` identifies both monitor owners and realization owners.
 `ensure_can_wait` rejects a carrier wait on a fiber that needs the same thread to resume.
 `try_realize` returns this error without changing the cell. Runtime sequence operations use this fallible entry point.
-The legacy `realize` helper returns nil for cached thunk errors and panics on an unsafe carrier wait.
+The legacy `realize` helper returns nil for cached thunk errors, panics on an unsafe carrier
+wait, and continues a cancellation as the private parking unwind.
 Its infallible trait callers cannot return a transient wait error.
 
 ### `parking` (virtual threads Phase 2)
@@ -748,7 +752,7 @@ pub enum DelayState {
 pub struct Delay { pub state: TrackedMutex<DelayState> }
 impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self;
-    pub fn force(&self) -> Result<Value, String>;
+    pub fn force(&self) -> ValueResult<Value>;
     pub fn is_realized(&self) -> bool;
 }
 

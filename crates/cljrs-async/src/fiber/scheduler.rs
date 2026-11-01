@@ -65,34 +65,51 @@ fn duration_env(name: &str, default: u64, micros: bool) -> Duration {
     }
 }
 
-/// Bound on distinct diagnostic names. Runtime-built closures allocate
-/// fresh names, so names are interned by content.
+/// Bound on distinct diagnostic names per generation. Runtime-built
+/// closures allocate fresh names, so names are interned by content.
 const MAX_NATIVE_NAMES: usize = 4096;
+/// Frame tokens encode `generation * NAME_STRIDE + id`, with 1-based ids.
+const NAME_STRIDE: usize = MAX_NATIVE_NAMES + 1;
+const NAME_GENERATIONS: usize = usize::MAX / NAME_STRIDE;
 
-/// Process-wide native diagnostic names; ids are 1-based indexes into `list`
-/// and are cached on each `NativeFn`, so only a function's first call locks.
+/// Generation of the process-wide table, readable without its lock.
+static NAME_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-wide native diagnostic names. Tokens are cached on each
+/// `NativeFn`, so only a function's first call per generation locks. A full
+/// table starts a new generation instead of losing new names for good;
+/// tokens from an older generation are re-interned on their next call.
 #[derive(Default)]
 struct NativeNames {
     list: Vec<Arc<str>>,
     ids: HashMap<Arc<str>, usize>,
+    generation: usize,
 }
 
 impl NativeNames {
-    /// Intern by content, so equal names from fresh allocations share an id.
-    /// Past the bound, new names share one overflow entry.
+    /// Intern by content, so equal names from fresh allocations share a token.
     fn intern(&mut self, name: &Arc<str>) -> usize {
-        if let Some(id) = self.ids.get(name) {
-            return *id;
+        if let Some(token) = self.ids.get(name) {
+            return *token;
         }
         if self.list.len() >= MAX_NATIVE_NAMES {
-            if self.list.len() == MAX_NATIVE_NAMES {
-                self.list.push("<native function>".into());
-            }
-            return self.list.len();
+            self.list.clear();
+            self.ids.clear();
+            self.generation = (self.generation + 1) % NAME_GENERATIONS;
+            NAME_GENERATION.store(self.generation, Ordering::Relaxed);
         }
         self.list.push(name.clone());
-        self.ids.insert(name.clone(), self.list.len());
-        self.list.len()
+        let token = self.generation * NAME_STRIDE + self.list.len();
+        self.ids.insert(name.clone(), token);
+        token
+    }
+
+    /// The name for a frame token, if it belongs to the current generation.
+    fn name(&self, token: usize) -> Option<&str> {
+        if token == 0 || token / NAME_STRIDE != self.generation {
+            return None;
+        }
+        self.list.get(token % NAME_STRIDE - 1).map(AsRef::as_ref)
     }
 }
 
@@ -225,13 +242,15 @@ impl Scheduler {
             "cljrs: fiber {} stalled its isolate for {:?}; native frame: {} (other fibers runnable)",
             run.id.0,
             now.duration_since(run.heartbeat),
-            native_names()
-                .lock()
-                .unwrap()
-                .list
-                .get(self.native.load(Ordering::Relaxed).wrapping_sub(1))
-                .map(AsRef::as_ref)
-                .unwrap_or("<Rust body without safepoints>")
+            match self.native.load(Ordering::Relaxed) {
+                0 => "<Rust body without safepoints>".to_string(),
+                token => native_names()
+                    .lock()
+                    .unwrap()
+                    .name(token)
+                    .unwrap_or("<native function>")
+                    .to_string(),
+            }
         ))
     }
 }
@@ -369,7 +388,7 @@ impl Scheduling {
         cached: &cljrs_gc::fiber::NativeDiagnosticId,
     ) -> usize {
         let mut id = cached.get();
-        if id == 0 {
+        if id == 0 || id / NAME_STRIDE != NAME_GENERATION.load(Ordering::Relaxed) {
             id = native_names().lock().unwrap().intern(name);
             cached.set(id);
         }
@@ -437,13 +456,9 @@ pub(super) struct RunGuard<'a> {
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         let scheduler = &self.scheduling.wake.scheduler;
-        let outer = self.outer.take().map(|mut run| {
-            // The outer fiber was waiting on this resume, not stalled.
-            run.heartbeat = Instant::now();
-            run.reported = false;
-            run
-        });
-        *scheduler.running.lock().unwrap() = outer;
+        // Restore the outer entry unchanged: an outer fiber that keeps
+        // driving inner ones without reaching its own safepoint is stalled.
+        *scheduler.running.lock().unwrap() = self.outer.take();
         scheduler.native.store(self.native, Ordering::Relaxed);
     }
 }
@@ -466,18 +481,22 @@ mod tests {
     #[test]
     fn native_name_tables_stay_bounded() {
         let mut names = NativeNames::default();
-        // Fresh allocations of one name share an id.
+        // Fresh allocations of one name share a token.
         let first = names.intern(&Arc::from("partial-wrapper"));
         for _ in 0..10_000 {
             assert_eq!(names.intern(&Arc::from("partial-wrapper")), first);
         }
         assert_eq!(names.list.len(), 1);
-        // Distinct names stop growing at the bound and share an overflow id.
+        assert_eq!(names.name(first), Some("partial-wrapper"));
+        // Distinct names stay bounded; a full table starts a new generation,
+        // so later names are still reported and stale tokens are not misread.
         for i in 0..2 * MAX_NATIVE_NAMES {
             names.intern(&Arc::from(format!("generated-{i}")));
         }
-        assert_eq!(names.list.len(), MAX_NATIVE_NAMES + 1);
-        assert_eq!(&*names.list[MAX_NATIVE_NAMES], "<native function>");
+        assert!(names.list.len() <= MAX_NATIVE_NAMES);
+        assert_eq!(names.name(first), None);
+        let late = names.intern(&Arc::from("late-name"));
+        assert_eq!(names.name(late), Some("late-name"));
     }
 
     #[test]

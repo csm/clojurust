@@ -1068,7 +1068,7 @@ mod tests {
             fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
         }
         impl Thunk for DoneThunk {
-            fn force(&self) -> Result<Value, String> {
+            fn force(&self) -> crate::ValueResult<Value> {
                 Ok(Value::Long(99))
             }
         }

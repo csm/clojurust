@@ -1366,7 +1366,18 @@ impl cljrs_gc::Trace for BoundFn {
 
 /// A deferred computation that produces a `Value` when forced.
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Result<Value, String>;
+    /// Errors other than `crate::ValueError::Cancelled` are cached as their message.
+    /// A thunk interrupted by fiber cancellation must return
+    /// `crate::ValueError::Cancelled`, so the cell stays pending for other readers.
+    fn force(&self) -> crate::ValueResult<Value>;
+}
+
+/// The cached message of a failed thunk.
+fn thunk_error_message(error: crate::ValueError) -> String {
+    match error {
+        crate::ValueError::Other(message) => message,
+        other => other.to_string(),
+    }
 }
 
 /// Identifies a computation by its isolate thread and optional fiber.
@@ -1458,6 +1469,8 @@ impl LazySeq {
     pub fn realize(&self) -> Value {
         match self.try_realize() {
             Ok(value) => value,
+            // No error channel here: continue the cancellation as an unwind.
+            Err(crate::ValueError::Cancelled) => crate::parking::resume_cancelled(),
             Err(error) => {
                 // Infallible trait callers cannot return a transient wait
                 // error. Fail explicitly instead of silently losing data.
@@ -1469,7 +1482,9 @@ impl LazySeq {
 
     /// Realize a sequence with explicit errors, including unsafe carrier waits.
     /// A rejected wait does not change the thunk or its realization state.
-    pub fn try_realize(&self) -> Result<Value, String> {
+    /// Cached and ordinary errors are `crate::ValueError::Other`; a thunk cancelled
+    /// with its fiber returns `crate::ValueError::Cancelled` and stays pending.
+    pub fn try_realize(&self) -> crate::ValueResult<Value> {
         let owner = Realizer::current();
         let thunk = loop {
             let listener = self.ready.listen();
@@ -1481,12 +1496,12 @@ impl LazySeq {
                     crate::publish::read_slot(self as *const _ as usize, 0);
                     return Ok(value);
                 }
-                LazySeqState::Error(error) => return Err(error.clone()),
+                LazySeqState::Error(error) => return Err(crate::ValueError::Other(error.clone())),
                 LazySeqState::Realizing { owner: active, .. } => {
                     if *active == owner {
                         return Ok(Value::Nil);
                     }
-                    active.ensure_can_wait()?;
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1514,12 +1529,17 @@ impl LazySeq {
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 Ok(result)
             }
-            // A cancelled realizer leaves the thunk Pending (via the guard)
-            // for other readers and resumes cancellation, not a cached error.
-            Err(_) if crate::parking::cancelled() => crate::parking::resume_cancelled(),
-            Err(msg) => {
-                *self.state.lock().unwrap() = LazySeqState::Error(msg.clone());
-                Err(msg)
+            // Cancellation is not the thunk's result: the guard returns it to
+            // Pending for other readers, and the error propagates typed.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => {
+                let message = thunk_error_message(error);
+                *self.state.lock().unwrap() = LazySeqState::Error(message.clone());
+                Err(crate::ValueError::Other(message))
             }
         };
         drop(thunk);
@@ -1727,9 +1747,9 @@ impl Delay {
         }
     }
 
-    /// Force the delay and cache the result.
-    /// Returns the value on success, or an error message on failure.
-    pub fn force(&self) -> Result<Value, String> {
+    /// Force the delay and cache the result. Errors are as for
+    /// [`LazySeq::try_realize`].
+    pub fn force(&self) -> crate::ValueResult<Value> {
         let owner = Realizer::current();
         let thunk = loop {
             let listener = self.ready.listen();
@@ -1741,12 +1761,14 @@ impl Delay {
                     crate::publish::read_slot(self as *const _ as usize, 0);
                     return Ok(value);
                 }
-                DelayState::Error(e) => return Err(e.clone()),
+                DelayState::Error(e) => return Err(crate::ValueError::Other(e.clone())),
                 DelayState::Realizing { owner: active, .. } => {
                     if *active == owner {
-                        return Err("recursive delay realization".into());
+                        return Err(crate::ValueError::Other(
+                            "recursive delay realization".into(),
+                        ));
                     }
-                    active.ensure_can_wait()?;
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1768,17 +1790,24 @@ impl Delay {
             lazy: None,
             delay: Some(self),
         };
-        let result = thunk
-            .force()
-            .map(|value| crate::publish::publish_for_owner(value, self as *const _ as usize));
-        if result.is_err() && crate::parking::cancelled() {
-            // As for lazy seqs: leave the thunk Pending for other readers.
-            crate::parking::resume_cancelled();
-        }
+        let result = match thunk.force() {
+            Ok(value) => Ok(crate::publish::publish_for_owner(
+                value,
+                self as *const _ as usize,
+            )),
+            // As for lazy seqs: the guard leaves the thunk Pending.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => Err(thunk_error_message(error)),
+        };
         *self.state.lock().unwrap() = match &result {
             Ok(value) => DelayState::Forced(value.clone()),
             Err(error) => DelayState::Error(error.clone()),
         };
+        let result = result.map_err(crate::ValueError::Other);
         drop(thunk);
         #[cfg(feature = "no-gc")]
         cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
@@ -2028,15 +2057,15 @@ impl CljxFuture {
         let value = match &*state {
             FutureState::Running => return None,
             FutureState::Done(v) => Ok(v.clone()),
-            FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
-            FutureState::GasExhausted => Err(ValueError::GasExhausted),
-            FutureState::MemoryLimitExceeded(f) => Err(ValueError::MemoryLimitExceeded(*f)),
+            FutureState::Failed(v) => Err(crate::ValueError::Thrown(v.clone())),
+            FutureState::GasExhausted => Err(crate::ValueError::GasExhausted),
+            FutureState::MemoryLimitExceeded(f) => Err(crate::ValueError::MemoryLimitExceeded(*f)),
             // A producer interrupted by fiber cancellation reaches awaiters as
             // the same catchable error as `future-cancel`. A cancelled
             // awaiter stops at its own park; healthy ones can handle it.
             FutureState::Cancelled | FutureState::Interrupted => {
                 drop(state);
-                return Some(Err(ValueError::Thrown(Self::cancelled_error())));
+                return Some(Err(crate::ValueError::Thrown(Self::cancelled_error())));
             }
         };
         self.mark_observed();

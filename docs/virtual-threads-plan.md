@@ -523,9 +523,10 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - Generated call sites check errors before consuming a nil sentinel. Error exits
   release only regions opened by that compiled function. Poll functions consume TLS
   errors into their in-band result and preserve typed gas and memory failures.
-- Warm native diagnostic calls read a name id cached on the `NativeFn` and publish it
+- Warm native diagnostic calls read a name token cached on the `NativeFn` and publish it
   with one atomic store: no lock, lookup, or Arc clone. Names are interned by content in
-  a bounded process-wide table, so runtime-built closures cannot grow it without limit. Environment rooting
+  a bounded process-wide table that starts a new generation when full, so runtime-built
+  closures cannot grow it without limit and later names are still reported. Environment rooting
   happens only for actual yields.
 - The overflow investigation keeps platform signal handlers intact. A native
   recursion path without safepoints can still hit the fatal guard page; this phase

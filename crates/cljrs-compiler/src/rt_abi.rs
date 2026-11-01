@@ -1466,7 +1466,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
                     Value::LazySeq(ls) => {
                         current = match ls.get().try_realize() {
                             Ok(value) => value,
-                            Err(error) => return throw_str(error),
+                            Err(error) => return signal_error(error),
                         };
                     }
                     Value::List(l) => {
@@ -1715,7 +1715,7 @@ pub unsafe extern "C" fn rt_into_mapcat(
 /// back to the interpreter.  Unlike [`eager_seq_elems`], this forces lazy
 /// thunks; it is used where the caller is an eager consumer that would fully
 /// realize the source anyway.
-fn realize_seq_elems(coll: &Value) -> Result<Option<Vec<Value>>, String> {
+fn realize_seq_elems(coll: &Value) -> cljrs_value::ValueResult<Option<Vec<Value>>> {
     let _root = cljrs_runtime::env::gc_roots::root_value(coll);
     Ok(match coll {
         Value::Vector(v) => Some(v.get().iter().cloned().collect()),
@@ -1779,7 +1779,7 @@ pub unsafe extern "C" fn rt_into_map(
 
     let elems = match realize_seq_elems(coll_ref) {
         Ok(elems) => elems,
-        Err(error) => return throw_str(error),
+        Err(error) => return signal_error(error),
     };
     let Some(elems) = elems else {
         let to_val = to_ref.clone();
@@ -1891,7 +1891,7 @@ pub unsafe extern "C" fn rt_first(coll: *const Value) -> *const Value {
             let _root = cljrs_runtime::env::gc_roots::root_value(coll_ref);
             let realized = match ls.get().try_realize() {
                 Ok(value) => box_val(value),
-                Err(error) => return throw_str(error),
+                Err(error) => return signal_error(error),
             };
             unsafe { rt_first(realized) }
         }
@@ -1937,7 +1937,7 @@ pub unsafe extern "C" fn rt_rest(coll: *const Value) -> *const Value {
             let _root = cljrs_runtime::env::gc_roots::root_value(coll_ref);
             let realized = match ls.get().try_realize() {
                 Ok(value) => box_val(value),
-                Err(error) => return throw_str(error),
+                Err(error) => return signal_error(error),
             };
             unsafe { rt_rest(realized) }
         }
@@ -3255,9 +3255,12 @@ pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
     struct CompiledThunk(Value);
 
     impl Thunk for CompiledThunk {
-        fn force(&self) -> Result<Value, String> {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
             let _root = cljrs_runtime::env::gc_roots::root_value(&self.0);
-            cljrs_runtime::env::callback::invoke(&self.0, vec![]).map_err(|e| format!("{e}"))
+            cljrs_runtime::env::callback::invoke(&self.0, vec![]).map_err(|e| match e {
+                cljrs_value::ValueError::Cancelled => e,
+                other => cljrs_value::ValueError::Other(format!("{other}")),
+            })
         }
     }
 
@@ -5453,7 +5456,7 @@ mod tests {
             fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
         }
         impl cljrs_value::Thunk for GateThunk {
-            fn force(&self) -> Result<Value, String> {
+            fn force(&self) -> cljrs_value::ValueResult<Value> {
                 let receiver = self.0.borrow_mut().take().unwrap();
                 cljrs_async::fiber::park_on(receiver).unwrap();
                 Ok(Value::List(GcPtr::new(PersistentList::from_iter([
@@ -5489,7 +5492,7 @@ mod tests {
                         };
                         cell.get()
                             .try_realize()
-                            .map_err(cljrs_runtime::env::error::EvalError::Runtime)
+                            .map_err(cljrs_runtime::env::error::realize_error_to_eval_error)
                     })
                     .unwrap();
                     tokio::task::yield_now().await;
@@ -6426,7 +6429,12 @@ mod resource_review_tests {
                     if matches!(kind, ResourceError::Cancelled) {
                         // An interrupted producer reaches a healthy awaiter as
                         // the catchable cancellation exception.
-                        assert!(take_pending_exception_value().is_some());
+                        let thrown = take_pending_exception_value().expect("no thrown value");
+                        assert!(
+                            matches!(&thrown, Value::Error(e)
+                                if e.get().message() == cljrs_value::FUTURE_CANCELLED_MSG),
+                            "not the cancellation exception"
+                        );
                         assert!(take_pending_resource_error().is_none());
                     } else {
                         assert!(take_pending_exception_value().is_none());

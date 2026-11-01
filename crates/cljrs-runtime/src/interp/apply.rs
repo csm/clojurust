@@ -113,10 +113,10 @@ impl cljrs_gc::Trace for CallableValueThunk {
 }
 
 impl Thunk for CallableValueThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         let mut env = Env::new(self.globals.clone(), &self.ns);
         crate::env::apply::apply_value(&self.callee, Vec::new(), &mut env)
-            .map_err(|e| format!("{e}"))
+            .map_err(crate::env::error::eval_error_to_thunk_error)
     }
 }
 
@@ -173,13 +173,13 @@ impl cljrs_gc::Trace for ClosureThunk {
 }
 
 impl Thunk for ClosureThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         // Root the closed-over values so they survive GC.  The thunk may live
         // on the Rust stack outside any Env frame (e.g., after LazySeq::realize
         // drops its Mutex guard), so GC wouldn't trace them otherwise.
         let _closed_root = crate::env::gc_roots::root_values(&self.f.closed_over_vals);
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
-        call_cljrs_fn(&self.f, &[], &mut env).map_err(|e| format!("{e}"))
+        call_cljrs_fn(&self.f, &[], &mut env).map_err(crate::env::error::eval_error_to_thunk_error)
     }
 }
 

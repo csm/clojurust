@@ -48,8 +48,8 @@ pub fn current() -> Option<u64> {
     HOOKS.get().and_then(|h| (h.current)())
 }
 
-/// True while the running fiber is being cancelled. Cached state (lazy seqs,
-/// delays) must not record a failure caused by cancellation.
+/// True while the running fiber is being cancelled. Used where a failure is
+/// delivered to a reader, so a cancelled reader keeps its own cancellation.
 pub fn cancelled() -> bool {
     HOOKS.get().is_some_and(|h| (h.cancelled)())
 }

@@ -414,14 +414,16 @@ impl FiberTask {
     }
 
     fn unwind(&mut self) {
-        // Every suspended fiber, whether parked explicitly or at an automatic
+        // A suspended fiber, whether parked explicitly or at an automatic
         // yield, resumes with a cancellation token. Explicit parks raise the
         // private Cancelled payload, which NativeFn wrappers and C-ABI bridges
         // turn into an uncatchable error, so nothing unwinds through foreign
-        // frames. Only a fiber that never started is force-unwound: that
-        // runs no user code.
+        // frames. Cleanup then runs as this fiber: its scheduling context is
+        // entered, as for a normal resume. Fibers that never started or have
+        // already finished run no code, and a drop that could not park here
+        // (runtime lock held, critical section, borrowed slot, unwinding)
+        // force-unwinds instead of running user code in that context.
         self.pending.take();
-        let started = !self.yielder.is_null();
         if let Some(co) = &mut self.co {
             let _current = CurrentGuard::enter(if self.yielder.is_null() {
                 None
@@ -432,8 +434,9 @@ impl FiberTask {
                     scheduling: &*self.scheduling,
                 })
             });
-            if started {
+            if co.started() && !co.done() && cljrs_gc::mutator::can_park() {
                 self.scheduling.cancel();
+                let _running = self.scheduling.enter();
                 let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
                 match outcome {
                     Err(cljrs_value::ValueError::Cancelled) => {}
