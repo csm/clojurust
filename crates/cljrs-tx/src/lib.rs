@@ -274,10 +274,19 @@ fn execute_inner(
     let function = env.eval(program.form()).map_err(map_eval_error)?;
     let result = cljrs_runtime::env::apply::apply_value(&function, args, &mut env)
         .map_err(map_eval_error)?;
-    let result = serialize(&result).map_err(|error| match error {
-        CloneError::Cancelled => TxError::Cancelled,
-        CloneError::GasExhausted => TxError::GasExhausted,
-        other => TxError::Clone(other),
+    let result = serialize(&result).map_err(|error| {
+        // Resource limits keep their own TxError kinds, as on the host-call
+        // argument path, instead of reading as a data (clone) error.
+        match cljrs_value::clone::resource_value_error(&error) {
+            Some(ValueError::Cancelled) => TxError::Cancelled,
+            Some(ValueError::GasExhausted) => TxError::GasExhausted,
+            Some(ValueError::MemoryLimitExceeded(fault)) => TxError::MemoryExhausted {
+                limit: fault.hard_limit,
+                used: fault.committed,
+                requested: fault.requested,
+            },
+            _ => TxError::Clone(error),
+        }
     })?;
     validate_pure_data(&result).map_err(TxError::InvalidResult)?;
 

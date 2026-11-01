@@ -618,6 +618,7 @@ cljrs_gc::mutator_slot!("my-crate/MY_FLAG", cell MY_FLAG: bool);
 pub struct MutatorState;                 // !Send; one value per slot
 impl MutatorState {
     pub fn fresh() -> Self;              // a not-yet-started computation
+    pub fn unregistered() -> Self;       // empty placeholder; touches no thread-locals, never installed
     pub fn save() -> Self;               // detach current; thread gets fresh defaults
     pub fn restore(self);                // reinstall a saved state
     pub fn swap_with_current(&mut self); // exchange (scheduler resume/park)

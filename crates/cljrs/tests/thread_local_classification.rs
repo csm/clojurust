@@ -56,6 +56,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     (
         "cljrs-async/src/fiber.rs",
+        "DRAINING",
+        Thread("reentrancy flag for the carrier's deferred-cancellation drain"),
+    ),
+    (
+        "cljrs-async/src/fiber.rs",
         "DEFERRED_CANCELS",
         Thread("carrier queue of dropped fibers awaiting cancellation; each keeps its own state"),
     ),

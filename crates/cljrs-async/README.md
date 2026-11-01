@@ -303,8 +303,12 @@ dropped where it could not park (a runtime lock held, a critical section, a borr
 or during unwinding) is queued on its carrier instead: a forced unwind could cross
 `extern "C"` or JIT frames and abort, and leaking would strand guards held across the park
 (lazy-seq realization, monitors). The queue is drained, each fiber cancelled normally, at
-the next fiber poll or completed cancellation on that carrier. Queued fibers keep their
-detached mutator state, so their roots stay traced; any left at thread exit are leaked. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
+the next fiber poll, before every explicit park (so a waiter on a guard the queued fiber
+holds is released before it suspends), after each completed cancellation, and when a root
+drive or its executor finishes. Only the outermost drain loops, so a long queue does not
+recurse. A queued fiber's wake is closed, so it is never counted as ready, and it keeps its
+detached mutator state, so its roots stay traced. Queuing uses only fallible thread-local
+access; a fiber still queued once the thread's locals are gone is leaked as a last resort. Later safepoints neither yield nor fail, so `finally` cleanup runs to completion.
 An explicit park during cleanup cannot suspend the fiber; it unwinds to the nearest
 `NativeFn` or C-ABI boundary as `ValueError::Cancelled`.
 Other panic payloads retain their original message and type.

@@ -220,6 +220,16 @@ impl MutatorState {
         }
     }
 
+    /// An empty state that touches no thread-locals and is not registered with
+    /// the isolate. Only for placeholders that are never installed (swapped)
+    /// or traced; usable during unwinding and thread-local teardown.
+    pub fn unregistered() -> Self {
+        Self {
+            values: Rc::new(RefCell::new(Box::new([]))),
+            _not_send: PhantomData,
+        }
+    }
+
     /// Detach the current thread's per-mutator state, leaving fresh defaults
     /// in the thread-locals.
     pub fn save() -> Self {

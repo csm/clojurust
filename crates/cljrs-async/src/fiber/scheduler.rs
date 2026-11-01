@@ -338,7 +338,18 @@ pub(super) struct Scheduling {
 
 impl Scheduling {
     pub(super) fn new(id: FiberId, limit: usize, bytes: usize) -> Self {
-        let wake = TaskWake::new(SCHEDULER.with(Arc::clone));
+        Self::with_scheduler(SCHEDULER.with(Arc::clone), id, limit, bytes)
+    }
+
+    /// Scheduling for a placeholder task that never runs. Uses one shared
+    /// scheduler instead of this thread's, so it touches no thread-locals.
+    pub(super) fn placeholder(id: FiberId) -> Self {
+        static PLACEHOLDER: OnceLock<Arc<Scheduler>> = OnceLock::new();
+        Self::with_scheduler(PLACEHOLDER.get_or_init(Scheduler::new).clone(), id, 0, 0)
+    }
+
+    fn with_scheduler(scheduler: Arc<Scheduler>, id: FiberId, limit: usize, bytes: usize) -> Self {
+        let wake = TaskWake::new(scheduler);
         Self {
             waker: Waker::from(wake.clone()),
             wake,

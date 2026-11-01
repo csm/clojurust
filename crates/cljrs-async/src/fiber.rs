@@ -137,6 +137,9 @@ fn park_on_impl<F: Future>(future: F) -> F::Output {
         resume_cancelled();
     }
     assert_parkable();
+    // The awaited event may be a guard a queued fiber still holds (a lazy-seq
+    // realization or a monitor); release those before suspending on it.
+    run_deferred_cancels();
     let current = CURRENT
         .with(Cell::get)
         .expect("park_on called outside a fiber");
@@ -538,9 +541,21 @@ impl FiberTask {
             // leaking would strand guards held across the park (lazy-seq
             // realization, monitors). Queue it; it is cancelled as soon as
             // this carrier can park.
+            // A queued task is no longer in the LocalSet: close its wake so
+            // a later wakeup cannot count it as a ready fiber.
+            self.scheduling.wake.close();
             let id = self.id;
-            let task = std::mem::replace(self, FiberTask::empty(id));
-            DEFERRED_CANCELS.with(|queue| queue.borrow_mut().0.push(task));
+            let mut task = Some(std::mem::replace(self, FiberTask::empty(id)));
+            // `try_with`: this can run during unwinding or TLS teardown.
+            let _ = DEFERRED_CANCELS.try_with(|queue| {
+                if let Ok(mut queue) = queue.try_borrow_mut() {
+                    queue.0.push(task.take().unwrap());
+                }
+            });
+            if let Some(task) = task {
+                // The queue is gone (thread teardown): last resort.
+                std::mem::forget(task);
+            }
             return;
         }
         if self.co.is_some() {
@@ -557,13 +572,14 @@ impl FiberTask {
     }
 
     /// A completed placeholder left behind when a task is moved out to be
-    /// cancelled later. Dropping it does nothing.
+    /// cancelled later. Dropping it does nothing, and building it touches no
+    /// thread-locals, since this runs in `Drop`.
     fn empty(id: FiberId) -> Self {
         Self {
             co: None,
-            scheduling: Box::new(Scheduling::new(id, 0, 0)),
+            scheduling: Box::new(Scheduling::placeholder(id)),
             reservation: None,
-            state: MutatorState::fresh(),
+            state: MutatorState::unregistered(),
             pending: None,
             roots: Box::new([]),
             roots_guard: None,
@@ -601,14 +617,35 @@ impl Drop for DeferredCancels {
 thread_local! {
     // Carrier driver state, like STACK_POOL: never a computation's state.
     static DEFERRED_CANCELS: RefCell<DeferredCancels> = RefCell::new(DeferredCancels::default());
+    // Set while a drain runs, so cancelling a queued task does not recurse.
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Cancel queued fibers once the carrier can park. Runs at every fiber poll
-/// and after every completed cancellation.
+/// Cancel queued fibers once the carrier can park. Runs at every fiber poll,
+/// before every explicit park, after every completed cancellation, and when a
+/// root drive or its executor finishes. Only the outermost call loops.
 fn run_deferred_cancels() {
+    if DRAINING
+        .try_with(|draining| draining.replace(true))
+        .unwrap_or(true)
+    {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = DRAINING.try_with(|draining| draining.set(false));
+        }
+    }
+    let _done = Done;
     while cljrs_gc::mutator::can_park() {
         let Some(task) = DEFERRED_CANCELS
-            .try_with(|queue| queue.borrow_mut().0.pop())
+            .try_with(|queue| {
+                queue
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut queue| queue.0.pop())
+            })
             .ok()
             .flatten()
         else {
@@ -754,6 +791,7 @@ pub fn run_root(
     impl Drop for Drive<'_> {
         fn drop(&mut self) {
             self.task.cancel();
+            run_deferred_cancels();
             self.carrier.swap_with_current();
             self.task.state.swap_with_current();
         }
@@ -780,6 +818,8 @@ pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut Mutat
     }
     let _restore = Restore(carrier);
     drop(local);
+    // Tasks dropped with the executor may have been queued for cancellation.
+    run_deferred_cancels();
     crate::channel::report_unobserved_thread_failures();
 }
 

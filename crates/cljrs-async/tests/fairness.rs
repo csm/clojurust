@@ -653,3 +653,59 @@ fn cancellation_while_apply_spreads_a_lazy_seq_still_runs_finally() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn a_waiter_on_a_deferred_fibers_realization_does_not_hang() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    #[derive(Debug)]
+    struct ParksFirst(Cell<u32>);
+    impl cljrs_gc::Trace for ParksFirst {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParksFirst {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })?;
+            }
+            Ok(Value::Long(42))
+        }
+    }
+    run(async {
+        let lazy = Rc::new(LazySeq::new(Box::new(ParksFirst(Cell::new(0)))));
+        let shared = lazy.clone();
+        // B is the only runnable fiber: it drops A (parked mid-realization)
+        // under a runtime lock, then waits on that same realization.
+        let b = fiber::spawn(move || {
+            let realizing = shared.clone();
+            let mut a = Box::pin(
+                Fiber::new(move || {
+                    realizing
+                        .try_realize()
+                        .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+                })
+                .unwrap()
+                .into_task(),
+            );
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(a.as_mut().poll(&mut cx).is_pending());
+            let lock = cljrs_gc::mutator::TrackedMutex::new(());
+            let guard = lock.lock().unwrap();
+            drop(a);
+            drop(guard);
+            shared
+                .try_realize()
+                .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+        })
+        .unwrap();
+        let value = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("waiter hung on a deferred fiber's realization")
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(value, Value::Long(42));
+    });
+}
