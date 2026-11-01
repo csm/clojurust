@@ -4,7 +4,7 @@ use crate::builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
-use cljrs_value::{Keyword, PersistentList, Symbol, Value, ValueError, ValueResult};
+use cljrs_value::{Keyword, PersistentList, Symbol, Value, ValueResult};
 use std::sync::Arc;
 
 use crate::env::env::Env;
@@ -110,7 +110,7 @@ pub fn value_to_seq_vec(val: &Value) -> ValueResult<Vec<Value>> {
         match current.unwrap_meta() {
             Value::Nil => break,
             Value::LazySeq(ls) => {
-                current = ls.get().try_realize().map_err(ValueError::Other)?;
+                current = ls.get().try_realize()?;
             }
             Value::Cons(c) => {
                 result.push(c.get().head.clone());

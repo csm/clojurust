@@ -227,7 +227,7 @@ impl cljrs_gc::Trace for WaitingThunk {
     }
 }
 impl cljrs_value::Thunk for WaitingThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         if self.1 {
             fiber::park_on(std::future::pending::<()>());
         } else {
@@ -251,7 +251,7 @@ fn realizing_thunks_remain_traced() {
             };
             cell.get()
                 .force()
-                .map_err(cljrs_runtime::env::error::EvalError::Runtime)
+                .map_err(cljrs_runtime::env::error::realize_error_to_eval_error)
         })
         .unwrap();
         tokio::task::yield_now().await;
@@ -380,7 +380,7 @@ impl cljrs_gc::Trace for RetryingThunk {
     }
 }
 impl cljrs_value::Thunk for RetryingThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         let attempt = self.attempts.get() + 1;
         self.attempts.set(attempt);
         if attempt == 1 {
@@ -398,7 +398,7 @@ fn realize(value: &Value) -> EvalResult {
         Value::LazySeq(cell) => cell.get().try_realize(),
         _ => unreachable!(),
     }
-    .map_err(cljrs_runtime::env::error::EvalError::Runtime)
+    .map_err(cljrs_runtime::env::error::realize_error_to_eval_error)
 }
 #[test]
 fn cancelled_and_panicked_realizers_allow_other_readers_to_retry() {

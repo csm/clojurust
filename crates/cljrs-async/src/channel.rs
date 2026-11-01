@@ -81,12 +81,23 @@ enum Publication {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ChannelFailure {
     Gas,
+    Cancelled,
     Memory(cljrs_gc::MemoryLimitExceeded),
 }
 impl ChannelFailure {
-    fn error(self) -> cljrs_value::ValueError {
+    /// The error a reader receives. Call without holding a channel lock: a
+    /// cancellation allocates its exception. Like an interrupted future, a
+    /// healthy reader gets the catchable cancellation exception, while a
+    /// reader that is itself being cancelled keeps its own cancellation.
+    pub(crate) fn reader_error(self) -> cljrs_value::ValueError {
         match self {
             Self::Gas => cljrs_value::ValueError::GasExhausted,
+            Self::Cancelled if cljrs_value::parking::cancelled() => {
+                cljrs_value::ValueError::Cancelled
+            }
+            Self::Cancelled => {
+                cljrs_value::ValueError::Thrown(cljrs_value::CljxFuture::cancelled_error())
+            }
             Self::Memory(error) => cljrs_value::ValueError::MemoryLimitExceeded(error),
         }
     }
@@ -99,9 +110,17 @@ struct FailureReport {
     reported: Cell<bool>,
 }
 impl FailureReport {
+    /// Runs from `CljChannel::drop`, possibly during a GC sweep: it must not
+    /// allocate managed values. Deliberate cancellation is not reported, like
+    /// an interrupted future discarded unread.
     fn report(&self) {
-        if !self.observed.get() && !self.reported.replace(true) {
-            eprintln!("[clojurust thread error] {}", self.error.error());
+        if self.observed.get() || self.reported.replace(true) {
+            return;
+        }
+        match self.error {
+            ChannelFailure::Gas => eprintln!("[clojurust thread error] gas exhausted"),
+            ChannelFailure::Memory(error) => eprintln!("[clojurust thread error] {error}"),
+            ChannelFailure::Cancelled => {}
         }
     }
 }
@@ -453,11 +472,17 @@ impl CljChannel {
         self.state.lock().unwrap().failure = Some(report);
         self.close();
     }
-    pub(crate) fn failure(&self) -> Option<cljrs_value::ValueError> {
-        self.state.lock().unwrap().failure.as_ref().map(|report| {
+    /// Mark a producer failure observed and return its kind. Copies the
+    /// kind out so the reader's error is built after the lock is released.
+    pub(crate) fn failure_kind(&self) -> Option<ChannelFailure> {
+        let state = self.state.lock().unwrap();
+        state.failure.as_ref().map(|report| {
             report.observed.set(true);
-            report.error.error()
+            report.error
         })
+    }
+    pub(crate) fn failure(&self) -> Option<cljrs_value::ValueError> {
+        self.failure_kind().map(ChannelFailure::reader_error)
     }
     /// Take a value and preserve a producer's resource-limit failure.
     pub async fn take_result(&self) -> cljrs_value::ValueResult<Value> {

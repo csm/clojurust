@@ -70,6 +70,12 @@ pub enum CloneError {
     },
     /// The channel's receiver side has been dropped.
     Disconnected,
+    /// Realizing a lazy value was interrupted by fiber cancellation; callers
+    /// must surface it as `ValueError::Cancelled`, which stays uncatchable.
+    Cancelled,
+    /// Realizing a lazy value exhausted the gas budget; callers surface it
+    /// as the uncatchable `ValueError::GasExhausted`.
+    GasExhausted,
     /// The process memory governor refused the message's queue charge
     /// (strict mode).
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
@@ -94,6 +100,8 @@ impl std::fmt::Display for CloneError {
                 )
             }
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
+            CloneError::Cancelled => write!(f, "execution cancelled"),
+            CloneError::GasExhausted => write!(f, "gas exhausted"),
             CloneError::MemoryLimitExceeded(e) => e.fmt(f),
             CloneError::Full {
                 bytes,
@@ -454,6 +462,7 @@ pub enum SerializedErrorKind {
     Unsupported,
     Other(String),
     GasExhausted,
+    Cancelled,
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     OutOfRange,
     TransientAlreadyPersisted,
@@ -475,6 +484,7 @@ impl SerializedErrorKind {
             SerializedErrorKind::IndexOutOfBounds { .. }
             | SerializedErrorKind::OddMap { .. }
             | SerializedErrorKind::Unsupported
+            | SerializedErrorKind::Cancelled
             | SerializedErrorKind::GasExhausted
             | SerializedErrorKind::MemoryLimitExceeded(_)
             | SerializedErrorKind::OutOfRange
@@ -485,6 +495,18 @@ impl SerializedErrorKind {
 }
 
 // ── serialize ─────────────────────────────────────────────────────────────────
+
+/// The `ValueError` a caller surfaces for a resource-limit `CloneError`
+/// (cancellation, gas, memory), so it stays uncatchable; `None` for ordinary
+/// boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError> {
+    match error {
+        CloneError::Cancelled => Some(ValueError::Cancelled),
+        CloneError::GasExhausted => Some(ValueError::GasExhausted),
+        CloneError::MemoryLimitExceeded(fault) => Some(ValueError::MemoryLimitExceeded(*fault)),
+        _ => None,
+    }
+}
 
 /// Serialize a `Value` into a `Send + Sync` wire form suitable for crossing an
 /// isolate boundary. Returns [`CloneError`] for non-shareable values.
@@ -596,11 +618,14 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         }
 
         // ── Lazy sequences: realize first ──
-        Value::LazySeq(p) => serialize(
-            &p.get()
-                .try_realize()
-                .map_err(|_| not_shareable("lazy seq whose realization failed"))?,
-        ),
+        Value::LazySeq(p) => serialize(&p.get().try_realize().map_err(|error| match error {
+            // Resource errors and cancellation keep their identity, so they
+            // are not turned into a catchable "not shareable" error.
+            ValueError::Cancelled => CloneError::Cancelled,
+            ValueError::GasExhausted => CloneError::GasExhausted,
+            ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
+            _ => not_shareable("lazy seq whose realization failed"),
+        })?),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {
@@ -722,6 +747,7 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
         ValueError::Unsupported => SerializedErrorKind::Unsupported,
         ValueError::Other(s) => SerializedErrorKind::Other(s.clone()),
         ValueError::GasExhausted => SerializedErrorKind::GasExhausted,
+        ValueError::Cancelled => SerializedErrorKind::Cancelled,
         ValueError::MemoryLimitExceeded(e) => SerializedErrorKind::MemoryLimitExceeded(*e),
         ValueError::OutOfRange => SerializedErrorKind::OutOfRange,
         ValueError::TransientAlreadyPersisted => SerializedErrorKind::TransientAlreadyPersisted,
@@ -911,6 +937,7 @@ fn deserialize_error(se: SerializedError) -> crate::error::ExceptionInfo {
         SerializedErrorKind::Unsupported => ValueError::Unsupported,
         SerializedErrorKind::Other(s) => ValueError::Other(s),
         SerializedErrorKind::GasExhausted => ValueError::GasExhausted,
+        SerializedErrorKind::Cancelled => ValueError::Cancelled,
         SerializedErrorKind::MemoryLimitExceeded(e) => ValueError::MemoryLimitExceeded(e),
         SerializedErrorKind::OutOfRange => ValueError::OutOfRange,
         SerializedErrorKind::TransientAlreadyPersisted => ValueError::TransientAlreadyPersisted,
@@ -1064,7 +1091,7 @@ mod tests {
             fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
         }
         impl Thunk for DoneThunk {
-            fn force(&self) -> Result<Value, String> {
+            fn force(&self) -> crate::ValueResult<Value> {
                 Ok(Value::Long(99))
             }
         }

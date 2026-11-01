@@ -192,7 +192,12 @@ fn builtin_isolate_put(args: &[Value]) -> ValueResult<Value> {
              cross an isolate boundary"
         ))),
         Err(e @ CloneError::Full { .. }) => Err(ValueError::Other(format!("isolate-put!: {e}"))),
-        Err(CloneError::MemoryLimitExceeded(fault)) => Err(ValueError::MemoryLimitExceeded(fault)),
+        // Cancellation and resource limits: one mapping for every boundary.
+        Err(
+            e @ (CloneError::MemoryLimitExceeded(_)
+            | CloneError::Cancelled
+            | CloneError::GasExhausted),
+        ) => Err(cljrs_value::clone::resource_value_error(&e).expect("resource clone error")),
     }
 }
 

@@ -5,6 +5,7 @@
 
 use std::ptr::NonNull;
 
+pub mod fiber;
 pub mod governor;
 pub mod mutator;
 pub mod region;

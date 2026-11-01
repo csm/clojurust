@@ -12,6 +12,10 @@ pub enum EvalError {
     #[error("gas exhausted")]
     GasExhausted,
 
+    /// Execution was cancelled; the gas budget was not exhausted.
+    #[error("execution cancelled")]
+    Cancelled,
+
     /// The process memory governor refused a governed allocation (strict
     /// mode), and a collection did not bring committed memory back within
     /// the hard limit.  Fixed-size; building it never allocates.  Like
@@ -71,6 +75,7 @@ impl EvalError {
             other => {
                 let msg = other.to_string();
                 let error = match other {
+                    EvalError::Cancelled => ValueError::Cancelled,
                     EvalError::MemoryLimitExceeded(fault) => {
                         cljrs_value::ValueError::MemoryLimitExceeded(fault)
                     }
@@ -82,6 +87,24 @@ impl EvalError {
                 ))
             }
         }
+    }
+}
+
+/// A `Thunk::force` error: cancellation stays typed, so lazy cells do not
+/// cache it; every other failure becomes its message, as before.
+pub fn eval_error_to_thunk_error(error: EvalError) -> ValueError {
+    match error {
+        EvalError::Cancelled => ValueError::Cancelled,
+        other => ValueError::Other(other.to_string()),
+    }
+}
+
+/// A realization error (`LazySeq::try_realize`, `Delay::force`) as a runtime
+/// error, keeping cancellation uncatchable.
+pub fn realize_error_to_eval_error(error: ValueError) -> EvalError {
+    match error {
+        ValueError::Cancelled => EvalError::Cancelled,
+        other => EvalError::Runtime(other.to_string()),
     }
 }
 
@@ -98,6 +121,7 @@ pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
     match err {
         ValueError::Thrown(v) => EvalError::Thrown(v),
         ValueError::GasExhausted => EvalError::GasExhausted,
+        ValueError::Cancelled => EvalError::Cancelled,
         ValueError::MemoryLimitExceeded(fault) => {
             // The error is back on a path that carries it; a copy left in
             // the runtime-fault slot (see `callback::invoke`) would report

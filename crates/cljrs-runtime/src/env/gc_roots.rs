@@ -234,22 +234,34 @@ pub fn force_collect(env: &Env) {
 /// committed memory is back within the hard limit and returned as
 /// [`EvalError::MemoryLimitExceeded`] otherwise.  Under `no-gc` there is no
 /// collection; region scopes release their memory as they exit.
-#[cfg(feature = "no-gc")]
-pub fn gc_safepoint(_env: &Env) -> EvalResult<()> {
+pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    fiber_safepoint(env)?;
+    #[cfg(not(feature = "no-gc"))]
+    collect_if_needed(env);
     check_memory_fault()
 }
 
+fn fiber_safepoint(env: &Env) -> EvalResult<()> {
+    cljrs_gc::fiber::safepoint_with(|yield_now| {
+        let _env_root = push_env_root(env);
+        yield_now()
+    })
+    .map_err(|error| match error {
+        cljrs_gc::fiber::SafepointError::StackOverflow(message) => EvalError::Runtime(message),
+        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::Cancelled,
+    })
+}
+
 #[cfg(not(feature = "no-gc"))]
-pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+fn collect_if_needed(env: &Env) {
     // Fast path: no GC activity and no pending fault.
     if !cljrs_gc::governor::runtime_fault_possible()
         && !cljrs_gc::gc_requested()
         && !cljrs_gc::CONFIG_CANCELLATION.in_progress()
     {
-        return Ok(());
+        return;
     }
     collect_at_safepoint(env);
-    check_memory_fault()
 }
 
 /// Turn the thread's pending memory fault, if it survives

@@ -21,7 +21,7 @@ plus all persistent (immutable, structurally shared) collection types.  The
 src/
   lib.rs                         — module declarations and re-exports
   clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
-  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)`, uncatchable like `GasExhausted`), ValueResult<T> alias
+  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` and `Cancelled`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
@@ -620,7 +620,7 @@ one local name, happens once in `GlobalEnv::set_refer_clojure_filter`.
 
 ```rust
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Result<Value, String>;
+    fn force(&self) -> ValueResult<Value>;
 }
 
 pub struct Realizer { /* isolate thread and optional fiber id */ }
@@ -638,7 +638,7 @@ pub enum LazySeqState {
 pub struct LazySeq { pub state: TrackedMutex<LazySeqState> }
 impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self;
-    pub fn try_realize(&self) -> Result<Value, String>;
+    pub fn try_realize(&self) -> ValueResult<Value>;
     pub fn realize(&self) -> Value;
     pub fn error(&self) -> Option<String>;
 }
@@ -648,12 +648,16 @@ pub struct CljxCons { pub head: Value, pub tail: Value }
 `Thunk` implementations live in `cljrs-runtime`, so this crate needs no evaluator dependency.
 The realization state retains the traced thunk while user code runs without the cell lock.
 Other fibers wait for the result. Cancellation or a panic restores `Pending` and wakes waiters so another reader can retry.
-Normal thunk errors remain cached.
+A thunk reports cancellation as `ValueError::Cancelled`, which is returned typed and never
+cached; returning an error (rather than unwinding) keeps a caller's locks unpoisoned.
+Any other thunk error is cached as its message and returned as `ValueError::Other`, so a
+real exception raised during cancellation cleanup is still an ordinary, catchable error.
 
 `Realizer` identifies both monitor owners and realization owners.
 `ensure_can_wait` rejects a carrier wait on a fiber that needs the same thread to resume.
 `try_realize` returns this error without changing the cell. Runtime sequence operations use this fallible entry point.
-The legacy `realize` helper returns nil for cached thunk errors and panics on an unsafe carrier wait.
+The legacy `realize` helper returns nil for cached thunk errors, panics on an unsafe carrier
+wait, and continues a cancellation as the private parking unwind.
 Its infallible trait callers cannot return a transient wait error.
 
 ### `parking` (virtual threads Phase 2)
@@ -663,17 +667,21 @@ pub type BlockingResult = Box<dyn Any + Send>;
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
 pub struct Hooks {
     pub current: fn() -> Option<u64>,
+    pub cancelled: fn() -> bool,
     pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
     pub sleep: fn(Duration),
     pub blocking: fn(BlockingJob) -> BlockingResult,
 }
 pub fn install(hooks: Hooks);
 pub fn current() -> Option<u64>;
+pub fn cancelled() -> bool; // the running fiber is being cancelled
 pub fn park<F: Future>(future: F) -> F::Output;
 pub fn block_on<F: Future>(future: F) -> F::Output;
 pub fn sleep(duration: Duration);
 pub fn blocking<F, T>(job: F) -> T
 where F: FnOnce() -> T + Send + 'static, T: Send + 'static;
+pub fn resume_cancelled() -> !; // unwind a cancelled fiber with a private payload
+pub fn catch_cancelled<T>(operation: impl FnOnce() -> T) -> ValueResult<T>;
 
 pub struct Event { /* Default + Debug */ }
 impl Event {
@@ -690,6 +698,10 @@ Native fibers install the executor hooks once. This crate does not depend on Tok
 `park` accepts borrowed futures inside a fiber. `block_on` also supports notification futures outside a fiber with an OS-thread wait.
 `sleep` and `blocking` keep their direct behavior outside fibers.
 Managed values require precise roots across a park and cannot cross worker threads.
+A park in a cancelled fiber unwinds with `resume_cancelled`. `catch_cancelled` turns
+only that payload into `ValueError::Cancelled` and rethrows every other panic.
+`NativeFn` wrappers and C-ABI bridges use it so cancellation never unwinds through
+foreign frames.
 
 A listener registers before its caller checks the protected condition.
 `notify_all` wakes every listener, and listener destruction removes its waker.
@@ -740,7 +752,7 @@ pub enum DelayState {
 pub struct Delay { pub state: TrackedMutex<DelayState> }
 impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self;
-    pub fn force(&self) -> Result<Value, String>;
+    pub fn force(&self) -> ValueResult<Value>;
     pub fn is_realized(&self) -> bool;
 }
 
@@ -752,7 +764,9 @@ pub struct CljxPromise {
 
 pub struct CljxFuture {
     pub ready: parking::Event,
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Interrupted | ...
+    // Drop warns about an unobserved Failed/GasExhausted/MemoryLimitExceeded state, and
+    // about Interrupted only when CLJRS_WARN_INTERRUPTED_FUTURES=1 (or true/yes).
                                     // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
@@ -899,11 +913,19 @@ impl SerializedValue {
 pub enum CloneError {
     NotShareable { type_name: &'static str },
     Disconnected,
+    /// Realizing a lazy seq was interrupted by fiber cancellation, or ran out
+    /// of gas; callers surface these as the uncatchable `ValueError` kinds.
+    Cancelled,
+    GasExhausted,
     /// A byte-bounded isolate channel has no room for the message.
     Full { bytes: usize, queued: usize, limit: usize },
     /// The strict process governor refused the message's queue charge.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
+
+/// The uncatchable `ValueError` for a resource-limit CloneError (cancellation,
+/// gas, memory); `None` for ordinary boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
 /// closures, native resources, and other non-shareable types.
@@ -1062,6 +1084,8 @@ Unobserved future failures warn on drop, including resource failures. Internal t
 Bounded invocations retain their original allocation rules.
 
 `NativeFn::captures: Arc<[Value]>` records managed values retained by a Rust callable.
+`NativeFn::diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId` caches the function's
+watchdog name id; struct literals set it to `Default::default()`.
 The callable and tracer share one immutable allocation. Compiled and IR adapters use the same capture slice.
 For struct literals, convert an existing capture vector with `.into()`.
 

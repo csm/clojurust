@@ -8,11 +8,33 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+/// Private unwind payload for infallible Rust parking APIs.
+#[derive(Debug)]
+struct Cancelled;
+
+/// Stop an infallible parking call. Native and ABI boundaries must use
+/// `catch_cancelled` before returning through foreign frames.
+pub fn resume_cancelled() -> ! {
+    std::panic::resume_unwind(Box::new(Cancelled))
+}
+
+/// Convert only a parking cancellation into a typed error. Preserve all other
+/// panic payloads, including coroutine forced unwinds.
+pub fn catch_cancelled<T>(operation: impl FnOnce() -> T) -> crate::ValueResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(value) => Ok(value),
+        Err(payload) if payload.is::<Cancelled>() => Err(crate::ValueError::Cancelled),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 pub type BlockingResult = Box<dyn Any + Send>;
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
 
 pub struct Hooks {
     pub current: fn() -> Option<u64>,
+    /// True while the running fiber is being cancelled.
+    pub cancelled: fn() -> bool,
     pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
     pub sleep: fn(Duration),
     pub blocking: fn(BlockingJob) -> BlockingResult,
@@ -24,6 +46,12 @@ pub fn install(hooks: Hooks) {
 }
 pub fn current() -> Option<u64> {
     HOOKS.get().and_then(|h| (h.current)())
+}
+
+/// True while the running fiber is being cancelled. Used where a failure is
+/// delivered to a reader, so a cancelled reader keeps its own cancellation.
+pub fn cancelled() -> bool {
+    HOOKS.get().is_some_and(|h| (h.cancelled)())
 }
 
 /// Run Send-only native work off the isolate while a fiber waits. Conversion

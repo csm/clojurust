@@ -22,9 +22,12 @@ pub fn catch<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
 
 /// Realize for an infallible trait. Callers must use `catch` at their boundary.
 pub(crate) fn for_trait(sequence: &crate::LazySeq) -> crate::Value {
-    sequence
-        .try_realize()
-        .unwrap_or_else(|message| resume_unwind(Box::new(Failure(message))))
+    match sequence.try_realize() {
+        Ok(value) => value,
+        // Cancellation keeps its own payload, caught by `parking::catch_cancelled`.
+        Err(crate::ValueError::Cancelled) => crate::parking::resume_cancelled(),
+        Err(error) => resume_unwind(Box::new(Failure(error.to_string()))),
+    }
 }
 
 /// True for scalar values whose equality, hash, and display cannot run user code.

@@ -9,6 +9,7 @@ use std::future::Future;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootError {
     GasExhausted,
+    Cancelled,
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     Evaluation(String),
 }
@@ -16,6 +17,7 @@ impl std::fmt::Display for RootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GasExhausted => f.write_str("gas exhausted"),
+            Self::Cancelled => f.write_str("execution cancelled"),
             Self::MemoryLimitExceeded(error) => error.fmt(f),
             Self::Evaluation(message) => f.write_str(message),
         }
@@ -27,6 +29,7 @@ impl From<cljrs_runtime::env::error::EvalError> for RootError {
         use cljrs_runtime::env::error::EvalError;
         match error {
             EvalError::GasExhausted => Self::GasExhausted,
+            EvalError::Cancelled => Self::Cancelled,
             EvalError::MemoryLimitExceeded(error) => Self::MemoryLimitExceeded(error),
             other => Self::Evaluation(other.to_string()),
         }

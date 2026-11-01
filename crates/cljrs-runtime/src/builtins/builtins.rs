@@ -1857,7 +1857,7 @@ pub const EXPERIMENTAL_SOURCE: &str = include_str!("experimental.cljrs");
 /// on first access, which is fine since they are already fully in memory.
 struct ValueIter {
     current: Value,
-    error: Option<String>,
+    error: Option<ValueError>,
 }
 
 impl ValueIter {
@@ -1869,7 +1869,7 @@ impl ValueIter {
     }
 
     /// Check if an error occurred during iteration.
-    fn take_error(&mut self) -> Option<String> {
+    fn take_error(&mut self) -> Option<ValueError> {
         self.error.take()
     }
 }
@@ -1891,6 +1891,13 @@ impl Iterator for ValueIter {
                     let _current_root = crate::env::gc_roots::root_value(&self.current);
                     match ls.get().try_realize() {
                         Ok(value) => self.current = value,
+                        // Not every consumer calls `take_error`; ending the
+                        // iteration would hand a truncated result to code in
+                        // a cancelled fiber. Continue as the cancellation
+                        // unwind, which the enclosing NativeFn boundary (or
+                        // `value_to_seq`, for the evaluator) turns back into
+                        // the typed error.
+                        Err(ValueError::Cancelled) => cljrs_value::parking::resume_cancelled(),
                         Err(error) => {
                             self.error = Some(error);
                             self.current = Value::Nil;
@@ -2055,12 +2062,17 @@ pub(crate) fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
         | Value::DoubleArray(_)
         | Value::Str(_)
         | Value::TypeInstance(_) => {
-            let mut iter = ValueIter::new(v.clone());
-            let result: Vec<Value> = iter.by_ref().collect();
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(result)
+            // The evaluator calls this directly (`apply`), outside any
+            // NativeFn boundary, so catch the iterator's cancellation unwind
+            // here: callers get a typed error and `finally` still runs.
+            cljrs_value::parking::catch_cancelled(|| {
+                let mut iter = ValueIter::new(v.clone());
+                let result: Vec<Value> = iter.by_ref().collect();
+                match iter.take_error() {
+                    Some(err) => Err(err),
+                    None => Ok(result),
+                }
+            })?
         }
         Value::Nil => Ok(Vec::new()),
         _ => Err(ValueError::WrongType {
@@ -3408,7 +3420,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
         Value::ObjectArray(a) => a.get().0.lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
-            let realized = s.get().try_realize().map_err(ValueError::Other)?;
+            let realized = s.get().try_realize()?;
             return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
@@ -3516,7 +3528,7 @@ fn builtin_list_star(args: &[Value]) -> ValueResult<Value> {
     let mut iter = ValueIter::new(last.clone());
     items.extend(iter.by_ref());
     if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+        return Err(err);
     }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
@@ -3945,7 +3957,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(v.clone());
             let n = iter.by_ref().count();
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             return Ok(Value::Long(n as i64));
         }
@@ -4023,7 +4035,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     // Iteratively unwrap lazy seqs to avoid stack overflow.
     let mut val = args[0].unwrap_meta().clone();
     while let Value::LazySeq(ls) = &val {
-        let realized = ls.get().try_realize().map_err(ValueError::Other)?;
+        let realized = ls.get().try_realize()?;
         val = realized;
     }
     match &val {
@@ -4170,7 +4182,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            let v = ls.get().try_realize()?;
             builtin_first(&[v])
         }
         Value::Cons(c) => Ok(c.get().head.clone()),
@@ -4210,7 +4222,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().try_realize().map_err(ValueError::Other)?;
+            let v = ls.get().try_realize()?;
             builtin_rest(&[v])
         }
         Value::Cons(c) => {
@@ -4329,7 +4341,7 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(args[0].clone());
             let result = iter.nth(idx);
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             nth_or_not_found(result, default.as_ref(), idx, idx + 1)
         }
@@ -4476,7 +4488,7 @@ impl cljrs_gc::Trace for ConcatThunk {
 }
 
 impl Thunk for ConcatThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         // Root the collections so they survive GC while we iterate.
         let _colls_root = crate::env::gc_roots::root_values(&self.colls);
         let mut colls = self.colls.clone();
@@ -4530,7 +4542,7 @@ impl Thunk for ConcatThunk {
 /// Extract first element and rest from a seq-like value without fully realizing it.
 /// Used by the lazy concat implementation.  Iteratively unwraps LazySeq to
 /// avoid stack overflow on deeply nested lazy chains.
-fn concat_first_rest(val: &Value) -> Result<(Option<Value>, Value), String> {
+fn concat_first_rest(val: &Value) -> ValueResult<(Option<Value>, Value)> {
     // Iteratively unwrap lazy seqs first.
     let mut current = val.clone();
     while let Value::LazySeq(ls) = current {
@@ -4754,7 +4766,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
             }
         }
         if let Some(err) = iter.take_error() {
-            return Err(ValueError::Other(err));
+            return Err(err);
         }
         // Call completion arity
         acc = crate::env::callback::invoke(&xf_rf, vec![acc])?;
@@ -4796,7 +4808,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         };
     }
     if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+        return Err(err);
     }
     Ok(match meta {
         Some(m) => result.with_meta(m),
@@ -4854,7 +4866,7 @@ fn reduce_from(f: &Value, init: Value, iter: &mut ValueIter) -> ValueResult<Valu
         }
     }
     if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+        return Err(err);
     }
     Ok((*acc).clone())
 }
@@ -4903,7 +4915,7 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(coll.clone());
             let v: Vec<Value> = iter.by_ref().collect();
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             let result = Value::Vector(GcPtr::new(PersistentVector::from_iter(v)));
             Ok(match meta {
@@ -5916,7 +5928,7 @@ fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
 fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
     match v {
         Value::Nil => Ok(None),
-        Value::LazySeq(ls) => seq_first_rest(&ls.get().try_realize().map_err(ValueError::Other)?),
+        Value::LazySeq(ls) => seq_first_rest(&ls.get().try_realize()?),
         Value::Cons(c) => {
             let cell = c.get();
             Ok(Some((cell.head.clone(), cell.tail.clone())))
@@ -6217,7 +6229,7 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
         Value::Atom(a) => Ok(a.get().deref()),
         Value::SharedAtom(sa) => Ok(demote(&sa.deref_val())),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
-        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
+        Value::Delay(d) => d.get().force(),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Promise(_) | Value::Future(_) => {
             if matches!(&args[0], Value::Future(_))
@@ -8269,7 +8281,7 @@ fn builtin_volatile_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_force(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
+        Value::Delay(d) => d.get().force(),
         other => Ok(other.clone()), // non-delay passes through
     }
 }

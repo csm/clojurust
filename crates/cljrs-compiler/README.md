@@ -201,8 +201,10 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Lazy realization errors:** `rt_count`, `rt_first`, `rt_rest`, `rt_apply`,
   `rt_into_map`, and `rt_kwargs_map` propagate realization errors through the
   pending-exception slot. A rejected carrier wait preserves the pending thunk.
-  Every boxed ABI bridge uses `#[catch_realization(throw_str)]` to contain
-  realization failures from equality, hashing, and formatting.
+  Every boxed ABI bridge uses `#[catch_realization(throw_str, signal_error)]` to contain
+  realization failures from equality, hashing, and formatting, and to turn a
+  fiber-cancellation unwind into the uncatchable pending `Cancelled` resource error
+  before it can cross the C ABI.
   ABI subprocess tests cover parked realizers. An AOT test covers catchable
   realization errors in a compiled binary.
 - **Keyword arguments:** `rt_kwargs_map(rest) -> *const Value` — the compiled tiers' half of `KnownFn::KwargsMap`, normalizing a variadic rest seq into the value a map-shaped rest pattern (`[& {:keys [a b]}]`) destructures against. Delegates to `Value::from_kwargs_rest`, the one definition every tier shares (issue #368). A lone trailing argument is returned as-is, so like `rt_first`/`rt_nth` its result can alias arg 0; a dangling key raises through the pending-exception slot rather than unwinding out of the `extern "C"` frame
@@ -838,3 +840,37 @@ A first lookup during a bounded invocation fills an invocation-local table.
 Repeated keyword and versioned-global fills reuse its boxed value without further arena allocation.
 Program caches and compiled slots never receive invocation-owned pointers. The guard clears the table before freeing its arena.
 Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.
+
+
+## Fiber safepoints (virtual threads Phase 4)
+
+`rt_abi::rt_safepoint() -> i8` polls GC coordination, then the optional native
+fiber scheduler. It returns 1 to continue. A stack-margin failure stores a
+catchable pending exception and returns 0. Automatic-yield cancellation stores
+an uncatchable resource error and returns 0. Generated native functions check
+this status at entry and loop back-edges and return their ABI sentinel on failure.
+The wasm `rt_safepoint` import keeps its original `() -> ()` signature, so existing
+hosts still instantiate modules; wasm retains the existing async model.
+
+`tests/fiber_fairness.rs` checks that published JIT machine code yields during a
+CPU loop and can be cancelled at an automatic yield. The AOT suite checks
+fairness and fiber-specific recursion errors in a GC binary. The existing `no-gc`
+AOT blacklist rejects this fixture's escaping function definitions.
+Generated call sites test for a pending error before consuming a failed call's nil
+sentinel or running another operation. `rt_throw` stores an owned, traced value and
+replaces an earlier throw. Poll functions transfer typed errors out of TLS before
+returning; later invocations on the same carrier start with clear error slots.
+
+Additional native bridges:
+
+- `rt_error_pending() -> u8` checks for a pending exception or resource error.
+- `rt_error_flag_ptr() -> *const u8` returns the carrier's error flag. Generated code
+  loads it once per function and tests the byte inline after each runtime call, instead
+  of calling `rt_error_pending`. The flag is a fiber-swapped mutator slot.
+- `rt_native_frame_depth() -> usize` records a function's native region checkpoint.
+- `rt_native_frame_cleanup(depth: usize)` closes only regions opened above that checkpoint on an error exit.
+- `rt_async_fail(sm: *mut CljxStateMachine) -> i32` consumes TLS errors and stores the correct poll result (`POLL_CANCELLED` for fiber cancellation). Memory faults retain their typed delivery through the confirmed governor slot.
+
+The codegen uses the same cleanup on safepoint, gas, and post-call failures. It
+preserves caller-owned regions. Tests exercise thrown values, gas exhaustion,
+memory faults, skipped side effects, and subsequent calls on the same carrier.

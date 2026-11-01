@@ -60,6 +60,8 @@ pub const POLL_READY: i32 = 1;
 pub const POLL_THREW: i32 = 2;
 /// Poll-function return code: the active gas meter was exhausted.
 pub const POLL_GAS_EXHAUSTED: i32 = 3;
+/// Execution was cancelled independently of the gas budget.
+pub const POLL_CANCELLED: i32 = 4;
 
 /// The C-ABI signature of a compiled poll function.  The result/thrown value is
 /// returned in-band (`CljxStateMachine::pending`), not through an out-pointer.
@@ -137,6 +139,10 @@ pub fn check_ready(val: &Value) -> Readiness {
                 cljrs_value::publish::read_slot(f.get() as *const _ as usize, 0);
                 f.get().mark_observed();
                 Readiness::Failed(v.clone())
+            }
+            FutureState::Interrupted => {
+                f.get().mark_observed();
+                Readiness::Failed(CljxFuture::cancelled_error())
             }
             FutureState::GasExhausted => {
                 f.get().mark_observed();
@@ -222,6 +228,7 @@ impl Future for CompiledAsyncTask {
             POLL_READY => Poll::Ready(Ok(this.sm.pending.clone())),
             POLL_THREW => Poll::Ready(Err(EvalError::Thrown(this.sm.pending.clone()))),
             POLL_GAS_EXHAUSTED => Poll::Ready(Err(EvalError::GasExhausted)),
+            POLL_CANCELLED => Poll::Ready(Err(EvalError::Cancelled)),
             other => Poll::Ready(Err(EvalError::Runtime(format!(
                 "compiled async poll returned invalid code {other}"
             )))),

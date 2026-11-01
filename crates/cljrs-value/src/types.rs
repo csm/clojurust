@@ -1077,6 +1077,8 @@ pub enum Arity {
 
 pub struct NativeFn {
     pub name: Arc<str>,
+    /// Lazily assigned watchdog name id (`Default::default()` when building).
+    pub diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId,
     pub arity: Arity,
     pub func: NativeFnFunc,
     /// Managed values retained by the opaque callable closure.
@@ -1093,9 +1095,12 @@ impl NativeFn {
             arity,
             blocking_func: None,
             captures: Default::default(),
+            diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
-                crate::realization::catch(|| func(args))
-                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
             }),
         }
     }
@@ -1112,9 +1117,12 @@ impl NativeFn {
             arity,
             blocking_func: None,
             captures: Default::default(),
+            diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
-                crate::realization::catch(|| func(args))
-                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
             }),
         }
     }
@@ -1145,8 +1153,10 @@ impl NativeFn {
     ) -> Self {
         let mut native = Self::with_closure(name, arity, func);
         native.blocking_func = Some(Arc::new(move |args| {
-            crate::realization::catch(|| blocking_func(args))
-                .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            crate::parking::catch_cancelled(|| {
+                crate::realization::catch(|| blocking_func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            })?
         }));
         native
     }
@@ -1356,7 +1366,18 @@ impl cljrs_gc::Trace for BoundFn {
 
 /// A deferred computation that produces a `Value` when forced.
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Result<Value, String>;
+    /// Errors other than `crate::ValueError::Cancelled` are cached as their message.
+    /// A thunk interrupted by fiber cancellation must return
+    /// `crate::ValueError::Cancelled`, so the cell stays pending for other readers.
+    fn force(&self) -> crate::ValueResult<Value>;
+}
+
+/// The cached message of a failed thunk.
+fn thunk_error_message(error: crate::ValueError) -> String {
+    match error {
+        crate::ValueError::Other(message) => message,
+        other => other.to_string(),
+    }
 }
 
 /// Identifies a computation by its isolate thread and optional fiber.
@@ -1448,6 +1469,8 @@ impl LazySeq {
     pub fn realize(&self) -> Value {
         match self.try_realize() {
             Ok(value) => value,
+            // No error channel here: continue the cancellation as an unwind.
+            Err(crate::ValueError::Cancelled) => crate::parking::resume_cancelled(),
             Err(error) => {
                 // Infallible trait callers cannot return a transient wait
                 // error. Fail explicitly instead of silently losing data.
@@ -1459,7 +1482,9 @@ impl LazySeq {
 
     /// Realize a sequence with explicit errors, including unsafe carrier waits.
     /// A rejected wait does not change the thunk or its realization state.
-    pub fn try_realize(&self) -> Result<Value, String> {
+    /// Cached and ordinary errors are `crate::ValueError::Other`; a thunk cancelled
+    /// with its fiber returns `crate::ValueError::Cancelled` and stays pending.
+    pub fn try_realize(&self) -> crate::ValueResult<Value> {
         let owner = Realizer::current();
         let thunk = loop {
             let listener = self.ready.listen();
@@ -1471,12 +1496,12 @@ impl LazySeq {
                     crate::publish::read_slot(self as *const _ as usize, 0);
                     return Ok(value);
                 }
-                LazySeqState::Error(error) => return Err(error.clone()),
+                LazySeqState::Error(error) => return Err(crate::ValueError::Other(error.clone())),
                 LazySeqState::Realizing { owner: active, .. } => {
                     if *active == owner {
                         return Ok(Value::Nil);
                     }
-                    active.ensure_can_wait()?;
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1504,9 +1529,17 @@ impl LazySeq {
                 *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
                 Ok(result)
             }
-            Err(msg) => {
-                *self.state.lock().unwrap() = LazySeqState::Error(msg.clone());
-                Err(msg)
+            // Cancellation is not the thunk's result: the guard returns it to
+            // Pending for other readers, and the error propagates typed.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => {
+                let message = thunk_error_message(error);
+                *self.state.lock().unwrap() = LazySeqState::Error(message.clone());
+                Err(crate::ValueError::Other(message))
             }
         };
         drop(thunk);
@@ -1714,9 +1747,9 @@ impl Delay {
         }
     }
 
-    /// Force the delay and cache the result.
-    /// Returns the value on success, or an error message on failure.
-    pub fn force(&self) -> Result<Value, String> {
+    /// Force the delay and cache the result. Errors are as for
+    /// [`LazySeq::try_realize`].
+    pub fn force(&self) -> crate::ValueResult<Value> {
         let owner = Realizer::current();
         let thunk = loop {
             let listener = self.ready.listen();
@@ -1728,12 +1761,14 @@ impl Delay {
                     crate::publish::read_slot(self as *const _ as usize, 0);
                     return Ok(value);
                 }
-                DelayState::Error(e) => return Err(e.clone()),
+                DelayState::Error(e) => return Err(crate::ValueError::Other(e.clone())),
                 DelayState::Realizing { owner: active, .. } => {
                     if *active == owner {
-                        return Err("recursive delay realization".into());
+                        return Err(crate::ValueError::Other(
+                            "recursive delay realization".into(),
+                        ));
                     }
-                    active.ensure_can_wait()?;
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
                     drop(state);
                     listener.wait(None);
                     continue;
@@ -1755,13 +1790,24 @@ impl Delay {
             lazy: None,
             delay: Some(self),
         };
-        let result = thunk
-            .force()
-            .map(|value| crate::publish::publish_for_owner(value, self as *const _ as usize));
+        let result = match thunk.force() {
+            Ok(value) => Ok(crate::publish::publish_for_owner(
+                value,
+                self as *const _ as usize,
+            )),
+            // As for lazy seqs: the guard leaves the thunk Pending.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => Err(thunk_error_message(error)),
+        };
         *self.state.lock().unwrap() = match &result {
             Ok(value) => DelayState::Forced(value.clone()),
             Err(error) => DelayState::Error(error.clone()),
         };
+        let result = result.map_err(crate::ValueError::Other);
         drop(thunk);
         #[cfg(feature = "no-gc")]
         cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
@@ -1940,6 +1986,8 @@ pub enum FutureState {
     /// The future exhausted the evaluation budget. Kept distinct from a
     /// thrown value so user-level catch clauses cannot intercept it.
     GasExhausted,
+    /// The producer was interrupted by fiber cancellation (uncatchable).
+    Interrupted,
     /// The future's body failed with a managed-memory limit fault (strict
     /// governor mode). Kept distinct for the same reason as `GasExhausted`.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
@@ -2009,12 +2057,15 @@ impl CljxFuture {
         let value = match &*state {
             FutureState::Running => return None,
             FutureState::Done(v) => Ok(v.clone()),
-            FutureState::Failed(v) => Err(ValueError::Thrown(v.clone())),
-            FutureState::GasExhausted => Err(ValueError::GasExhausted),
-            FutureState::MemoryLimitExceeded(f) => Err(ValueError::MemoryLimitExceeded(*f)),
-            FutureState::Cancelled => {
+            FutureState::Failed(v) => Err(crate::ValueError::Thrown(v.clone())),
+            FutureState::GasExhausted => Err(crate::ValueError::GasExhausted),
+            FutureState::MemoryLimitExceeded(f) => Err(crate::ValueError::MemoryLimitExceeded(*f)),
+            // A producer interrupted by fiber cancellation reaches awaiters as
+            // the same catchable error as `future-cancel`. A cancelled
+            // awaiter stops at its own park; healthy ones can handle it.
+            FutureState::Cancelled | FutureState::Interrupted => {
                 drop(state);
-                return Some(Err(ValueError::Thrown(Self::cancelled_error())));
+                return Some(Err(crate::ValueError::Thrown(Self::cancelled_error())));
             }
         };
         self.mark_observed();
@@ -2094,20 +2145,41 @@ impl Drop for CljxFuture {
         // (still-valid) allocation.
         if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(state) = self.state.lock()
-            && matches!(
-                &*state,
-                FutureState::Failed(_)
-                    | FutureState::GasExhausted
-                    | FutureState::MemoryLimitExceeded(_)
-            )
         {
-            eprintln!(
-                "[clojurust warning] a failed future was discarded without its error \
-                 being observed (no await/deref); the failure was lost"
-            );
+            match &*state {
+                FutureState::Failed(_)
+                | FutureState::GasExhausted
+                | FutureState::MemoryLimitExceeded(_) => eprintln!(
+                    "[clojurust warning] a failed future was discarded without its error \
+                     being observed (no await/deref); the failure was lost"
+                ),
+                // Interruption is deliberate, like `future-cancel`: silent
+                // unless CLJRS_WARN_INTERRUPTED_FUTURES opts in.
+                FutureState::Interrupted if warn_interrupted_futures() => eprintln!(
+                    "[clojurust warning] an interrupted future was discarded without \
+                     being observed (no await/deref)"
+                ),
+                _ => {}
+            }
         }
         crate::publish::clear_slots(self as *const _ as usize);
     }
+}
+
+/// Whether discarding an unread `Interrupted` future warns, like a failed
+/// one. Off by default; `CLJRS_WARN_INTERRUPTED_FUTURES=1` (or `true`/`yes`)
+/// enables it. Read once per process: `CljxFuture::drop` can run during a GC
+/// sweep.
+fn warn_interrupted_futures() -> bool {
+    static WARN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WARN.get_or_init(|| {
+        std::env::var("CLJRS_WARN_INTERRUPTED_FUTURES").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+    })
 }
 
 impl Default for CljxFuture {

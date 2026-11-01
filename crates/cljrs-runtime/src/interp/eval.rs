@@ -455,7 +455,10 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Var(var) => crate::env::dynamics::deref_var(&var)
             .ok_or_else(|| EvalError::Runtime("unbound var".into())),
         Value::Volatile(vol) => Ok(vol.get().deref()),
-        Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
+        Value::Delay(d) => d
+            .get()
+            .force()
+            .map_err(crate::env::error::realize_error_to_eval_error),
         Value::Agent(a) => Ok(a.get().get_state()),
         Value::Reduced(inner) => Ok((*inner).clone()),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
