@@ -398,7 +398,11 @@ pub struct FiberTask {
 
 impl FiberTask {
     fn release_stack(&mut self) {
-        let co = self.co.take().expect("fiber already completed");
+        let Some(co) = self.co.take() else {
+            // The suspended stack was leaked by `unwind`.
+            self.scheduling.wake.close();
+            return;
+        };
         let stack = co.into_stack();
         self.scheduling.wake.close();
         let mut reservation = self.reservation.take().unwrap();
@@ -420,33 +424,45 @@ impl FiberTask {
         // turn into an uncatchable error, so nothing unwinds through foreign
         // frames. Cleanup then runs as this fiber: its scheduling context is
         // entered, as for a normal resume. Fibers that never started or have
-        // already finished run no code, and a drop that could not park here
-        // (runtime lock held, critical section, borrowed slot, unwinding)
-        // force-unwinds instead of running user code in that context.
+        // already finished run no code.
         self.pending.take();
-        if let Some(co) = &mut self.co {
-            let _current = CurrentGuard::enter(if self.yielder.is_null() {
-                None
-            } else {
-                Some(Current {
-                    id: self.id,
-                    yielder: self.yielder,
-                    scheduling: &*self.scheduling,
-                })
+        let Some(co) = &mut self.co else { return };
+        if !co.started() || co.done() {
+            co.force_unwind();
+            return;
+        }
+        if !cljrs_gc::mutator::can_park() {
+            // Dropped where cleanup cannot run (runtime lock held, critical
+            // section, borrowed slot, unwinding). A forced unwind could cross
+            // extern "C" or JIT frames and abort, so leak the suspended stack
+            // instead. Parks hold no runtime locks or slot borrows, so its
+            // frames retain nothing the carrier needs; the stack and its
+            // reservation stay allocated and charged.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "cljrs: fiber {} dropped where it could not be cancelled; \
+                     its stack was leaked",
+                    self.id.0
+                );
             });
-            if co.started() && !co.done() && cljrs_gc::mutator::can_park() {
-                self.scheduling.cancel();
-                let _running = self.scheduling.enter();
-                let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
-                match outcome {
-                    Err(cljrs_value::ValueError::Cancelled) => {}
-                    Err(_) => unreachable!(),
-                    Ok(CoroutineResult::Return(_)) => {}
-                    Ok(CoroutineResult::Yield(_)) => unreachable!("cancelled fiber suspended"),
-                }
-            } else {
-                co.force_unwind();
-            }
+            std::mem::forget(self.co.take());
+            std::mem::forget(self.reservation.take());
+            return;
+        }
+        let _current = CurrentGuard::enter(Some(Current {
+            id: self.id,
+            yielder: self.yielder,
+            scheduling: &*self.scheduling,
+        }));
+        self.scheduling.cancel();
+        let _running = self.scheduling.enter();
+        let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
+        match outcome {
+            Err(cljrs_value::ValueError::Cancelled) => {}
+            Err(_) => unreachable!(),
+            Ok(CoroutineResult::Return(_)) => {}
+            Ok(CoroutineResult::Yield(_)) => unreachable!("cancelled fiber suspended"),
         }
     }
 }

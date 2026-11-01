@@ -70,6 +70,9 @@ pub enum CloneError {
     },
     /// The channel's receiver side has been dropped.
     Disconnected,
+    /// Realizing a lazy value was interrupted by fiber cancellation; callers
+    /// must surface it as `ValueError::Cancelled`, which stays uncatchable.
+    Cancelled,
     /// The process memory governor refused the message's queue charge
     /// (strict mode).
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
@@ -94,6 +97,7 @@ impl std::fmt::Display for CloneError {
                 )
             }
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
+            CloneError::Cancelled => write!(f, "execution cancelled"),
             CloneError::MemoryLimitExceeded(e) => e.fmt(f),
             CloneError::Full {
                 bytes,
@@ -598,11 +602,13 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         }
 
         // ── Lazy sequences: realize first ──
-        Value::LazySeq(p) => serialize(
-            &p.get()
-                .try_realize()
-                .map_err(|_| not_shareable("lazy seq whose realization failed"))?,
-        ),
+        Value::LazySeq(p) => serialize(&p.get().try_realize().map_err(|error| match error {
+            // Cancellation and memory faults keep their identity, so they are
+            // not turned into a catchable "not shareable" error.
+            ValueError::Cancelled => CloneError::Cancelled,
+            ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
+            _ => not_shareable("lazy seq whose realization failed"),
+        })?),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {

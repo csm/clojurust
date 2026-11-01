@@ -296,3 +296,67 @@ fn cancelling_an_explicit_park_inside_an_abi_bridge_returns_an_error() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn dropping_a_fiber_parked_in_an_abi_bridge_under_a_lock_does_not_abort() {
+    const CHILD: &str = "CLJRS_DROP_PARKED_ABI_LOCKED";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dropping_a_fiber_parked_in_an_abi_bridge_under_a_lock_does_not_abort",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("its stack was leaked"), "{stderr}");
+        return;
+    }
+    use cljrs_compiler::rt_abi;
+    use cljrs_gc::GcPtr;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.into_globals();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, async {
+                let cleaned = Rc::new(Cell::new(false));
+                let flag = cleaned.clone();
+                let mut task = Box::pin(
+                    fiber::Fiber::new(move || {
+                        let _ctx = cljrs_runtime::env::callback::install_eval_context_guard(
+                            globals,
+                            "user".into(),
+                        );
+                        let promise = Value::Promise(GcPtr::new(cljrs_value::CljxPromise::new()));
+                        let _root = cljrs_runtime::env::gc_roots::root_value(&promise);
+                        // An explicit park inside an extern-C bridge.
+                        unsafe {
+                            rt_abi::rt_deref(&promise);
+                        }
+                        flag.set(true);
+                        Ok(Value::Nil)
+                    })
+                    .unwrap()
+                    .into_task(),
+                );
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(task.as_mut().poll(&mut cx).is_pending());
+                let lock = cljrs_gc::mutator::TrackedMutex::new(());
+                let guard = lock.lock().unwrap();
+                drop(task);
+                drop(guard);
+                assert!(!cleaned.get(), "cleanup ran under a runtime lock");
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -90,15 +90,6 @@ impl EvalError {
     }
 }
 
-/// Surface a builtin's `ValueError` to the evaluator as a *catchable* condition.
-///
-/// Internal runtime errors (`IndexOutOfBounds`, `WrongType`, `ArityError`, …)
-/// are normalized into an `EvalError::Thrown(Value::Error(..))` carrying the
-/// original `ValueError` variant and its plain display message — no
-/// `runtime error:` prefix — so that `(catch :default e ..)` /
-/// `(catch Throwable e ..)` bind a value on which `ex-message` / `ex-data`
-/// behave the same as for a user `throw` / `ex-info`. A `ValueError::Thrown`
-/// (a builtin re-throwing a Clojure value) is surfaced as that exact value.
 /// A `Thunk::force` error: cancellation stays typed, so lazy cells do not
 /// cache it; every other failure becomes its message, as before.
 pub fn eval_error_to_thunk_error(error: EvalError) -> ValueError {
@@ -117,6 +108,15 @@ pub fn realize_error_to_eval_error(error: ValueError) -> EvalError {
     }
 }
 
+/// Surface a builtin's `ValueError` to the evaluator as a *catchable* condition.
+///
+/// Internal runtime errors (`IndexOutOfBounds`, `WrongType`, `ArityError`, …)
+/// are normalized into an `EvalError::Thrown(Value::Error(..))` carrying the
+/// original `ValueError` variant and its plain display message — no
+/// `runtime error:` prefix — so that `(catch :default e ..)` /
+/// `(catch Throwable e ..)` bind a value on which `ex-message` / `ex-data`
+/// behave the same as for a user `throw` / `ex-info`. A `ValueError::Thrown`
+/// (a builtin re-throwing a Clojure value) is surfaced as that exact value.
 pub fn value_error_to_eval_error(err: ValueError) -> EvalError {
     match err {
         ValueError::Thrown(v) => EvalError::Thrown(v),

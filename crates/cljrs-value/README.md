@@ -911,6 +911,9 @@ impl SerializedValue {
 pub enum CloneError {
     NotShareable { type_name: &'static str },
     Disconnected,
+    /// Realizing a lazy seq was interrupted by fiber cancellation; callers
+    /// surface it as the uncatchable `ValueError::Cancelled`.
+    Cancelled,
     /// A byte-bounded isolate channel has no room for the message.
     Full { bytes: usize, queued: usize, limit: usize },
     /// The strict process governor refused the message's queue charge.

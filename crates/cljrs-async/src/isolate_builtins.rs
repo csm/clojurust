@@ -193,6 +193,7 @@ fn builtin_isolate_put(args: &[Value]) -> ValueResult<Value> {
         ))),
         Err(e @ CloneError::Full { .. }) => Err(ValueError::Other(format!("isolate-put!: {e}"))),
         Err(CloneError::MemoryLimitExceeded(fault)) => Err(ValueError::MemoryLimitExceeded(fault)),
+        Err(CloneError::Cancelled) => Err(ValueError::Cancelled),
     }
 }
 

@@ -274,7 +274,10 @@ fn execute_inner(
     let function = env.eval(program.form()).map_err(map_eval_error)?;
     let result = cljrs_runtime::env::apply::apply_value(&function, args, &mut env)
         .map_err(map_eval_error)?;
-    let result = serialize(&result)?;
+    let result = serialize(&result).map_err(|error| match error {
+        CloneError::Cancelled => TxError::Cancelled,
+        other => TxError::Clone(other),
+    })?;
     validate_pure_data(&result).map_err(TxError::InvalidResult)?;
 
     // Make the lifetime ordering explicit: all GcPtrs disappear before the

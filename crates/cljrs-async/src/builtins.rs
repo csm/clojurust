@@ -117,8 +117,7 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
         .map(|(i, v)| {
             Box::pin(async move {
                 let result = await_value(v.clone()).await;
-                // A producer interrupted by cancellation fails the select with
-                // its catchable exception, as every other reader sees it,
+                // A producer interrupted by cancellation fails the select,
                 // rather than contributing nil like an ordinary failure.
                 let interrupted = result.is_err()
                     && matches!(&v, Value::Future(future) if matches!(
@@ -131,7 +130,9 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
         .collect();
     let ((result, idx, interrupted), _, _) = futures_util::future::select_all(branches).await;
     let value = match result {
-        Err(error) if interrupted => return Err(error),
+        // Settle as Interrupted, like `take!`: awaiters get the catchable
+        // cancellation exception, and an unread result is not reported.
+        Err(_) if interrupted => return Err(EvalError::Cancelled),
         Err(
             error @ (EvalError::GasExhausted
             | EvalError::Cancelled

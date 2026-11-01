@@ -134,8 +134,8 @@ fn unread_thread_resource_errors_are_reported_without_a_collection() {
                 });
                 let forms = cljrs_reader::Parser::new(
                     if kind == "cancelled" {
-                        // A take! of a cancelled body, dropped unread, is silent too.
-                        "(require '[clojure.core.async :as a]) (a/thread (limit)) (a/take! (a/thread (limit))) (sleep 1) nil"
+                        // take! and alts over a cancelled body, dropped unread, are silent too.
+                        "(require '[clojure.core.async :as a]) (a/thread (limit)) (a/take! (a/thread (limit))) (a/alts [(a/take! (a/thread (limit)))]) (sleep 1) nil"
                     } else {
                         "(require '[clojure.core.async :as a]) (a/thread (limit)) (sleep 1) nil"
                     }

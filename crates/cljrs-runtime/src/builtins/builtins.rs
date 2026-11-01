@@ -1891,6 +1891,12 @@ impl Iterator for ValueIter {
                     let _current_root = crate::env::gc_roots::root_value(&self.current);
                     match ls.get().try_realize() {
                         Ok(value) => self.current = value,
+                        // Not every consumer calls `take_error`; ending the
+                        // iteration would hand a truncated result to code in
+                        // a cancelled fiber. Continue as the cancellation
+                        // unwind, which the enclosing NativeFn boundary turns
+                        // back into the typed error.
+                        Err(ValueError::Cancelled) => cljrs_value::parking::resume_cancelled(),
                         Err(error) => {
                             self.error = Some(error);
                             self.current = Value::Nil;

@@ -379,6 +379,7 @@ impl Scheduling {
             scheduling: self,
             outer,
             native,
+            entered: now,
         }
     }
 
@@ -452,13 +453,20 @@ pub(super) struct RunGuard<'a> {
     scheduling: &'a Scheduling,
     outer: Option<Running>,
     native: usize,
+    entered: Instant,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         let scheduler = &self.scheduling.wake.scheduler;
-        // Restore the outer entry unchanged: an outer fiber that keeps
-        // driving inner ones without reaching its own safepoint is stalled.
-        *scheduler.running.lock().unwrap() = self.outer.take();
+        // Pause the outer fiber's clock while the inner one ran: shift its
+        // heartbeat by the inner resume, so only the outer fiber's own time
+        // without a safepoint counts. Repeated short inner resumes therefore
+        // still let a stalled outer fiber be reported.
+        let outer = self.outer.take().map(|mut run| {
+            run.heartbeat += self.entered.elapsed();
+            run
+        });
+        *scheduler.running.lock().unwrap() = outer;
         scheduler.native.store(self.native, Ordering::Relaxed);
     }
 }
@@ -543,16 +551,24 @@ mod tests {
                 let _native =
                     cljrs_gc::fiber::native_frame(&Arc::from("outer-native"), &Default::default());
                 let native = SCHEDULER.with(|s| s.native.load(Ordering::Relaxed));
+                let heartbeat =
+                    || SCHEDULER.with(|s| s.running.lock().unwrap().as_ref().unwrap().heartbeat);
+                let before = heartbeat();
                 // Drive another fiber to completion on this carrier.
                 let mut inner = std::pin::pin!(
-                    super::super::Fiber::new(|| { Ok(cljrs_value::Value::Nil) })
-                        .unwrap()
-                        .into_task()
+                    super::super::Fiber::new(|| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(cljrs_value::Value::Nil)
+                    })
+                    .unwrap()
+                    .into_task()
                 );
                 let waker = std::task::Waker::noop();
                 let mut cx = std::task::Context::from_waker(waker);
                 assert!(inner.as_mut().poll(&mut cx).is_ready());
                 assert_eq!(running_id(), Some(outer_id));
+                // The inner fiber's 50 ms is not charged to the outer fiber.
+                assert!(heartbeat() >= before + Duration::from_millis(50));
                 assert_eq!(SCHEDULER.with(|s| s.native.load(Ordering::Relaxed)), native);
                 Ok(cljrs_value::Value::Nil)
             })

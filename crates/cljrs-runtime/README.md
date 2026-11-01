@@ -428,6 +428,13 @@ installed by `cljrs-tx`.
 - `EvalError::to_error_value(self) -> Value` — convert an error into a Clojure
   error *value*; `Thrown` is returned unchanged, anything else is wrapped in a
   fresh `ExceptionInfo`
+- `eval_error_to_thunk_error(error: EvalError) -> ValueError` — the error a
+  `Thunk::force` implementation returns: `EvalError::Cancelled` stays
+  `ValueError::Cancelled` (so lazy cells leave the thunk pending instead of
+  caching it); every other error becomes `ValueError::Other(message)`.
+- `realize_error_to_eval_error(error: ValueError) -> EvalError` — a
+  `LazySeq::try_realize` / `Delay::force` error as an `EvalError::Runtime`,
+  keeping `ValueError::Cancelled` as the uncatchable `EvalError::Cancelled`.
 - `value_error_to_eval_error(err: ValueError) -> EvalError` — surface a builtin's
   `ValueError` as a *catchable* `EvalError::Thrown(Value::Error(..))`, preserving
   the original variant and its plain message (no `runtime error:` prefix) so
