@@ -46,7 +46,8 @@ pub enum ValueError {
     /// Reserved for fiber cancellation (`parking::catch_cancelled` and
     /// cancelled safepoints). It is uncatchable inside the cancelled
     /// computation, but a future it settles is treated like `future-cancel`:
-    /// awaiters get a catchable exception and an unread one is not reported.
+    /// awaiters get a catchable exception, and an unread one is not reported
+    /// unless `CLJRS_WARN_INTERRUPTED_FUTURES` is enabled.
     /// Native code must not return it for other failures.
     #[error("execution cancelled")]
     Cancelled,

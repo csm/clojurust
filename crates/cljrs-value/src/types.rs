@@ -2145,21 +2145,41 @@ impl Drop for CljxFuture {
         // (still-valid) allocation.
         if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(state) = self.state.lock()
-            && matches!(
-                &*state,
-                // Interruption is deliberate, like `future-cancel`: no warning.
-                FutureState::Failed(_)
-                    | FutureState::GasExhausted
-                    | FutureState::MemoryLimitExceeded(_)
-            )
         {
-            eprintln!(
-                "[clojurust warning] a failed future was discarded without its error \
-                 being observed (no await/deref); the failure was lost"
-            );
+            match &*state {
+                FutureState::Failed(_)
+                | FutureState::GasExhausted
+                | FutureState::MemoryLimitExceeded(_) => eprintln!(
+                    "[clojurust warning] a failed future was discarded without its error \
+                     being observed (no await/deref); the failure was lost"
+                ),
+                // Interruption is deliberate, like `future-cancel`: silent
+                // unless CLJRS_WARN_INTERRUPTED_FUTURES opts in.
+                FutureState::Interrupted if warn_interrupted_futures() => eprintln!(
+                    "[clojurust warning] an interrupted future was discarded without \
+                     being observed (no await/deref)"
+                ),
+                _ => {}
+            }
         }
         crate::publish::clear_slots(self as *const _ as usize);
     }
+}
+
+/// Whether discarding an unread `Interrupted` future warns, like a failed
+/// one. Off by default; `CLJRS_WARN_INTERRUPTED_FUTURES=1` (or `true`/`yes`)
+/// enables it. Read once per process: `CljxFuture::drop` can run during a GC
+/// sweep.
+fn warn_interrupted_futures() -> bool {
+    static WARN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WARN.get_or_init(|| {
+        std::env::var("CLJRS_WARN_INTERRUPTED_FUTURES").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+    })
 }
 
 impl Default for CljxFuture {

@@ -189,8 +189,9 @@ case it keeps its own uncatchable cancellation. The exception is built after the
 lock is released, and an unread cancelled channel is not reported, so neither path
 allocates under the channel lock or during a GC sweep. `take!` on such a channel settles
 as `Interrupted`, and `alts` fails with the cancellation exception instead of yielding
-`nil` for it. Interrupted futures, like cancelled ones, are not
-reported when discarded unread. A compiled poll that is itself cancelled returns
+`nil` for it. Interrupted futures, like cancelled ones, are not reported when discarded
+unread, unless `CLJRS_WARN_INTERRUPTED_FUTURES=1` (or `true`/`yes`) is set, which
+prints a separate "interrupted future was discarded" warning. A compiled poll that is itself cancelled returns
 `POLL_CANCELLED`. Every `spawn_future` captures the complete active meter stack
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.

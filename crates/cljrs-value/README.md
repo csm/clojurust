@@ -765,6 +765,8 @@ pub struct CljxPromise {
 pub struct CljxFuture {
     pub ready: parking::Event,
     pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Interrupted | ...
+    // Drop warns about an unobserved Failed/GasExhausted/MemoryLimitExceeded state, and
+    // about Interrupted only when CLJRS_WARN_INTERRUPTED_FUTURES=1 (or true/yes).
                                     // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
