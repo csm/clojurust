@@ -584,7 +584,7 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   spelling, and error delivery, in both interpreter modes with collections at park points.
   In `no-gc` builds the rendezvous case is ignored: values handed between two parked fibers
   over a rendezvous channel are released early. The same failure reproduces with plain
-  `future` before this phase, so it is tracked as a separate `no-gc` ownership bug.
+  `future` before this phase, so it is tracked separately as csm/clojurust#442.
 
 ---
 

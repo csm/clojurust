@@ -151,8 +151,8 @@ fn async_fns_run_on_fibers_and_may_deref() {
 #[test]
 #[cfg_attr(
     feature = "no-gc",
-    ignore = "pre-existing no-gc bug: values handed between two parked fibers over a \
-              rendezvous channel are released early (also reproduces with plain `future`)"
+    ignore = "csm/clojurust#442: no-gc releases values handed between two parked fibers \
+              over a rendezvous channel too early (also reproduces with plain `future`)"
 )]
 fn async_calls_are_concurrent() {
     // Both bodies must be parked at once for the rendezvous to complete.
