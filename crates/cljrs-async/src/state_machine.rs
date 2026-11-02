@@ -1,5 +1,11 @@
 //! Compiled async state machines (Phase H runtime support).
 //!
+//! **No runtime path uses this ABI.** Since virtual-threads Phase 5 every
+//! `^:async` call runs on a fiber, and TODO.md Phase H is closed. The poll
+//! ABI remains only so `cljrs-compiler`'s `lower_async` / poll-codegen unit
+//! tests compile; the poll-function registry was removed. Delete this module
+//! together with that transform.
+//!
 //! When `cljrs_ir::lower::async_lower` rewrites an `^:async` function into a
 //! poll function, codegen emits it as a C-ABI *poll function* with the
 //! signature
@@ -124,7 +130,7 @@ pub enum Readiness {
 }
 
 /// Check whether an awaited value has resolved, without blocking.  Mirrors
-/// [`crate::eval_async::await_value`] but for the poll-loop (no `.await`):
+/// [`crate::task::await_value`] but for the poll-loop (no `.await`):
 /// futures/promises report their settled state; any other value is immediately
 /// ready (awaiting a non-future is the identity).
 pub fn check_ready(val: &Value) -> Readiness {
@@ -239,10 +245,9 @@ impl Future for CompiledAsyncTask {
 /// Build a state machine for `poll_fn`, materialise `args` into its slots, and
 /// spawn it on the current `LocalSet`, returning the `Value::Future` it settles.
 ///
-/// This is the compiled-async counterpart of
-/// [`crate::runtime::AsyncRuntimeImpl::spawn_async_call`]'s `spawn_future`
-/// path: the dispatcher calls it when the callee arity has a compiled poll
-/// function.
+/// Test-only: no dispatch path runs compiled state machines since `^:async`
+/// calls moved to fibers (virtual-threads plan Phase 5).
+#[cfg(test)]
 pub fn spawn_state_machine(
     poll_fn: PollFn,
     n_slots: usize,
@@ -252,98 +257,13 @@ pub fn spawn_state_machine(
     let roots = args.clone();
     let mut sm = CljxStateMachine::new(poll_fn, n_slots, args);
     sm.eval_ctx = eval_ctx;
-    crate::eval_async::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
-}
-
-// ── Compiled poll-function registry ──────────────────────────────────────────
-//
-// AOT/JIT compilation of an `^:async` function emits a poll function and
-// registers it here, keyed by the arity's `ir_arity_id` (the canonical
-// per-arity id used throughout the JIT).  `AsyncRuntimeImpl::spawn_async_call`
-// consults the registry: a hit runs the native state machine via
-// `spawn_state_machine`, a miss falls back to the tree-walking `run_async_fn`
-// (after a one-shot compile attempt, when an async-compile hook is installed).
-// Function pointers are `Send + Sync`, so the registry is a simple global map.
-
-use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
-
-#[derive(Clone, Copy)]
-struct PollEntry {
-    poll_fn: PollFn,
-    n_slots: usize,
-}
-
-#[derive(Default)]
-struct Registry {
-    /// JIT registrations, keyed by the arity's runtime `ir_arity_id`.
-    compiled: HashMap<u64, PollEntry>,
-    /// Arities a JIT compile has been attempted for (one-shot).
-    attempted: HashSet<u64>,
-    /// AOT registrations, keyed by `(ns, name, arity)` — the compile-time key,
-    /// since `ir_arity_id` is only assigned at runtime.
-    named: HashMap<(String, String, usize), PollEntry>,
-}
-
-static POLL_REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
-
-/// Register a compiled poll function for an arity (`ir_arity_id`) with the
-/// number of state-machine slots it needs.  Called by the AOT harness / JIT
-/// once per compiled `^:async` arity.
-pub fn register_poll_fn(arity_id: u64, poll_fn: PollFn, n_slots: usize) {
-    let mut guard = POLL_REGISTRY.write().unwrap();
-    guard
-        .get_or_insert_with(Registry::default)
-        .compiled
-        .insert(arity_id, PollEntry { poll_fn, n_slots });
-}
-
-/// Look up a compiled poll function for an arity (`ir_arity_id`).
-pub fn lookup_poll_fn(arity_id: u64) -> Option<(PollFn, usize)> {
-    let guard = POLL_REGISTRY.read().unwrap();
-    guard
-        .as_ref()?
-        .compiled
-        .get(&arity_id)
-        .map(|e| (e.poll_fn, e.n_slots))
-}
-
-/// Mark `arity_id` as having had a compile attempt.  Returns `true` on the
-/// first call (the caller should run the compile), `false` thereafter — so a
-/// failed or unsupported lowering is attempted only once per arity.
-pub fn mark_compile_attempted(arity_id: u64) -> bool {
-    let mut guard = POLL_REGISTRY.write().unwrap();
-    guard
-        .get_or_insert_with(Registry::default)
-        .attempted
-        .insert(arity_id)
-}
-
-/// Register an AOT-compiled poll function by `(ns, name, arity)`.  Called by the
-/// generated AOT harness once per compiled `^:async` arity, before the program
-/// runs.
-pub fn register_poll_fn_named(ns: &str, name: &str, arity: usize, poll_fn: PollFn, n_slots: usize) {
-    let mut guard = POLL_REGISTRY.write().unwrap();
-    guard.get_or_insert_with(Registry::default).named.insert(
-        (ns.to_string(), name.to_string(), arity),
-        PollEntry { poll_fn, n_slots },
-    );
-}
-
-/// Look up an AOT-compiled poll function by `(ns, name, arity)`.
-pub fn lookup_poll_fn_named(ns: &str, name: &str, arity: usize) -> Option<(PollFn, usize)> {
-    let guard = POLL_REGISTRY.read().unwrap();
-    guard
-        .as_ref()?
-        .named
-        .get(&(ns.to_string(), name.to_string(), arity))
-        .map(|e| (e.poll_fn, e.n_slots))
+    crate::task::spawn_future_with_roots(roots, CompiledAsyncTask::new(sm))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval_async::{await_value, spawn_future};
+    use crate::task::{await_value, spawn_future};
 
     fn block_on_local<F: std::future::Future>(f: F) -> F::Output {
         let rt = tokio::runtime::Builder::new_current_thread()

@@ -402,6 +402,28 @@ pub fn dispatch_if_async(callee: &Value, args: &[Value], env: &Env) -> Option<Va
     Some(rt.spawn_async_call(callee.clone(), args.to_vec(), call_env))
 }
 
+/// Run the body of `callee` on the current stack, without `^:async` dispatch.
+///
+/// Native async runtimes call this from the fiber that an `^:async` call spawns,
+/// so the body runs on the ordinary synchronous evaluator instead of spawning
+/// another fiber. Non-function callees behave like [`apply_value`].
+pub fn apply_fn_body(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    let Value::Fn(f) = callee else {
+        return apply_value(callee, args, env);
+    };
+    cljrs_value::realization::catch(|| {
+        let _callee_root = crate::env::gc_roots::root_value(callee);
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        crate::env::gc_roots::gc_safepoint(env)?;
+        env.call_cljrs_fn(f.get(), &args)
+    })
+    .unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            cljrs_value::ValueError::Other(message),
+        ))
+    })
+}
+
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     cljrs_value::realization::catch(|| apply_value_inner(callee, args, env)).unwrap_or_else(

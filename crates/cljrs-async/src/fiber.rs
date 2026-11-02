@@ -31,7 +31,14 @@ use cljrs_gc::fiber::StackReservation;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use scheduler::Scheduling;
 
+/// Default fiber stack reservation. `go` and `^:async` bodies run the
+/// tree-walker on fibers, and unoptimized builds use several times more stack
+/// per interpreter frame, so debug builds reserve 4 MiB. Pages are committed
+/// lazily, so the larger reservation costs address space, not memory.
+#[cfg(not(debug_assertions))]
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+#[cfg(debug_assertions)]
+const DEFAULT_STACK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static STACK_POOL: Mutex<Vec<(usize, DefaultStack, StackReservation)>> = Mutex::new(Vec::new());
@@ -698,6 +705,17 @@ impl FiberResult {
         }
     }
 
+    /// Borrow the result while it stays rooted, across any number of yields.
+    ///
+    /// Borrow-only: a `Value` cloned out of it must not outlive this
+    /// `FiberResult`. Dropping it releases the result's ownership (in `no-gc`
+    /// builds, its region leases) without publishing to the caller. To keep a
+    /// value past the `FiberResult`, take it with [`Self::into_result`] and root
+    /// it yourself.
+    pub fn get(&self) -> &EvalResult {
+        self.result.as_ref().unwrap()
+    }
+
     pub fn into_result(mut self) -> EvalResult {
         #[cfg(feature = "no-gc")]
         for lease in &self.leases {
@@ -728,26 +746,27 @@ pub fn spawn_rooted(
     body: impl FnOnce() -> EvalResult + 'static,
 ) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
     let task = Fiber::with_roots(roots, body)?.into_task();
+    Ok(tokio::task::spawn_local(drive_to_result(task)))
+}
+
+/// Drive `task` to completion and keep its result rooted in a [`FiberResult`].
+async fn drive_to_result(task: FiberTask) -> FiberResult {
     #[cfg(feature = "no-gc")]
-    let allocation = task.allocation.clone();
-    Ok(tokio::task::spawn_local(async move {
-        #[cfg(feature = "no-gc")]
-        let result = {
-            let mut task = task;
-            task.owned_result = true;
-            let result = std::future::poll_fn(|cx| {
-                let _context = allocation.enter();
-                Pin::new(&mut task).poll(cx)
-            })
-            .await;
-            // Capture result storage while the completed task still pins its
-            // original scopes. The JoinHandle can outlive those lexical scopes.
-            FiberResult::new(result)
-        };
-        #[cfg(not(feature = "no-gc"))]
-        let result = FiberResult::new(task.await);
-        result
-    }))
+    {
+        let allocation = task.allocation.clone();
+        let mut task = task;
+        task.owned_result = true;
+        let result = std::future::poll_fn(|cx| {
+            let _context = allocation.enter();
+            Pin::new(&mut task).poll(cx)
+        })
+        .await;
+        // Capture result storage while the completed task still pins its
+        // original scopes. The JoinHandle can outlive those lexical scopes.
+        FiberResult::new(result)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    FiberResult::new(task.await)
 }
 
 /// Drive a borrowed top-level computation on a 64 MiB root stack.
@@ -848,4 +867,74 @@ pub fn run_root_owned(
         &mut driver.carrier,
         body,
     )
+}
+
+/// Evaluate one top-level form on a new fiber from async code that already
+/// runs on the isolate's LocalSet, returning its result rooted in a
+/// [`FiberResult`].
+///
+/// This is the fiber replacement for the retired native `eval_async` entry
+/// point. The form runs on the ordinary evaluator, so `await`, `deref`, and
+/// channel ops park the fiber. Like `future`, the fiber receives a snapshot of
+/// the caller's dynamic bindings, its active gas meters, and its interrupt
+/// flags, so a meter or interrupt around the caller also governs the form.
+/// The fiber evaluates in a fresh environment for `env`'s globals and
+/// namespace; a namespace change made by the form (`ns`, `in-ns`) is copied
+/// back into `env`. Lexical frames in `env` are not visible.
+///
+/// The result stays rooted across later yields and collections until the
+/// `FiberResult` is consumed or dropped: borrow it with [`FiberResult::get`],
+/// or take it with [`FiberResult::into_result`]. Use [`run_root`] instead when
+/// the caller is not already inside the runtime.
+pub async fn eval_form(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> FiberResult {
+    match eval_form_task(form, env) {
+        Ok((task, final_ns)) => {
+            let result = drive_to_result(task).await;
+            env.current_ns = final_ns.borrow().clone();
+            result
+        }
+        Err(error) => FiberResult::new(Err(error)),
+    }
+}
+
+/// [`eval_form`], returning the value directly and unrooted, as
+/// [`crate::await_value`] does. Use it before the next yield; a value kept
+/// across later yields must be rooted by the caller (or use [`eval_form`]).
+/// In `no-gc` builds the fiber publishes its result to the caller's scope on
+/// completion, as a root evaluation does.
+pub async fn eval_form_unrooted(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> EvalResult {
+    let (task, final_ns) = eval_form_task(form, env)?;
+    let result = task.await;
+    env.current_ns = final_ns.borrow().clone();
+    result
+}
+
+/// The form's namespace once its fiber completes, for the caller to copy back.
+type FinalNs = std::rc::Rc<RefCell<std::sync::Arc<str>>>;
+
+/// Build the conveyed fiber for one form, and the cell its final namespace is
+/// written to, which the caller copies into its `env` once the fiber completes.
+#[allow(clippy::result_large_err)]
+fn eval_form_task(
+    form: &cljrs_reader::Form,
+    env: &cljrs_runtime::env::env::Env,
+) -> Result<(FiberTask, FinalNs), EvalError> {
+    let form = form.clone();
+    let globals = env.globals.clone();
+    let start_ns = env.current_ns.clone();
+    let final_ns = std::rc::Rc::new(RefCell::new(start_ns.clone()));
+    let report_ns = final_ns.clone();
+    let fiber = crate::runtime::conveyed_fiber(Vec::new(), move || {
+        let mut fiber_env = cljrs_runtime::env::env::Env::new(globals, &start_ns);
+        let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
+        *report_ns.borrow_mut() = fiber_env.current_ns.clone();
+        result
+    })?;
+    Ok((fiber.into_task(), final_ns))
 }

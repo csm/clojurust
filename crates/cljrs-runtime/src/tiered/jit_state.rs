@@ -1007,7 +1007,6 @@ mod tests {
         fn deopt_sentinel(&self) -> usize {
             0
         }
-        fn compile_async_arity(&self, _: &Value, _: usize, _: &mut crate::env::env::Env) {}
     }
 
     fn jit() -> Arc<Tiers> {

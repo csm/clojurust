@@ -16,6 +16,14 @@ cross-isolate coordination. `GcPtr`'s `!Send` bound makes sharing across isolate
 
 Done (Phases A–H, A2, B1):
 
+- Virtual-threads Phase 5 (`docs/virtual-threads-plan.md`): on native targets `go` bodies
+  and `^:async` calls run on fibers with the ordinary evaluator. `await`, `deref`, `<!`,
+  `>!`, and `alts!` park the fiber; any function the body calls may park too. `go` returns
+  a result channel (it is `thread-call` of its body), and `await` takes from a channel.
+  `^:async` still makes a call return a future, but no longer selects a separate evaluator.
+  `eval_async` and the colored rules of Phases B–C now apply only to wasm32. Phase H's
+  compiled state machines are no longer used on any dispatch path.
+
 - Phase A: `init()` registers the async runtime hook with the interpreter.
 - Phase B: `^:async` fn dispatch via the `AsyncRuntime` hook; `eval_async` tree-walker;
   cooperative `await` of futures/promises.
@@ -196,7 +204,7 @@ prints a separate "interrupted future was discarded" warning. A compiled poll th
 and reinstalls it only for each task poll, preserving nested budgets without
 leaking thread-local state across sibling `LocalSet` tasks.
 
-**Which forms yield:** `eval_async` has a yielding arm for `await`, `do`, `if`, `let`/`let*`,
+**Which forms yield (wasm32 only):** `eval_async` has a yielding arm for `await`, `do`, `if`, `let`/`let*`,
 `loop`/`loop*`, `recur`, `try` (body, `catch` handlers and `finally`), `def`, `defonce`, `and`,
 `or`, `throw`, `set!` (value and `(.-field inst)` target), `letfn` (body), `binding` (inits and
 body), `with-out-str` (body), collection literals, and function-call arguments. Every *other* special form is delegated to the synchronous evaluator,
@@ -270,6 +278,16 @@ computation on a 64 MiB stack. It transfers the host mutator state into the root
 and restores that state on return. The caller retains `carrier: MutatorState`
 between drives on the same LocalSet. This state holds roots for pending async tasks.
 The caller also installs this carrier state while destroying the LocalSet.
+
+`eval_form(form, env).await -> FiberResult` evaluates one form on a new fiber from async
+code that already runs on the LocalSet. It replaces the native `eval_async` entry point.
+The fiber uses a fresh environment for `env`'s globals and namespace, copies a namespace
+change back into `env`, and conveys the caller's dynamic bindings, gas meters, and
+interrupt flags. The result stays rooted across later yields until the `FiberResult` is
+consumed or dropped. `FiberResult::get(&self) -> &EvalResult` borrows it (borrow-only: a
+cloned value must not outlive the `FiberResult`); `into_result` takes it.
+`eval_form_unrooted(form, env).await -> EvalResult` returns the value directly and
+unrooted, like `await_value`, for callers that use it before the next yield.
 
 `park_on` can borrow fiber stack locals and suspend through synchronous native frames.
 `current()` returns the running fiber ID. During future polls, it returns `None`.
@@ -358,14 +376,16 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | File | Description |
 |---|---|
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
-| `src/runtime.rs` | `AsyncRuntimeImpl`: async task dispatch and fiber call dispatch with binding, gas, and interrupt conveyance |
-| `src/state_machine.rs` | Compiled-async runtime (Phase H): `CljxStateMachine` (resume state + GC-rooted live-value slots + `pending` + the `eval_ctx` installed around each poll so the poll fn's global-lookup/call bridges work while detached on the executor), the C-ABI `PollFn` type and `POLL_PENDING`/`POLL_READY`/`POLL_THREW`/`POLL_GAS_EXHAUSTED`/`POLL_CANCELLED` codes, `check_ready` resume helper, and `CompiledAsyncTask`/`spawn_state_machine` which drive a compiled poll function on the `LocalSet` while keeping its slots traced. Also the poll-fn registry that `AsyncRuntimeImpl::spawn_async_call` consults to route an `^:async` call to the native state machine instead of `eval_async`'s `run_async_fn`: `register_poll_fn`/`lookup_poll_fn`/`mark_compile_attempted` (keyed by `ir_arity_id`, used by the JIT hook which compiles once on first call) and `register_poll_fn_named`/`lookup_poll_fn_named` (keyed by `(ns, name, arity)`, registered by the AOT harness for `cljrs compile`d binaries) |
+| `src/runtime.rs` | `AsyncRuntimeImpl`: `^:async` dispatch (a body fiber on native targets, `eval_async` on wasm32) and fiber call dispatch with binding, gas, and interrupt conveyance |
+| `src/state_machine.rs` | Compiled-async poll ABI (TODO.md Phase H, closed): `CljxStateMachine`, the C-ABI `PollFn` type and `POLL_*` codes, `check_ready`, `CompiledAsyncTask`, and test-only `spawn_state_machine`. `cljrs-compiler`'s `rt_abi` and codegen implement this ABI for `lower_async` unit coverage. No runtime dispatch path uses it: `^:async` calls run on fibers, and the poll-function registry was removed |
 | `src/fiber.rs` | Native stackful fibers, governed stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/fiber/scheduler.rs` | Safepoint time slices, ready-task wakers, stack-margin checks, native-frame names, and carrier watchdog |
-| `src/eval_async.rs` | `eval_async` async tree-walker, `run_async_fn` driver, and the shared `spawn_future`/`settle_future`/`await_value` task helpers |
+| `src/eval_async.rs` | (wasm32, or the `colored-eval` feature) `eval_async` colored tree-walker and `run_async_fn` driver |
+| `src/task.rs` | Shared executor tasks delivered through a Clojure future: `spawn_future`, `spawn_future_with_roots`, `settle_future`, `await_value` |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
-| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!` |
-| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
+| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!`, `alts!!`, and on native targets the parking `<!`, `>!`, `alts!`; on every target `alts!-future`, the future-returning exactly-one selection (behind wasm32's `alts!` macro) |
+| `src/core_async_wasm.cljrs` | (wasm32 only) `<!`, `>!`, and `alts!` macros over `await` for colored `go` bodies |
+| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go` (a result channel, via `thread-call`), `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
 | `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
 | `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a byte-bounded queue whose messages hold governor `MessageQueue` charges; `isolate_channel_with_limit`, `try_send`/`send_async`, `IsolateReceiver::close`; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |
@@ -379,10 +399,10 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report once at destruction or teardown |
 | `tests/fiber_surface.rs` | Blocking Clojure surface, nested futures, binding conveyance, channel closure, root state restoration, and GC across root drives |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
-| `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` under the legacy `eval_async` driver |
+| `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` at top level, evaluated on a fiber |
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |
-| `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and `eval_async` (csm/clojurust#428) |
-| `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically in `eval_async` and the sync evaluator (containers, `let*`/`loop*` binding vectors) |
+| `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and a top-level fiber (csm/clojurust#428) |
+| `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically on a fiber and in the sync evaluator (containers, `let*`/`loop*` binding vectors) |
 
 ## Public API
 
@@ -429,7 +449,7 @@ pub mod isolate {
 
 /// Re-exports for sibling native crates (e.g. cljrs-io) that drive their own
 /// work onto the shared LocalSet executor.
-pub use eval_async::{await_value, spawn_future, spawn_future_with_roots};
+pub use task::{await_value, spawn_future, spawn_future_with_roots};
 
 pub mod worker_pool {
     /// Global Send-only worker pool backed by a Tokio multi-thread runtime.
@@ -502,7 +522,7 @@ pub mod isolate_channel {
     pub fn isolate_channel_with_limit(limit: usize) -> (IsolateSender, IsolateReceiver);
 }
 
-pub mod eval_async {
+pub mod task {
     /// Spawn `task` on the current LocalSet and return a `Value::Future` that
     /// settles when it completes. The shared delivery point for async primitives;
     /// public so other native crates can produce results through the same path.
@@ -515,22 +535,21 @@ pub mod eval_async {
     where
         F: Future<Output = Result<Value, EvalError>> + 'static;
 
+    /// Await a Clojure value from Rust async code inside a LocalSet context.
+    /// Futures and promises wait until resolved; any other value is returned as-is.
+    pub async fn await_value(val: Value) -> Result<Value, EvalError>;
+}
+
+/// The colored evaluator for wasm32 `go` and `^:async` bodies. Also built on
+/// native targets with the `colored-eval` feature, which only `cljrs-wasm` enables.
+#[cfg(any(target_arch = "wasm32", feature = "colored-eval"))]
+pub mod eval_async {
     /// Drive an ^:async fn body to completion, yielding at every await.
     pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env)
         -> Result<Value, EvalError>;
 
-    /// Asynchronously evaluate a single form. Handles await/do/if/let and
-    /// function-call arguments with yielding; delegates other forms to the
-    /// synchronous evaluator. A call whose head is a form-intercepted native
-    /// (`cljrs_interp::apply::is_form_intercepted` — `apply`, `swap!`, `eval`,
-    /// …) is handed to the synchronous evaluator whole, since those need the
-    /// unevaluated forms.
+    /// Asynchronously evaluate a single form, yielding at every `await`.
     pub async fn eval_async(form: &Form, env: &mut Env) -> Result<Value, EvalError>;
-
-    /// Cooperatively await a Clojure value inside a LocalSet context.
-    /// Futures and promises yield until resolved; any other value is returned as-is.
-    /// Used by the WASM REPL for implicit top-level await.
-    pub async fn await_value(val: Value) -> Result<Value, EvalError>;
 }
 
 pub mod channel {
@@ -692,6 +711,12 @@ Root errors remain ordinary results. `RootError` preserves typed gas and memory-
 Managed Values remain on their isolate thread. An OS-thread panic still appears in the outer join result.
 
 `CljChannel::take_result()` preserves resource-limit failures from a thread producer.
+`channel::as_channel(&Value) -> Option<&CljChannel>` is the single check that a value is a
+channel. `CljChannel::take_for_await()` is the async take behind `await`: `nil` once closed
+and drained, failures as `EvalError`. `channel::take_sync(&anchor, &channel)` is the
+synchronous take behind `<!`, `<!!`, sync `await`, and IR `ChanTake`: it roots the channel,
+parks a fiber or blocks outside one, and on wasm32 returns a ready value or errors when the
+take would block.
 Clojure blocking takes, future takes, polls, and channel alternatives propagate those failures without making them catchable.
 Ordinary thread-body throws are reported and close the result channel.
 Channels publish values only after a put commits. Failed offers and losing or cancelled alternatives do not publish their candidates.

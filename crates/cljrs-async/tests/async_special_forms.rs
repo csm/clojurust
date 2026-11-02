@@ -12,12 +12,15 @@
 //! a watchdog thread and the assertion is on `recv_timeout`
 //! (`tokio::time::timeout` cannot catch it: the parked thread is the one that
 //! would poll the timer).
+//!
+//! Since virtual-threads Phase 5 these cases run on fibers (`fiber::eval_form`);
+//! the colored `eval_async` evaluator they first targeted is wasm32-only.
 
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -55,7 +58,9 @@ fn eval_async_src(src: &str) -> Option<String> {
             let mut parser = Parser::new(src, "<test>".to_string());
             let mut result = Value::Nil;
             for form in parser.parse_all().expect("parse error") {
-                result = eval_async(&form, &mut env).await.expect("eval error");
+                result = eval_form_unrooted(&form, &mut env)
+                    .await
+                    .expect("eval error");
             }
             format!("{result}")
         });
@@ -178,15 +183,29 @@ fn binding_survives_a_yield_in_the_body() {
     assert_eq!(out.as_deref(), Some("[[2 42] :root]"));
 }
 
-/// A task that runs while the binding body is suspended must not see its
-/// frame: dynamic bindings are thread-local and every `LocalSet` task shares
-/// the thread.
+/// A `go` block conveys the dynamic bindings in effect where it starts, as in
+/// core.async (virtual-threads plan Phase 5: `go` bodies are fibers, which
+/// convey bindings like `future`).
 #[test]
-fn binding_does_not_leak_into_other_tasks() {
+fn go_conveys_bindings_into_its_fiber() {
     let out = run("(def ^:dynamic *d* :root)
                    (def seen (chan 1))
                    (binding [*d* :bound]
                      (go (await (put! seen *d*)))
+                     [(await (take! ch)) *d* (await (take! seen))])");
+    assert_eq!(out.as_deref(), Some("[42 :bound :bound]"));
+}
+
+/// A task started outside a binding must not see a frame that another fiber
+/// installed while parked inside its `binding` body.
+#[test]
+fn binding_does_not_leak_into_other_tasks() {
+    let out = run("(def ^:dynamic *d* :root)
+                   (def seen (chan 1))
+                   (def gate (chan 1))
+                   (go (await (take! gate)) (await (put! seen *d*)))
+                   (binding [*d* :bound]
+                     (await (put! gate :go))
                      [(await (take! ch)) *d* (await (take! seen))])");
     assert_eq!(out.as_deref(), Some("[42 :bound :root]"));
 }

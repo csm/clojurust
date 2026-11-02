@@ -26,7 +26,6 @@ use std::sync::Weak;
 use cljrs_ir::IrFunction;
 use cljrs_value::Value;
 
-use crate::env::env::Env;
 use crate::tiered::tiers::Tiers;
 
 /// A JIT compiler attached to one runtime.
@@ -70,12 +69,4 @@ pub trait JitBackend: Send + Sync {
     /// deoptimization; the address is a compiler-owned leaked allocation that
     /// no real result can ever alias.
     fn deopt_sentinel(&self) -> usize;
-
-    /// Compile the called `^:async` arity to a native poll function and
-    /// register it, so subsequent dispatches run the state machine instead of
-    /// the `eval_async` tree-walker (Phase H).
-    ///
-    /// A no-op on any lowering or codegen failure.  Called once per arity by
-    /// the async dispatcher, which cannot reach a compiler itself.
-    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env);
 }

@@ -1,26 +1,17 @@
 //! `AsyncRuntimeImpl` — the Tokio-backed implementation of `AsyncRuntime`.
 
-use cljrs_gc::GcPtr;
 use cljrs_runtime::env::async_hook::AsyncRuntime;
 use cljrs_runtime::env::env::Env;
 use cljrs_runtime::env::error::{EvalError, EvalResult};
-use cljrs_runtime::interp::apply::select_arity;
-use cljrs_value::{NativeObjectBox, PersistentList, Value};
+use cljrs_value::Value;
 
 use crate::channel::CljChannel;
+#[cfg(target_arch = "wasm32")]
+use crate::eval_async::run_async_fn;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::eval_async::spawn_future;
-use crate::eval_async::{run_async_fn, spawn_future_with_roots};
-use crate::state_machine::{
-    lookup_poll_fn, lookup_poll_fn_named, mark_compile_attempted, spawn_state_machine,
-};
-
-/// Whether async-JIT activation is enabled (default on; disable with
-/// `CLJRS_NO_ASYNC_JIT`).
-fn async_jit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CLJRS_NO_ASYNC_JIT").is_err())
-}
+use crate::task::spawn_future;
+#[cfg(target_arch = "wasm32")]
+use crate::task::spawn_future_with_roots;
 
 pub(crate) struct AsyncRuntimeImpl;
 
@@ -31,58 +22,21 @@ impl AsyncRuntimeImpl {
 }
 
 impl AsyncRuntime for AsyncRuntimeImpl {
-    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, mut env: Env) -> Value {
-        // Native fast path: if this arity has a compiled poll function (or one
-        // can be compiled now via the JIT hook), run the native state machine;
-        // otherwise fall back to the tree-walker.  The compiled poll function
-        // runs detached on the executor, so it carries the eval context
-        // (globals + defining ns) it needs to resolve globals / call other fns.
-        if let Value::Fn(f) = &callee {
-            // Scope the GcPtr borrow so `callee`/`env` can move into the
-            // fallback below; only Copy/cloned data escapes.
-            let info = {
-                let fr = f.get();
-                select_arity(fr, args.len()).ok().map(|a| {
-                    (
-                        a.ir_arity_id,
-                        fr.defining_ns.clone(),
-                        fr.name.clone(),
-                        a.params.len(),
-                        a.rest_param.is_some(),
-                    )
-                })
-            };
-            if let Some((id, ns, name, n_fixed, is_variadic)) = info {
-                let ctx = (env.globals.clone(), ns.clone());
-                let orig_argc = args.len();
-                // JIT registry (keyed by runtime ir_arity_id).
-                if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
-                    let packed = pack_for_native(&args, n_fixed, is_variadic);
-                    return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
-                }
-                // AOT registry (keyed by ns/name/fixed-param-count, registered by the harness).
-                if let Some(nm) = name.as_deref()
-                    && let Some((poll_fn, n_slots)) = lookup_poll_fn_named(&ns, nm, n_fixed)
-                {
-                    let packed = pack_for_native(&args, n_fixed, is_variadic);
-                    return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
-                }
-                // One-shot compile attempt (when the runtime has a JIT).
-                if async_jit_enabled()
-                    && mark_compile_attempted(id)
-                    && let Some(backend) = env.globals.jit_backend()
-                {
-                    backend.compile_async_arity(&callee, orig_argc, &mut env);
-                    if let Some((poll_fn, n_slots)) = lookup_poll_fn(id) {
-                        let packed = pack_for_native(&args, n_fixed, is_variadic);
-                        return spawn_state_machine(poll_fn, n_slots, packed, Some(ctx));
-                    }
-                }
-            }
+    /// Native targets run an `^:async` call on its own fiber. The body uses the
+    /// ordinary synchronous evaluator, so `await`, `deref`, and channel ops
+    /// park the fiber. The call still returns a `Future` immediately.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value {
+        match call_fiber_with(callee, args, env, Vec::new(), FiberEntry::Body) {
+            Ok(fiber) => spawn_future(fiber.into_task()),
+            Err(error) => spawn_future(async move { Err(error) }),
         }
-        // `spawn_future` keeps the task on the current LocalSet thread, so the
-        // `!Send` Clojure values (env, args, GcPtrs) never cross threads, and
-        // delivers the body's result into the returned Future.
+    }
+
+    /// wasm32 has no stack switching, so `^:async` bodies keep the colored
+    /// `eval_async` tree-walker there.
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_async_call(&self, callee: Value, args: Vec<Value>, env: Env) -> Value {
         let mut roots = args.clone();
         roots.push(callee.clone());
         spawn_future_with_roots(roots, async move { run_async_fn(callee, args, &env).await })
@@ -96,9 +50,17 @@ impl AsyncRuntime for AsyncRuntimeImpl {
         ))
     }
 
+    fn take_if_channel(&self, val: &Value) -> Option<EvalResult> {
+        let channel = crate::channel::as_channel(val)?;
+        Some(
+            crate::channel::take_sync(val, channel)
+                .map_err(cljrs_runtime::env::error::value_error_to_eval_error),
+        )
+    }
+
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
-        cljrs_value::parking::block_on(ch.take_result())
+        crate::channel::take_sync(&chan, ch)
             .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
     }
 
@@ -118,8 +80,54 @@ impl AsyncRuntime for AsyncRuntimeImpl {
 pub(crate) fn call_fiber(
     callee: Value,
     args: Vec<Value>,
+    env: Env,
+    roots: Vec<Value>,
+) -> Result<crate::fiber::Fiber, EvalError> {
+    call_fiber_with(callee, args, env, roots, FiberEntry::Apply)
+}
+
+/// How a call fiber enters its callee.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+enum FiberEntry {
+    /// Ordinary application, including `^:async` dispatch of the callee.
+    Apply,
+    /// Run the callee's body directly. Used by `^:async` dispatch itself, so the
+    /// spawned fiber does not dispatch (and spawn) again.
+    Body,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+fn call_fiber_with(
+    callee: Value,
+    args: Vec<Value>,
     mut env: Env,
     mut roots: Vec<Value>,
+    entry: FiberEntry,
+) -> Result<crate::fiber::Fiber, EvalError> {
+    roots.push(callee.clone());
+    roots.extend(args.iter().cloned());
+    roots.extend(
+        env.frames
+            .iter()
+            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
+    );
+    conveyed_fiber(roots, move || match entry {
+        FiberEntry::Apply => cljrs_runtime::env::apply::apply_value(&callee, args, &mut env),
+        FiberEntry::Body => cljrs_runtime::env::apply::apply_fn_body(&callee, args, &mut env),
+    })
+}
+
+/// Build a fiber that runs `body` with the caller's dynamic bindings (a
+/// snapshot), active gas meters, and interrupt flags installed, as `future`
+/// does. `roots` are the managed values `body` captures; the conveyed binding
+/// values are added to them.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+pub(crate) fn conveyed_fiber(
+    mut roots: Vec<Value>,
+    body: impl FnOnce() -> EvalResult + 'static,
 ) -> Result<crate::fiber::Fiber, EvalError> {
     use cljrs_runtime::env::{dynamics, gas};
     #[cfg(feature = "no-gc")]
@@ -131,59 +139,23 @@ pub(crate) fn call_fiber(
     let bindings = dynamics::capture_current();
     let meters = gas::active_meters();
     let interrupts = gas::active_interrupts();
-    roots.push(callee.clone());
-    roots.extend(args.iter().cloned());
-    roots.extend(
-        env.frames
-            .iter()
-            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
-    );
     roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
     crate::fiber::Fiber::with_roots(roots, move || {
         dynamics::install_frames(bindings);
         let _interrupts = gas::InterruptScope::enter(&interrupts);
         let _meters = gas::install_meters(&meters);
-        cljrs_runtime::env::apply::apply_value(&callee, args, &mut env)
+        body()
     })
-}
-
-/// Pack args for a compiled (native) async state machine.
-///
-/// Fixed arities pass args through unchanged. Variadic arities must have the
-/// trailing args collected into a `Value::List` (or `Value::Nil` for empty
-/// rest) before being handed to the state machine, which expects exactly
-/// `n_fixed + 1` slot values. This mirrors what `bind_fn_params` does on the
-/// tree-walking path and what `call_jit_native` does on the sync JIT path.
-fn pack_for_native(args: &[Value], n_fixed: usize, is_variadic: bool) -> Vec<Value> {
-    if !is_variadic {
-        return args.to_vec();
-    }
-    let split = n_fixed.min(args.len());
-    let mut v = args[..split].to_vec();
-    let rest_items = &args[split..];
-    let rest_val = if rest_items.is_empty() {
-        Value::Nil
-    } else {
-        Value::List(GcPtr::new(PersistentList::from_iter(rest_items.to_vec())))
-    };
-    v.push(rest_val);
-    v
 }
 
 #[allow(clippy::result_large_err)]
 fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
-    match val {
+    crate::channel::as_channel(val).ok_or_else(|| match val {
         Value::NativeObject(ptr) => {
-            let obj: &NativeObjectBox = ptr.get();
-            obj.downcast_ref::<CljChannel>().ok_or_else(|| {
-                EvalError::Runtime(format!("expected Channel, got {}", obj.type_tag()))
-            })
+            EvalError::Runtime(format!("expected Channel, got {}", ptr.get().type_tag()))
         }
-        other => Err(EvalError::Runtime(format!(
-            "expected Channel, got {}",
-            other.type_name(),
-        ))),
-    }
+        other => EvalError::Runtime(format!("expected Channel, got {}", other.type_name())),
+    })
 }
 
 /// Spawn a long-lived background task on the current `LocalSet` that services

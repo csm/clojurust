@@ -7,6 +7,9 @@
 //! popped whatever entry was on top, task A finishing while task B was
 //! suspended removed B's root and left A's own entry pointing at A's freed
 //! loop values: B's accumulator was then collected while B still used it.
+//!
+//! Since virtual-threads Phase 5 these cases run on fibers (`fiber::eval_form`);
+//! the colored `eval_async` evaluator they first targeted is wasm32-only.
 
 #![cfg(not(feature = "no-gc"))]
 
@@ -14,7 +17,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::{Form, Parser};
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -47,7 +50,7 @@ fn interleaved_async_loops_keep_their_roots() {
 
     let (a, b) = local.block_on(&rt, async move {
         let mut setup = Env::new(globals.clone(), "user");
-        eval_async(
+        eval_form_unrooted(
             &parse_one("(require '[clojure.core.async :refer [timeout]])"),
             &mut setup,
         )
@@ -59,7 +62,11 @@ fn interleaved_async_loops_keep_their_roots() {
         let task_a = tokio::task::spawn_local(async move {
             let form =
                 parse_one("(loop* [i 0] (if (< i 2) (do (await (timeout 1)) (recur (inc i))) :a))");
-            eval_async(&form, &mut env_a).await.expect("loop a")
+            // Format before the task ends: a JoinHandle output is not a GC root.
+            format!(
+                "{}",
+                eval_form_unrooted(&form, &mut env_a).await.expect("loop a")
+            )
         });
 
         // B builds its accumulator without yielding, so each iteration's alloc
@@ -74,7 +81,14 @@ fn interleaved_async_loops_keep_their_roots() {
                          (recur (conj acc (str \"item-\" i)) (inc i)))
                      acc))",
             );
-            eval_async(&form, &mut env_b).await.expect("loop b")
+            let b = eval_form_unrooted(&form, &mut env_b).await.expect("loop b");
+            let Value::Vector(v) = &b else {
+                panic!("loop b returned {b}");
+            };
+            v.get()
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect::<Vec<String>>()
         });
 
         // Collect at every scheduler turn until both loops are done.
@@ -95,11 +109,8 @@ fn interleaved_async_loops_keep_their_roots() {
         (a, b)
     });
 
-    assert_eq!(format!("{a}"), ":a");
-    let Value::Vector(v) = &b else {
-        panic!("loop b returned {b}");
-    };
-    let items: Vec<String> = v.get().iter().map(|x| format!("{x}")).collect();
+    assert_eq!(a, ":a");
+    let items = b;
     let expected: Vec<String> = (0..50).map(|i| format!("\"item-{i}\"")).collect();
     assert_eq!(items, expected);
 }

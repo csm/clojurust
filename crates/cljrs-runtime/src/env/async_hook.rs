@@ -29,6 +29,16 @@ pub trait AsyncRuntime: Send + Sync {
         Ok(self.spawn_async_call(callee, args, env))
     }
 
+    /// `await` support: if `val` is one of this runtime's channels, take from it,
+    /// parking the calling fiber (or blocking the OS thread outside a fiber),
+    /// and keep it rooted for the whole wait. On wasm32, which cannot park, a
+    /// ready value (or `nil` for a closed channel) is returned at once and a take
+    /// that would block is an error. Returns `None` for any other value.
+    fn take_if_channel(&self, val: &Value) -> Option<EvalResult> {
+        let _ = val;
+        None
+    }
+
     /// Block the current OS thread until a value can be taken from the channel.
     ///
     /// Used by the IR interpreter's sync-context fallback for `ChanTake`.

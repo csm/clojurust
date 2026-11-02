@@ -33,7 +33,7 @@ use tokio::task::AbortHandle;
 use tokio_rustls::TlsConnector;
 
 use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, make_chan};
-use cljrs_async::eval_async::spawn_future_with_roots;
+use cljrs_async::spawn_future_with_roots;
 use cljrs_async::worker_pool::WorkerPool;
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::GlobalEnv;

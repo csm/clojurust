@@ -2484,14 +2484,12 @@ fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
 /// When `cljrs-async` is loaded, `eval_async` intercepts `await` forms before
 /// the sync evaluator reaches this handler, so this path is only taken in
 /// non-async code. Inside a fiber, this path parks until settlement.
-/// Outside a fiber, it blocks the OS thread, like `(deref val)`.
+/// Outside a fiber, it blocks the OS thread, like `(deref val)`. A channel is
+/// taken from, so `(await (go ...))` yields the block's value.
 fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
     if args.is_empty() {
         return Err(EvalError::Runtime("await requires one argument".into()));
     }
     let val = eval(&args[0], env)?;
-    match val {
-        Value::Future(_) | Value::Promise(_) => crate::interp::eval::deref_value(val),
-        other => Ok(other),
-    }
+    crate::interp::eval::await_value_sync(val, &env.globals)
 }

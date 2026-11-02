@@ -94,7 +94,7 @@ fn loop_intermediates_are_collected() {
         cljrs_runtime::tiered::eval(f, &mut tiered).expect("eval")
     });
 
-    // Async evaluator, as the CLI drives each top-level form.
+    // A top-level fiber, as the CLI drives each top-level form.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -103,7 +103,10 @@ fn loop_intermediates_are_collected() {
     let mut async_env = env(ExecutionMode::TreeWalk);
     assert_frees("async top level", &top_level, |f| {
         local
-            .block_on(&rt, cljrs_async::eval_async::eval_async(f, &mut async_env))
+            .block_on(
+                &rt,
+                cljrs_async::fiber::eval_form_unrooted(f, &mut async_env),
+            )
             .expect("eval")
     });
 }

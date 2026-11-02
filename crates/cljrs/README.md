@@ -292,7 +292,7 @@ Build with e.g. `cargo build --release --features enable-rustyline,no-gc`.
 | `cljrs-compiler` (workspace)| AOT pipeline (`compile_file`, `compile_test_harness`, `lower_file_to_ir`) |
 | `cljrs-ir` (workspace)      | `IrBundle`, `serialize_bundle`, `deserialize_bundle` — used by `ir build` / `ir dump` |
 | `cljrs-interop` (workspace) | Rust ↔ Clojure FFI                                                |
-| `cljrs-async` (workspace, optional) | `clojure.core.async` runtime + `eval_async`; enabled by `async`  |
+| `cljrs-async` (workspace, optional) | `clojure.core.async` runtime and fibers (`eval_async` on wasm32); enabled by `async`  |
 | `cljrs-io` (workspace, optional) | `clojure.rust.io.async` async file I/O; enabled by `async`       |
 | `tokio` (workspace, optional) | Single-threaded runtime + `LocalSet` driving async; enabled by `async` |
 | `tracing` (workspace)       | `Level` for the `--debug` / `--trace` default; `--debug` / `--trace` / `-X` all build one `Targets` filter and install the stderr subscriber through `cljrs_runtime::logging`, which owns the `tracing-subscriber` dependency |

@@ -95,6 +95,9 @@ pub(crate) fn compile_jit(
 /// `cljrs_ir::lower::async_lower`) to native code, returning a pointer with the
 /// state-machine ABI `extern "C" fn(*mut CljxStateMachine, *mut *const Value)
 /// -> i32`.  Mirrors [`compile_jit`] but declares the fixed poll-fn signature.
+/// Test-only: no runtime path compiles `^:async` state machines since fibers
+/// replaced them (virtual-threads plan Phase 5).
+#[cfg(test)]
 pub(crate) fn compile_jit_poll(
     func_name: &str,
     ir_func: &IrFunction,

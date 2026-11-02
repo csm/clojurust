@@ -946,27 +946,9 @@ pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) 
         compiler.compile_function(ns_ir, id)?;
     }
 
-    // ── 4b. Async poll functions (Phase H) ──────────────────────────────
-    // Regular `defn`s are compiled into `__cljrs_main`; `^:async` ones stay
-    // interpreted (their body has `await`) and so were never evaluated into the
-    // compile-time `env`.  Evaluate just their *definitions* now (the original
-    // form, so `^:async` metadata survives; never a side-effecting top-level
-    // form) so their bodies can be introspected and compiled to poll functions.
-    for (i, form) in forms.iter().enumerate() {
-        if is_def_form(form) && expanded_needs_interpreter(&expanded[i]) {
-            let _ = cljrs_runtime::tiered::eval(form, &mut env);
-        }
-    }
-    // Compile a native state machine for each `^:async` fn the program
-    // defined, into the same object module.  The harness registers them so
-    // dispatch runs native instead of the `eval_async` tree-walker.
-    let async_polls = compile_async_poll_fns(&mut compiler, &mut env)?;
-    if !async_polls.is_empty() {
-        eprintln!(
-            "[aot] compiled {} async poll function(s)",
-            async_polls.len()
-        );
-    }
+    // `^:async` fns stay interpreted (their body has `await`); at runtime each
+    // call runs its body on a fiber (virtual-threads plan Phase 5), so no
+    // async state machines are compiled.
 
     let obj_bytes = compiler.finish();
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
@@ -997,7 +979,6 @@ pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) 
             structural_ns: structural_ns.as_ref(),
             compiled_namespaces: &compiled_namespaces,
             versioned_bundled: &versioned_bundled,
-            async_polls: &async_polls,
         },
         session,
     )?;
@@ -1334,19 +1315,6 @@ fn render_require_spec(spec: &cljrs_runtime::env::env::RequireSpec) -> String {
 }
 
 /// Check if a top-level form needs the interpreter (can't be AOT-compiled yet).
-/// Whether `form` is a top-level `def`/`defn`/`defn-` (a binding definition,
-/// safe to evaluate at compile time — no program side effects).
-fn is_def_form(form: &cljrs_reader::Form) -> bool {
-    use cljrs_reader::form::FormKind;
-    if let FormKind::List(parts) = &form.kind
-        && let Some(head) = parts.first()
-        && let FormKind::Symbol(s) = &head.kind
-    {
-        return matches!(s.as_str(), "def" | "defn" | "defn-");
-    }
-    false
-}
-
 fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
     use cljrs_reader::form::FormKind;
     match &form.kind {
@@ -1883,130 +1851,6 @@ fn lower_namespace(
 
 // ── Harness generation ──────────────────────────────────────────────────────
 
-/// Create a temporary Cargo project that links the compiled object code with
-/// the clojurust runtime and produces a binary.
-/// A `^:async` arity compiled to a native poll function, to be registered by
-/// the generated harness via `cljrs_async::state_machine::register_poll_fn_named`.
-struct AsyncPollEntry {
-    ns: String,
-    name: String,
-    arity: usize,
-    symbol: String,
-    n_slots: usize,
-}
-
-/// Compile a native poll function for each `^:async` fn the program defined
-/// (introspected from `env`, which already evaluated every `defn` at compile
-/// time), into the AOT object module.  Functions whose body uses an unsupported
-/// construct (channels, spawn, `throw`, regions) are skipped — they keep the
-/// `eval_async` tree-walker at runtime.  Capturing closures and fns with inner
-/// closures are also skipped (standalone lowering can't see captures, and inner
-/// closures would need separate subfunction-symbol management).
-fn compile_async_poll_fns(
-    compiler: &mut Compiler,
-    env: &mut cljrs_runtime::tiered::Env,
-) -> AotResult<Vec<AsyncPollEntry>> {
-    // Snapshot the async fns first so no namespace lock is held across lowering
-    // (which re-enters the env).
-    struct AritySnap {
-        params: Vec<Arc<str>>,
-        rest: Option<Arc<str>>,
-        dparams: Vec<(usize, cljrs_reader::Form)>,
-        drest: Option<cljrs_reader::Form>,
-        body: Vec<cljrs_reader::Form>,
-    }
-    struct FnSnap {
-        ns: Arc<str>,
-        name: Arc<str>,
-        arities: Vec<AritySnap>,
-    }
-
-    #[cfg(feature = "no-gc")]
-    let _reads = cljrs_gc::region::ReadScope::nested();
-    let snaps: Vec<FnSnap> = {
-        let ns_map = env.globals.namespaces.read().unwrap();
-        let mut out = Vec::new();
-        for (ns_name, ns_ptr) in ns_map.iter() {
-            // User namespaces only; the stdlib defines no `^:async` fns and
-            // scanning it would just waste work.
-            if ns_name.starts_with("clojure.") {
-                continue;
-            }
-            let interns = ns_ptr.get().interns.lock().unwrap();
-            for (vname, var) in interns.iter() {
-                let Some(cljrs_value::Value::Fn(f)) = var.get().deref() else {
-                    continue;
-                };
-                let fr = f.get();
-                if !fr.is_async || !fr.closed_over_names.is_empty() {
-                    continue;
-                }
-                let arities = fr
-                    .arities
-                    .iter()
-                    .map(|a| AritySnap {
-                        params: a.params.clone(),
-                        rest: a.rest_param.clone(),
-                        dparams: a.destructure_params.clone(),
-                        drest: a.destructure_rest.clone(),
-                        body: a.body.clone(),
-                    })
-                    .collect();
-                out.push(FnSnap {
-                    ns: fr.defining_ns.clone(),
-                    name: fr.name.clone().unwrap_or_else(|| vname.clone()),
-                    arities,
-                });
-            }
-        }
-        out
-    };
-
-    let mut entries = Vec::new();
-    for fnsnap in &snaps {
-        for arity in &fnsnap.arities {
-            // Channel / concurrency ops (Phase H4) aren't modeled by the poll
-            // machine; keep such fns on the tree-walker.
-            if cljrs_ir::lower::async_lower::body_uses_unsupported_async(&arity.body) {
-                continue;
-            }
-            let ir = match cljrs_runtime::tiered::lower::lower_arity(
-                Some(&fnsnap.name),
-                &arity.params,
-                arity.rest.as_ref(),
-                &arity.dparams,
-                arity.drest.as_ref(),
-                &arity.body,
-                &fnsnap.ns,
-                env,
-                true,
-            ) {
-                Ok(ir) => ir,
-                Err(_) => continue,
-            };
-            // Inner closures would need separate subfunction symbols; defer.
-            if !ir.subfunctions.is_empty() {
-                continue;
-            }
-            let low = match cljrs_ir::lower::lower_async(&ir) {
-                Ok(low) => low,
-                Err(_) => continue,
-            };
-            let symbol = format!("__cljrs_async_poll_{}", entries.len());
-            let func_id = compiler.declare_poll_function(&symbol)?;
-            compiler.compile_function(&low.poll_fn, func_id)?;
-            entries.push(AsyncPollEntry {
-                ns: fnsnap.ns.to_string(),
-                name: fnsnap.name.to_string(),
-                arity: arity.params.len(),
-                symbol,
-                n_slots: low.n_slots,
-            });
-        }
-    }
-    Ok(entries)
-}
-
 /// Everything the generated Cargo harness is assembled from.
 ///
 /// A parameter object rather than a longer argument list: these all answer one
@@ -2019,7 +1863,6 @@ struct HarnessInputs<'a> {
     structural_ns: Option<&'a (String, Vec<cljrs_runtime::env::env::RequireSpec>)>,
     compiled_namespaces: &'a [CompiledNamespace],
     versioned_bundled: &'a [(Arc<str>, String)],
-    async_polls: &'a [AsyncPollEntry],
 }
 
 /// The harness source that calls an extension's `:rust :init` hook, or nothing
@@ -2058,6 +1901,8 @@ fn native_init_code(init_fn: Option<&str>) -> String {
     }
 }
 
+/// Create a temporary Cargo project that links the compiled object code with
+/// the clojurust runtime and produces a binary.
 fn build_harness(
     out_path: &Path,
     inputs: HarnessInputs<'_>,
@@ -2069,7 +1914,6 @@ fn build_harness(
         structural_ns,
         compiled_namespaces,
         versioned_bundled,
-        async_polls,
     } = inputs;
     let rust_config = session.rust_config_ref();
     let extensions = session.extensions();
@@ -2216,7 +2060,7 @@ edition = "2024"
                         Ok(main_result) => {
                             // If -main is ^:async it returns a Future; await it on the
                             // current LocalSet so all spawned go-blocks drain to completion.
-                            if let Err(e) = cljrs_async::fiber::park_on(cljrs_async::eval_async::await_value(main_result)) {
+                            if let Err(e) = cljrs_async::fiber::park_on(cljrs_async::await_value(main_result)) {
                                 return Err(e);
                             }
                         }
@@ -2294,38 +2138,6 @@ edition = "2024"
 
     let native_init_code = native_init_code(rust_config.and_then(|rc| rc.init_fn.as_deref()));
 
-    // Register AOT-compiled async poll functions: declare each as an external
-    // symbol (defined in the linked object), then register it by ns/name/arity
-    // so `^:async` dispatch runs native instead of the tree-walker.
-    let async_poll_registration = if async_polls.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from(
-            "\n    // Register AOT-compiled async poll functions.\n    unsafe extern \"C\" {\n",
-        );
-        for e in async_polls {
-            s.push_str(&format!(
-                "        fn {sym}(sm: *mut cljrs_async::state_machine::CljxStateMachine) -> i32;\n",
-                sym = e.symbol,
-            ));
-        }
-        s.push_str("    }\n    unsafe {\n");
-        for e in async_polls {
-            s.push_str(&format!(
-                "        cljrs_async::state_machine::register_poll_fn_named({ns:?}, {name:?}, {arity}, \
-                 std::mem::transmute::<unsafe extern \"C\" fn(*mut cljrs_async::state_machine::CljxStateMachine) -> i32, \
-                 cljrs_async::state_machine::PollFn>({sym}), {nslots});\n",
-                ns = e.ns,
-                name = e.name,
-                arity = e.arity,
-                sym = e.symbol,
-                nslots = e.n_slots,
-            ));
-        }
-        s.push_str("    }\n");
-        s
-    };
-
     let main_rs = format!(
         r#"//! Auto-generated AOT harness for clojurust.
 //!
@@ -2366,7 +2178,7 @@ fn run() -> cljrs_runtime::env::error::EvalResult {{
     globals.set_versioned_offline(true);
 
     // Register the extensions this program was compiled with.
-{extension_init}{async_polls}
+{extension_init}
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 {bundled}
@@ -2429,7 +2241,6 @@ fn main() {{
         ns_init_externs = ns_init_externs,
         native_init = native_init_code,
         main_call = main_call_code,
-        async_polls = async_poll_registration,
         extension_init = extensions.harness_init_code(),
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
@@ -3359,31 +3170,6 @@ mod tests {
             .parse_all()
             .expect("parse")
             .remove(0)
-    }
-
-    #[cfg(feature = "no-gc")]
-    #[test]
-    fn async_poll_scan_reads_owned_function_roots() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
-                let mut env = cljrs_runtime::env::env::Env::new(runtime.globals().clone(), "user");
-                cljrs_runtime::interp::eval::eval(
-                    &parse_one("(defn ^:async scanned [] 42)"),
-                    &mut env,
-                )
-                .unwrap();
-                let mut compiler = Compiler::new().unwrap();
-                assert!(
-                    !compile_async_poll_fns(&mut compiler, &mut env)
-                        .unwrap()
-                        .is_empty()
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
     }
 
     /// Lowering refuses an anonymous `^:async` fn (a compiled closure cannot

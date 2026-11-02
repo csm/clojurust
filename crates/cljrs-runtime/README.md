@@ -56,7 +56,7 @@ src/
     monitor.rs          — reentrant object monitors, fiber waiters, and carrier deadlock checks
     policy.rs           — capability policy for isolated transaction functions
     taps.rs             — tap> / add-tap registry
-    async_hook.rs       — AsyncRuntime seam and the async-JIT compile hook
+    async_hook.rs       — AsyncRuntime seam (`^:async` dispatch, fiber calls, blocking channel ops)
     depth.rs            — call-depth cap for ExecutionMode::NoGcTransaction
     vcs.rs              — VcsProvider trait (the runtime's git seam) and the
                           cljrs-project-backed ProjectVcs impl (`deps` feature)
@@ -641,7 +641,9 @@ collection.
 ### `apply` submodule
 
 `apply_value` applies an evaluated callee to evaluated args (functions,
-keywords, maps, sets, vars, protocol/multimethod dispatch). For a
+keywords, maps, sets, vars, protocol/multimethod dispatch). `apply_fn_body(callee,
+args, env)` runs a function's body on the current stack without `^:async`
+dispatch; the async runtime calls it from the fiber an `^:async` call spawns. For a
 `Value::ProtocolFn` callee whose protocol has `extend_via_metadata` set (`(defprotocol
 Name :extend-via-metadata true ...)`), dispatch first checks the first arg's
 metadata for an entry keyed by the method's FULLY-QUALIFIED SYMBOL — `ns/method`,
@@ -692,7 +694,7 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 
 ### `async_hook` submodule
 
-The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  Async-JIT activation is *not* here: the dispatcher reaches it through the calling runtime's own backend (`GlobalEnv::jit_backend()` → `JitBackend::compile_async_arity`), so a runtime without a JIT simply keeps tree-walking `^:async` bodies.
+The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  `^:async` bodies are never compiled to state machines: on native targets each call runs its body on a fiber, and on wasm32 through `eval_async` (virtual-threads plan Phase 5; TODO.md Phase H is closed).
 
 ---
 
@@ -1158,7 +1160,8 @@ conditional in ANY slot of an `ns` require spec, namespace included, so
 `[#?(:clj clojure.core :cljs cljs.core) :as core]` reads — an option selecting
 no branch is dropped, a namespace selecting none is an error.
 
-**Pieces shared with the async evaluator.** `cljrs-async`'s `eval_async` has its
+**Pieces shared with the async evaluator.** `cljrs-async`'s `eval_async` (wasm32 only; native
+targets run `^:async` bodies on fibers with this evaluator) has its
 own arm for every special form that evaluates a sub-expression in place, because
 running one on the sync path parks the `LocalSet` thread at any `await` inside
 it. To keep those arms from re-implementing the forms, `special.rs` exposes each
@@ -1364,8 +1367,9 @@ pub mod defn_registry {
 3. If cached **and not async**: executes via `ir_interp::interpret_ir` (register-file interpreter)
 4. If not cached **or async**: counts the call (`jit_state::record_interp_call`, Phase 10.7 —
    see "Background lowering" below) and falls back to `interp::apply::call_cljrs_fn`
-   (tree-walking).  For `^:async` functions the tree-walking path dispatches to `eval_async`
-   in `cljrs-async`, which cooperatively yields to the Tokio `LocalSet` executor.
+   (tree-walking).  An `^:async` call first dispatches through the async runtime hook: on
+   native targets `cljrs-async` runs the body on a fiber via `env::apply::apply_fn_body`
+   (which skips async dispatch); on wasm32 it runs `eval_async`.
 5. How IR gets into the cache:
    - **Warm-threshold background lowering (default, Phase 10.7)**: when a function's
      tree-walked call count crosses `ir_threshold()` (default 50), the dispatch seam
@@ -1471,7 +1475,6 @@ pub trait JitBackend: Send + Sync {
     fn mark_stale(&self, epoch: u64);
     fn take_pending_exception(&self) -> Option<Value>;
     fn deopt_sentinel(&self) -> usize;
-    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env);
 }
 ```
 
@@ -1743,6 +1746,14 @@ A native fiber parks during worker execution. Outside a fiber, the call runs syn
 `AsyncRuntime::spawn_fiber_call(callee, args, env) -> EvalResult` dispatches an
 ordinary function into a fiber. The default implementation delegates to
 `spawn_async_call` for runtimes without fiber support.
+
+`AsyncRuntime::take_if_channel(&val) -> Option<EvalResult>` lets `await` take from the
+runtime's channels (what `go` returns): it parks or blocks and keeps the channel rooted
+while waiting, and returns `None` for any other value (the default). On wasm32, which
+cannot park, it returns a ready value or `nil` for a closed channel, and errors when the
+take would block; `await_value_sync` treats unsettled futures and promises the same way. The tree-walker and
+the IR interpreter both use it through `interp::eval::await_value_sync(val, globals)`,
+which dereferences futures and promises and returns other values unchanged.
 
 `macroexpand_all` expands the operand of reader dereference (`@`). Thus AOT
 and IR lowering expand `@(future ...)` before they compile the future body.
