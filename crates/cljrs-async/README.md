@@ -334,7 +334,10 @@ Other panic payloads retain their original message and type.
 
 A process watchdog thread sleeps on a condition variable while no fiber is running, and otherwise checks once per stall interval. If a fiber misses safepoints for
 `CLJRS_FIBER_STALL_MS` (default 100 ms) while another fiber is ready, it prints the
-fiber ID and innermost native function name once for that stall. Parked fibers do not
+fiber ID and innermost native function name once for that stall. A stall during garbage
+collection (collecting, or waiting for a stop-the-world phase) is reported as a
+`garbage collection pause` instead of a native frame. A fiber that yielded at an expired
+slice counts as ready, although tokio defers its wake. Parked fibers do not
 trigger warnings. Only fiber readiness is tracked, so a stall that delays only non-fiber
 tasks is not reported. Both timing settings accept positive integers; invalid values use defaults.
 

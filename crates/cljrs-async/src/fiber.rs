@@ -211,6 +211,7 @@ fn install_parking_hooks() {
             yield_now: yield_slice,
             reclaim_stacks: reclaim_idle_stacks,
             enter_native: |name, id| scheduling().map_or(0, |s| s.enter_native(name, id)),
+            enter_gc_pause: || scheduling().map_or(0, Scheduling::enter_gc_pause),
             exit_native: |previous| {
                 if let Some(s) = scheduling() {
                     s.exit_native(previous);

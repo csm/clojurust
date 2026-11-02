@@ -17,6 +17,9 @@ pub struct Hooks {
     pub yield_now: fn() -> Result<(), SafepointError>,
     pub reclaim_stacks: fn(),
     pub enter_native: fn(&Arc<str>, &NativeDiagnosticId) -> usize,
+    /// Like `enter_native`, but marks a garbage-collection pause rather than
+    /// a named native call. Undone by `exit_native`.
+    pub enter_gc_pause: fn() -> usize,
     pub exit_native: fn(usize),
 }
 
@@ -81,6 +84,17 @@ pub fn native_frame(name: &Arc<str>, id: &NativeDiagnosticId) -> NativeFrameGuar
     let previous = HOOKS
         .get()
         .map_or(0, |hooks| (hooks.enter_native)(name, id));
+    NativeFrameGuard {
+        previous,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// Mark the running fiber as paused for garbage collection (collecting, or
+/// waiting for a stop-the-world phase), so a stall is not blamed on native
+/// code. Without a running fiber this does nothing.
+pub fn gc_pause() -> NativeFrameGuard {
+    let previous = HOOKS.get().map_or(0, |hooks| (hooks.enter_gc_pause)());
     NativeFrameGuard {
         previous,
         _thread: std::marker::PhantomData,

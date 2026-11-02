@@ -886,6 +886,7 @@ pub struct Hooks {
     pub yield_now: fn() -> Result<(), SafepointError>,
     pub reclaim_stacks: fn(), // drop idle pooled stacks on every carrier
     pub enter_native: fn(&Arc<str>, &NativeDiagnosticId) -> usize, // previous frame token
+    pub enter_gc_pause: fn() -> usize, // marks a GC pause; previous frame token
     pub exit_native: fn(usize),
 }
 pub fn install(hooks: Hooks);
@@ -894,6 +895,7 @@ pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointErro
     -> Result<(), SafepointError>) -> Result<(), SafepointError>;
 pub struct NativeDiagnosticId; // Default (0 = unassigned) + Clone + Debug; get()/set(usize)
 pub fn native_frame(name: &Arc<str>, id: &NativeDiagnosticId) -> NativeFrameGuard;
+pub fn gc_pause() -> NativeFrameGuard; // held by heap collection and STW waits
 pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
 pub const STACK_COMMIT_ESTIMATE: usize; // 64 KiB budgeted per stack
 pub struct StackReservation; // Drop releases its charges and live/pool count.

@@ -71,6 +71,9 @@ const MAX_NATIVE_NAMES: usize = 4096;
 /// Frame tokens encode `generation * NAME_STRIDE + id`, with 1-based ids.
 const NAME_STRIDE: usize = MAX_NATIVE_NAMES + 1;
 const NAME_GENERATIONS: usize = usize::MAX / NAME_STRIDE;
+/// Frame token for a garbage-collection pause. Name tokens stay below it:
+/// the largest is `(NAME_GENERATIONS - 1) * NAME_STRIDE + MAX_NATIVE_NAMES`.
+const GC_PAUSE: usize = usize::MAX;
 
 /// Generation of the process-wide table, readable without its lock.
 static NAME_GENERATION: AtomicUsize = AtomicUsize::new(0);
@@ -238,19 +241,22 @@ impl Scheduler {
             return None;
         }
         run.reported = true;
-        Some(format!(
-            "cljrs: fiber {} stalled its isolate for {:?}; native frame: {} (other fibers runnable)",
-            run.id.0,
-            now.duration_since(run.heartbeat),
-            match self.native.load(Ordering::Relaxed) {
-                0 => "<Rust body without safepoints>".to_string(),
-                token => native_names()
+        let cause = match self.native.load(Ordering::Relaxed) {
+            GC_PAUSE => "garbage collection pause".to_string(),
+            0 => "native frame: <Rust body without safepoints>".to_string(),
+            token => format!(
+                "native frame: {}",
+                native_names()
                     .lock()
                     .unwrap()
                     .name(token)
                     .unwrap_or("<native function>")
-                    .to_string(),
-            }
+            ),
+        };
+        Some(format!(
+            "cljrs: fiber {} stalled its isolate for {:?}; {cause} (other fibers runnable)",
+            run.id.0,
+            now.duration_since(run.heartbeat),
         ))
     }
 }
@@ -420,6 +426,16 @@ impl Scheduling {
         }
         let previous = self.native.replace(id);
         self.wake.scheduler.native.store(id, Ordering::Relaxed);
+        previous
+    }
+
+    /// Mark a garbage-collection pause; `exit_native` restores the frame.
+    pub(super) fn enter_gc_pause(&self) -> usize {
+        let previous = self.native.replace(GC_PAUSE);
+        self.wake
+            .scheduler
+            .native
+            .store(GC_PAUSE, Ordering::Relaxed);
         previous
     }
 

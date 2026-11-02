@@ -24,6 +24,7 @@ pub fn safepoint() {
         return;
     }
     // GC is in progress — park and wait.
+    let _pause = crate::fiber::gc_pause();
     CONFIG_CANCELLATION.park();
     while CONFIG_CANCELLATION.in_progress() {
         std::thread::yield_now();
@@ -100,6 +101,7 @@ pub fn begin_stw() -> Option<StwGuard> {
         return None;
     }
     // Wait for all other mutator threads to park.
+    let _pause = crate::fiber::gc_pause();
     wait_for_threads_to_park();
     Some(StwGuard { _private: () })
 }

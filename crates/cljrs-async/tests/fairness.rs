@@ -390,6 +390,50 @@ fn watchdog_counts_a_sibling_that_yielded_its_slice() {
 }
 
 #[test]
+fn watchdog_attributes_a_stall_to_a_gc_pause() {
+    const CHILD: &str = "CLJRS_GC_PAUSE_STALL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watchdog_attributes_a_stall_to_a_gc_pause",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STALL_MS", "10")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("stalled its isolate").count(), 1, "{stderr}");
+        assert!(stderr.contains("; garbage collection pause ("), "{stderr}");
+        assert!(!stderr.contains("native frame"), "{stderr}");
+        return;
+    }
+    run(async {
+        let collector = fiber::spawn(|| {
+            // A collection inside a native call is still reported as GC.
+            let _native =
+                cljrs_gc::fiber::native_frame(&"outer-native".into(), &Default::default());
+            // A slow root scan stands in for marking a large heap.
+            #[cfg(not(feature = "no-gc"))]
+            cljrs_gc::HEAP.collect(|_| std::thread::sleep(Duration::from_millis(150)));
+            // No-gc builds never collect; exercise the marker directly.
+            #[cfg(feature = "no-gc")]
+            {
+                let _pause = cljrs_gc::fiber::gc_pause();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let sibling = fiber::spawn(|| Ok(Value::Nil)).unwrap();
+        collector.await.unwrap().into_result().unwrap();
+        sibling.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
 fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
     std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
         for mode in [cljrs_runtime::ExecutionMode::TreeWalk, cljrs_runtime::ExecutionMode::Tiered] {
