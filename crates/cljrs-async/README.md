@@ -279,14 +279,15 @@ and restores that state on return. The caller retains `carrier: MutatorState`
 between drives on the same LocalSet. This state holds roots for pending async tasks.
 The caller also installs this carrier state while destroying the LocalSet.
 
-`eval_form(form, env).await -> EvalResult` evaluates one form on a new fiber from async
+`eval_form(form, env).await -> FiberResult` evaluates one form on a new fiber from async
 code that already runs on the LocalSet. It replaces the native `eval_async` entry point.
 The fiber uses a fresh environment for `env`'s globals and namespace, copies a namespace
 change back into `env`, and conveys the caller's dynamic bindings, gas meters, and
-interrupt flags. Its result is unrooted, like `await_value`'s.
-`eval_form_rooted(form, env).await -> FiberResult` keeps the result rooted across later
-yields until the `FiberResult` is consumed; `FiberResult::get(&self) -> &EvalResult`
-borrows it.
+interrupt flags. The result stays rooted across later yields until the `FiberResult` is
+consumed or dropped. `FiberResult::get(&self) -> &EvalResult` borrows it (borrow-only: a
+cloned value must not outlive the `FiberResult`); `into_result` takes it.
+`eval_form_unrooted(form, env).await -> EvalResult` returns the value directly and
+unrooted, like `await_value`, for callers that use it before the next yield.
 
 `park_on` can borrow fiber stack locals and suspend through synchronous native frames.
 `current()` returns the running fiber ID. During future polls, it returns `None`.

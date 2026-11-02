@@ -175,10 +175,10 @@ fn pending_local_future_rejects_carrier_waits_and_root_can_borrow_env() {
             )
             .parse_all()
             .unwrap();
-            cljrs_async::fiber::eval_form(&forms[0], &mut env)
+            cljrs_async::fiber::eval_form_unrooted(&forms[0], &mut env)
                 .await
                 .unwrap();
-            let value = cljrs_async::fiber::eval_form(&forms[1], &mut env)
+            let value = cljrs_async::fiber::eval_form_unrooted(&forms[1], &mut env)
                 .await
                 .unwrap();
             assert_eq!(value.to_string(), "42");

@@ -293,7 +293,7 @@ fn awaited_go_channels_survive_collections() {
     );
 }
 
-/// `fiber::eval_form` conveys the caller's dynamic bindings and gas meters,
+/// `fiber::eval_form_unrooted` (like `eval_form`) conveys the caller's dynamic bindings and gas meters,
 /// like `future`, so an embedder's binding or budget governs the form.
 #[test]
 fn eval_form_conveys_bindings_and_gas() {
@@ -316,7 +316,7 @@ fn eval_form_conveys_bindings_and_gas() {
                         .unwrap()
                         .remove(0)
                 };
-                fiber::eval_form(&parse("(def ^:dynamic *x* :root)"), &mut env)
+                fiber::eval_form_unrooted(&parse("(def ^:dynamic *x* :root)"), &mut env)
                     .await
                     .unwrap();
                 let var = globals.lookup_var_in_ns("user", "*x*").unwrap();
@@ -325,14 +325,16 @@ fn eval_form_conveys_bindings_and_gas() {
                     let _frame = cljrs_runtime::env::dynamics::push_frame(
                         [(key, Value::keyword(cljrs_value::Keyword::simple("bound")))].into(),
                     );
-                    fiber::eval_form(&parse("*x*"), &mut env).await.unwrap()
+                    fiber::eval_form_unrooted(&parse("*x*"), &mut env)
+                        .await
+                        .unwrap()
                 };
                 assert_eq!(bound.to_string(), ":bound");
 
                 let meter = cljrs_runtime::env::gas::GasMeter::new(1_000);
                 let spun = {
                     let _gas = cljrs_runtime::env::gas::GasGuard::install(meter);
-                    fiber::eval_form(&parse("(loop [] (recur))"), &mut env).await
+                    fiber::eval_form_unrooted(&parse("(loop [] (recur))"), &mut env).await
                 };
                 assert!(
                     matches!(
@@ -349,10 +351,10 @@ fn eval_form_conveys_bindings_and_gas() {
         .unwrap();
 }
 
-/// `fiber::eval_form_rooted` keeps its result rooted across later yields and
+/// `fiber::eval_form` keeps its result rooted across later yields and
 /// collections, until the `FiberResult` is consumed.
 #[test]
-fn eval_form_rooted_survives_later_collections() {
+fn eval_form_result_survives_later_collections() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
@@ -372,14 +374,14 @@ fn eval_form_rooted_survives_later_collections() {
                         .unwrap()
                         .remove(0)
                 };
-                let kept = fiber::eval_form_rooted(
+                let kept = fiber::eval_form(
                     &parse("(mapv (fn [i] (str \"item-\" i)) (range 50))"),
                     &mut env,
                 )
                 .await;
                 for _ in 0..3 {
                     // Allocate on another fiber, then collect, while `kept` waits.
-                    fiber::eval_form(&parse("(count (vec (range 2000)))"), &mut env)
+                    fiber::eval_form_unrooted(&parse("(count (vec (range 2000)))"), &mut env)
                         .await
                         .unwrap();
                     tokio::task::yield_now().await;
@@ -394,7 +396,15 @@ fn eval_form_rooted_survives_later_collections() {
                 };
                 assert_eq!(items.get().count(), 50);
                 assert_eq!(items.get().nth(49).unwrap().to_string(), "\"item-49\"");
-                drop(kept);
+                // Taking the value publishes it to this scope (in no-gc
+                // builds, through its region leases); it stays usable while
+                // more forms run.
+                let taken = kept.into_result().unwrap();
+                let _roots = cljrs_runtime::env::gc_roots::root_value(&taken);
+                fiber::eval_form_unrooted(&parse("(count (vec (range 2000)))"), &mut env)
+                    .await
+                    .unwrap();
+                assert_eq!(taken.to_string().matches("item-").count(), 50);
             });
             fiber::drop_local_with_carrier(local, &mut MutatorState::fresh());
         })

@@ -75,8 +75,8 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ]);
         fns
     };
-    // wasm32's `alts!` macro awaits this future-returning selection.
-    #[cfg(target_arch = "wasm32")]
+    // The future-returning exactly-one selection. wasm32's `alts!` macro
+    // awaits it; colored bodies on any target can `(await (alts!-future ...))`.
     let fns = {
         let mut fns = fns;
         fns.push((
@@ -307,6 +307,14 @@ fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
 fn builtin_take_parking(args: &[Value]) -> ValueResult<Value> {
     take_parking("<!", args)
 }
+
+/// What a colored body should call instead of a parking `alts`: the same
+/// exactly-one selection, awaited. (`alts` over `take!` futures would lose the
+/// values its losing takes consume.)
+#[cfg(target_arch = "wasm32")]
+const ALTS_COLORED_HINT: &str = "(alts! ports)";
+#[cfg(not(target_arch = "wasm32"))]
+const ALTS_COLORED_HINT: &str = "(await (alts!-future ports))";
 
 /// Reject a carrier wait from a colored (wasm32 `eval_async`) body, naming the
 /// operation the caller used.
@@ -646,7 +654,7 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
 /// Select exactly one take or `[channel value]` put. Options are :priority
 /// (input order) and :default (return immediately when nothing is ready).
 fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
-    reject_colored_wait("alts!!", "(await (alts [(take! ch) ...]))")?;
+    reject_colored_wait("alts!!", ALTS_COLORED_HINT)?;
     let (requests, default) = alts_requests("alts!!", args)?;
     // The guard records the slice's address, so the Vec must outlive it.
     let roots = alts_roots(&requests, &default);
@@ -657,7 +665,7 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
 /// `(alts! ports & opts)` — `alts!!` under its core.async name (native targets).
 #[cfg(not(target_arch = "wasm32"))]
 fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
-    reject_colored_wait("alts!", "(await (alts [(take! ch) ...]))")?;
+    reject_colored_wait("alts!", ALTS_COLORED_HINT)?;
     let (requests, default) = alts_requests("alts!", args)?;
     // The guard lives on the parked fiber's own root stack and records the
     // slice's address, so the Vec must outlive it.
@@ -667,8 +675,8 @@ fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
 }
 
 /// `(alts!-future ports & opts)` — the same selection as a future, which the
-/// wasm32 `alts!` macro awaits inside colored `go` bodies.
-#[cfg(target_arch = "wasm32")]
+/// wasm32 `alts!` macro awaits inside colored `go` bodies. Unlike `alts` over
+/// `take!` futures, it completes exactly one operation and returns `[val ch]`.
 fn builtin_alts_future(args: &[Value]) -> ValueResult<Value> {
     let (requests, default) = alts_requests("alts!", args)?;
     // The task's captured roots keep the ports alive; no guard spans an await.

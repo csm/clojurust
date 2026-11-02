@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 
@@ -59,7 +59,7 @@ fn eval_both(src: &str) -> (Result<String, String>, Result<String, String>) {
 
     let asynced = block_on_local(async move {
         let mut env = Env::new(globals, "user");
-        eval_form(&form, &mut env)
+        eval_form_unrooted(&form, &mut env)
             .await
             .map(|v| format!("{v}"))
             .map_err(|e| e.to_string())

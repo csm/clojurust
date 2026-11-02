@@ -51,22 +51,23 @@ impl AsyncRuntime for AsyncRuntimeImpl {
     }
 
     fn take_if_channel(&self, val: &Value) -> Option<EvalResult> {
-        let Value::NativeObject(obj) = val else {
-            return None;
-        };
-        if obj.get().type_tag() != crate::channel::CHANNEL_TAG {
-            return None;
+        let channel = crate::channel::as_channel(val)?;
+        // wasm32 cannot park: blocking its only thread would starve the task
+        // that feeds the channel. Only colored bodies can await one there.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = channel;
+            Some(Err(EvalError::Runtime(
+                "await on a channel requires a go or ^:async body on wasm32".into(),
+            )))
         }
-        Some(self.chan_take_blocking(val.clone()))
+        #[cfg(not(target_arch = "wasm32"))]
+        Some(take_channel_blocking(val, channel))
     }
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
-        // Root the channel for the whole wait: once its producer closes it and
-        // drops its own reference, this local may be the only one left.
-        let _root = cljrs_runtime::env::gc_roots::root_value(&chan);
         let ch = downcast_channel(&chan)?;
-        cljrs_value::parking::block_on(ch.take_result())
-            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+        take_channel_blocking(&chan, ch)
     }
 
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()> {
@@ -151,6 +152,15 @@ pub(crate) fn conveyed_fiber(
         let _meters = gas::install_meters(&meters);
         body()
     })
+}
+
+/// Take from `channel` (the channel behind `anchor`), parking the calling fiber
+/// or blocking outside one. Roots the channel for the whole wait: once its
+/// producer closes it and drops its own reference, `anchor` may be the only one.
+#[allow(clippy::result_large_err)]
+fn take_channel_blocking(anchor: &Value, channel: &CljChannel) -> EvalResult {
+    let _root = cljrs_runtime::env::gc_roots::root_value(anchor);
+    cljrs_value::parking::block_on(channel.take_for_await())
 }
 
 #[allow(clippy::result_large_err)]

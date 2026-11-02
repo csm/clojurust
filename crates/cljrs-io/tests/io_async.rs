@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -67,7 +67,7 @@ fn spit_then_slurp_round_trip() {
         let mut env = Env::new(globals, "user");
 
         // spit delivers the number of bytes written on its promise channel.
-        let written = eval_form(
+        let written = eval_form_unrooted(
             &parse_one(&format!(
                 "(await (clojure.core.async/take! \
                    (clojure.rust.io.async/spit \"{path}\" \"hello, world\")))"
@@ -79,7 +79,7 @@ fn spit_then_slurp_round_trip() {
         assert_eq!(written, Value::Long(12));
 
         // slurp reads it back as a string on its promise channel.
-        let read = eval_form(
+        let read = eval_form_unrooted(
             &parse_one(&format!(
                 "(await (clojure.core.async/take! \
                    (clojure.rust.io.async/slurp \"{path}\")))"
@@ -106,7 +106,7 @@ fn char_chan_streams_then_closes() {
             &mut env,
         );
         for expected in ['a', 'b', 'c'] {
-            let c = eval_form(
+            let c = eval_form_unrooted(
                 &parse_one("(await (clojure.core.async/take! ch))"),
                 &mut env,
             )
@@ -115,7 +115,7 @@ fn char_chan_streams_then_closes() {
             assert_eq!(c, Value::Char(expected));
         }
         // Channel closes at EOF: the next take yields nil.
-        let end = eval_form(
+        let end = eval_form_unrooted(
             &parse_one("(await (clojure.core.async/take! ch))"),
             &mut env,
         )
@@ -134,7 +134,7 @@ fn read_bytes_returns_prefix_byte_array() {
     let cleanup = path.clone();
     block_on_local(async move {
         let mut env = Env::new(globals, "user");
-        let len = eval_form(
+        let len = eval_form_unrooted(
             &parse_one(&format!(
                 "(alength (await (clojure.core.async/take! \
                    (clojure.rust.io.async/read-bytes \"{path}\" 3))))"

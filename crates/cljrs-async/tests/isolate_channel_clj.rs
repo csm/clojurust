@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_runtime::env::error::EvalError;
@@ -152,7 +152,7 @@ fn isolate_take_resolves_a_put_value() {
         // Stash the channel ends in vars so both forms see the same channel.
         eval_sync("(def ch (isolate-chan))", &mut env);
         eval_sync("(isolate-put! (first ch) [:hello 99])", &mut env);
-        let r = eval_form(&parse_one("(await (isolate-take! (second ch)))"), &mut env)
+        let r = eval_form_unrooted(&parse_one("(await (isolate-take! (second ch)))"), &mut env)
             .await
             .unwrap();
         let expected = eval_sync("[:hello 99]", &mut env);

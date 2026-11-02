@@ -705,8 +705,13 @@ impl FiberResult {
         }
     }
 
-    /// Borrow the result while it stays rooted. Use this to keep a result
-    /// across later yields without rooting it yourself.
+    /// Borrow the result while it stays rooted, across any number of yields.
+    ///
+    /// Borrow-only: a `Value` cloned out of it must not outlive this
+    /// `FiberResult`. Dropping it releases the result's ownership (in `no-gc`
+    /// builds, its region leases) without publishing to the caller. To keep a
+    /// value past the `FiberResult`, take it with [`Self::into_result`] and root
+    /// it yourself.
     pub fn get(&self) -> &EvalResult {
         self.result.as_ref().unwrap()
     }
@@ -865,7 +870,8 @@ pub fn run_root_owned(
 }
 
 /// Evaluate one top-level form on a new fiber from async code that already
-/// runs on the isolate's LocalSet, and return its result.
+/// runs on the isolate's LocalSet, returning its result rooted in a
+/// [`FiberResult`].
 ///
 /// This is the fiber replacement for the retired native `eval_async` entry
 /// point. The form runs on the ordinary evaluator, so `await`, `deref`, and
@@ -876,24 +882,52 @@ pub fn run_root_owned(
 /// namespace; a namespace change made by the form (`ns`, `in-ns`) is copied
 /// back into `env`. Lexical frames in `env` are not visible.
 ///
-/// The returned value is not rooted, as with [`crate::await_value`]: use it
-/// before the next yield, or call [`eval_form_rooted`] to keep it across
-/// later yields. Use [`run_root`] instead when the caller is not already
-/// inside the runtime.
+/// The result stays rooted across later yields and collections until the
+/// `FiberResult` is consumed or dropped: borrow it with [`FiberResult::get`],
+/// or take it with [`FiberResult::into_result`]. Use [`run_root`] instead when
+/// the caller is not already inside the runtime.
 pub async fn eval_form(
     form: &cljrs_reader::Form,
     env: &mut cljrs_runtime::env::env::Env,
-) -> EvalResult {
-    eval_form_rooted(form, env).await.into_result()
+) -> FiberResult {
+    match eval_form_task(form, env) {
+        Ok((task, finish)) => {
+            let result = drive_to_result(task).await;
+            finish(env);
+            result
+        }
+        Err(error) => FiberResult::new(Err(error)),
+    }
 }
 
-/// [`eval_form`], returning the result rooted in a [`FiberResult`]. The value
-/// stays rooted, across any number of later yields, until the `FiberResult`
-/// is consumed or dropped; borrow it with [`FiberResult::get`].
-pub async fn eval_form_rooted(
+/// [`eval_form`], returning the value directly and unrooted, as
+/// [`crate::await_value`] does. Use it before the next yield; a value kept
+/// across later yields must be rooted by the caller (or use [`eval_form`]).
+/// In `no-gc` builds the fiber publishes its result to the caller's scope on
+/// completion, as a root evaluation does.
+pub async fn eval_form_unrooted(
     form: &cljrs_reader::Form,
     env: &mut cljrs_runtime::env::env::Env,
-) -> FiberResult {
+) -> EvalResult {
+    let (task, finish) = eval_form_task(form, env)?;
+    let result = task.await;
+    finish(env);
+    result
+}
+
+/// Build the conveyed fiber for one form, and the step that copies its final
+/// namespace back into the caller's `env` once it has completed.
+#[allow(clippy::result_large_err, clippy::type_complexity)]
+fn eval_form_task(
+    form: &cljrs_reader::Form,
+    env: &cljrs_runtime::env::env::Env,
+) -> Result<
+    (
+        FiberTask,
+        Box<dyn FnOnce(&mut cljrs_runtime::env::env::Env)>,
+    ),
+    EvalError,
+> {
     let form = form.clone();
     let globals = env.globals.clone();
     let start_ns = env.current_ns.clone();
@@ -904,11 +938,9 @@ pub async fn eval_form_rooted(
         let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
         *report_ns.borrow_mut() = fiber_env.current_ns.clone();
         result
-    });
-    let result = match fiber {
-        Ok(fiber) => drive_to_result(fiber.into_task()).await,
-        Err(error) => FiberResult::new(Err(error)),
+    })?;
+    let finish = move |env: &mut cljrs_runtime::env::env::Env| {
+        env.current_ns = final_ns.borrow().clone();
     };
-    env.current_ns = final_ns.borrow().clone();
-    result
+    Ok((fiber.into_task(), Box::new(finish)))
 }

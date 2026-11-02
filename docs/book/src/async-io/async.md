@@ -235,7 +235,8 @@ rt.block_on(local.run_until(async {
 Code that can park must run on a fiber. From synchronous Rust, drive it with
 `cljrs_async::fiber::run_root` (or `Isolate::spawn_root`). From async code
 already on the `LocalSet`, `cljrs_async::fiber::eval_form(&form, &mut env).await`
-evaluates one form on a new fiber.
+evaluates one form on a new fiber and returns its result rooted in a `FiberResult`
+(`eval_form_unrooted` returns the bare value, for immediate use).
 
 The CLI links this crate when built with its default `async` feature; a minimal
 binary can be produced with `cargo build -p cljrs --no-default-features`.

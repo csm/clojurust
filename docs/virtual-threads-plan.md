@@ -574,8 +574,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - `eval_async` is compiled only for wasm32 (and natively behind the `colored-eval` feature, which `cljrs-wasm` enables so it builds in the workspace). The shared future-delivery helpers moved to
   `cljrs_async::task`. `fiber::eval_form` evaluates one form on a fiber from async code on the
   LocalSet; it replaces native uses of `eval_async`. Like `future`, it conveys the caller's
-  dynamic bindings, gas meters, and interrupt flags. Its result is unrooted, like `await_value`;
-  `fiber::eval_form_rooted` returns it rooted in a `FiberResult` (`FiberResult::get` borrows it).
+  dynamic bindings, gas meters, and interrupt flags. It returns the result rooted in a
+  `FiberResult` (`FiberResult::get` borrows it); `fiber::eval_form_unrooted` returns the bare
+  value, like `await_value`.
   The whole async test corpus runs on fibers.
 - Phase H is closed. No dispatch path consults compiled poll functions: the JIT no longer
   activates `^:async` arities (`JitBackend::compile_async_arity` and `async_jit.rs` are gone),

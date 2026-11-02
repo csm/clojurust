@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -60,7 +60,9 @@ fn eval_async_src(src: &str) -> Option<String> {
             let mut parser = Parser::new(src, "<test>".to_string());
             let mut result = Value::Nil;
             for form in parser.parse_all().expect("parse error") {
-                result = eval_form(&form, &mut env).await.expect("eval error");
+                result = eval_form_unrooted(&form, &mut env)
+                    .await
+                    .expect("eval error");
             }
             format!("{result}")
         });

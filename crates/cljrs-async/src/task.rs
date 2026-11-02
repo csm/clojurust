@@ -213,15 +213,13 @@ async fn await_value_inner(val: Value) -> EvalResult {
                 listener.await;
             }
         }
-        Value::NativeObject(obj) if obj.get().type_tag() == crate::channel::CHANNEL_TAG => {
+        other => match crate::channel::as_channel(&other) {
             // `go` returns a result channel; awaiting it takes the value.
-            let anchor = Value::NativeObject(obj.clone());
-            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-            crate::channel::chan_ref(obj.get())
-                .take_result()
-                .await
-                .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
-        }
-        other => Ok(other),
+            Some(channel) => {
+                let _root = cljrs_runtime::env::gc_roots::root_value(&other);
+                channel.take_for_await().await
+            }
+            None => Ok(other),
+        },
     }
 }

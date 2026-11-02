@@ -44,7 +44,7 @@ fn eval_async_src(src: &str) -> Result<Value, String> {
     local.block_on(&rt, async {
         let mut result = Value::Nil;
         for form in &forms {
-            result = cljrs_async::fiber::eval_form(form, &mut env)
+            result = cljrs_async::fiber::eval_form_unrooted(form, &mut env)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
         }

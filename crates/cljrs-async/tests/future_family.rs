@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::builtins::builtins::EXPERIMENTAL_NS;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
@@ -40,7 +40,7 @@ async fn eval_all(src: &str, env: &mut Env) -> Value {
     let mut p = Parser::new(src.to_string(), "<test>".to_string());
     let mut result = Value::Nil;
     for form in p.parse_all().expect("parse error") {
-        result = eval_form(&form, env).await.expect("eval error");
+        result = eval_form_unrooted(&form, env).await.expect("eval error");
     }
     result
 }
@@ -49,7 +49,9 @@ async fn eval_err(src: &str, env: &mut Env) -> String {
     let mut p = Parser::new(src.to_string(), "<test>".to_string());
     let mut last = Err(String::new());
     for form in p.parse_all().expect("parse error") {
-        last = eval_form(&form, env).await.map_err(|e| format!("{e:?}"));
+        last = eval_form_unrooted(&form, env)
+            .await
+            .map_err(|e| format!("{e:?}"));
         if last.is_err() {
             break;
         }

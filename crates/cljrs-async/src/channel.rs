@@ -485,6 +485,15 @@ impl CljChannel {
         self.failure_kind().map(ChannelFailure::reader_error)
     }
     /// Take a value and preserve a producer's resource-limit failure.
+    /// Take one value for `await` (sync or async): `nil` once closed and
+    /// drained, and the channel's typed failure as an `EvalError`. Callers keep
+    /// the channel rooted for the whole wait.
+    pub async fn take_for_await(&self) -> cljrs_runtime::env::error::EvalResult {
+        self.take_result()
+            .await
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+    }
+
     pub async fn take_result(&self) -> cljrs_value::ValueResult<Value> {
         let value = self.take().await;
         match self.failure() {
@@ -770,6 +779,17 @@ impl NativeObject for CljMult {
 /// Create a fresh `CljChannel` wrapped as a `Value::NativeObject`-ready pointer.
 pub fn make_chan(capacity: usize) -> GcPtr<NativeObjectBox> {
     gc_native_object(CljChannel::new(capacity))
+}
+
+/// The `CljChannel` behind `val`, when `val` is a channel. The single tag
+/// check shared by every path that accepts a channel, including `await`.
+pub fn as_channel(val: &Value) -> Option<&CljChannel> {
+    match val {
+        Value::NativeObject(obj) if obj.get().type_tag() == CHANNEL_TAG => {
+            Some(chan_ref(obj.get()))
+        }
+        _ => None,
+    }
 }
 
 /// Borrow the `CljChannel` out of a `NativeObjectBox`.

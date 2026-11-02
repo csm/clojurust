@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use cljrs_async::fiber::eval_form;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::{Form, Parser};
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -50,7 +50,7 @@ fn interleaved_async_loops_keep_their_roots() {
 
     let (a, b) = local.block_on(&rt, async move {
         let mut setup = Env::new(globals.clone(), "user");
-        eval_form(
+        eval_form_unrooted(
             &parse_one("(require '[clojure.core.async :refer [timeout]])"),
             &mut setup,
         )
@@ -63,7 +63,10 @@ fn interleaved_async_loops_keep_their_roots() {
             let form =
                 parse_one("(loop* [i 0] (if (< i 2) (do (await (timeout 1)) (recur (inc i))) :a))");
             // Format before the task ends: a JoinHandle output is not a GC root.
-            format!("{}", eval_form(&form, &mut env_a).await.expect("loop a"))
+            format!(
+                "{}",
+                eval_form_unrooted(&form, &mut env_a).await.expect("loop a")
+            )
         });
 
         // B builds its accumulator without yielding, so each iteration's alloc
@@ -78,7 +81,7 @@ fn interleaved_async_loops_keep_their_roots() {
                          (recur (conj acc (str \"item-\" i)) (inc i)))
                      acc))",
             );
-            let b = eval_form(&form, &mut env_b).await.expect("loop b");
+            let b = eval_form_unrooted(&form, &mut env_b).await.expect("loop b");
             let Value::Vector(v) = &b else {
                 panic!("loop b returned {b}");
             };

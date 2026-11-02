@@ -103,7 +103,10 @@ fn loop_intermediates_are_collected() {
     let mut async_env = env(ExecutionMode::TreeWalk);
     assert_frees("async top level", &top_level, |f| {
         local
-            .block_on(&rt, cljrs_async::fiber::eval_form(f, &mut async_env))
+            .block_on(
+                &rt,
+                cljrs_async::fiber::eval_form_unrooted(f, &mut async_env),
+            )
             .expect("eval")
     });
 }
