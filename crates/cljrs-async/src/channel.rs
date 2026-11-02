@@ -488,6 +488,7 @@ impl CljChannel {
     /// Take one value for `await` (sync or async): `nil` once closed and
     /// drained, and the channel's typed failure as an `EvalError`. Callers keep
     /// the channel rooted for the whole wait.
+    #[allow(clippy::result_large_err)] // `EvalError` by value, as every evaluator entry point.
     pub async fn take_for_await(&self) -> cljrs_runtime::env::error::EvalResult {
         self.take_result()
             .await
