@@ -260,6 +260,30 @@ fn async_errors_still_settle_the_future() {
 }
 
 #[test]
+fn alts_future_selects_exactly_one_and_names_itself() {
+    // The future-returning selection behind wasm32's `alts!` macro, called
+    // directly: one take completes, the other channel keeps its value, and the
+    // result is `[val ch]`. Its errors name `alts!-future`.
+    assert_both(
+        r#"
+        (require '[clojure.core.async :as a :refer [chan >!! poll! alts!-future]])
+        (def c1 (chan 1))
+        (def c2 (chan 1))
+        (>!! c1 :one)
+        (>!! c2 :two)
+        (def picked (await (alts!-future [c1 c2] :priority true)))
+        (defn msg [f] (try (f) (catch Exception e (str e))))
+        [(first picked)
+         (= (second picked) c1)
+         (poll! c2)
+         (boolean (re-find #"alts!-future accepts"
+                           (msg #(await (alts!-future [c1] :bogus 1)))))]
+        "#,
+        "[:one true :two true]",
+    );
+}
+
+#[test]
 fn alts_keeps_its_ports_rooted_while_parked() {
     // The put value is referenced only by the parked selection. Collections
     // while it waits must not free it (or the channels).
@@ -404,6 +428,11 @@ fn eval_form_result_survives_later_collections() {
                 fiber::eval_form_unrooted(&parse("(count (vec (range 2000)))"), &mut env)
                     .await
                     .unwrap();
+                #[cfg(not(feature = "no-gc"))]
+                {
+                    cljrs_gc::request_gc();
+                    cljrs_runtime::env::gc_roots::async_gc_collect();
+                }
                 assert_eq!(taken.to_string().matches("item-").count(), 50);
             });
             fiber::drop_local_with_carrier(local, &mut MutatorState::fresh());

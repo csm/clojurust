@@ -449,12 +449,26 @@ pub fn is_special_form(s: &str) -> bool {
 
 /// `await` on the synchronous evaluator, shared by the tree-walker and the IR
 /// interpreter. A future or promise is dereferenced, which parks on a fiber.
+/// On wasm32, which cannot park, a value that is not ready yet is an error.
 /// A channel (what `go` returns) is taken from through
 /// [`AsyncRuntime::take_if_channel`](crate::env::async_hook::AsyncRuntime::take_if_channel),
 /// so `(await (go ...))` yields the block's value. Any other value is returned
 /// unchanged.
 pub fn await_value_sync(v: Value, globals: &GlobalEnv) -> EvalResult {
     match v {
+        // wasm32 cannot park its only thread: a synchronous `await` returns a
+        // settled value at once and errors when it would have to wait.
+        #[cfg(target_arch = "wasm32")]
+        Value::Future(f) => match f.get().settled_value() {
+            Some(settled) => settled.map_err(crate::env::error::value_error_to_eval_error),
+            None => Err(would_block_on_wasm()),
+        },
+        #[cfg(target_arch = "wasm32")]
+        Value::Promise(p) => {
+            let value = p.get().value.lock().unwrap().clone();
+            value.ok_or_else(would_block_on_wasm)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         Value::Future(_) | Value::Promise(_) => deref_value(v),
         other => match globals
             .async_runtime()
@@ -464,6 +478,13 @@ pub fn await_value_sync(v: Value, globals: &GlobalEnv) -> EvalResult {
             None => Ok(other),
         },
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn would_block_on_wasm() -> EvalError {
+    EvalError::Runtime(
+        "this await would block, which wasm32 cannot do outside a go or ^:async body".into(),
+    )
 }
 
 /// Dereference a value: used by `@x` reader macro and the `deref` builtin.

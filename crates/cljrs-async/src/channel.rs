@@ -484,7 +484,6 @@ impl CljChannel {
     pub(crate) fn failure(&self) -> Option<cljrs_value::ValueError> {
         self.failure_kind().map(ChannelFailure::reader_error)
     }
-    /// Take a value and preserve a producer's resource-limit failure.
     /// Take one value for `await` (sync or async): `nil` once closed and
     /// drained, and the channel's typed failure as an `EvalError`. Callers keep
     /// the channel rooted for the whole wait.
@@ -495,6 +494,7 @@ impl CljChannel {
             .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
     }
 
+    /// Take a value and preserve a producer's resource-limit failure.
     pub async fn take_result(&self) -> cljrs_value::ValueResult<Value> {
         let value = self.take().await;
         match self.failure() {
@@ -791,6 +791,31 @@ pub fn as_channel(val: &Value) -> Option<&CljChannel> {
         }
         _ => None,
     }
+}
+
+/// Synchronous take, shared by `<!`, `<!!`, synchronous `await`, and the IR
+/// interpreter's `ChanTake`. Roots `anchor` (the channel's own value) for the
+/// whole wait, then parks the calling fiber or, outside one, blocks the OS
+/// thread. wasm32 cannot park, so there it returns a ready value (or `nil` for
+/// a closed, drained channel) at once, and errors only when the take would block.
+pub fn take_sync(anchor: &Value, channel: &CljChannel) -> cljrs_value::ValueResult<Value> {
+    let _root = cljrs_runtime::env::gc_roots::root_value(anchor);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let value = channel.try_take().ok_or_else(|| {
+            cljrs_value::ValueError::Other(
+                "this channel take would block, which wasm32 cannot do outside a go \
+                 or ^:async body; use (<! ch) or (await (take! ch)) there"
+                    .into(),
+            )
+        })?;
+        match channel.failure() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    cljrs_value::parking::block_on(channel.take_result())
 }
 
 /// Borrow the `CljChannel` out of a `NativeObjectBox`.

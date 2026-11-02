@@ -24,7 +24,7 @@ use cljrs_value::{
     gc_native_object,
 };
 
-use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
+use crate::channel::{CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
 use crate::task::{await_value, spawn_future_with_roots};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
@@ -188,7 +188,9 @@ async fn alts_select(futures: Vec<Value>) -> EvalResult {
 /// task.
 fn channel_arg(args: &[Value]) -> ValueResult<GcPtr<NativeObjectBox>> {
     match args.first() {
-        Some(Value::NativeObject(obj)) if obj.get().type_tag() == CHANNEL_TAG => Ok(obj.clone()),
+        Some(value @ Value::NativeObject(obj)) if crate::channel::as_channel(value).is_some() => {
+            Ok(obj.clone())
+        }
         other => Err(ValueError::WrongType {
             expected: "channel",
             got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
@@ -335,7 +337,7 @@ fn take_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
             .map_err(cljrs_runtime::env::callback::eval_error_to_value_error);
     }
     let ch = channel_arg(args)?;
-    cljrs_value::parking::block_on(chan_ref(ch.get()).take_result())
+    crate::channel::take_sync(&args[0], chan_ref(ch.get()))
 }
 
 /// `(>!! ch val)` — put onto a channel, parking the calling fiber.
@@ -678,7 +680,7 @@ fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
 /// wasm32 `alts!` macro awaits inside colored `go` bodies. Unlike `alts` over
 /// `take!` futures, it completes exactly one operation and returns `[val ch]`.
 fn builtin_alts_future(args: &[Value]) -> ValueResult<Value> {
-    let (requests, default) = alts_requests("alts!", args)?;
+    let (requests, default) = alts_requests("alts!-future", args)?;
     // The task's captured roots keep the ports alive; no guard spans an await.
     let roots = alts_roots(&requests, &default);
     Ok(spawn_future_with_roots(roots, async move {

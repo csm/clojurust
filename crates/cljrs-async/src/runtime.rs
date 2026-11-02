@@ -3,7 +3,7 @@
 use cljrs_runtime::env::async_hook::AsyncRuntime;
 use cljrs_runtime::env::env::Env;
 use cljrs_runtime::env::error::{EvalError, EvalResult};
-use cljrs_value::{NativeObjectBox, Value};
+use cljrs_value::Value;
 
 use crate::channel::CljChannel;
 #[cfg(target_arch = "wasm32")]
@@ -52,22 +52,16 @@ impl AsyncRuntime for AsyncRuntimeImpl {
 
     fn take_if_channel(&self, val: &Value) -> Option<EvalResult> {
         let channel = crate::channel::as_channel(val)?;
-        // wasm32 cannot park: blocking its only thread would starve the task
-        // that feeds the channel. Only colored bodies can await one there.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = channel;
-            Some(Err(EvalError::Runtime(
-                "await on a channel requires a go or ^:async body on wasm32".into(),
-            )))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        Some(take_channel_blocking(val, channel))
+        Some(
+            crate::channel::take_sync(val, channel)
+                .map_err(cljrs_runtime::env::error::value_error_to_eval_error),
+        )
     }
 
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
         let ch = downcast_channel(&chan)?;
-        take_channel_blocking(&chan, ch)
+        crate::channel::take_sync(&chan, ch)
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
     }
 
     fn chan_put_blocking(&self, chan: Value, val: Value) -> EvalResult<()> {
@@ -154,29 +148,14 @@ pub(crate) fn conveyed_fiber(
     })
 }
 
-/// Take from `channel` (the channel behind `anchor`), parking the calling fiber
-/// or blocking outside one. Roots the channel for the whole wait: once its
-/// producer closes it and drops its own reference, `anchor` may be the only one.
-#[allow(clippy::result_large_err)]
-fn take_channel_blocking(anchor: &Value, channel: &CljChannel) -> EvalResult {
-    let _root = cljrs_runtime::env::gc_roots::root_value(anchor);
-    cljrs_value::parking::block_on(channel.take_for_await())
-}
-
 #[allow(clippy::result_large_err)]
 fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
-    match val {
+    crate::channel::as_channel(val).ok_or_else(|| match val {
         Value::NativeObject(ptr) => {
-            let obj: &NativeObjectBox = ptr.get();
-            obj.downcast_ref::<CljChannel>().ok_or_else(|| {
-                EvalError::Runtime(format!("expected Channel, got {}", obj.type_tag()))
-            })
+            EvalError::Runtime(format!("expected Channel, got {}", ptr.get().type_tag()))
         }
-        other => Err(EvalError::Runtime(format!(
-            "expected Channel, got {}",
-            other.type_name(),
-        ))),
-    }
+        other => EvalError::Runtime(format!("expected Channel, got {}", other.type_name())),
+    })
 }
 
 /// Spawn a long-lived background task on the current `LocalSet` that services

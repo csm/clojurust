@@ -1749,7 +1749,9 @@ ordinary function into a fiber. The default implementation delegates to
 
 `AsyncRuntime::take_if_channel(&val) -> Option<EvalResult>` lets `await` take from the
 runtime's channels (what `go` returns): it parks or blocks and keeps the channel rooted
-while waiting, and returns `None` for any other value (the default). The tree-walker and
+while waiting, and returns `None` for any other value (the default). On wasm32, which
+cannot park, it returns a ready value or `nil` for a closed channel, and errors when the
+take would block; `await_value_sync` treats unsettled futures and promises the same way. The tree-walker and
 the IR interpreter both use it through `interp::eval::await_value_sync(val, globals)`,
 which dereferences futures and promises and returns other values unchanged.
 

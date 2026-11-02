@@ -383,7 +383,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `src/eval_async.rs` | (wasm32, or the `colored-eval` feature) `eval_async` colored tree-walker and `run_async_fn` driver |
 | `src/task.rs` | Shared executor tasks delivered through a Clojure future: `spawn_future`, `spawn_future_with_roots`, `settle_future`, `await_value` |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
-| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!`, `alts!!`, and on native targets the parking `<!`, `>!`, `alts!` (wasm32: `alts!-future`, the future-returning selection behind its `alts!` macro) |
+| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!`, `alts!!`, and on native targets the parking `<!`, `>!`, `alts!`; on every target `alts!-future`, the future-returning exactly-one selection (behind wasm32's `alts!` macro) |
 | `src/core_async_wasm.cljrs` | (wasm32 only) `<!`, `>!`, and `alts!` macros over `await` for colored `go` bodies |
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go` (a result channel, via `thread-call`), `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
@@ -711,6 +711,12 @@ Root errors remain ordinary results. `RootError` preserves typed gas and memory-
 Managed Values remain on their isolate thread. An OS-thread panic still appears in the outer join result.
 
 `CljChannel::take_result()` preserves resource-limit failures from a thread producer.
+`channel::as_channel(&Value) -> Option<&CljChannel>` is the single check that a value is a
+channel. `CljChannel::take_for_await()` is the async take behind `await`: `nil` once closed
+and drained, failures as `EvalError`. `channel::take_sync(&anchor, &channel)` is the
+synchronous take behind `<!`, `<!!`, sync `await`, and IR `ChanTake`: it roots the channel,
+parks a fiber or blocks outside one, and on wasm32 returns a ready value or errors when the
+take would block.
 Clojure blocking takes, future takes, polls, and channel alternatives propagate those failures without making them catchable.
 Ordinary thread-body throws are reported and close the result channel.
 Channels publish values only after a put commits. Failed offers and losing or cancelled alternatives do not publish their candidates.

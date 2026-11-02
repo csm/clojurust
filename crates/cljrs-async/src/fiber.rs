@@ -891,9 +891,9 @@ pub async fn eval_form(
     env: &mut cljrs_runtime::env::env::Env,
 ) -> FiberResult {
     match eval_form_task(form, env) {
-        Ok((task, finish)) => {
+        Ok((task, final_ns)) => {
             let result = drive_to_result(task).await;
-            finish(env);
+            env.current_ns = final_ns.borrow().clone();
             result
         }
         Err(error) => FiberResult::new(Err(error)),
@@ -909,25 +909,22 @@ pub async fn eval_form_unrooted(
     form: &cljrs_reader::Form,
     env: &mut cljrs_runtime::env::env::Env,
 ) -> EvalResult {
-    let (task, finish) = eval_form_task(form, env)?;
+    let (task, final_ns) = eval_form_task(form, env)?;
     let result = task.await;
-    finish(env);
+    env.current_ns = final_ns.borrow().clone();
     result
 }
 
-/// Build the conveyed fiber for one form, and the step that copies its final
-/// namespace back into the caller's `env` once it has completed.
-#[allow(clippy::result_large_err, clippy::type_complexity)]
+/// The form's namespace once its fiber completes, for the caller to copy back.
+type FinalNs = std::rc::Rc<RefCell<std::sync::Arc<str>>>;
+
+/// Build the conveyed fiber for one form, and the cell its final namespace is
+/// written to, which the caller copies into its `env` once the fiber completes.
+#[allow(clippy::result_large_err)]
 fn eval_form_task(
     form: &cljrs_reader::Form,
     env: &cljrs_runtime::env::env::Env,
-) -> Result<
-    (
-        FiberTask,
-        Box<dyn FnOnce(&mut cljrs_runtime::env::env::Env)>,
-    ),
-    EvalError,
-> {
+) -> Result<(FiberTask, FinalNs), EvalError> {
     let form = form.clone();
     let globals = env.globals.clone();
     let start_ns = env.current_ns.clone();
@@ -939,8 +936,5 @@ fn eval_form_task(
         *report_ns.borrow_mut() = fiber_env.current_ns.clone();
         result
     })?;
-    let finish = move |env: &mut cljrs_runtime::env::env::Env| {
-        env.current_ns = final_ns.borrow().clone();
-    };
-    Ok((fiber.into_task(), Box::new(finish)))
+    Ok((fiber.into_task(), final_ns))
 }
