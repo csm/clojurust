@@ -343,6 +343,53 @@ fn watchdog_reports_a_blocked_native_frame_once() {
 }
 
 #[test]
+fn watchdog_counts_a_sibling_that_yielded_its_slice() {
+    const CHILD: &str = "CLJRS_YIELDED_SIBLING_STALL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watchdog_counts_a_sibling_that_yielded_its_slice",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STALL_MS", "10")
+            .env("CLJRS_FIBER_SLICE_US", "1000")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("stalled its isolate").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("native frame: blocking-test-native"),
+            "{stderr}"
+        );
+        return;
+    }
+    run(async {
+        // The sibling starts first and runs a CPU loop, so it is runnable
+        // only because its slice expired and it yielded automatically.
+        let sibling = fiber::spawn(|| {
+            let end = Instant::now() + Duration::from_millis(5);
+            while Instant::now() < end {
+                cljrs_gc::fiber::safepoint().unwrap();
+            }
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let blocker = fiber::spawn(|| {
+            let _native =
+                cljrs_gc::fiber::native_frame(&"blocking-test-native".into(), &Default::default());
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        blocker.await.unwrap().into_result().unwrap();
+        sibling.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
 fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
     std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
         for mode in [cljrs_runtime::ExecutionMode::TreeWalk, cljrs_runtime::ExecutionMode::Tiered] {
