@@ -447,6 +447,23 @@ pub fn is_special_form(s: &str) -> bool {
 
 // ── eval_body ─────────────────────────────────────────────────────────────────
 
+/// `await` on the synchronous evaluator, shared by the tree-walker and the IR
+/// interpreter. A future or promise is dereferenced, which parks on a fiber.
+/// A core.async channel (what `go` returns) is taken from through the async
+/// runtime, so `(await (go ...))` yields the block's value. Any other value is
+/// returned unchanged.
+pub fn await_value_sync(v: Value, globals: &GlobalEnv) -> EvalResult {
+    let is_channel = matches!(&v, Value::NativeObject(obj) if obj.get().type_tag() == "Channel");
+    match v {
+        Value::Future(_) | Value::Promise(_) => deref_value(v),
+        v if is_channel => match globals.async_runtime() {
+            Some(rt) => rt.chan_take_blocking(v),
+            None => Ok(v),
+        },
+        other => Ok(other),
+    }
+}
+
 /// Dereference a value: used by `@x` reader macro and the `deref` builtin.
 pub fn deref_value(v: Value) -> EvalResult {
     match v {

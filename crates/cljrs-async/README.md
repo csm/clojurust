@@ -18,8 +18,9 @@ Done (Phases A–H, A2, B1):
 
 - Virtual-threads Phase 5 (`docs/virtual-threads-plan.md`): on native targets `go` bodies
   and `^:async` calls run on fibers with the ordinary evaluator. `await`, `deref`, `<!`,
-  `>!`, and `alts!` park the fiber; any function the body calls may park too. `^:async`
-  still makes a call return a future, but no longer selects a separate evaluator.
+  `>!`, and `alts!` park the fiber; any function the body calls may park too. `go` returns
+  a result channel (it is `thread-call` of its body), and `await` takes from a channel.
+  `^:async` still makes a call return a future, but no longer selects a separate evaluator.
   `eval_async` and the colored rules of Phases B–C now apply only to wasm32. Phase H's
   compiled state machines are no longer used on any dispatch path.
 
@@ -371,15 +372,15 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 |---|---|
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
 | `src/runtime.rs` | `AsyncRuntimeImpl`: `^:async` dispatch (a body fiber on native targets, `eval_async` on wasm32) and fiber call dispatch with binding, gas, and interrupt conveyance |
-| `src/state_machine.rs` | Compiled-async poll ABI (TODO.md Phase H, closed): `CljxStateMachine`, the C-ABI `PollFn` type and `POLL_*` codes, `check_ready`, and `CompiledAsyncTask`/`spawn_state_machine`. `cljrs-compiler`'s `rt_abi` and codegen implement this ABI for `lower_async` unit coverage. No runtime dispatch path uses it: `^:async` calls run on fibers. The `register_poll_fn*`/`lookup_poll_fn*` registries are retained but unused |
+| `src/state_machine.rs` | Compiled-async poll ABI (TODO.md Phase H, closed): `CljxStateMachine`, the C-ABI `PollFn` type and `POLL_*` codes, `check_ready`, `CompiledAsyncTask`, and test-only `spawn_state_machine`. `cljrs-compiler`'s `rt_abi` and codegen implement this ABI for `lower_async` unit coverage. No runtime dispatch path uses it: `^:async` calls run on fibers, and the poll-function registry was removed |
 | `src/fiber.rs` | Native stackful fibers, governed stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/fiber/scheduler.rs` | Safepoint time slices, ready-task wakers, stack-margin checks, native-frame names, and carrier watchdog |
 | `src/eval_async.rs` | (wasm32, or the `colored-eval` feature) `eval_async` colored tree-walker and `run_async_fn` driver |
 | `src/task.rs` | Shared executor tasks delivered through a Clojure future: `spawn_future`, `spawn_future_with_roots`, `settle_future`, `await_value` |
 | `src/channel.rs` | `CljChannel` (buffered/rendezvous) and `CljMult` (broadcast multiplexer) exposed as `NativeObject`s |
-| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!`, `alts!!`, and on native targets the parking `<!`, `>!`, `alts!` |
-| `src/core_async_wasm.cljrs` | (wasm32 only) `<!` and `>!` macros over `await` for colored `go` bodies |
-| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go`, `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
+| `src/builtins.rs` | native fns: `timeout`, `alts`, `chan`, `take!`, `put!`, `close!`, `poll!`, `offer!`, `async-spawn`, `join-all`, `thread-call`, `onto-chan!`, `to-chan!`, `mult`, `tap!`, `untap!`, `untap-all!`, `<!!`, `>!!`, `alts!!`, and on native targets the parking `<!`, `>!`, `alts!` (wasm32: `alts!-future`, the future-returning selection behind its `alts!` macro) |
+| `src/core_async_wasm.cljrs` | (wasm32 only) `<!`, `>!`, and `alts!` macros over `await` for colored `go` bodies |
+| `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go` (a result channel, via `thread-call`), `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
 | `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
 | `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a byte-bounded queue whose messages hold governor `MessageQueue` charges; `isolate_channel_with_limit`, `try_send`/`send_async`, `IsolateReceiver::close`; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |

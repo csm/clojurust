@@ -557,31 +557,40 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - `^:async` keeps its meaning for callers: a call runs concurrently and returns a future. It no
   longer selects an evaluator, so `deref`, `<!!`, and other waits inside such a body park instead
   of raising the Phase C "use await" errors. Those errors now apply only on wasm32.
+- `go` returns a result channel, as core.async does: it is `thread-call` of the body. A non-nil
+  result is put on the channel, which then closes; a nil result or an exception only closes it
+  (the exception is printed). Every channel op, `alts!`, `merge`, and `join-all` therefore
+  accepts a `go` result. `async-spawn` still returns a future of a thunk's value.
 - `await` is the synchronous special form everywhere on native targets: it parks on a future or
-  promise and returns other values unchanged.
-- `<!`, `>!`, and `alts!` are native functions that alias the parking `<!!`, `>!!`, and
-  `alts!!`. They park in any fiber, including ordinary functions called from a `go` body, as in
-  core.async's virtual-thread mode. A take of a future or promise waits for its value, so
-  `(<!! (go ...))` works although `go` still returns a future rather than a channel.
-  wasm32 defines `<!` and `>!` as macros over `await` (`core_async_wasm.cljrs`).
+  promise, takes from a channel (so `(await (go ...))` keeps working), and returns other values
+  unchanged. `cljrs_async::await_value` takes from channels too.
+- `<!`, `>!`, and `alts!` are native functions with the parking behaviour of `<!!`, `>!!`, and
+  `alts!!`, and errors that name the operation called. They park in any fiber, including
+  ordinary functions called from a `go` body, as in core.async's virtual-thread mode. A take of
+  an `^:async` call's future or a promise waits for its value. wasm32 defines `<!`, `>!`, and
+  `alts!` as macros over `await` (`core_async_wasm.cljrs`); its `alts!` awaits the same
+  exactly-one selection through `alts!-future`.
 - `eval_async` is compiled only for wasm32 (and natively behind the `colored-eval` feature, which `cljrs-wasm` enables so it builds in the workspace). The shared future-delivery helpers moved to
   `cljrs_async::task`. `fiber::eval_form` evaluates one form on a fiber from async code on the
-  LocalSet; it replaces native uses of `eval_async`. The whole async test corpus runs on fibers.
+  LocalSet; it replaces native uses of `eval_async`. Like `future`, it conveys the caller's
+  dynamic bindings, gas meters, and interrupt flags. The whole async test corpus runs on fibers.
 - Phase H is closed. No dispatch path consults compiled poll functions: the JIT no longer
   activates `^:async` arities (`JitBackend::compile_async_arity` and `async_jit.rs` are gone),
   and the AOT driver no longer compiles or registers poll functions. Fibers suspend JIT and AOT
   frames as they are, so a state-machine transform adds no correctness and its remaining
-  benefit (smaller suspended state) does not justify a second compilation path. The unused
-  `lower_async` transform, poll-function codegen, and `cljrs_async::state_machine` ABI remain
-  for a follow-up deletion.
+  benefit (smaller suspended state) does not justify a second compilation path. The poll-function
+  registry is gone. The `lower_async` transform, poll-function codegen, and the
+  `cljrs_async::state_machine` ABI remain only for their unit tests, pending a follow-up deletion.
 - Debug builds reserve 4 MiB fiber stacks by default; release builds keep 1 MiB.
   Unoptimized tree-walker frames are several times larger, and macro-heavy `go` bodies such
   as `alt` exceeded 1 MiB in debug builds. Stack pages are committed lazily.
 - Dynamic bindings: a `go` block now sees the bindings in effect where it starts (core.async
   semantics). Previously its colored task saw only root bindings.
 - `tests/converged.rs` covers `go` with `<!`/`>!`, parking through ordinary functions and
-  HOFs, `alts!`, `deref` inside `^:async` bodies, concurrent `^:async` rendezvous, the colored
-  spelling, and error delivery, in both interpreter modes with collections at park points.
+  HOFs, `alts!`, `go` result channels with `alts!`/`merge`/`join-all`, `deref` inside `^:async`
+  bodies, concurrent `^:async` rendezvous, the colored spelling, error delivery, and operation
+  names in errors, in both interpreter modes with collections at park points. It also checks
+  that `fiber::eval_form` conveys bindings and gas.
   In `no-gc` builds the rendezvous case is ignored: values handed between two parked fibers
   over a rendezvous channel are released early. The same failure reproduces with plain
   `future` before this phase, so it is tracked separately as csm/clojurust#442.

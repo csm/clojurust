@@ -1851,8 +1851,6 @@ fn lower_namespace(
 
 // ── Harness generation ──────────────────────────────────────────────────────
 
-/// Create a temporary Cargo project that links the compiled object code with
-/// the clojurust runtime and produces a binary.
 /// Everything the generated Cargo harness is assembled from.
 ///
 /// A parameter object rather than a longer argument list: these all answer one
@@ -1903,6 +1901,8 @@ fn native_init_code(init_fn: Option<&str>) -> String {
     }
 }
 
+/// Create a temporary Cargo project that links the compiled object code with
+/// the clojurust runtime and produces a binary.
 fn build_harness(
     out_path: &Path,
     inputs: HarnessInputs<'_>,

@@ -25,7 +25,8 @@ deeply it is nested inside other calls.
 
 | Construct | Returns | Body runs on |
 |---|---|---|
-| `go`, `^:async` fn call | a future | a new fiber |
+| `go` | a result channel | a new fiber |
+| `^:async` fn call | a future | a new fiber |
 | `future`, `future-call` | a future | a new fiber |
 | `thread`, `io-thread`, `thread-call` | a result channel | a new fiber |
 | CLI, REPL, nREPL, tests, AOT `main` | — | the root fiber |
@@ -133,12 +134,13 @@ Non-blocking variants act synchronously and return immediately:
 
 The blocking spellings `<!!`, `>!!`, and `alts!!` are the same operations. On a
 native fiber they park; outside any fiber they block the OS thread. A take of a
-future or promise (`(<!! (go ...))`) waits for its value, because `go` returns a
-future rather than a channel.
+future or promise (such as an `^:async` call's result) waits for its value.
 
 ### `go` blocks
 
-`go` runs its body on a new fiber and returns a `Future` of its value:
+`go` runs its body on a new fiber and returns a result channel, as in core.async.
+A non-nil result is put on the channel, which then closes. A nil result, or an
+exception (which is printed), only closes it:
 
 ```clojure
 (def in  (chan 1))
@@ -149,7 +151,13 @@ future rather than a channel.
 
 (>!! in 21)
 (<!! out)    ; => 42
+
+(<!! (go (+ 1 2)))     ; => 3
+(await (go :done))     ; => :done — await takes from a channel
 ```
+
+Because the result is a channel, it works with `alts!`, `merge`, and the other
+channel operations.
 
 The older spelling, `(await (take! in))` / `(await (put! out v))`, still works
 and is the portable form for code that must also run on wasm32.

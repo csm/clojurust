@@ -67,11 +67,22 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
             (
                 "<!",
                 Arity::Fixed(1),
-                builtin_take_blocking as fn(&[Value]) -> ValueResult<Value>,
+                builtin_take_parking as fn(&[Value]) -> ValueResult<Value>,
             ),
-            (">!", Arity::Fixed(2), builtin_put_blocking),
-            ("alts!", Arity::Variadic { min: 1 }, builtin_alts_blocking),
+            (">!", Arity::Fixed(2), builtin_put_parking),
+            ("alts!", Arity::Variadic { min: 1 }, builtin_alts_parking),
         ]);
+        fns
+    };
+    // wasm32's `alts!` macro awaits this future-returning selection.
+    #[cfg(target_arch = "wasm32")]
+    let fns = {
+        let mut fns = fns;
+        fns.push((
+            "alts!-future",
+            Arity::Variadic { min: 1 },
+            builtin_alts_future as fn(&[Value]) -> ValueResult<Value>,
+        ));
         fns
     };
     for (name, arity, func) in fns {
@@ -280,21 +291,36 @@ fn builtin_offer(args: &[Value]) -> ValueResult<Value> {
 
 // ── Phase H: blocking sync-context channel ops (<!! / >!!) ──────────────────
 
-/// `(<!! ch)` / `(<! ch)` — take from a channel, parking the calling fiber.
+/// `(<!! ch)` — take from a channel, parking the calling fiber.
 ///
 /// Parks a fiber until data arrives, or blocks the OS thread outside a fiber.
 /// Returns nil on a closed, drained channel. Colored async callers use take!.
-/// A `go` block or `^:async` call returns a future rather than a channel; a
-/// take of a future or promise waits for its value, so `(<!! (go ...))` works.
+/// An `^:async` call returns a future; a take of a future or promise waits for
+/// its value.
 fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
+    take_parking("<!!", args)
+}
+
+/// `(<! ch)` — the parking take, under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_take_parking(args: &[Value]) -> ValueResult<Value> {
+    take_parking("<!", args)
+}
+
+/// Reject a carrier wait from a colored (wasm32 `eval_async`) body, naming the
+/// operation the caller used.
+fn reject_colored_wait(name: &str, instead: &str) -> ValueResult<()> {
     if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
     {
-        return Err(ValueError::Other(
-            "<!! (blocking take) must not be called inside an ^:async function; \
-             use (await (take! ch)) instead"
-                .into(),
-        ));
+        return Err(ValueError::Other(format!(
+            "{name} must not be called directly inside a colored async body; use {instead} instead"
+        )));
     }
+    Ok(())
+}
+
+fn take_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait(name, "(<! ch)")?;
     if let Some(pending @ (Value::Future(_) | Value::Promise(_))) = args.first() {
         return cljrs_runtime::interp::eval::deref_value(pending.clone())
             .map_err(cljrs_runtime::env::callback::eval_error_to_value_error);
@@ -303,19 +329,22 @@ fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
     cljrs_value::parking::block_on(chan_ref(ch.get()).take_result())
 }
 
-/// `(>!! ch val)` — blocking put from a synchronous (non-async) context.
+/// `(>!! ch val)` — put onto a channel, parking the calling fiber.
 ///
 /// Parks a fiber until accepted, or blocks the OS thread outside a fiber.
 /// Returns true on success and false when closed. Colored async callers use put!.
 fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
-    {
-        return Err(ValueError::Other(
-            ">!! (blocking put) must not be called inside an ^:async function; \
-             use (await (put! ch val)) instead"
-                .into(),
-        ));
-    }
+    put_parking(">!!", args)
+}
+
+/// `(>! ch val)` — the parking put, under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_put_parking(args: &[Value]) -> ValueResult<Value> {
+    put_parking(">!", args)
+}
+
+fn put_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait(name, "(>! ch val)")?;
     let ch = channel_arg(args)?;
     let val = args.get(1).cloned().unwrap_or(Value::Nil);
     Ok(Value::Bool(chan_ref(ch.get()).put_blocking(val)))
@@ -615,12 +644,53 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
 /// Select exactly one take or `[channel value]` put. Options are :priority
 /// (input order) and :default (return immediately when nothing is ready).
 fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
-    {
-        return Err(ValueError::Other(
-            "alts!! requires a synchronous context or a fiber".into(),
-        ));
-    }
+    reject_colored_wait("alts!!", "(alts! ports)")?;
+    let (requests, default) = alts_requests("alts!!", args)?;
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&alts_roots(&requests, &default));
+    cljrs_value::parking::block_on(alts_select_ports(requests, default))
+}
+
+/// `(alts! ports & opts)` — `alts!!` under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
+    let (requests, default) = alts_requests("alts!", args)?;
+    // The guard lives on the parked fiber's own root stack.
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&alts_roots(&requests, &default));
+    cljrs_value::parking::block_on(alts_select_ports(requests, default))
+}
+
+/// `(alts!-future ports & opts)` — the same selection as a future, which the
+/// wasm32 `alts!` macro awaits inside colored `go` bodies.
+#[cfg(target_arch = "wasm32")]
+fn builtin_alts_future(args: &[Value]) -> ValueResult<Value> {
+    let (requests, default) = alts_requests("alts!", args)?;
+    // The task's captured roots keep the ports alive; no guard spans an await.
+    let roots = alts_roots(&requests, &default);
+    Ok(spawn_future_with_roots(roots, async move {
+        alts_select_ports(requests, default)
+            .await
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+    }))
+}
+
+/// One parsed `alts` port: a channel, and the value to put (`None` for a take).
+type AltsRequest = (GcPtr<NativeObjectBox>, Option<Value>);
+
+/// The managed values a selection must keep alive: channels, put values, and
+/// the default. Callers root these for the selection's whole wait.
+fn alts_roots(requests: &[AltsRequest], default: &Option<Value>) -> Vec<Value> {
+    requests
+        .iter()
+        .flat_map(|(channel, value)| {
+            std::iter::once(Value::NativeObject(channel.clone())).chain(value.clone())
+        })
+        .chain(default.clone())
+        .collect()
+}
+
+/// Parse `alts!`/`alts!!` ports and options, naming `name` in errors. Ports
+/// are shuffled unless `:priority` is set.
+fn alts_requests(name: &str, args: &[Value]) -> ValueResult<(Vec<AltsRequest>, Option<Value>)> {
     let alternatives = value_to_seq_vec(&args[0])?;
     let _roots = cljrs_runtime::env::gc_roots::root_values(&alternatives);
     let mut default = None;
@@ -638,9 +708,9 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
                 priority = !matches!(value, Value::Nil | Value::Bool(false))
             }
             _ => {
-                return Err(ValueError::Other(
-                    "alts!! accepts only :default and :priority options".into(),
-                ));
+                return Err(ValueError::Other(format!(
+                    "{name} accepts only :default and :priority options"
+                )));
             }
         }
         Ok(())
@@ -651,26 +721,26 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
         }
     } else {
         if !(args.len() - 1).is_multiple_of(2) {
-            return Err(ValueError::Other(
-                "alts!! options require key/value pairs".into(),
-            ));
+            return Err(ValueError::Other(format!(
+                "{name} options require key/value pairs"
+            )));
         }
         for [key, value] in args[1..].as_chunks::<2>().0 {
             option(key, value)?;
         }
     }
     if alternatives.is_empty() && default.is_none() {
-        return Err(ValueError::Other(
-            "alts!! requires at least one channel or a :default option".into(),
-        ));
+        return Err(ValueError::Other(format!(
+            "{name} requires at least one channel or a :default option"
+        )));
     }
     let mut requests = Vec::with_capacity(alternatives.len());
     for alternative in &alternatives {
         let (channel, value) = if let Value::Vector(pair) = alternative {
             if pair.get().count() != 2 {
-                return Err(ValueError::Other(
-                    "alts!! put alternatives require [channel value]".into(),
-                ));
+                return Err(ValueError::Other(format!(
+                    "{name} put alternatives require [channel value]"
+                )));
             }
             let value = pair.get().nth(1).unwrap().clone();
             if matches!(value, Value::Nil) {
@@ -688,6 +758,16 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
     if !priority {
         requests.shuffle(&mut rand::rng());
     }
+    Ok((requests, default))
+}
+
+/// Complete exactly one of `requests` (or return `default`), yielding
+/// `[value channel]`, or `[default :default]`. The caller roots
+/// [`alts_roots`] for the whole wait.
+async fn alts_select_ports(
+    requests: Vec<AltsRequest>,
+    default: Option<Value>,
+) -> ValueResult<Value> {
     let ops = requests
         .iter()
         .map(|(channel, value)| {
@@ -698,7 +778,7 @@ fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
             }
         })
         .collect();
-    let (value, index) = cljrs_value::parking::block_on(crate::channel::select(ops, default));
+    let (value, index) = crate::channel::select(ops, default).await;
     if index != usize::MAX
         && requests[index].1.is_none()
         && let Some(error) = chan_ref(requests[index].0.get()).failure()

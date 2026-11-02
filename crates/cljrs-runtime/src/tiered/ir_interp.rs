@@ -794,9 +794,10 @@ fn execute_inst(
         // in practice.  They provide a graceful sync-context fallback for the
         // cases where they are reached (e.g. in tests or non-async callers).
         Inst::Await { src, dst } => {
-            // Sync fallback: block the OS thread until the future/promise resolves.
+            // Same as the tree-walker's `await`: park (or block outside a
+            // fiber) until the future, promise, or channel delivers.
             let val = regs.get_cloned(*src);
-            let resolved = crate::interp::eval::deref_value(val)?;
+            let resolved = crate::interp::eval::await_value_sync(val, globals)?;
             regs.set(*dst, resolved);
         }
 

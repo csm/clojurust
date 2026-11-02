@@ -265,6 +265,7 @@ impl<M: Module> Compiler<M> {
     /// state machine's slots, and the result/thrown value is returned in-band via
     /// `CljxStateMachine::pending`, so the compiled signature is a single pointer
     /// plus an `i32` poll code, independent of the function's arity.
+    #[cfg(test)]
     pub fn declare_poll_function(&mut self, name: &str) -> CodegenResult<FuncId> {
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;

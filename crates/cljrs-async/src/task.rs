@@ -165,7 +165,8 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
 }
 
 /// Cooperatively await a Clojure value. Futures and promises yield to the
-/// executor until resolved; any other value is returned as-is.
+/// executor until resolved, a channel (what `go` returns) is taken from, and
+/// any other value is returned as-is.
 pub async fn await_value(val: Value) -> EvalResult {
     #[cfg(feature = "no-gc")]
     {
@@ -211,6 +212,15 @@ async fn await_value_inner(val: Value) -> EvalResult {
                 cljrs_runtime::env::gc_roots::async_gc_collect();
                 listener.await;
             }
+        }
+        Value::NativeObject(obj) if obj.get().type_tag() == crate::channel::CHANNEL_TAG => {
+            // `go` returns a result channel; awaiting it takes the value.
+            let anchor = Value::NativeObject(obj.clone());
+            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+            crate::channel::chan_ref(obj.get())
+                .take_result()
+                .await
+                .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
         }
         other => Ok(other),
     }

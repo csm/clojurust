@@ -862,9 +862,15 @@ pub fn run_root_owned(
 ///
 /// This is the fiber replacement for the retired native `eval_async` entry
 /// point. The form runs on the ordinary evaluator, so `await`, `deref`, and
-/// channel ops park the fiber. The fiber evaluates in a fresh environment for
-/// `env`'s globals and namespace; a namespace change made by the form (`ns`,
-/// `in-ns`) is copied back into `env`. Lexical frames in `env` are not visible.
+/// channel ops park the fiber. Like `future`, the fiber receives a snapshot of
+/// the caller's dynamic bindings, its active gas meters, and its interrupt
+/// flags, so a meter or interrupt around the caller also governs the form.
+/// The fiber evaluates in a fresh environment for `env`'s globals and
+/// namespace; a namespace change made by the form (`ns`, `in-ns`) is copied
+/// back into `env`. Lexical frames in `env` are not visible.
+///
+/// As with [`crate::await_value`], the returned value is not rooted: a caller
+/// that keeps it across a later yield must root it first.
 /// Use [`run_root`] instead when the caller is not already inside the runtime.
 pub async fn eval_form(
     form: &cljrs_reader::Form,
@@ -875,7 +881,7 @@ pub async fn eval_form(
     let start_ns = env.current_ns.clone();
     let final_ns = std::rc::Rc::new(RefCell::new(start_ns.clone()));
     let report_ns = final_ns.clone();
-    let task = Fiber::new(move || {
+    let task = crate::runtime::conveyed_fiber(Vec::new(), move || {
         let mut fiber_env = cljrs_runtime::env::env::Env::new(globals, &start_ns);
         let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
         *report_ns.borrow_mut() = fiber_env.current_ns.clone();

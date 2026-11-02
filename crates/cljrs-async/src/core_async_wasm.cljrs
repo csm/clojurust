@@ -1,8 +1,8 @@
 ;; clojure.core.async — wasm32-only definitions.
 ;;
 ;; wasm32 has no stack switching, so `go` bodies remain colored `eval_async`
-;; tasks. There, the parking channel ops are macros over `await`, and they are
-;; valid only inside a `go` or `^:async` body. Native targets define `<!`, `>!`,
+;; tasks. There, the parking channel ops (`<!`, `>!`, `alts!`) are macros over
+;; `await`, valid only inside a `go` or `^:async` body. Native targets define `<!`, `>!`,
 ;; and `alts!` as functions that park the calling fiber instead.
 
 (defmacro <!
@@ -14,3 +14,9 @@
   "Puts val onto ch inside a go or ^:async body. Returns false when closed."
   [ch val]
   (list 'await (list 'clojure.core.async/put! ch val)))
+
+(defmacro alts!
+  "Completes exactly one take or [ch val] put from ports inside a go or
+  ^:async body. Returns [val ch], or [default :default] with a :default option."
+  [ports & opts]
+  (list 'await (cons 'clojure.core.async/alts!-future (cons ports opts))))

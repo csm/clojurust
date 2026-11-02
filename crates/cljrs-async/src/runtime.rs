@@ -98,6 +98,29 @@ fn call_fiber_with(
     mut roots: Vec<Value>,
     entry: FiberEntry,
 ) -> Result<crate::fiber::Fiber, EvalError> {
+    roots.push(callee.clone());
+    roots.extend(args.iter().cloned());
+    roots.extend(
+        env.frames
+            .iter()
+            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
+    );
+    conveyed_fiber(roots, move || match entry {
+        FiberEntry::Apply => cljrs_runtime::env::apply::apply_value(&callee, args, &mut env),
+        FiberEntry::Body => cljrs_runtime::env::apply::apply_fn_body(&callee, args, &mut env),
+    })
+}
+
+/// Build a fiber that runs `body` with the caller's dynamic bindings (a
+/// snapshot), active gas meters, and interrupt flags installed, as `future`
+/// does. `roots` are the managed values `body` captures; the conveyed binding
+/// values are added to them.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+pub(crate) fn conveyed_fiber(
+    mut roots: Vec<Value>,
+    body: impl FnOnce() -> EvalResult + 'static,
+) -> Result<crate::fiber::Fiber, EvalError> {
     use cljrs_runtime::env::{dynamics, gas};
     #[cfg(feature = "no-gc")]
     if cljrs_gc::alloc_ctx::invocation_is_active() {
@@ -108,22 +131,12 @@ fn call_fiber_with(
     let bindings = dynamics::capture_current();
     let meters = gas::active_meters();
     let interrupts = gas::active_interrupts();
-    roots.push(callee.clone());
-    roots.extend(args.iter().cloned());
-    roots.extend(
-        env.frames
-            .iter()
-            .flat_map(|frame| frame.bindings.iter().map(|(_, value)| value.clone())),
-    );
     roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
     crate::fiber::Fiber::with_roots(roots, move || {
         dynamics::install_frames(bindings);
         let _interrupts = gas::InterruptScope::enter(&interrupts);
         let _meters = gas::install_meters(&meters);
-        match entry {
-            FiberEntry::Apply => cljrs_runtime::env::apply::apply_value(&callee, args, &mut env),
-            FiberEntry::Body => cljrs_runtime::env::apply::apply_fn_body(&callee, args, &mut env),
-        }
+        body()
     })
 }
 

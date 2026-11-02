@@ -122,14 +122,46 @@ fn ordinary_functions_called_from_go_can_park() {
 }
 
 #[test]
-fn go_returns_a_future_that_takes_and_awaits() {
+fn go_returns_a_result_channel() {
+    // As in core.async: one non-nil value, then the channel is closed.
     assert_both(
         r#"
         (require '[clojure.core.async :as a :refer [go <!!]])
         (def g (go (sleep 1) :done))
-        [(future? g) (<!! g) (await g) @g]
+        (def h (go :awaited))
+        [(future? g) (<!! g) (<!! g) (await h) (<!! (go nil))]
         "#,
-        "[true :done :done :done]",
+        "[false :done nil :awaited nil]",
+    );
+}
+
+#[test]
+fn go_channels_compose_with_channel_ops() {
+    // alts!, merge, and join-all accept go results like any channel.
+    assert_both(
+        r#"
+        (require '[clojure.core.async :as a :refer [go alts! <!! join-all]])
+        (def slow (go (sleep 50) :slow))
+        (def picked (go (let [[v ch] (alts! [slow (go :fast)])] [v (= ch slow)])))
+        [(<!! picked)
+         (sort (await (a/into [] (a/merge [(go 1) (go 2)]))))
+         (await (join-all [(go :x) (go :y)]))]
+        "#,
+        "[[:fast false] (1 2) [:x :y]]",
+    );
+}
+
+#[test]
+fn parking_ops_name_themselves_in_errors() {
+    assert_both(
+        r#"
+        (require '[clojure.core.async :as a :refer [chan alts! alts!!]])
+        (def c (chan 1))
+        (defn msg [f] (try (f) (catch Exception e (str e))))
+        [(boolean (re-find #"alts! accepts" (msg #(alts! [c] :foo 1))))
+         (boolean (re-find #"alts!! accepts" (msg #(alts!! [c] :foo 1))))]
+        "#,
+        "[true true]",
     );
 }
 
@@ -204,13 +236,81 @@ fn colored_spelling_still_works() {
 }
 
 #[test]
-fn go_errors_settle_the_future() {
+fn go_errors_close_the_channel() {
+    // As in core.async: the exception is reported, and takers see nil.
     assert_both(
         r#"
-        (require '[clojure.core.async :as a :refer [go]])
+        (require '[clojure.core.async :as a :refer [go <!!]])
         (def g (go (throw (ex-info "boom" {:k 1}))))
-        (try (await g) (catch Exception e (ex-data e)))
+        [(<!! g) (await (go (throw (ex-info "again" {}))))]
+        "#,
+        "[nil nil]",
+    );
+}
+
+#[test]
+fn async_errors_still_settle_the_future() {
+    assert_both(
+        r#"
+        (defn ^:async boom [] (throw (ex-info "boom" {:k 1})))
+        (try (await (boom)) (catch Exception e (ex-data e)))
         "#,
         "{:k 1}",
     );
+}
+
+/// `fiber::eval_form` conveys the caller's dynamic bindings and gas meters,
+/// like `future`, so an embedder's binding or budget governs the form.
+#[test]
+fn eval_form_conveys_bindings_and_gas() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                cljrs_async::init(&globals);
+                let mut env = Env::new(globals.clone(), "user");
+                let parse = |src: &str| {
+                    cljrs_reader::Parser::new(src.into(), "<eval-form>".into())
+                        .parse_all()
+                        .unwrap()
+                        .remove(0)
+                };
+                fiber::eval_form(&parse("(def ^:dynamic *x* :root)"), &mut env)
+                    .await
+                    .unwrap();
+                let var = globals.lookup_var_in_ns("user", "*x*").unwrap();
+                let key = cljrs_runtime::env::dynamics::var_key_of(&var);
+                let bound = {
+                    let _frame = cljrs_runtime::env::dynamics::push_frame(
+                        [(key, Value::keyword(cljrs_value::Keyword::simple("bound")))].into(),
+                    );
+                    fiber::eval_form(&parse("*x*"), &mut env).await.unwrap()
+                };
+                assert_eq!(bound.to_string(), ":bound");
+
+                let meter = cljrs_runtime::env::gas::GasMeter::new(1_000);
+                let spun = {
+                    let _gas = cljrs_runtime::env::gas::GasGuard::install(meter);
+                    fiber::eval_form(&parse("(loop [] (recur))"), &mut env).await
+                };
+                assert!(
+                    matches!(
+                        spun,
+                        Err(cljrs_runtime::env::error::EvalError::GasExhausted)
+                    ),
+                    "{spun:?}"
+                );
+            });
+            fiber::drop_local_with_carrier(local, &mut MutatorState::fresh());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

@@ -56,7 +56,7 @@ src/
     monitor.rs          — reentrant object monitors, fiber waiters, and carrier deadlock checks
     policy.rs           — capability policy for isolated transaction functions
     taps.rs             — tap> / add-tap registry
-    async_hook.rs       — AsyncRuntime seam and the async-JIT compile hook
+    async_hook.rs       — AsyncRuntime seam (`^:async` dispatch, fiber calls, blocking channel ops)
     depth.rs            — call-depth cap for ExecutionMode::NoGcTransaction
     vcs.rs              — VcsProvider trait (the runtime's git seam) and the
                           cljrs-project-backed ProjectVcs impl (`deps` feature)
@@ -694,7 +694,7 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 
 ### `async_hook` submodule
 
-The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  Async-JIT activation is *not* here: the dispatcher reaches it through the calling runtime's own backend (`GlobalEnv::jit_backend()` → `JitBackend::compile_async_arity`), so a runtime without a JIT simply keeps tree-walking `^:async` bodies.
+The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  `^:async` bodies are never compiled to state machines: on native targets each call runs its body on a fiber, and on wasm32 through `eval_async` (virtual-threads plan Phase 5; TODO.md Phase H is closed).
 
 ---
 
@@ -1475,7 +1475,6 @@ pub trait JitBackend: Send + Sync {
     fn mark_stale(&self, epoch: u64);
     fn take_pending_exception(&self) -> Option<Value>;
     fn deopt_sentinel(&self) -> usize;
-    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env);
 }
 ```
 
