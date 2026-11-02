@@ -281,8 +281,12 @@ The caller also installs this carrier state while destroying the LocalSet.
 
 `eval_form(form, env).await -> EvalResult` evaluates one form on a new fiber from async
 code that already runs on the LocalSet. It replaces the native `eval_async` entry point.
-The fiber uses a fresh environment for `env`'s globals and namespace, and copies a
-namespace change back into `env`.
+The fiber uses a fresh environment for `env`'s globals and namespace, copies a namespace
+change back into `env`, and conveys the caller's dynamic bindings, gas meters, and
+interrupt flags. Its result is unrooted, like `await_value`'s.
+`eval_form_rooted(form, env).await -> FiberResult` keeps the result rooted across later
+yields until the `FiberResult` is consumed; `FiberResult::get(&self) -> &EvalResult`
+borrows it.
 
 `park_on` can borrow fiber stack locals and suspend through synchronous native frames.
 `current()` returns the running fiber ID. During future polls, it returns `None`.

@@ -563,7 +563,8 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   accepts a `go` result. `async-spawn` still returns a future of a thunk's value.
 - `await` is the synchronous special form everywhere on native targets: it parks on a future or
   promise, takes from a channel (so `(await (go ...))` keeps working), and returns other values
-  unchanged. `cljrs_async::await_value` takes from channels too.
+  unchanged. `cljrs_async::await_value` takes from channels too. The synchronous evaluators reach
+  channels through `AsyncRuntime::take_if_channel`, which keeps the channel rooted while parked.
 - `<!`, `>!`, and `alts!` are native functions with the parking behaviour of `<!!`, `>!!`, and
   `alts!!`, and errors that name the operation called. They park in any fiber, including
   ordinary functions called from a `go` body, as in core.async's virtual-thread mode. A take of
@@ -573,7 +574,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
 - `eval_async` is compiled only for wasm32 (and natively behind the `colored-eval` feature, which `cljrs-wasm` enables so it builds in the workspace). The shared future-delivery helpers moved to
   `cljrs_async::task`. `fiber::eval_form` evaluates one form on a fiber from async code on the
   LocalSet; it replaces native uses of `eval_async`. Like `future`, it conveys the caller's
-  dynamic bindings, gas meters, and interrupt flags. The whole async test corpus runs on fibers.
+  dynamic bindings, gas meters, and interrupt flags. Its result is unrooted, like `await_value`;
+  `fiber::eval_form_rooted` returns it rooted in a `FiberResult` (`FiberResult::get` borrows it).
+  The whole async test corpus runs on fibers.
 - Phase H is closed. No dispatch path consults compiled poll functions: the JIT no longer
   activates `^:async` arities (`JitBackend::compile_async_arity` and `async_jit.rs` are gone),
   and the AOT driver no longer compiles or registers poll functions. Fibers suspend JIT and AOT

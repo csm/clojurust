@@ -1747,6 +1747,12 @@ A native fiber parks during worker execution. Outside a fiber, the call runs syn
 ordinary function into a fiber. The default implementation delegates to
 `spawn_async_call` for runtimes without fiber support.
 
+`AsyncRuntime::take_if_channel(&val) -> Option<EvalResult>` lets `await` take from the
+runtime's channels (what `go` returns): it parks or blocks and keeps the channel rooted
+while waiting, and returns `None` for any other value (the default). The tree-walker and
+the IR interpreter both use it through `interp::eval::await_value_sync(val, globals)`,
+which dereferences futures and promises and returns other values unchanged.
+
 `macroexpand_all` expands the operand of reader dereference (`@`). Thus AOT
 and IR lowering expand `@(future ...)` before they compile the future body.
 

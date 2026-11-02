@@ -57,7 +57,9 @@ keeps working unchanged.
 ```
 
 `await` is a **special form**. `(await x)` waits for a `Future` or `promise` and
-returns its value; any other value is returned unchanged.
+returns its value. On a channel (such as a `go` result) it takes one value,
+returning `nil` once the channel is closed and drained. Any other value is
+returned unchanged.
 
 - On a native fiber — any `go` or `^:async` body, and any code it calls —
   `(await x)` parks the fiber. It is the same as `(deref x)` for futures.

@@ -4,8 +4,9 @@
 //! a `Value::Future` immediately and resolve on the `LocalSet` executor, so they
 //! compose with `await` exactly like an `^:async` call. `close!`, `poll!`, and
 //! `offer!` act on a channel synchronously and return their result directly.
-//! `async-spawn` runs a thunk concurrently (the runtime backing the `go` macro):
-//! on a fiber on native targets, as a colored task on wasm32. On native targets
+//! `async-spawn` runs a thunk concurrently and returns a future: on a fiber on
+//! native targets, as a colored task on wasm32. `go` expands to `thread-call`,
+//! which returns a result channel. On native targets
 //! `<!`, `>!`, and `alts!` are the parking `<!!`, `>!!`, and `alts!!`.
 
 use rand::seq::SliceRandom;
@@ -320,7 +321,7 @@ fn reject_colored_wait(name: &str, instead: &str) -> ValueResult<()> {
 }
 
 fn take_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
-    reject_colored_wait(name, "(<! ch)")?;
+    reject_colored_wait(name, "(await (take! ch))")?;
     if let Some(pending @ (Value::Future(_) | Value::Promise(_))) = args.first() {
         return cljrs_runtime::interp::eval::deref_value(pending.clone())
             .map_err(cljrs_runtime::env::callback::eval_error_to_value_error);
@@ -344,16 +345,17 @@ fn builtin_put_parking(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn put_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
-    reject_colored_wait(name, "(>! ch val)")?;
+    reject_colored_wait(name, "(await (put! ch val))")?;
     let ch = channel_arg(args)?;
     let val = args.get(1).cloned().unwrap_or(Value::Nil);
     Ok(Value::Bool(chan_ref(ch.get()).put_blocking(val)))
 }
 
 /// `(async-spawn thunk)` — run a zero-arg function concurrently, returning a
-/// `Value::Future`. This is the runtime behind `go`. Native targets run the
-/// thunk on its own fiber, where `await`, `<!`, and other waits park the fiber.
-/// wasm32 runs it as a colored `eval_async` task.
+/// `Value::Future` of its value. (`go` returns a result channel through
+/// `thread-call` instead.) Native targets run the thunk on its own fiber, where
+/// `await`, `<!`, and other waits park the fiber. wasm32 runs it as a colored
+/// `eval_async` task.
 fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_runtime::env::callback::capture_eval_context()
@@ -409,14 +411,14 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let call_env = Env::new(globals, &ns);
     #[cfg(not(target_arch = "wasm32"))]
     let body = crate::runtime::call_fiber(thunk, Vec::new(), call_env, vec![ch_val.clone()])
-        .map_err(|error| ValueError::Other(error.to_string()))?
+        .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?
         .into_task();
     #[cfg(not(target_arch = "wasm32"))]
     let _ = rt;
     #[cfg(target_arch = "wasm32")]
     let body = crate::task::await_value(
         rt.spawn_fiber_call(thunk, Vec::new(), call_env)
-            .map_err(|error| ValueError::Other(error.to_string()))?,
+            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?,
     );
     let anchor = ch_val.clone();
     let delivery = spawn_future_with_roots(args.to_vec(), async move {
@@ -644,18 +646,23 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
 /// Select exactly one take or `[channel value]` put. Options are :priority
 /// (input order) and :default (return immediately when nothing is ready).
 fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
-    reject_colored_wait("alts!!", "(alts! ports)")?;
+    reject_colored_wait("alts!!", "(await (alts [(take! ch) ...]))")?;
     let (requests, default) = alts_requests("alts!!", args)?;
-    let _roots = cljrs_runtime::env::gc_roots::root_values(&alts_roots(&requests, &default));
+    // The guard records the slice's address, so the Vec must outlive it.
+    let roots = alts_roots(&requests, &default);
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
     cljrs_value::parking::block_on(alts_select_ports(requests, default))
 }
 
 /// `(alts! ports & opts)` — `alts!!` under its core.async name (native targets).
 #[cfg(not(target_arch = "wasm32"))]
 fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait("alts!", "(await (alts [(take! ch) ...]))")?;
     let (requests, default) = alts_requests("alts!", args)?;
-    // The guard lives on the parked fiber's own root stack.
-    let _roots = cljrs_runtime::env::gc_roots::root_values(&alts_roots(&requests, &default));
+    // The guard lives on the parked fiber's own root stack and records the
+    // slice's address, so the Vec must outlive it.
+    let roots = alts_roots(&requests, &default);
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
     cljrs_value::parking::block_on(alts_select_ports(requests, default))
 }
 

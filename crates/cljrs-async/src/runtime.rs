@@ -50,7 +50,20 @@ impl AsyncRuntime for AsyncRuntimeImpl {
         ))
     }
 
+    fn take_if_channel(&self, val: &Value) -> Option<EvalResult> {
+        let Value::NativeObject(obj) = val else {
+            return None;
+        };
+        if obj.get().type_tag() != crate::channel::CHANNEL_TAG {
+            return None;
+        }
+        Some(self.chan_take_blocking(val.clone()))
+    }
+
     fn chan_take_blocking(&self, chan: Value) -> EvalResult {
+        // Root the channel for the whole wait: once its producer closes it and
+        // drops its own reference, this local may be the only one left.
+        let _root = cljrs_runtime::env::gc_roots::root_value(&chan);
         let ch = downcast_channel(&chan)?;
         cljrs_value::parking::block_on(ch.take_result())
             .map_err(cljrs_runtime::env::error::value_error_to_eval_error)

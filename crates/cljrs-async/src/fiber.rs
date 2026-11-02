@@ -705,6 +705,12 @@ impl FiberResult {
         }
     }
 
+    /// Borrow the result while it stays rooted. Use this to keep a result
+    /// across later yields without rooting it yourself.
+    pub fn get(&self) -> &EvalResult {
+        self.result.as_ref().unwrap()
+    }
+
     pub fn into_result(mut self) -> EvalResult {
         #[cfg(feature = "no-gc")]
         for lease in &self.leases {
@@ -735,26 +741,27 @@ pub fn spawn_rooted(
     body: impl FnOnce() -> EvalResult + 'static,
 ) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
     let task = Fiber::with_roots(roots, body)?.into_task();
+    Ok(tokio::task::spawn_local(drive_to_result(task)))
+}
+
+/// Drive `task` to completion and keep its result rooted in a [`FiberResult`].
+async fn drive_to_result(task: FiberTask) -> FiberResult {
     #[cfg(feature = "no-gc")]
-    let allocation = task.allocation.clone();
-    Ok(tokio::task::spawn_local(async move {
-        #[cfg(feature = "no-gc")]
-        let result = {
-            let mut task = task;
-            task.owned_result = true;
-            let result = std::future::poll_fn(|cx| {
-                let _context = allocation.enter();
-                Pin::new(&mut task).poll(cx)
-            })
-            .await;
-            // Capture result storage while the completed task still pins its
-            // original scopes. The JoinHandle can outlive those lexical scopes.
-            FiberResult::new(result)
-        };
-        #[cfg(not(feature = "no-gc"))]
-        let result = FiberResult::new(task.await);
-        result
-    }))
+    {
+        let allocation = task.allocation.clone();
+        let mut task = task;
+        task.owned_result = true;
+        let result = std::future::poll_fn(|cx| {
+            let _context = allocation.enter();
+            Pin::new(&mut task).poll(cx)
+        })
+        .await;
+        // Capture result storage while the completed task still pins its
+        // original scopes. The JoinHandle can outlive those lexical scopes.
+        FiberResult::new(result)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    FiberResult::new(task.await)
 }
 
 /// Drive a borrowed top-level computation on a 64 MiB root stack.
@@ -869,26 +876,39 @@ pub fn run_root_owned(
 /// namespace; a namespace change made by the form (`ns`, `in-ns`) is copied
 /// back into `env`. Lexical frames in `env` are not visible.
 ///
-/// As with [`crate::await_value`], the returned value is not rooted: a caller
-/// that keeps it across a later yield must root it first.
-/// Use [`run_root`] instead when the caller is not already inside the runtime.
+/// The returned value is not rooted, as with [`crate::await_value`]: use it
+/// before the next yield, or call [`eval_form_rooted`] to keep it across
+/// later yields. Use [`run_root`] instead when the caller is not already
+/// inside the runtime.
 pub async fn eval_form(
     form: &cljrs_reader::Form,
     env: &mut cljrs_runtime::env::env::Env,
 ) -> EvalResult {
+    eval_form_rooted(form, env).await.into_result()
+}
+
+/// [`eval_form`], returning the result rooted in a [`FiberResult`]. The value
+/// stays rooted, across any number of later yields, until the `FiberResult`
+/// is consumed or dropped; borrow it with [`FiberResult::get`].
+pub async fn eval_form_rooted(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> FiberResult {
     let form = form.clone();
     let globals = env.globals.clone();
     let start_ns = env.current_ns.clone();
     let final_ns = std::rc::Rc::new(RefCell::new(start_ns.clone()));
     let report_ns = final_ns.clone();
-    let task = crate::runtime::conveyed_fiber(Vec::new(), move || {
+    let fiber = crate::runtime::conveyed_fiber(Vec::new(), move || {
         let mut fiber_env = cljrs_runtime::env::env::Env::new(globals, &start_ns);
         let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
         *report_ns.borrow_mut() = fiber_env.current_ns.clone();
         result
-    })?
-    .into_task();
-    let result = task.await;
+    });
+    let result = match fiber {
+        Ok(fiber) => drive_to_result(fiber.into_task()).await,
+        Err(error) => FiberResult::new(Err(error)),
+    };
     env.current_ns = final_ns.borrow().clone();
     result
 }

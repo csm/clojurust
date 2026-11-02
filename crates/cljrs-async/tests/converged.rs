@@ -259,6 +259,40 @@ fn async_errors_still_settle_the_future() {
     );
 }
 
+#[test]
+fn alts_keeps_its_ports_rooted_while_parked() {
+    // The put value is referenced only by the parked selection. Collections
+    // while it waits must not free it (or the channels).
+    assert_both(
+        r#"
+        (require '[clojure.core.async :as a :refer [chan go alts! <!!]])
+        (def c1 (chan))
+        (def c2 (chan))
+        (def picked (go (let [[v ch] (alts! [c1 [c2 (str "put-" (inc 0))]] :priority true)]
+                          [v (= ch c2)])))
+        (sleep 1)
+        (collect-now)
+        (collect-now)
+        [(<!! c2) (<!! picked)]
+        "#,
+        "[\"put-1\" [true true]]",
+    );
+}
+
+#[test]
+fn awaited_go_channels_survive_collections() {
+    assert_both(
+        r#"
+        (require '[clojure.core.async :as a :refer [go]])
+        (defn wait [i] (await (go (sleep 1) (collect-now) (vec (range i)))))
+        (let [f (future (mapv wait [1 2 3]))]
+          (collect-now)
+          @f)
+        "#,
+        "[[0] [0 1] [0 1 2]]",
+    );
+}
+
 /// `fiber::eval_form` conveys the caller's dynamic bindings and gas meters,
 /// like `future`, so an embedder's binding or budget governs the form.
 #[test]
@@ -307,6 +341,60 @@ fn eval_form_conveys_bindings_and_gas() {
                     ),
                     "{spun:?}"
                 );
+            });
+            fiber::drop_local_with_carrier(local, &mut MutatorState::fresh());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// `fiber::eval_form_rooted` keeps its result rooted across later yields and
+/// collections, until the `FiberResult` is consumed.
+#[test]
+fn eval_form_rooted_survives_later_collections() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                cljrs_async::init(&globals);
+                let mut env = Env::new(globals.clone(), "user");
+                let parse = |src: &str| {
+                    cljrs_reader::Parser::new(src.into(), "<eval-form>".into())
+                        .parse_all()
+                        .unwrap()
+                        .remove(0)
+                };
+                let kept = fiber::eval_form_rooted(
+                    &parse("(mapv (fn [i] (str \"item-\" i)) (range 50))"),
+                    &mut env,
+                )
+                .await;
+                for _ in 0..3 {
+                    // Allocate on another fiber, then collect, while `kept` waits.
+                    fiber::eval_form(&parse("(count (vec (range 2000)))"), &mut env)
+                        .await
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    #[cfg(not(feature = "no-gc"))]
+                    {
+                        cljrs_gc::request_gc();
+                        cljrs_runtime::env::gc_roots::async_gc_collect();
+                    }
+                }
+                let Ok(Value::Vector(items)) = kept.get() else {
+                    panic!("unexpected {:?}", kept.get());
+                };
+                assert_eq!(items.get().count(), 50);
+                assert_eq!(items.get().nth(49).unwrap().to_string(), "\"item-49\"");
+                drop(kept);
             });
             fiber::drop_local_with_carrier(local, &mut MutatorState::fresh());
         })
