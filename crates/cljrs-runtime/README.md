@@ -479,6 +479,12 @@ spawned, and `InterruptScope::enter(&flags)` makes them the only flags observed
 for the duration of one poll (restoring the previous ones on drop), so a task
 answers only to an interrupt of the evaluation that spawned it.
 
+A fiber parked on a wait reaches no checkpoint, so raise interrupts with
+`request_interrupt(flag: &AtomicBool)`: it sets the flag and wakes every parked
+wait. `async fn interrupted(flags: &[Arc<AtomicBool>])` completes once any of
+`flags` is set (never, for an empty slice); fiber parks race it against the
+awaited event and unwind as `Cancelled` when it wins.
+
 ### `policy` submodule
 
 Dynamic capability policy used by isolated transaction functions.

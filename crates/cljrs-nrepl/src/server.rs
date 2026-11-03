@@ -7,7 +7,7 @@
 //! interpreter thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,7 +52,8 @@ impl Pending {
             }
             busy = true;
             if id.is_none_or(|want| want == i) {
-                flag.store(true, Ordering::SeqCst);
+                // Also wakes the eval if it is parked on a wait.
+                cljrs_runtime::env::gas::request_interrupt(flag);
                 hit = true;
             }
         }

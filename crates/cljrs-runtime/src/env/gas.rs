@@ -21,10 +21,15 @@
 //! is polled under the flags of the evaluation that spawned it
 //! ([`active_interrupts`], [`InterruptScope`]), so interrupting whichever
 //! evaluation is driving the executor leaves other evaluations' tasks alone.
+//!
+//! A fiber parked on a wait reaches no checkpoint, so setting a flag alone
+//! does not stop it. Raise an interrupt with [`request_interrupt`] instead:
+//! it sets the flag and wakes every parked wait, which then observes the flag
+//! through [`interrupted`] and unwinds at the park point (issue #446).
 
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 /// A shareable, monotonically-decreasing execution-credit budget.
 #[derive(Debug)]
@@ -82,6 +87,36 @@ impl Drop for InterruptGuard {
         INTERRUPTS.with(|flags| {
             flags.borrow_mut().pop();
         });
+    }
+}
+
+/// Woken by every [`request_interrupt`], so parked waits can recheck flags.
+static RAISED: LazyLock<cljrs_value::parking::Event> =
+    LazyLock::new(cljrs_value::parking::Event::default);
+
+/// Set `flag` and wake every wait parked under interrupt flags, so a parked
+/// evaluation observing `flag` stops promptly instead of at its next
+/// checkpoint after the wait ends. Prefer this over storing to the flag
+/// directly, which only checkpoints observe.
+pub fn request_interrupt(flag: &AtomicBool) {
+    flag.store(true, Ordering::SeqCst);
+    RAISED.notify_all();
+}
+
+/// Completes once any of `flags` is set by [`request_interrupt`]; never
+/// completes for an empty slice. Used by fiber parks to race the awaited
+/// event against an interrupt of the parked evaluation.
+pub async fn interrupted(flags: &[Arc<AtomicBool>]) {
+    if flags.is_empty() {
+        return std::future::pending().await;
+    }
+    loop {
+        // Listen before checking, so a request between the two still wakes us.
+        let listener = RAISED.listen();
+        if flags.iter().any(|flag| flag.load(Ordering::SeqCst)) {
+            return;
+        }
+        listener.await;
     }
 }
 

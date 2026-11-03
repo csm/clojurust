@@ -293,6 +293,10 @@ unrooted, like `await_value`, for callers that use it before the next yield.
 `current()` returns the running fiber ID. During future polls, it returns `None`.
 Panics in the body or parked future become `EvalError::Runtime`.
 Cancellation unwinds the fiber with its mutator state installed before stack reuse.
+`park_on` also observes the fiber's interrupt flags (`gas::active_interrupts`): when one
+is already set, or is raised with `gas::request_interrupt` while parked, the park unwinds
+as the uncatchable `Cancelled` error, so an interrupt stops a parked wait without a
+checkpoint. A fiber body that receives such an unwind returns `Err(EvalError::Cancelled)`.
 
 The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
 512 KB minimum. Smaller values are clamped to 512 KB with a one-time warning; unparseable values fail construction. A process-wide pool
