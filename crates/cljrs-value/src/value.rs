@@ -391,6 +391,7 @@ impl Eq for Value {}
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        crate::realization::check_stack();
         // Strip metadata — it is ignored for equality in Clojure.
         if let Value::WithMeta(inner, _) = self {
             return inner.as_ref() == other;
@@ -602,6 +603,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
 
 impl ClojureHash for Value {
     fn clojure_hash(&self) -> u32 {
+        crate::realization::check_stack();
         match self {
             Value::WithMeta(inner, _) => inner.clojure_hash(),
             Value::Reduced(inner) => inner.clojure_hash(),
@@ -855,6 +857,7 @@ impl fmt::Display for PrintValue<'_> {
 
 /// Print a value.  `readably = true` quotes strings and escapes chars.
 pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Result {
+    crate::realization::check_stack();
     match v {
         Value::WithMeta(inner, _) => pr_str(inner, f, readably),
         Value::Reduced(inner) => {
@@ -1750,6 +1753,7 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
+        crate::realization::check_stack();
         // Strip metadata for comparison.
         let a = self.unwrap_meta();
         let b = other.unwrap_meta();

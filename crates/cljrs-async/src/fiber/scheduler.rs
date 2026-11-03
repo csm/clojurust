@@ -10,28 +10,7 @@ use std::time::{Duration, Instant};
 use super::FiberId;
 use cljrs_gc::fiber::SafepointError;
 
-/// Read the machine stack, rather than an ASan fake-stack local's address.
-#[inline(always)]
-fn stack_pointer() -> usize {
-    let pointer: usize;
-    // SAFETY: each instruction only copies the current stack register. It
-    // neither accesses memory nor changes the stack or condition flags.
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        std::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack, preserves_flags));
-        #[cfg(target_arch = "x86")]
-        std::arch::asm!("mov {}, esp", out(reg) pointer, options(nomem, nostack, preserves_flags));
-        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-        std::arch::asm!("mov {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
-        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-        std::arch::asm!("mv {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
-        #[cfg(target_arch = "loongarch64")]
-        std::arch::asm!("move {}, $sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
-        #[cfg(target_arch = "powerpc64")]
-        std::arch::asm!("mr {}, 1", out(reg) pointer, options(nomem, nostack, preserves_flags));
-    }
-    pointer
-}
+use cljrs_gc::fiber::stack_pointer;
 
 thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
@@ -407,10 +386,13 @@ impl Scheduling {
                 wake: Arc::downgrade(&self.wake),
             });
         watchdog().notify_running();
+        // Native recursion probes this; the safepoint checks `limit` itself.
+        let stack_limit = cljrs_gc::fiber::set_native_stack_limit(self.limit);
         RunGuard {
             scheduling: self,
             outer,
             native,
+            stack_limit,
         }
     }
 
@@ -494,9 +476,11 @@ pub(super) struct RunGuard<'a> {
     scheduling: &'a Scheduling,
     outer: Option<Running>,
     native: usize,
+    stack_limit: usize,
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
+        cljrs_gc::fiber::set_native_stack_limit(self.stack_limit);
         let scheduler = &self.scheduling.wake.scheduler;
         // Pause the outer fiber's clock while the inner one ran: shift its
         // heartbeat by the inner resume, so only the outer fiber's own time

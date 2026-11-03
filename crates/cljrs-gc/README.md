@@ -906,7 +906,18 @@ impl StackReservation {
     pub fn set_pooled(&mut self, pooled: bool);
 }
 pub fn reserved_stack_bytes() -> usize; // active and pooled reservations
+pub fn stack_pointer() -> usize; // machine stack register (address of a local on wasm)
+pub const NATIVE_STACK_MARGIN: usize; // 128 KiB kept free below native recursion probes
+pub fn set_native_stack_limit(limit: usize) -> usize; // 0 clears; returns previous limit
+pub fn native_stack_low() -> Option<usize>; // Some(remaining) within the margin on a fiber
 ```
+
+Recursive native code (printing, equality, hashing, comparison) never reaches a
+safepoint. The fiber driver publishes the running fiber's stack limit with
+`set_native_stack_limit` on every resume and restores the outer value when the
+resume ends; `native_stack_low` compares it with `stack_pointer()`. Off a fiber
+the limit is zero and the probe always returns `None`. The probe only reports;
+`cljrs-value`'s `realization::check_stack` turns it into a catchable error.
 
 `SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
 ABI frames through the runtime's uncatchable resource-error path.

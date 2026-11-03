@@ -1020,6 +1020,12 @@ The boundary catches only that payload. Ordinary panics and fiber cancellation c
 The evaluator and compiler ABI also install realization boundaries.
 Rust embedders can use `realization::catch(|| format!("{value}"))` for fallible printing.
 
+`realization::check_stack()` fails through the same payload when the running fiber is within
+`cljrs_gc::fiber::NATIVE_STACK_MARGIN` of its guard page. `Value`'s `PartialEq`, `ClojureHash`,
+`Ord`, and `pr_str` call it on entry, so printing, comparing, or hashing deeply nested data on a
+fiber throws a catchable "stack overflow in native code" error instead of hitting the guard page.
+It is a no-op off a fiber.
+
 `realization::is_inert(&Value) -> bool` identifies scalar values whose equality, hash, and display cannot run user code.
 Transient maps and sets use in-place updates and direct lookups while all keys meet this condition.
 Other operations compute from traced snapshots outside their locks.

@@ -30,6 +30,26 @@ pub(crate) fn for_trait(sequence: &crate::LazySeq) -> crate::Value {
     }
 }
 
+/// Stop recursive native code (printing, equality, hashing, comparison) before
+/// it reaches the running fiber's guard page. These paths never reach an
+/// interpreter safepoint, so they probe the stack themselves and fail through
+/// the same payload as a realization error, caught by `catch`.
+#[inline]
+pub fn check_stack() {
+    if let Some(remaining) = cljrs_gc::fiber::native_stack_low() {
+        stack_exhausted(remaining)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stack_exhausted(remaining: usize) -> ! {
+    resume_unwind(Box::new(Failure(format!(
+        "stack overflow in native code: value nested too deeply \
+         ({remaining} bytes of fiber stack remaining)"
+    ))))
+}
+
 /// True for scalar values whose equality, hash, and display cannot run user code.
 /// This is conservative: composite and mutable values use the rooted slow path.
 pub fn is_inert(value: &crate::Value) -> bool {
