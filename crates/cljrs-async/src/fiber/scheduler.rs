@@ -71,6 +71,9 @@ const MAX_NATIVE_NAMES: usize = 4096;
 /// Frame tokens encode `generation * NAME_STRIDE + id`, with 1-based ids.
 const NAME_STRIDE: usize = MAX_NATIVE_NAMES + 1;
 const NAME_GENERATIONS: usize = usize::MAX / NAME_STRIDE;
+/// Frame token for a garbage-collection pause. Name tokens stay below it:
+/// the largest is `(NAME_GENERATIONS - 1) * NAME_STRIDE + MAX_NATIVE_NAMES`.
+const GC_PAUSE: usize = usize::MAX;
 
 /// Generation of the process-wide table, readable without its lock.
 static NAME_GENERATION: AtomicUsize = AtomicUsize::new(0);
@@ -238,19 +241,22 @@ impl Scheduler {
             return None;
         }
         run.reported = true;
-        Some(format!(
-            "cljrs: fiber {} stalled its isolate for {:?}; native frame: {} (other fibers runnable)",
-            run.id.0,
-            now.duration_since(run.heartbeat),
-            match self.native.load(Ordering::Relaxed) {
-                0 => "<Rust body without safepoints>".to_string(),
-                token => native_names()
+        let cause = match self.native.load(Ordering::Relaxed) {
+            GC_PAUSE => "garbage collection pause".to_string(),
+            0 => "native frame: <Rust body without safepoints>".to_string(),
+            token => format!(
+                "native frame: {}",
+                native_names()
                     .lock()
                     .unwrap()
                     .name(token)
                     .unwrap_or("<native function>")
-                    .to_string(),
-            }
+            ),
+        };
+        Some(format!(
+            "cljrs: fiber {} stalled its isolate for {:?}; {cause} (other fibers runnable)",
+            run.id.0,
+            now.duration_since(run.heartbeat),
         ))
     }
 }
@@ -280,6 +286,21 @@ impl TaskWake {
 
     pub(super) fn schedule(self: &Arc<Self>) {
         self.wake_by_ref();
+    }
+
+    /// Count this fiber as ready before an automatic yield parks it.
+    ///
+    /// `tokio::task::yield_now` defers its wake until the carrier runs out of
+    /// ready tasks and polls the driver, so `wake_by_ref` would not count the
+    /// yielded fiber while a sibling blocks the carrier. Marking it queued
+    /// here keeps the deferred wake (timers and I/O still run first) while
+    /// letting the watchdog see a runnable fiber. The later deferred wake
+    /// finds it already queued, and `poll` clears the mark on resume.
+    pub(super) fn mark_ready(&self) {
+        let state = self.state.lock().unwrap();
+        if !state.closed && !self.queued.swap(true, Ordering::Relaxed) {
+            self.scheduler.ready.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn poll(&self, parent: &Waker) {
@@ -405,6 +426,16 @@ impl Scheduling {
         }
         let previous = self.native.replace(id);
         self.wake.scheduler.native.store(id, Ordering::Relaxed);
+        previous
+    }
+
+    /// Mark a garbage-collection pause; `exit_native` restores the frame.
+    pub(super) fn enter_gc_pause(&self) -> usize {
+        let previous = self.native.replace(GC_PAUSE);
+        self.wake
+            .scheduler
+            .native
+            .store(GC_PAUSE, Ordering::Relaxed);
         previous
     }
 
@@ -737,6 +768,23 @@ mod tests {
         assert_eq!(scheduler.ready.load(Ordering::Relaxed), 1);
         wake.close();
         wake.wake_by_ref();
+        assert_eq!(scheduler.ready.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_yield_mark_counts_once_and_clears_on_poll() {
+        let scheduler = Scheduler::new();
+        let wake = TaskWake::new(scheduler.clone());
+        wake.mark_ready();
+        wake.mark_ready();
+        assert_eq!(scheduler.ready.load(Ordering::Relaxed), 1);
+        // The deferred wake that follows the yield does not count it again.
+        wake.wake_by_ref();
+        assert_eq!(scheduler.ready.load(Ordering::Relaxed), 1);
+        wake.poll(Waker::noop());
+        assert_eq!(scheduler.ready.load(Ordering::Relaxed), 0);
+        wake.close();
+        wake.mark_ready();
         assert_eq!(scheduler.ready.load(Ordering::Relaxed), 0);
     }
 }

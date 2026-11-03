@@ -1066,6 +1066,7 @@ mod gc_full {
         }
 
         pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F) {
+            let _pause = crate::fiber::gc_pause();
             let pre_count = self.inner.lock().unwrap().count;
             let pre_memory = self.memory_in_use.load(Ordering::Relaxed);
             tracing::debug!(

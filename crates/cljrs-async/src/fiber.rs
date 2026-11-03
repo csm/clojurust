@@ -194,6 +194,11 @@ fn scheduling() -> Option<&'static Scheduling> {
 }
 
 fn yield_slice() -> Result<(), cljrs_gc::fiber::SafepointError> {
+    // `yield_now` defers its wake, so count this fiber as ready now: the
+    // watchdog must see it while a sibling pins the carrier (issue #445).
+    if let Some(scheduling) = scheduling() {
+        scheduling.wake.mark_ready();
+    }
     catch_cancelled(|| park_on_impl(tokio::task::yield_now()))
         .map_err(|_| cljrs_gc::fiber::SafepointError::Cancelled)
 }
@@ -206,6 +211,7 @@ fn install_parking_hooks() {
             yield_now: yield_slice,
             reclaim_stacks: reclaim_idle_stacks,
             enter_native: |name, id| scheduling().map_or(0, |s| s.enter_native(name, id)),
+            enter_gc_pause: || scheduling().map_or(0, Scheduling::enter_gc_pause),
             exit_native: |previous| {
                 if let Some(s) = scheduling() {
                     s.exit_native(previous);
