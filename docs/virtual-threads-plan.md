@@ -252,8 +252,11 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
 - Each fiber checks its actual remaining stack space at safepoints. A 256 KiB margin
   lets ordinary recursion return a stack-overflow error that identifies the fiber.
   The transaction-specific `CALL_DEPTH` budget remains independent of this check.
-- A guard-page hit from native recursion without safepoints remains fatal.
-  Phase 4 keeps platform signal handlers intact and uses safepoint checks for recoverable errors.
+- Recursive native code without safepoints (printing, equality, hashing, comparison
+  over nested data) probes the fiber's stack limit on entry and throws a catchable
+  error 128 KiB before the guard page (issue #452). Other native recursion, such as
+  foreign Rust code, can still hit the fatal guard page.
+  Phase 4 keeps platform signal handlers intact and uses explicit checks for recoverable errors.
 
 ---
 
@@ -531,8 +534,9 @@ Native embedders declare managed captures with `NativeFn::with_captures`.
   closures cannot grow it without limit and later names are still reported. Environment rooting
   happens only for actual yields.
 - The overflow investigation keeps platform signal handlers intact. A native
-  recursion path without safepoints can still hit the fatal guard page; this phase
-  does not attempt signal-handler unwinding or recovery.
+  recursion path without safepoints or stack probes can still hit the fatal guard
+  page; this phase does not attempt signal-handler unwinding or recovery. The
+  printer, equality, hashing, and comparison probe the stack themselves (issue #452).
 - Regression tests cover both interpreters, published JIT code, AOT binaries,
   GC during automatic yields, cancellation, stack reuse and strict admission,
   stall warnings, and overflow reporting. Interpreter and JIT coverage runs in GC

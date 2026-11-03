@@ -7638,6 +7638,8 @@ fn builtin_random_sample(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
+    // Recurses through nested collections without reaching a safepoint.
+    cljrs_value::realization::check_stack();
     match (a, b) {
         (Value::Nil, Value::Nil) => Ok(std::cmp::Ordering::Equal),
         (Value::Nil, _) => Ok(std::cmp::Ordering::Less),

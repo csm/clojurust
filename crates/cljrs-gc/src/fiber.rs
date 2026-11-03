@@ -1,5 +1,6 @@
 //! Executor-independent fiber safepoints, diagnostics, and stack accounting.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -56,6 +57,87 @@ pub(crate) fn reclaim_idle_stacks() {
     if let Some(hooks) = HOOKS.get() {
         (hooks.reclaim_stacks)();
     }
+}
+
+/// Read the machine stack, rather than an ASan fake-stack local's address.
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    ))]
+    {
+        let pointer: usize;
+        // SAFETY: each instruction only copies the current stack register. It
+        // neither accesses memory nor changes the stack or condition flags.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            std::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+            #[cfg(target_arch = "x86")]
+            std::arch::asm!("mov {}, esp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+            #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+            std::arch::asm!("mov {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+            std::arch::asm!("mv {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+            #[cfg(target_arch = "loongarch64")]
+            std::arch::asm!("move {}, $sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+            #[cfg(target_arch = "powerpc64")]
+            std::arch::asm!("mr {}, 1", out(reg) pointer, options(nomem, nostack, preserves_flags));
+        }
+        pointer
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    )))]
+    {
+        // No fiber stacks here (e.g. wasm); approximate with a local.
+        let marker = 0u8;
+        std::hint::black_box(&marker) as *const u8 as usize
+    }
+}
+
+/// Stack kept free below a native recursion probe: room to unwind to the
+/// nearest evaluation boundary. Smaller than the interpreter safepoint's
+/// margin, so Clojure code called back from native code still fails first.
+pub const NATIVE_STACK_MARGIN: usize = 128 * 1024;
+
+thread_local! {
+    /// Lowest usable address of the running fiber's stack (guard included);
+    /// zero when no fiber runs on this thread.
+    static NATIVE_STACK_LIMIT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Publish the running fiber's stack limit for [`native_stack_low`]. Zero
+/// clears it. Returns the previous limit, to restore when the resume ends.
+pub fn set_native_stack_limit(limit: usize) -> usize {
+    NATIVE_STACK_LIMIT.with(|cell| cell.replace(limit))
+}
+
+/// Probe for recursive native code (printing, equality, hashing, comparison)
+/// that never reaches an interpreter safepoint. Returns the bytes left when
+/// the running fiber is within [`NATIVE_STACK_MARGIN`] of its guard page.
+/// Always `None` off a fiber.
+#[inline]
+pub fn native_stack_low() -> Option<usize> {
+    let limit = NATIVE_STACK_LIMIT.with(Cell::get);
+    if limit == 0 {
+        return None;
+    }
+    let remaining = stack_pointer().saturating_sub(limit);
+    (remaining < NATIVE_STACK_MARGIN).then_some(remaining)
 }
 
 /// A native function's lazily assigned diagnostic name id, stored with the

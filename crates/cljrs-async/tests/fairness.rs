@@ -453,6 +453,58 @@ fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
 }
 
 #[test]
+fn native_recursion_over_nested_data_throws_before_the_guard_page() {
+    // Printing, equality, hashing and comparison recurse in Rust without an
+    // interpreter safepoint (issue #452). Each must throw a catchable error.
+    const SOURCE: &str = r#"
+        (let [nest (fn [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) (list acc)) acc)))
+              deep (nest 32000)
+              other (nest 32000)
+              vdeep (reduce (fn [acc _] [acc]) [] (range 32000))
+              caught? (fn [f] (try (f) false
+                                (catch Exception e
+                                  (some? (re-find #"stack overflow in native code" (ex-message e))))))]
+          [(caught? #(pr-str deep)) (caught? #(str deep)) (caught? #(= deep other))
+           (caught? #(hash deep)) (caught? #(compare vdeep vdeep))
+           (= 203 (count (pr-str (nest 100))))])"#;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for mode in [
+                cljrs_runtime::ExecutionMode::TreeWalk,
+                cljrs_runtime::ExecutionMode::Tiered,
+            ] {
+                let runtime = cljrs_runtime::Runtime::builder()
+                    .execution_mode(mode)
+                    .build()
+                    .unwrap();
+                let form = cljrs_reader::Parser::new(SOURCE.into(), "<native-overflow>".into())
+                    .parse_all()
+                    .unwrap()
+                    .remove(0);
+                run(async {
+                    let task = Fiber::new(move || {
+                        cljrs_runtime::tiered::eval(
+                            &form,
+                            &mut Env::new(runtime.globals().clone(), "user"),
+                        )
+                    })
+                    .unwrap();
+                    let result = task.into_task().await.unwrap();
+                    assert_eq!(
+                        result.to_string(),
+                        "[true true true true true true]",
+                        "{mode:?}"
+                    );
+                });
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
     const CHILD: &str = "CLJRS_IDLE_STACK_RECLAIM";
     let Ok(mode) = std::env::var(CHILD) else {
