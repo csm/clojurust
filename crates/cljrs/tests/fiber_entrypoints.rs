@@ -105,23 +105,21 @@ fn clojure_test_bodies_run_in_a_root_fiber() {
     assert!(output.contains("2 passed"), "{output}");
 }
 
-#[test]
-fn nrepl_root_waits_preserve_output_and_session_bindings() {
-    use cljrs_nrepl::bencode::{self, Bencode};
-    use std::collections::BTreeMap;
-    use std::io::Read;
-    struct Server(std::process::Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
+struct NreplServer(std::process::Child);
+impl Drop for NreplServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    let dir = tempfile::tempdir().unwrap();
-    let mut server = Server(
+}
+
+/// Start `cljrs nrepl` on an ephemeral port in `dir`, returning the port.
+fn start_nrepl(dir: &std::path::Path) -> (NreplServer, u16) {
+    use std::io::Read;
+    let mut server = NreplServer(
         command()
             .args(["nrepl", "--port", "0"])
-            .current_dir(dir.path())
+            .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -129,8 +127,12 @@ fn nrepl_root_waits_preserve_output_and_session_bindings() {
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     let port: u16 = loop {
-        if let Ok(port) = std::fs::read_to_string(dir.path().join(".nrepl-port")) {
-            break port.trim().parse().unwrap();
+        // The file can be seen before its contents are written.
+        if let Some(port) = std::fs::read_to_string(dir.join(".nrepl-port"))
+            .ok()
+            .and_then(|port| port.trim().parse().ok())
+        {
+            break port;
         }
         if let Some(status) = server.0.try_wait().unwrap() {
             let mut error = String::new();
@@ -146,6 +148,16 @@ fn nrepl_root_waits_preserve_output_and_session_bindings() {
         assert!(Instant::now() < deadline, "nREPL did not start");
         std::thread::sleep(Duration::from_millis(10));
     };
+    (server, port)
+}
+
+#[test]
+fn nrepl_root_waits_preserve_output_and_session_bindings() {
+    use cljrs_nrepl::bencode::{self, Bencode};
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, port) = start_nrepl(dir.path());
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -188,6 +200,150 @@ fn nrepl_root_waits_preserve_output_and_session_bindings() {
     }
     assert_eq!(values, ["41", "42"]);
     assert_eq!(output, ":root-output\n");
+}
+
+/// An `interrupt` stops an eval parked on a wait that would never end, or
+/// end only much later, and the session keeps working (issue #446).
+#[test]
+fn nrepl_interrupt_stops_parked_evals() {
+    use cljrs_nrepl::bencode::{self, Bencode};
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    struct Client {
+        stream: std::net::TcpStream,
+        bytes: Vec<u8>,
+        stash: Vec<Bencode>,
+        session: Option<String>,
+    }
+    impl Client {
+        fn send(&mut self, fields: &[(&str, &str)]) {
+            let mut request = BTreeMap::new();
+            if let Some(session) = &self.session {
+                request.insert(b"session".to_vec(), Bencode::str(session.as_str()));
+            }
+            for (key, value) in fields {
+                request.insert(key.as_bytes().to_vec(), Bencode::str(*value));
+            }
+            self.stream
+                .write_all(&bencode::encode_to_vec(&Bencode::Dict(request)))
+                .unwrap();
+        }
+        /// Read replies to `id` up to its "done", returning their statuses
+        /// and values (or new session id).
+        fn collect(&mut self, id: &str) -> (Vec<String>, Vec<String>) {
+            let (mut statuses, mut values) = (Vec::new(), Vec::new());
+            loop {
+                let id_of = |msg: &Bencode| {
+                    msg.as_dict()
+                        .and_then(|d| d.get(b"id".as_slice()))
+                        .and_then(Bencode::as_str)
+                        .map(str::to_owned)
+                };
+                let stashed = self
+                    .stash
+                    .iter()
+                    .position(|m| id_of(m).as_deref() == Some(id));
+                let msg = if let Some(index) = stashed {
+                    Some(self.stash.remove(index))
+                } else if let Some((msg, consumed)) = bencode::decode(&self.bytes).unwrap() {
+                    self.bytes.drain(..consumed);
+                    Some(msg)
+                } else {
+                    None
+                };
+                if let Some(msg) = msg {
+                    if id_of(&msg).as_deref() != Some(id) {
+                        // A reply to another request, e.g. an interrupt
+                        // answered before the eval it stopped.
+                        self.stash.push(msg);
+                        continue;
+                    }
+                    let dict = msg.as_dict().unwrap();
+                    for key in [b"value".as_slice(), b"new-session".as_slice()] {
+                        if let Some(value) = dict.get(key).and_then(Bencode::as_str) {
+                            values.push(value.to_owned());
+                        }
+                    }
+                    if let Some(Bencode::List(status)) = dict.get(b"status".as_slice()) {
+                        statuses
+                            .extend(status.iter().filter_map(|s| s.as_str().map(str::to_owned)));
+                        if statuses.iter().any(|s| s == "done") {
+                            return (statuses, values);
+                        }
+                    }
+                } else {
+                    let mut chunk = [0; 4096];
+                    let n = self.stream.read(&mut chunk).unwrap();
+                    assert!(n > 0, "nREPL disconnected");
+                    self.bytes.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, port) = start_nrepl(dir.path());
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut client = Client {
+        stream,
+        bytes: Vec::new(),
+        stash: Vec::new(),
+        session: None,
+    };
+    client.send(&[("op", "clone"), ("id", "clone")]);
+    client.session = client.collect("clone").1.pop();
+    assert!(client.session.is_some());
+    client.send(&[
+        ("op", "eval"),
+        ("id", "require"),
+        ("code", "(require '[clojure.core.async :as a])"),
+    ]);
+    let (statuses, _) = client.collect("require");
+    assert!(!statuses.iter().any(|s| s == "eval-error"), "{statuses:?}");
+
+    let parked = [
+        "(deref (promise))",
+        "(Thread/sleep 20000)",
+        "(a/<!! (a/chan))",
+        "@(future (Thread/sleep 20000))",
+        "(try (deref (promise)) (catch Exception _ :caught))",
+    ];
+    for (n, code) in parked.iter().enumerate() {
+        let id = format!("parked-{n}");
+        client.send(&[("op", "eval"), ("id", &id), ("code", code)]);
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        client.send(&[
+            ("op", "interrupt"),
+            ("id", &format!("interrupt-{n}")),
+            ("interrupt-id", &id),
+        ]);
+        let (statuses, values) = client.collect(&id);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{code}: interrupt took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            statuses.iter().any(|s| s == "interrupted"),
+            "{code}: {statuses:?} {values:?}"
+        );
+        assert!(values.is_empty(), "{code}: {values:?}");
+        client.collect(&format!("interrupt-{n}"));
+
+        // The interpreter is free again and the flag is not stale.
+        let check = format!("check-{n}");
+        client.send(&[
+            ("op", "eval"),
+            ("id", &check),
+            ("code", "(do (Thread/sleep 10) @(future (+ 1 2)))"),
+        ]);
+        assert_eq!(client.collect(&check).1, ["3"], "after {code}");
+    }
 }
 
 #[test]

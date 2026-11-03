@@ -150,15 +150,28 @@ fn park_on_impl<F: Future>(future: F) -> F::Output {
     let current = CURRENT
         .with(Cell::get)
         .expect("park_on called outside a fiber");
+    // A parked fiber reaches no execution-credit checkpoint, so race the wait
+    // against the evaluation's interrupt flags (issue #446). The flags are
+    // captured here, on the fiber: the park future is polled by the driver.
+    let interrupts = cljrs_runtime::env::gas::active_interrupts();
+    if interrupts.iter().any(|flag| flag.load(Ordering::SeqCst)) {
+        resume_cancelled();
+    }
     let mut future = pin!(future);
+    let mut interrupt = pin!(cljrs_runtime::env::gas::interrupted(&interrupts));
     let mut output = None;
+    let mut was_interrupted = false;
     {
-        let mut wait = pin!(poll_fn(|cx| match future.as_mut().poll(cx) {
-            Poll::Ready(value) => {
+        let mut wait = pin!(poll_fn(|cx| {
+            if let Poll::Ready(value) = future.as_mut().poll(cx) {
                 output = Some(value);
-                Poll::Ready(())
+                return Poll::Ready(());
             }
-            Poll::Pending => Poll::Pending,
+            if interrupt.as_mut().poll(cx).is_ready() {
+                was_interrupted = true;
+                return Poll::Ready(());
+            }
+            Poll::Pending
         }));
         let park = Park::new(wait.as_mut());
         // SAFETY: CURRENT is installed only while this coroutine is resumed or
@@ -166,6 +179,12 @@ fn park_on_impl<F: Future>(future: F) -> F::Output {
         if matches!(unsafe { &*current.yielder }.suspend(park), Resume::Cancel) {
             resume_cancelled();
         }
+    }
+    if was_interrupted {
+        // Unwind like a cancellation: native boundaries turn it into the
+        // uncatchable `Cancelled` error, and the fiber body boundary below
+        // returns it as the fiber's result.
+        resume_cancelled();
     }
     output.expect("fiber resumed before its park future completed")
 }
@@ -358,7 +377,14 @@ impl Fiber {
                 let _allocation_scope = allocation.enter();
                 #[cfg(feature = "no-gc")]
                 let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
-                let result = body();
+                // An interrupted park unwinds with the cancellation payload
+                // though the fiber is not being cancelled; one that reaches
+                // the body without passing a native boundary ends it here.
+                let result = match catch_cancelled(body) {
+                    Ok(result) => result,
+                    Err(_) if !(&*scheduling_ptr).is_cancelled() => Err(EvalError::Cancelled),
+                    Err(_) => resume_cancelled(),
+                };
                 // Cancellation returns through foreign frames as an uncatchable
                 // error, then resumes Rust unwinding at this safe boundary.
                 if (&*scheduling_ptr).is_cancelled() {
