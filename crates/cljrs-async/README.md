@@ -413,6 +413,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/no_gc_lifetimes.rs` | No-GC lifetime tests for task results, lazy sequences, top-level accumulators, and replacement of cell contents |
 | `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report once at destruction or teardown |
 | `tests/fiber_surface.rs` | Blocking Clojure surface, nested futures, binding conveyance, channel closure, root state restoration, and GC across root drives |
+| `tests/concurrent_require.rs` | Namespace loads are claimed per thread + fiber: a second fiber waits on a parked load instead of reporting a circular require; genuine cycles still error |
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
 | `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` at top level, evaluated on a fiber |
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |

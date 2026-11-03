@@ -200,22 +200,12 @@ pub fn ensure_versioned_ns_loaded(
         return Ok(versioned_ns_name);
     }
 
-    let should_load = crate::env::loader::claim_or_wait(globals, &versioned_ns_name)?;
-    if !should_load {
+    let Some(claim) = crate::env::loader::claim_or_wait(globals, &versioned_ns_name)? else {
         return Ok(versioned_ns_name);
-    }
+    };
 
     let result = do_versioned_load(globals, base_ns, commit, &versioned_ns_name);
-
-    globals
-        .loading
-        .lock()
-        .unwrap()
-        .remove(versioned_ns_name.as_ref());
-    if result.is_ok() {
-        globals.mark_loaded(&versioned_ns_name);
-    }
-    globals.loading_done.notify_all();
+    claim.finish(result.is_ok());
 
     result?;
     Ok(versioned_ns_name)

@@ -6,16 +6,18 @@ use std::sync::Arc;
 
 use crate::env::env::{Env, GlobalEnv, RequireRefer, RequireSpec};
 use crate::env::error::{EvalError, EvalResult};
+use cljrs_value::types::Realizer;
 
 /// Find, load, and wire up the source file for `spec.ns`.
 ///
 /// - Idempotent: if already loaded, skips file evaluation but still applies
 ///   alias/refer in the *current* namespace.
-/// - Same-thread cycle detection: returns an error if the current thread is
-///   already loading `spec.ns` (true circular require).
-/// - Cross-thread coordination: if a *different* thread is loading `spec.ns`,
-///   waits for it to finish (via `GlobalEnv::loading_done`) instead of
-///   reporting a spurious "circular require" error.
+/// - Cycle detection: returns an error if the current computation (same
+///   thread *and* fiber) is already loading `spec.ns` (true circular require).
+/// - Concurrent coordination: if a *different* thread or fiber is loading
+///   `spec.ns`, waits for it to finish (via `GlobalEnv::loading_done`, which
+///   parks a fiber and blocks a plain thread) instead of reporting a spurious
+///   "circular require" error.
 /// - Versioned require: if `spec.version` is set, delegates to
 ///   `load_versioned_ns` which fetches source at the given commit.
 pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) -> EvalResult<()> {
@@ -33,23 +35,12 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
 
     let ns_name = &spec.ns;
 
-    if !globals.is_loaded(ns_name) {
-        // Try to claim this namespace for loading, or wait if another thread
-        // is already loading it.
-        let should_load = claim_or_wait(&globals, ns_name)?;
-
-        if should_load {
-            let result = do_load(&globals, ns_name);
-
-            // Release the claim and notify any waiting threads.
-            globals.loading.lock().unwrap().remove(ns_name.as_ref());
-            if result.is_ok() {
-                globals.mark_loaded(ns_name);
-            }
-            globals.loading_done.notify_all();
-
-            result?;
-        }
+    if !globals.is_loaded(ns_name)
+        && let Some(claim) = claim_or_wait(&globals, ns_name)?
+    {
+        let result = do_load(&globals, ns_name);
+        claim.finish(result.is_ok());
+        result?;
     }
 
     // Apply alias.
@@ -67,33 +58,80 @@ pub fn load_ns(globals: Arc<GlobalEnv>, spec: &RequireSpec, current_ns: &str) ->
     Ok(())
 }
 
-/// Claim `ns_name` for loading by the current thread, or wait until another
-/// thread that claimed it finishes.
+/// An exclusive claim on loading one namespace, held by the computation that
+/// must load it.  Dropping the claim — including on an unwind or a cancelled
+/// fiber — releases it and wakes waiters, which then retry the load.
+pub(crate) struct LoadClaim<'a> {
+    globals: &'a GlobalEnv,
+    ns_name: Arc<str>,
+}
+
+impl LoadClaim<'_> {
+    /// Release the claim, marking the namespace loaded first when `loaded`.
+    pub(crate) fn finish(self, loaded: bool) {
+        if loaded {
+            self.globals.mark_loaded(&self.ns_name);
+        }
+        // `Drop` releases the claim and notifies waiters.
+    }
+}
+
+impl Drop for LoadClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut loading) = self.globals.loading.lock() {
+            loading.remove(self.ns_name.as_ref());
+        }
+        self.globals.loading_done.notify_all();
+    }
+}
+
+/// Claim `ns_name` for loading by the current computation, or wait until the
+/// computation that claimed it finishes.
 ///
-/// Returns `Ok(true)` if the caller claimed the namespace and must load it.
-/// Returns `Ok(false)` if another thread loaded it while we waited.
-/// Returns `Err` on a genuine circular require (same thread).
-pub(crate) fn claim_or_wait(globals: &Arc<GlobalEnv>, ns_name: &Arc<str>) -> EvalResult<bool> {
-    let tid = std::thread::current().id();
+/// A computation is a thread plus, when running on one, a fiber
+/// ([`Realizer`]): two fibers sharing an OS thread are distinct loaders.
+///
+/// Returns `Ok(Some(claim))` if the caller claimed the namespace and must
+/// load it, then release the claim with [`LoadClaim::finish`].
+/// Returns `Ok(None)` if another computation loaded it while we waited.
+/// Returns `Err` on a genuine circular require (same computation), or when
+/// waiting would block the isolate thread on one of its own parked fibers.
+pub(crate) fn claim_or_wait<'a>(
+    globals: &'a GlobalEnv,
+    ns_name: &Arc<str>,
+) -> EvalResult<Option<LoadClaim<'a>>> {
+    let me = Realizer::current();
     loop {
+        // Register before checking so a release between the check and the
+        // wait is not missed.
+        let listener = globals.loading_done.listen();
         let mut loading = globals.loading.lock().unwrap();
         match loading.get(ns_name.as_ref()) {
             None => {
-                loading.insert(ns_name.clone(), tid);
-                return Ok(true);
+                // The previous owner may have finished between our
+                // `is_loaded` check and taking the lock.
+                if globals.is_loaded(ns_name) {
+                    return Ok(None);
+                }
+                loading.insert(ns_name.clone(), me);
+                return Ok(Some(LoadClaim {
+                    globals,
+                    ns_name: ns_name.clone(),
+                }));
             }
-            Some(&owner) if owner == tid => {
+            Some(&owner) if owner == me => {
                 return Err(EvalError::Runtime(format!("circular require: {ns_name}")));
             }
-            Some(_) => {
-                // A different thread is loading this namespace.  Wait for it
-                // to finish (the Condvar releases `loading` while sleeping).
-                let _guard = globals.loading_done.wait(loading).unwrap();
-                // After waking, the namespace may now be fully loaded.
+            Some(&owner) => {
+                // Another thread or fiber is loading this namespace.  Wait
+                // for it to finish; never hold `loading` across the wait.
+                owner.ensure_can_wait().map_err(EvalError::Runtime)?;
+                drop(loading);
+                listener.wait(None);
                 if globals.is_loaded(ns_name) {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                // Otherwise loop and try to claim again.
+                // The load failed or was abandoned: loop and try to claim.
             }
         }
     }
