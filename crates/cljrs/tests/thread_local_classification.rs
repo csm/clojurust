@@ -76,6 +76,13 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
     ),
     // ── cljrs-gc ────────────────────────────────────────────────────────────
     (
+        "cljrs-gc/src/fiber.rs",
+        "NATIVE_STACK_LIMIT",
+        Thread(
+            "running fiber's stack limit; the scheduler sets it on every resume and restores it after",
+        ),
+    ),
+    (
         "cljrs-gc/src/lib.rs",
         "ALLOC_ROOTS",
         FiberWhen("cljrs-gc/ALLOC_ROOTS", !NO_GC),
