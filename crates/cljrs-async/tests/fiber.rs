@@ -367,3 +367,67 @@ fn cancellation_releases_fiber_scratch_regions() {
         assert_eq!(dropped.get(), 2);
     });
 }
+
+/// `drive_until` gives a host a bounded slice: it returns at the deadline
+/// while a spawned fiber is still parked, ready fibers run during each slice,
+/// and the parked one resumes in a later slice once its wait is over.
+#[test]
+fn drive_until_runs_fibers_for_a_bounded_slice() {
+    use std::time::{Duration, Instant};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+    let ticks = Rc::new(Cell::new(0u32));
+    let woke = Rc::new(Cell::new(false));
+    let (t, w) = (ticks.clone(), woke.clone());
+    local.spawn_local(async move {
+        fiber::spawn(move || {
+            fiber::park_on(tokio::time::sleep(Duration::from_millis(200)));
+            w.set(true);
+            Ok(Value::Nil)
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    });
+    local.spawn_local(async move {
+        fiber::spawn(move || {
+            loop {
+                fiber::park_on(tokio::time::sleep(Duration::from_millis(5)));
+                t.set(t.get() + 1);
+            }
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    });
+
+    let started = Instant::now();
+    let mut longest = Duration::ZERO;
+    while !woke.get() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "fiber never woke"
+        );
+        let turn = Instant::now();
+        fiber::drive_until(&rt, &local, &mut carrier, turn + Duration::from_millis(10));
+        longest = longest.max(turn.elapsed());
+    }
+    assert!(
+        longest < Duration::from_millis(100),
+        "a slice took {longest:?}"
+    );
+    assert!(
+        ticks.get() > 3,
+        "the looping fiber ran {} times",
+        ticks.get()
+    );
+    // A deadline already past returns at once.
+    let turn = Instant::now();
+    fiber::drive_until(&rt, &local, &mut carrier, turn);
+    assert!(turn.elapsed() < Duration::from_millis(100));
+    fiber::drop_local_with_carrier(local, &mut carrier);
+}

@@ -12,15 +12,17 @@ default = ["regex-full", "deps"]
 # Regex engine and pass-throughs. Every workspace dependency below is taken
 # with default features off (see the note in the root Cargo.toml), so what
 # their defaults used to provide is re-exported here and kept in `default`.
-regex-full  = ["cljrs-value/regex-full", "cljrs-runtime/regex-full"]
-small-regex = ["cljrs-value/small-regex", "cljrs-runtime/small-regex"]
+regex-full  = ["cljrs-value/regex-full", "cljrs-runtime/regex-full", "cljrs-async/regex-full"]
+small-regex = ["cljrs-value/small-regex", "cljrs-runtime/small-regex", "cljrs-async/small-regex"]
 
 # Pass-through for cljrs-runtime's git-backed dependency support.
-deps = ["cljrs-runtime/deps"]
-no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-runtime/no-gc"]
+deps = ["cljrs-runtime/deps", "cljrs-async/deps"]
+no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-runtime/no-gc", "cljrs-async/no-gc"]
 
 [dependencies]
 cljrs-runtime = { workspace = true }
+# Fibers for `Poller::spawn_pending`.
+cljrs-async    = { workspace = true }
 cljrs-gc       = { workspace = true }
 cljrs-value    = { workspace = true }
 cljrs-reader   = { workspace = true }

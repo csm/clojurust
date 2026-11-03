@@ -39,8 +39,11 @@ mod engine;
 pub mod protocol;
 mod server;
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -183,7 +186,7 @@ impl Server {
     /// Like [`Server::serve`], but every top-level form is evaluated through
     /// `eval_form`, letting the caller drive async forms on its own runtime.
     pub fn serve_with(mut self, mut eval_form: impl EvalForm) -> miette::Result<()> {
-        let mut engine = engine::Engine::new(self.globals.clone());
+        let engine = engine::Engine::new(self.globals.clone());
         // recv() errors once every job sender is gone, i.e. the network
         // thread (and all its connection tasks) has shut down.
         while let Ok(job) = self.job_rx.recv() {
@@ -201,10 +204,11 @@ impl Server {
     /// Turn the server into a [`Poller`] for an interpreter thread that also
     /// serves other work. Same thread rule as [`Server::serve`].
     pub fn into_poller(self) -> Poller {
-        let engine = engine::Engine::new(self.globals.clone());
+        let engine = Rc::new(engine::Engine::new(self.globals.clone()));
         Poller {
             server: self,
             engine,
+            lanes: Rc::default(),
         }
     }
 }
@@ -227,11 +231,41 @@ pub enum PollStatus {
 /// itself. A `Poller` handles only the jobs already queued and returns, so
 /// the host interleaves them with its own work.
 ///
+/// There are two ways to handle a job:
+///
+/// - [`Poller::poll`] / [`Poller::poll_timeout`] run each job to completion
+///   before returning. An eval that waits (`Thread/sleep`, a channel take,
+///   `@(future ...)`) holds the host for the whole wait, even when the wait
+///   parks a fiber and leaves the isolate free.
+/// - [`Poller::spawn_pending`] starts each job on a fiber on the host's
+///   `LocalSet` and returns at once. The host drives that `LocalSet` as it
+///   already does (for example with [`cljrs_async::fiber::drive_until`] once
+///   per frame), and replies are sent as the fibers run. A parked eval then
+///   costs the host nothing.
+///
+/// Either way, jobs for one session run one at a time, in arrival order.
+/// Spawned jobs for different sessions can interleave at parks. The two
+/// modes can be mixed: while a session has spawned jobs in flight, `poll`
+/// queues that session's new jobs behind them instead of running them.
+///
 /// Dropping it shuts the server down: the network thread stops, its thread
 /// is joined, and the port file is removed.
 pub struct Poller {
     server: Server,
-    engine: engine::Engine,
+    engine: Rc<engine::Engine>,
+    lanes: Rc<Lanes>,
+}
+
+/// Jobs waiting behind a session's in-flight spawned job, by lane key. A key
+/// is present exactly while a lane task for it is alive on the `LocalSet`.
+type Lanes = RefCell<HashMap<String, VecDeque<Job>>>;
+
+/// The ordering key of a job: its session, or the shared default session.
+fn lane_key(job: &Job) -> String {
+    job.req
+        .session
+        .clone()
+        .unwrap_or_else(|| "default".to_string())
 }
 
 impl Poller {
@@ -248,7 +282,7 @@ impl Poller {
     pub fn poll(&mut self, eval_form: &mut impl EvalForm) -> PollStatus {
         loop {
             match self.server.job_rx.try_recv() {
-                Ok(job) => self.engine.handle(job, eval_form),
+                Ok(job) => self.handle_now(job, eval_form),
                 Err(mpsc::TryRecvError::Empty) => return PollStatus::Open,
                 Err(mpsc::TryRecvError::Disconnected) => return PollStatus::Closed,
             }
@@ -265,12 +299,162 @@ impl Poller {
     ) -> PollStatus {
         match self.server.job_rx.recv_timeout(timeout) {
             Ok(job) => {
-                self.engine.handle(job, eval_form);
+                self.handle_now(job, eval_form);
                 self.poll(eval_form)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => PollStatus::Open,
             Err(mpsc::RecvTimeoutError::Disconnected) => PollStatus::Closed,
         }
+    }
+
+    /// Run `job` on this thread now, unless its session has spawned jobs in
+    /// flight; then it waits its turn behind them.
+    fn handle_now(&mut self, job: Job, eval_form: &mut impl EvalForm) {
+        let job = match self.lanes.borrow_mut().get_mut(&lane_key(&job)) {
+            Some(queue) => {
+                queue.push_back(job);
+                return;
+            }
+            None => job,
+        };
+        self.engine.handle(job, eval_form);
+    }
+
+    /// Start every job queued right now on a fiber on `local`, without
+    /// running any of them, and return.
+    ///
+    /// Nothing is evaluated until the host drives `local` (with
+    /// [`cljrs_async::fiber::drive_until`], [`cljrs_async::fiber::run_root`],
+    /// or its own `block_on`). Each job's replies are sent from its fiber as
+    /// it runs. Jobs for one session run in order, each after the previous
+    /// one completes; jobs for different sessions may interleave whenever
+    /// one parks. `interrupt` works as with [`Poller::poll`], including for
+    /// an eval parked on a wait.
+    ///
+    /// `eval_form` runs inside a fiber, so it must not start a root drive
+    /// itself: pass [`cljrs_runtime::tiered::eval`] (or a wrapper around
+    /// it), not an evaluator built on [`cljrs_async::fiber::run_root`]. Waits
+    /// inside the form park its fiber.
+    ///
+    /// Each job gets a fiber stack of the default size (see
+    /// `CLJRS_FIBER_STACK_KB`), not the 64 MiB a root drive gets, so very
+    /// deep non-tail recursion reaches its depth limit sooner than under
+    /// [`Poller::poll`] with a `run_root` evaluator.
+    pub fn spawn_pending<F>(&mut self, local: &tokio::task::LocalSet, eval_form: F) -> PollStatus
+    where
+        F: EvalForm + Clone + 'static,
+    {
+        loop {
+            match self.server.job_rx.try_recv() {
+                Ok(job) => self.spawn_job(local, job, &eval_form),
+                Err(mpsc::TryRecvError::Empty) => return PollStatus::Open,
+                Err(mpsc::TryRecvError::Disconnected) => return PollStatus::Closed,
+            }
+        }
+    }
+
+    /// Queue `job` on its session's lane, starting a lane task on `local`
+    /// when the session has none.
+    fn spawn_job<F>(&mut self, local: &tokio::task::LocalSet, job: Job, eval_form: &F)
+    where
+        F: EvalForm + Clone + 'static,
+    {
+        let key = lane_key(&job);
+        {
+            let mut lanes = self.lanes.borrow_mut();
+            if let Some(queue) = lanes.get_mut(&key) {
+                queue.push_back(job);
+                return;
+            }
+            lanes.insert(key.clone(), VecDeque::from([job]));
+        }
+        // Closes the lane when the task ends, or when the `LocalSet` drops
+        // it unfinished, so later jobs for the session are not stranded
+        // behind a lane that no longer runs.
+        struct LaneGuard {
+            lanes: Rc<Lanes>,
+            key: String,
+        }
+        impl Drop for LaneGuard {
+            fn drop(&mut self) {
+                if let Ok(mut lanes) = self.lanes.try_borrow_mut() {
+                    lanes.remove(&self.key);
+                }
+            }
+        }
+        let guard = LaneGuard {
+            lanes: self.lanes.clone(),
+            key,
+        };
+        let engine = self.engine.clone();
+        let eval_form = eval_form.clone();
+        local.spawn_local(async move {
+            loop {
+                let next = guard
+                    .lanes
+                    .borrow_mut()
+                    .get_mut(&guard.key)
+                    .and_then(VecDeque::pop_front);
+                let Some(job) = next else { break };
+                run_on_fiber(engine.clone(), job, eval_form.clone()).await;
+            }
+            drop(guard);
+        });
+    }
+}
+
+/// Handle one job on a new fiber and wait for it.
+async fn run_on_fiber<F>(engine: Rc<engine::Engine>, job: Job, mut eval_form: F)
+where
+    F: EvalForm + 'static,
+{
+    // Kept to answer the request if the fiber ends without finishing it
+    // (it could not be created, or it unwound).
+    let req = job.req.clone();
+    let replies = job.replies.clone();
+    let cancelled = job.cancelled.clone();
+    let pending_key = job.pending_key.clone();
+    let pending = job.pending.clone();
+    let finished = Rc::new(std::cell::Cell::new(false));
+    let done = finished.clone();
+    let failure = match cljrs_async::fiber::Fiber::new(move || {
+        engine.handle(job, &mut eval_form);
+        done.set(true);
+        Ok(Value::Nil)
+    }) {
+        Ok(fiber) => fiber.into_task().await.err(),
+        Err(e) => Some(e),
+    };
+    if finished.get() {
+        return;
+    }
+    let sid = req.session.clone().unwrap_or_default();
+    let status: &[&str] = if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        &["interrupted"]
+    } else {
+        let msg = failure.map_or_else(
+            || "nrepl: job did not finish".to_string(),
+            |e| e.to_string(),
+        );
+        let _ = replies.send(
+            protocol::Response::for_request(&req, &sid)
+                .str_field("err", format!("{msg}\n"))
+                .build(),
+        );
+        &["eval-error"]
+    };
+    let _ = replies.send(
+        protocol::Response::for_request(&req, &sid)
+            .status(status)
+            .build(),
+    );
+    let _ = replies.send(
+        protocol::Response::for_request(&req, &sid)
+            .status(&["done"])
+            .build(),
+    );
+    if let Some(key) = &pending_key {
+        pending.remove(key);
     }
 }
 

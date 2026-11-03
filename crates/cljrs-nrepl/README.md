@@ -18,11 +18,20 @@ Supported ops: `clone`, `close`, `describe`, `eval`, `interrupt`, `load-file`, `
 
 `eval` and `load-file` stream `out` messages while a form runs: printed text is sent at each newline, whenever 1 KiB is pending without one, and when the form ends. This holds for `serve`, `serve_with` and `Poller` alike, since all three run the same engine.
 
+### Hosts that own their loop: `Poller`
+
+`Server::into_poller()` returns a `Poller` for an interpreter thread that also runs its own loop. It has two modes, which can be mixed:
+
+- `poll(&mut eval_form)` / `poll_timeout(&mut eval_form, timeout)` run every queued job to completion before returning. An eval that waits holds the host for the whole wait, even when the wait only parks a fiber.
+- `spawn_pending(&local, eval_form)` starts every queued job on a fiber on the host's `LocalSet` and returns at once; nothing runs until the host drives `local` (typically `cljrs_async::fiber::drive_until(rt, &local, &mut carrier, deadline)` once per frame). Replies are sent from the fibers as they run, so an eval parked on `Thread/sleep`, a channel take, an HTTP fetch or `@(future ...)` costs the host nothing. `eval_form` runs inside the fiber, so pass `cljrs_runtime::tiered::eval` (or a wrapper), never an evaluator that calls `run_root`. Each job gets a default-size fiber stack (`CLJRS_FIBER_STACK_KB`), not a 64 MiB root stack.
+
+Jobs for one session run one at a time, in arrival order, in both modes; spawned jobs for different sessions interleave at parks. While a session has spawned jobs in flight, `poll` queues that session's new jobs behind them. Requests with no session share the `"default"` session's order.
+
 Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, bound via the dynamic-binding stack around each request. Retained values are interned in the hidden `cljrs.nrepl.session-state` namespace so the GC traces them between evals.
 
 ### Limitations
 
-- **Interrupt is cooperative.** While an `eval`/`load-file` runs, its cancel flag is installed on the runtime's execution-credit (gas) meter (`cljrs_runtime::env::gas::InterruptGuard`). An `interrupt` sets the flag from the network thread with `gas::request_interrupt`, and the running code stops at its next checkpoint: every tree-walker eval step, every IR basic block, and the JIT's credit checks. An eval parked on a fiber wait (`(deref (promise))`, `Thread/sleep`, `<!!`, `@(future ...)`, `blocking`) is woken and stops at the park point. So a `(loop [] (recur))`, a non-terminating function, or a deep non-tail recursion is stopped mid-form, a `try`/`catch` cannot swallow it, and the session keeps working afterwards. This applies equally to `serve`, `serve_with` and the `Poller` (the eval runs inside `poll`, and the network thread interrupts it there). The eval answers `status ["interrupted"]` and then `["done"]`. The `interrupt` request answers `["done"]`, `["session-idle","done"]` when nothing is in flight in that session, or `["interrupt-id-mismatch","done"]` when `interrupt-id` names no in-flight request. A queued request that is interrupted is dropped without being evaluated.
+- **Interrupt is cooperative.** While an `eval`/`load-file` runs, its cancel flag is installed on the runtime's execution-credit (gas) meter (`cljrs_runtime::env::gas::InterruptGuard`). An `interrupt` sets the flag from the network thread with `gas::request_interrupt`, and the running code stops at its next checkpoint: every tree-walker eval step, every IR basic block, and the JIT's credit checks. An eval parked on a fiber wait (`(deref (promise))`, `Thread/sleep`, `<!!`, `@(future ...)`, `blocking`) is woken and stops at the park point. So a `(loop [] (recur))`, a non-terminating function, or a deep non-tail recursion is stopped mid-form, a `try`/`catch` cannot swallow it, and the session keeps working afterwards. This applies equally to `serve`, `serve_with` and the `Poller` (the eval runs inside `poll`, or on its fiber after `spawn_pending`, and the network thread interrupts it there). The eval answers `status ["interrupted"]` and then `["done"]`. The `interrupt` request answers `["done"]`, `["session-idle","done"]` when nothing is in flight in that session, or `["interrupt-id-mismatch","done"]` when `interrupt-id` names no in-flight request. A queued request that is interrupted is dropped without being evaluated.
   **Not interruptible:** time spent inside a single native call that does not return to evaluated code: blocking I/O (socket/file/stdin reads), sleeping, waiting on a lock, promise or future, and long-running Rust builtins (for example sorting or hashing a huge collection in one call). The interrupt takes effect when the call returns and evaluation reaches its next checkpoint. The flag is thread-local to the evaluating thread, so work the eval hands to other threads (`future`, agents, or tasks a `serve_with` evaluator runs on a different thread) keeps running; only the eval itself is stopped. Async tasks on the eval's own thread are scoped the same way: a task stops only when the eval that spawned it is interrupted, not when it happens to be polled while a different, interrupted eval drives the executor. Work already done is not rolled back: side effects and `def`s made before the interrupt remain.
 - **No `err` stream for user output.** cljrs has no stderr writer for user code (`*err*` is unbound and every print goes to `*out*`), so only `out` is streamed; `err` carries evaluation errors only. Text printed inside `with-out-str` is captured by it and not streamed.
 - **`macroexpand`:** `print-meta` is ignored.
@@ -33,7 +42,7 @@ Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, boun
 
 | File | Purpose |
 |---|---|
-| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, the `Job` bridge type |
+| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, `Poller` (with the per-session lanes behind `spawn_pending`), `PollStatus`, the `Job` bridge type |
 | `src/bencode.rs` | Hand-rolled bencode codec (the nREPL subset) with incremental decoding for TCP framing |
 | `src/protocol.rs` | `Request` decoding and the `Response` builder |
 | `src/server.rs` | Network thread: accept loop, per-connection reader/writer tasks, `describe`/`interrupt`, in-flight registry |
@@ -48,6 +57,12 @@ Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, boun
 - `Server::serve(self) -> miette::Result<()>` — blocks the calling (interpreter) thread processing requests until shutdown; evaluates with `cljrs_runtime::tiered::eval`.
 - `Server::serve_with(self, eval_form: impl EvalForm) -> miette::Result<()>` — like `serve`, but each top-level form goes through the supplied evaluator (the CLI passes its async `LocalSet` driver).
 - `Server::shutdown_handle(&self) -> ShutdownHandle` — `Send + Clone`; `shutdown()` stops the network thread and ends `serve`.
+- `Server::into_poller(self) -> Poller` — non-blocking driver for a host with its own loop (see above). Dropping it shuts the server down.
+- `Poller::port`, `Poller::shutdown_handle`
+- `Poller::poll(&mut self, eval_form: &mut impl EvalForm) -> PollStatus` — handle every queued job now.
+- `Poller::poll_timeout(&mut self, eval_form: &mut impl EvalForm, timeout: Duration) -> PollStatus` — wait up to `timeout` for a job, then handle everything queued.
+- `Poller::spawn_pending<F: EvalForm + Clone + 'static>(&mut self, local: &LocalSet, eval_form: F) -> PollStatus` — start every queued job on a fiber on `local` and return; per-session order is kept.
+- `enum PollStatus { Open, Closed }` — `Closed` once the server has shut down.
 - `trait EvalForm: FnMut(&Form, &mut Env) -> Result<Value, EvalError>` — evaluator signature for `serve_with`.
 - `mod bencode` — `Bencode`, `encode`, `encode_to_vec`, `decode` (public for tests/clients).
 - `mod protocol` — `Request`, `Response`.

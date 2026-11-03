@@ -279,6 +279,14 @@ and restores that state on return. The caller retains `carrier: MutatorState`
 between drives on the same LocalSet. This state holds roots for pending async tasks.
 The caller also installs this carrier state while destroying the LocalSet.
 
+`drive_until(rt, local, carrier, deadline: Instant)` drives the LocalSet's tasks
+with `carrier` installed until `deadline`, then returns. It is for a host that owns
+its loop (a UI frame, say) and gives the isolate a slice per turn: spawned fibers,
+`go` loops and `cljrs_nrepl::Poller::spawn_pending` jobs run during the slice and stay
+parked or queued between slices. Unlike `run_root(..., || { park_on(sleep(budget)); ... })`
+it allocates no root fiber. `rt` needs its time driver. Call it outside the runtime and
+outside any fiber, with the same `carrier` as every other drive of `local`.
+
 `eval_form(form, env).await -> FiberResult` evaluates one form on a new fiber from async
 code that already runs on the LocalSet. It replaces the native `eval_async` entry point.
 The fiber uses a fresh environment for `env`'s globals and namespace, copies a namespace

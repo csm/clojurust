@@ -857,6 +857,40 @@ pub fn run_root(
     result
 }
 
+/// Drive the tasks on `local` until `deadline`, with `carrier` installed, and
+/// return. For a host that owns the thread's loop (a UI frame, say) and gives
+/// the isolate a slice of each turn: fibers and `go` loops spawned on `local`
+/// (including nREPL jobs from `cljrs_nrepl::Poller::spawn_pending`) run
+/// during the slice and stay parked or queued between slices.
+///
+/// Returns at `deadline` even when tasks are still ready, and at once when
+/// `deadline` has passed (after one poll of the ready tasks). Use the same
+/// `carrier` for every drive of `local`, as with [`run_root`]: it holds the
+/// executor's task roots between drives. `rt` must have its time driver
+/// enabled. Call outside the Tokio runtime and outside any fiber.
+pub fn drive_until(
+    rt: &tokio::runtime::Runtime,
+    local: &tokio::task::LocalSet,
+    carrier: &mut MutatorState,
+    deadline: std::time::Instant,
+) {
+    assert!(current().is_none(), "drive_until called inside a fiber");
+    // The carrier's state (task roots, failure-report registry) is current
+    // while tasks run; the host's is restored afterwards, even on a panic.
+    struct Restore<'a>(&'a mut MutatorState);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            run_deferred_cancels();
+            self.0.swap_with_current();
+        }
+    }
+    carrier.swap_with_current();
+    let _restore = Restore(carrier);
+    // The timer is built inside the runtime: it needs the time driver.
+    let deadline = tokio::time::Instant::from_std(deadline);
+    local.block_on(rt, async move { tokio::time::sleep_until(deadline).await });
+}
+
 /// Destroy local tasks with their carrier state installed, restoring the caller
 /// even if task destruction unwinds.
 pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut MutatorState) {
