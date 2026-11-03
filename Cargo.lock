@@ -959,6 +959,7 @@ dependencies = [
 name = "cljrs-nrepl"
 version = "0.1.0"
 dependencies = [
+ "cljrs-async",
  "cljrs-gc",
  "cljrs-reader",
  "cljrs-runtime",
