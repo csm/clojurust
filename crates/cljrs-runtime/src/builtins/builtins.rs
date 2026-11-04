@@ -47,19 +47,27 @@ use std::time::Duration;
 
 /// One entry of the capture stack: a buffer, plus an optional sink that
 /// receives the buffered text incrementally (streamed capture).
+#[derive(Default)]
 struct OutputCapture {
     buf: String,
     sink: Option<Box<dyn FnMut(&str)>>,
 }
+
+/// A capture-stack entry. Entries are shared handles so a fiber spawned
+/// inside a capture (`future`, `thread`, `go`, ...) can be handed the
+/// enclosing entries and print into the same buffer or streaming sink, the
+/// way the JVM conveys the `*out*` binding. All fibers of a scheduler run on
+/// one OS thread, so `Rc` suffices.
+type CaptureEntry = std::rc::Rc<std::cell::RefCell<OutputCapture>>;
 
 /// A streamed capture flushes once its buffer holds this many bytes, even
 /// without a newline.
 const STREAM_FLUSH_THRESHOLD: usize = 1024;
 
 thread_local! {
-    static OUTPUT_CAPTURE: std::cell::RefCell<Vec<OutputCapture>> = const { std::cell::RefCell::new(Vec::new()) };
+    static OUTPUT_CAPTURE: std::cell::RefCell<Vec<CaptureEntry>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-cljrs_gc::mutator_slot!("cljrs-runtime/OUTPUT_CAPTURE", refcell OUTPUT_CAPTURE: Vec<OutputCapture>);
+cljrs_gc::mutator_slot!("cljrs-runtime/OUTPUT_CAPTURE", refcell OUTPUT_CAPTURE: Vec<CaptureEntry>);
 
 // BigDecimal precision
 
@@ -119,23 +127,17 @@ fn apply_precision_or_default(result: BigDecimal) -> ValueResult<BigDecimal> {
     })
 }
 
-/// Push a new capture buffer onto the stack.
-pub fn push_output_capture() {
+fn push_capture_entry(entry: OutputCapture) {
     OUTPUT_CAPTURE.with(|stack| {
-        stack.borrow_mut().push(OutputCapture {
-            buf: String::new(),
-            sink: None,
-        })
+        stack
+            .borrow_mut()
+            .push(std::rc::Rc::new(std::cell::RefCell::new(entry)))
     });
 }
 
-/// Push `buf` as the capture buffer, continuing a capture previously taken off
-/// the stack with [`pop_output_capture`]. The async evaluator uses this to keep
-/// a `with-out-str` buffer installed only while its own task is being polled.
-/// Only the plain (non-streamed) capture it pushed round-trips this way; a
-/// streamed capture below it on the stack is never popped by that evaluator.
-pub fn resume_output_capture(buf: String) {
-    OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().push(OutputCapture { buf, sink: None }));
+/// Push a new capture buffer onto the stack.
+pub fn push_output_capture() {
+    push_capture_entry(OutputCapture::default());
 }
 
 /// Push a *streamed* capture: output written while it is the top of the
@@ -143,12 +145,14 @@ pub fn resume_output_capture(buf: String) {
 /// [`STREAM_FLUSH_THRESHOLD`] bytes are pending, and when the capture is
 /// popped. A nested [`push_output_capture`] (e.g. `with-out-str`) still
 /// captures its own output without streaming it.
+///
+/// Fibers spawned while the capture is active keep streaming into `sink`
+/// even after it is popped here, as JVM output written to a conveyed `*out*`
+/// does; the sink is dropped once the last such fiber finishes.
 pub fn push_streaming_output_capture(sink: Box<dyn FnMut(&str)>) {
-    OUTPUT_CAPTURE.with(|stack| {
-        stack.borrow_mut().push(OutputCapture {
-            buf: String::new(),
-            sink: Some(sink),
-        })
+    push_capture_entry(OutputCapture {
+        buf: String::new(),
+        sink: Some(sink),
     });
 }
 
@@ -157,50 +161,109 @@ pub fn push_streaming_output_capture(sink: Box<dyn FnMut(&str)>) {
 /// string is empty.
 pub fn pop_output_capture() -> Option<String> {
     let top = OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().pop())?;
-    match top.sink {
-        None => Some(top.buf),
+    let (buf, sink) = {
+        let mut entry = top.borrow_mut();
+        let buf = std::mem::take(&mut entry.buf);
+        (buf, entry.sink.take())
+    };
+    match sink {
+        None => Some(buf),
         Some(mut sink) => {
-            if !top.buf.is_empty() {
-                sink(&top.buf);
+            if !buf.is_empty() {
+                sink(&buf);
+            }
+            // Leave the sink installed for fibers still holding this entry.
+            let mut entry = top.borrow_mut();
+            if entry.sink.is_none() {
+                entry.sink = Some(sink);
             }
             Some(String::new())
         }
     }
 }
 
+/// A capture entry taken off the stack by [`suspend_output_capture`], to be
+/// put back with [`SuspendedOutputCapture::resume`]. The entry keeps its
+/// identity, so fibers spawned while it was installed keep writing to it.
+pub struct SuspendedOutputCapture(CaptureEntry);
+
+impl SuspendedOutputCapture {
+    /// Push this entry back onto the current capture stack.
+    pub fn resume(&self) {
+        OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().push(self.0.clone()));
+    }
+
+    /// Take the captured text, ending the capture.
+    pub fn finish(self) -> String {
+        std::mem::take(&mut self.0.borrow_mut().buf)
+    }
+}
+
+/// Take the top capture entry off the stack without draining it. The async
+/// evaluator uses this to keep a `with-out-str` capture installed only while
+/// its own task is being polled.
+pub fn suspend_output_capture() -> Option<SuspendedOutputCapture> {
+    OUTPUT_CAPTURE
+        .with(|stack| stack.borrow_mut().pop())
+        .map(SuspendedOutputCapture)
+}
+
+/// The current fiber's capture stack, shared rather than copied, for
+/// conveying to a newly spawned fiber (see [`ConveyedOutputCapture::install`]).
+pub struct ConveyedOutputCapture(Vec<CaptureEntry>);
+
+/// Snapshot the active capture stack so a child fiber's output lands in the
+/// same buffers and streaming sinks as the spawning fiber's.
+pub fn convey_output_capture() -> ConveyedOutputCapture {
+    ConveyedOutputCapture(OUTPUT_CAPTURE.with(|stack| stack.borrow().clone()))
+}
+
+impl ConveyedOutputCapture {
+    /// Install the conveyed entries beneath anything already on the current
+    /// fiber's capture stack (normally empty at fiber start).
+    pub fn install(self) {
+        OUTPUT_CAPTURE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let mut entries = self.0;
+            entries.append(&mut stack);
+            *stack = entries;
+        });
+    }
+}
+
 /// Write to the current capture buffer if active, otherwise to stdout.
 /// Returns true if captured, false if written to stdout.
 fn capture_or_print(s: &str) -> bool {
-    // Take any chunk due for a streamed flush out of the stack, and call the
-    // sink with the stack unborrowed (the sink may run arbitrary code).
-    let due = OUTPUT_CAPTURE.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        let top = stack.last_mut()?;
-        top.buf.push_str(s);
-        top.sink.as_ref()?;
-        let cut = if top.buf.len() >= STREAM_FLUSH_THRESHOLD {
-            top.buf.len()
-        } else {
-            top.buf.rfind('\n').map(|i| i + 1)?
-        };
-        let rest = top.buf.split_off(cut);
-        let chunk = std::mem::replace(&mut top.buf, rest);
-        // Borrow the sink out while it runs.
-        let depth = stack.len();
-        let top = stack.last_mut()?;
-        top.sink.take().map(|sink| (chunk, sink, depth))
-    });
-    let Some((chunk, mut sink, depth)) = due else {
-        return OUTPUT_CAPTURE.with(|stack| !stack.borrow().is_empty());
+    let Some(top) = OUTPUT_CAPTURE.with(|stack| stack.borrow().last().cloned()) else {
+        return false;
     };
-    sink(&chunk);
-    OUTPUT_CAPTURE.with(|stack| {
-        if let Some(entry) = stack.borrow_mut().get_mut(depth - 1)
-            && entry.sink.is_none()
-        {
+    // Take any chunk due for a streamed flush out of the entry, and call the
+    // sink with the entry unborrowed (the sink may run arbitrary code).
+    let due = {
+        let mut entry = top.borrow_mut();
+        entry.buf.push_str(s);
+        if entry.sink.is_none() {
+            None
+        } else {
+            let cut = if entry.buf.len() >= STREAM_FLUSH_THRESHOLD {
+                Some(entry.buf.len())
+            } else {
+                entry.buf.rfind('\n').map(|i| i + 1)
+            };
+            cut.and_then(|cut| {
+                let rest = entry.buf.split_off(cut);
+                let chunk = std::mem::replace(&mut entry.buf, rest);
+                entry.sink.take().map(|sink| (chunk, sink))
+            })
+        }
+    };
+    if let Some((chunk, mut sink)) = due {
+        sink(&chunk);
+        let mut entry = top.borrow_mut();
+        if entry.sink.is_none() {
             entry.sink = Some(sink);
         }
-    });
+    }
     true
 }
 

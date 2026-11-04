@@ -109,6 +109,97 @@ fn blocking_surface_and_bindings_in_both_interpreters() {
 }
 
 #[test]
+fn output_capture_is_conveyed_to_spawned_fibers() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for mode in [
+                cljrs_runtime::ExecutionMode::TreeWalk,
+                cljrs_runtime::ExecutionMode::Tiered,
+            ] {
+                let runtime = cljrs_runtime::Runtime::builder()
+                    .execution_mode(mode)
+                    .build()
+                    .unwrap();
+                let globals = runtime.globals().clone();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async { cljrs_async::init(&globals) });
+                let mut carrier = MutatorState::fresh();
+                let g = globals.clone();
+                let result = fiber::run_root(&rt, &local, &mut carrier, move || {
+                    let mut env = Env::new(g, "user");
+                    let source = r#"
+                  (require '[clojure.core.async :as a])
+                  (assert (= "from future\n"
+                             (with-out-str @(future (println "from future")))))
+                  (assert (= "from thread\n"
+                             (with-out-str (a/<!! (a/thread (println "from thread"))))))
+                  (assert (= "from io-thread\n"
+                             (with-out-str (a/<!! (a/io-thread (println "from io-thread"))))))
+                  (assert (= "a\nb\n"
+                             (with-out-str (println "a") @(future (println "b")))))
+                  (assert (= ["inner\n" "outer\n"]
+                             (let [inner (atom nil)
+                                   outer (with-out-str
+                                           @(future (reset! inner (with-out-str (println "inner")))
+                                                    (println "outer")))]
+                               [@inner outer])))
+                  :passed
+                "#;
+                    let forms = cljrs_reader::Parser::new(source.into(), "<capture>".into())
+                        .parse_all()
+                        .unwrap();
+                    let mut result = Value::Nil;
+                    for form in forms {
+                        result = cljrs_runtime::tiered::eval(&form, &mut env)?;
+                    }
+                    Ok(result)
+                });
+                assert_eq!(result.unwrap().to_string(), ":passed");
+            }
+            // A streaming capture installed by the host (as nREPL does)
+            // receives output from fibers spawned under it.
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async { cljrs_async::init(&globals) });
+            let mut carrier = MutatorState::fresh();
+            let streamed = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+            let sink = streamed.clone();
+            cljrs_runtime::builtins::builtins::push_streaming_output_capture(Box::new(
+                move |text: &str| sink.borrow_mut().push_str(text),
+            ));
+            fiber::run_root(&rt, &local, &mut carrier, move || {
+                let mut env = Env::new(globals, "user");
+                let forms = cljrs_reader::Parser::new(
+                    "(require '[clojure.core.async :as a]) @(future (println \"streamed\")) (a/<!! (a/thread (println \"thread\")))".into(),
+                    "<stream>".into(),
+                )
+                .parse_all()
+                .unwrap();
+                for form in forms {
+                    cljrs_runtime::tiered::eval(&form, &mut env)?;
+                }
+                Ok(Value::Nil)
+            })
+            .unwrap();
+            assert_eq!(cljrs_runtime::builtins::builtins::pop_output_capture().unwrap(), "");
+            assert_eq!(&*streamed.borrow(), "streamed\nthread\n");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn root_restores_host_capture_and_preserves_background_roots_between_drives() {
     std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
         let runtime = cljrs_runtime::Runtime::builder().build().unwrap();

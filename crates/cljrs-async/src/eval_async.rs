@@ -643,17 +643,24 @@ async fn eval_binding_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// being polled and held here in between; output printed by other tasks while
 /// this one is suspended is not captured.
 async fn eval_with_out_str_async(body: &[Form], env: &mut Env) -> EvalResult {
-    use cljrs_runtime::builtins::builtins::{pop_output_capture, resume_output_capture};
-    let mut buf = String::new();
+    use cljrs_runtime::builtins::builtins::{push_output_capture, suspend_output_capture};
+    push_output_capture();
+    let mut capture = suspend_output_capture();
     let result = poll_scoped(
         Box::pin(eval_body_async(body, env)),
-        &mut buf,
-        |buf| resume_output_capture(std::mem::take(buf)),
-        |buf| *buf = pop_output_capture().unwrap_or_default(),
+        &mut capture,
+        |capture| {
+            if let Some(c) = capture {
+                c.resume()
+            }
+        },
+        |capture| *capture = suspend_output_capture(),
     )
     .await;
     result?;
-    Ok(Value::string(buf))
+    Ok(Value::string(
+        capture.map(|c| c.finish()).unwrap_or_default(),
+    ))
 }
 
 /// Drive `fut` to completion with thread-local state installed only for the

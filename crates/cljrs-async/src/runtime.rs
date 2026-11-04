@@ -139,9 +139,11 @@ pub(crate) fn conveyed_fiber(
     let bindings = dynamics::capture_current();
     let meters = gas::active_meters();
     let interrupts = gas::active_interrupts();
+    let output = cljrs_runtime::builtins::builtins::convey_output_capture();
     roots.extend(bindings.iter().flat_map(|frame| frame.values().cloned()));
     crate::fiber::Fiber::with_roots(roots, move || {
         dynamics::install_frames(bindings);
+        output.install();
         let _interrupts = gas::InterruptScope::enter(&interrupts);
         let _meters = gas::install_meters(&meters);
         body()
