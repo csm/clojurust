@@ -505,6 +505,31 @@ fn native_recursion_over_nested_data_throws_before_the_guard_page() {
           [(caught? #(pr-str deep)) (caught? #(str deep)) (caught? #(= deep other))
            (caught? #(hash deep)) (caught? #(compare vdeep vdeep))
            (= 203 (count (pr-str (nest 100))))])"#;
+    // The 32,000-level nesting must exceed the fiber stack, so pin a 1 MiB
+    // stack instead of the much larger default (#454): under ASan's opt-level
+    // 1 a 32 MiB stack holds `=` and `hash` at this depth, and at opt-level 1
+    // without ASan even 4 MiB holds `=`. Run in a child process so the
+    // override cannot leak into other tests in this binary.
+    const CHILD: &str = "CLJRS_NATIVE_OVERFLOW_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_recursion_over_nested_data_throws_before_the_guard_page",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STACK_KB", "1024")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
