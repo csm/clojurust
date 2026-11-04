@@ -90,7 +90,7 @@ the existing `LocalSet`, not a second executor.
 Stacks are `mmap`-reserved with a guard page and committed lazily by the OS, so a large
 reservation is cheap in physical memory. The tree-walker is stack-hungry (macro-heavy loading
 already needs 16 MB test threads), so the default reservation is configurable
-(`CLJRS_FIBER_STACK_KB`, default 1 MB for `io-thread`/`go`; the root fiber uses the main
+(`CLJRS_FIBER_STACK_KB`, default 16 MB for `io-thread`/`go`; the root fiber uses the main
 thread's size). Stacks are pooled and reused.
 
 ---
@@ -324,7 +324,7 @@ blocking FFI call) stalls every fiber on the isolate. Mitigations:
   `current` on native targets. Tokio's `LocalSet` drives each fiber on its isolate thread.
 - `park_on` keeps the future pinned on the fiber stack. The future can borrow local values.
   The driver polls it with the fiber's mutator state installed.
-- Stacks default to 1 MB. `CLJRS_FIBER_STACK_KB` has a 512 KB minimum; smaller settings are
+- Stacks default to 16 MB (32 MB in debug builds). `CLJRS_FIBER_STACK_KB` has a 512 KB minimum; smaller settings are
   clamped with a one-time warning. A process-wide pool keeps up to 32 finished stacks. Root entry points remain unchanged until Phase 3.
 - Each `MutatorState` registers weakly with its isolate. Slot callbacks trace saved shadow
   roots, allocation roots, regions, bindings, eval contexts, watch errors, and pending exceptions.

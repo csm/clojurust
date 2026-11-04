@@ -31,14 +31,19 @@ use cljrs_gc::fiber::StackReservation;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use scheduler::Scheduling;
 
-/// Default fiber stack reservation. `go` and `^:async` bodies run the
-/// tree-walker on fibers, and unoptimized builds use several times more stack
-/// per interpreter frame, so debug builds reserve 4 MiB. Pages are committed
-/// lazily, so the larger reservation costs address space, not memory.
+/// Default fiber stack reservation. `go`, `future`, `thread` and `^:async`
+/// bodies run on fibers. In release builds the default tiered mode uses about
+/// 3 KB of machine stack per Clojure call level and the pure tree-walker about
+/// 6 KB, so 16 MiB leaves room for about 5,000 (tiered) or 2,500 (tree-walk)
+/// levels of non-tail recursion after the 256 KiB safepoint margin; 1 MiB
+/// allowed only ~400 (#454). Unoptimized builds use an order of magnitude more
+/// stack per interpreter frame, so debug builds reserve 32 MiB. Pages are
+/// committed lazily (a parked fiber with a trivial body touches about 8 KB), so
+/// the larger reservation costs address space, not memory.
 #[cfg(not(debug_assertions))]
-const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+const DEFAULT_STACK_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(debug_assertions)]
-const DEFAULT_STACK_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_STACK_BYTES: usize = 32 * 1024 * 1024;
 const MAX_POOLED_STACKS: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static STACK_POOL: Mutex<Vec<(usize, DefaultStack, StackReservation)>> = Mutex::new(Vec::new());
