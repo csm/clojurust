@@ -267,8 +267,15 @@ Only waiting fibers are detected; a stall that delays only other async tasks is 
 stack bytes. The memory governor charges active and pooled reservations,
 including guard pages, as `fiber-stack`. These are virtual reservations, not
 resident memory measurements. Strict memory budgets must include the root's
-64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 1024, minimum 512).
+64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 16384 in release
+builds and 32768 in debug builds, minimum 512).
 
 A recursion error reports the fiber ID and remaining stack space. Safepoints
-keep a 256 KiB margin for interpreter frames and error construction. Native
+keep a 256 KiB margin for interpreter frames and error construction. In a
+release build the default 16 MiB stack allows about 5,000 levels of non-tail
+recursion inside a `go`, `future`, `thread` or `^:async` body (about 2,500 when
+everything runs in the tree-walker, which uses roughly 6 KB of stack per call
+level); the 64 MiB root allows roughly four times as many.
+Raise `CLJRS_FIBER_STACK_KB` for deeper recursion; reserved pages are committed
+lazily, so a larger reservation costs address space rather than memory. Native
 recursion that bypasses safepoints can still hit the fatal guard page.

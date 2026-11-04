@@ -452,6 +452,44 @@ fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
     }).unwrap().join().unwrap();
 }
 
+/// Issue #454: the default fiber stack must hold ordinary non-tail recursion
+/// (a 1 MiB default allowed only ~400 levels in release builds). Unoptimized
+/// interpreter frames are an order of magnitude larger, so debug builds check
+/// a shallower depth against their larger default.
+#[test]
+fn default_fiber_stack_holds_moderate_non_tail_recursion() {
+    const DEPTH: i64 = if cfg!(debug_assertions) { 400 } else { 2000 };
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap();
+            let form = cljrs_reader::Parser::new(
+                format!("(do (defn f [n] (if (zero? n) 0 (inc (f (dec n))))) (f {DEPTH}))"),
+                "<depth>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let task = Fiber::new(move || {
+                    cljrs_runtime::tiered::eval(
+                        &form,
+                        &mut Env::new(runtime.globals().clone(), "user"),
+                    )
+                })
+                .unwrap();
+                let value = task.into_task().await.unwrap();
+                assert_eq!(value, Value::Long(DEPTH));
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn native_recursion_over_nested_data_throws_before_the_guard_page() {
     // Printing, equality, hashing and comparison recurse in Rust without an
@@ -467,6 +505,31 @@ fn native_recursion_over_nested_data_throws_before_the_guard_page() {
           [(caught? #(pr-str deep)) (caught? #(str deep)) (caught? #(= deep other))
            (caught? #(hash deep)) (caught? #(compare vdeep vdeep))
            (= 203 (count (pr-str (nest 100))))])"#;
+    // The 32,000-level nesting must exceed the fiber stack, so pin a 1 MiB
+    // stack instead of the much larger default (#454): under ASan's opt-level
+    // 1 a 32 MiB stack holds `=` and `hash` at this depth, and at opt-level 1
+    // without ASan even 4 MiB holds `=`. Run in a child process so the
+    // override cannot leak into other tests in this binary.
+    const CHILD: &str = "CLJRS_NATIVE_OVERFLOW_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_recursion_over_nested_data_throws_before_the_guard_page",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STACK_KB", "1024")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {

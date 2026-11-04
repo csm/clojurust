@@ -306,7 +306,11 @@ is already set, or is raised with `gas::request_interrupt` while parked, the par
 as the uncatchable `Cancelled` error, so an interrupt stops a parked wait without a
 checkpoint. A fiber body that receives such an unwind returns `Err(EvalError::Cancelled)`.
 
-The default stack reservation is 1 MB. `CLJRS_FIBER_STACK_KB` sets the reservation, with a
+The default stack reservation is 16 MiB in release builds (32 MiB in debug builds), which
+allows about 5,000 levels of non-tail recursion in a `go`, `future`, `thread` or
+`^:async` body in a release build's default tiered mode (about 2,500 in pure tree-walk
+mode); the 64 MiB root allows roughly four times as many. Pages are committed lazily, so a parked fiber costs only the stack it touches.
+`CLJRS_FIBER_STACK_KB` sets the reservation, with a
 512 KB minimum. Smaller values are clamped to 512 KB with a one-time warning; unparseable values fail construction. A process-wide pool
 keeps up to 32 finished stacks for any carrier.
 Each active or pooled stack charges `MemoryClass::FiberStack` with a 64 KiB commit
