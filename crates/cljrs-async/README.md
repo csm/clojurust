@@ -290,7 +290,7 @@ outside any fiber, with the same `carrier` as every other drive of `local`.
 `eval_form(form, env).await -> FiberResult` evaluates one form on a new fiber from async
 code that already runs on the LocalSet. It replaces the native `eval_async` entry point.
 The fiber uses a fresh environment for `env`'s globals and namespace, copies a namespace
-change back into `env`, and conveys the caller's dynamic bindings, gas meters, and
+change back into `env`, and conveys the caller's dynamic bindings, gas meters, output capture, and
 interrupt flags. The result stays rooted across later yields until the `FiberResult` is
 consumed or dropped. `FiberResult::get(&self) -> &EvalResult` borrows it (borrow-only: a
 cloned value must not outlive the `FiberResult`); `into_result` takes it.
@@ -391,7 +391,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | File | Description |
 |---|---|
 | `src/lib.rs` | `init(globals)` entry point; registers `AsyncRuntimeImpl`, loads `clojure.rust.error`, and builds the `clojure.core.async` namespace |
-| `src/runtime.rs` | `AsyncRuntimeImpl`: `^:async` dispatch (a body fiber on native targets, `eval_async` on wasm32) and fiber call dispatch with binding, gas, and interrupt conveyance |
+| `src/runtime.rs` | `AsyncRuntimeImpl`: `^:async` dispatch (a body fiber on native targets, `eval_async` on wasm32) and fiber call dispatch with binding, gas, interrupt, and output-capture conveyance |
 | `src/state_machine.rs` | Compiled-async poll ABI (TODO.md Phase H, closed): `CljxStateMachine`, the C-ABI `PollFn` type and `POLL_*` codes, `check_ready`, `CompiledAsyncTask`, and test-only `spawn_state_machine`. `cljrs-compiler`'s `rt_abi` and codegen implement this ABI for `lower_async` unit coverage. No runtime dispatch path uses it: `^:async` calls run on fibers, and the poll-function registry was removed |
 | `src/fiber.rs` | Native stackful fibers, governed stack pool, parking, panic delivery, cancellation, and rooted results |
 | `src/fiber/scheduler.rs` | Safepoint time slices, ready-task wakers, stack-margin checks, native-frame names, and carrier watchdog |

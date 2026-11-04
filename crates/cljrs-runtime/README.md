@@ -1186,7 +1186,19 @@ Two thread-local stacks gained a resume operation for the same caller, which
 keeps `binding`/`with-out-str` state installed only while its own task is
 polled: `dynamics::take_frame(guard) -> HashMap<VarKey, Value>` pops a
 `binding` frame and returns it, and
-`builtins::builtins::resume_output_capture(buf)` pushes a capture buffer back.
+`builtins::builtins::suspend_output_capture() -> Option<SuspendedOutputCapture>`
+takes the top capture entry off the stack without draining it
+(`SuspendedOutputCapture::resume(&self)` pushes it back,
+`SuspendedOutputCapture::finish(self) -> String` takes the captured text).
+
+Capture-stack entries are shared handles, so output capture follows spawned
+fibers the way the JVM conveys `*out*`:
+`builtins::builtins::convey_output_capture() -> ConveyedOutputCapture`
+snapshots the stack and `ConveyedOutputCapture::install(self)` installs it in
+the child (cljrs-async's `conveyed_fiber` does both). Text a `future`,
+`thread` or `go` body prints therefore lands in the enclosing `with-out-str`
+buffer or nREPL streaming sink; a streaming sink stays live after
+`pop_output_capture` for fibers that still hold it.
 
 **The datatype, protocol and multimethod family is Clojure, not Rust.**
 `deftype`, `defrecord`, `reify`, `defprotocol`, `extend-type`,
