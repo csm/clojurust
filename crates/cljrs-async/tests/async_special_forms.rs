@@ -229,16 +229,32 @@ fn with_out_str_body_awaits() {
 }
 
 /// Output printed before and after a yield is captured; output printed by
-/// another task while this one is suspended is not.
+/// an unrelated task (spawned outside the capture) while this one is
+/// suspended is not.
 #[test]
 fn with_out_str_captures_only_its_own_task() {
-    let out = run("(def done (chan 1))
+    let out = run("(def start (chan 1))
+                   (def done (chan 1))
+                   (go (await (take! start)) (print \"-other-\") (await (put! done :ok)))
                    (with-out-str
                      (print \"a\")
-                     (go (print \"-other-\") (await (put! done :ok)))
+                     (await (put! start :go))
                      (await (take! done))
                      (print (await (take! ch))))");
     assert_eq!(out.as_deref(), Some("\"a42\""));
+}
+
+/// A go block spawned inside `with-out-str` inherits the capture, as a
+/// conveyed `*out*` binding does on the JVM (#453).
+#[test]
+fn with_out_str_captures_go_blocks_it_spawns() {
+    let out = run("(def done (chan 1))
+                   (with-out-str
+                     (print \"a\")
+                     (go (print \"-child-\") (await (put! done :ok)))
+                     (await (take! done))
+                     (print (await (take! ch))))");
+    assert_eq!(out.as_deref(), Some("\"a-child-42\""));
 }
 
 #[test]
