@@ -644,7 +644,9 @@ fiber could block on that same non-reentrant lock. Release the guard before
 `block_on`, `run_root`, or polling a fiber. Optional automatic yields use
 `can_park()` and defer instead.
 
-Each detached state registers weakly with its isolate. Collection traces saved slot values
+Each detached state registers weakly with its isolate. Registration is O(1) amortized:
+dead entries are swept at each collection, or by `MutatorState::fresh` once the registry
+has doubled since the last sweep. Collection traces saved slot values
 through callbacks declared with `mutator_slot!(..., trace trace_saved)`.
 The callback takes `&T` and `&mut MarkVisitor`.
 The scheduler keeps root addresses valid until it restores the state and unwinds the owning stack.

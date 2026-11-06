@@ -177,9 +177,46 @@ pub struct MutatorState {
 
 type SlotValues = Box<[Option<Box<dyn Any>>]>;
 
+/// Registry of every detached state on this isolate thread.
+///
+/// Weak entries never keep a finished fiber or its stack roots alive. Dead
+/// entries are swept lazily: [`MutatorState::fresh`] only sweeps once the list
+/// has doubled since the last sweep, so registration is O(1) amortized rather
+/// than O(live states) (issue #455).
+struct Detached {
+    states: Vec<Weak<RefCell<SlotValues>>>,
+    /// Length at which the next registration sweeps dead entries.
+    sweep_at: usize,
+}
+
+/// Smallest sweep threshold, so tiny lists are not swept on every push.
+const MIN_SWEEP_AT: usize = 64;
+
+impl Detached {
+    /// Recompute the sweep threshold after a sweep, from the surviving entries.
+    fn reset_threshold(&mut self) {
+        self.sweep_at = (self.states.len() * 2).max(MIN_SWEEP_AT);
+    }
+
+    fn register(&mut self, state: Weak<RefCell<SlotValues>>) {
+        if self.states.len() >= self.sweep_at {
+            self.states.retain(|w| w.strong_count() > 0);
+            self.reset_threshold();
+        }
+        self.states.push(state);
+    }
+}
+
 thread_local! {
-    // Weak entries never keep a finished fiber or its stack roots alive.
-    static DETACHED: RefCell<Vec<Weak<RefCell<SlotValues>>>> = const { RefCell::new(Vec::new()) };
+    static DETACHED: RefCell<Detached> = const {
+        RefCell::new(Detached { states: Vec::new(), sweep_at: MIN_SWEEP_AT })
+    };
+}
+
+/// Number of entries (live or not yet swept) in this thread's registry.
+#[cfg(test)]
+fn detached_len() -> usize {
+    DETACHED.with(|d| d.borrow().states.len())
 }
 
 /// Trace every detached state on this isolate thread, including a driver's
@@ -187,8 +224,9 @@ thread_local! {
 /// is unwound with its state installed and the state is dropped.
 #[cfg(not(feature = "no-gc"))]
 pub(crate) fn trace_suspended(visitor: &mut crate::MarkVisitor) {
-    DETACHED.with(|states| {
-        states.borrow_mut().retain(|weak| {
+    DETACHED.with(|detached| {
+        let mut detached = detached.borrow_mut();
+        detached.states.retain(|weak| {
             let Some(values) = weak.upgrade() else {
                 return false;
             };
@@ -199,6 +237,7 @@ pub(crate) fn trace_suspended(visitor: &mut crate::MarkVisitor) {
             }
             true
         });
+        detached.reset_threshold();
     });
 }
 
@@ -209,11 +248,7 @@ impl MutatorState {
         Self {
             values: {
                 let values = Rc::new(RefCell::new(values));
-                DETACHED.with(|states| {
-                    let mut states = states.borrow_mut();
-                    states.retain(|w| w.strong_count() > 0);
-                    states.push(Rc::downgrade(&values));
-                });
+                DETACHED.with(|detached| detached.borrow_mut().register(Rc::downgrade(&values)));
                 values
             },
             _not_send: PhantomData,
@@ -483,5 +518,22 @@ mod tests {
         let m = TrackedMutex::new(());
         let _g = m.lock().unwrap();
         assert_parkable();
+    }
+
+    #[test]
+    fn detached_registry_stays_bounded_by_live_states() {
+        // Dropped states are swept lazily; the registry never grows past
+        // roughly twice the number of live states (issue #455).
+        let live: Vec<MutatorState> = (0..100).map(|_| MutatorState::fresh()).collect();
+        for _ in 0..10_000 {
+            drop(MutatorState::fresh());
+        }
+        let len = detached_len();
+        assert!(len >= live.len());
+        assert!(
+            len <= 2 * (live.len() + 2) + MIN_SWEEP_AT,
+            "registry len {len}"
+        );
+        drop(live);
     }
 }
