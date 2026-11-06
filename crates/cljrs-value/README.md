@@ -694,6 +694,7 @@ impl Listener<'_> {
 }
 ```
 
+`Event` keeps registered wakers in a map keyed by listener id, so registering, updating and dropping a listener are O(1) however many fibers wait on it; `notify_all` wakes every current listener.
 Native fibers install the executor hooks once. This crate does not depend on Tokio.
 `park` accepts borrowed futures inside a fiber. `block_on` also supports notification futures outside a fiber with an OS-thread wait.
 `sleep` and `blocking` keep their direct behavior outside fibers.

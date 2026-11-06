@@ -470,20 +470,25 @@ Fiber cancellation is the separate, equally uncatchable `EvalError::Cancelled`.
 Exhaustion state is scoped per guard, so an exhausted inner evaluation cannot
 poison a healthy outer evaluation after the inner guard drops.
 
-The same checkpoints observe interrupt flags. `InterruptGuard::install(flag:
-Arc<AtomicBool>)` scopes a flag to an evaluation on the current thread; setting
-it from any thread fails the next `charge`, and `interrupt_requested() -> bool`
-tells an interrupt from real exhaustion. `active_interrupts() ->
-Vec<Arc<AtomicBool>>` captures the installed flags where an async task is
+The same checkpoints observe interrupt flags. `InterruptFlag` is an
+`AtomicBool` paired with its own wake `Event` (`InterruptFlag::new(set: bool)`,
+`is_set() -> bool`, `request()`). `InterruptGuard::install(flag:
+Arc<InterruptFlag>)` scopes a flag to an evaluation on the current thread;
+raising it from any thread fails the next `charge`, and `interrupt_requested()
+-> bool` tells an interrupt from real exhaustion. `active_interrupts() ->
+InterruptFlags` (`Arc<[Arc<InterruptFlag>]>`, an O(1) snapshot shared rather
+than copied) captures the installed flags where an async task or fiber is
 spawned, and `InterruptScope::enter(&flags)` makes them the only flags observed
 for the duration of one poll (restoring the previous ones on drop), so a task
 answers only to an interrupt of the evaluation that spawned it.
 
 A fiber parked on a wait reaches no checkpoint, so raise interrupts with
-`request_interrupt(flag: &AtomicBool)`: it sets the flag and wakes every parked
-wait. `async fn interrupted(flags: &[Arc<AtomicBool>])` completes once any of
-`flags` is set (never, for an empty slice); fiber parks race it against the
-awaited event and unwind as `Cancelled` when it wins.
+`InterruptFlag::request` (or `request_interrupt(flag: &InterruptFlag)`): it sets
+the flag and wakes only the waits parked under that flag, not every parked
+fiber in the process. `async fn interrupted(flags: &[Arc<InterruptFlag>])`
+completes once any of `flags` is set (never, for an empty slice), listening only
+on those flags' events; fiber parks race it against the awaited event and
+unwind as `Cancelled` when it wins.
 
 ### `policy` submodule
 

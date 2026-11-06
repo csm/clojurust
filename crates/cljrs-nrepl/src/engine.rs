@@ -8,7 +8,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
@@ -93,7 +92,7 @@ impl Engine {
             pending_key,
             pending,
         } = job;
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled.is_set() {
             // Interrupted while still queued: drop the work entirely.
             let sid = req.session.clone().unwrap_or_default();
             let _ = replies.send(
@@ -235,7 +234,7 @@ impl Engine {
         req: &Request,
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
     ) {
         let Some(code) = req.code.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
@@ -254,7 +253,7 @@ impl Engine {
         req: &Request,
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
     ) {
         let Some(file) = req.file.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
@@ -279,7 +278,7 @@ impl Engine {
         req: &Request,
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
         code: &str,
         filename: &str,
     ) {
@@ -335,7 +334,7 @@ impl Engine {
         for form in &forms {
             // Interrupted between top-level forms (a running form is stopped
             // by the interrupt flag installed on the gas meter, below).
-            if cancelled.load(Ordering::SeqCst) {
+            if cancelled.is_set() {
                 interrupted = true;
                 break;
             }
@@ -379,7 +378,7 @@ impl Engine {
                 // An interrupt unwinds as `GasExhausted`; any failure once the
                 // flag is set is reported as the interrupt (a native bridge
                 // may have wrapped the signal in another error).
-                Err(_) if cancelled.load(Ordering::SeqCst) => {
+                Err(_) if cancelled.is_set() => {
                     interrupted = true;
                     break;
                 }

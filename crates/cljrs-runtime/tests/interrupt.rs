@@ -3,12 +3,11 @@
 //! `GasExhausted` path.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cljrs_reader::Parser;
 use cljrs_runtime::env::error::EvalError;
-use cljrs_runtime::env::gas::{InterruptGuard, interrupt_requested};
+use cljrs_runtime::env::gas::{InterruptFlag, InterruptGuard, interrupt_requested};
 
 fn forms(src: &str) -> Vec<cljrs_reader::Form> {
     Parser::new(src.to_owned(), "<interrupt-test>".to_owned())
@@ -40,7 +39,7 @@ fn describe(result: Result<cljrs_value::Value, EvalError>) -> String {
 }
 
 fn interrupted_eval(setup: &'static str, call: &'static str) -> String {
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(InterruptFlag::new(false));
     let worker_flag = flag.clone();
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -62,7 +61,7 @@ fn interrupted_eval(setup: &'static str, call: &'static str) -> String {
         })
         .expect("spawn");
     std::thread::sleep(Duration::from_millis(200));
-    flag.store(true, Ordering::Relaxed);
+    flag.request();
     handle.join().expect("worker panicked")
 }
 
@@ -97,7 +96,7 @@ fn interrupt_unwinds_live_non_tail_recursion() {
 
 #[test]
 fn interrupt_stops_deep_non_tail_recursion() {
-    let flag = Arc::new(AtomicBool::new(true));
+    let flag = Arc::new(InterruptFlag::new(true));
     let result = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
@@ -123,21 +122,21 @@ fn interrupt_stops_deep_non_tail_recursion() {
 #[test]
 fn stale_flag_does_not_stop_next_eval() {
     let mut env = env();
-    let flag = Arc::new(AtomicBool::new(true));
+    let flag = Arc::new(InterruptFlag::new(true));
     {
         let _guard = InterruptGuard::install(flag.clone());
         let result = cljrs_runtime::tiered::eval(&forms("(loop [] (recur))").remove(0), &mut env);
         assert_eq!(describe(result), "interrupted");
     }
-    assert!(flag.load(Ordering::Relaxed), "the old flag stays set");
+    assert!(flag.is_set(), "the old flag stays set");
     {
         // A fresh job with its own (clear) flag, one that errors.
-        let _guard = InterruptGuard::install(Arc::new(AtomicBool::new(false)));
+        let _guard = InterruptGuard::install(Arc::new(InterruptFlag::new(false)));
         let result =
             cljrs_runtime::tiered::eval(&forms("(throw (ex-info \"x\" {}))").remove(0), &mut env);
         assert!(describe(result).starts_with("error"));
     }
-    let _guard = InterruptGuard::install(Arc::new(AtomicBool::new(false)));
+    let _guard = InterruptGuard::install(Arc::new(InterruptFlag::new(false)));
     let result = cljrs_runtime::tiered::eval(
         &forms("(loop [n 0] (if (< n 100000) (recur (inc n)) n))").remove(0),
         &mut env,
