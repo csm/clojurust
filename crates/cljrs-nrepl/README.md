@@ -27,6 +27,16 @@ Supported ops: `clone`, `close`, `describe`, `eval`, `interrupt`, `load-file`, `
 
 Jobs for one session run one at a time, in arrival order, in both modes; spawned jobs for different sessions interleave at parks. While a session has spawned jobs in flight, `poll` queues that session's new jobs behind them. Requests with no session share the `"default"` session's order.
 
+### Admission and resource limits
+
+`Config::limits` (`Limits`, all defaults generous) bounds the work and buffering one server accepts:
+
+- **Accepted jobs.** Every job counts from admission until it finishes (its final `done` reply) or is dropped: queued on the job channel, waiting behind its session, running, or parked on a fiber after `spawn_pending`. The network thread refuses a request that would exceed `max_pending_jobs` (default 1024) or, for its session, `max_session_jobs` (default 256), replying at once with `err` and status `["error" "overloaded" "done"]` instead of queueing it. The job channel, the session lanes and the set of spawned evaluations are therefore all bounded. `Poller::pending_jobs()` reports the current count.
+- **Interrupts under overload.** `describe` and `interrupt` are answered on the network thread before admission, so a saturated server still interrupts queued, running, and parked evals; interrupting frees the slot.
+- **Request size.** `max_request_bytes` (default 64 MiB) bounds one request frame. A connection whose buffered input reaches it without completing a frame, or that sends a larger frame, is closed.
+- **Output.** `max_output_bytes` (default 64 MiB) bounds the reply bytes queued for one connection but not yet written. A client that stops reading is disconnected when a reply would exceed it (a single reply larger than the limit still goes out when nothing else is queued). The eval keeps running; its later replies are dropped.
+- **Per-call budgets.** `Poller::poll_budget`, `poll_timeout_budget` and `spawn_pending_budget` take at most `budget` jobs per call and return a `PollBatch { status, jobs, budget_exhausted }`; `budget_exhausted` means the call stopped at its budget and more jobs may be waiting. The unbudgeted calls take everything queued.
+
 Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, bound via the dynamic-binding stack around each request. Retained values are interned in the hidden `cljrs.nrepl.session-state` namespace so the GC traces them between evals.
 
 ### Limitations
@@ -42,27 +52,34 @@ Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, boun
 
 | File | Purpose |
 |---|---|
-| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, `Poller` (with the per-session lanes behind `spawn_pending`), `PollStatus`, the `Job` bridge type |
+| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, `Poller` (with the per-session lanes behind `spawn_pending` and the budgeted polls), `PollStatus`, `PollBatch`, the `Job` bridge type |
+| `src/limits.rs` | `Limits`; job admission counter and tickets; byte-bounded per-connection reply channel; per-job reply handle that releases the admission slot at `done` |
 | `src/bencode.rs` | Hand-rolled bencode codec (the nREPL subset) with incremental decoding for TCP framing |
 | `src/protocol.rs` | `Request` decoding and the `Response` builder |
-| `src/server.rs` | Network thread: accept loop, per-connection reader/writer tasks, `describe`/`interrupt`, in-flight registry |
+| `src/server.rs` | Network thread: accept loop, per-connection reader/writer tasks (request size and output limits), `describe`/`interrupt`, job admission, in-flight registry |
 | `src/engine.rs` | Interpreter thread: session registry, eval with streamed output and `*1`/`*2`/`*3`/`*e`, completions, lookup, macroexpand, analyze-last-stacktrace |
 | `tests/nrepl_server.rs` | End-to-end test: full stdlib env + scripted bencode client over TCP |
+| `tests/limits.rs` | Overload refusal with interrupts still answered, budgeted polls, parked spawned evals holding session slots, oversized request frames, unread output |
 
 ## Public API
 
-- `struct Config { addr: SocketAddr, port_file: Option<PathBuf> }` — bind address (port 0 = OS-assigned) and optional `.nrepl-port` file; `Default` binds `127.0.0.1:0`.
+- `struct Config { addr: SocketAddr, port_file: Option<PathBuf>, limits: Limits }` — bind address (port 0 = OS-assigned), optional `.nrepl-port` file, and resource limits; `Default` binds `127.0.0.1:0` with `Limits::default()`.
+- `struct Limits { max_pending_jobs: usize, max_session_jobs: usize, max_request_bytes: usize, max_output_bytes: usize }` — see *Admission and resource limits*; `Default`: 1024 jobs, 256 per session, 64 MiB per request frame, 64 MiB queued output per connection.
 - `fn start(config: Config, globals: Arc<GlobalEnv>) -> miette::Result<Server>` — binds the listener, writes the port file, spawns the network thread. Must be called on the thread that owns `globals`.
 - `Server::port(&self) -> u16`
 - `Server::serve(self) -> miette::Result<()>` — blocks the calling (interpreter) thread processing requests until shutdown; evaluates with `cljrs_runtime::tiered::eval`.
 - `Server::serve_with(self, eval_form: impl EvalForm) -> miette::Result<()>` — like `serve`, but each top-level form goes through the supplied evaluator (the CLI passes its async `LocalSet` driver).
 - `Server::shutdown_handle(&self) -> ShutdownHandle` — `Send + Clone`; `shutdown()` stops the network thread and ends `serve`.
+- `Server::limits(&self) -> Limits`
 - `Server::into_poller(self) -> Poller` — non-blocking driver for a host with its own loop (see above). Dropping it shuts the server down.
-- `Poller::port`, `Poller::shutdown_handle`
+- `Poller::port`, `Poller::shutdown_handle`, `Poller::limits`
+- `Poller::pending_jobs(&self) -> usize` — admitted, unfinished jobs (queued, waiting, running, or parked).
 - `Poller::poll(&mut self, eval_form: &mut impl EvalForm) -> PollStatus` — handle every queued job now.
 - `Poller::poll_timeout(&mut self, eval_form: &mut impl EvalForm, timeout: Duration) -> PollStatus` — wait up to `timeout` for a job, then handle everything queued.
 - `Poller::spawn_pending<F: EvalForm + Clone + 'static>(&mut self, local: &LocalSet, eval_form: F) -> PollStatus` — start every queued job on a fiber on `local` and return; per-session order is kept.
+- `Poller::poll_budget(&mut self, eval_form: &mut impl EvalForm, budget: usize) -> PollBatch`, `Poller::poll_timeout_budget(&mut self, eval_form, timeout, budget) -> PollBatch`, `Poller::spawn_pending_budget(&mut self, local: &LocalSet, eval_form: F, budget: usize) -> PollBatch` — as above, taking at most `budget` jobs.
 - `enum PollStatus { Open, Closed }` — `Closed` once the server has shut down.
+- `struct PollBatch { status: PollStatus, jobs: usize, budget_exhausted: bool }` — result of a budgeted call.
 - `trait EvalForm: FnMut(&Form, &mut Env) -> Result<Value, EvalError>` — evaluator signature for `serve_with`.
 - `mod bencode` — `Bencode`, `encode`, `encode_to_vec`, `decode` (public for tests/clients).
 - `mod protocol` — `Request`, `Response`.

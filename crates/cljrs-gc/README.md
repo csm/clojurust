@@ -484,11 +484,16 @@ pub struct IsolateControl { /* atomics */ }
 impl IsolateControl {
     pub fn id(&self) -> IsolateId;
     pub fn name(&self) -> Arc<str>;
-    pub fn request_collection(&self);
+    pub fn request_collection(&self);          // wakes registered service wakers
     pub fn collection_requested(&self) -> bool;
     pub fn take_collection_request(&self) -> bool;
-    pub fn request_recall(&self);
+    pub fn request_recall(&self);              // wakes registered service wakers
     pub fn recall_requested(&self) -> bool;
+    // Runtime service tasks (the async GC service) suspend until a request:
+    // register before checking for work; each request drains the list.
+    pub fn register_service_waker(&self, waker: &Waker);
+    pub fn unregister_service_waker(&self, waker: &Waker);
+    pub fn service_waker_count(&self) -> usize;
     pub fn used_bytes(&self) -> usize;
     pub fn free_credit_bytes(&self) -> usize;
     pub fn region_bytes(&self) -> usize;

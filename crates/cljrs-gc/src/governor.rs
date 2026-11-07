@@ -65,6 +65,7 @@ use std::cell::{Cell, OnceCell};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
 const KIB: usize = 1024;
@@ -653,6 +654,11 @@ pub struct IsolateControl {
     gc_requested: AtomicBool,
     /// The governor asks the isolate to return its unused credit.
     recall_requested: AtomicBool,
+    /// Wakers of runtime service tasks (such as the async GC service) that
+    /// suspend until a collection or credit recall is requested.  A request
+    /// that sets either flag wakes and drains them; see
+    /// [`IsolateControl::register_service_waker`].
+    service_wakers: Mutex<Vec<Waker>>,
     used_bytes: AtomicUsize,
     peak_used_bytes: AtomicUsize,
     free_credit_bytes: AtomicUsize,
@@ -688,6 +694,7 @@ impl IsolateControl {
             name: Mutex::new(name),
             gc_requested: AtomicBool::new(false),
             recall_requested: AtomicBool::new(false),
+            service_wakers: Mutex::new(Vec::new()),
             used_bytes: AtomicUsize::new(0),
             peak_used_bytes: AtomicUsize::new(0),
             free_credit_bytes: AtomicUsize::new(0),
@@ -724,8 +731,14 @@ impl IsolateControl {
     }
 
     /// Ask the isolate to collect at its next safepoint.
+    ///
+    /// The first request after the flag was clear also wakes the isolate's
+    /// registered service tasks, so an idle executor can suspend until work
+    /// arrives.  This may be called from any thread.
     pub fn request_collection(&self) {
-        self.gc_requested.store(true, Ordering::Release);
+        if !self.gc_requested.swap(true, Ordering::AcqRel) {
+            self.wake_services();
+        }
     }
 
     /// Whether a collection request is pending.
@@ -741,7 +754,55 @@ impl IsolateControl {
     /// Ask the isolate to return its unused credit at its next runtime
     /// service poll ([`IsolateAccount::poll`]).
     pub fn request_recall(&self) {
-        self.recall_requested.store(true, Ordering::Release);
+        if !self.recall_requested.swap(true, Ordering::AcqRel) {
+            self.wake_services();
+        }
+    }
+
+    /// Register `waker` to be woken by the next collection or recall request.
+    ///
+    /// A service task registers before it checks for pending work, so a
+    /// request that races with the check either is seen by the check or wakes
+    /// the waker.  Registration is idempotent for wakers that wake the same
+    /// task.  Each request drains the registered wakers, so a task must
+    /// register again every time it suspends.
+    pub fn register_service_waker(&self, waker: &Waker) {
+        let mut wakers = self
+            .service_wakers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
+    /// Remove `waker` (and any waker that wakes the same task).  Called when a
+    /// service task stops, so a dropped executor leaves no stale waker behind.
+    pub fn unregister_service_waker(&self, waker: &Waker) {
+        self.service_wakers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|w| !w.will_wake(waker));
+    }
+
+    /// Number of registered service wakers (diagnostics and tests).
+    pub fn service_waker_count(&self) -> usize {
+        self.service_wakers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn wake_services(&self) {
+        let wakers = std::mem::take(
+            &mut *self
+                .service_wakers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
     /// Whether a credit recall is pending.

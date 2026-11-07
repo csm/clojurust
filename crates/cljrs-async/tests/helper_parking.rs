@@ -9,8 +9,8 @@
 //! test instead of letting it hang.
 //!
 //! `cljrs_async::init` is called before any tokio runtime exists, so the
-//! background GC-service task (itself a `yield_now` loop) is not started and
-//! cannot mask a spinning helper.
+//! background GC-service task is not started. The service now suspends while
+//! idle (see `gc_service.rs`), but keeping it out isolates the helpers.
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::result_large_err)]
 

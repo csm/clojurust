@@ -163,12 +163,21 @@ fn downcast_channel(val: &Value) -> EvalResult<&CljChannel> {
 /// Spawn a long-lived background task on the current `LocalSet` that services
 /// GC requests between poll cycles.
 ///
-/// At each cooperative yield the task calls [`cljrs_runtime::env::gc_roots::async_gc_collect`].
-/// Because `LocalSet` is single-threaded, no other tasks run while that function
-/// executes, making it safe to scan thread-local root stacks for all suspended tasks.
+/// The task suspends until the isolate has GC work: it registers its waker
+/// with the isolate's [`cljrs_gc::IsolateControl`], and a collection request or
+/// governor credit recall (from this thread or another) wakes it.  When woken
+/// it calls [`cljrs_runtime::env::gc_roots::async_gc_collect`].  Because
+/// `LocalSet` is single-threaded, no other tasks run while that function
+/// executes, making it safe to scan thread-local root stacks for all suspended
+/// tasks.  An idle executor therefore stays idle: the service never wakes
+/// itself without a request.
+///
+/// Calling this more than once (repeated `init`) starts one service per call;
+/// each suspends independently and the first to run services the request.
+/// Dropping the `LocalSet` drops the task, which unregisters its waker.
 ///
 /// Must be called from within a Tokio `LocalSet` context (e.g., from `init`).
-/// On `wasm32` this is a no-op — see below.
+/// On `wasm32` and under `no-gc` this is a no-op — see below.
 pub(crate) fn spawn_gc_service() {
     // On native, `spawn_local` panics unless it is called inside a Tokio
     // runtime *and* a `LocalSet`.  Several callers invoke `init()` with no
@@ -182,24 +191,80 @@ pub(crate) fn spawn_gc_service() {
     // emitting a scary—but-caught—panic message to stderr during compilation.
     // The `catch_unwind` remains as a guard for the pathological case of a
     // runtime present without a LocalSet, which none of our call paths hit.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "no-gc")))]
     if tokio::runtime::Handle::try_current().is_ok() {
         let _ = std::panic::catch_unwind(|| {
-            tokio::task::spawn_local(async {
-                loop {
-                    tokio::task::yield_now().await;
-                    cljrs_runtime::env::gc_roots::async_gc_collect();
-                }
-            });
+            tokio::task::spawn_local(gc_service());
         });
     }
 
-    // On wasm32, tokio's yield_now() only cooperates with the LocalSet scheduler
-    // — it does NOT yield back to the browser event loop.  A `loop { yield_now();
-    // gc(); }` task therefore generates an endless chain of microtasks that
-    // starves rendering and bogs down the browser.  Skip the service entirely;
-    // GC safepoints in `await_value` fire at every real async suspension point,
-    // which is sufficient for correctness.
+    // On wasm32 the service stays disabled: GC safepoints in `await_value`
+    // fire at every real async suspension point, which is sufficient for
+    // correctness there, and the browser build has no other thread to request
+    // collection while the executor is idle.
     #[cfg(target_arch = "wasm32")]
     let _ = ();
+}
+
+/// Body of the background GC service; see [`spawn_gc_service`].
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "no-gc")))]
+async fn gc_service() {
+    use cljrs_runtime::env::gc_roots::{async_gc_collect, async_gc_pending};
+    use std::task::Poll;
+
+    // `None` only during thread-local teardown, when no request can arrive.
+    let Some(control) = cljrs_gc::governor::current_control() else {
+        return;
+    };
+    let mut registration = ServiceRegistration {
+        control,
+        waker: None,
+    };
+    loop {
+        // Register before checking, so a request that lands between the check
+        // and the suspension still wakes this task.
+        std::future::poll_fn(|cx| {
+            registration.register(cx.waker());
+            if async_gc_pending() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        async_gc_collect();
+        // Let ready tasks run before the next check, so a burst of requests
+        // cannot monopolise the executor.
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The GC service's waker registration; unregisters when the task is dropped
+/// (for example, with its `LocalSet`).
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "no-gc")))]
+struct ServiceRegistration {
+    control: std::sync::Arc<cljrs_gc::IsolateControl>,
+    waker: Option<std::task::Waker>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "no-gc")))]
+impl ServiceRegistration {
+    fn register(&mut self, waker: &std::task::Waker) {
+        if let Some(old) = &self.waker
+            && !old.will_wake(waker)
+        {
+            self.control.unregister_service_waker(old);
+        }
+        self.control.register_service_waker(waker);
+        self.waker = Some(waker.clone());
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "no-gc")))]
+impl Drop for ServiceRegistration {
+    fn drop(&mut self) {
+        if let Some(waker) = &self.waker {
+            self.control.unregister_service_waker(waker);
+        }
+    }
 }

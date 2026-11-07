@@ -422,6 +422,24 @@ pub(crate) fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVis
 #[cfg(feature = "no-gc")]
 pub fn async_gc_collect() {}
 
+/// Whether [`async_gc_collect`] has work: a collection is requested or a
+/// configuration cancellation is in progress.  Also services a pending
+/// governor credit recall, as the safepoint check does.
+///
+/// The async GC service suspends while this is `false`; it registers its
+/// waker with the isolate's control first (see
+/// `cljrs_gc::IsolateControl::register_service_waker`), so a request made
+/// after this check wakes it.  Always `false` under `no-gc`.
+#[cfg(feature = "no-gc")]
+pub fn async_gc_pending() -> bool {
+    false
+}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn async_gc_pending() -> bool {
+    cljrs_gc::CONFIG_CANCELLATION.in_progress() || cljrs_gc::gc_requested()
+}
+
 #[cfg(not(feature = "no-gc"))]
 pub fn async_gc_collect() {
     if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {

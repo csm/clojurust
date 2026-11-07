@@ -45,7 +45,10 @@ Done (Phases A–H, A2, B1):
   inside `loop`/`recur`, including in a `recur` *argument*.
 - Phase G: GC safepoints at async yield points via `cljrs_runtime::env::gc_roots::async_gc_collect()`,
   called before each `yield_now().await` in `await_value`. Background GC-service task spawned
-  by `init()`. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
+  by `init()` (native, GC builds); it registers its waker with the isolate's `IsolateControl`
+  and suspends until a collection request or credit recall arrives, so an idle executor stays
+  idle (CLJ-ASYNC-004). Each `init` inside a runtime starts one service; dropping the `LocalSet`
+  unregisters its waker. Explicit GC root guards for `task_future` in `spawn_future`, callee/env in
   `run_async_fn`, and awaited futures/promises in `await_value`. `eval_loop_async` runs a
   GC safepoint per iteration and scopes each iteration in an alloc frame, released when
   the iteration recurs without having yielded, so dead intermediates are collectable.
@@ -429,6 +432,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |
 | `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and a top-level fiber (csm/clojurust#428) |
 | `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically on a fiber and in the sync evaluator (containers, `let*`/`loop*` binding vectors) |
+| `tests/gc_service.rs` | the background GC service lets an idle executor suspend (counting waker and paused-clock checks), collects after same-thread and cross-thread requests, services credit recalls while idle, keeps a parked `go` block's roots, and leaves no wakers after repeated `init` or `LocalSet` shutdown |
 | `tests/helper_parking.rs` | `onto-chan!`, `to-chan!` and `mult` park instead of busy-polling (paused-clock idleness check, csm/clojurust#457): blocked on a rendezvous/full channel, an empty source, or a rendezvous/full tap; resumption and ordered delivery once unblocked; closure of the channel, tap, or source while parked |
 
 ## Public API
