@@ -24,7 +24,7 @@ use cljrs_value::{
     gc_native_object,
 };
 
-use crate::channel::{CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
+use crate::channel::{CljChannel, CljMult, MULT_TAG};
 use crate::task::{await_value, spawn_future_with_roots};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
@@ -469,35 +469,12 @@ fn builtin_onto_chan(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     let coll = args.get(1).cloned().unwrap_or(Value::Nil);
     let values = value_to_seq_vec(&coll)?;
-    let rendezvous = chan_ref(ch.get()).is_rendezvous();
     Ok(spawn_future_with_roots(args.to_vec(), async move {
         for v in values {
-            if rendezvous {
-                let token = loop {
-                    match chan_ref(ch.get()).rv_offer(&v) {
-                        RvOffer::Offered(t) => break t,
-                        RvOffer::Closed => return Ok(Value::NativeObject(ch)),
-                        RvOffer::Full => {}
-                    }
-                    tokio::task::yield_now().await;
-                };
-                loop {
-                    match chan_ref(ch.get()).rv_status(token) {
-                        RvStatus::Taken => break,
-                        RvStatus::ClosedUntaken => return Ok(Value::NativeObject(ch)),
-                        RvStatus::Waiting => {}
-                    }
-                    tokio::task::yield_now().await;
-                }
-            } else {
-                loop {
-                    match chan_ref(ch.get()).try_put_buffered(&v) {
-                        Some(true) => break,
-                        Some(false) => return Ok(Value::NativeObject(ch)),
-                        None => {}
-                    }
-                    tokio::task::yield_now().await;
-                }
+            // Parks until a taker (or buffer slot) accepts the value; `false`
+            // means the channel closed first, so stop without closing again.
+            if !chan_ref(ch.get()).put(v).await {
+                return Ok(Value::NativeObject(ch));
             }
         }
         chan_ref(ch.get()).close();
@@ -516,13 +493,8 @@ fn builtin_to_chan(args: &[Value]) -> ValueResult<Value> {
     let ch_val = Value::NativeObject(ch.clone());
     spawn_future_with_roots(args.to_vec(), async move {
         for v in values {
-            loop {
-                match chan_ref(ch.get()).try_put_buffered(&v) {
-                    Some(true) => break,
-                    Some(false) => return Ok(Value::Nil),
-                    None => {}
-                }
-                tokio::task::yield_now().await;
+            if !chan_ref(ch.get()).put(v).await {
+                return Ok(Value::Nil);
             }
         }
         chan_ref(ch.get()).close();
@@ -558,56 +530,26 @@ fn builtin_mult(args: &[Value]) -> ValueResult<Value> {
 
     spawn_future_with_roots(args.to_vec(), async move {
         loop {
-            // Take the next value from the source channel.
-            let v = loop {
-                match chan_ref(source_ch.get()).try_take() {
-                    // `nil` from try_take means the channel is closed and drained.
-                    Some(Value::Nil) => {
-                        let taps = mult_ref(mult.get()).taps.lock().unwrap().clone();
-                        for (tap_ch, close_on_done) in &taps {
-                            if *close_on_done {
-                                chan_ref(tap_ch.get()).close();
-                            }
-                        }
-                        return Ok(Value::Nil);
+            // Park until the source yields a value; `nil` means it is closed
+            // and drained.
+            let v = chan_ref(source_ch.get()).take().await;
+            if matches!(v, Value::Nil) {
+                let taps = mult_ref(mult.get()).taps.lock().unwrap().clone();
+                for (tap_ch, close_on_done) in &taps {
+                    if *close_on_done {
+                        chan_ref(tap_ch.get()).close();
                     }
-                    Some(v) => break v,
-                    None => {}
                 }
-                tokio::task::yield_now().await;
-            };
+                return Ok(Value::Nil);
+            }
 
             // Snapshot the tap list to avoid holding the lock during puts.
             let taps: Vec<(GcPtr<NativeObjectBox>, bool)> =
                 mult_ref(mult.get()).taps.lock().unwrap().clone();
 
+            // Each put parks until that tap accepts the value or closes.
             for (tap_ch, _) in &taps {
-                if chan_ref(tap_ch.get()).is_rendezvous() {
-                    let token = loop {
-                        match chan_ref(tap_ch.get()).rv_offer(&v) {
-                            RvOffer::Offered(t) => break Some(t),
-                            RvOffer::Closed => break None,
-                            RvOffer::Full => {}
-                        }
-                        tokio::task::yield_now().await;
-                    };
-                    if let Some(token) = token {
-                        loop {
-                            match chan_ref(tap_ch.get()).rv_status(token) {
-                                RvStatus::Taken | RvStatus::ClosedUntaken => break,
-                                RvStatus::Waiting => {}
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                } else {
-                    loop {
-                        if chan_ref(tap_ch.get()).try_put_buffered(&v).is_some() {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                }
+                let _ = chan_ref(tap_ch.get()).put(v.clone()).await;
             }
         }
     });

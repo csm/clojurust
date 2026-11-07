@@ -53,3 +53,6 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
 proptest = "1"
+# Paused clock: helper_parking.rs proves helpers park by letting virtual time
+# auto-advance, which tokio does only when no task is ready.
+tokio    = { workspace = true, features = ["test-util"] }
