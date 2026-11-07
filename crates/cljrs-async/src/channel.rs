@@ -36,6 +36,10 @@ pub(crate) const CHANNEL_TAG: &str = "Channel";
 pub(crate) const MULT_TAG: &str = "Mult";
 
 /// Outcome of a non-blocking rendezvous offer (capacity-0 `put!`).
+///
+/// Test-only: production code parks on [`CljChannel::put`]. The offer/status
+/// pair survives as a low-level probe of the queue/publication invariants.
+#[cfg(test)]
 pub(crate) enum RvOffer {
     /// Value placed into the empty slot; the token identifies its queue entry
     /// so the putter can detect when that particular value is consumed.
@@ -46,7 +50,8 @@ pub(crate) enum RvOffer {
     Closed,
 }
 
-/// Status of a rendezvous offer that is waiting to be taken.
+/// Status of a rendezvous offer that is waiting to be taken (test-only).
+#[cfg(test)]
 pub(crate) enum RvStatus {
     /// A taker consumed our value — `put!` resolves `true`.
     Taken,
@@ -627,7 +632,8 @@ impl CljChannel {
             .map(|(value, _)| matches!(value, Value::Bool(true)))
     }
 
-    /// Offer a value into a rendezvous channel's single slot.
+    /// Offer a value into a rendezvous channel's single slot (test-only).
+    #[cfg(test)]
     pub(crate) fn rv_offer(&self, v: &Value) -> RvOffer {
         let mut st = self.state.lock().unwrap();
         if st.closed {
@@ -680,6 +686,7 @@ impl CljChannel {
     ///
     /// A cancelled take can restore an older value ahead of this offer.
     /// Check and retract only the queue entry identified by the token.
+    #[cfg(test)]
     pub(crate) fn rv_status(&self, token: u64) -> RvStatus {
         let mut st = self.state.lock().unwrap();
         if !st.queue.contains_key(&token) {

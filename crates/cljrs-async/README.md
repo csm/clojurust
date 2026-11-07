@@ -39,7 +39,8 @@ Done (Phases A–H, A2, B1):
   runs a thunk and delivers its result to a buffered channel. `onto-chan!` seeds a channel from
   a collection and closes it; `to-chan!` does the same but returns the channel before seeding
   finishes (background task). `mult` broadcasts a source channel to all registered tap channels
-  (`tap!`/`untap!`/`untap-all!`). Clojure-level: `async-pmap`, `thread` macro, `merge`,
+  (`tap!`/`untap!`/`untap-all!`). All three background tasks park on `CljChannel::put`/`take`
+  rather than polling, so an undelivered value or a slow tap costs no CPU. Clojure-level: `async-pmap`, `thread` macro, `merge`,
   `reduce`, `into`. `eval_loop_async` and `eval_recur_async` enable proper `await` yielding
   inside `loop`/`recur`, including in a `recur` *argument*.
 - Phase G: GC safepoints at async yield points via `cljrs_runtime::env::gc_roots::async_gc_collect()`,
@@ -579,8 +580,8 @@ pub mod channel {
     impl CljChannel {
         /// Create a channel. `capacity == 0` is an unbuffered rendezvous channel.
         pub fn new(capacity: usize) -> Self;
-        /// Async put: yield to the LocalSet until the value is accepted (buffered
-        /// or handed off). `true` on success, `false` if the channel is closed.
+        /// Async put: park (event-driven, no polling) until the value is accepted
+        /// (buffered or handed off). `true` on success, `false` if the channel is closed.
         /// The building block other crates use to stream produced values.
         /// Enqueued values pass through the Phase 10.5 publish barrier
         /// (cljrs_value::publish::publish_value): the taker may outlive any
