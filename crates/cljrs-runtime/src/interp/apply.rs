@@ -233,7 +233,16 @@ pub fn is_form_intercepted(name: &str) -> bool {
 /// - The `apply` function (spread last arg).
 /// - The `swap!` function (needs env to call the function).
 /// - Regular function calls.
-pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalResult {
+///
+/// `site` is the whole call form when it is a stable AST node (as opposed to
+/// a temporary built while evaluating); a macro call's expansion is memoized
+/// on it so that re-evaluating the same call site does not re-run the macro.
+pub fn eval_call(
+    site: Option<&Form>,
+    func_form: &Form,
+    arg_forms: &[Form],
+    env: &mut Env,
+) -> EvalResult {
     // Interop: (.methodName target args...) — method call syntax.
     if let FormKind::Symbol(s) = &func_form.kind
         && is_method_sugar(s)
@@ -249,7 +258,20 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // Macro check: expand then re-eval.
     if let Value::Macro(mfn) = &callee {
-        let expanded = macro_apply(mfn.get(), func_form, arg_forms, env)?;
+        let mfn = mfn.get();
+        // Expand each call site once per (macro, namespace), as Clojure does
+        // at compile time, instead of on every evaluation. See
+        // `cljrs_reader::ExpansionCache`.
+        if let (Some(site), Some(macro_id)) = (site, mfn.arities.first().map(|a| a.ir_arity_id)) {
+            if let Some(expanded) = site.expansion.get(macro_id, &env.current_ns) {
+                return eval(&expanded, env);
+            }
+            let ns = env.current_ns.clone();
+            let expanded = macro_apply(mfn, func_form, arg_forms, env)?;
+            let expanded = site.expansion.store(macro_id, ns, expanded);
+            return eval(&expanded, env);
+        }
+        let expanded = macro_apply(mfn, func_form, arg_forms, env)?;
         return eval(&expanded, env);
     }
 

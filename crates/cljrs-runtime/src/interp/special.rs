@@ -356,7 +356,7 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
     Ok(CljxFnArity {
         params,
         rest_param,
-        body,
+        body: body.into(),
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::interp::arity::fresh_arity_id(),

@@ -499,11 +499,11 @@ thin pointer in the leaf-node Vec.
 ### `CljxFn` / `CljxFnArity` (Phase 4)
 
 ```rust
-// Requires cljrs-reader (for Vec<Form> body).
+// Requires cljrs-reader (for the Form body).
 pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,        // positional param names
     pub rest_param: Option<Arc<str>>, // name after & (if any)
-    pub body: Vec<Form>,              // forms in this arity's body
+    pub body: Arc<[Form]>,            // forms in this arity's body (shared by clones)
     pub param_hints: Vec<Option<TypeHint>>, // primitive type hint per param (^long, …)
     pub rest_hint: Option<TypeHint>,         // hint on the rest param (rarely used)
     // (also: destructure_params, destructure_rest, ir_arity_id)

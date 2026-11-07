@@ -22,13 +22,19 @@ pub fn force_eager_lowering() {
 /// which is expensive.  Disabled by default; set `CLJRS_EAGER_LOWER=1` to
 /// enable.  (Or set `CLJRS_NO_IR=1` to disable all IR functionality.)
 pub(crate) fn eager_lower_enabled() -> bool {
-    if std::env::var("CLJRS_NO_IR").is_ok() {
+    // Read once: this runs every time a fn value is created, and `getenv`
+    // scans the whole environment block.
+    static NO_IR: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CLJRS_NO_IR").is_ok());
+    static EAGER: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CLJRS_EAGER_LOWER").is_ok());
+    if *NO_IR {
         return false;
     }
     if EAGER_LOWER_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var("CLJRS_EAGER_LOWER").is_ok()
+    *EAGER
 }
 
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
