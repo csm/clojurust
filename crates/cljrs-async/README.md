@@ -424,6 +424,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |
 | `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and a top-level fiber (csm/clojurust#428) |
 | `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically on a fiber and in the sync evaluator (containers, `let*`/`loop*` binding vectors) |
+| `tests/helper_parking.rs` | `onto-chan!`, `to-chan!` and `mult` park instead of busy-polling (paused-clock idleness check, csm/clojurust#457): blocked on a rendezvous/full channel, an empty source, or a rendezvous/full tap; resumption and ordered delivery once unblocked; closure of the channel, tap, or source while parked |
 
 ## Public API
 
