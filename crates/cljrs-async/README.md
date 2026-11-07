@@ -245,7 +245,10 @@ the caller's dynamic bindings. Changes in a child stay in that child.
 
 `io-thread` and `thread` return a channel. The channel receives a non-nil result,
 then closes. A nil result or an exception closes the channel without a value.
-`thread-call` accepts a zero-argument function. Each call uses one body fiber.
+`thread-call` accepts a zero-argument function. Each call uses one body fiber. On native
+targets that fiber's own executor task delivers the result to the channel when the body
+returns (`fiber::spawn_delivering`), so a `go` costs one LocalSet task and no intermediate
+`Future` cell; wasm32 keeps a delivery future.
 Body failures print a diagnostic before the channel closes.
 A failed future raises its error
 when a caller dereferences it. `future-cancel` cancels the result and leaves the body active.
@@ -312,7 +315,7 @@ allows about 5,000 levels of non-tail recursion in a `go`, `future`, `thread` or
 `^:async` body in a release build's default tiered mode (about 2,500 in pure tree-walk
 mode); the 64 MiB root allows roughly four times as many. Pages are committed lazily, so a parked fiber costs only the stack it touches.
 `CLJRS_FIBER_STACK_KB` sets the reservation, with a
-512 KB minimum. Smaller values are clamped to 512 KB with a one-time warning; unparseable values fail construction. A process-wide pool
+512 KB minimum. It is read once per process, at the first fiber construction. Smaller values are clamped to 512 KB with a one-time warning; unparseable values fail construction. A process-wide pool
 keeps up to 32 finished stacks for any carrier.
 Each active or pooled stack charges `MemoryClass::FiberStack` with a 64 KiB commit
 estimate plus guard pages, not its full reservation. Strict admission can reject
@@ -325,7 +328,9 @@ counts, and reserved stack bytes. The root's 64 MiB reservation uses the same ac
 At interpreter, IR, JIT, and AOT safepoints, a fiber yields to the LocalSet whenever its
 time slice expires, so ready fibers and other tasks (compiled async state machines,
 delivery futures, timers, I/O bridges) all run. `CLJRS_FIBER_SLICE_US` defaults to 10000 microseconds.
-Clock checks are batched every 64 safepoints. Yielding waits for runtime locks, borrowed mutator slots, and
+Clock checks (slice expiry and the watchdog heartbeat) are batched every 64 safepoints;
+each native-frame exit counts as 8, so a loop of long native calls checks the clock every
+8 calls rather than stretching the slice to 64 calls. Yielding waits for runtime locks, borrowed mutator slots, and
 governor critical sections to end in every build. It also defers during Rust unwinding.
 Root guards protect environments only during an actual yield.
 Cancelling a started fiber resumes it with a private token, whether it is suspended
@@ -747,7 +752,7 @@ Buffered channel values pass publication once, when the put commits.
 A take transfers ownership to the consumer without another publication scan.
 Direct handoffs publish the accepted value before either participant resumes.
 Channels report resource failures only when the failure remains unread at destruction or executor teardown.
-A read marks the report observed. The internal delivery future also counts as observed, so collection produces no duplicate warning.
+A read marks the report observed. On wasm32 the internal delivery future also counts as observed, so collection produces no duplicate warning; native targets deliver from the fiber's task and create no such future.
 `channel::report_unobserved_thread_failures()` flushes the current executor registry after all consumers finish.
 The carrier and its fibers share this registry. Another executor's teardown cannot flush these reports.
 Native root drivers and both isolate entry points call this helper during teardown.
