@@ -771,3 +771,49 @@ fn spawned_jobs_can_be_interrupted() {
     host.run_until(&done);
     join_client(client);
 }
+
+/// Once a client has seen an eval's `done`, the session is idle: an
+/// `interrupt` sent immediately after must answer `session-idle`. The server
+/// used to send `done` before removing the request from its pending table,
+/// so a fast client could still see the finished eval as running.
+#[test]
+fn interrupt_right_after_done_finds_the_session_idle() {
+    let globals = {
+        let runtime = cljrs_runtime::Runtime::builder()
+            .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+            .build()
+            .expect("runtime");
+        cljrs_stdlib::install(&runtime);
+        runtime.into_globals()
+    };
+    let server = cljrs_nrepl::start(cljrs_nrepl::Config::default(), globals).expect("start");
+    let port = server.port();
+    let shutdown = server.shutdown_handle();
+
+    let client_thread = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(|| {
+            let mut c = Client::connect(port);
+            let resp = c.request(&[("op", "clone")]);
+            let session = field(&resp, "new-session")
+                .expect("new-session")
+                .to_string();
+            for i in 0..200 {
+                let resp = eval(&mut c, &session, "(+ 1 2)");
+                assert_eq!(field(&resp, "value"), Some("3"));
+                let resp = c.request(&[("op", "interrupt"), ("session", &session)]);
+                assert_eq!(
+                    statuses(&resp[0]),
+                    ["session-idle", "done"],
+                    "iteration {i}"
+                );
+            }
+        });
+        shutdown.shutdown();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+
+    server.serve().expect("serve");
+    client_thread.join().expect("client scenario failed");
+}

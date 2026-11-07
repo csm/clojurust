@@ -92,6 +92,14 @@ impl Engine {
             pending_key,
             pending,
         } = job;
+        // Leave `Pending` before the final `done` goes out: a client may send
+        // `interrupt` the moment it sees `done`, and must then find the
+        // session idle rather than this finished request.
+        let finish = || {
+            if let Some(key) = &pending_key {
+                pending.remove(key);
+            }
+        };
         if cancelled.is_set() {
             // Interrupted while still queued: drop the work entirely.
             let sid = req.session.clone().unwrap_or_default();
@@ -100,6 +108,7 @@ impl Engine {
                     .status(&["interrupted"])
                     .build(),
             );
+            finish();
             let _ = replies.send(Response::for_request(&req, &sid).status(&["done"]).build());
         } else {
             match req.op.as_str() {
@@ -113,9 +122,9 @@ impl Engine {
                     let _interrupt =
                         cljrs_runtime::env::gas::InterruptGuard::install(cancelled.clone());
                     if req.op == "eval" {
-                        self.op_eval(&req, &replies, eval_form, &cancelled);
+                        self.op_eval(&req, &replies, eval_form, &cancelled, &finish);
                     } else {
-                        self.op_load_file(&req, &replies, eval_form, &cancelled);
+                        self.op_load_file(&req, &replies, eval_form, &cancelled, &finish);
                     }
                 }
                 "completions" => self.op_completions(&req, &replies),
@@ -135,9 +144,7 @@ impl Engine {
                 }
             }
         }
-        if let Some(key) = &pending_key {
-            pending.remove(key);
-        }
+        finish();
     }
 
     // ── Sessions ──────────────────────────────────────────────────────────────
@@ -235,9 +242,11 @@ impl Engine {
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
     ) {
         let Some(code) = req.code.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
+            finish();
             let _ = replies.send(
                 Response::for_request(req, &sid)
                     .status(&["error", "no-code", "done"])
@@ -245,7 +254,7 @@ impl Engine {
             );
             return;
         };
-        self.eval_code(req, replies, eval_form, cancelled, &code, "<nrepl>");
+        self.eval_code(req, replies, eval_form, cancelled, finish, &code, "<nrepl>");
     }
 
     fn op_load_file(
@@ -254,9 +263,11 @@ impl Engine {
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
     ) {
         let Some(file) = req.file.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
+            finish();
             let _ = replies.send(
                 Response::for_request(req, &sid)
                     .status(&["error", "no-file", "done"])
@@ -268,17 +279,20 @@ impl Engine {
             .file_name
             .clone()
             .unwrap_or_else(|| "<load-file>".into());
-        self.eval_code(req, replies, eval_form, cancelled, &file, &filename);
+        self.eval_code(req, replies, eval_form, cancelled, finish, &file, &filename);
     }
 
     /// Shared body of `eval` and `load-file`: evaluate all forms in `code`,
     /// streaming `out`/`value`/`err` messages, then a final `done`.
+    /// `finish` runs just before that `done` is sent.
+    #[allow(clippy::too_many_arguments)]
     fn eval_code(
         &self,
         req: &Request,
         replies: &UnboundedSender<Bencode>,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
         code: &str,
         filename: &str,
     ) {
@@ -314,6 +328,7 @@ impl Engine {
                         .status(&["eval-error"])
                         .build(),
                 );
+                finish();
                 let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
                 return;
             }
@@ -423,6 +438,7 @@ impl Engine {
                     .build(),
             );
         }
+        finish();
         let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
     }
 

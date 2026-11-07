@@ -153,7 +153,7 @@ fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
         }
 
         // ── Collections ───────────────────────────────────────────────────
-        FormKind::List(forms) => eval_list(forms, env),
+        FormKind::List(forms) => eval_list(form, forms, env),
         FormKind::Vector(forms) => {
             let forms = expand_reader_conds_cow(forms);
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
@@ -282,18 +282,22 @@ pub fn eval_with_gas(form: &Form, env: &mut Env, credits: u64) -> EvalResult {
 
 // ── List / call dispatch ──────────────────────────────────────────────────────
 
-fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
+fn eval_list(site: &Form, forms: &[Form], env: &mut Env) -> EvalResult {
     if forms.is_empty() {
         return Ok(Value::List(GcPtr::new(PersistentList::empty())));
     }
 
     // Expand reader conditionals (both splicing and non-splicing) before dispatch.
     let expanded: Vec<Form>;
+    // A call whose parts came from expanding reader conditionals is a
+    // temporary, so it is not a stable site for the macro-expansion cache.
+    let mut site = Some(site);
     let forms: &[Form] = if forms
         .iter()
         .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
     {
         expanded = expand_reader_conds(forms);
+        site = None;
         if expanded.is_empty() {
             return Ok(Value::List(GcPtr::new(PersistentList::empty())));
         }
@@ -309,7 +313,7 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
         return eval_special(s, &forms[1..], env);
     }
 
-    eval_call(&forms[0], &forms[1..], env)
+    eval_call(site, &forms[0], &forms[1..], env)
 }
 
 // ── Symbol resolution ─────────────────────────────────────────────────────────

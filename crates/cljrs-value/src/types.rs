@@ -1217,8 +1217,10 @@ pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,
     /// The name after `&`, if any.
     pub rest_param: Option<Arc<str>>,
-    /// The body forms for this arity.
-    pub body: Vec<Form>,
+    /// The body forms for this arity. Shared, so cloning a fn (e.g. when
+    /// `lazy-seq` wraps a thunk, or a closure is copied) does not deep-copy
+    /// its body.
+    pub body: Arc<[Form]>,
     /// Destructuring patterns: (param_index, original_form).
     /// After binding the gensym'd param, these patterns are applied
     /// via `bind_pattern` to destructure the value.
@@ -1242,7 +1244,7 @@ impl CljxFnArity {
         // params Vec buffer (Arc<str> pointers; the str data is shared, skip it)
         self.params.capacity() * mem::size_of::<Arc<str>>()
         // body: the dominant consumer — Form AST trees stored inline
-        + self.body.capacity() * mem::size_of::<Form>()
+        + self.body.len() * mem::size_of::<Form>()
         + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
         // destructure_params
         + self.destructure_params.capacity() * mem::size_of::<(usize, Form)>()

@@ -79,7 +79,7 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
         }
 
         let mut result = Ok(Value::Nil);
-        for form in &arity.body {
+        for form in arity.body.iter() {
             result = Box::pin(eval_async(form, &mut env)).await;
             if result.is_err() {
                 break;
