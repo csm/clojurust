@@ -16,6 +16,13 @@ thread_local! {
     pub(super) static SCHEDULER: Arc<Scheduler> = Scheduler::new();
 }
 
+/// Safepoints between clock reads (slice expiry and heartbeat updates).
+const SAFEPOINT_CHECK_INTERVAL: u32 = 64;
+/// Safepoint ticks a native-frame exit counts for. A loop of native calls
+/// reaches the clock check after `SAFEPOINT_CHECK_INTERVAL / NATIVE_EXIT_TICKS`
+/// calls, bounding how far long native calls stretch the time slice.
+const NATIVE_EXIT_TICKS: u32 = 8;
+
 pub(super) struct Scheduler {
     ready: AtomicUsize,
     running: Mutex<Option<Running>>,
@@ -423,6 +430,13 @@ impl Scheduling {
 
     pub(super) fn exit_native(&self, previous: usize) {
         self.native.set(previous);
+        // A native call may run for milliseconds without a safepoint, so it
+        // weighs more than one: a loop of long native calls then reads the
+        // clock (and updates the heartbeat) every few calls rather than every
+        // `SAFEPOINT_CHECK_INTERVAL` (issue #458). Cheap natives stay cheap:
+        // still at most one clock read per `NATIVE_EXIT_TICKS` calls.
+        self.ticks
+            .set(self.ticks.get().saturating_add(NATIVE_EXIT_TICKS));
         self.wake
             .scheduler
             .native
@@ -452,11 +466,12 @@ impl Scheduling {
         if self.cancelled.get() {
             return Ok(false);
         }
-        let ticks = self.ticks.get().wrapping_add(1);
-        self.ticks.set(ticks);
-        if !ticks.is_multiple_of(64) {
+        let ticks = self.ticks.get().saturating_add(1);
+        if ticks < SAFEPOINT_CHECK_INTERVAL {
+            self.ticks.set(ticks);
             return Ok(false);
         }
+        self.ticks.set(0);
         let now = Instant::now();
         if let Some(run) = self.wake.scheduler.running.lock().unwrap().as_mut() {
             run.heartbeat = now;
@@ -607,7 +622,43 @@ mod tests {
         current
             .slice_start
             .set(Instant::now() - Duration::from_secs(1));
-        current.ticks.set(63);
+        current.ticks.set(SAFEPOINT_CHECK_INTERVAL - 1);
+    }
+
+    #[test]
+    fn native_exits_bring_the_slice_check_forward() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            super::super::spawn(|| {
+                let current = super::super::scheduling().unwrap();
+                current
+                    .slice_start
+                    .set(Instant::now() - Duration::from_secs(1));
+                current.ticks.set(0);
+                let id = cljrs_gc::fiber::NativeDiagnosticId::default();
+                let name: Arc<str> = Arc::from("slow-native");
+                let calls = SAFEPOINT_CHECK_INTERVAL / NATIVE_EXIT_TICKS;
+                // One native call short of the interval: no clock read yet.
+                for _ in 1..calls {
+                    drop(cljrs_gc::fiber::native_frame(&name, &id));
+                }
+                assert!(!current.safepoint().unwrap());
+                // The next native exit makes the following safepoint check the
+                // clock and find the slice expired, far before 64 safepoints.
+                drop(cljrs_gc::fiber::native_frame(&name, &id));
+                assert!(current.safepoint().unwrap());
+                assert_eq!(current.ticks.get(), 0);
+                Ok(cljrs_value::Value::Nil)
+            })
+            .unwrap()
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        });
     }
 
     #[test]

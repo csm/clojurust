@@ -16,8 +16,8 @@ use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use cljrs_gc::mutator::{MutatorState, assert_parkable};
@@ -84,7 +84,18 @@ pub fn current() -> Option<FiberId> {
 
 const MIN_STACK_BYTES: usize = 512 * 1024;
 
+/// The configured fiber stack size, read from `CLJRS_FIBER_STACK_KB` once per
+/// process: `std::env::var` takes the environment lock and allocates, and
+/// every `go`/`future` builds a fiber (issue #458).
 fn stack_bytes() -> Result<usize, EvalError> {
+    static STACK_BYTES: OnceLock<Result<usize, String>> = OnceLock::new();
+    STACK_BYTES
+        .get_or_init(read_stack_bytes)
+        .clone()
+        .map_err(EvalError::Runtime)
+}
+
+fn read_stack_bytes() -> Result<usize, String> {
     match std::env::var("CLJRS_FIBER_STACK_KB") {
         Ok(value) => {
             let bytes = value
@@ -92,25 +103,21 @@ fn stack_bytes() -> Result<usize, EvalError> {
                 .ok()
                 .and_then(|kb| kb.checked_mul(1024))
                 .ok_or_else(|| {
-                    EvalError::Runtime(
-                        "CLJRS_FIBER_STACK_KB must be a size that fits in usize".into(),
-                    )
+                    "CLJRS_FIBER_STACK_KB must be a size that fits in usize".to_string()
                 })?;
             if bytes < MIN_STACK_BYTES {
                 // Smaller stacks cannot hold the safepoint margin. Clamp, as
-                // earlier releases accepted these values.
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "warning: CLJRS_FIBER_STACK_KB={value} is below the 512 KiB minimum; using 512"
-                    );
-                });
+                // earlier releases accepted these values. Read once, so this
+                // warns once.
+                eprintln!(
+                    "warning: CLJRS_FIBER_STACK_KB={value} is below the 512 KiB minimum; using 512"
+                );
                 return Ok(MIN_STACK_BYTES);
             }
             Ok(bytes)
         }
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STACK_BYTES),
-        Err(_) => Err(EvalError::Runtime("invalid CLJRS_FIBER_STACK_KB".into())),
+        Err(_) => Err("invalid CLJRS_FIBER_STACK_KB".to_string()),
     }
 }
 
@@ -784,6 +791,32 @@ pub fn spawn_rooted(
 ) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
     let task = Fiber::with_roots(roots, body)?.into_task();
     Ok(tokio::task::spawn_local(drive_to_result(task)))
+}
+
+/// Spawn `task` on the current `LocalSet` and pass its result to `deliver` in
+/// the poll that completes it, while the task (and the roots it registered)
+/// is still alive. One executor task and no intermediate `Future` cell or
+/// root state, unlike awaiting the task inside [`crate::task::spawn_future`].
+/// The fiber installs its own conveyed bindings, meters and interrupt flags,
+/// so the poll needs no outer scopes. Must be called within a `LocalSet`.
+pub(crate) fn spawn_delivering(task: FiberTask, deliver: impl FnOnce(EvalResult) + 'static) {
+    let mut task = task;
+    let mut deliver = Some(deliver);
+    #[cfg(feature = "no-gc")]
+    let (lease, allocation) = (task._captures.clone(), task.allocation.clone());
+    tokio::task::spawn_local(poll_fn(move |cx| {
+        #[cfg(feature = "no-gc")]
+        let _lease_scope = lease.enter();
+        #[cfg(feature = "no-gc")]
+        let _allocation_scope = allocation.enter();
+        let Poll::Ready(result) = Pin::new(&mut task).poll(cx) else {
+            return Poll::Pending;
+        };
+        if let Some(deliver) = deliver.take() {
+            deliver(result);
+        }
+        Poll::Ready(())
+    }));
 }
 
 /// Drive `task` to completion and keep its result rooted in a [`FiberResult`].
