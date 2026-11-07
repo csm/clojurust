@@ -45,7 +45,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 use cljrs_runtime::tiered::{Env, EvalError, GlobalEnv};
@@ -81,7 +80,7 @@ pub(crate) struct Job {
     pub replies: tokio::sync::mpsc::UnboundedSender<Bencode>,
     /// Set by an `interrupt` op. Checked before the job starts, and installed
     /// on the gas meter while it evaluates so a running eval stops too.
-    pub cancelled: Arc<AtomicBool>,
+    pub cancelled: Arc<cljrs_runtime::env::gas::InterruptFlag>,
     /// Entry to clear from the in-flight registry when the job completes.
     pub pending_key: Option<server::PendingKey>,
     pub pending: Arc<server::Pending>,
@@ -429,7 +428,7 @@ where
         return;
     }
     let sid = req.session.clone().unwrap_or_default();
-    let status: &[&str] = if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+    let status: &[&str] = if cancelled.is_set() {
         &["interrupted"]
     } else {
         let msg = failure.map_or_else(

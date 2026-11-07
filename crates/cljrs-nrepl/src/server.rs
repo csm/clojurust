@@ -7,7 +7,6 @@
 //! interpreter thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +14,8 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
+
+use cljrs_runtime::env::gas::InterruptFlag;
 
 use crate::Job;
 use crate::bencode::{self, Bencode};
@@ -28,11 +29,11 @@ pub(crate) type PendingKey = (String, String);
 /// interpreter thread (which clears entries as jobs finish).
 #[derive(Default)]
 pub(crate) struct Pending {
-    map: Mutex<HashMap<PendingKey, Arc<AtomicBool>>>,
+    map: Mutex<HashMap<PendingKey, Arc<InterruptFlag>>>,
 }
 
 impl Pending {
-    fn insert(&self, key: PendingKey, flag: Arc<AtomicBool>) {
+    fn insert(&self, key: PendingKey, flag: Arc<InterruptFlag>) {
         self.map.lock().unwrap().insert(key, flag);
     }
 
@@ -168,7 +169,7 @@ fn dispatch(
             let _ = reply_tx.send(resp.build());
         }
         _ => {
-            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::new(InterruptFlag::new(false));
             // Only evals are interruptible, and only when addressable.
             let pending_key = match (req.op.as_str(), &req.session, &req.id) {
                 ("eval" | "load-file", Some(s), Some(i)) => {

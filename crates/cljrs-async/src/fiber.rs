@@ -159,7 +159,7 @@ fn park_on_impl<F: Future>(future: F) -> F::Output {
     // against the evaluation's interrupt flags (issue #446). The flags are
     // captured here, on the fiber: the park future is polled by the driver.
     let interrupts = cljrs_runtime::env::gas::active_interrupts();
-    if interrupts.iter().any(|flag| flag.load(Ordering::SeqCst)) {
+    if interrupts.iter().any(|flag| flag.is_set()) {
         resume_cancelled();
     }
     let mut future = pin!(future);

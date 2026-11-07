@@ -2,6 +2,7 @@
 //!
 //! Hooks run only on a fiber; ordinary callers retain blocking behavior.
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -92,7 +93,9 @@ pub fn park<F: Future>(future: F) -> F::Output {
 struct State {
     generation: u64,
     next_id: u64,
-    wakers: Vec<(u64, Waker)>,
+    /// Registered wakers keyed by listener id: O(1) register, update and
+    /// unregister however many fibers wait on the event.
+    wakers: HashMap<u64, Waker>,
 }
 
 /// Broadcast event with race-free registration and cancellation cleanup.
@@ -121,7 +124,7 @@ impl Event {
             std::mem::take(&mut state.wakers)
         };
         self.cond.notify_all();
-        for (_, waker) in wakers {
+        for waker in wakers.into_values() {
             waker.wake();
         }
     }
@@ -163,22 +166,24 @@ impl Future for Listener<'_> {
         if state.generation != self.generation {
             return Poll::Ready(());
         }
-        if let Some((_, w)) = state.wakers.iter_mut().find(|(id, _)| *id == self.id) {
-            w.clone_from(cx.waker());
-        } else {
-            state.wakers.push((self.id, cx.waker().clone()));
+        match state.wakers.entry(self.id) {
+            std::collections::hash_map::Entry::Occupied(mut w) => {
+                w.get_mut().clone_from(cx.waker())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(cx.waker().clone());
+            }
         }
         Poll::Pending
     }
 }
 impl Drop for Listener<'_> {
     fn drop(&mut self) {
-        self.event
-            .state
-            .lock()
-            .unwrap()
-            .wakers
-            .retain(|(id, _)| *id != self.id);
+        let mut state = self.event.state.lock().unwrap();
+        // After a notification the waker was already taken.
+        if state.generation == self.generation {
+            state.wakers.remove(&self.id);
+        }
     }
 }
 
