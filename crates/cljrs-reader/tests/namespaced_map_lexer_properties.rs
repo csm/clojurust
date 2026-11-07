@@ -22,8 +22,14 @@ fn bare_name() -> impl Strategy<Value = String> {
 }
 
 /// A namespace: bare identifiers joined by dots, as `my.app.core`.
+/// `nil`, `true` and `false` read as literals, not symbols, so they are never
+/// a valid prefix; the generator must not produce them.
 fn ns_name() -> impl Strategy<Value = String> {
-    prop::collection::vec(bare_name(), 1..3).prop_map(|parts| parts.join("."))
+    prop::collection::vec(bare_name(), 1..3)
+        .prop_map(|parts| parts.join("."))
+        .prop_filter("reserved literal, not a symbol", |ns| {
+            !matches!(ns.as_str(), "nil" | "true" | "false")
+        })
 }
 
 /// Any run of the characters the JVM reader skips between the prefix and `{`.

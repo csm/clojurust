@@ -120,17 +120,42 @@ syntax-quote form.
 
 ---
 
+### `form::ExpansionCache` / `form::CachedExpansion`
+
+Per-call-site memo of a macro expansion, owned by the call's `Form`, so the
+tree-walker expands a call site inside a fn body or `loop` once instead of on
+every evaluation (Clojure expands once, at compile time). An entry is valid
+only for the macro (`macro_id`, its first arity's process-unique id) and
+namespace that produced it. Clones of a list form share one slot (allocated
+lazily), so a `(fn ...)` body copied into many closures expands once in total;
+a freshly parsed form starts empty.
+
+```rust
+pub struct CachedExpansion { pub macro_id: u64, pub ns: Arc<str>, pub form: Arc<Form> }
+
+impl ExpansionCache {
+    pub fn get(&self, macro_id: u64, ns: &str) -> Option<Arc<Form>>
+    pub fn store(&self, macro_id: u64, ns: Arc<str>, form: Form) -> Arc<Form>
+    pub fn clear(&self)
+}
+```
+
+---
+
 ### `form::Form` / `form::FormKind`
 
 The reader AST. Every `Form` carries a `Span` for diagnostics.
 
-`PartialEq` on `Form` ignores spans — equality tests compare only `FormKind`.
+`PartialEq` on `Form` ignores spans and the expansion cache — equality tests
+compare only `FormKind`.
 
 ```rust
-#[derive(Debug, Clone)]
+#[derive(Debug)] // Clone is hand-written: a list's clones share `expansion`
 pub struct Form {
     pub kind: FormKind,
     pub span: Span,
+    /// Memoized macro expansion when this form is a macro call site.
+    pub expansion: ExpansionCache,
 }
 
 impl Form {

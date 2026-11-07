@@ -993,6 +993,9 @@ pub struct IsolateAccount {
     /// Bytes allocated since the last recorded collection; used to compute the
     /// allocation rate for dynamic collection targets.
     alloc_since_collection: Cell<usize>,
+    /// Credit [`Self::try_reserve_credit`] has just promised; a recall
+    /// serviced during that grant must not trim below it.
+    reserved: Cell<usize>,
     /// When this isolate last recorded a collection; paired with
     /// `alloc_since_collection` to derive the allocation rate.
     /// Set at registration, so the first rate covers the isolate's lifetime.
@@ -1143,7 +1146,9 @@ impl IsolateAccount {
         match self.request_credit(bytes - credit, current_admission()) {
             Ok(grant) => {
                 self.credit.set(credit + grant);
+                self.reserved.set(bytes);
                 self.after_grant();
+                self.reserved.set(0);
                 Ok(())
             }
             Err(refused) => {
@@ -1260,7 +1265,10 @@ impl IsolateAccount {
         // Returned credit leaves the `GcHeap` class, so that class must
         // first hold this account's current non-region bytes.
         self.publish_region();
-        let limit = self.governor.retained_credit(self.governor.pressure());
+        let limit = self
+            .governor
+            .retained_credit(self.governor.pressure())
+            .max(self.reserved.get());
         let credit = self.credit.get();
         if credit > limit {
             self.credit.set(limit);
@@ -2041,6 +2049,7 @@ impl ProcessMemoryGovernor {
             pending_allocs: Cell::new(0),
             pending_alloc_bytes: Cell::new(0),
             alloc_since_collection: Cell::new(0),
+            reserved: Cell::new(0),
             collection_started: Cell::new(Instant::now()),
         }
     }

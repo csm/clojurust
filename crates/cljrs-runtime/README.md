@@ -1021,10 +1021,13 @@ evaluator may consume fewer credits than equivalent interpreted code. Compiled
 code emits a checkpoint call at every basic block even when no meter is active;
 avoiding that always-on JIT cost requires a future metering-mode fast path.
 
-### `eval_call(func_form, arg_forms, env) -> EvalResult`
+### `eval_call(site, func_form, arg_forms, env) -> EvalResult`
 
 Evaluate a function-call form.  Handles macros, native-function special cases,
-and user-defined `CljxFn` application with the recur trampoline.
+and user-defined `CljxFn` application with the recur trampoline.  `site` is the
+whole call `Form` when it is a stable AST node; a macro call's expansion is
+memoized on it (`cljrs_reader::ExpansionCache`), keyed by macro identity and
+current namespace, so re-evaluating the site does not re-run the macro.
 
 ### `eval_body(forms, env) -> EvalResult`
 

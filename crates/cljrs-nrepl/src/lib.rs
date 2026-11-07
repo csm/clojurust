@@ -572,14 +572,15 @@ where
             .status(status)
             .build(),
     );
+    // Leave `Pending` before `done`, as `Engine::handle` does.
+    if let Some(key) = &pending_key {
+        pending.remove(key);
+    }
     let _ = replies.send(
         protocol::Response::for_request(&req, &sid)
             .status(&["done"])
             .build(),
     );
-    if let Some(key) = &pending_key {
-        pending.remove(key);
-    }
 }
 
 impl Drop for Poller {
