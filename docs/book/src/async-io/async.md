@@ -209,7 +209,8 @@ dispatches to the matching handler:
 Because every fiber shares the isolate thread, GC safepoints are cooperative:
 the collector runs on the active fiber at a safepoint and traces every
 suspended fiber's roots. A background GC-service task (spawned by the crate's `init`)
-services collection requests, and explicit root guards keep spawned task
+sleeps until a collection is requested and then services it, so an idle
+executor stays idle, and explicit root guards keep spawned task
 futures and their captured environments reachable while they are in flight.
 
 ## Embedding from Rust
