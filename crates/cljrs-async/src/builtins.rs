@@ -419,46 +419,63 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);
+    // Native: the fiber's own executor task delivers its result, so a `go`
+    // costs one LocalSet task and one root state (issue #458). The channel is
+    // among the fiber's roots, which stay registered through delivery.
     #[cfg(not(target_arch = "wasm32"))]
-    let body = crate::runtime::call_fiber(thunk, Vec::new(), call_env, vec![ch_val.clone()])
-        .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?
-        .into_task();
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = rt;
+    {
+        let _ = rt;
+        let task = crate::runtime::call_fiber(thunk, Vec::new(), call_env, vec![ch_val.clone()])
+            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?
+            .into_task();
+        crate::fiber::spawn_delivering(task, move |result| {
+            let _ = deliver_thread_result(chan_ref(result_ch.get()), result);
+        });
+    }
     #[cfg(target_arch = "wasm32")]
-    let body = crate::task::await_value(
-        rt.spawn_fiber_call(thunk, Vec::new(), call_env)
-            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?,
-    );
-    let anchor = ch_val.clone();
-    let delivery = spawn_future_with_roots(args.to_vec(), async move {
-        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-        match body.await {
-            Ok(value) if !matches!(value, Value::Nil) => {
-                chan_ref(result_ch.get()).try_put_buffered(&value);
-            }
-            Ok(_) => {}
-            Err(error @ EvalError::Cancelled) => {
-                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Cancelled);
-                return Err(error);
-            }
-            Err(error @ EvalError::GasExhausted) => {
-                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Gas);
-                return Err(error);
-            }
-            Err(EvalError::MemoryLimitExceeded(fault)) => {
-                chan_ref(result_ch.get()).fail(crate::channel::ChannelFailure::Memory(fault));
-                return Err(EvalError::MemoryLimitExceeded(fault));
-            }
-            Err(error) => eprintln!("[clojurust thread error] {error}"),
+    {
+        let body = crate::task::await_value(
+            rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+                .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?,
+        );
+        let anchor = ch_val.clone();
+        let delivery = spawn_future_with_roots(args.to_vec(), async move {
+            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+            deliver_thread_result(chan_ref(result_ch.get()), body.await)
+        });
+        if let Value::Future(future) = delivery {
+            future.get().mark_observed();
         }
-        chan_ref(result_ch.get()).close();
-        Ok(Value::Nil)
-    });
-    if let Value::Future(future) = delivery {
-        future.get().mark_observed();
     }
     Ok(ch_val)
+}
+
+/// Send a `thread-call` body's non-nil result to its channel and close it, or
+/// fail the channel for an interrupt, exhausted gas or memory limit. Other
+/// errors are reported and only close the channel.
+#[allow(clippy::result_large_err)]
+fn deliver_thread_result(channel: &CljChannel, result: EvalResult) -> EvalResult {
+    match result {
+        Ok(value) if !matches!(value, Value::Nil) => {
+            channel.try_put_buffered(&value);
+        }
+        Ok(_) => {}
+        Err(error @ EvalError::Cancelled) => {
+            channel.fail(crate::channel::ChannelFailure::Cancelled);
+            return Err(error);
+        }
+        Err(error @ EvalError::GasExhausted) => {
+            channel.fail(crate::channel::ChannelFailure::Gas);
+            return Err(error);
+        }
+        Err(EvalError::MemoryLimitExceeded(fault)) => {
+            channel.fail(crate::channel::ChannelFailure::Memory(fault));
+            return Err(EvalError::MemoryLimitExceeded(fault));
+        }
+        Err(error) => eprintln!("[clojurust thread error] {error}"),
+    }
+    channel.close();
+    Ok(Value::Nil)
 }
 
 /// `(onto-chan! ch coll)` — put every value from `coll` onto `ch` and then
