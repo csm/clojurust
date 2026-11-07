@@ -9,13 +9,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::limits::JobReplies;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_runtime::env::dynamics;
 use cljrs_runtime::tiered::{EvalError, GlobalEnv};
 use cljrs_value::{Keyword, Value, Var};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bencode::Bencode;
 use crate::protocol::{Request, Response};
@@ -91,7 +91,11 @@ impl Engine {
             cancelled,
             pending_key,
             pending,
+            ticket,
         } = job;
+        // The job counts against the admission limits while it runs or
+        // parks, until its final `done` reply (or until it is dropped).
+        let replies = JobReplies::new(replies, ticket);
         if cancelled.is_set() {
             // Interrupted while still queued: drop the work entirely.
             let sid = req.session.clone().unwrap_or_default();
@@ -170,7 +174,7 @@ impl Engine {
         format!("session-{micros:x}-{:x}", self.session_counter.get())
     }
 
-    fn op_clone(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_clone(&self, req: &Request, replies: &JobReplies) {
         // The new session inherits the source session's namespace.
         let source = req
             .session
@@ -194,7 +198,7 @@ impl Engine {
         );
     }
 
-    fn op_close(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_close(&self, req: &Request, replies: &JobReplies) {
         let sid = req.session.clone().unwrap_or_default();
         self.sessions.borrow_mut().remove(&sid);
         // Drop the session's retained values so the GC can reclaim them.
@@ -216,7 +220,7 @@ impl Engine {
         );
     }
 
-    fn op_ls_sessions(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_ls_sessions(&self, req: &Request, replies: &JobReplies) {
         let sessions: Vec<Bencode> = self.sessions.borrow().keys().map(Bencode::str).collect();
         let sid = req.session.clone().unwrap_or_default();
         let _ = replies.send(
@@ -232,7 +236,7 @@ impl Engine {
     fn op_eval(
         &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
     ) {
@@ -251,7 +255,7 @@ impl Engine {
     fn op_load_file(
         &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
     ) {
@@ -276,7 +280,7 @@ impl Engine {
     fn eval_code(
         &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
         cancelled: &cljrs_runtime::env::gas::InterruptFlag,
         code: &str,
@@ -428,7 +432,7 @@ impl Engine {
 
     // ── Tooling ops ───────────────────────────────────────────────────────────
 
-    fn op_completions(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_completions(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
         let session_cell = self.session(&sid);
         let session = session_cell.borrow();
@@ -507,7 +511,7 @@ impl Engine {
 
     /// cider-nrepl `macroexpand`: expand `code` in `ns` with the requested
     /// expander and reply with the printed expansion.
-    fn op_macroexpand(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_macroexpand(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
         let globals = self.globals.clone();
         let session_cell = self.session(&sid);
@@ -574,7 +578,7 @@ impl Engine {
 
     /// cider-nrepl `analyze-last-stacktrace` (legacy `stacktrace`): one
     /// message per cause of the session's `*e`, outermost first.
-    fn op_analyze_last_stacktrace(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_analyze_last_stacktrace(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
         let session_cell = self.session(&sid);
         let session = session_cell.borrow();
@@ -626,7 +630,7 @@ impl Engine {
         let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
     }
 
-    fn op_lookup(&self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_lookup(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
         let session_cell = self.session(&sid);
         let session = session_cell.borrow();

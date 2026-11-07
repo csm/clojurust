@@ -39,6 +39,7 @@ pub fn run(args: Args, versioning: VersioningFlags) -> miette::Result<i32> {
     let config = cljrs_nrepl::Config {
         addr,
         port_file: Some(PathBuf::from(".nrepl-port")),
+        limits: cljrs_nrepl::Limits::default(),
     };
     let server = cljrs_nrepl::start(config, globals)?;
     // Editors (CIDER, Calva) parse this exact line to auto-connect.

@@ -36,8 +36,11 @@
 
 pub mod bencode;
 mod engine;
+mod limits;
 pub mod protocol;
 mod server;
+
+pub use limits::Limits;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -50,7 +53,6 @@ use std::sync::mpsc;
 use cljrs_runtime::tiered::{Env, EvalError, GlobalEnv};
 use cljrs_value::Value;
 
-use crate::bencode::Bencode;
 use crate::protocol::Request;
 
 /// Server configuration.
@@ -61,6 +63,8 @@ pub struct Config {
     /// convention editors use to auto-connect). Removed again when
     /// [`Server::serve`] returns.
     pub port_file: Option<PathBuf>,
+    /// Bounds on accepted jobs, request size, and queued output.
+    pub limits: Limits,
 }
 
 impl Default for Config {
@@ -68,6 +72,7 @@ impl Default for Config {
         Config {
             addr: ([127, 0, 0, 1], 0).into(),
             port_file: None,
+            limits: Limits::default(),
         }
     }
 }
@@ -76,14 +81,17 @@ impl Default for Config {
 /// Carries only `Send` data — never GC'd values.
 pub(crate) struct Job {
     pub req: Request,
-    /// Channel back to the connection's writer task.
-    pub replies: tokio::sync::mpsc::UnboundedSender<Bencode>,
+    /// Channel back to the connection's writer task, bounded by
+    /// [`Limits::max_output_bytes`].
+    pub replies: limits::ReplySender,
     /// Set by an `interrupt` op. Checked before the job starts, and installed
     /// on the gas meter while it evaluates so a running eval stops too.
     pub cancelled: Arc<cljrs_runtime::env::gas::InterruptFlag>,
     /// Entry to clear from the in-flight registry when the job completes.
     pub pending_key: Option<server::PendingKey>,
     pub pending: Arc<server::Pending>,
+    /// The job's admission slot; released when the job is dropped.
+    pub ticket: limits::Ticket,
 }
 
 /// Signature of the per-form evaluator the interpreter thread uses.
@@ -104,6 +112,7 @@ pub struct Server {
     net_thread: Option<std::thread::JoinHandle<()>>,
     port_file: Option<PathBuf>,
     globals: Arc<GlobalEnv>,
+    admission: Arc<limits::Admission>,
 }
 
 /// Cloneable, `Send` handle that stops the server: the network thread shuts
@@ -140,8 +149,12 @@ pub fn start(config: Config, globals: Arc<GlobalEnv>) -> miette::Result<Server> 
             .map_err(|e| miette::miette!("nrepl: failed to write {}: {e}", path.display()))?;
     }
 
+    // Unbounded as a channel, but every job on it holds an admission ticket,
+    // so it never carries more than `limits.max_pending_jobs` jobs.
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let admission = limits::Admission::new(config.limits);
+    let net_admission = admission.clone();
 
     let net_thread = std::thread::Builder::new()
         .name("cljrs-nrepl-net".into())
@@ -150,7 +163,7 @@ pub fn start(config: Config, globals: Arc<GlobalEnv>) -> miette::Result<Server> 
                 .enable_all()
                 .build()
                 .expect("nrepl: failed to build tokio runtime");
-            rt.block_on(server::run(listener, job_tx, shutdown_rx));
+            rt.block_on(server::run(listener, job_tx, net_admission, shutdown_rx));
             // Dropping the runtime aborts connection tasks, which drops their
             // job senders and unblocks the interpreter thread's recv loop.
         })
@@ -163,6 +176,7 @@ pub fn start(config: Config, globals: Arc<GlobalEnv>) -> miette::Result<Server> 
         net_thread: Some(net_thread),
         port_file: config.port_file,
         globals,
+        admission,
     })
 }
 
@@ -174,6 +188,11 @@ impl Server {
 
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
+    }
+
+    /// The limits this server enforces.
+    pub fn limits(&self) -> Limits {
+        *self.admission.limits()
     }
 
     /// Process evaluation jobs on the current thread until the server is shut
@@ -222,6 +241,20 @@ pub enum PollStatus {
     Closed,
 }
 
+/// The outcome of one budgeted [`Poller`] call
+/// ([`Poller::poll_budget`] / [`Poller::spawn_pending_budget`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollBatch {
+    /// Whether the server can still receive jobs.
+    pub status: PollStatus,
+    /// Jobs taken off the incoming queue by this call.
+    pub jobs: usize,
+    /// The call stopped because it reached its budget, not because the
+    /// queue was empty or closed: more jobs may be waiting, so call again
+    /// (on a later turn) to take them.
+    pub budget_exhausted: bool,
+}
+
 /// A non-blocking nREPL driver.
 ///
 /// [`Server::serve_with`] blocks the interpreter thread on the job channel,
@@ -242,6 +275,16 @@ pub enum PollStatus {
 ///   per frame), and replies are sent as the fibers run. A parked eval then
 ///   costs the host nothing.
 ///
+/// [`Poller::poll_budget`] and [`Poller::spawn_pending_budget`] take at most
+/// a given number of jobs per call and report whether the budget ran out, so
+/// a host can bound the work one turn admits; the unbudgeted calls take
+/// everything queued. Independently, the server admits at most
+/// [`Limits::max_pending_jobs`] unfinished jobs (and
+/// [`Limits::max_session_jobs`] per session), counting queued, running and
+/// parked ones, and refuses the rest with an `overloaded` status, so the
+/// incoming queue, the session lanes and the set of spawned evaluations
+/// are all bounded. `interrupt` is never subject to admission.
+///
 /// Either way, jobs for one session run one at a time, in arrival order.
 /// Spawned jobs for different sessions can interleave at parks. The two
 /// modes can be mixed: while a session has spawned jobs in flight, `poll`
@@ -259,12 +302,10 @@ pub struct Poller {
 /// is present exactly while a lane task for it is alive on the `LocalSet`.
 type Lanes = RefCell<HashMap<String, VecDeque<Job>>>;
 
-/// The ordering key of a job: its session, or the shared default session.
-fn lane_key(job: &Job) -> String {
-    job.req
-        .session
-        .clone()
-        .unwrap_or_else(|| "default".to_string())
+/// The ordering (and admission) key of a request: its session, or the
+/// shared default session.
+pub(crate) fn lane_key(req: &protocol::Request) -> String {
+    req.session.clone().unwrap_or_else(|| "default".to_string())
 }
 
 impl Poller {
@@ -277,14 +318,59 @@ impl Poller {
         self.server.shutdown.clone()
     }
 
+    /// The limits this server enforces.
+    pub fn limits(&self) -> Limits {
+        self.server.limits()
+    }
+
+    /// Admitted jobs not yet finished: queued, waiting behind their session,
+    /// running, or parked. Never exceeds [`Limits::max_pending_jobs`].
+    pub fn pending_jobs(&self) -> usize {
+        self.server.admission.pending()
+    }
+
     /// Handle every job queued right now, without waiting for more.
     pub fn poll(&mut self, eval_form: &mut impl EvalForm) -> PollStatus {
-        loop {
+        self.poll_budget(eval_form, usize::MAX).status
+    }
+
+    /// Handle at most `budget` jobs queued right now, without waiting for
+    /// more. Each runs to completion before the next, as with
+    /// [`Poller::poll`]; see [`PollBatch`] for the result.
+    pub fn poll_budget(&mut self, eval_form: &mut impl EvalForm, budget: usize) -> PollBatch {
+        self.take_jobs(budget, |this, job| this.handle_now(job, eval_form))
+    }
+
+    /// Take up to `budget` jobs off the incoming queue, passing each to
+    /// `handle`.
+    fn take_jobs(&mut self, budget: usize, mut handle: impl FnMut(&mut Self, Job)) -> PollBatch {
+        let mut jobs = 0;
+        while jobs < budget {
             match self.server.job_rx.try_recv() {
-                Ok(job) => self.handle_now(job, eval_form),
-                Err(mpsc::TryRecvError::Empty) => return PollStatus::Open,
-                Err(mpsc::TryRecvError::Disconnected) => return PollStatus::Closed,
+                Ok(job) => {
+                    jobs += 1;
+                    handle(self, job);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return PollBatch {
+                        status: PollStatus::Open,
+                        jobs,
+                        budget_exhausted: false,
+                    };
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return PollBatch {
+                        status: PollStatus::Closed,
+                        jobs,
+                        budget_exhausted: false,
+                    };
+                }
             }
+        }
+        PollBatch {
+            status: PollStatus::Open,
+            jobs,
+            budget_exhausted: true,
         }
     }
 
@@ -296,20 +382,50 @@ impl Poller {
         eval_form: &mut impl EvalForm,
         timeout: std::time::Duration,
     ) -> PollStatus {
+        self.poll_timeout_budget(eval_form, timeout, usize::MAX)
+            .status
+    }
+
+    /// Like [`Poller::poll_timeout`], but handle at most `budget` jobs
+    /// (including the one waited for); see [`PollBatch`] for the result. A
+    /// zero budget returns at once without waiting.
+    pub fn poll_timeout_budget(
+        &mut self,
+        eval_form: &mut impl EvalForm,
+        timeout: std::time::Duration,
+        budget: usize,
+    ) -> PollBatch {
+        if budget == 0 {
+            return PollBatch {
+                status: PollStatus::Open,
+                jobs: 0,
+                budget_exhausted: true,
+            };
+        }
         match self.server.job_rx.recv_timeout(timeout) {
             Ok(job) => {
                 self.handle_now(job, eval_form);
-                self.poll(eval_form)
+                let mut batch = self.poll_budget(eval_form, budget - 1);
+                batch.jobs += 1;
+                batch
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => PollStatus::Open,
-            Err(mpsc::RecvTimeoutError::Disconnected) => PollStatus::Closed,
+            Err(mpsc::RecvTimeoutError::Timeout) => PollBatch {
+                status: PollStatus::Open,
+                jobs: 0,
+                budget_exhausted: false,
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => PollBatch {
+                status: PollStatus::Closed,
+                jobs: 0,
+                budget_exhausted: false,
+            },
         }
     }
 
     /// Run `job` on this thread now, unless its session has spawned jobs in
     /// flight; then it waits its turn behind them.
     fn handle_now(&mut self, job: Job, eval_form: &mut impl EvalForm) {
-        let job = match self.lanes.borrow_mut().get_mut(&lane_key(&job)) {
+        let job = match self.lanes.borrow_mut().get_mut(&lane_key(&job.req)) {
             Some(queue) => {
                 queue.push_back(job);
                 return;
@@ -343,13 +459,22 @@ impl Poller {
     where
         F: EvalForm + Clone + 'static,
     {
-        loop {
-            match self.server.job_rx.try_recv() {
-                Ok(job) => self.spawn_job(local, job, &eval_form),
-                Err(mpsc::TryRecvError::Empty) => return PollStatus::Open,
-                Err(mpsc::TryRecvError::Disconnected) => return PollStatus::Closed,
-            }
-        }
+        self.spawn_pending_budget(local, eval_form, usize::MAX)
+            .status
+    }
+
+    /// Like [`Poller::spawn_pending`], but start at most `budget` of the jobs
+    /// queued right now; see [`PollBatch`] for the result.
+    pub fn spawn_pending_budget<F>(
+        &mut self,
+        local: &tokio::task::LocalSet,
+        eval_form: F,
+        budget: usize,
+    ) -> PollBatch
+    where
+        F: EvalForm + Clone + 'static,
+    {
+        self.take_jobs(budget, |this, job| this.spawn_job(local, job, &eval_form))
     }
 
     /// Queue `job` on its session's lane, starting a lane task on `local`
@@ -358,7 +483,7 @@ impl Poller {
     where
         F: EvalForm + Clone + 'static,
     {
-        let key = lane_key(&job);
+        let key = lane_key(&job.req);
         {
             let mut lanes = self.lanes.borrow_mut();
             if let Some(queue) = lanes.get_mut(&key) {
