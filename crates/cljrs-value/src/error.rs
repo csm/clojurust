@@ -41,6 +41,22 @@ pub enum ValueError {
     #[error("gas exhausted")]
     GasExhausted,
 
+    /// Execution was cancelled; the gas budget was not exhausted.
+    ///
+    /// Reserved for fiber cancellation (`parking::catch_cancelled` and
+    /// cancelled safepoints). It is uncatchable inside the cancelled
+    /// computation, but a future it settles is treated like `future-cancel`:
+    /// awaiters get a catchable exception, and an unread one is not reported
+    /// unless `CLJRS_WARN_INTERRUPTED_FUTURES` is enabled.
+    /// Native code must not return it for other failures.
+    #[error("execution cancelled")]
+    Cancelled,
+
+    /// The process memory governor refused a governed allocation (strict
+    /// mode).  Like `GasExhausted`, it is not catchable by Clojure code.
+    #[error("{0}")]
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+
     #[error("out of range")]
     OutOfRange,
 
@@ -91,6 +107,8 @@ impl ExceptionInfo {
             ValueError::Unsupported => "Unsupported",
             ValueError::Other(_) => "Other",
             ValueError::GasExhausted => "GasExhausted",
+            ValueError::Cancelled => "Cancelled",
+            ValueError::MemoryLimitExceeded(_) => "MemoryLimitExceeded",
             ValueError::OutOfRange => "OutOfRange",
             ValueError::TransientAlreadyPersisted => "TransientAlreadyPersisted",
             ValueError::Parse => "ParseError",
@@ -172,6 +190,12 @@ impl ExceptionInfo {
 
 impl Trace for ExceptionInfo {
     fn trace(&self, visitor: &mut MarkVisitor) {
+        if let Some(data) = &self.data {
+            data.trace(visitor);
+        }
+        if let ValueError::Thrown(value) = &self.error {
+            value.trace(visitor);
+        }
         if let Some(cause) = self.cause.as_ref() {
             visitor.visit(cause);
         }

@@ -1,0 +1,917 @@
+#![cfg(not(target_arch = "wasm32"))]
+#![allow(clippy::result_large_err)]
+
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use cljrs_async::fiber::{self, Fiber};
+use cljrs_gc::{GcPtr, MemoryClass};
+use cljrs_runtime::env::{env::Env, error::EvalError};
+use cljrs_value::{Arity, NativeFn, Value};
+
+#[test]
+fn configured_stacks_clamp_unsafe_sizes_before_execution() {
+    const CHILD: &str = "CLJRS_REVIEW_STACK_MINIMUM";
+    if std::env::var_os(CHILD).is_none() {
+        for size in ["64", "128", "256", "512", "junk"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "configured_stacks_clamp_unsafe_sizes_before_execution",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CLJRS_FIBER_STACK_KB", size)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{size} KiB: {stderr}");
+            let warnings = stderr.matches("below the 512 KiB minimum").count();
+            let expected = usize::from(!matches!(size, "512" | "junk"));
+            assert_eq!(warnings, expected, "{size} KiB: {stderr}");
+        }
+        return;
+    }
+    if std::env::var("CLJRS_FIBER_STACK_KB").unwrap() == "junk" {
+        let error = Fiber::new(|| Ok(Value::Nil))
+            .err()
+            .expect("unparseable stack size accepted");
+        assert!(
+            error.to_string().contains("CLJRS_FIBER_STACK_KB"),
+            "{error:?}"
+        );
+        return;
+    }
+    // Two fibers: the clamp warning is printed once per process.
+    drop(Fiber::new(|| Ok(Value::Nil)).unwrap());
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let form = cljrs_reader::Parser::new("(+ 1 2)".into(), "<small-stack>".into())
+                .parse_all()
+                .unwrap()
+                .remove(0);
+            run(async {
+                let task = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(
+                        &form,
+                        &mut Env::new(runtime.globals().clone(), "user"),
+                    )
+                })
+                .unwrap();
+                assert_eq!(task.await.unwrap().into_result().unwrap(), Value::Long(3));
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run(body: impl std::future::Future<Output = ()>) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    tokio::task::LocalSet::new().block_on(&rt, body);
+}
+
+#[test]
+fn expired_slices_yield_to_ready_non_fiber_tasks() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder().build().unwrap();
+            let globals = runtime.globals().clone();
+            let ready = Rc::new(Cell::new(false));
+            let observed = ready.clone();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            globals.intern(
+                "user",
+                "stop?".into(),
+                Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "stop?",
+                    Arity::Fixed(0),
+                    move |_| {
+                        Ok(if observed.get() {
+                            Value::string("signalled")
+                        } else if Instant::now() >= deadline {
+                            Value::string("deadline")
+                        } else {
+                            Value::Nil
+                        })
+                    },
+                ))),
+            );
+            let form = cljrs_reader::Parser::new(
+                "(loop [] (or (stop?) (recur)))".into(),
+                "<non-fiber-fairness>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let spinner = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(&form, &mut Env::new(globals, "user"))
+                })
+                .unwrap();
+                // A plain LocalSet task, and no sibling fiber.
+                let signal = ready.clone();
+                let task = tokio::task::spawn_local(async move { signal.set(true) });
+                let result = spinner.await.unwrap().into_result().unwrap();
+                assert_eq!(
+                    result,
+                    Value::string("signalled"),
+                    "CPU loop starved a ready non-fiber task"
+                );
+                task.await.unwrap();
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn cpu_loops_yield_in_both_interpreters_and_preserve_roots() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for mode in [
+                cljrs_runtime::ExecutionMode::TreeWalk,
+                cljrs_runtime::ExecutionMode::Tiered,
+            ] {
+                let runtime = cljrs_runtime::Runtime::builder()
+                    .execution_mode(mode)
+                    .build()
+                    .unwrap();
+                let globals = runtime.globals().clone();
+                let ready = Rc::new(Cell::new(false));
+                let observed = ready.clone();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                globals.intern(
+                    "user",
+                    "stop?".into(),
+                    Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                        "stop?",
+                        Arity::Fixed(0),
+                        move |_| Ok(Value::Bool(observed.get() || Instant::now() >= deadline)),
+                    ))),
+                );
+                let form = cljrs_reader::Parser::new(
+                    "(let [saved (str \"live-\" 42)] (loop [] (if (stop?) saved (recur))))".into(),
+                    "<fairness>".into(),
+                )
+                .parse_all()
+                .unwrap()
+                .remove(0);
+                run(async {
+                    let spinner_globals = globals.clone();
+                    let spinner = fiber::spawn(move || {
+                        cljrs_runtime::tiered::eval(&form, &mut Env::new(spinner_globals, "user"))
+                    })
+                    .unwrap();
+                    let signal = ready.clone();
+                    let collector = fiber::spawn(move || {
+                        let env = Env::new(globals, "user");
+                        cljrs_runtime::env::gc_roots::force_collect(&env);
+                        signal.set(true);
+                        Ok(Value::Nil)
+                    })
+                    .unwrap();
+                    let result = spinner.await.unwrap().into_result().unwrap();
+                    assert!(
+                        ready.get(),
+                        "CPU loop ran to its deadline without yielding: {mode:?}"
+                    );
+                    assert_eq!(result, Value::string("live-42"));
+                    collector.await.unwrap().into_result().unwrap();
+                });
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn stack_charges_cover_pool_reuse_completion_and_cancellation() {
+    // The process-wide governor must not race with other tests in this binary.
+    const CHILD: &str = "CLJRS_PHASE4_ACCOUNTING";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stack_charges_cover_pool_reuse_completion_and_cancellation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let governor = cljrs_gc::governor();
+    let baseline = governor.snapshot();
+    let fiber = Fiber::new(|| Ok(Value::Nil)).unwrap();
+    let allocated = governor.snapshot();
+    assert_eq!(allocated.fiber_count, baseline.fiber_count + 1);
+    let bytes = allocated.class_bytes(MemoryClass::FiberStack);
+    // Only the commit estimate and guard pages are budgeted, not the reservation.
+    assert!(bytes > 0 && bytes < 1024 * 1024, "{bytes}");
+    // corosensei's `limit()` sits below the guard page, so at least one guard
+    // page beyond the 1 MiB request is both reserved and budgeted.
+    let page = 4096;
+    assert!(
+        allocated.reserved_fiber_stack_bytes
+            >= baseline.reserved_fiber_stack_bytes + 1024 * 1024 + page
+    );
+    assert!(
+        bytes >= cljrs_gc::fiber::STACK_COMMIT_ESTIMATE + page,
+        "{bytes}"
+    );
+    drop(fiber);
+    let pooled = governor.snapshot();
+    assert_eq!(pooled.fiber_count, baseline.fiber_count);
+    assert_eq!(pooled.pooled_fiber_stacks, baseline.pooled_fiber_stacks + 1);
+    assert_eq!(pooled.class_bytes(MemoryClass::FiberStack), bytes);
+    assert_eq!(
+        pooled.reserved_fiber_stack_bytes,
+        allocated.reserved_fiber_stack_bytes
+    );
+    run(async {
+        let task = fiber::spawn(|| {
+            fiber::park_on(std::future::pending::<()>());
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(governor.class_bytes(MemoryClass::FiberStack), bytes);
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        let task = fiber::spawn(|| Ok(Value::Long(42))).unwrap();
+        assert_eq!(task.await.unwrap().into_result().unwrap(), Value::Long(42));
+    });
+    assert_eq!(governor.snapshot().fiber_count, baseline.fiber_count);
+    assert!(cljrs_gc::stats_report().contains("reserved stack bytes"));
+    let hard = 768 * 1024;
+    let mut config = cljrs_gc::MemoryConfig::with_limits(512 * 1024, hard).unwrap();
+    config.strict = true;
+    governor.configure(config).unwrap();
+    // A 64 MiB root reservation is admitted under a much smaller hard limit.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+    fiber::run_root(&rt, &local, &mut carrier, || Ok(Value::Nil)).unwrap();
+    // Exhaust the budget. Idle stacks are reclaimed before refusing it.
+    let committed = governor.snapshot().committed_bytes;
+    let _filler = governor
+        .reserve_shared(MemoryClass::Code, hard - committed + 1)
+        .unwrap();
+    assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
+    assert_eq!(governor.snapshot().pooled_fiber_stacks, 0);
+    let committed = governor.snapshot().committed_bytes;
+    let _rest = governor
+        .reserve_shared(MemoryClass::Code, hard - committed)
+        .unwrap();
+    let error = Fiber::new(|| Ok(Value::Nil)).err().unwrap();
+    assert!(
+        matches!(error, EvalError::MemoryLimitExceeded(ref fault) if fault.class == MemoryClass::FiberStack),
+        "{error:?}"
+    );
+    assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
+}
+
+#[test]
+fn watchdog_reports_a_blocked_native_frame_once() {
+    const CHILD: &str = "CLJRS_PHASE4_STALL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watchdog_reports_a_blocked_native_frame_once",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STALL_MS", "10")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("stalled its isolate").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("native frame: blocking-test-native"),
+            "{stderr}"
+        );
+        return;
+    }
+    run(async {
+        let blocker = fiber::spawn(|| {
+            let _native =
+                cljrs_gc::fiber::native_frame(&"blocking-test-native".into(), &Default::default());
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let sibling = fiber::spawn(|| Ok(Value::Nil)).unwrap();
+        blocker.await.unwrap().into_result().unwrap();
+        sibling.await.unwrap().into_result().unwrap();
+        // Parked and unstarted fibers do not make another fiber runnable.
+        let unstarted = Fiber::new(|| Ok(Value::Nil)).unwrap();
+        let sleeper = fiber::spawn(|| {
+            fiber::park_on(tokio::time::sleep(Duration::from_millis(50)));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let lone = fiber::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        sleeper.await.unwrap().into_result().unwrap();
+        lone.await.unwrap().into_result().unwrap();
+        drop(unstarted);
+    });
+}
+
+#[test]
+fn watchdog_counts_a_sibling_that_yielded_its_slice() {
+    const CHILD: &str = "CLJRS_YIELDED_SIBLING_STALL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watchdog_counts_a_sibling_that_yielded_its_slice",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STALL_MS", "10")
+            .env("CLJRS_FIBER_SLICE_US", "1000")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("stalled its isolate").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("native frame: blocking-test-native"),
+            "{stderr}"
+        );
+        return;
+    }
+    run(async {
+        // The sibling starts first and runs a CPU loop, so it is runnable
+        // only because its slice expired and it yielded automatically.
+        let sibling = fiber::spawn(|| {
+            let end = Instant::now() + Duration::from_millis(5);
+            while Instant::now() < end {
+                cljrs_gc::fiber::safepoint().unwrap();
+            }
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let blocker = fiber::spawn(|| {
+            let _native =
+                cljrs_gc::fiber::native_frame(&"blocking-test-native".into(), &Default::default());
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        blocker.await.unwrap().into_result().unwrap();
+        sibling.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
+fn watchdog_attributes_a_stall_to_a_gc_pause() {
+    const CHILD: &str = "CLJRS_GC_PAUSE_STALL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "watchdog_attributes_a_stall_to_a_gc_pause",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STALL_MS", "10")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("stalled its isolate").count(), 1, "{stderr}");
+        assert!(stderr.contains("; garbage collection pause ("), "{stderr}");
+        assert!(!stderr.contains("native frame"), "{stderr}");
+        return;
+    }
+    run(async {
+        let collector = fiber::spawn(|| {
+            // A collection inside a native call is still reported as GC.
+            let _native =
+                cljrs_gc::fiber::native_frame(&"outer-native".into(), &Default::default());
+            // A slow root scan stands in for marking a large heap.
+            #[cfg(not(feature = "no-gc"))]
+            cljrs_gc::HEAP.collect(|_| std::thread::sleep(Duration::from_millis(150)));
+            // No-gc builds never collect; exercise the marker directly.
+            #[cfg(feature = "no-gc")]
+            {
+                let _pause = cljrs_gc::fiber::gc_pause();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        let sibling = fiber::spawn(|| Ok(Value::Nil)).unwrap();
+        collector.await.unwrap().into_result().unwrap();
+        sibling.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
+fn recursion_reports_the_fiber_before_reaching_its_guard_page() {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        for mode in [cljrs_runtime::ExecutionMode::TreeWalk, cljrs_runtime::ExecutionMode::Tiered] {
+            let runtime = cljrs_runtime::Runtime::builder().execution_mode(mode).build().unwrap();
+            let form = cljrs_reader::Parser::new(
+                "(do (defn overflow [] (+ 1 (overflow))) (overflow))".into(), "<overflow>".into())
+                .parse_all().unwrap().remove(0);
+            run(async {
+                let task = Fiber::new(move || cljrs_runtime::tiered::eval(&form,
+                    &mut Env::new(runtime.globals().clone(), "user"))).unwrap();
+                let id = task.id();
+                let error = task.into_task().await.unwrap_err();
+                assert!(matches!(&error, EvalError::Runtime(message) if message.contains("stack overflow in fiber")), "{id:?}: {error:?}");
+            });
+        }
+    }).unwrap().join().unwrap();
+}
+
+/// Issue #454: the default fiber stack must hold ordinary non-tail recursion
+/// (a 1 MiB default allowed only ~400 levels in release builds). Unoptimized
+/// interpreter frames are an order of magnitude larger, so debug builds check
+/// a shallower depth against their larger default.
+#[test]
+fn default_fiber_stack_holds_moderate_non_tail_recursion() {
+    const DEPTH: i64 = if cfg!(debug_assertions) { 400 } else { 2000 };
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap();
+            let form = cljrs_reader::Parser::new(
+                format!("(do (defn f [n] (if (zero? n) 0 (inc (f (dec n))))) (f {DEPTH}))"),
+                "<depth>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let task = Fiber::new(move || {
+                    cljrs_runtime::tiered::eval(
+                        &form,
+                        &mut Env::new(runtime.globals().clone(), "user"),
+                    )
+                })
+                .unwrap();
+                let value = task.into_task().await.unwrap();
+                assert_eq!(value, Value::Long(DEPTH));
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn native_recursion_over_nested_data_throws_before_the_guard_page() {
+    // Printing, equality, hashing and comparison recurse in Rust without an
+    // interpreter safepoint (issue #452). Each must throw a catchable error.
+    const SOURCE: &str = r#"
+        (let [nest (fn [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) (list acc)) acc)))
+              deep (nest 32000)
+              other (nest 32000)
+              vdeep (reduce (fn [acc _] [acc]) [] (range 32000))
+              caught? (fn [f] (try (f) false
+                                (catch Exception e
+                                  (some? (re-find #"stack overflow in native code" (ex-message e))))))]
+          [(caught? #(pr-str deep)) (caught? #(str deep)) (caught? #(= deep other))
+           (caught? #(hash deep)) (caught? #(compare vdeep vdeep))
+           (= 203 (count (pr-str (nest 100))))])"#;
+    // The 32,000-level nesting must exceed the fiber stack, so pin a 1 MiB
+    // stack instead of the much larger default (#454): under ASan's opt-level
+    // 1 a 32 MiB stack holds `=` and `hash` at this depth, and at opt-level 1
+    // without ASan even 4 MiB holds `=`. Run in a child process so the
+    // override cannot leak into other tests in this binary.
+    const CHILD: &str = "CLJRS_NATIVE_OVERFLOW_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_recursion_over_nested_data_throws_before_the_guard_page",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CLJRS_FIBER_STACK_KB", "1024")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for mode in [
+                cljrs_runtime::ExecutionMode::TreeWalk,
+                cljrs_runtime::ExecutionMode::Tiered,
+            ] {
+                let runtime = cljrs_runtime::Runtime::builder()
+                    .execution_mode(mode)
+                    .build()
+                    .unwrap();
+                let form = cljrs_reader::Parser::new(SOURCE.into(), "<native-overflow>".into())
+                    .parse_all()
+                    .unwrap()
+                    .remove(0);
+                run(async {
+                    let task = Fiber::new(move || {
+                        cljrs_runtime::tiered::eval(
+                            &form,
+                            &mut Env::new(runtime.globals().clone(), "user"),
+                        )
+                    })
+                    .unwrap();
+                    let result = task.into_task().await.unwrap();
+                    assert_eq!(
+                        result.to_string(),
+                        "[true true true true true true]",
+                        "{mode:?}"
+                    );
+                });
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn idle_stacks_are_reclaimed_for_other_classes_across_carriers() {
+    const CHILD: &str = "CLJRS_IDLE_STACK_RECLAIM";
+    let Ok(mode) = std::env::var(CHILD) else {
+        for mode in ["child", "root"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "idle_stacks_are_reclaimed_for_other_classes_across_carriers",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let mib = 1024 * 1024;
+    let hard = 2 * mib;
+    let governor = cljrs_gc::governor();
+    let mut config = cljrs_gc::MemoryConfig::with_limits(1800 * 1024, hard).unwrap();
+    config.strict = true;
+    governor.configure(config).unwrap();
+    let root = mode == "root";
+    std::thread::spawn(move || {
+        if root {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let mut carrier = cljrs_gc::mutator::MutatorState::fresh();
+            fiber::run_root(&rt, &local, &mut carrier, || Ok(Value::Nil)).unwrap();
+        } else {
+            drop(Fiber::new(|| Ok(Value::Nil)).unwrap());
+        }
+    })
+    .join()
+    .unwrap();
+    let snapshot = governor.snapshot();
+    assert_eq!(snapshot.pooled_fiber_stacks, 1);
+    assert!(snapshot.reserved_fiber_stack_bytes >= if root { 64 * mib } else { mib });
+    assert!(governor.class_bytes(MemoryClass::FiberStack) > 0);
+    // Fits only once the other carrier's idle stack releases its charge.
+    let requested = hard - snapshot.committed_bytes + 1;
+    let code = governor
+        .reserve_shared(MemoryClass::Code, requested)
+        .unwrap();
+    assert_eq!(governor.class_bytes(MemoryClass::FiberStack), 0);
+    let snapshot = governor.snapshot();
+    assert_eq!(snapshot.pooled_fiber_stacks, 0);
+    assert_eq!(snapshot.reserved_fiber_stack_bytes, 0);
+    assert_eq!(code.bytes(), requested);
+}
+
+#[test]
+fn cancelled_realization_leaves_shared_lazy_values_pending() {
+    use cljrs_value::types::{Delay, LazySeq, Thunk};
+
+    // The first force parks until cancelled and returns the typed
+    // cancellation, as a NativeFn boundary inside a Clojure thunk does; later
+    // forces succeed.
+    #[derive(Debug)]
+    struct ParkOnce(Cell<u32>);
+    impl cljrs_gc::Trace for ParkOnce {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParkOnce {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })?;
+                unreachable!("pending park resumed");
+            }
+            Ok(Value::Long(42))
+        }
+    }
+
+    run(async {
+        let delay = Rc::new(Delay::new(Box::new(ParkOnce(Cell::new(0)))));
+        let lazy = Rc::new(LazySeq::new(Box::new(ParkOnce(Cell::new(0)))));
+        for target in ["delay", "lazy"] {
+            let (d, l) = (delay.clone(), lazy.clone());
+            let task = fiber::spawn(move || {
+                let result = match target {
+                    "delay" => d.force(),
+                    _ => l.try_realize(),
+                };
+                // The cancellation propagates typed, so a caller holding a
+                // lock returns normally instead of unwinding through it.
+                assert!(matches!(result, Err(cljrs_value::ValueError::Cancelled)));
+                Err(cljrs_runtime::env::error::EvalError::Cancelled)
+            })
+            .unwrap();
+            tokio::task::yield_now().await;
+            task.abort();
+            assert!(task.await.err().unwrap().is_cancelled());
+        }
+        // A real exception raised during cancellation cleanup stays an
+        // ordinary, catchable error rather than turning into cancellation.
+        #[derive(Debug)]
+        struct Fails;
+        impl cljrs_gc::Trace for Fails {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl Thunk for Fails {
+            fn force(&self) -> cljrs_value::ValueResult<Value> {
+                Err(cljrs_value::ValueError::Other("parse failed".into()))
+            }
+        }
+        let checked = Rc::new(Cell::new(false));
+        let flag = checked.clone();
+        let task = fiber::spawn(move || {
+            let parked = cljrs_value::parking::catch_cancelled(|| {
+                fiber::park_on(std::future::pending::<()>())
+            });
+            let failing = Delay::new(Box::new(Fails));
+            assert!(
+                matches!(failing.force(), Err(cljrs_value::ValueError::Other(m)) if m == "parse failed")
+            );
+            flag.set(true);
+            parked.map_err(cljrs_runtime::env::error::value_error_to_eval_error)?;
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        assert!(checked.get(), "cleanup did not run");
+        // Healthy readers re-run the thunk instead of seeing a cached error.
+        let (d, l) = (delay.clone(), lazy.clone());
+        let reader = fiber::spawn(move || {
+            assert_eq!(d.force().unwrap(), Value::Long(42));
+            assert_eq!(l.try_realize().unwrap(), Value::Long(42));
+            Ok(Value::Nil)
+        })
+        .unwrap();
+        reader.await.unwrap().into_result().unwrap();
+    });
+}
+
+#[test]
+fn a_panic_after_parking_reports_instead_of_resuming_a_finished_fiber() {
+    run(async {
+        let task = fiber::spawn(|| {
+            fiber::park_on(tokio::task::yield_now());
+            panic!("native bug after a park");
+        })
+        .unwrap();
+        let error = task.await.unwrap().into_result().unwrap_err();
+        assert!(
+            matches!(&error, EvalError::Runtime(message) if message.contains("native bug after a park")),
+            "{error}"
+        );
+    });
+}
+
+#[test]
+fn dropping_a_parked_fiber_defers_cleanup_until_it_could_park() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    // The first force parks forever; a later reader's force succeeds.
+    #[derive(Debug)]
+    struct ParksFirst(Cell<u32>);
+    impl cljrs_gc::Trace for ParksFirst {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParksFirst {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })?;
+            }
+            Ok(Value::Long(42))
+        }
+    }
+    run(async {
+        for locked in [false, true] {
+            let cleaned = Rc::new(Cell::new(false));
+            let flag = cleaned.clone();
+            let lazy = Rc::new(LazySeq::new(Box::new(ParksFirst(Cell::new(0)))));
+            let realizing = lazy.clone();
+            let mut task = Box::pin(
+                Fiber::new(move || {
+                    // Parked inside a realization: its guard must run when
+                    // the fiber is cancelled.
+                    let realized = realizing.try_realize();
+                    flag.set(true);
+                    realized.map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+                })
+                .unwrap()
+                .into_task(),
+            );
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(task.as_mut().poll(&mut cx).is_pending());
+            let lock = cljrs_gc::mutator::TrackedMutex::new(());
+            let guard = locked.then(|| lock.lock().unwrap());
+            drop(task);
+            // Under a runtime lock, cleanup must not run inside the drop.
+            assert_eq!(cleaned.get(), !locked, "cleanup ran under a runtime lock");
+            drop(guard);
+            // The next fiber poll on this carrier runs the deferred cleanup.
+            fiber::spawn(|| Ok(Value::Nil)).unwrap().await.unwrap();
+            assert!(cleaned.get(), "deferred cleanup never ran: {locked}");
+            // The realization was released, not stranded in Realizing.
+            let reader = lazy.clone();
+            let value = fiber::spawn(move || {
+                reader
+                    .try_realize()
+                    .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+            })
+            .unwrap()
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+            assert_eq!(value, Value::Long(42));
+        }
+    });
+}
+
+#[test]
+fn cancellation_while_apply_spreads_a_lazy_seq_still_runs_finally() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    #[derive(Debug)]
+    struct Parks;
+    impl cljrs_gc::Trace for Parks {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for Parks {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            cljrs_value::parking::catch_cancelled(|| fiber::park_on(std::future::pending::<()>()))?;
+            Ok(Value::Nil)
+        }
+    }
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap();
+            let globals = runtime.globals().clone();
+            let released = Rc::new(Cell::new(false));
+            let flag = released.clone();
+            globals.intern(
+                "user",
+                "release!".into(),
+                Value::NativeFunction(GcPtr::new(NativeFn::with_closure(
+                    "release!",
+                    Arity::Fixed(0),
+                    move |_| {
+                        flag.set(true);
+                        Ok(Value::Nil)
+                    },
+                ))),
+            );
+            globals.intern(
+                "user",
+                "parked".into(),
+                Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(Parks)))),
+            );
+            let form = cljrs_reader::Parser::new(
+                "(try (apply vector parked) (finally (release!)))".into(),
+                "<apply-finally>".into(),
+            )
+            .parse_all()
+            .unwrap()
+            .remove(0);
+            run(async {
+                let task = fiber::spawn(move || {
+                    cljrs_runtime::tiered::eval(&form, &mut Env::new(globals, "user"))
+                })
+                .unwrap();
+                tokio::task::yield_now().await;
+                task.abort();
+                assert!(task.await.err().unwrap().is_cancelled());
+            });
+            assert!(released.get(), "finally was skipped by the cancellation");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn a_waiter_on_a_deferred_fibers_realization_does_not_hang() {
+    use cljrs_value::types::{LazySeq, Thunk};
+    #[derive(Debug)]
+    struct ParksFirst(Cell<u32>);
+    impl cljrs_gc::Trace for ParksFirst {
+        fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    }
+    impl Thunk for ParksFirst {
+        fn force(&self) -> cljrs_value::ValueResult<Value> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 1 {
+                cljrs_value::parking::catch_cancelled(|| {
+                    fiber::park_on(std::future::pending::<()>())
+                })?;
+            }
+            Ok(Value::Long(42))
+        }
+    }
+    run(async {
+        let lazy = Rc::new(LazySeq::new(Box::new(ParksFirst(Cell::new(0)))));
+        let shared = lazy.clone();
+        // B is the only runnable fiber: it drops A (parked mid-realization)
+        // under a runtime lock, then waits on that same realization.
+        let b = fiber::spawn(move || {
+            let realizing = shared.clone();
+            let mut a = Box::pin(
+                Fiber::new(move || {
+                    realizing
+                        .try_realize()
+                        .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+                })
+                .unwrap()
+                .into_task(),
+            );
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(a.as_mut().poll(&mut cx).is_pending());
+            let lock = cljrs_gc::mutator::TrackedMutex::new(());
+            let guard = lock.lock().unwrap();
+            drop(a);
+            drop(guard);
+            shared
+                .try_realize()
+                .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+        })
+        .unwrap();
+        let value = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("waiter hung on a deferred fiber's realization")
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(value, Value::Long(42));
+    });
+}

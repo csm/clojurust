@@ -4,17 +4,18 @@
 //! Jobs arrive from the network thread one at a time; replies go back as
 //! ready-made bencode messages over the connection's reply channel.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::limits::JobReplies;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_runtime::env::dynamics;
 use cljrs_runtime::tiered::{EvalError, GlobalEnv};
 use cljrs_value::{Keyword, Value, Var};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bencode::Bencode;
 use crate::protocol::{Request, Response};
@@ -31,17 +32,23 @@ const STAR_SLOTS: [&str; 4] = ["1", "2", "3", "e"];
 
 pub(crate) struct Engine {
     globals: Arc<GlobalEnv>,
-    sessions: HashMap<String, Session>,
+    /// Each session sits in its own cell so a job can keep its session
+    /// borrowed while it is parked on a fiber, without locking out jobs for
+    /// other sessions. Jobs for one session never overlap (see
+    /// `crate::Lanes`), so a session's cell has one borrower at a time.
+    sessions: RefCell<HashMap<String, Rc<RefCell<Session>>>>,
     /// `clojure.core`'s `*1`/`*2`/`*3`/`*e` vars, bound per-request via the
     /// dynamics stack so user code sees session-correct values.
     star_vars: Option<[GcPtr<Var>; 4]>,
-    session_counter: u64,
+    session_counter: Cell<u64>,
 }
 
 struct Session {
     env: cljrs_runtime::tiered::Env,
     /// Most recent values, indexed as [*1, *2, *3, *e].
     stars: [Value; 4],
+    #[cfg(feature = "no-gc")]
+    ownership: cljrs_gc::region::RegionLease,
 }
 
 impl Session {
@@ -49,6 +56,8 @@ impl Session {
         Session {
             env: cljrs_runtime::tiered::Env::new(globals, "user"),
             stars: [Value::Nil, Value::Nil, Value::Nil, Value::Nil],
+            #[cfg(feature = "no-gc")]
+            ownership: Default::default(),
         }
     }
 }
@@ -67,21 +76,35 @@ impl Engine {
         };
         Engine {
             globals,
-            sessions: HashMap::new(),
+            sessions: RefCell::new(HashMap::new()),
             star_vars,
-            session_counter: 0,
+            session_counter: Cell::new(0),
         }
     }
 
-    pub(crate) fn handle(&mut self, job: Job, eval_form: &mut impl EvalForm) {
+    pub(crate) fn handle(&self, job: Job, eval_form: &mut impl EvalForm) {
+        #[cfg(feature = "no-gc")]
+        let _reads = cljrs_gc::region::ReadScope::enter();
         let Job {
             req,
             replies,
             cancelled,
             pending_key,
             pending,
+            ticket,
         } = job;
-        if cancelled.load(Ordering::SeqCst) {
+        // The job counts against the admission limits while it runs or
+        // parks, until its final `done` reply (or until it is dropped).
+        let replies = JobReplies::new(replies, ticket);
+        // Leave `Pending` before the final `done` goes out: a client may send
+        // `interrupt` the moment it sees `done`, and must then find the
+        // session idle rather than this finished request.
+        let finish = || {
+            if let Some(key) = &pending_key {
+                pending.remove(key);
+            }
+        };
+        if cancelled.is_set() {
             // Interrupted while still queued: drop the work entirely.
             let sid = req.session.clone().unwrap_or_default();
             let _ = replies.send(
@@ -89,6 +112,7 @@ impl Engine {
                     .status(&["interrupted"])
                     .build(),
             );
+            finish();
             let _ = replies.send(Response::for_request(&req, &sid).status(&["done"]).build());
         } else {
             match req.op.as_str() {
@@ -102,9 +126,9 @@ impl Engine {
                     let _interrupt =
                         cljrs_runtime::env::gas::InterruptGuard::install(cancelled.clone());
                     if req.op == "eval" {
-                        self.op_eval(&req, &replies, eval_form, &cancelled);
+                        self.op_eval(&req, &replies, eval_form, &cancelled, &finish);
                     } else {
-                        self.op_load_file(&req, &replies, eval_form, &cancelled);
+                        self.op_load_file(&req, &replies, eval_form, &cancelled, &finish);
                     }
                 }
                 "completions" => self.op_completions(&req, &replies),
@@ -124,9 +148,7 @@ impl Engine {
                 }
             }
         }
-        if let Some(key) = &pending_key {
-            pending.remove(key);
-        }
+        finish();
     }
 
     // ── Sessions ──────────────────────────────────────────────────────────────
@@ -135,37 +157,45 @@ impl Engine {
     /// carry no session share a `"default"` session (real nREPL hands each a
     /// transient one; a stable default is simpler and friendlier to scripted
     /// clients).
-    fn ensure_session(&mut self, sid: Option<&str>) -> String {
+    fn ensure_session(&self, sid: Option<&str>) -> String {
         let sid = sid.unwrap_or("default").to_string();
-        if !self.sessions.contains_key(&sid) {
-            self.sessions
-                .insert(sid.clone(), Session::new(self.globals.clone()));
-        }
+        self.sessions
+            .borrow_mut()
+            .entry(sid.clone())
+            .or_insert_with(|| Rc::new(RefCell::new(Session::new(self.globals.clone()))));
         sid
     }
 
-    fn new_session_id(&mut self) -> String {
-        self.session_counter += 1;
+    /// The session named `sid`, created if unknown.
+    fn session(&self, sid: &str) -> Rc<RefCell<Session>> {
+        self.ensure_session(Some(sid));
+        self.sessions.borrow()[sid].clone()
+    }
+
+    fn new_session_id(&self) -> String {
+        self.session_counter.set(self.session_counter.get() + 1);
         let micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
-        format!("session-{micros:x}-{:x}", self.session_counter)
+        format!("session-{micros:x}-{:x}", self.session_counter.get())
     }
 
-    fn op_clone(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_clone(&self, req: &Request, replies: &JobReplies) {
         // The new session inherits the source session's namespace.
-        let source_ns = req
+        let source = req
             .session
             .as_deref()
-            .and_then(|s| self.sessions.get(s))
-            .map(|s| s.env.current_ns.clone());
+            .and_then(|s| self.sessions.borrow().get(s).cloned());
+        let source_ns = source.map(|s| s.borrow().env.current_ns.clone());
         let new_sid = self.new_session_id();
         let mut session = Session::new(self.globals.clone());
         if let Some(ns) = source_ns {
             session.env.current_ns = ns;
         }
-        self.sessions.insert(new_sid.clone(), session);
+        self.sessions
+            .borrow_mut()
+            .insert(new_sid.clone(), Rc::new(RefCell::new(session)));
         let sid = req.session.clone().unwrap_or_else(|| new_sid.clone());
         let _ = replies.send(
             Response::for_request(req, &sid)
@@ -175,14 +205,19 @@ impl Engine {
         );
     }
 
-    fn op_close(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_close(&self, req: &Request, replies: &JobReplies) {
         let sid = req.session.clone().unwrap_or_default();
-        self.sessions.remove(&sid);
+        self.sessions.borrow_mut().remove(&sid);
         // Drop the session's retained values so the GC can reclaim them.
         if let Some(ns) = self.globals.namespaces.read().unwrap().get(STATE_NS) {
             let mut interns = ns.get().interns.lock().unwrap();
             for slot in STAR_SLOTS {
-                interns.remove(format!("{sid}-{slot}").as_str());
+                if let Some(var) = interns.remove(format!("{sid}-{slot}").as_str()) {
+                    #[cfg(feature = "no-gc")]
+                    var.get().bind(Value::Nil);
+                    #[cfg(not(feature = "no-gc"))]
+                    let _ = var;
+                }
             }
         }
         let _ = replies.send(
@@ -192,8 +227,8 @@ impl Engine {
         );
     }
 
-    fn op_ls_sessions(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
-        let sessions: Vec<Bencode> = self.sessions.keys().map(Bencode::str).collect();
+    fn op_ls_sessions(&self, req: &Request, replies: &JobReplies) {
+        let sessions: Vec<Bencode> = self.sessions.borrow().keys().map(Bencode::str).collect();
         let sid = req.session.clone().unwrap_or_default();
         let _ = replies.send(
             Response::for_request(req, &sid)
@@ -206,14 +241,16 @@ impl Engine {
     // ── Evaluation ────────────────────────────────────────────────────────────
 
     fn op_eval(
-        &mut self,
+        &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
     ) {
         let Some(code) = req.code.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
+            finish();
             let _ = replies.send(
                 Response::for_request(req, &sid)
                     .status(&["error", "no-code", "done"])
@@ -221,18 +258,20 @@ impl Engine {
             );
             return;
         };
-        self.eval_code(req, replies, eval_form, cancelled, &code, "<nrepl>");
+        self.eval_code(req, replies, eval_form, cancelled, finish, &code, "<nrepl>");
     }
 
     fn op_load_file(
-        &mut self,
+        &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
     ) {
         let Some(file) = req.file.clone() else {
             let sid = self.ensure_session(req.session.as_deref());
+            finish();
             let _ = replies.send(
                 Response::for_request(req, &sid)
                     .status(&["error", "no-file", "done"])
@@ -244,24 +283,29 @@ impl Engine {
             .file_name
             .clone()
             .unwrap_or_else(|| "<load-file>".into());
-        self.eval_code(req, replies, eval_form, cancelled, &file, &filename);
+        self.eval_code(req, replies, eval_form, cancelled, finish, &file, &filename);
     }
 
     /// Shared body of `eval` and `load-file`: evaluate all forms in `code`,
     /// streaming `out`/`value`/`err` messages, then a final `done`.
+    /// `finish` runs just before that `done` is sent.
+    #[allow(clippy::too_many_arguments)]
     fn eval_code(
-        &mut self,
+        &self,
         req: &Request,
-        replies: &UnboundedSender<Bencode>,
+        replies: &JobReplies,
         eval_form: &mut impl EvalForm,
-        cancelled: &AtomicBool,
+        cancelled: &cljrs_runtime::env::gas::InterruptFlag,
+        finish: &dyn Fn(),
         code: &str,
         filename: &str,
     ) {
         let sid = self.ensure_session(req.session.as_deref());
         let globals = self.globals.clone();
         let star_vars = self.star_vars.clone();
-        let session = self.sessions.get_mut(&sid).expect("session just ensured");
+        let session_cell = self.session(&sid);
+        let mut session_ref = session_cell.borrow_mut();
+        let session = &mut *session_ref;
 
         // Honor the request's namespace when it exists; an unknown namespace
         // would be created empty (no clojure.core refers) and break
@@ -288,6 +332,7 @@ impl Engine {
                         .status(&["eval-error"])
                         .build(),
                 );
+                finish();
                 let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
                 return;
             }
@@ -308,7 +353,7 @@ impl Engine {
         for form in &forms {
             // Interrupted between top-level forms (a running form is stopped
             // by the interrupt flag installed on the gas meter, below).
-            if cancelled.load(Ordering::SeqCst) {
+            if cancelled.is_set() {
                 interrupted = true;
                 break;
             }
@@ -338,6 +383,11 @@ impl Engine {
                     session.stars[2] = session.stars[1].clone();
                     session.stars[1] = session.stars[0].clone();
                     session.stars[0] = value;
+                    #[cfg(feature = "no-gc")]
+                    {
+                        session.ownership =
+                            cljrs_gc::region::RegionLease::for_values(&session.stars);
+                    }
                     if let Some(vars) = &star_vars {
                         for (var, val) in vars.iter().zip(session.stars.iter()).take(3) {
                             dynamics::set_thread_local(var, val.clone());
@@ -347,7 +397,7 @@ impl Engine {
                 // An interrupt unwinds as `GasExhausted`; any failure once the
                 // flag is set is reported as the interrupt (a native bridge
                 // may have wrapped the signal in another error).
-                Err(_) if cancelled.load(Ordering::SeqCst) => {
+                Err(_) if cancelled.is_set() => {
                     interrupted = true;
                     break;
                 }
@@ -365,6 +415,11 @@ impl Engine {
                             .build(),
                     );
                     session.stars[3] = e.to_error_value();
+                    #[cfg(feature = "no-gc")]
+                    {
+                        session.ownership =
+                            cljrs_gc::region::RegionLease::for_values(&session.stars);
+                    }
                     if let Some(vars) = &star_vars {
                         dynamics::set_thread_local(&vars[3], session.stars[3].clone());
                     }
@@ -387,14 +442,16 @@ impl Engine {
                     .build(),
             );
         }
+        finish();
         let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
     }
 
     // ── Tooling ops ───────────────────────────────────────────────────────────
 
-    fn op_completions(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_completions(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
-        let session = &self.sessions[&sid];
+        let session_cell = self.session(&sid);
+        let session = session_cell.borrow();
         let prefix = req.prefix.clone().unwrap_or_default();
         let context_ns: Arc<str> = match &req.ns {
             Some(ns)
@@ -470,10 +527,11 @@ impl Engine {
 
     /// cider-nrepl `macroexpand`: expand `code` in `ns` with the requested
     /// expander and reply with the printed expansion.
-    fn op_macroexpand(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_macroexpand(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
         let globals = self.globals.clone();
-        let session = self.sessions.get_mut(&sid).expect("session just ensured");
+        let session_cell = self.session(&sid);
+        let session = session_cell.borrow();
         let ns = req
             .ns
             .as_deref()
@@ -536,9 +594,10 @@ impl Engine {
 
     /// cider-nrepl `analyze-last-stacktrace` (legacy `stacktrace`): one
     /// message per cause of the session's `*e`, outermost first.
-    fn op_analyze_last_stacktrace(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_analyze_last_stacktrace(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
-        let session = self.sessions.get(&sid).expect("session just ensured");
+        let session_cell = self.session(&sid);
+        let session = session_cell.borrow();
         let err = session.stars[3].clone();
         let causes: Vec<(String, String, Option<String>)> = match &err {
             Value::Nil => Vec::new(),
@@ -587,9 +646,10 @@ impl Engine {
         let _ = replies.send(Response::for_request(req, &sid).status(&["done"]).build());
     }
 
-    fn op_lookup(&mut self, req: &Request, replies: &UnboundedSender<Bencode>) {
+    fn op_lookup(&self, req: &Request, replies: &JobReplies) {
         let sid = self.ensure_session(req.session.as_deref());
-        let session = &self.sessions[&sid];
+        let session_cell = self.session(&sid);
+        let session = session_cell.borrow();
         let context_ns: Arc<str> = match &req.ns {
             Some(ns)
                 if self

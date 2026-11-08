@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 use crate::interp::destructure::value_to_seq_vec;
-use crate::interp::eval::eval;
+use crate::interp::eval::eval_unscoped as eval;
 
 /// Convert an EvalError to a Value for storage (e.g. agent errors).
 /// Preserves Thrown values (ex-info); other errors become strings.
@@ -31,12 +31,17 @@ fn eval_error_to_value(e: EvalError) -> Value {
 /// Each watch fn is called as `(f key ref old new)`.
 /// Errors thrown by watch fns are re-thrown (matching Clojure behavior).
 fn fire_watches(
-    watches: &std::sync::Mutex<Vec<(Value, Value)>>,
+    watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>,
     reference: &Value,
     old: &Value,
     new: &Value,
     env: &mut Env,
 ) {
+    match reference {
+        Value::Atom(atom) => atom.get().protect_watches(),
+        Value::Var(var) => var.get().protect_watches(),
+        _ => {}
+    }
     let ws: Vec<(Value, Value)> = watches.lock().unwrap().clone();
     for (key, f) in &ws {
         let args = vec![key.clone(), reference.clone(), old.clone(), new.clone()];
@@ -58,6 +63,7 @@ fn fire_watches(
 thread_local! {
     static WATCH_ERROR: std::cell::RefCell<Option<EvalError>> = const { std::cell::RefCell::new(None) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/WATCH_ERROR", refcell WATCH_ERROR: Option<EvalError>, trace trace_saved_watch_error);
 
 /// Check if a watch error occurred and propagate it.
 fn check_watch_error() -> EvalResult<()> {
@@ -107,10 +113,10 @@ impl cljrs_gc::Trace for CallableValueThunk {
 }
 
 impl Thunk for CallableValueThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         let mut env = Env::new(self.globals.clone(), &self.ns);
         crate::env::apply::apply_value(&self.callee, Vec::new(), &mut env)
-            .map_err(|e| format!("{e}"))
+            .map_err(crate::env::error::eval_error_to_thunk_error)
     }
 }
 
@@ -138,7 +144,9 @@ pub fn make_lazy_seq_from_fn(
             globals,
             ns,
         };
-        return Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))));
+        return Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+            thunk,
+        )))));
     }
     // Anything else with type-name "fn" is acceptable; route through
     // apply_value at force-time.  Reject non-callable values up front.
@@ -153,7 +161,9 @@ pub fn make_lazy_seq_from_fn(
         globals,
         ns,
     };
-    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
+    Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+        thunk,
+    )))))
 }
 
 impl cljrs_gc::Trace for ClosureThunk {
@@ -163,13 +173,13 @@ impl cljrs_gc::Trace for ClosureThunk {
 }
 
 impl Thunk for ClosureThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         // Root the closed-over values so they survive GC.  The thunk may live
         // on the Rust stack outside any Env frame (e.g., after LazySeq::realize
         // drops its Mutex guard), so GC wouldn't trace them otherwise.
         let _closed_root = crate::env::gc_roots::root_values(&self.f.closed_over_vals);
         let mut env = Env::with_closure(self.globals.clone(), &self.ns, &self.f);
-        call_cljrs_fn(&self.f, &[], &mut env).map_err(|e| format!("{e}"))
+        call_cljrs_fn(&self.f, &[], &mut env).map_err(crate::env::error::eval_error_to_thunk_error)
     }
 }
 
@@ -223,7 +233,16 @@ pub fn is_form_intercepted(name: &str) -> bool {
 /// - The `apply` function (spread last arg).
 /// - The `swap!` function (needs env to call the function).
 /// - Regular function calls.
-pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalResult {
+///
+/// `site` is the whole call form when it is a stable AST node (as opposed to
+/// a temporary built while evaluating); a macro call's expansion is memoized
+/// on it so that re-evaluating the same call site does not re-run the macro.
+pub fn eval_call(
+    site: Option<&Form>,
+    func_form: &Form,
+    arg_forms: &[Form],
+    env: &mut Env,
+) -> EvalResult {
     // Interop: (.methodName target args...) — method call syntax.
     if let FormKind::Symbol(s) = &func_form.kind
         && is_method_sugar(s)
@@ -239,7 +258,20 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
 
     // Macro check: expand then re-eval.
     if let Value::Macro(mfn) = &callee {
-        let expanded = macro_apply(mfn.get(), func_form, arg_forms, env)?;
+        let mfn = mfn.get();
+        // Expand each call site once per (macro, namespace), as Clojure does
+        // at compile time, instead of on every evaluation. See
+        // `cljrs_reader::ExpansionCache`.
+        if let (Some(site), Some(macro_id)) = (site, mfn.arities.first().map(|a| a.ir_arity_id)) {
+            if let Some(expanded) = site.expansion.get(macro_id, &env.current_ns) {
+                return eval(&expanded, env);
+            }
+            let ns = env.current_ns.clone();
+            let expanded = macro_apply(mfn, func_form, arg_forms, env)?;
+            let expanded = site.expansion.store(macro_id, ns, expanded);
+            return eval(&expanded, env);
+        }
+        let expanded = macro_apply(mfn, func_form, arg_forms, env)?;
         return eval(&expanded, env);
     }
 
@@ -299,7 +331,7 @@ pub fn eval_call(func_form: &Form, arg_forms: &[Form], env: &mut Env) -> EvalRes
             return Ok(fut);
         }
         let _args_root = crate::env::gc_roots::root_values(&args);
-        crate::env::gc_roots::gc_safepoint(env);
+        crate::env::gc_roots::gc_safepoint(env)?;
         return env.call_cljrs_fn(f.get(), &args);
     }
 
@@ -519,7 +551,8 @@ fn dispatch_seq_method(method: &str, target: &Value, args: &[Value]) -> EvalResu
             let needle = args
                 .first()
                 .ok_or_else(|| EvalError::Runtime(".indexOf requires an argument".into()))?;
-            let items = crate::interp::destructure::value_to_seq_vec(target);
+            let items = crate::interp::destructure::value_to_seq_vec(target)
+                .map_err(crate::env::error::value_error_to_eval_error)?;
             for (i, item) in items.iter().enumerate() {
                 if item == needle {
                     return Ok(Value::Long(i as i64));
@@ -572,13 +605,15 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
     let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
     let mut current_args = Vec::from(args);
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::default();
     loop {
         // Root current_args on the shadow stack so they survive GC.
         // They haven't been bound into the env yet.
         let _args_root = crate::env::gc_roots::root_values(&current_args);
 
         // GC safepoint before entering function body
-        crate::env::gc_roots::gc_safepoint(&env);
+        crate::env::gc_roots::gc_safepoint(&env)?;
 
         env.push_frame();
 
@@ -615,16 +650,15 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         bind_fn_params(arity, &current_args, &mut env)?;
 
         // Eval body, catching Recur.
-        // Under no-gc: push a scratch region; evaluate all-but-last in it,
-        // then pop scratch before the tail expression so the return value
-        // lands in the caller's allocation context.
+        // Under no-gc: evaluate in scratch, then transfer the return value's
+        // backing scopes into the caller before the scratch guard exits.
         #[cfg(not(feature = "no-gc"))]
         let result = eval_body_recur_fn(&arity.body, &mut env);
         #[cfg(feature = "no-gc")]
         let result = {
             let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
             // scratch drops here: resets the region (frees intermediates)
-            eval_body_with_scratch(&arity.body, &mut scratch, &mut env)
+            eval_body_with_scratch(&arity.body, &mut scratch, &mut recur_lease, &mut env)
         };
         env.pop_frame();
         // _call_frame drops at the end of this iteration (after the match
@@ -646,7 +680,8 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
                         match rest_val {
                             Value::Nil => {} // no extra args
                             _ => {
-                                let rest_items = value_to_seq_vec(rest_val);
+                                let rest_items = value_to_seq_vec(rest_val)
+                                    .map_err(crate::env::error::value_error_to_eval_error)?;
                                 flat.extend(rest_items);
                             }
                         }
@@ -714,7 +749,8 @@ fn bind_fn_params_impl(
             // convert the rest args list into a map of alternating key-value pairs,
             // matching Clojure's keyword-arguments convention.
             let destructure_val = if pattern.is_kwargs_rest_pattern() {
-                let items = value_to_seq_vec(&rest_val);
+                let items = value_to_seq_vec(&rest_val)
+                    .map_err(crate::env::error::value_error_to_eval_error)?;
                 Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)?
             } else {
                 rest_val
@@ -742,26 +778,24 @@ fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult 
     Ok(result)
 }
 
-/// Under `no-gc`: evaluate body forms with the scratch region active for all
-/// non-tail forms, then pop the scratch before the tail expression so the
-/// return value (or `recur` args) are allocated in the caller's context.
+/// Evaluate the body in scratch, then transfer returned backing scopes to the
+/// caller. Tail control-flow forms keep their unused temporaries in scratch.
 #[cfg(feature = "no-gc")]
-fn eval_body_with_scratch(
+pub(crate) fn eval_body_with_scratch(
     body: &[cljrs_reader::Form],
     scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
+    recur_lease: &mut cljrs_gc::region::RegionLease,
     env: &mut Env,
 ) -> EvalResult {
-    if body.is_empty() {
-        scratch.pop_for_return();
-        return Ok(Value::Nil);
+    let mut result = Ok(Value::Nil);
+    for form in body {
+        result = eval(form, env);
+        if result.is_err() {
+            break;
+        }
     }
-    // Eval all non-tail forms in the scratch region.
-    for form in &body[..body.len() - 1] {
-        eval(form, env)?;
-    }
-    // Pop scratch so the tail expression allocates in the caller's context.
     scratch.pop_for_return();
-    eval(&body[body.len() - 1], env)
+    crate::interp::eval::publish_result(result, Some(recur_lease))
 }
 
 /// Select the matching arity for the given argument count.
@@ -853,6 +887,9 @@ fn macro_apply(
     }
 
     let expanded_val = call_cljrs_fn(mfn, args.as_ref(), env)?;
+    // The macro's call frame no longer roots its result, and converting it can
+    // realize lazy seqs, which runs code with GC safepoints.
+    let _expanded_root = crate::env::gc_roots::root_value(&expanded_val);
     let dummy_span = cljrs_types::span::Span::new(Arc::new("<macro>".to_string()), 0, 0, 1, 1);
     crate::interp::macros::value_to_form(&expanded_val, dummy_span)
 }
@@ -910,7 +947,9 @@ pub fn handle_make_lazy_seq(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         globals: env.globals.clone(),
         ns: env.current_ns.clone(),
     };
-    Ok(Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(thunk)))))
+    Ok(Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Handle `(make-delay f)` — wraps a zero-arg fn in a Delay.
@@ -937,7 +976,9 @@ fn handle_make_delay(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         globals: env.globals.clone(),
         ns: env.current_ns.clone(),
     };
-    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+    Ok(Value::Delay(GcPtr::new_isolated(Delay::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Handle `(vswap! vol f & args)` — apply f to current volatile value and store.
@@ -958,15 +999,12 @@ fn handle_vswap(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().deref();
+            let previous_payload = v.get().snapshot();
+            let cur = previous_payload.value.clone();
             let mut call_args = vec![cur];
             call_args.extend(extra);
-            // Under no-gc: the value written into the volatile must live in the
-            // StaticArena since the volatile outlives all scratch regions.
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1007,14 +1045,10 @@ fn handle_vreset(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         });
     }
     let vol_val = eval(&arg_forms[0], env)?;
-    // Under no-gc: the new value written into the volatile must live in the
-    // StaticArena since the volatile outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = eval(&arg_forms[1], env)?;
     match &vol_val {
         Value::Volatile(v) => {
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1100,7 +1134,7 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     }
 
-    let atom = GcPtr::new(Atom::new(initial));
+    let atom = GcPtr::new_isolated(Atom::new(initial));
     if let Some(m) = meta_opt {
         atom.get()
             .set_meta(if m == Value::Nil { None } else { Some(m) });
@@ -1123,9 +1157,18 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
 /// `reset!` on a shared-atom: promote the new value and store it atomically.
 /// Returns the (isolate-local) value that was written.
 fn shared_atom_reset(sa: &Arc<cljrs_value::SharedAtom>, new_val: Value) -> EvalResult {
-    let promoted = cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
-    sa.reset(promoted);
+    let promoted = cljrs_value::promote(&new_val).map_err(promote_error)?;
+    sa.try_reset(promoted)
+        .map_err(EvalError::MemoryLimitExceeded)?;
     Ok(new_val)
+}
+
+/// A failed promotion as an evaluation error: a memory refusal stays one.
+fn promote_error(e: cljrs_value::PromoteError) -> EvalError {
+    match e.memory {
+        Some(fault) => EvalError::MemoryLimitExceeded(fault),
+        None => EvalError::Runtime(e.to_string()),
+    }
 }
 
 /// `swap!` on a shared-atom: CAS-retry loop.  Loads the current value, demotes
@@ -1145,9 +1188,11 @@ fn shared_atom_swap(
         call_args.push(old_val);
         call_args.extend(extra.iter().cloned());
         let new_val = crate::env::apply::apply_value(f, call_args, env)?;
-        let promoted =
-            cljrs_value::promote(&new_val).map_err(|e| EvalError::Runtime(e.to_string()))?;
-        if sa.compare_and_set(&cur, promoted) {
+        let promoted = cljrs_value::promote(&new_val).map_err(promote_error)?;
+        if sa
+            .try_compare_and_set(&cur, promoted)
+            .map_err(EvalError::MemoryLimitExceeded)?
+        {
             return Ok(new_val);
         }
         // Lost the race; another writer committed first. Re-read and retry.
@@ -1165,10 +1210,6 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         });
     }
     let atom_val = eval(&arg_forms[0], env)?;
-    // Under no-gc: the new value written into the atom must live in the
-    // StaticArena since the atom outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = eval(&arg_forms[1], env)?;
 
     let atom = match &atom_val {
@@ -1183,8 +1224,9 @@ fn handle_reset_bang(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     };
 
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().deref();
-    atom.get().reset(new_val.clone());
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1233,16 +1275,13 @@ fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         }
     };
 
-    let old_val = atom.get().deref();
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
     let mut args = vec![old_val.clone()];
     args.extend(evaled);
-    // Under no-gc: the value written into the atom must live in the StaticArena
-    // since the atom outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = crate::env::apply::apply_value(&f, args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
-    atom.get().reset(new_val.clone());
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1421,11 +1460,10 @@ pub fn eval_reset_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     validate_atom_value(&atom, &new_val, env)?;
-    let old_val = atom.get().deref();
-    atom.get().reset(new_val.clone());
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1452,14 +1490,13 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    let old_val = atom.get().deref();
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
     let mut call_args = vec![old_val.clone()];
     call_args.extend(args);
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
     validate_atom_value(&atom, &new_val, env)?;
-    atom.get().reset(new_val.clone());
+    let new_val = atom.get().reset(new_val);
     fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
     check_watch_error()?;
     Ok(new_val)
@@ -1490,12 +1527,10 @@ pub fn eval_vreset_bang(args: Vec<Value>) -> EvalResult {
             got: args.len(),
         });
     }
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let new_val = args[1].clone();
     match &args[0] {
         Value::Volatile(v) => {
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1518,13 +1553,12 @@ pub fn eval_vswap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     let f = args.remove(0);
     match vol_val {
         Value::Volatile(v) => {
-            let cur = v.get().deref();
+            let previous_payload = v.get().snapshot();
+            let cur = previous_payload.value.clone();
             let mut call_args = vec![cur];
             call_args.extend(args);
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
             let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
-            v.get().reset(new_val.clone());
+            let new_val = v.get().reset(new_val);
             Ok(new_val)
         }
         other => Err(EvalError::Runtime(format!(
@@ -1553,7 +1587,9 @@ pub fn make_delay_from_fn(
         }
     };
     let thunk = ClosureThunk { f, globals, ns };
-    Ok(Value::Delay(GcPtr::new(Delay::new(Box::new(thunk)))))
+    Ok(Value::Delay(GcPtr::new_isolated(Delay::new(Box::new(
+        thunk,
+    )))))
 }
 
 /// Execute `alter-var-root` with already-evaluated args: `[var, f, extra...]`.
@@ -2017,4 +2053,17 @@ fn handle_bound_fn_star(arg_forms: &[Form], env: &mut Env) -> EvalResult {
         wrapped: f,
         captured_bindings: merged,
     })))
+}
+
+fn trace_saved_watch_error(error: &Option<EvalError>, visitor: &mut cljrs_gc::MarkVisitor) {
+    use cljrs_gc::Trace;
+    match error {
+        Some(EvalError::Thrown(value)) => value.trace(visitor),
+        Some(EvalError::Recur(values)) => {
+            for value in values {
+                value.trace(visitor);
+            }
+        }
+        _ => {}
+    }
 }

@@ -51,7 +51,7 @@ use std::{any::Any, sync::Mutex};
 #[cfg(unix)]
 use cljrs_async::channel::{chan_deliver, chan_put, chan_ref, chan_take, make_chan};
 #[cfg(unix)]
-use cljrs_async::spawn_future;
+use cljrs_async::spawn_future_with_roots;
 #[cfg(unix)]
 use cljrs_runtime::env::error::EvalResult;
 #[cfg(unix)]
@@ -359,7 +359,9 @@ pub fn connect_to(path: &str, in_buf: usize, out_buf: usize) -> Value {
     let path = path.to_string();
     let promise = make_chan(1);
     let promise_val = Value::NativeObject(promise.clone());
-    spawn_future(async move { do_connect(path, in_buf, out_buf, promise).await });
+    spawn_future_with_roots(vec![promise_val.clone()], async move {
+        do_connect(path, in_buf, out_buf, promise).await
+    });
     promise_val
 }
 

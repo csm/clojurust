@@ -10,8 +10,7 @@
 //!
 //! ## Debug provenance (Phase 7)
 //!
-//! Under `cfg(all(feature = "no-gc", debug_assertions))` the arena maintains a
-//! registry of all addresses it has ever allocated.  [`is_static_addr`] checks
+//! The arena tracks its chunk address ranges in every no-gc build.  [`is_static_addr`] checks
 //! whether a raw pointer came from the arena, which lets the write-site
 //! assertions in `Atom::reset` / `Var::bind` catch region-local values being
 //! stored in program-lifetime containers.
@@ -20,7 +19,8 @@ use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{GcBox, GcPtr, Trace};
+use crate::governor::MemoryLimitExceeded;
+use crate::{AllocError, GcBox, GcPtr, Trace};
 
 /// Default chunk size: 256 KiB.
 const CHUNK_SIZE: usize = 256 * 1024;
@@ -41,6 +41,11 @@ struct Inner {
     end: usize,
 }
 
+/// Report an arena chunk to the governor.  Arena chunks are never freed.
+fn charge_chunk(bytes: usize) {
+    crate::governor::governor().charge_permanent(crate::governor::MemoryClass::Static, bytes);
+}
+
 impl Inner {
     fn new() -> Self {
         let layout = Layout::from_size_align(CHUNK_SIZE, 16).unwrap();
@@ -50,6 +55,7 @@ impl Inner {
                 .expect("StaticArena: initial chunk allocation failed")
         };
         let base = data.as_ptr() as usize;
+        charge_chunk(CHUNK_SIZE);
         Self {
             chunks: vec![Chunk { data, layout }],
             ptr: base,
@@ -69,8 +75,33 @@ impl Inner {
         self.grow(layout)
     }
 
+    /// [`Self::alloc_raw`], but a new chunk must first be admitted by the
+    /// governor; on refusal nothing is allocated or charged.
+    fn try_alloc_raw(&mut self, layout: Layout) -> Result<*mut u8, MemoryLimitExceeded> {
+        let aligned = (self.ptr + layout.align() - 1) & !(layout.align() - 1);
+        if aligned + layout.size() <= self.end {
+            self.ptr = aligned + layout.size();
+            return Ok(aligned as *mut u8);
+        }
+        crate::governor::governor().try_charge_permanent(
+            crate::governor::MemoryClass::Static,
+            Self::chunk_size(layout),
+        )?;
+        Ok(self.grow_charged(layout))
+    }
+
+    fn chunk_size(layout: Layout) -> usize {
+        CHUNK_SIZE.max(layout.size() * 2)
+    }
+
     fn grow(&mut self, layout: Layout) -> *mut u8 {
-        let chunk_size = CHUNK_SIZE.max(layout.size() * 2);
+        charge_chunk(Self::chunk_size(layout));
+        self.grow_charged(layout)
+    }
+
+    /// Add a chunk whose bytes the governor has already charged.
+    fn grow_charged(&mut self, layout: Layout) -> *mut u8 {
+        let chunk_size = Self::chunk_size(layout);
         let cl = Layout::from_size_align(chunk_size, layout.align().max(16)).unwrap();
         // SAFETY: non-zero size, valid layout.
         let data = unsafe {
@@ -85,7 +116,6 @@ impl Inner {
     }
 
     /// Check whether `addr` falls inside any chunk owned by this arena.
-    #[cfg(debug_assertions)]
     fn contains_addr(&self, addr: usize) -> bool {
         for chunk in &self.chunks {
             let base = chunk.data.as_ptr() as usize;
@@ -120,8 +150,10 @@ impl StaticArena {
         let gc_box = raw as *mut GcBox<T>;
         // SAFETY: raw is properly aligned and sized for GcBox<T>.
         // We intentionally omit running Drop on the value — static lifetime.
-        unsafe { std::ptr::write(gc_box, GcBox { value }) };
-        GcPtr(unsafe { NonNull::new_unchecked(gc_box) })
+        unsafe { std::ptr::write(gc_box, GcBox::new(value)) };
+        let pointer = GcPtr(unsafe { NonNull::new_unchecked(gc_box) });
+        pointer.get().init_ownership();
+        pointer
     }
 
     /// Allocate `value` directly (no `GcBox` wrapper) and return a
@@ -138,11 +170,41 @@ impl StaticArena {
         crate::StaticGcPtr(unsafe { NonNull::new_unchecked(raw) })
     }
 
+    /// Fallible [`Self::alloc`]: the governor is asked only when the arena
+    /// needs a new chunk, and a refusal returns the value.
+    pub fn try_alloc<T: Trace + 'static>(&self, value: T) -> Result<GcPtr<T>, AllocError<T>> {
+        let layout = Layout::new::<GcBox<T>>();
+        let raw = match self.inner.lock().unwrap().try_alloc_raw(layout) {
+            Ok(raw) => raw,
+            Err(error) => return Err(AllocError { value, error }),
+        };
+        let gc_box = raw as *mut GcBox<T>;
+        // SAFETY: raw is properly aligned and sized for GcBox<T>.
+        unsafe { std::ptr::write(gc_box, GcBox::new(value)) };
+        let pointer = GcPtr(unsafe { NonNull::new_unchecked(gc_box) });
+        pointer.get().init_ownership();
+        Ok(pointer)
+    }
+
+    /// Fallible [`Self::alloc_val`].
+    pub fn try_alloc_val<T: 'static>(
+        &self,
+        value: T,
+    ) -> Result<crate::StaticGcPtr<T>, AllocError<T>> {
+        let layout = Layout::new::<T>();
+        let raw = match self.inner.lock().unwrap().try_alloc_raw(layout) {
+            Ok(raw) => raw as *mut T,
+            Err(error) => return Err(AllocError { value, error }),
+        };
+        // SAFETY: raw is properly aligned and sized for T.
+        unsafe { std::ptr::write(raw, value) };
+        Ok(crate::StaticGcPtr(unsafe { NonNull::new_unchecked(raw) }))
+    }
+
     /// Return `true` if `addr` was allocated by this arena.
     ///
-    /// Used by debug-mode provenance assertions to distinguish static-arena
+    /// Used by publication and provenance checks to distinguish static-arena
     /// pointers from scratch-region pointers.
-    #[cfg(debug_assertions)]
     pub fn contains_addr(&self, addr: usize) -> bool {
         self.inner.lock().unwrap().contains_addr(addr)
     }
@@ -164,9 +226,7 @@ pub fn static_alloc_val<T: 'static>(value: T) -> crate::StaticGcPtr<T> {
 
 /// Return `true` if the raw pointer address was allocated by the static arena.
 ///
-/// This is an O(chunks) scan (typically 1–2 chunks) and is only intended for
-/// use in `debug_assert!` write-site checks.
-#[cfg(debug_assertions)]
+/// This is an O(chunks) scan used by no-gc publication and provenance checks.
 pub fn is_static_addr(addr: usize) -> bool {
     // If the arena has not been initialised yet, no allocation has ever been
     // made, so the address cannot be static.

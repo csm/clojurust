@@ -38,8 +38,7 @@ src/
     mod.rs        — `Jit` (the runtime's `JitBackend`) + `install`; `on_var_rebind` stales superseded code
     jit_compiler.rs — `compile_jit` / `compile_jit_poll`: build a `JITModule`, register rt_abi symbols, call shared codegen
     jit_worker.rs   — background compile thread; maps Tier-1 type profiles to per-parameter specializations
-    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints
-    async_jit.rs    — `^:async` arity activation: lower → state machine → native poll fn
+    code_cache.rs   — epoch-tagged module registry; stale/pin/reclaim at stop-the-world safepoints; each module holds a governor `MemoryClass::Code` charge (`reserve_reported`: reported, never denied, even in strict mode) for its machine code until it is reclaimed
     osr_integration.rs — (test-only) end-to-end OSR entry compile + call
   wasm/         — (feature `wasm-aot`) AOT Clojure → WebAssembly backend (second backend over the same IR)
     mod.rs      — public API (`compile_function`, `compile_bundle`, `WasmBackend`, `WasmError`); browser tier model
@@ -198,6 +197,15 @@ All functions are `#[unsafe(no_mangle)] pub extern "C"` — called by symbol nam
 - **Comparison:** `rt_eq`, `rt_case_eq` (type-strict equality for `case` dispatch — `Long`/`BigInt` interchangeable, mixed numerics never equal), `rt_lt`, `rt_gt`, `rt_lte`, `rt_gte`
 - **Primitive arrays:** `rt_alength(arr) -> i64`, `rt_aget_long(arr, i) -> i64`, `rt_aget_double(arr, i) -> f64` (unboxed element loads), `rt_aset_long`/`rt_aset_double` (unboxed stores), `rt_aget`/`rt_aset` (boxed fallback for unknown element types) — all bounds-checked, throwing on out-of-range / type mismatch
 - **Collections:** `rt_alloc_vector`, `rt_alloc_map`, `rt_alloc_set`, `rt_alloc_list`, `rt_alloc_cons`, `rt_get`, `rt_count`, `rt_first`, `rt_rest` (both seq any value — vector/list/cons fast paths, plus string/map/set/lazy-seq via `seq`; `rt_first`/`rt_nth`/`rt_peek` return an *interior pointer* into vector storage, so escape analysis treats them as aliasing arg 0), `rt_next` (`seq`-of-`rest`: returns `nil` when exhausted, unlike `rt_rest`), `rt_assoc`, `rt_conj`
+- **Lazy realization errors:** `rt_count`, `rt_first`, `rt_rest`, `rt_apply`,
+  `rt_into_map`, and `rt_kwargs_map` propagate realization errors through the
+  pending-exception slot. A rejected carrier wait preserves the pending thunk.
+  Every boxed ABI bridge uses `#[catch_realization(throw_str, signal_error)]` to contain
+  realization failures from equality, hashing, and formatting, and to turn a
+  fiber-cancellation unwind into the uncatchable pending `Cancelled` resource error
+  before it can cross the C ABI.
+  ABI subprocess tests cover parked realizers. An AOT test covers catchable
+  realization errors in a compiled binary.
 - **Keyword arguments:** `rt_kwargs_map(rest) -> *const Value` — the compiled tiers' half of `KnownFn::KwargsMap`, normalizing a variadic rest seq into the value a map-shaped rest pattern (`[& {:keys [a b]}]`) destructures against. Delegates to `Value::from_kwargs_rest`, the one definition every tier shares (issue #368). A lone trailing argument is returned as-is, so like `rt_first`/`rt_nth` its result can alias arg 0; a dangling key raises through the pending-exception slot rather than unwinding out of the `extern "C"` frame
 - **Scratch:** `rt_scratch_ptr(n_bytes: u32) -> *mut u8` — a thread-local, monotonically growing scratch buffer the wasm backend uses to marshal element-pointer arrays before the slice-taking `rt_alloc_*` bridges (the native backend uses an on-stack slot instead)
 - **Region alloc:** `rt_region_start() -> *mut Region` (returns the real region pointer; also pushes it onto the thread-local stack for opportunistic allocation and GC root tracing), `rt_region_end(*mut Region)`, `rt_region_alloc_vector/map/set/list/cons(*mut Region, ...)` — these bump directly into the passed region (the handle threaded through `RegionStart`/`RegionParam`/`CallWithRegion`; a null handle falls back to the thread-local lookup). Region closes route through `cljrs_gc::region::close_region`, honouring the Phase 10.5 poison/retire protocol; `rt_try` saves/unwinds the rt-side and gc-side region-stack depths independently
@@ -361,7 +369,7 @@ pub mod code_cache {
 
 `install` registers a `Jit` on the runtime's `JitState`
 (`cljrs_runtime::tiered::backend::JitBackend`) — enqueue, OSR enqueue,
-mark-stale, pending-exception, deopt-sentinel, and async-compile in one
+mark-stale, pending-exception, and deopt-sentinel in one
 object, per runtime.  The first call also creates the process-wide pieces:
 the compile queue, the `cljrs-jit-worker` thread, the var-rebind hook, and
 the stop-the-world reclaim hook.  All per-arity state (counters, argument
@@ -369,8 +377,8 @@ profiles, published pointers, OSR entries) belongs to the runtime, not to
 this module; this module owns the compiled machine code.
 
 Everything else here is crate-private: `jit_compiler::compile_jit` (and
-`compile_jit_poll` for `^:async` state machines), `jit_worker`, and
-`async_jit`.
+`compile_jit_poll`, test-only, for the `^:async` state-machine ABI) and
+`jit_worker`.
 
 Environment: `CLJRS_JIT_THRESHOLD` (Tier-1 calls before compiling, default
 1000), `CLJRS_OSR_THRESHOLD` (loop back-edges before an OSR-entry compile),
@@ -580,18 +588,14 @@ instantiating the AOT module against it (passing the runtime's reserved bases
 through `WasmLayout`), and wiring the IR interpreter in as the dynamic-code tier
 is the remaining runtime-side step.
 
-Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → **compile `^:async` poll functions** → generate Cargo harness → `cargo build --release` → copy binary.
+Pipeline: read source → parse → evaluate preamble → macro-expand → pin versioned references → discover required namespaces → **compile each required namespace** (`lower_namespace`: preamble/body partition + ANF lower) → ANF lower entry (Rust, `cljrs_ir::lower`) → optimize (escape analysis + region alloc) → **[no-gc] blacklist check** → Cranelift codegen (entry + per-namespace initializers) → generate Cargo harness → `cargo build --release` → copy binary.
 
-**Async activation (Phase H):** `compile_async_poll_fns` introspects the
-`^:async` fns the program defined (their `def` forms are evaluated into the
-compile-time env first), lowers each arity to a state machine (`is_async`, no
-region pass — a region scope can't span a suspend), compiles a poll function
-(`declare_poll_function`) into the same object module, and records
-`(ns, name, arity, symbol, n_slots)`. The harness declares each symbol `extern
-"C"` and calls `cljrs_async::state_machine::register_poll_fn_named` after
-`cljrs_async::init`, so `^:async` dispatch runs native. Unsupported bodies
-(channels/spawn/`throw`/regions), capturing closures, and fns with inner
-closures fall back to the `eval_async` tree-walker.
+**`^:async` functions are not compiled to state machines.** Their bodies stay
+interpreted, and each call runs its body on a fiber (`docs/virtual-threads-plan.md`
+Phase 5), where `await` parks. TODO.md Phase H (async state machines) is closed:
+neither the JIT nor the AOT driver lowers `^:async` arities to poll functions.
+`codegen`'s poll-function ABI and `jit_compiler::compile_jit_poll` (test-only)
+remain only for the `cljrs_ir::lower::lower_async` unit coverage.
 
 **Versioned namespaces are snapshotted at compile time.** Versioned requires
 execute during expansion (fetching the pinned source from git); a discovery
@@ -612,6 +616,10 @@ The generated harness `main()` calls `-main` (via `resolve`) after
 `__cljrs_main` returns, forwarding all command-line arguments (skipping the
 program name) as individual strings.  If `-main` is not defined the binary
 exits normally; if `-main` throws, the binary prints the error and exits 1.
+Before that, a memory-limit fault left by `__cljrs_main` (strict governor
+mode; `cljrs_gc::resolve_runtime_fault`) prints the fault and exits 1.
+`rt_try` does not catch `ValueError::MemoryLimitExceeded`, like
+`GasExhausted`; the fault stays in its slot for the entry seam.
 
 The generated harness `main()` (and the `compile_test_harness` test runner)
 calls `cljrs_gc::dump_stats_from_env()` once at exit, so AOT binaries honor
@@ -766,3 +774,97 @@ crate — a second direct dependency cannot undo a feature another edge enabled.
 | `cljrs-project` (workspace) | `config::RustConfig` — the user's `:rust` crate configuration, carried in `CompileSession` |
 | `cljrs-io`/`-net`/`-charset`/`-base64` | **dev-dependencies only** — extensions the end-to-end tests supply the way a host does |
 | `target-lexicon` (workspace) | Target triple detection |
+
+`tests/fiber_io.rs` uses FIFO gates to check isolate progress during file reads
+and process waits. A separate host thread releases each gate after the isolate makes progress.
+`rt_abi::tests::boxed_abi_bridges_have_realization_boundaries` audits boxed ABI entry points.
+
+`tests/blocking_form.rs` checks native call offload, rejection, errors, and cancellation in tree-walk and tiered modes.
+`tests/aot_native_init_e2e.rs` also compiles the core and namespaced `blocking` macros with typed native exports.
+Compiled Clojure closures have no blocking adapter and cannot move across the worker boundary.
+
+### Root fibers in native harnesses
+
+Generated program and test harnesses drive their entry function with
+`cljrs_async::fiber::run_root`. The 64 MiB root stack covers namespace setup,
+preamble evaluation, native initializers, compiled entry code, and `-main`.
+The test harness registers `clojure.core.async` and drives test bodies in the root fiber.
+Synchronous functions can dereference futures and use blocking channel operations.
+`tests/aot_e2e.rs` covers nested future waits, `io-thread`, and dynamic binding conveyance in a native binary.
+
+Compiled closure adapters propagate their pending exception into the normal
+call result. `rt_deref` records future dereference errors in the pending-exception slot.
+Thus a failed compiled future remains catchable through `@` with its exception data.
+
+`rt_abi::take_pending_resource_error() -> Option<ValueError>` consumes a native
+resource-limit signal. These signals use a per-fiber slot separate from thrown
+Clojure values. Compiled catch clauses bypass this slot. Native closure adapters,
+JIT/OSR dispatch, and AOT entry points preserve the original error category.
+
+Generated native harnesses return resource-limit errors through the root fiber.
+They print the error and exit with status 1 after context cleanup and GC-statistics output.
+The compiled `try` bridge preserves resource errors across catch and finally clauses.
+A finally-only clause rethrows the original exception after successful cleanup.
+
+All callback bridges, including compiled `swap!`, fused collection operations, `apply`, bindings, and output capture, preserve callback failures.
+`rt_abi::take_pending_exception_value()` consumes an ordinary pending throw while its native allocation roots remain live.
+Generated program entries consume both ordinary exceptions and resource errors before calling `-main`.
+
+Fused `into` fallbacks stop after a failed `filter`, `mapcat`, or `map` call.
+They preserve both ordinary exceptions and typed resource failures without another interpreter call.
+Call bridges use `signal_error` for every failure, including thrown values.
+Compiled atom reset and swap use the interpreter update functions.
+They share validators, watches, resource errors, and return ownership with interpreted calls.
+Fused fallbacks compose a Result-valued global-call helper, so a failed first call prevents the next call.
+Compiled closures share an `Arc<[Value]>` between execution and tracing.
+
+
+The `rt_identical` bridge uses `Value::identical`, including no-GC immutable scalar identity across relocation.
+Object-array ABI reads and writes use the same indexed ownership barriers as interpreter array operations.
+
+Under no-GC, standalone Rust callers can bound borrowed-result ownership with a `region::ReadScope`.
+Unscoped host results receive program-lifetime ownership.
+Runtime evaluation and fiber drivers establish the required scopes.
+
+Compiled array stores acquire caller ownership before returning a compact scalar alias.
+The identity ABI handles arrays, metadata wrappers, reduced values, and transients.
+
+Compiled keyword and versioned-value caches use program storage under no-GC.
+A first lookup during a bounded invocation fills an invocation-local table.
+Repeated keyword and versioned-global fills reuse its boxed value without further arena allocation.
+Program caches and compiled slots never receive invocation-owned pointers. The guard clears the table before freeing its arena.
+Protocol inline-cache hits borrow the implementation's cached ownership before invoking it.
+
+
+## Fiber safepoints (virtual threads Phase 4)
+
+`rt_abi::rt_safepoint() -> i8` polls GC coordination, then the optional native
+fiber scheduler. It returns 1 to continue. A stack-margin failure stores a
+catchable pending exception and returns 0. Automatic-yield cancellation stores
+an uncatchable resource error and returns 0. Generated native functions check
+this status at entry and loop back-edges and return their ABI sentinel on failure.
+The wasm `rt_safepoint` import keeps its original `() -> ()` signature, so existing
+hosts still instantiate modules; wasm retains the existing async model.
+
+`tests/fiber_fairness.rs` checks that published JIT machine code yields during a
+CPU loop and can be cancelled at an automatic yield. The AOT suite checks
+fairness and fiber-specific recursion errors in a GC binary. The existing `no-gc`
+AOT blacklist rejects this fixture's escaping function definitions.
+Generated call sites test for a pending error before consuming a failed call's nil
+sentinel or running another operation. `rt_throw` stores an owned, traced value and
+replaces an earlier throw. Poll functions transfer typed errors out of TLS before
+returning; later invocations on the same carrier start with clear error slots.
+
+Additional native bridges:
+
+- `rt_error_pending() -> u8` checks for a pending exception or resource error.
+- `rt_error_flag_ptr() -> *const u8` returns the carrier's error flag. Generated code
+  loads it once per function and tests the byte inline after each runtime call, instead
+  of calling `rt_error_pending`. The flag is a fiber-swapped mutator slot.
+- `rt_native_frame_depth() -> usize` records a function's native region checkpoint.
+- `rt_native_frame_cleanup(depth: usize)` closes only regions opened above that checkpoint on an error exit.
+- `rt_async_fail(sm: *mut CljxStateMachine) -> i32` consumes TLS errors and stores the correct poll result (`POLL_CANCELLED` for fiber cancellation). Memory faults retain their typed delivery through the confirmed governor slot.
+
+The codegen uses the same cleanup on safepoint, gas, and post-call failures. It
+preserves caller-owned regions. Tests exercise thrown values, gas exhaustion,
+memory faults, skipped side effects, and subsequent calls on the same carrier.

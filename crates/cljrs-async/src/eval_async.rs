@@ -5,7 +5,11 @@
 // from when it passed under 1.94.
 #![allow(clippy::result_large_err)]
 
-//! Asynchronous tree-walking evaluation for `^:async` function bodies.
+//! Asynchronous tree-walking evaluation for `^:async` function bodies (wasm32).
+//!
+//! Native targets run `^:async` bodies and `go` blocks on fibers with the
+//! ordinary evaluator (`docs/virtual-threads-plan.md` Phase 5). wasm32 has no
+//! stack switching, so this colored evaluator remains its async model.
 //!
 //! [`eval_async`] mirrors the synchronous [`cljrs_runtime::interp::eval::eval`] for the
 //! forms where an `await` can legitimately appear — `await` itself, `do`, `if`,
@@ -26,87 +30,21 @@
 
 use std::future::Future;
 
+use crate::task::await_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_runtime::builtins::form::{expand_pairs, expand_reader_conds_cow};
 use cljrs_runtime::env::env::Env;
-use cljrs_runtime::env::error::{EvalError, EvalResult};
+use cljrs_runtime::env::error::{EvalError, EvalResult, value_error_to_eval_error};
 use cljrs_runtime::interp::apply::{bind_fn_params, select_arity};
 use cljrs_runtime::interp::destructure::{bind_pattern, value_to_seq_vec};
 use cljrs_runtime::interp::eval::{eval, is_special_form};
 use cljrs_runtime::interp::macros::macroexpand;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    CljxFnArity, CljxFuture, FutureState, MapValue, PersistentHashSet, PersistentList,
-    PersistentVector, Value,
+    CljxFnArity, MapValue, PersistentHashSet, PersistentList, PersistentVector, Value,
 };
-
-/// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
-/// task settles on completion. The single delivery point for every async
-/// primitive (`^:async` calls, `timeout`, `alts`).
-///
-/// Public so other native crates (e.g. `cljrs-io`) can drive their own async
-/// work onto the shared executor and deliver results through the same `Future`
-/// machinery.
-///
-/// Must be called from within a Tokio `LocalSet` context.
-pub fn spawn_future<F>(task: F) -> Value
-where
-    F: Future<Output = EvalResult> + 'static,
-{
-    // GC builds: heap-promotion fallback — the task's captured environment is
-    // opaque to the publish-barrier scan, and the task may run after any
-    // bump-region scope active right now has closed.  Poison the active
-    // regions so they are retired (kept alive) instead of reset; a no-op (one
-    // thread-local read) when no region is open, which is the common case.
-    cljrs_gc::region::poison_active_regions();
-    let future = GcPtr::new(CljxFuture::new());
-    let task_future = future.clone();
-    let gas_meters = cljrs_runtime::env::gas::active_meters();
-    let interrupts = cljrs_runtime::env::gas::active_interrupts();
-    tokio::task::spawn_local(async move {
-        // Root the result future across GC cycles: the spawning scope's alloc
-        // frame may have dropped before the task gets to run.
-        let anchor = Value::Future(task_future.clone());
-        let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-        let mut task = Box::pin(task);
-        let result = std::future::poll_fn(|cx| {
-            // LocalSet tasks share an OS thread, so TLS state must be scoped
-            // to one poll and removed before another task can run. Meters
-            // stack on the driver's; interrupt flags replace them, so this
-            // task answers only to an interrupt of the eval that spawned it.
-            let _interrupts = cljrs_runtime::env::gas::InterruptScope::enter(&interrupts);
-            let _gas_guards = cljrs_runtime::env::gas::install_meters(&gas_meters);
-            task.as_mut().poll(cx)
-        })
-        .await;
-        settle_future(&task_future, result);
-    });
-    Value::Future(future)
-}
-
-/// Write a completed result into a future and wake blocking `deref` waiters.
-pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
-    let mut state = future.get().state.lock().unwrap();
-    // Cancellation is sticky. `future-cancel` does not interrupt the task, so a
-    // task cancelled mid-body still runs to completion and lands here; letting
-    // it write its result would flip `future-cancelled?` back to false and hand
-    // `await` a value it had already promised to raise on. Cancel wins: the
-    // side effects happened, the result is discarded.
-    if matches!(&*state, FutureState::Cancelled) {
-        return;
-    }
-    *state = match result {
-        Ok(v) => FutureState::Done(v),
-        // Preserve the thrown value (and any non-Thrown error as a fresh
-        // Value::Error) so `await` can re-throw it with ex-data/ex-cause intact.
-        Err(EvalError::GasExhausted) => FutureState::GasExhausted,
-        Err(e) => FutureState::Failed(e.to_error_value()),
-    };
-    drop(state);
-    future.get().cond.notify_all();
-}
 
 /// Run the body of an `^:async` function to completion, yielding at every
 /// `await`. Returns the value of the last body form.
@@ -141,7 +79,7 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
         }
 
         let mut result = Ok(Value::Nil);
-        for form in &arity.body {
+        for form in arity.body.iter() {
             result = Box::pin(eval_async(form, &mut env)).await;
             if result.is_err() {
                 break;
@@ -152,7 +90,7 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
         match result {
             Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_args)) => {
-                current_args = flatten_recur_args(&arity, new_args);
+                current_args = flatten_recur_args(&arity, new_args)?;
             }
             Err(e) => return Err(e),
         }
@@ -161,6 +99,22 @@ pub async fn run_async_fn(callee: Value, args: Vec<Value>, base: &Env) -> EvalRe
 
 /// Asynchronously evaluate a single form.
 pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    {
+        let mut reads = cljrs_gc::region::ReadContext::default();
+        let mut evaluation = Box::pin(eval_async_inner(form, env));
+        let result = std::future::poll_fn(|cx| {
+            let _reads = reads.enter();
+            evaluation.as_mut().poll(cx)
+        })
+        .await;
+        cljrs_runtime::interp::eval::publish_result(result, None)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    eval_async_inner(form, env).await
+}
+
+async fn eval_async_inner(form: &Form, env: &mut Env) -> EvalResult {
     // Collection literals may contain `await` sub-expressions (e.g. the
     // return value of a ^:async fn is `[(await x) (await y)]`). Evaluate
     // each element with eval_async so awaits yield cooperatively instead of
@@ -170,7 +124,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                vals.push(Box::pin(eval_async(f, env)).await?);
+                vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))));
         }
@@ -182,7 +136,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
                 .into_owned();
             let mut pairs: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                pairs.push(Box::pin(eval_async(f, env)).await?);
+                pairs.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             let kv_pairs: Vec<(Value, Value)> = pairs
                 .chunks(2)
@@ -194,7 +148,7 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
-                vals.push(Box::pin(eval_async(f, env)).await?);
+                vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Set(SetValue::Hash(GcPtr::new(
                 PersistentHashSet::from_iter(vals),
@@ -267,67 +221,15 @@ async fn eval_await_async(args: &[Form], env: &mut Env) -> EvalResult {
     let Some(arg) = args.first() else {
         return Err(EvalError::Runtime("await requires one argument".into()));
     };
-    let val = Box::pin(eval_async(arg, env)).await?;
+    let val = Box::pin(eval_async_inner(arg, env)).await?;
     await_value(val).await
-}
-
-/// Cooperatively await a Clojure value. Futures and promises yield to the
-/// executor until resolved; any other value is returned as-is.
-pub async fn await_value(val: Value) -> EvalResult {
-    match val {
-        Value::Future(f) => {
-            // Root the future across GC cycles: the alloc frame of the scope that
-            // produced it may have dropped before this task reached a yield point.
-            let anchor = Value::Future(f.clone());
-            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-            loop {
-                {
-                    let guard = f.get().state.lock().unwrap();
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(EvalError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(EvalError::GasExhausted);
-                        }
-                        FutureState::Cancelled => {
-                            return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {}
-                    }
-                }
-                cljrs_runtime::env::gc_roots::async_gc_collect();
-                tokio::task::yield_now().await;
-            }
-        }
-        Value::Promise(p) => {
-            let anchor = Value::Promise(p.clone());
-            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
-            loop {
-                {
-                    if let Some(v) = p.get().value.lock().unwrap().as_ref() {
-                        return Ok(v.clone());
-                    }
-                }
-                cljrs_runtime::env::gc_roots::async_gc_collect();
-                tokio::task::yield_now().await;
-            }
-        }
-        other => Ok(other),
-    }
 }
 
 /// Evaluate a sequence of body forms, returning the value of the last.
 async fn eval_body_async(forms: &[Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Nil;
     for form in forms {
-        result = Box::pin(eval_async(form, env)).await?;
+        result = Box::pin(eval_async_inner(form, env)).await?;
     }
     Ok(result)
 }
@@ -352,8 +254,12 @@ async fn eval_try_async(args: &[Form], env: &mut Env) -> EvalResult {
             result = Err(EvalError::Recur(recur_args));
             None
         }
-        Err(EvalError::GasExhausted) => {
-            result = Err(EvalError::GasExhausted);
+        Err(
+            error @ (EvalError::GasExhausted
+            | EvalError::Cancelled
+            | EvalError::MemoryLimitExceeded(_)),
+        ) => {
+            result = Err(error);
             None
         }
         Err(other) => Some(other),
@@ -394,16 +300,16 @@ async fn eval_if_async(args: &[Form], env: &mut Env) -> EvalResult {
     let Some(test_form) = args.first() else {
         return Err(EvalError::Runtime("if requires a test".into()));
     };
-    let test = Box::pin(eval_async(test_form, env)).await?;
+    let test = Box::pin(eval_async_inner(test_form, env)).await?;
     let truthy = !matches!(test, Value::Nil | Value::Bool(false));
     if truthy {
         match args.get(1) {
-            Some(then) => Box::pin(eval_async(then, env)).await,
+            Some(then) => Box::pin(eval_async_inner(then, env)).await,
             None => Ok(Value::Nil),
         }
     } else {
         match args.get(2) {
-            Some(els) => Box::pin(eval_async(els, env)).await,
+            Some(els) => Box::pin(eval_async_inner(els, env)).await,
             None => Ok(Value::Nil),
         }
     }
@@ -421,7 +327,7 @@ async fn eval_let_async(args: &[Form], env: &mut Env) -> EvalResult {
 
     env.push_frame();
     for pair in bindings.chunks(2) {
-        let val = match Box::pin(eval_async(&pair[1], env)).await {
+        let val = match Box::pin(eval_async_inner(&pair[1], env)).await {
             Ok(v) => v,
             Err(e) => {
                 env.pop_frame();
@@ -455,11 +361,23 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
     // Evaluate initial binding values.
     let mut current_vals: Vec<Value> = Vec::with_capacity(patterns.len());
     for form in &init_forms {
-        current_vals.push(Box::pin(eval_async(form, env)).await?);
+        current_vals.push(Box::pin(eval_async_inner(form, env)).await?);
     }
 
     let body = &args[1..];
     loop {
+        // Root current_vals so they survive GC — they're not yet bound in env.
+        let _vals_root = cljrs_runtime::env::gc_roots::root_values(&current_vals);
+
+        // GC safepoint on every iteration, as in the synchronous `eval_loop`,
+        // so a tight recur loop that never awaits still lets the collector run.
+        cljrs_runtime::env::gc_roots::gc_safepoint(env)?;
+
+        // Scope this iteration's allocations in a fresh alloc frame so the
+        // intermediates and the previous iteration's recur values become
+        // collectable once the iteration ends (see `eval_loop`).
+        let iter_frame = cljrs_gc::push_alloc_frame();
+
         env.push_frame();
         for (pat, val) in patterns.iter().zip(current_vals.iter()) {
             if let Err(e) = bind_pattern(pat, val.clone(), env) {
@@ -468,12 +386,19 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
             }
         }
 
-        let result = eval_body_async(body, env).await;
+        let (result, suspended) = poll_tracking_suspension(eval_body_async(body, env)).await;
         env.pop_frame();
 
         match result {
-            Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_vals)) => {
+                // Dropping the frame truncates ALLOC_ROOTS back to where this
+                // iteration started.  That is only sound when nothing else ran
+                // in between: if the body yielded, other tasks on this thread's
+                // `LocalSet` may have pushed roots of their own above ours, so
+                // keep every entry and let the enclosing frame release them.
+                if suspended {
+                    std::mem::forget(iter_frame);
+                }
                 if new_vals.len() != patterns.len() {
                     return Err(EvalError::Arity {
                         name: "recur".into(),
@@ -481,11 +406,34 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
+                // new_vals are moved out before the frame drops and are
+                // re-rooted at the top of the next iteration; no safepoint
+                // runs in between.
                 current_vals = new_vals;
             }
-            Err(e) => return Err(e),
+            // The loop's result (or error payload) keeps its alloc-frame roots
+            // until the enclosing frame drops: the async caller may yield
+            // before it roots the value itself.
+            other => {
+                std::mem::forget(iter_frame);
+                return other;
+            }
         }
     }
+}
+
+/// Drive `fut` to completion and report whether it ever returned `Pending`,
+/// i.e. whether it yielded and let other tasks on the `LocalSet` run.
+async fn poll_tracking_suspension<F: Future>(fut: F) -> (F::Output, bool) {
+    let mut fut = std::pin::pin!(fut);
+    let mut suspended = false;
+    let out = std::future::poll_fn(|cx| {
+        let poll = fut.as_mut().poll(cx);
+        suspended |= poll.is_pending();
+        poll
+    })
+    .await;
+    (out, suspended)
 }
 
 /// `(recur args…)` — evaluate every argument with [`eval_async`] so an `await`
@@ -501,7 +449,7 @@ async fn eval_recur_async(args: &[Form], env: &mut Env) -> EvalResult {
         // (ptr, len), so it is dropped before `push` can move the storage.
         let val = {
             let _vals_root = cljrs_runtime::env::gc_roots::root_values(&vals);
-            Box::pin(eval_async(form, env)).await?
+            Box::pin(eval_async_inner(form, env)).await?
         };
         vals.push(val);
     }
@@ -535,7 +483,7 @@ async fn eval_def_value_async(form: &Form, env: &mut Env) -> EvalResult {
     {
         let mut ctx: Option<cljrs_gc::alloc_ctx::StaticCtxGuard> = None;
         poll_scoped(
-            Box::pin(eval_async(form, env)),
+            Box::pin(eval_async_inner(form, env)),
             &mut ctx,
             |ctx| *ctx = Some(cljrs_gc::alloc_ctx::StaticCtxGuard::new()),
             |ctx| *ctx = None,
@@ -544,7 +492,7 @@ async fn eval_def_value_async(form: &Form, env: &mut Env) -> EvalResult {
     }
     #[cfg(not(feature = "no-gc"))]
     {
-        Box::pin(eval_async(form, env)).await
+        Box::pin(eval_async_inner(form, env)).await
     }
 }
 
@@ -565,7 +513,7 @@ async fn eval_defonce_async(args: &[Form], env: &mut Env) -> EvalResult {
 async fn eval_and_async(args: &[Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Bool(true);
     for form in args {
-        result = Box::pin(eval_async(form, env)).await?;
+        result = Box::pin(eval_async_inner(form, env)).await?;
         if matches!(result, Value::Nil | Value::Bool(false)) {
             return Ok(result);
         }
@@ -577,7 +525,7 @@ async fn eval_and_async(args: &[Form], env: &mut Env) -> EvalResult {
 async fn eval_or_async(args: &[Form], env: &mut Env) -> EvalResult {
     let mut last = Value::Nil;
     for form in args {
-        last = Box::pin(eval_async(form, env)).await?;
+        last = Box::pin(eval_async_inner(form, env)).await?;
         if !matches!(last, Value::Nil | Value::Bool(false)) {
             return Ok(last);
         }
@@ -588,7 +536,7 @@ async fn eval_or_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// `(throw x)` with a yielding `x`.
 async fn eval_throw_async(args: &[Form], env: &mut Env) -> EvalResult {
     let val = match args.first() {
-        Some(f) => Box::pin(eval_async(f, env)).await?,
+        Some(f) => Box::pin(eval_async_inner(f, env)).await?,
         None => Value::Nil,
     };
     Err(cljrs_runtime::interp::special::throw_value(val))
@@ -602,7 +550,7 @@ async fn eval_set_bang_async(args: &[Form], env: &mut Env) -> EvalResult {
         .first()
         .ok_or_else(|| EvalError::Runtime("set! requires a target".into()))?;
     let val = match args.get(1) {
-        Some(f) => Box::pin(eval_async(f, env)).await?,
+        Some(f) => Box::pin(eval_async_inner(f, env)).await?,
         None => Value::Nil,
     };
     match &target.kind {
@@ -610,7 +558,7 @@ async fn eval_set_bang_async(args: &[Form], env: &mut Env) -> EvalResult {
         _ => match sp::set_bang_field_target(target) {
             Some((field, inst_form)) => {
                 let _val_root = cljrs_runtime::env::gc_roots::root_value(&val);
-                let inst = Box::pin(eval_async(inst_form, env)).await?;
+                let inst = Box::pin(eval_async_inner(inst_form, env)).await?;
                 sp::set_type_instance_field(&inst, field, val.clone())
             }
             None => Err(sp::set_bang_target_error()),
@@ -658,7 +606,7 @@ async fn eval_binding_async(args: &[Form], env: &mut Env) -> EvalResult {
             .ok_or_else(|| EvalError::UnboundSymbol(sym_str.to_string()))?;
         let val = {
             let _vals_root = cljrs_runtime::env::gc_roots::root_values(&vals);
-            Box::pin(eval_async(&pair[1], env)).await?
+            Box::pin(eval_async_inner(&pair[1], env)).await?
         };
         keys.push(dynamics::var_key_of(&var_ptr));
         vals.push(val);
@@ -695,17 +643,24 @@ async fn eval_binding_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// being polled and held here in between; output printed by other tasks while
 /// this one is suspended is not captured.
 async fn eval_with_out_str_async(body: &[Form], env: &mut Env) -> EvalResult {
-    use cljrs_runtime::builtins::builtins::{pop_output_capture, resume_output_capture};
-    let mut buf = String::new();
+    use cljrs_runtime::builtins::builtins::{push_output_capture, suspend_output_capture};
+    push_output_capture();
+    let mut capture = suspend_output_capture();
     let result = poll_scoped(
         Box::pin(eval_body_async(body, env)),
-        &mut buf,
-        |buf| resume_output_capture(std::mem::take(buf)),
-        |buf| *buf = pop_output_capture().unwrap_or_default(),
+        &mut capture,
+        |capture| {
+            if let Some(c) = capture {
+                c.resume()
+            }
+        },
+        |capture| *capture = suspend_output_capture(),
     )
     .await;
     result?;
-    Ok(Value::string(buf))
+    Ok(Value::string(
+        capture.map(|c| c.finish()).unwrap_or_default(),
+    ))
 }
 
 /// Drive `fut` to completion with thread-local state installed only for the
@@ -762,13 +717,13 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
         let Some((target_form, arg_forms)) = args.split_first() else {
             return Err(EvalError::Runtime(format!("{s} requires a target object")));
         };
-        let target = Box::pin(eval_async(target_form, env)).await?;
+        let target = Box::pin(eval_async_inner(target_form, env)).await?;
         let _target_root = cljrs_runtime::env::gc_roots::root_value(&target);
         let mut argv: Vec<Value> = Vec::with_capacity(arg_forms.len());
         for a in arg_forms {
             let val = {
                 let _args_root = cljrs_runtime::env::gc_roots::root_values(&argv);
-                Box::pin(eval_async(a, env)).await?
+                Box::pin(eval_async_inner(a, env)).await?
             };
             argv.push(val);
         }
@@ -792,7 +747,7 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
     for a in args {
         let val = {
             let _args_root = cljrs_runtime::env::gc_roots::root_values(&argv);
-            Box::pin(eval_async(a, env)).await?
+            Box::pin(eval_async_inner(a, env)).await?
         };
         argv.push(val);
     }
@@ -801,17 +756,19 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
 
 /// Flatten `recur` arguments for a variadic arity so the rest collection is
 /// spread back into individual positional arguments (mirrors `call_cljrs_fn`).
-fn flatten_recur_args(arity: &CljxFnArity, new_args: Vec<Value>) -> Vec<Value> {
+fn flatten_recur_args(arity: &CljxFnArity, new_args: Vec<Value>) -> EvalResult<Vec<Value>> {
     if arity.rest_param.is_some() {
         let n = arity.params.len();
         if new_args.len() == n + 1 {
             let mut flat = new_args[..n].to_vec();
             match &new_args[n] {
                 Value::Nil => {}
-                rest_val => flat.extend(value_to_seq_vec(rest_val)),
+                rest_val => {
+                    flat.extend(value_to_seq_vec(rest_val).map_err(value_error_to_eval_error)?)
+                }
             }
-            return flat;
+            return Ok(flat);
         }
     }
-    new_args
+    Ok(new_args)
 }

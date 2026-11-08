@@ -10,9 +10,33 @@ use std::sync::Arc;
 use crate::env::env::Env;
 use crate::env::error::{EvalError, EvalResult};
 
-/// Expand a form one step.  Returns the same form if it is not a macro call.
+fn with_expansion_reads(body: impl FnOnce() -> EvalResult<Form>) -> EvalResult<Form> {
+    #[cfg(feature = "no-gc")]
+    let scratch = if !cljrs_gc::region::ReadScope::is_active()
+        && !cljrs_gc::alloc_ctx::invocation_is_active()
+    {
+        Some(cljrs_gc::alloc_ctx::ScratchGuard::new())
+    } else {
+        None
+    };
+    let result = body();
+    #[cfg(feature = "no-gc")]
+    if let Some(mut scratch) = scratch {
+        scratch.pop_for_return();
+        return match result {
+            Ok(form) => Ok(form),
+            Err(error) => match crate::interp::eval::publish_result(Err(error), None) {
+                Err(error) => Err(error),
+                Ok(_) => unreachable!(),
+            },
+        };
+    }
+    result
+}
+
+/// Expand a form once, owning borrowed values until the returned form is built.
 pub fn macroexpand_1(form: &Form, env: &mut Env) -> EvalResult<Form> {
-    macroexpand_1_in(form, env, Locals::Frames)
+    with_expansion_reads(|| macroexpand_1_in(form, env, Locals::Frames))
 }
 
 fn macroexpand_1_in(form: &Form, env: &mut Env, locals: Locals) -> EvalResult<Form> {
@@ -85,7 +109,7 @@ fn macroexpand_1_in(form: &Form, env: &mut Env, locals: Locals) -> EvalResult<Fo
 
 /// Fully expand a form until the head is no longer a macro.
 pub fn macroexpand(form: &Form, env: &mut Env) -> EvalResult<Form> {
-    macroexpand_in(form, env, Locals::Frames)
+    with_expansion_reads(|| macroexpand_in(form, env, Locals::Frames))
 }
 
 fn macroexpand_in(form: &Form, env: &mut Env, locals: Locals) -> EvalResult<Form> {
@@ -127,7 +151,7 @@ pub fn macroexpand_all(form: &Form, env: &mut Env) -> EvalResult<Form> {
 /// [`macroexpand_all`] for a form that stands inside the bindings `locals`,
 /// such as the body of a function with those parameters.
 pub fn macroexpand_all_in(form: &Form, env: &mut Env, locals: &[Arc<str>]) -> EvalResult<Form> {
-    expand_all(form, env, &mut locals.to_vec())
+    with_expansion_reads(|| expand_all(form, env, &mut locals.to_vec()))
 }
 
 /// Expand `form` and its sub-forms; `scope` holds the locals in scope at
@@ -258,6 +282,9 @@ fn expand_all(form: &Form, env: &mut Env, scope: &mut Vec<Arc<str>>) -> EvalResu
                 .collect::<EvalResult<Vec<_>>>()?;
             FormKind::Set(new_items)
         }
+        // Reader dereference evaluates its operand, so nested macros must
+        // expand before IR/AOT lowering just as in an explicit deref call.
+        FormKind::Deref(inner) => FormKind::Deref(Box::new(expand_all(inner, env, scope)?)),
         // Atoms, keywords, strings, etc. — no sub-forms.
         _ => return Ok(expanded),
     };
@@ -478,7 +505,12 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
         // Lazy sequences and cons cells: materialize into a list form.
         // This handles macro output like (cons 'do (map ...)).
         Value::LazySeq(ls) => {
-            return value_to_form(&ls.get().realize(), span);
+            return value_to_form(
+                &ls.get()
+                    .try_realize()
+                    .map_err(crate::env::error::realize_error_to_eval_error)?,
+                span,
+            );
         }
         Value::Cons(c) => {
             let mut items: Vec<Form> = Vec::new();
@@ -489,7 +521,12 @@ pub fn value_to_form(val: &Value, span: Span) -> EvalResult<Form> {
                         items.push(value_to_form(&cell.get().head, span.clone())?);
                         cur = cell.get().tail.clone();
                     }
-                    Value::LazySeq(ls) => cur = ls.get().realize(),
+                    Value::LazySeq(ls) => {
+                        cur = ls
+                            .get()
+                            .try_realize()
+                            .map_err(crate::env::error::realize_error_to_eval_error)?
+                    }
                     Value::List(l) => {
                         for v in l.get().iter() {
                             items.push(value_to_form(v, span.clone())?);

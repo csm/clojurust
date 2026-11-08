@@ -1,6 +1,6 @@
 # Process-Wide Managed-Memory Governor
 
-Status: Phases 0 through 2 implemented (observe-only accounting with chunked allocation credit). Phases 3 through 5 are open.
+Status: Phases 0 through 4 implemented (chunked allocation credit, non-heap memory classes, fallible allocation, and opt-in strict hard-limit admission). Phase 5 is open.
 See [Implementation status](#implementation-status).
 
 This document defines a process-wide governor for memory that clojurust manages.
@@ -387,6 +387,14 @@ At `Red`, process pressure overrides local zero-yield suppression.
 GC heap accounting uses the size in `GcBoxHeader`.
 Allocation consumes isolate credit, and sweep returns it.
 
+Persistent vectors, hash maps, hash sets, sorted maps, and sorted sets share nodes between versions.
+A version derived by one update from a GC-allocated version is charged only its path-copied nodes, which is O(log n).
+A version built wholesale, cloned, or derived from a version that never reached the heap is charged its full size.
+A derived version is also charged in full when its count reaches twice that of its nearest fully charged ancestor.
+A loop of `conj` calls therefore charges O(n) element bytes in total plus O(log n) bytes per step.
+A surviving version whose fully charged ancestor was collected is under-counted by less than twice that ancestor's charge.
+`cljrs-value`'s `collections/share_charge.rs` holds the rule.
+
 The implementation must remove the unused hard-limit logic from `GcHeap`.
 The process governor becomes the only hard admission authority.
 
@@ -509,6 +517,7 @@ The configuration parser must reject these states:
 - A soft limit greater than the hard limit
 - A critical reserve greater than the hard limit
 - A zero credit chunk
+- A zero queue limit
 - A queue limit greater than the application budget
 
 The default hard limit will use the applicable container or process memory limit.
@@ -647,6 +656,99 @@ Phase 2 decisions that later phases must keep or replace:
   A dynamic-target implementation was measured and reverted; see [Phase 2 benchmark](#phase-2-benchmark).
 - The heap shutdown pass is not assigned to a phase yet.
   Completion criterion 7 requires it.
+
+Phase 3 is complete:
+
+- Region chunks consume the isolate's local credit (`IsolateAccount::charge_region`) and return it when freed (`release_region`).
+  Each publish moves the account's region bytes from the governor's `GcHeap` class to its `Region` class; committed bytes do not change.
+  A retired region keeps its charge under a separate retired count (`retire_region`).
+  `MemorySnapshot` and `IsolateSnapshot` report active and retired region bytes separately.
+- `ByteBlob` (`cljrs-value`) owns one `MemoryCharge` for its buffer; `Value::ByteBlob` holds `Arc<ByteBlob>` instead of `Arc<[u8]>`.
+- `SharedAtom` stores `SharedSlot` values; each slot owns one `MemoryCharge` for its `Arc` allocation and string payload.
+  Cloning an `Arc` does not add a charge.
+- Isolate channels (`cljrs-async`) are byte-bounded queues of `AccountedMessage { value, charge }`.
+  The charge is `SerializedValue::wire_size`, reserved before enqueue and returned after the receiver deserializes the message.
+  `send`/`try_send` return `CloneError::Full`; `send_async` waits for capacity; `IsolateReceiver::close` (and drop) releases every queued charge.
+  The default limit is `MemoryConfig::queue_limit`; `isolate_channel_with_limit` and `(isolate-chan limit-bytes)` set one per channel.
+  `MemorySnapshot` reports queue waits, total wait time, and rejections.
+- JIT modules hold a `MemoryClass::Code` charge for their code size until reclamation frees them.
+- `static_alloc` records `size_of::<T>()` under `MemoryClass::Static` in GC builds; the `no-gc` static arena records each chunk.
+  These use `ProcessMemoryGovernor::charge_permanent`, which never returns the bytes.
+
+Phase 3 decisions that later phases must keep or replace:
+
+- Region chunks use isolate credit rather than direct reservations, so a region scope performs no process-wide atomic operation.
+  `crates/cljrs-gc/examples/region_bench.rs` measured about 5 ns (5%) more per region scope (create, four allocations, drop) on one thread.
+  A freed chunk's bytes become free credit; credit above the retained limit returns to the governor at once, because a `no-gc` isolate has no collection to trim it.
+- The `Region` class value lags each isolate's region use by at most its free credit, because the class split moves only when the account publishes.
+- A region chunk freed after its thread's account is dropped is not released again; the account returned it at drop.
+- Shared-value, queue, and code charges never fail while the governor is observe-only.
+  `ByteBlob::new`, `SharedSlot::new`, and code registration keep an `Option<MemoryCharge>` so Phase 4 can add fallible variants.
+- The compatibility `send` is the nonblocking send.
+  A message larger than the channel limit is rejected with `Full` even by `send_async`, because it can never fit.
+- Var shared roots (`Var::shared_root`), `SharedAtom` metadata, and the intern tables' `Arc<str>` names are not charged.
+  Static charges count only `size_of::<T>()` in GC builds, not memory the value owns.
+- `isolate-take!` still polls with `yield_now`; it does not use the channel's wakeup.
+
+Phase 4 is complete:
+
+- `MemoryConfig::strict` (`CLJRS_MEMORY_STRICT`, default off) turns on strict admission.
+  A CLI hard limit (`--gc-hard-limit-mb`) keeps the environment's strict setting.
+- `ProcessMemoryGovernor::admit` commits a grant with a compare-and-swap on the committed counter.
+  An application grant (`Admission::Application`) must keep committed bytes at or below the hard limit.
+  A critical grant (`Admission::Critical`) must keep them at or below the hard limit plus the critical reserve.
+  A refused credit chunk is retried at the exact shortfall.
+- A refusal changes no counter.
+  It increments `rejected_reservations` and `rejected_bytes`, logs under the `memory` target, requests collection, and holds pressure at `Red` until a normal chunk fits below the hard limit again.
+- Fallible paths: `GcPtr::try_new` returns `AllocError<T>`, which owns the value.
+  `IsolateAccount::try_reserve_credit` and `try_charge`, `reserve_shared`, `reserve_critical`, `try_charge_permanent`, and `try_static_alloc` return `MemoryLimitExceeded`.
+  `ByteBlob::try_new` and `try_with`, `SharedSlot::try_new`, and `SharedAtom::try_new`, `try_reset`, and `try_compare_and_set` reserve before they build or publish, so a refusal leaves the old shared value unchanged.
+  The infallible `ByteBlob::new` and `SharedSlot::new` use `ProcessMemoryGovernor::reserve_infallible`, which always returns a charge for the full size (a counted reserve overrun once the reserve is exhausted).
+- `ValueError::MemoryLimitExceeded`, `EvalError::MemoryLimitExceeded`, `CloneError::MemoryLimitExceeded`, and `SerializedErrorKind::MemoryLimitExceeded` carry the fixed-size `MemoryLimitExceeded`.
+  `try`/`catch` and `rt_try` do not intercept it, like `GasExhausted`.
+  A future whose body fails with it settles as `FutureState::MemoryLimitExceeded`, so `await` and `deref` re-raise the fault rather than a catchable thrown value; compiled async polls see `Readiness::MemoryLimitExceeded` and report it through the fault slot.
+- Runtime faults: an infallible allocation (`GcPtr::new`, a region chunk, `charge_permanent`, `ByteBlob::new`, `SharedSlot::new`) that strict admission refuses raises the thread's pending runtime fault.
+  The fault slot is a thread-local holding fixed-size data, separate from the compiled-code pending-exception slot.
+  The allocation then takes its exact shortfall from the critical reserve and requests collection.
+- `gc_safepoint` now returns `EvalResult<()>`.
+  After it collects, it resolves the fault (`resolve_runtime_fault`): if committed bytes are back below the hard limit with headroom to spare it clears the fault and continues; otherwise it returns `EvalError::MemoryLimitExceeded`.
+  The headroom is `min_headroom()` (at least 1 MiB), capped at an eighth of the hard limit.
+  Without it, a program whose live data creeps up to the limit collects after every few allocations.
+  A process-wide count of pending faults keeps the safepoint fast path at one extra relaxed load.
+- Compiled code: the JIT entry seam (`tiered::apply`), the OSR seam, and the AOT harness check the fault slot after native code returns.
+  `callback::invoke` maps `EvalError::MemoryLimitExceeded` to `ValueError::MemoryLimitExceeded` and confirms the fault in the slot, so a seam reports it even when compiled code drops the error.
+  `value_error_to_eval_error` clears the slot when the error reaches the interpreter as an `EvalError`.
+  The interpreter and compiled code therefore report the same `EvalError::MemoryLimitExceeded`.
+- Critical allocation path: `enter_critical`/`with_critical` (`CriticalSection`), `GcPtr::new_critical`, and `reserve_critical`.
+  `EvalError::to_error_value` and `value_error_to_eval_error` build error values with `new_critical`.
+- Isolate channels return `CloneError::MemoryLimitExceeded` when the governor refuses a queue charge.
+  `send_async` returns it at once.
+- JIT code uses `reserve_reported`, which is never refused.
+- `GcConfig::hard_limit_exceeded` is removed; the process governor is the only hard admission authority.
+- `MemorySnapshot` adds the strict flag, rejected reservations and bytes, critical grants, reserve overruns, and runtime faults raised and cleared.
+- Tests: governor unit tests (refusals leave counters unchanged, concurrent strict requests never exceed the hard limit, fault raise/resolve/confirm, critical sections, reserve overruns), `crates/cljrs-gc/tests/governor.rs` (`try_new`, `new`, `new_critical`, `try_static_alloc` against the process governor), and `crates/cljrs-runtime/tests/memory_limit.rs` (tree-walker and Tier-1 IR interpreter).
+
+Phase 4 decisions that later phases must keep or replace:
+
+- Strict mode stays opt-in. See [Rollout](#rollout).
+- Most of the roughly 550 `GcPtr::new` call sites were not rewritten to `try_new`.
+  A builtin holds unrooted values in Rust locals, so an allocation site cannot collect, and an immediate error at the first refusal would fail programs that one collection would let continue.
+  These sites rely on the runtime-fault path instead: the critical reserve covers allocation until the next safepoint, which collects before it decides.
+  `try_new` is for callers that can report an error at once.
+- The allocation bridge does not return a sentinel.
+  A refused `rt_*` allocation succeeds from the critical reserve, so compiled code continues with a valid value until the entry seam reports the fault.
+- A long native loop with no safepoint (one builtin that builds a large collection) can exhaust the critical reserve.
+  Infallible allocations then continue past `hard_limit + critical_reserve` and are counted as reserve overruns, instead of aborting.
+  Moving large collection and buffer constructors to `try_new` closes this gap.
+- Compiled loops call `rt_safepoint`, which parks but does not collect or resolve faults.
+  A fault raised in compiled code is reported at the entry seam, after the native call returns.
+- A fault that no safepoint resolves before an evaluation returns is resolved at the next evaluation's first safepoint.
+- `Yellow` and `Red` collection requests are unchanged; a refusal latches `Red` only while a normal chunk does not fit.
+- In `no-gc` builds `try_new` and `try_static_alloc` ask the governor only when the active region or the static arena must add a chunk (`Region::chunk_needed`, `StaticArena::try_alloc`); an object that fits in memory already charged is never refused.
+- The final Clojure representation of `MemoryLimitExceeded` remains deferred; Clojure code cannot catch it.
+- Persistent vectors, hash maps, hash sets, sorted maps, and sorted sets charge a derived version only its path-copied nodes (see "GC heap" under memory classes).
+  A growing vector under strict mode therefore reaches the limit by retained data, and `crates/cljrs-runtime/tests/memory_limit.rs` retains one with `conj`.
+- The heap shutdown pass is still not assigned to a phase.
 
 #### Phase 2 benchmark
 
@@ -858,7 +960,7 @@ The first implementation uses 64 KiB and measures both costs.
 
 ## Deferred decisions
 
-The following decisions do not block Phases 0 through 3:
+The following decisions do not block Phases 0 through 4 (Phase 4 is implemented):
 
 - The final Clojure representation of `MemoryLimitExceeded`
 - Runtime-specific sub-budgets for embedding applications

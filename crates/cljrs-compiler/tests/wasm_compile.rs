@@ -40,6 +40,30 @@ fn compiles_simple_defns_to_valid_wasm() {
         (defn pick [c a b] (if c a b))
         "#,
     );
+    // WebAssembly keeps the established void host safepoint contract.
+    let mut signatures = Vec::new();
+    let mut checked = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload.unwrap() {
+            wasmparser::Payload::TypeSection(types) => {
+                signatures.extend(types.into_iter_err_on_gc_types().map(Result::unwrap));
+            }
+            wasmparser::Payload::ImportSection(imports) => {
+                for import in imports.into_imports().map(Result::unwrap) {
+                    if import.name == "rt_safepoint" {
+                        let wasmparser::TypeRef::Func(index) = import.ty else {
+                            panic!("not a function import")
+                        };
+                        assert!(signatures[index as usize].params().is_empty());
+                        assert!(signatures[index as usize].results().is_empty());
+                        checked = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(checked, "missing host safepoint import");
     // Real wasm: magic + version, and structurally valid per wasmparser.
     assert_eq!(&bytes[..4], b"\0asm", "wasm magic");
     wasmparser::Validator::new()

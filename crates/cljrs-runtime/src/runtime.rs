@@ -204,11 +204,18 @@ impl RuntimeBuilder {
         // Re-refer clojure.core now that the bootstrap has defined its HOFs.
         globals.refer_core("user");
         globals.mark_loaded("clojure.core");
+        // The fiber namespace shares the restricted native blocking macro.
+        globals.get_or_create_ns("cljrs.fiber");
+        globals.intern(
+            "cljrs.fiber",
+            "blocking".into(),
+            globals
+                .lookup_in_ns("clojure.core", "blocking")
+                .expect("bootstrap blocking macro"),
+        );
+        globals.mark_loaded("cljrs.fiber");
 
-        // Experimental namespace: natives first, then the Clojure source that
-        // builds on them. Not referred into `user` — an explicit `require` is
-        // the only way in, so a feature probe for `clojure.core/future` and
-        // friends still (correctly) finds nothing.
+        // Keep the experimental future spellings as compatibility aliases.
         builtins::register_experimental(&globals, builtins::EXPERIMENTAL_NS);
         eval_embedded(
             &globals,
@@ -276,7 +283,7 @@ fn eval_embedded(globals: &Arc<GlobalEnv>, src: &str, origin: &str) -> Result<()
     let mut env = Env::new(globals.clone(), "clojure.core");
     for form in forms {
         let _alloc_frame = cljrs_gc::push_alloc_frame();
-        if let Err(e) = eval::eval(&form, &mut env) {
+        if let Err(e) = eval::eval_discard(&form, &mut env) {
             eprintln!("[{origin} warning] {}: {:?}", form.span.start, e);
         }
     }

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::builtins::builtins::EXPERIMENTAL_NS;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
@@ -40,7 +40,7 @@ async fn eval_all(src: &str, env: &mut Env) -> Value {
     let mut p = Parser::new(src.to_string(), "<test>".to_string());
     let mut result = Value::Nil;
     for form in p.parse_all().expect("parse error") {
-        result = eval_async(&form, env).await.expect("eval error");
+        result = eval_form_unrooted(&form, env).await.expect("eval error");
     }
     result
 }
@@ -49,7 +49,9 @@ async fn eval_err(src: &str, env: &mut Env) -> String {
     let mut p = Parser::new(src.to_string(), "<test>".to_string());
     let mut last = Err(String::new());
     for form in p.parse_all().expect("parse error") {
-        last = eval_async(&form, env).await.map_err(|e| format!("{e:?}"));
+        last = eval_form_unrooted(&form, env)
+            .await
+            .map_err(|e| format!("{e:?}"));
         if last.is_err() {
             break;
         }
@@ -212,8 +214,71 @@ fn both_await_paths_report_cancellation_the_same_way() {
                     cljrs_async::state_machine::Readiness::Pending => "Pending".to_string(),
                     cljrs_async::state_machine::Readiness::GasExhausted =>
                         "GasExhausted".to_string(),
+                    cljrs_async::state_machine::Readiness::MemoryLimitExceeded(f) =>
+                        format!("MemoryLimitExceeded({f})"),
                 }
             ),
         }
+    });
+}
+
+/// A future whose body fails with a memory-limit fault keeps the fault: both
+/// `await` and the compiled-poll readiness check report it as the
+/// uncatchable `MemoryLimitExceeded`, never as a catchable thrown value.
+#[test]
+fn memory_limit_fault_survives_future_settlement() {
+    use cljrs_runtime::env::error::EvalError;
+    let fault = cljrs_gc::MemoryLimitExceeded {
+        class: cljrs_gc::MemoryClass::GcHeap,
+        requested: 4096,
+        committed: 1 << 20,
+        hard_limit: 1 << 20,
+    };
+    block_on_local(async move {
+        let f =
+            cljrs_async::spawn_future(async move { Err(EvalError::MemoryLimitExceeded(fault)) });
+        let awaited = cljrs_async::await_value(f.clone()).await;
+        assert!(
+            matches!(awaited, Err(EvalError::MemoryLimitExceeded(got)) if got == fault),
+            "await: {awaited:?}"
+        );
+        assert!(matches!(
+            cljrs_async::state_machine::check_ready(&f),
+            cljrs_async::state_machine::Readiness::MemoryLimitExceeded(got) if got == fault
+        ));
+    });
+}
+
+#[test]
+fn declared_task_captures_survive_collection_before_the_first_poll() {
+    block_on_local(async {
+        let globals = async_env();
+        let env = Env::new(globals, "user");
+        let frame = cljrs_gc::push_alloc_frame();
+        let capture = Value::string("declared capture");
+        let future =
+            cljrs_async::spawn_future_with_roots(vec![capture.clone()], async move { Ok(capture) });
+        let _future_root = cljrs_runtime::env::gc_roots::root_value(&future);
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let done = completed.clone();
+        cljrs_async::spawn_future(async move {
+            done.set(true);
+            Ok(Value::Nil)
+        });
+        drop(frame);
+        cljrs_runtime::env::gc_roots::force_collect(&env);
+        cljrs_runtime::env::gc_roots::force_collect(&env);
+        assert_eq!(
+            cljrs_async::await_value(future.clone())
+                .await
+                .unwrap()
+                .to_string(),
+            "\"declared capture\""
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            completed.get(),
+            "an ignored task lost its result cell before polling"
+        );
     });
 }

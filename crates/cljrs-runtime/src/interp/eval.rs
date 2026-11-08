@@ -15,12 +15,100 @@ use cljrs_reader::form::FormKind;
 use cljrs_value::regex::Pattern;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    CljxFuture, FutureState, Keyword, MapValue, PersistentHashSet, PersistentList,
-    PersistentVector, Symbol, Value,
+    Keyword, MapValue, PersistentHashSet, PersistentList, PersistentVector, Symbol, Value,
 };
 
 /// Evaluate a `Form` in the given `Env`.
 pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
+    with_read_scope(|| eval_unscoped(form, env))
+}
+
+/// Evaluate a form whose successful result will be discarded by the caller.
+pub fn eval_discard(form: &Form, env: &mut Env) -> EvalResult<()> {
+    #[cfg(feature = "no-gc")]
+    let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+    let result = eval_unscoped(form, env);
+    #[cfg(feature = "no-gc")]
+    {
+        scratch.pop_for_return();
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => publish_result(Err(error), None).map(drop),
+        }
+    }
+    #[cfg(not(feature = "no-gc"))]
+    result.map(drop)
+}
+
+pub(crate) fn with_read_scope(body: impl FnOnce() -> EvalResult) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    let scope = cljrs_gc::region::ReadScope::enter();
+    let result = body();
+    #[cfg(feature = "no-gc")]
+    if let Some(scope) = scope {
+        let _borrowed = scope.finish();
+        return publish_result(result, None);
+    }
+    result
+}
+
+/// Transfer every value-bearing outcome before its producing scope closes.
+#[cfg(feature = "no-gc")]
+pub fn publish_result(
+    result: EvalResult,
+    recur: Option<&mut cljrs_gc::region::RegionLease>,
+) -> EvalResult {
+    use cljrs_value::publish::publish_return;
+    match result {
+        Ok(value) => Ok(publish_return(value)),
+        Err(EvalError::Thrown(value)) => Err(EvalError::Thrown(publish_return(value))),
+        Err(EvalError::Recur(values)) => {
+            if let Some(lease) = recur {
+                *lease = cljrs_gc::region::RegionLease::for_values(&values);
+            } else {
+                for value in &values {
+                    cljrs_gc::region::RegionLease::for_value(value).protect_current();
+                }
+            }
+            Err(EvalError::Recur(values))
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn with_scratch(body: impl FnOnce() -> EvalResult) -> EvalResult {
+    #[cfg(feature = "no-gc")]
+    let mut scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+    let result = body();
+    #[cfg(feature = "no-gc")]
+    {
+        scratch.pop_for_return();
+        publish_result(result, None)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    result
+}
+
+pub(crate) fn eval_unscoped(form: &Form, env: &mut Env) -> EvalResult {
+    if !matches!(
+        &form.kind,
+        FormKind::List(_)
+            | FormKind::Map(_)
+            | FormKind::Set(_)
+            | FormKind::SyntaxQuote(_)
+            | FormKind::TaggedLiteral(_, _)
+            | FormKind::Meta(_, _)
+    ) {
+        return eval_inner(form, env);
+    }
+    cljrs_value::realization::catch(|| eval_inner(form, env)).unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            cljrs_value::ValueError::Other(message),
+        ))
+    })
+}
+
+fn eval_inner(form: &Form, env: &mut Env) -> EvalResult {
     if !crate::env::gas::charge(1) {
         return Err(EvalError::GasExhausted);
     }
@@ -65,13 +153,13 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
         }
 
         // ── Collections ───────────────────────────────────────────────────
-        FormKind::List(forms) => eval_list(forms, env),
+        FormKind::List(forms) => eval_list(form, forms, env),
         FormKind::Vector(forms) => {
             let forms = expand_reader_conds_cow(forms);
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&vals);
-                vals.push(eval(f, env)?);
+                vals.push(eval_unscoped(f, env)?);
             }
             Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))))
         }
@@ -82,7 +170,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             let mut pairs: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&pairs);
-                pairs.push(eval(f, env)?);
+                pairs.push(eval_unscoped(f, env)?);
             }
             let kv_pairs: Vec<(Value, Value)> = pairs
                 .chunks(2)
@@ -95,7 +183,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             let mut vals: Vec<Value> = Vec::with_capacity(forms.len());
             for f in forms.iter() {
                 let _root = crate::env::gc_roots::root_values(&vals);
-                vals.push(eval(f, env)?);
+                vals.push(eval_unscoped(f, env)?);
             }
             Ok(Value::Set(SetValue::Hash(GcPtr::new(
                 PersistentHashSet::from_iter(vals),
@@ -116,7 +204,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             "unquote-splice outside syntax-quote".into(),
         )),
         FormKind::Deref(inner) => {
-            let v = eval(inner, env)?;
+            let v = eval_unscoped(inner, env)?;
             if env.is_async && matches!(v, Value::Future(_)) {
                 return Err(EvalError::Runtime(
                     "deref (@) on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
@@ -144,7 +232,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             //
             // `lower::anf` applies the same rule, so a promoted or AOT-compiled
             // body answers `meta` the same way an interpreted one does.
-            let mut value = eval(form, env)?;
+            let mut value = eval_unscoped(form, env)?;
             // `^:async (fn …)` is both: it makes the fn async, and — an `fn`
             // taking runtime metadata — lands `{:async true}` on it.
             // A stacked annotation (`^:async ^:a (fn …)`) has already wrapped
@@ -152,7 +240,7 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             // so stacked annotations never nest `WithMeta`.
             if meta.requests_async() && form.unmeta().is_fn_form() {
                 let target = match &mut value {
-                    Value::WithMeta(inner, _) => inner.as_mut(),
+                    Value::WithMeta(inner, _) => Arc::make_mut(inner),
                     other => other,
                 };
                 if let Value::Fn(f) = target {
@@ -162,14 +250,16 @@ pub fn eval(form: &Form, env: &mut Env) -> EvalResult {
             if !form.takes_runtime_meta() {
                 return Ok(value);
             }
-            let m = crate::builtins::form::expand_meta_annotation(meta, &mut |f| eval(f, env))?;
+            let m = crate::builtins::form::expand_meta_annotation(meta, &mut |f| {
+                eval_unscoped(f, env)
+            })?;
             Ok(crate::builtins::form::attach_meta(value, m))
         }
 
         // ── Dispatch ──────────────────────────────────────────────────────
         FormKind::AnonFn(body) => {
             let expanded = crate::builtins::form::expand_anon_fn(body, form.span.clone());
-            eval(&expanded, env)
+            eval_unscoped(&expanded, env)
         }
         FormKind::ReaderCond {
             splicing: _,
@@ -192,18 +282,22 @@ pub fn eval_with_gas(form: &Form, env: &mut Env, credits: u64) -> EvalResult {
 
 // ── List / call dispatch ──────────────────────────────────────────────────────
 
-fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
+fn eval_list(site: &Form, forms: &[Form], env: &mut Env) -> EvalResult {
     if forms.is_empty() {
         return Ok(Value::List(GcPtr::new(PersistentList::empty())));
     }
 
     // Expand reader conditionals (both splicing and non-splicing) before dispatch.
     let expanded: Vec<Form>;
+    // A call whose parts came from expanding reader conditionals is a
+    // temporary, so it is not a stable site for the macro-expansion cache.
+    let mut site = Some(site);
     let forms: &[Form] = if forms
         .iter()
         .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
     {
         expanded = expand_reader_conds(forms);
+        site = None;
         if expanded.is_empty() {
             return Ok(Value::List(GcPtr::new(PersistentList::empty())));
         }
@@ -219,7 +313,7 @@ fn eval_list(forms: &[Form], env: &mut Env) -> EvalResult {
         return eval_special(s, &forms[1..], env);
     }
 
-    eval_call(&forms[0], &forms[1..], env)
+    eval_call(site, &forms[0], &forms[1..], env)
 }
 
 // ── Symbol resolution ─────────────────────────────────────────────────────────
@@ -357,6 +451,46 @@ pub fn is_special_form(s: &str) -> bool {
 
 // ── eval_body ─────────────────────────────────────────────────────────────────
 
+/// `await` on the synchronous evaluator, shared by the tree-walker and the IR
+/// interpreter. A future or promise is dereferenced, which parks on a fiber.
+/// On wasm32, which cannot park, a value that is not ready yet is an error.
+/// A channel (what `go` returns) is taken from through
+/// [`AsyncRuntime::take_if_channel`](crate::env::async_hook::AsyncRuntime::take_if_channel),
+/// so `(await (go ...))` yields the block's value. Any other value is returned
+/// unchanged.
+pub fn await_value_sync(v: Value, globals: &GlobalEnv) -> EvalResult {
+    match v {
+        // wasm32 cannot park its only thread: a synchronous `await` returns a
+        // settled value at once and errors when it would have to wait.
+        #[cfg(target_arch = "wasm32")]
+        Value::Future(f) => match f.get().settled_value() {
+            Some(settled) => settled.map_err(crate::env::error::value_error_to_eval_error),
+            None => Err(would_block_on_wasm()),
+        },
+        #[cfg(target_arch = "wasm32")]
+        Value::Promise(p) => {
+            let value = p.get().value.lock().unwrap().clone();
+            value.ok_or_else(would_block_on_wasm)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::Future(_) | Value::Promise(_) => deref_value(v),
+        other => match globals
+            .async_runtime()
+            .and_then(|rt| rt.take_if_channel(&other))
+        {
+            Some(taken) => taken,
+            None => Ok(other),
+        },
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn would_block_on_wasm() -> EvalError {
+    EvalError::Runtime(
+        "this await would block, which wasm32 cannot do outside a go or ^:async body".into(),
+    )
+}
+
 /// Dereference a value: used by `@x` reader macro and the `deref` builtin.
 pub fn deref_value(v: Value) -> EvalResult {
     match v {
@@ -365,35 +499,18 @@ pub fn deref_value(v: Value) -> EvalResult {
         Value::Var(var) => crate::env::dynamics::deref_var(&var)
             .ok_or_else(|| EvalError::Runtime("unbound var".into())),
         Value::Volatile(vol) => Ok(vol.get().deref()),
-        Value::Delay(d) => d.get().force().map_err(EvalError::Runtime),
+        Value::Delay(d) => d
+            .get()
+            .force()
+            .map_err(crate::env::error::realize_error_to_eval_error),
         Value::Agent(a) => Ok(a.get().get_state()),
-        Value::Reduced(inner) => Ok(*inner),
+        Value::Reduced(inner) => Ok((*inner).clone()),
         Value::Promise(p) => Ok(p.get().deref_blocking()),
-        Value::Future(f) => {
-            let mut guard = f.get().state.lock().unwrap();
-            loop {
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        return Ok(v.clone());
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::Thrown(v.clone()));
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        return Err(EvalError::GasExhausted);
-                    }
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                    }
-                    FutureState::Running => {
-                        guard = f.get().cond.wait(guard).unwrap();
-                    }
-                }
-            }
-        }
+        Value::Future(f) => f
+            .get()
+            .wait_value(None)
+            .map(|v| v.unwrap())
+            .map_err(crate::env::error::value_error_to_eval_error),
         other => Err(EvalError::Runtime(format!(
             "cannot deref {}",
             other.type_name()
@@ -405,7 +522,7 @@ pub fn deref_value(v: Value) -> EvalResult {
 pub fn eval_body(forms: &[Form], env: &mut Env) -> EvalResult {
     let mut result = Value::Nil;
     for form in forms {
-        result = eval(form, env)?;
+        result = eval_unscoped(form, env)?;
     }
     Ok(result)
 }
@@ -414,7 +531,7 @@ pub fn eval_body(forms: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
     match crate::builtins::form::select_reader_cond(clauses) {
-        Some(f) => eval(f, env),
+        Some(f) => eval_unscoped(f, env),
         None => Ok(Value::Nil),
     }
 }
@@ -424,7 +541,7 @@ fn eval_reader_cond(clauses: &[Form], env: &mut Env) -> EvalResult {
 fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
     match tag {
         "uuid" => {
-            let val = eval(inner, env)?;
+            let val = eval_unscoped(inner, env)?;
             match &val {
                 Value::Str(s) => {
                     let uuid = uuid::Uuid::parse_str(s.get())
@@ -439,7 +556,7 @@ fn eval_tagged_literal(tag: &str, inner: &Form, env: &mut Env) -> EvalResult {
         }
         "inst" => {
             // TODO: implement #inst for date/time literals
-            let val = eval(inner, env)?;
+            let val = eval_unscoped(inner, env)?;
             Ok(val)
         }
         _ => Err(EvalError::Runtime(format!(

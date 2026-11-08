@@ -23,6 +23,7 @@ use syn::{
 // ── Attribute argument parsing ────────────────────────────────────────────────
 
 struct ExportArgs {
+    blocking: bool,
     ns: Option<LitStr>,
     name: Option<LitStr>,
     /// Minimum arity for variadic functions (default 0).
@@ -31,12 +32,20 @@ struct ExportArgs {
 
 impl Parse for ExportArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut blocking = false;
         let mut ns: Option<LitStr> = None;
         let mut name: Option<LitStr> = None;
         let mut variadic_min: Option<LitInt> = None;
 
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
+            if key == "blocking" {
+                blocking = true;
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
@@ -60,6 +69,7 @@ impl Parse for ExportArgs {
         }
 
         Ok(Self {
+            blocking,
             ns,
             name,
             variadic_min,
@@ -85,6 +95,11 @@ impl Parse for ExportArgs {
 ///   (default: Rust function name with `_` replaced by `-`).
 /// - `variadic_min = N` — for variadic functions, set the minimum arity
 ///   (default 0). Only meaningful when the function takes `&[Value]`.
+///
+/// - `blocking` — convert owned inputs on the isolate, run the Rust function
+///   on the blocking worker pool, then convert its result on the isolate.
+///   Inputs and output must be `Send + 'static`. Variadic `&[Value]` exports
+///   cannot use this attribute. Outside a fiber, the call runs directly.
 ///
 /// # Supported signatures
 ///
@@ -160,6 +175,12 @@ fn export_impl(args: ExportArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     // Detect variadic: exactly one parameter whose type is `&[Value]`.
     let variadic = params.len() == 1 && is_slice_of_value(&params[0].ty);
 
+    if args.blocking && variadic {
+        return Err(syn::Error::new_spanned(
+            fn_ident,
+            "blocking exports require owned, Send parameters; &[Value] cannot cross threads",
+        ));
+    }
     let native_fn_expr = if variadic {
         let min: usize = match &args.variadic_min {
             Some(lit) => lit.base10_parse()?,
@@ -172,7 +193,13 @@ fn export_impl(args: ExportArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             "`variadic_min` is only valid when the function takes `&[Value]`",
         ));
     } else {
-        build_fixed(&qualified, fn_ident, &params, &func.sig.output)?
+        build_fixed(
+            &qualified,
+            fn_ident,
+            &params,
+            &func.sig.output,
+            args.blocking,
+        )?
     };
 
     Ok(quote! {
@@ -192,16 +219,33 @@ fn build_fixed(
     fn_ident: &syn::Ident,
     params: &[&PatType],
     ret: &ReturnType,
+    blocking: bool,
 ) -> syn::Result<TokenStream2> {
     let n = params.len();
     let indices: Vec<usize> = (0..n).collect();
     let arg_idents: Vec<syn::Ident> = (0..n).map(|i| format_ident!("__a{i}")).collect();
     let param_tys: Vec<&Type> = params.iter().map(|pt| pt.ty.as_ref()).collect();
 
-    let result_expr = build_result_expr(quote! { #fn_ident(#(#arg_idents),*) }, ret)?;
+    let direct_call = quote! { #fn_ident(#(#arg_idents),*) };
+    let call = if blocking {
+        quote! { ::cljrs_interop::blocking(move || #direct_call) }
+    } else {
+        direct_call.clone()
+    };
+    let result_expr = build_result_expr(call, ret)?;
+    let convert = match ret {
+        ReturnType::Default => quote! { |_| Ok(::cljrs_interop::Value::Nil) },
+        ReturnType::Type(_, ty) if is_unit_type(ty) => {
+            quote! { |_| Ok(::cljrs_interop::Value::Nil) }
+        }
+        _ => {
+            let converted = build_result_expr(quote! { __result }, ret)?;
+            quote! { |__result| { #converted } }
+        }
+    };
 
     Ok(quote! {
-        ::cljrs_interop::NativeFn::with_closure(
+        ::cljrs_interop::NativeFn::with_blocking(
             #qualified,
             ::cljrs_interop::Arity::Fixed(#n),
             move |args| {
@@ -210,7 +254,18 @@ fn build_fixed(
                         <#param_tys as ::cljrs_interop::FromValue>::from_value(&args[#indices])?;
                 )*
                 #result_expr
-            }
+            },
+            move |args| {
+                #(
+                    let #arg_idents =
+                        <#param_tys as ::cljrs_interop::FromValue>::from_value(&args[#indices])?;
+                )*
+                use ::cljrs_interop::blocking::BlockingDispatch as _;
+                let __call = ::cljrs_interop::blocking::BlockingCall::new(
+                    #qualified, (#(#arg_idents,)*), move |(#(#arg_idents,)*)| #direct_call, #convert,
+                );
+                (&__call).run_blocking()
+            },
         )
     })
 }
@@ -308,4 +363,31 @@ fn result_ok_type(ty: &Type) -> Option<&Type> {
 /// Returns true for the unit type `()`.
 fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// Catch lazy realization failures before an extern-C ABI boundary.
+/// The argument names a function that converts an error string to the ABI result.
+#[proc_macro_attribute]
+pub fn catch_realization(handler: TokenStream, item: TokenStream) -> TokenStream {
+    let handlers = parse_macro_input!(handler with syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated);
+    let handler = &handlers[0];
+    let mut function = parse_macro_input!(item as ItemFn);
+    let body = function.block;
+    let wrapped = quote!({
+        match cljrs_value::realization::catch(|| #body) {
+            Ok(value) => value,
+            Err(message) => #handler(message),
+        }
+    });
+    function.block = if let Some(cancel_handler) = handlers.get(1) {
+        Box::new(syn::parse_quote!({
+            match cljrs_value::parking::catch_cancelled(|| #wrapped) {
+                Ok(value) => value,
+                Err(error) => #cancel_handler(error),
+            }
+        }))
+    } else {
+        Box::new(syn::parse_quote!(#wrapped))
+    };
+    quote!(#function).into()
 }

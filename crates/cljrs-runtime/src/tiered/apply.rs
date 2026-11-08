@@ -22,13 +22,19 @@ pub fn force_eager_lowering() {
 /// which is expensive.  Disabled by default; set `CLJRS_EAGER_LOWER=1` to
 /// enable.  (Or set `CLJRS_NO_IR=1` to disable all IR functionality.)
 pub(crate) fn eager_lower_enabled() -> bool {
-    if std::env::var("CLJRS_NO_IR").is_ok() {
+    // Read once: this runs every time a fn value is created, and `getenv`
+    // scans the whole environment block.
+    static NO_IR: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CLJRS_NO_IR").is_ok());
+    static EAGER: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CLJRS_EAGER_LOWER").is_ok());
+    if *NO_IR {
         return false;
     }
     if EAGER_LOWER_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var("CLJRS_EAGER_LOWER").is_ok()
+    *EAGER
 }
 
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
@@ -66,6 +72,7 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 thread_local! {
     pub static IR_LOWERING_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/IR_LOWERING_ACTIVE", cell IR_LOWERING_ACTIVE: bool);
 
 /// Attempt to execute via the IR interpreter.
 /// Returns `None` if IR is not available (not cached, lowering failed, etc.).
@@ -425,9 +432,17 @@ fn call_jit_native(
     // (while the alloc frame still roots it), exactly as Tier-1 would have
     // propagated it — and so a stale slot cannot misfire a later `rt_try`.
     let pending_exception = caller_env.globals.jit().take_pending_exception();
+    let resource_error = caller_env.globals.jit().take_pending_resource_error();
+    if let Some(error) = resource_error {
+        return Err(crate::env::error::value_error_to_eval_error(error));
+    }
     if gas_exhausted {
         return Err(crate::env::error::EvalError::GasExhausted);
     }
+    // A memory fault raised inside native code (a refused allocation in an
+    // `rt_*` bridge, or an interpreter error a callback could not carry)
+    // waits in its own slot; report it the way Tier 1 would.
+    crate::env::gc_roots::check_memory_fault()?;
     if let Some(thrown) = pending_exception {
         return Err(crate::env::error::EvalError::Thrown(thrown));
     }

@@ -148,6 +148,8 @@ pub fn register(globals: &Arc<GlobalEnv>) {
 /// Namespaces are registered as embedded *sources*, so each one is parsed and
 /// evaluated on its first `require` rather than at install time.
 pub fn install(runtime: &Runtime) {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::enter();
     register(runtime.globals());
 }
 

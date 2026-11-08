@@ -121,6 +121,8 @@ pub fn lower_via_rust(
     compilable_forms: &[cljrs_reader::Form],
     env: &mut cljrs_runtime::tiered::Env,
 ) -> AotResult<IrFunction> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let ns_arc: Arc<str> = Arc::from(ns);
     // `ns` has already been evaluated into `env`, so its own `def`s, refers and
     // `(:refer-clojure ...)` filter are visible: a name it rebinds must not be
@@ -944,27 +946,9 @@ pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) 
         compiler.compile_function(ns_ir, id)?;
     }
 
-    // ── 4b. Async poll functions (Phase H) ──────────────────────────────
-    // Regular `defn`s are compiled into `__cljrs_main`; `^:async` ones stay
-    // interpreted (their body has `await`) and so were never evaluated into the
-    // compile-time `env`.  Evaluate just their *definitions* now (the original
-    // form, so `^:async` metadata survives; never a side-effecting top-level
-    // form) so their bodies can be introspected and compiled to poll functions.
-    for (i, form) in forms.iter().enumerate() {
-        if is_def_form(form) && expanded_needs_interpreter(&expanded[i]) {
-            let _ = cljrs_runtime::tiered::eval(form, &mut env);
-        }
-    }
-    // Compile a native state machine for each `^:async` fn the program
-    // defined, into the same object module.  The harness registers them so
-    // dispatch runs native instead of the `eval_async` tree-walker.
-    let async_polls = compile_async_poll_fns(&mut compiler, &mut env)?;
-    if !async_polls.is_empty() {
-        eprintln!(
-            "[aot] compiled {} async poll function(s)",
-            async_polls.len()
-        );
-    }
+    // `^:async` fns stay interpreted (their body has `await`); at runtime each
+    // call runs its body on a fiber (virtual-threads plan Phase 5), so no
+    // async state machines are compiled.
 
     let obj_bytes = compiler.finish();
     eprintln!("[aot] generated {} bytes of object code", obj_bytes.len());
@@ -995,7 +979,6 @@ pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) 
             structural_ns: structural_ns.as_ref(),
             compiled_namespaces: &compiled_namespaces,
             versioned_bundled: &versioned_bundled,
-            async_polls: &async_polls,
         },
         session,
     )?;
@@ -1332,19 +1315,6 @@ fn render_require_spec(spec: &cljrs_runtime::env::env::RequireSpec) -> String {
 }
 
 /// Check if a top-level form needs the interpreter (can't be AOT-compiled yet).
-/// Whether `form` is a top-level `def`/`defn`/`defn-` (a binding definition,
-/// safe to evaluate at compile time — no program side effects).
-fn is_def_form(form: &cljrs_reader::Form) -> bool {
-    use cljrs_reader::form::FormKind;
-    if let FormKind::List(parts) = &form.kind
-        && let Some(head) = parts.first()
-        && let FormKind::Symbol(s) = &head.kind
-    {
-        return matches!(s.as_str(), "def" | "defn" | "defn-");
-    }
-    false
-}
-
 fn needs_interpreter(form: &cljrs_reader::Form) -> bool {
     use cljrs_reader::form::FormKind;
     match &form.kind {
@@ -1836,6 +1806,8 @@ fn lower_namespace(
     init_symbol: &str,
     globals: &Arc<cljrs_runtime::env::env::GlobalEnv>,
 ) -> AotResult<(String, Option<IrFunction>)> {
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let mut parser = Parser::new(source.to_string(), format!("<{ns_name}>"));
     let forms = parser.parse_all()?;
 
@@ -1879,128 +1851,6 @@ fn lower_namespace(
 
 // ── Harness generation ──────────────────────────────────────────────────────
 
-/// Create a temporary Cargo project that links the compiled object code with
-/// the clojurust runtime and produces a binary.
-/// A `^:async` arity compiled to a native poll function, to be registered by
-/// the generated harness via `cljrs_async::state_machine::register_poll_fn_named`.
-struct AsyncPollEntry {
-    ns: String,
-    name: String,
-    arity: usize,
-    symbol: String,
-    n_slots: usize,
-}
-
-/// Compile a native poll function for each `^:async` fn the program defined
-/// (introspected from `env`, which already evaluated every `defn` at compile
-/// time), into the AOT object module.  Functions whose body uses an unsupported
-/// construct (channels, spawn, `throw`, regions) are skipped — they keep the
-/// `eval_async` tree-walker at runtime.  Capturing closures and fns with inner
-/// closures are also skipped (standalone lowering can't see captures, and inner
-/// closures would need separate subfunction-symbol management).
-fn compile_async_poll_fns(
-    compiler: &mut Compiler,
-    env: &mut cljrs_runtime::tiered::Env,
-) -> AotResult<Vec<AsyncPollEntry>> {
-    // Snapshot the async fns first so no namespace lock is held across lowering
-    // (which re-enters the env).
-    struct AritySnap {
-        params: Vec<Arc<str>>,
-        rest: Option<Arc<str>>,
-        dparams: Vec<(usize, cljrs_reader::Form)>,
-        drest: Option<cljrs_reader::Form>,
-        body: Vec<cljrs_reader::Form>,
-    }
-    struct FnSnap {
-        ns: Arc<str>,
-        name: Arc<str>,
-        arities: Vec<AritySnap>,
-    }
-
-    let snaps: Vec<FnSnap> = {
-        let ns_map = env.globals.namespaces.read().unwrap();
-        let mut out = Vec::new();
-        for (ns_name, ns_ptr) in ns_map.iter() {
-            // User namespaces only; the stdlib defines no `^:async` fns and
-            // scanning it would just waste work.
-            if ns_name.starts_with("clojure.") {
-                continue;
-            }
-            let interns = ns_ptr.get().interns.lock().unwrap();
-            for (vname, var) in interns.iter() {
-                let Some(cljrs_value::Value::Fn(f)) = var.get().deref() else {
-                    continue;
-                };
-                let fr = f.get();
-                if !fr.is_async || !fr.closed_over_names.is_empty() {
-                    continue;
-                }
-                let arities = fr
-                    .arities
-                    .iter()
-                    .map(|a| AritySnap {
-                        params: a.params.clone(),
-                        rest: a.rest_param.clone(),
-                        dparams: a.destructure_params.clone(),
-                        drest: a.destructure_rest.clone(),
-                        body: a.body.clone(),
-                    })
-                    .collect();
-                out.push(FnSnap {
-                    ns: fr.defining_ns.clone(),
-                    name: fr.name.clone().unwrap_or_else(|| vname.clone()),
-                    arities,
-                });
-            }
-        }
-        out
-    };
-
-    let mut entries = Vec::new();
-    for fnsnap in &snaps {
-        for arity in &fnsnap.arities {
-            // Channel / concurrency ops (Phase H4) aren't modeled by the poll
-            // machine; keep such fns on the tree-walker.
-            if cljrs_ir::lower::async_lower::body_uses_unsupported_async(&arity.body) {
-                continue;
-            }
-            let ir = match cljrs_runtime::tiered::lower::lower_arity(
-                Some(&fnsnap.name),
-                &arity.params,
-                arity.rest.as_ref(),
-                &arity.dparams,
-                arity.drest.as_ref(),
-                &arity.body,
-                &fnsnap.ns,
-                env,
-                true,
-            ) {
-                Ok(ir) => ir,
-                Err(_) => continue,
-            };
-            // Inner closures would need separate subfunction symbols; defer.
-            if !ir.subfunctions.is_empty() {
-                continue;
-            }
-            let low = match cljrs_ir::lower::lower_async(&ir) {
-                Ok(low) => low,
-                Err(_) => continue,
-            };
-            let symbol = format!("__cljrs_async_poll_{}", entries.len());
-            let func_id = compiler.declare_poll_function(&symbol)?;
-            compiler.compile_function(&low.poll_fn, func_id)?;
-            entries.push(AsyncPollEntry {
-                ns: fnsnap.ns.to_string(),
-                name: fnsnap.name.to_string(),
-                arity: arity.params.len(),
-                symbol,
-                n_slots: low.n_slots,
-            });
-        }
-    }
-    Ok(entries)
-}
-
 /// Everything the generated Cargo harness is assembled from.
 ///
 /// A parameter object rather than a longer argument list: these all answer one
@@ -2013,7 +1863,6 @@ struct HarnessInputs<'a> {
     structural_ns: Option<&'a (String, Vec<cljrs_runtime::env::env::RequireSpec>)>,
     compiled_namespaces: &'a [CompiledNamespace],
     versioned_bundled: &'a [(Arc<str>, String)],
-    async_polls: &'a [AsyncPollEntry],
 }
 
 /// The harness source that calls an extension's `:rust :init` hook, or nothing
@@ -2052,6 +1901,8 @@ fn native_init_code(init_fn: Option<&str>) -> String {
     }
 }
 
+/// Create a temporary Cargo project that links the compiled object code with
+/// the clojurust runtime and produces a binary.
 fn build_harness(
     out_path: &Path,
     inputs: HarnessInputs<'_>,
@@ -2063,7 +1914,6 @@ fn build_harness(
         structural_ns,
         compiled_namespaces,
         versioned_bundled,
-        async_polls,
     } = inputs;
     let rust_config = session.rust_config_ref();
     let extensions = session.extensions();
@@ -2210,14 +2060,12 @@ edition = "2024"
                         Ok(main_result) => {
                             // If -main is ^:async it returns a Future; await it on the
                             // current LocalSet so all spawned go-blocks drain to completion.
-                            if let Err(e) = cljrs_async::eval_async::await_value(main_result).await {
-                                eprintln!("cljrs: error in -main: {e:?}");
-                                std::process::exit(1);
+                            if let Err(e) = cljrs_async::fiber::park_on(cljrs_async::await_value(main_result)) {
+                                return Err(e);
                             }
                         }
                         Err(e) => {
-                            eprintln!("cljrs: error in -main: {e:?}");
-                            std::process::exit(1);
+                            return Err(e);
                         }
                     }
                 }
@@ -2290,38 +2138,6 @@ edition = "2024"
 
     let native_init_code = native_init_code(rust_config.and_then(|rc| rc.init_fn.as_deref()));
 
-    // Register AOT-compiled async poll functions: declare each as an external
-    // symbol (defined in the linked object), then register it by ns/name/arity
-    // so `^:async` dispatch runs native instead of the tree-walker.
-    let async_poll_registration = if async_polls.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from(
-            "\n    // Register AOT-compiled async poll functions.\n    unsafe extern \"C\" {\n",
-        );
-        for e in async_polls {
-            s.push_str(&format!(
-                "        fn {sym}(sm: *mut cljrs_async::state_machine::CljxStateMachine) -> i32;\n",
-                sym = e.symbol,
-            ));
-        }
-        s.push_str("    }\n    unsafe {\n");
-        for e in async_polls {
-            s.push_str(&format!(
-                "        cljrs_async::state_machine::register_poll_fn_named({ns:?}, {name:?}, {arity}, \
-                 std::mem::transmute::<unsafe extern \"C\" fn(*mut cljrs_async::state_machine::CljxStateMachine) -> i32, \
-                 cljrs_async::state_machine::PollFn>({sym}), {nslots});\n",
-                ns = e.ns,
-                name = e.name,
-                arity = e.arity,
-                sym = e.symbol,
-                nslots = e.n_slots,
-            ));
-        }
-        s.push_str("    }\n");
-        s
-    };
-
     let main_rs = format!(
         r#"//! Auto-generated AOT harness for clojurust.
 //!
@@ -2335,7 +2151,8 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 {ns_init_externs}}}
 
-async fn run() {{
+fn run() -> cljrs_runtime::env::error::EvalResult {{
+    let outcome = (|| -> cljrs_runtime::env::error::EvalResult {{
     // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
     // cannot parse is a hard error, matching `cljrs -X`: someone asked for
     // diagnostics and must not be left silently without them.
@@ -2361,7 +2178,7 @@ async fn run() {{
     globals.set_versioned_offline(true);
 
     // Register the extensions this program was compiled with.
-{extension_init}{async_polls}
+{extension_init}
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
 {bundled}
@@ -2369,16 +2186,26 @@ async fn run() {{
     // initializers instead of interpreting source.
 {compiled_ns}{native_init}
 {ns_setup}    // Push an eval context so rt_call can dispatch through the interpreter.
-    cljrs_runtime::env::callback::push_eval_context(&env);
+    let _context = cljrs_runtime::env::callback::install_eval_context_guard(env.globals.clone(), env.current_ns.clone());
 {preamble}
     // Call the compiled code.
     let _result = unsafe {{ __cljrs_main() }};
+    if let Some(error) = cljrs_compiler::rt_abi::take_pending_resource_error() {{
+        return Err(cljrs_runtime::env::error::value_error_to_eval_error(error));
+    }}
+    if let Some(thrown) = cljrs_compiler::rt_abi::take_pending_exception_value() {{
+        return Err(cljrs_runtime::env::error::EvalError::Thrown(thrown));
+    }}
+    // A memory-limit fault raised in compiled code (strict mode) that no
+    // later collection cleared ends the program like an interpreter error.
+    if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{
+        return Err(cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault));
+    }}
 {main_call}
-    // Pop the eval context.
-    cljrs_runtime::env::callback::pop_eval_context();
-
-    // If CLJRS_GC_STATS is set, dump GC stats to its target (stdout/file).
+    Ok(Value::Nil)
+    }})();
     cljrs_gc::dump_stats_from_env();
+    outcome
 }}
 
 fn main() {{
@@ -2396,7 +2223,10 @@ fn main() {{
                 .build()
                 .expect("failed to build Tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, run());
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {{
+                eprintln!("cljrs: {{error}}");
+                std::process::exit(1);
+            }}
         }})
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {{
@@ -2411,7 +2241,6 @@ fn main() {{
         ns_init_externs = ns_init_externs,
         native_init = native_init_code,
         main_call = main_call_code,
-        async_polls = async_poll_registration,
         extension_init = extensions.harness_init_code(),
     );
     std::fs::write(harness_dir.join("src/main.rs"), main_rs)?;
@@ -2439,10 +2268,10 @@ const HARNESS_RUNTIME_CRATES: &[&str] = &[
 ];
 
 /// Runtime crates the AOT *test* harness links against.  The test harness
-/// links the compiled namespace initializers (so it needs `cljrs-compiler`
-/// for the `rt_*` ABI bridges) but not the async/IO/net/charset stacks —
-/// those namespaces are not registered by the generated test runner.
+/// links compiled namespace initializers and the async runtime for root
+/// fibers and core.async test bodies. IO/net/charset remain host extensions.
 const TEST_HARNESS_RUNTIME_CRATES: &[&str] = &[
+    "cljrs-async",
     "cljrs-types",
     "cljrs-gc",
     "cljrs-value",
@@ -2809,7 +2638,7 @@ use cljrs_value::Value;
     }
 
     code.push_str(
-        r#"fn run() {
+        r#"fn run() -> cljrs_runtime::env::error::EvalResult {
     // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
     // cannot parse is a hard error, matching `cljrs -X`: someone asked for
     // diagnostics and must not be left silently without them.
@@ -2855,6 +2684,8 @@ use cljrs_value::Value;
             ),
         ));
     }
+
+    cljrs_async::init(&globals);
 
     // Register bundled dependency sources so require can find them
     // without needing source files on disk.
@@ -2996,6 +2827,7 @@ use cljrs_value::Value;
     if total_fail > 0 || total_error > 0 {
         std::process::exit(1);
     }
+    Ok(Value::Nil)
 }
 
 fn main() {
@@ -3004,7 +2836,15 @@ fn main() {
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
     let thread = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
-        .spawn(run)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().expect("Tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            if let Err(error) = cljrs_async::fiber::run_root_owned(&rt, local, run) {
+                eprintln!("cljrs: {error}");
+                std::process::exit(1);
+            }
+        })
         .expect("failed to spawn main thread");
     if let Err(e) = thread.join() {
         std::panic::resume_unwind(e);
@@ -3254,7 +3094,8 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-{runtime_deps}"#,
+{runtime_deps}tokio = {{ version = "1", features = ["rt", "time", "net", "io-util"] }}
+"#,
     );
     std::fs::write(harness_dir.join("Cargo.toml"), cargo_toml)?;
     deps.seed_lockfile(&harness_dir)?;

@@ -1898,3 +1898,23 @@
 ;; The impl fns capture locals because deftype* registers them at the call site.
 (defmacro reify [& impls]
   `(make-type-instance (deftype* ~(gensym "reify__") [] ~@impls) {}))
+
+(defmacro locking [x & body]
+  (list 'clojure.core/locking-call x (cons 'fn (cons [] body))))
+
+
+;; Argument evaluation stays on the isolate. Only typed native call bodies offload.
+(defmacro blocking [& calls]
+  (cons 'do
+    (map (fn [call]
+           (if (and (seq? call) (seq call))
+             (cons 'clojure.core/blocking-call call)
+             (throw (ex-info "blocking expects native call forms" {}))))
+         calls)))
+
+(defmacro future
+  "Runs body concurrently on this isolate in a fiber. Conveys dynamic bindings.
+  Dereferencing parks the calling fiber. Use isolates for parallel execution.
+  Cancellation discards the result without interrupting the body."
+  [& body]
+  (list 'clojure.core/future-call (list 'fn [] (cons 'do body))))

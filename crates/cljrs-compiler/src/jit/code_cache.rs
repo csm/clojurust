@@ -50,6 +50,10 @@ struct CodeRecord {
     /// The arity this code was compiled for (diagnostics only).
     arity_id: u64,
     compiled: CompiledFn,
+    /// Governor charge (`MemoryClass::Code`) for the machine code; returned
+    /// when the record is dropped after reclamation.  Report-only: the
+    /// governor does not deny code publication.
+    _charge: cljrs_gc::MemoryCharge,
 }
 
 #[derive(Default)]
@@ -80,8 +84,18 @@ fn cache() -> &'static Mutex<CacheState> {
 /// pointer (see the worker), so a later [`mark_stale`] can find this module.
 pub(crate) fn register(arity_id: u64, compiled: CompiledFn) -> u64 {
     let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    // Reported, never denied, even in strict mode.
+    let charge = cljrs_gc::governor()
+        .reserve_reported(cljrs_gc::MemoryClass::Code, compiled.code_size as usize);
     let mut state = cache().lock().unwrap();
-    state.live.insert(epoch, CodeRecord { arity_id, compiled });
+    state.live.insert(
+        epoch,
+        CodeRecord {
+            arity_id,
+            compiled,
+            _charge: charge,
+        },
+    );
     epoch
 }
 
@@ -210,13 +224,13 @@ pub fn reclaimed_bytes() -> u64 {
 // ── Test-only inspection helpers ────────────────────────────────────────────
 
 /// True if `epoch` is currently in the stale (awaiting-reclamation) set.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 pub(crate) fn is_stale(epoch: u64) -> bool {
     cache().lock().unwrap().stale.contains_key(&epoch)
 }
 
 /// True if `epoch` is currently in the live set.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no-gc")))]
 pub(crate) fn is_live(epoch: u64) -> bool {
     cache().lock().unwrap().live.contains_key(&epoch)
 }

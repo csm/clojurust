@@ -15,6 +15,11 @@ default = ["regex-full", "deps"]
 regex-full  = ["cljrs-value/regex-full", "cljrs-runtime/regex-full"]
 small-regex = ["cljrs-value/small-regex", "cljrs-runtime/small-regex"]
 
+# Compile the colored `eval_async` evaluator on native targets too. wasm32 always
+# has it; native runtimes run `go`/`^:async` bodies on fibers and never dispatch
+# to it. `cljrs-wasm` enables this so the browser crate also builds natively.
+colored-eval = []
+
 # Pass-through for cljrs-runtime's git-backed dependency support.
 deps = ["cljrs-runtime/deps"]
 
@@ -26,6 +31,9 @@ no-gc = [
     "cljrs-runtime/no-gc",
 ]
 
+# Enable corosensei's stack-switch hooks only with an ASan-instrumented build.
+fiber-sanitizer = ["corosensei/sanitizer"]
+
 [dependencies]
 cljrs-runtime = { workspace = true }
 cljrs-types    = { workspace = true }
@@ -34,8 +42,10 @@ cljrs-reader   = { workspace = true }
 cljrs-value    = { workspace = true }
 tokio          = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 futures-util   = { workspace = true }
+rand           = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+corosensei = "0.3.4"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -43,3 +53,6 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
 proptest = "1"
+# Paused clock: helper_parking.rs proves helpers park by letting virtual time
+# auto-advance, which tokio does only when no task is ready.
+tokio    = { workspace = true, features = ["test-util"] }

@@ -1,5 +1,6 @@
 use crate::Value;
 use crate::collections::array_map::PersistentArrayMap;
+use crate::collections::share_charge::{ShareCharge, hamt_path_bytes, rb_path_bytes};
 use rpds::{HashTrieMapSync, RedBlackTreeMapSync};
 
 /// An immutable hash map that preserves insertion order when iterated.
@@ -16,12 +17,21 @@ use rpds::{HashTrieMapSync, RedBlackTreeMapSync};
 /// Small maps (≤8 entries) are represented as `PersistentArrayMap` instead;
 /// the two types share the same `Value::Map` variant.  `PersistentHashMap` is
 /// used once the entry count exceeds the array-map threshold.
+///
+/// A map derived by `assoc` or `dissoc` from a GC-allocated map reports only
+/// its path-copied nodes from `gc_size_extra`; see
+/// `collections::share_charge` for the full rule.
 #[derive(Debug, Clone)]
 pub struct PersistentHashMap {
     index: HashTrieMapSync<Value, u64>,
     order: RedBlackTreeMapSync<u64, (Value, Value)>,
     next_seq: u64,
+    charge: ShareCharge,
+    keys_inert: bool,
 }
+
+/// An entry of the insertion-order tree.
+type OrderEntry = (u64, (Value, Value));
 
 impl PersistentHashMap {
     pub fn empty() -> Self {
@@ -29,6 +39,8 @@ impl PersistentHashMap {
             index: HashTrieMapSync::new_sync(),
             next_seq: 0,
             order: RedBlackTreeMapSync::new_sync(),
+            charge: ShareCharge::full(),
+            keys_inert: true,
         }
     }
 
@@ -54,6 +66,15 @@ impl PersistentHashMap {
         self.order.get(seq).map(|(_, v)| v)
     }
 
+    pub(crate) fn storage_entry(&self, key: &Value) -> Option<(usize, Value)> {
+        self.index
+            .get_key_value(key)
+            .map(|(stored, sequence)| (*sequence as usize, stored.clone()))
+    }
+    pub(crate) fn keys_inert(&self) -> bool {
+        self.keys_inert
+    }
+
     pub fn contains_key(&self, key: &Value) -> bool {
         self.index.contains_key(key)
     }
@@ -63,33 +84,95 @@ impl PersistentHashMap {
     /// Re-associating a key that is already present keeps its original
     /// insertion position; a brand-new key is appended at the end.
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        if let Some(seq) = self.index.get(&key) {
+        let keys_inert = self.keys_inert && crate::realization::is_inert(&key);
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
             let seq = *seq;
+            let n = self.count();
             Self {
                 index: self.index.clone(),
-                order: self.order.insert(seq, (key, value)),
+                order: self.order.insert(seq, (stored_key.clone(), value)),
                 next_seq: self.next_seq,
+                charge: self.charge.derive(n, n, rb_path_bytes::<OrderEntry>(n)),
+                keys_inert,
             }
         } else {
             let seq = self.next_seq;
+            let n = self.count();
             Self {
                 index: self.index.insert(key.clone(), seq),
                 order: self.order.insert(seq, (key, value)),
                 next_seq: seq + 1,
+                charge: self.charge.derive(n, n + 1, Self::path_bytes(n + 1)),
+                keys_inert,
             }
+        }
+    }
+
+    // Only used when neither hashing nor equality can realize user code.
+    pub(crate) fn assoc_mut(&mut self, key: Value, value: Value) {
+        self.keys_inert &= crate::realization::is_inert(&key);
+        if let Some((stored_key, seq)) = self.index.get_key_value(&key) {
+            self.order.insert_mut(*seq, (stored_key.clone(), value));
+        } else {
+            let seq = self.next_seq;
+            self.index.insert_mut(key.clone(), seq);
+            self.order.insert_mut(seq, (key, value));
+            self.next_seq += 1;
+        }
+        self.charge = ShareCharge::full();
+    }
+
+    pub(crate) fn dissoc_mut(&mut self, key: &Value) {
+        if let Some(seq) = self.index.get(key).copied() {
+            self.index.remove_mut(key);
+            self.order.remove_mut(&seq);
+            self.charge = ShareCharge::full();
         }
     }
 
     /// Return a new map with `key` removed.
     pub fn dissoc(&self, key: &Value) -> Self {
         match self.index.get(key) {
-            Some(seq) => Self {
-                index: self.index.remove(key),
-                order: self.order.remove(seq),
-                next_seq: self.next_seq,
-            },
-            None => self.clone(),
+            Some(seq) => {
+                let n = self.count();
+                Self {
+                    index: self.index.remove(key),
+                    order: self.order.remove(seq),
+                    next_seq: self.next_seq,
+                    charge: self.charge.derive(n, n - 1, Self::path_bytes(n)),
+                    keys_inert: self.keys_inert,
+                }
+            }
+            None => {
+                let n = self.count();
+                Self {
+                    index: self.index.clone(),
+                    order: self.order.clone(),
+                    next_seq: self.next_seq,
+                    charge: self.charge.derive(n, n, 0),
+                    keys_inert: self.keys_inert,
+                }
+            }
         }
+    }
+
+    /// Bytes path-copied in both trees by inserting or removing one entry.
+    fn path_bytes(n: usize) -> usize {
+        hamt_path_bytes::<(Value, u64)>(n) + rb_path_bytes::<OrderEntry>(n)
+    }
+
+    /// Estimated bytes owned by this map if it shared no nodes.
+    pub(crate) fn full_size_extra(&self) -> usize {
+        // Per entry: index HashTrieMap entry (~40) + order RedBlackTree node
+        // (~48) + values stored inline in the order tree (not behind GcPtr).
+        self.count() * (88 + 2 * std::mem::size_of::<Value>())
+    }
+
+    /// What `gc_size_extra` would report, without marking this version
+    /// allocated.
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charge.size_extra(self.full_size_extra())
     }
 
     /// Iterate over all `(key, value)` pairs in insertion order.
@@ -141,6 +224,10 @@ impl PartialEq for PersistentHashMap {
 }
 
 impl cljrs_gc::Trace for PersistentHashMap {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for (_, (k, v)) in self.order.iter() {
             k.trace(visitor);
@@ -149,10 +236,7 @@ impl cljrs_gc::Trace for PersistentHashMap {
     }
 
     fn gc_size_extra(&self) -> usize {
-        // Per entry: index HashTrieMap entry (~40) + order RedBlackTree node
-        // (~48) + values stored inline in the order tree (not behind GcPtr).
-        let n = self.index.size();
-        n * (88 + 2 * std::mem::size_of::<Value>())
+        self.charge.on_alloc(self.full_size_extra())
     }
 }
 
@@ -287,5 +371,20 @@ mod tests {
             .assoc(kw("c"), int(3))
             .dissoc(&kw("b"));
         assert_eq!(m.keys(), vec![kw("a"), kw("c")]);
+    }
+
+    #[test]
+    fn assoc_on_allocated_map_charges_path_bytes() {
+        let _alloc = crate::collections::share_charge::alloc_scope();
+        let m = GcPtr::new(PersistentHashMap::from_pairs(
+            (0..10_000).map(|i| (int(i), int(i))),
+        ));
+        let added = m.get().assoc(int(-1), int(0));
+        assert_eq!(added.charged(), PersistentHashMap::path_bytes(10_001));
+        let replaced = m.get().assoc(int(5), int(0));
+        assert_eq!(replaced.charged(), rb_path_bytes::<OrderEntry>(10_000));
+        let removed = m.get().dissoc(&int(5));
+        assert_eq!(removed.charged(), PersistentHashMap::path_bytes(10_000));
+        assert!(removed.charged() * 100 < m.get().full_size_extra());
     }
 }

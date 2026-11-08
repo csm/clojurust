@@ -8,7 +8,7 @@
 //! contaminating a healthy enclosing or subsequent scope.
 //!
 //! The same checkpoints also observe *interrupt flags*: an embedder (e.g. the
-//! nREPL server) installs an `Arc<AtomicBool>` with [`InterruptGuard`] for the
+//! nREPL server) installs an [`InterruptFlag`] with [`InterruptGuard`] for the
 //! extent of an evaluation, and another thread sets it to stop that
 //! evaluation. A set flag makes every subsequent charge fail exactly like an
 //! exhausted budget, so the evaluation unwinds through the same uncatchable
@@ -21,10 +21,51 @@
 //! is polled under the flags of the evaluation that spawned it
 //! ([`active_interrupts`], [`InterruptScope`]), so interrupting whichever
 //! evaluation is driving the executor leaves other evaluations' tasks alone.
+//!
+//! A fiber parked on a wait reaches no checkpoint, so it races its wait
+//! against [`interrupted`]. Each flag carries its own wake event: raising it
+//! with [`InterruptFlag::request`] wakes only the waits parked under that
+//! flag, which then unwind at the park point (issues #446, #456).
 
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use cljrs_value::parking::Event;
+
+/// A settable interrupt flag for one evaluation, with its own wake event so
+/// that raising it wakes only the fibers parked under it.
+#[derive(Debug, Default)]
+pub struct InterruptFlag {
+    set: AtomicBool,
+    raised: Event,
+}
+
+impl InterruptFlag {
+    pub fn new(set: bool) -> Self {
+        Self {
+            set: AtomicBool::new(set),
+            raised: Event::default(),
+        }
+    }
+
+    /// True once the flag has been raised.
+    pub fn is_set(&self) -> bool {
+        self.set.load(Ordering::SeqCst)
+    }
+
+    /// Raise the flag and wake every wait parked under it, so a parked
+    /// evaluation stops promptly instead of at its next checkpoint after the
+    /// wait ends.
+    pub fn request(&self) {
+        self.set.store(true, Ordering::SeqCst);
+        self.raised.notify_all();
+    }
+}
+
+/// An immutable snapshot of an interrupt-flag stack, cheap to clone for
+/// every park and every spawned task.
+pub type InterruptFlags = Arc<[Arc<InterruptFlag>]>;
 
 /// A shareable, monotonically-decreasing execution-credit budget.
 #[derive(Debug)]
@@ -57,8 +98,11 @@ impl GasMeter {
 thread_local! {
     static ACTIVE: RefCell<Vec<Arc<GasMeter>>> = const { RefCell::new(Vec::new()) };
     static EXHAUSTED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-    static INTERRUPTS: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
+    static INTERRUPTS: RefCell<InterruptFlags> = RefCell::new(InterruptFlags::default());
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_ACTIVE", refcell ACTIVE: Vec<Arc<GasMeter>>);
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_EXHAUSTED", refcell EXHAUSTED: Vec<bool>);
+cljrs_gc::mutator_slot!("cljrs-runtime/GAS_INTERRUPTS", refcell INTERRUPTS: InterruptFlags);
 
 /// Installs an interrupt flag for the dynamic extent of an evaluation on
 /// this thread. While installed, setting the flag (from any thread) makes the
@@ -68,8 +112,13 @@ thread_local! {
 pub struct InterruptGuard;
 
 impl InterruptGuard {
-    pub fn install(flag: Arc<AtomicBool>) -> Self {
-        INTERRUPTS.with(|flags| flags.borrow_mut().push(flag));
+    pub fn install(flag: Arc<InterruptFlag>) -> Self {
+        // Pushes rebuild the snapshot so parks can share it without copying;
+        // they happen once per evaluation, parks far more often.
+        INTERRUPTS.with(|flags| {
+            let mut flags = flags.borrow_mut();
+            *flags = flags.iter().cloned().chain([flag]).collect();
+        });
         Self
     }
 }
@@ -77,8 +126,51 @@ impl InterruptGuard {
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
         INTERRUPTS.with(|flags| {
-            flags.borrow_mut().pop();
+            let mut flags = flags.borrow_mut();
+            let len = flags.len().saturating_sub(1);
+            *flags = flags[..len].iter().cloned().collect();
         });
+    }
+}
+
+/// Raise `flag`; see [`InterruptFlag::request`].
+pub fn request_interrupt(flag: &InterruptFlag) {
+    flag.request();
+}
+
+/// Completes once any of `flags` is raised; never completes for an empty
+/// slice. Used by fiber parks to race the awaited event against an interrupt
+/// of the parked evaluation. Listens only on the given flags' own events.
+pub async fn interrupted(flags: &[Arc<InterruptFlag>]) {
+    match flags {
+        [] => std::future::pending().await,
+        [flag] => loop {
+            // Listen before checking, so a request between the two still wakes us.
+            let listener = flag.raised.listen();
+            if flag.is_set() {
+                return;
+            }
+            listener.await;
+        },
+        _ => loop {
+            let mut listeners: Vec<_> = flags.iter().map(|flag| flag.raised.listen()).collect();
+            if flags.iter().any(|flag| flag.is_set()) {
+                return;
+            }
+            std::future::poll_fn(|cx| {
+                // Poll every listener so each registers this waker.
+                let mut ready = false;
+                for listener in &mut listeners {
+                    ready |= std::future::Future::poll(std::pin::Pin::new(listener), cx).is_ready();
+                }
+                if ready {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        },
     }
 }
 
@@ -88,13 +180,14 @@ pub fn interrupt_requested() -> bool {
         flags
             .borrow()
             .iter()
-            .any(|flag| flag.load(Ordering::Relaxed))
+            .any(|flag| flag.set.load(Ordering::Relaxed))
     })
 }
 
-/// Clone the interrupt flags installed on this thread for async task
-/// propagation, as [`active_meters`] does for gas meters.
-pub fn active_interrupts() -> Vec<Arc<AtomicBool>> {
+/// Snapshot the interrupt flags installed on this thread for async task
+/// propagation, as [`active_meters`] does for gas meters. O(1): shares the
+/// installed stack rather than copying it.
+pub fn active_interrupts() -> InterruptFlags {
     INTERRUPTS.with(|flags| flags.borrow().clone())
 }
 
@@ -109,12 +202,12 @@ pub fn active_interrupts() -> Vec<Arc<AtomicBool>> {
 /// driver's, which are put back when the poll ends.
 #[must_use = "dropping InterruptScope immediately restores the previous interrupt flags"]
 pub struct InterruptScope {
-    outer: Vec<Arc<AtomicBool>>,
+    outer: InterruptFlags,
 }
 
 impl InterruptScope {
-    pub fn enter(flags: &[Arc<AtomicBool>]) -> Self {
-        let outer = INTERRUPTS.with(|installed| installed.replace(flags.to_vec()));
+    pub fn enter(flags: &InterruptFlags) -> Self {
+        let outer = INTERRUPTS.with(|installed| installed.replace(flags.clone()));
         Self { outer }
     }
 }
@@ -252,11 +345,11 @@ mod tests {
 
     #[test]
     fn interrupt_flag_fails_charges_until_uninstalled() {
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(InterruptFlag::new(false));
         {
             let _guard = InterruptGuard::install(flag.clone());
             assert!(charge(1));
-            flag.store(true, Ordering::Relaxed);
+            flag.request();
             assert!(!charge(1));
             assert!(is_exhausted());
             assert!(interrupt_requested());
@@ -268,18 +361,18 @@ mod tests {
 
     #[test]
     fn interrupt_scope_replaces_the_installed_flags_and_restores_them() {
-        let driver = Arc::new(AtomicBool::new(true));
+        let driver = Arc::new(InterruptFlag::new(true));
         let _guard = InterruptGuard::install(driver.clone());
         assert!(!charge(1));
         {
             // A task spawned by an evaluation nobody interrupted.
-            let _scope = InterruptScope::enter(&[]);
+            let _scope = InterruptScope::enter(&InterruptFlags::default());
             assert!(!interrupt_requested());
             assert!(charge(1));
         }
         {
             // A task spawned by the interrupted evaluation itself.
-            let _scope = InterruptScope::enter(&[driver]);
+            let _scope = InterruptScope::enter(&InterruptFlags::from([driver]));
             assert!(!charge(1));
         }
         assert!(interrupt_requested());
@@ -297,13 +390,14 @@ mod tests {
             nested in proptest::collection::vec(proptest::bool::ANY, 0..4),
         ) {
             use proptest::prop_assert_eq;
-            let flags = |set: &[bool]| -> Vec<Arc<AtomicBool>> {
-                set.iter().map(|b| Arc::new(AtomicBool::new(*b))).collect()
+            let flags = |set: &[bool]| -> InterruptFlags {
+                set.iter().map(|b| Arc::new(InterruptFlag::new(*b))).collect()
             };
             let any = |set: &[bool]| set.iter().any(|b| *b);
 
             let _guards: Vec<InterruptGuard> = flags(&installed)
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(InterruptGuard::install)
                 .collect();
             prop_assert_eq!(interrupt_requested(), any(&installed));

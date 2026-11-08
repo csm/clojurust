@@ -565,6 +565,12 @@ impl JitState {
         self.backend().and_then(|b| b.take_pending_exception())
     }
 
+    /// Take a native resource-limit error without converting it to a throw.
+    pub fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        self.backend()
+            .and_then(|backend| backend.take_pending_resource_error())
+    }
+
     /// Whether `arity_id` may be compiled with type specializations.
     pub fn specialization_allowed(&self, arity_id: u64) -> bool {
         !self.spec_banned.read().unwrap().contains(&arity_id)
@@ -766,11 +772,10 @@ impl Drop for JitState {
 //
 // Code unloading (Phase 10.2) frees a superseded `JITModule` only once no frame
 // is executing its code.  We track that precisely: each in-flight native call
-// pushes its code epoch onto a per-thread stack for the duration of the call.
+// pushes its code epoch onto a per-mutator stack for the duration of the call.
 //
-// This is per *thread*, not per runtime: one thread can have native frames from
-// several runtimes on its stack, and the question reclamation asks is "is any
-// thread executing this module?".
+// This is per computation, not per runtime: one fiber can have native frames
+// from several runtimes. Reclamation must also count parked fibers.
 //
 // At a stop-the-world safepoint every mutator thread is parked, so the reclaimer
 // can read all threads' stacks to compute the set of epochs that must not be
@@ -780,7 +785,7 @@ impl Drop for JitState {
 //     safepoint poll inside it).
 //   - At STW all other threads are frozen, so their stacks are stable.
 //
-// The per-thread stack lives behind a `Mutex` that is essentially uncontended
+// Each mutator stack lives behind a `Mutex` that is essentially uncontended
 // on the hot path (only the owning thread locks it, briefly); the reclaimer
 // contends for it only at the rare STW safepoint.
 
@@ -790,16 +795,26 @@ struct ThreadFrames {
 
 static FRAME_REGISTRY: RwLock<Vec<Weak<ThreadFrames>>> = RwLock::new(Vec::new());
 
-thread_local! {
-    static MY_FRAMES: Arc<ThreadFrames> = {
-        let frames = Arc::new(ThreadFrames { stack: Mutex::new(Vec::new()) });
-        let mut reg = FRAME_REGISTRY.write().unwrap();
-        // Opportunistically drop registrations for threads that have exited.
-        reg.retain(|w| w.strong_count() > 0);
-        reg.push(Arc::downgrade(&frames));
-        frames
-    };
+struct MutatorFrames(Arc<ThreadFrames>);
+
+impl Default for MutatorFrames {
+    fn default() -> Self {
+        let frames = Arc::new(ThreadFrames {
+            stack: Mutex::new(Vec::new()),
+        });
+        let mut registry = FRAME_REGISTRY.write().unwrap();
+        registry.retain(|w| w.strong_count() > 0);
+        registry.push(Arc::downgrade(&frames));
+        Self(frames)
+    }
 }
+
+thread_local! {
+    static MY_FRAMES: std::cell::RefCell<MutatorFrames> = std::cell::RefCell::new(MutatorFrames::default());
+}
+// Every saved state retains its registered stack, so live_epochs includes
+// suspended fibers on all isolates as well as currently executing frames.
+cljrs_gc::mutator_slot!("cljrs-runtime/MY_FRAMES", refcell MY_FRAMES: MutatorFrames);
 
 /// RAII guard that pops one active-frame epoch on drop (including on unwind,
 /// e.g. when native code throws back through the dispatch boundary).
@@ -810,7 +825,8 @@ pub struct JitFrameGuard {
 impl Drop for JitFrameGuard {
     fn drop(&mut self) {
         MY_FRAMES.with(|f| {
-            let mut stack = f.stack.lock().unwrap();
+            let frames = f.borrow();
+            let mut stack = frames.0.stack.lock().unwrap();
             // Pop the matching epoch.  Frames are strictly LIFO, so the epoch
             // is almost always the top; search defensively in case of nesting.
             if let Some(pos) = stack.iter().rposition(|&e| e == self.epoch) {
@@ -825,7 +841,7 @@ impl Drop for JitFrameGuard {
 /// Returns a guard that unregisters the frame on drop.  Must wrap the native
 /// call so code unloading never frees a module that is executing.
 pub fn push_jit_frame(epoch: u64) -> JitFrameGuard {
-    MY_FRAMES.with(|f| f.stack.lock().unwrap().push(epoch));
+    MY_FRAMES.with(|f| f.borrow().0.stack.lock().unwrap().push(epoch));
     JitFrameGuard { epoch }
 }
 
@@ -836,11 +852,11 @@ pub fn push_jit_frame(epoch: u64) -> JitFrameGuard {
 /// executing native code, so that module (this epoch) must be pinned against
 /// reclamation.
 pub fn current_jit_epoch() -> Option<u64> {
-    MY_FRAMES.with(|f| f.stack.lock().unwrap().last().copied())
+    MY_FRAMES.with(|f| f.borrow().0.stack.lock().unwrap().last().copied())
 }
 
 /// Collect the set of epochs with at least one active native frame across all
-/// mutator threads.
+/// mutator threads, including suspended fibers.
 ///
 /// **Must be called at a stop-the-world safepoint** (all other mutator threads
 /// parked), so each thread's frame stack is stable while it is read.  Used by
@@ -991,7 +1007,6 @@ mod tests {
         fn deopt_sentinel(&self) -> usize {
             0
         }
-        fn compile_async_arity(&self, _: &Value, _: usize, _: &mut crate::env::env::Env) {}
     }
 
     fn jit() -> Arc<Tiers> {

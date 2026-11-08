@@ -17,14 +17,23 @@ so they cannot be moved between threads. Running every async task on one thread
 via `LocalSet` keeps those pointers sound and keeps garbage collection simple —
 "stop the world" just means "finish the current poll, collect, resume."
 
-Two tiers coexist:
+On native targets every concurrent body runs on a **fiber**: a lightweight
+thread with its own stack, driven by the `LocalSet`. Blocking-looking calls —
+`<!`, `>!`, `await`, `deref`, `sleep`, file and socket I/O — park the fiber and
+let the others run. There is one evaluator, so any function can wait, however
+deeply it is nested inside other calls.
 
-| Tier | Runs on | Used by |
+| Construct | Returns | Body runs on |
 |---|---|---|
-| Async (single thread) | Tokio `LocalSet` | `^:async` fns, `go`, channels, `timeout`, `alts` |
-| Parallel (thread pool) | OS threads | `future`, `pmap`, `agent` (unchanged core primitives) |
+| `go` | a result channel | a new fiber |
+| `^:async` fn call | a future | a new fiber |
+| `future`, `future-call` | a future | a new fiber |
+| `thread`, `io-thread`, `thread-call` | a result channel | a new fiber |
+| CLI, REPL, nREPL, tests, AOT `main` | — | the root fiber |
 
-Both tiers produce `Value::Future`, so a caller can `await` or `deref` either.
+wasm32 has no stack switching. There, `go` and `^:async` bodies use a separate
+cooperative evaluator, and only `await` (or `<!`/`>!`, macros over `await`)
+directly in such a body can wait.
 
 To run Clojure work on more than one core, the single-threaded executor is
 instantiated multiple times as independent **isolates**; see the
@@ -32,9 +41,11 @@ instantiated multiple times as independent **isolates**; see the
 
 ## `^:async` functions and `await`
 
-A function tagged `^:async` runs its body as an async task. Calling it returns
-a `Future` *immediately*; the body runs cooperatively, yielding the executor at
-every `await`.
+Calling a function tagged `^:async` returns a `Future` *immediately*. The body
+runs concurrently on its own fiber, with the ordinary evaluator. The tag no
+longer selects a different evaluator on native targets; it only means "calls
+run concurrently and return a future". Code written for the older colored model
+keeps working unchanged.
 
 ```clojure
 (defn ^:async fetch [url]
@@ -45,30 +56,38 @@ every `await`.
 (await (fetch "https://example.com"))  ; yields until the body is ready
 ```
 
-`await` is a **special form**, not a function — it is syntactically detectable
-so the compiler can recognise yield points. Its behaviour depends on context:
+`await` is a **special form**. `(await x)` waits for a `Future` or `promise` and
+returns its value. On a channel (such as a `go` result) it takes one value,
+returning `nil` once the channel is closed and drained. Any other value is
+returned unchanged.
 
-- Inside an `^:async` body (driven by the async evaluator), `(await x)` yields
-  the executor thread until `x` — a `Future`, a `promise`, or a channel op —
-  resolves, then returns the resolved value.
-- Outside any async context, `(await x)` falls back to a **blocking** deref of
-  the value, so the form still works in synchronous code.
-
-`^:async` is *viral*: a function that uses `await` should itself be `^:async`.
+- On a native fiber — any `go` or `^:async` body, and any code it calls —
+  `(await x)` parks the fiber. It is the same as `(deref x)` for futures.
+- On wasm32, `(await x)` inside a `go` or `^:async` body yields the executor.
+- Outside a fiber, `(await x)` blocks the OS thread.
 
 ### `await` vs. `deref`
 
-`deref` / `@` always blocks the calling OS thread. Calling `deref` on a future
-**inside** an `^:async` body is a runtime error:
+In a native fiber, `deref` / `@` parks until the future or promise settles.
+CLI evaluation, REPL, nREPL, tests, and AOT programs start in root fibers.
+An ordinary function can wait through nested calls without async annotations.
 
 ```clojure
-(defn ^:async bad [f]
-  @f)            ; error: use (await ...) instead of deref inside an ^:async function
+(defn answer [] @(future (sleep 10) 42))
+@(future (answer))
+;; => 42
 ```
 
-This enforcement (via the interpreter's async-context flag) prevents the
-classic deadlock where a task blocks the only executor thread waiting on a
-future that can only be resolved by that same thread.
+`future` and `future-call` convey dynamic bindings into each child fiber.
+A child's binding changes stay private to that child. These fibers run
+concurrently on one isolate thread. Isolates provide parallel Clojure execution.
+`future-cancel` cancels the result without interrupting the body.
+
+`go` and `^:async` bodies are fibers too, so `deref` works in them exactly like
+`await`. A pending local future rejects carrier dereference outside a fiber.
+Synchronous embedders use `fiber::run_root` or `Isolate::spawn_root`.
+Manual futures with producers on other OS threads retain blocking dereference. On wasm32, callers retain the
+async waiting rules.
 
 ## Channels
 
@@ -91,8 +110,16 @@ model free of async concerns.
 
 ### Channel operations
 
-Operations that can block return a `Value::Future`, so they are used with
-`await` inside an async context:
+The core.async parking operations take and put directly. On native targets they
+park the calling fiber, in a `go` body or anywhere else:
+
+| Operation | Meaning |
+|---|---|
+| `(<! ch)` | take the next value (or `nil` once closed and drained) |
+| `(>! ch v)` | put `v`; returns `true`, or `false` if closed |
+| `(alts! [ch [ch v] ...])` | complete exactly one take or put; returns `[value ch]` |
+
+Future-returning variants compose with `await`, `alts`, and `join-all`:
 
 | Operation | Meaning |
 |---|---|
@@ -107,29 +134,35 @@ Non-blocking variants act synchronously and return immediately:
 | `(poll! ch)` | take a buffered value now, or `nil` if none is ready |
 | `(offer! ch v)` | put `v` now if there is buffer room → `true`/`false` |
 
-Blocking variants park the OS thread and are meant for the REPL, tests, and
-other synchronous contexts — **not** for use inside an `^:async` body or from
-the single-threaded executor thread (they deadlock there):
-
-| Operation | Meaning |
-|---|---|
-| `(<!! ch)` | blocking take |
-| `(>!! ch v)` | blocking put |
+The blocking spellings `<!!`, `>!!`, and `alts!!` are the same operations. On a
+native fiber they park; outside any fiber they block the OS thread. A take of a
+future or promise (such as an `^:async` call's result) waits for its value.
 
 ### `go` blocks
 
-`go` spawns its body as an anonymous async task and returns a `Future`:
+`go` runs its body on a new fiber and returns a result channel, as in core.async.
+A non-nil result is put on the channel, which then closes. A nil result, or an
+exception (which is printed), only closes it:
 
 ```clojure
 (def in  (chan 1))
 (def out (chan 1))
 
-(go (let [v (await (take! in))]
-      (await (put! out (* v 2)))))
+(go (let [v (<! in)]
+      (>! out (* v 2))))
 
-(await (put! in 21))
-(await (take! out))    ; => 42
+(>!! in 21)
+(<!! out)    ; => 42
+
+(<!! (go (+ 1 2)))     ; => 3
+(await (go :done))     ; => :done — await takes from a channel
 ```
+
+Because the result is a channel, it works with `alts!`, `merge`, and the other
+channel operations.
+
+The older spelling, `(await (take! in))` / `(await (put! out v))`, still works
+and is the portable form for code that must also run on wasm32.
 
 ## Selection: `timeout`, `alts`, `alt`
 
@@ -163,7 +196,7 @@ dispatches to the matching handler:
 |---|---|
 | `(join-all futs)` | await a seq of futures, returning a vector of results (like `Promise.all`) |
 | `(async-pmap f coll)` | spawn `f` over `coll` concurrently and await all results |
-| `(thread f)` / `(thread-call f)` | run `f` on a real OS thread (`spawn_blocking`); deliver its result over a channel |
+| `(thread body...)` / `(io-thread body...)` / `(thread-call f)` | run an ordinary body in a fiber and return a result channel |
 | `(onto-chan! ch coll)` | put every element of `coll` onto `ch`, then close it |
 | `(to-chan! coll)` | return a channel and seed it from `coll` in the background |
 | `(merge chs)` | fan several channels into one |
@@ -173,10 +206,11 @@ dispatches to the matching handler:
 
 ## Garbage collection
 
-Because the async tier is single-threaded, GC safepoints are cooperative: the
-runtime collects between poll cycles, and `await` invokes a safepoint before
-each yield. A background GC-service task (spawned by the crate's `init`)
-services collection requests, and explicit root guards keep spawned task
+Because every fiber shares the isolate thread, GC safepoints are cooperative:
+the collector runs on the active fiber at a safepoint and traces every
+suspended fiber's roots. A background GC-service task (spawned by the crate's `init`)
+sleeps until a collection is requested and then services it, so an idle
+executor stays idle, and explicit root guards keep spawned task
 futures and their captured environments reachable while they are in flight.
 
 ## Embedding from Rust
@@ -199,6 +233,12 @@ rt.block_on(local.run_until(async {
 }));
 ```
 
+Code that can park must run on a fiber. From synchronous Rust, drive it with
+`cljrs_async::fiber::run_root` (or `Isolate::spawn_root`). From async code
+already on the `LocalSet`, `cljrs_async::fiber::eval_form(&form, &mut env).await`
+evaluates one form on a new fiber and returns its result rooted in a `FiberResult`
+(`eval_form_unrooted` returns the bare value, for immediate use).
+
 The CLI links this crate when built with its default `async` feature; a minimal
 binary can be produced with `cargo build -p cljrs --no-default-features`.
 
@@ -206,3 +246,37 @@ binary can be produced with `cargo build -p cljrs --no-default-features`.
 > the GC-service spawn no-ops in that case and should be re-invoked from inside a
 > `LocalSet::run_until` block. `timeout` uses the browser's `setTimeout`
 > (via `gloo-timers`) on `wasm32` instead of `tokio::time::sleep`.
+
+A failed `thread` or `io-thread` body prints an error and closes its result channel.
+Each call uses one fiber. The `io-thread` macro delegates to `thread`.
+
+
+## Fairness and diagnostics on native targets
+
+CPU loops cooperate with other fibers at function and loop safepoints.
+`CLJRS_FIBER_SLICE_US` sets the time slice in microseconds (default 10000).
+The driver yields whenever a slice expires, so other fibers and async tasks run.
+Native functions must return to a safepoint or use parking operations to let
+other fibers run.
+
+If native code blocks a carrier while another fiber is ready, the watchdog
+prints the fiber ID and native function name. `CLJRS_FIBER_STALL_MS` sets the
+warning threshold in milliseconds (default 100). Each stall produces one warning.
+Only waiting fibers are detected; a stall that delays only other async tasks is silent.
+
+`--gc-stats` includes live and peak fiber counts, pooled stacks, and reserved
+stack bytes. The memory governor charges active and pooled reservations,
+including guard pages, as `fiber-stack`. These are virtual reservations, not
+resident memory measurements. Strict memory budgets must include the root's
+64 MiB stack and each child's stack (`CLJRS_FIBER_STACK_KB`, default 16384 in release
+builds and 32768 in debug builds, minimum 512).
+
+A recursion error reports the fiber ID and remaining stack space. Safepoints
+keep a 256 KiB margin for interpreter frames and error construction. In a
+release build the default 16 MiB stack allows about 5,000 levels of non-tail
+recursion inside a `go`, `future`, `thread` or `^:async` body (about 2,500 when
+everything runs in the tree-walker, which uses roughly 6 KB of stack per call
+level); the 64 MiB root allows roughly four times as many.
+Raise `CLJRS_FIBER_STACK_KB` for deeper recursion; reserved pages are committed
+lazily, so a larger reservation costs address space rather than memory. Native
+recursion that bypasses safepoints can still hit the fatal guard page.

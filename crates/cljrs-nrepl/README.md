@@ -18,11 +18,30 @@ Supported ops: `clone`, `close`, `describe`, `eval`, `interrupt`, `load-file`, `
 
 `eval` and `load-file` stream `out` messages while a form runs: printed text is sent at each newline, whenever 1 KiB is pending without one, and when the form ends. This holds for `serve`, `serve_with` and `Poller` alike, since all three run the same engine.
 
+### Hosts that own their loop: `Poller`
+
+`Server::into_poller()` returns a `Poller` for an interpreter thread that also runs its own loop. It has two modes, which can be mixed:
+
+- `poll(&mut eval_form)` / `poll_timeout(&mut eval_form, timeout)` run every queued job to completion before returning. An eval that waits holds the host for the whole wait, even when the wait only parks a fiber.
+- `spawn_pending(&local, eval_form)` starts every queued job on a fiber on the host's `LocalSet` and returns at once; nothing runs until the host drives `local` (typically `cljrs_async::fiber::drive_until(rt, &local, &mut carrier, deadline)` once per frame). Replies are sent from the fibers as they run, so an eval parked on `Thread/sleep`, a channel take, an HTTP fetch or `@(future ...)` costs the host nothing. `eval_form` runs inside the fiber, so pass `cljrs_runtime::tiered::eval` (or a wrapper), never an evaluator that calls `run_root`. Each job gets a default-size fiber stack (`CLJRS_FIBER_STACK_KB`), not a 64 MiB root stack.
+
+Jobs for one session run one at a time, in arrival order, in both modes; spawned jobs for different sessions interleave at parks. While a session has spawned jobs in flight, `poll` queues that session's new jobs behind them. Requests with no session share the `"default"` session's order.
+
+### Admission and resource limits
+
+`Config::limits` (`Limits`, all defaults generous) bounds the work and buffering one server accepts:
+
+- **Accepted jobs.** Every job counts from admission until it finishes (its final `done` reply) or is dropped: queued on the job channel, waiting behind its session, running, or parked on a fiber after `spawn_pending`. The network thread refuses a request that would exceed `max_pending_jobs` (default 1024) or, for its session, `max_session_jobs` (default 256), replying at once with `err` and status `["error" "overloaded" "done"]` instead of queueing it. The job channel, the session lanes and the set of spawned evaluations are therefore all bounded. `Poller::pending_jobs()` reports the current count.
+- **Interrupts under overload.** `describe` and `interrupt` are answered on the network thread before admission, so a saturated server still interrupts queued, running, and parked evals; interrupting frees the slot.
+- **Request size.** `max_request_bytes` (default 64 MiB) bounds one request frame. A connection whose buffered input reaches it without completing a frame, or that sends a larger frame, is closed.
+- **Output.** `max_output_bytes` (default 64 MiB) bounds the reply bytes queued for one connection but not yet written. A client that stops reading is disconnected when a reply would exceed it (a single reply larger than the limit still goes out when nothing else is queued). The eval keeps running; its later replies are dropped.
+- **Per-call budgets.** `Poller::poll_budget`, `poll_timeout_budget` and `spawn_pending_budget` take at most `budget` jobs per call and return a `PollBatch { status, jobs, budget_exhausted }`; `budget_exhausted` means the call stopped at its budget and more jobs may be waiting. The unbudgeted calls take everything queued.
+
 Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, bound via the dynamic-binding stack around each request. Retained values are interned in the hidden `cljrs.nrepl.session-state` namespace so the GC traces them between evals.
 
 ### Limitations
 
-- **Interrupt is cooperative.** While an `eval`/`load-file` runs, its cancel flag is installed on the runtime's execution-credit (gas) meter (`cljrs_runtime::env::gas::InterruptGuard`). An `interrupt` sets the flag from the network thread, and the running code stops at its next checkpoint: every tree-walker eval step, every IR basic block, and the JIT's credit checks. So a `(loop [] (recur))`, a non-terminating function, or a deep non-tail recursion is stopped mid-form, a `try`/`catch` cannot swallow it, and the session keeps working afterwards. This applies equally to `serve`, `serve_with` and the `Poller` (the eval runs inside `poll`, and the network thread interrupts it there). The eval answers `status ["interrupted"]` and then `["done"]`. The `interrupt` request answers `["done"]`, `["session-idle","done"]` when nothing is in flight in that session, or `["interrupt-id-mismatch","done"]` when `interrupt-id` names no in-flight request. A queued request that is interrupted is dropped without being evaluated.
+- **Interrupt is cooperative.** While an `eval`/`load-file` runs, its cancel flag is installed on the runtime's execution-credit (gas) meter (`cljrs_runtime::env::gas::InterruptGuard`). An `interrupt` raises the flag (a `gas::InterruptFlag`) from the network thread with `gas::request_interrupt`, and the running code stops at its next checkpoint: every tree-walker eval step, every IR basic block, and the JIT's credit checks. An eval parked on a fiber wait (`(deref (promise))`, `Thread/sleep`, `<!!`, `@(future ...)`, `blocking`) is woken and stops at the park point. So a `(loop [] (recur))`, a non-terminating function, or a deep non-tail recursion is stopped mid-form, a `try`/`catch` cannot swallow it, and the session keeps working afterwards. This applies equally to `serve`, `serve_with` and the `Poller` (the eval runs inside `poll`, or on its fiber after `spawn_pending`, and the network thread interrupts it there). The eval answers `status ["interrupted"]` and then `["done"]`. The `interrupt` request answers `["done"]`, `["session-idle","done"]` when nothing is in flight in that session, or `["interrupt-id-mismatch","done"]` when `interrupt-id` names no in-flight request. A queued request that is interrupted is dropped without being evaluated.
   **Not interruptible:** time spent inside a single native call that does not return to evaluated code: blocking I/O (socket/file/stdin reads), sleeping, waiting on a lock, promise or future, and long-running Rust builtins (for example sorting or hashing a huge collection in one call). The interrupt takes effect when the call returns and evaluation reaches its next checkpoint. The flag is thread-local to the evaluating thread, so work the eval hands to other threads (`future`, agents, or tasks a `serve_with` evaluator runs on a different thread) keeps running; only the eval itself is stopped. Async tasks on the eval's own thread are scoped the same way: a task stops only when the eval that spawned it is interrupted, not when it happens to be polled while a different, interrupted eval drives the executor. Work already done is not rolled back: side effects and `def`s made before the interrupt remain.
 - **No `err` stream for user output.** cljrs has no stderr writer for user code (`*err*` is unbound and every print goes to `*out*`), so only `out` is streamed; `err` carries evaluation errors only. Text printed inside `with-out-str` is captured by it and not streamed.
 - **`macroexpand`:** `print-meta` is ignored.
@@ -33,21 +52,34 @@ Each session has its own `Env` (namespace) and its own `*1`/`*2`/`*3`/`*e`, boun
 
 | File | Purpose |
 |---|---|
-| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, the `Job` bridge type |
+| `src/lib.rs` | Public API: `Config`, `start`, `Server`, `ShutdownHandle`, `Poller` (with the per-session lanes behind `spawn_pending` and the budgeted polls), `PollStatus`, `PollBatch`, the `Job` bridge type |
+| `src/limits.rs` | `Limits`; job admission counter and tickets; byte-bounded per-connection reply channel; per-job reply handle that releases the admission slot at `done` |
 | `src/bencode.rs` | Hand-rolled bencode codec (the nREPL subset) with incremental decoding for TCP framing |
 | `src/protocol.rs` | `Request` decoding and the `Response` builder |
-| `src/server.rs` | Network thread: accept loop, per-connection reader/writer tasks, `describe`/`interrupt`, in-flight registry |
+| `src/server.rs` | Network thread: accept loop, per-connection reader/writer tasks (request size and output limits), `describe`/`interrupt`, job admission, in-flight registry |
 | `src/engine.rs` | Interpreter thread: session registry, eval with streamed output and `*1`/`*2`/`*3`/`*e`, completions, lookup, macroexpand, analyze-last-stacktrace |
 | `tests/nrepl_server.rs` | End-to-end test: full stdlib env + scripted bencode client over TCP |
+| `tests/limits.rs` | Overload refusal with interrupts still answered, budgeted polls, parked spawned evals holding session slots, oversized request frames, unread output |
 
 ## Public API
 
-- `struct Config { addr: SocketAddr, port_file: Option<PathBuf> }` — bind address (port 0 = OS-assigned) and optional `.nrepl-port` file; `Default` binds `127.0.0.1:0`.
+- `struct Config { addr: SocketAddr, port_file: Option<PathBuf>, limits: Limits }` — bind address (port 0 = OS-assigned), optional `.nrepl-port` file, and resource limits; `Default` binds `127.0.0.1:0` with `Limits::default()`.
+- `struct Limits { max_pending_jobs: usize, max_session_jobs: usize, max_request_bytes: usize, max_output_bytes: usize }` — see *Admission and resource limits*; `Default`: 1024 jobs, 256 per session, 64 MiB per request frame, 64 MiB queued output per connection.
 - `fn start(config: Config, globals: Arc<GlobalEnv>) -> miette::Result<Server>` — binds the listener, writes the port file, spawns the network thread. Must be called on the thread that owns `globals`.
 - `Server::port(&self) -> u16`
 - `Server::serve(self) -> miette::Result<()>` — blocks the calling (interpreter) thread processing requests until shutdown; evaluates with `cljrs_runtime::tiered::eval`.
 - `Server::serve_with(self, eval_form: impl EvalForm) -> miette::Result<()>` — like `serve`, but each top-level form goes through the supplied evaluator (the CLI passes its async `LocalSet` driver).
 - `Server::shutdown_handle(&self) -> ShutdownHandle` — `Send + Clone`; `shutdown()` stops the network thread and ends `serve`.
+- `Server::limits(&self) -> Limits`
+- `Server::into_poller(self) -> Poller` — non-blocking driver for a host with its own loop (see above). Dropping it shuts the server down.
+- `Poller::port`, `Poller::shutdown_handle`, `Poller::limits`
+- `Poller::pending_jobs(&self) -> usize` — admitted, unfinished jobs (queued, waiting, running, or parked).
+- `Poller::poll(&mut self, eval_form: &mut impl EvalForm) -> PollStatus` — handle every queued job now.
+- `Poller::poll_timeout(&mut self, eval_form: &mut impl EvalForm, timeout: Duration) -> PollStatus` — wait up to `timeout` for a job, then handle everything queued.
+- `Poller::spawn_pending<F: EvalForm + Clone + 'static>(&mut self, local: &LocalSet, eval_form: F) -> PollStatus` — start every queued job on a fiber on `local` and return; per-session order is kept.
+- `Poller::poll_budget(&mut self, eval_form: &mut impl EvalForm, budget: usize) -> PollBatch`, `Poller::poll_timeout_budget(&mut self, eval_form, timeout, budget) -> PollBatch`, `Poller::spawn_pending_budget(&mut self, local: &LocalSet, eval_form: F, budget: usize) -> PollBatch` — as above, taking at most `budget` jobs.
+- `enum PollStatus { Open, Closed }` — `Closed` once the server has shut down.
+- `struct PollBatch { status: PollStatus, jobs: usize, budget_exhausted: bool }` — result of a budgeted call.
 - `trait EvalForm: FnMut(&Form, &mut Env) -> Result<Value, EvalError>` — evaluator signature for `serve_with`.
 - `mod bencode` — `Bencode`, `encode`, `encode_to_vec`, `decode` (public for tests/clients).
 - `mod protocol` — `Request`, `Response`.
@@ -81,3 +113,8 @@ edge to a package, so one edge left at its defaults re-enables `regex-full` for
 the whole graph. `deps` has to be off as well for the size win to land, since
 `cljrs-project/vcs` pulls `regex` in through `pgp`. See
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+
+The `no-gc` feature forwards GC-less allocation to runtime, value, and allocator dependencies.
+Each request owns a temporary read scope. Sessions retain independent leases for `*1`, `*2`, `*3`, and `*e`.
+Closing a session releases these leases and clears its internal retained-value roots.

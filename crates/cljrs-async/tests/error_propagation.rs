@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -114,7 +114,9 @@ fn async_take_returns_value() {
         eval_sync(REQ, &mut env);
         eval_sync("(def out (chan 1))", &mut env);
         eval_sync("(offer! out 21)", &mut env);
-        let r = eval_async(&parse_one("(<? out)"), &mut env).await.unwrap();
+        let r = eval_form_unrooted(&parse_one("(<? out)"), &mut env)
+            .await
+            .unwrap();
         assert_eq!(r, Value::Long(21));
     });
 }
@@ -127,14 +129,14 @@ fn go_try_delivers_result_then_propagates_via_take() {
         eval_sync(REQ, &mut env);
         // Success: go-try's result channel yields the body value; <? returns it.
         eval_sync("(defn ^:async ok-run [] (<? (go-try 42)))", &mut env);
-        let r = eval_async(&parse_one("(await (ok-run))"), &mut env)
+        let r = eval_form_unrooted(&parse_one("(await (ok-run))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Long(42));
 
         // A nil body just closes the channel; <? sees nil (not an error).
         eval_sync("(defn ^:async nil-run [] (<? (go-try nil)))", &mut env);
-        let r = eval_async(&parse_one("(await (nil-run))"), &mut env)
+        let r = eval_form_unrooted(&parse_one("(await (nil-run))"), &mut env)
             .await
             .unwrap();
         assert_eq!(r, Value::Nil);
@@ -153,7 +155,7 @@ fn go_try_catches_throw_and_propagates_as_error() {
             "(defn ^:async err-run [] (<? (go-try (throw (ex-info \"boom\" {})))))",
             &mut env,
         );
-        let r = eval_async(&parse_one("(await (err-run))"), &mut env).await;
+        let r = eval_form_unrooted(&parse_one("(await (err-run))"), &mut env).await;
         assert!(r.is_err(), "expected an error, got {r:?}");
         let msg = format!("{:?}", r.unwrap_err());
         assert!(
@@ -182,7 +184,7 @@ fn awaited_throw_preserves_ex_data() {
             "(defn ^:async boom [] (throw (ex-info \"nope\" {:code 42})))",
             &mut env,
         );
-        let err = eval_async(&parse_one("(await (boom))"), &mut env)
+        let err = eval_form_unrooted(&parse_one("(await (boom))"), &mut env)
             .await
             .expect_err("awaiting a throwing async fn should error");
 

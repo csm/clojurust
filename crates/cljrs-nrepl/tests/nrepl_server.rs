@@ -600,3 +600,220 @@ fn poller_interrupts_running_eval() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// A host that owns its loop (a UI frame, say) and gives the isolate a short
+/// slice per turn: `spawn_pending` starts each job on a fiber and returns,
+/// and `drive_until` runs the fibers for the slice.
+struct SpawningHost {
+    poller: cljrs_nrepl::Poller,
+    rt: tokio::runtime::Runtime,
+    local: Option<tokio::task::LocalSet>,
+    carrier: cljrs_gc::mutator::MutatorState,
+    /// Longest single turn: spawn plus one slice.
+    longest_turn: Duration,
+}
+
+impl SpawningHost {
+    fn start() -> (SpawningHost, u16) {
+        let globals = {
+            let runtime = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
+                .build()
+                .expect("runtime");
+            cljrs_stdlib::install(&runtime);
+            runtime.into_globals()
+        };
+        let server = cljrs_nrepl::start(cljrs_nrepl::Config::default(), globals).expect("start");
+        let port = server.port();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let host = SpawningHost {
+            poller: server.into_poller(),
+            rt,
+            local: Some(tokio::task::LocalSet::new()),
+            carrier: cljrs_gc::mutator::MutatorState::fresh(),
+            longest_turn: Duration::ZERO,
+        };
+        (host, port)
+    }
+
+    /// Run turns until `done` fires.
+    fn run_until(&mut self, done: &std::sync::mpsc::Receiver<()>) {
+        let local = self.local.as_ref().unwrap();
+        while done.try_recv().is_err() {
+            let started = std::time::Instant::now();
+            let status = self
+                .poller
+                .spawn_pending(local, cljrs_runtime::tiered::eval);
+            assert_eq!(status, cljrs_nrepl::PollStatus::Open);
+            cljrs_async::fiber::drive_until(
+                &self.rt,
+                local,
+                &mut self.carrier,
+                started + Duration::from_millis(5),
+            );
+            self.longest_turn = self.longest_turn.max(started.elapsed());
+        }
+    }
+}
+
+impl Drop for SpawningHost {
+    fn drop(&mut self) {
+        let local = self.local.take().unwrap();
+        cljrs_async::fiber::drop_local_with_carrier(local, &mut self.carrier);
+    }
+}
+
+fn spawn_client<T: Send + 'static>(
+    port: u16,
+    body: impl FnOnce(&mut Client) -> T + Send + 'static,
+) -> (
+    std::thread::JoinHandle<std::thread::Result<T>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            body(&mut Client::connect(port))
+        }));
+        let _ = done_tx.send(());
+        result
+    });
+    (client, done_rx)
+}
+
+fn join_client<T>(client: std::thread::JoinHandle<std::thread::Result<T>>) -> T {
+    match client.join().expect("client thread") {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Issue #447: an eval parked on a wait no longer holds the host. While one
+/// session sleeps, the host keeps taking short turns and another session's
+/// eval completes; the sleeping session's next request waits its turn.
+#[test]
+fn spawned_jobs_park_without_holding_the_host() {
+    let (mut host, port) = SpawningHost::start();
+    let (client, done) = spawn_client(port, |c| {
+        let clone = |c: &mut Client| {
+            let resp = c.request(&[("op", "clone")]);
+            field(&resp, "new-session").unwrap().to_string()
+        };
+        let (a, b) = (clone(c), clone(c));
+        let slow = c.send(&[
+            ("op", "eval"),
+            ("session", &a),
+            (
+                "code",
+                "(do (println \"before\") (Thread/sleep 500) :slept)",
+            ),
+        ]);
+        // Queued behind the sleep in the same session.
+        let after = c.send(&[("op", "eval"), ("session", &a), ("code", "*1")]);
+        // Another session runs while `a` is parked.
+        let started = std::time::Instant::now();
+        let resp = eval(c, &b, "(+ 1 2)");
+        assert_eq!(field(&resp, "value"), Some("3"));
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "session b waited {:?} behind a parked eval",
+            started.elapsed()
+        );
+        let resp = c.collect(&slow);
+        assert_eq!(field(&resp, "out"), Some("before\n"));
+        assert_eq!(field(&resp, "value"), Some(":slept"));
+        // `*1` is read after the sleep finished, so it sees its value.
+        let resp = c.collect(&after);
+        assert_eq!(field(&resp, "value"), Some(":slept"));
+        // Tooling ops still answer on the spawned path.
+        let resp = c.request(&[("op", "ls-sessions")]);
+        assert_eq!(statuses(&resp[0]), ["done"]);
+    });
+    host.run_until(&done);
+    join_client(client);
+    assert!(
+        host.longest_turn < Duration::from_millis(250),
+        "a host turn took {:?}",
+        host.longest_turn
+    );
+}
+
+/// Interrupts reach spawned evals: one parked on a long wait, and one
+/// running a non-terminating loop.
+#[test]
+fn spawned_jobs_can_be_interrupted() {
+    let (mut host, port) = SpawningHost::start();
+    let (client, done) = spawn_client(port, |c| {
+        let resp = c.request(&[("op", "clone")]);
+        let session = field(&resp, "new-session").unwrap().to_string();
+        let parked = c.send(&[
+            ("op", "eval"),
+            ("session", &session),
+            ("code", "(Thread/sleep 60000)"),
+        ]);
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let interrupt = c.send(&[
+            ("op", "interrupt"),
+            ("session", &session),
+            ("interrupt-id", &parked),
+        ]);
+        let resp = c.collect(&parked);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let all: Vec<Vec<String>> = resp.iter().map(statuses).collect();
+        assert!(all.contains(&vec!["interrupted".to_string()]), "{all:?}");
+        assert_eq!(statuses(&c.collect(&interrupt)[0]), ["done"]);
+        interrupt_running_eval(c, &session);
+    });
+    host.run_until(&done);
+    join_client(client);
+}
+
+/// Once a client has seen an eval's `done`, the session is idle: an
+/// `interrupt` sent immediately after must answer `session-idle`. The server
+/// used to send `done` before removing the request from its pending table,
+/// so a fast client could still see the finished eval as running.
+#[test]
+fn interrupt_right_after_done_finds_the_session_idle() {
+    let globals = {
+        let runtime = cljrs_runtime::Runtime::builder()
+            .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+            .build()
+            .expect("runtime");
+        cljrs_stdlib::install(&runtime);
+        runtime.into_globals()
+    };
+    let server = cljrs_nrepl::start(cljrs_nrepl::Config::default(), globals).expect("start");
+    let port = server.port();
+    let shutdown = server.shutdown_handle();
+
+    let client_thread = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(|| {
+            let mut c = Client::connect(port);
+            let resp = c.request(&[("op", "clone")]);
+            let session = field(&resp, "new-session")
+                .expect("new-session")
+                .to_string();
+            for i in 0..200 {
+                let resp = eval(&mut c, &session, "(+ 1 2)");
+                assert_eq!(field(&resp, "value"), Some("3"));
+                let resp = c.request(&[("op", "interrupt"), ("session", &session)]);
+                assert_eq!(
+                    statuses(&resp[0]),
+                    ["session-idle", "done"],
+                    "iteration {i}"
+                );
+            }
+        });
+        shutdown.shutdown();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+
+    server.serve().expect("serve");
+    client_thread.join().expect("client scenario failed");
+}

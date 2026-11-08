@@ -1,8 +1,8 @@
 #[cfg(not(feature = "no-gc"))]
 use crate::env::dynamics;
 use crate::env::env::Env;
-#[cfg(not(feature = "no-gc"))]
 use crate::env::env::GlobalEnv;
+use crate::env::error::{EvalError, EvalResult};
 use std::cell::RefCell;
 
 // ── Stop-the-world reclaim hooks (JIT code unloading, cold-IR sweep) ────────
@@ -62,6 +62,45 @@ thread_local! {
     static OPTION_VALUE_ROOTS: RefCell<Vec<(*const Option<cljrs_value::Value>, usize)>> =
         const { RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/ENV_ROOTS", refcell ENV_ROOTS: Vec<*const Env>, trace trace_saved_envs);
+cljrs_gc::mutator_slot!("cljrs-runtime/VALUE_ROOTS", refcell VALUE_ROOTS: Vec<(*const cljrs_value::Value, usize)>, trace trace_saved_values);
+cljrs_gc::mutator_slot!(
+    "cljrs-runtime/OPTION_VALUE_ROOTS",
+    refcell OPTION_VALUE_ROOTS: Vec<(*const Option<cljrs_value::Value>, usize)>, trace trace_saved_options
+);
+
+// SAFETY: detached states are traced only while the owning fiber's stack
+// remains allocated. Root guards are removed during unwind before stack reuse.
+fn trace_saved_envs(roots: &Vec<*const Env>, visitor: &mut cljrs_gc::MarkVisitor) {
+    for &env in roots {
+        trace_env_roots(unsafe { &*env }, visitor);
+    }
+}
+fn trace_saved_values(
+    roots: &Vec<(*const cljrs_value::Value, usize)>,
+    visitor: &mut cljrs_gc::MarkVisitor,
+) {
+    use cljrs_gc::Trace;
+    for &(ptr, len) in roots {
+        for value in unsafe { std::slice::from_raw_parts(ptr, len) } {
+            value.trace(visitor);
+        }
+    }
+}
+fn trace_saved_options(
+    roots: &Vec<(*const Option<cljrs_value::Value>, usize)>,
+    visitor: &mut cljrs_gc::MarkVisitor,
+) {
+    use cljrs_gc::Trace;
+    for &(ptr, len) in roots {
+        for value in unsafe { std::slice::from_raw_parts(ptr, len) }
+            .iter()
+            .flatten()
+        {
+            value.trace(visitor);
+        }
+    }
+}
 
 /// RAII guard that pops the Env pointer on drop.
 pub struct EnvRootGuard;
@@ -74,16 +113,23 @@ impl Drop for EnvRootGuard {
     }
 }
 
-/// RAII guard that pops one entry from the value shadow stack on drop.
+/// RAII guard that removes its own entry from the value shadow stack on drop.
+///
+/// The entry is removed by identity rather than popped: async tasks on one
+/// `LocalSet` share this thread's stack and can hold guards across `await`s,
+/// so guards need not drop in LIFO order.
 pub struct ValueRootGuard {
-    pushed: bool,
+    entry: Option<(*const cljrs_value::Value, usize)>,
 }
 
 impl Drop for ValueRootGuard {
     fn drop(&mut self) {
-        if self.pushed {
+        if let Some(entry) = self.entry {
             VALUE_ROOTS.with(|roots| {
-                roots.borrow_mut().pop();
+                let mut roots = roots.borrow_mut();
+                if let Some(i) = roots.iter().rposition(|e| *e == entry) {
+                    roots.remove(i);
+                }
             });
         }
     }
@@ -100,23 +146,19 @@ pub fn push_env_root(env: &Env) -> EnvRootGuard {
 
 /// Register a single Value as a GC root.
 pub fn root_value(val: &cljrs_value::Value) -> ValueRootGuard {
-    VALUE_ROOTS.with(|roots| {
-        roots
-            .borrow_mut()
-            .push((val as *const cljrs_value::Value, 1));
-    });
-    ValueRootGuard { pushed: true }
+    let entry = (val as *const cljrs_value::Value, 1);
+    VALUE_ROOTS.with(|roots| roots.borrow_mut().push(entry));
+    ValueRootGuard { entry: Some(entry) }
 }
 
 /// Register a slice of Values as GC roots (e.g., a Vec<Value>).
 pub fn root_values(vals: &[cljrs_value::Value]) -> ValueRootGuard {
     if vals.is_empty() {
-        return ValueRootGuard { pushed: false };
+        return ValueRootGuard { entry: None };
     }
-    VALUE_ROOTS.with(|roots| {
-        roots.borrow_mut().push((vals.as_ptr(), vals.len()));
-    });
-    ValueRootGuard { pushed: true }
+    let entry = (vals.as_ptr(), vals.len());
+    VALUE_ROOTS.with(|roots| roots.borrow_mut().push(entry));
+    ValueRootGuard { entry: Some(entry) }
 }
 
 /// RAII guard that pops one entry from the option-value shadow stack on drop.
@@ -174,6 +216,8 @@ pub fn force_collect(env: &Env) {
         trace_value_roots(visitor);
         trace_option_value_roots(visitor);
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         crate::env::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });
@@ -183,14 +227,54 @@ pub fn force_collect(env: &Env) {
 
 /// Interpreter-level GC safepoint.
 ///
-/// Under `no-gc` this is a no-op. Under GC mode it either parks (if collection
-/// is in progress) or initiates a collection (if memory pressure was signalled).
-#[cfg(feature = "no-gc")]
-pub fn gc_safepoint(_env: &Env) {}
+/// Under GC mode it either parks (if collection is in progress) or initiates
+/// a collection (if memory pressure was signalled).  Then, in both modes, it
+/// resolves a pending memory fault: an allocation that strict admission
+/// refused but that could not fail (`GcPtr::new`).  The fault is dropped if
+/// committed memory is back within the hard limit and returned as
+/// [`EvalError::MemoryLimitExceeded`] otherwise.  Under `no-gc` there is no
+/// collection; region scopes release their memory as they exit.
+pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    fiber_safepoint(env)?;
+    #[cfg(not(feature = "no-gc"))]
+    collect_if_needed(env);
+    check_memory_fault()
+}
+
+fn fiber_safepoint(env: &Env) -> EvalResult<()> {
+    cljrs_gc::fiber::safepoint_with(|yield_now| {
+        let _env_root = push_env_root(env);
+        yield_now()
+    })
+    .map_err(|error| match error {
+        cljrs_gc::fiber::SafepointError::StackOverflow(message) => EvalError::Runtime(message),
+        cljrs_gc::fiber::SafepointError::Cancelled => EvalError::Cancelled,
+    })
+}
 
 #[cfg(not(feature = "no-gc"))]
-pub fn gc_safepoint(env: &Env) {
-    // Fast path: no GC activity at all.
+fn collect_if_needed(env: &Env) {
+    // Fast path: no GC activity and no pending fault.
+    if !cljrs_gc::governor::runtime_fault_possible()
+        && !cljrs_gc::gc_requested()
+        && !cljrs_gc::CONFIG_CANCELLATION.in_progress()
+    {
+        return;
+    }
+    collect_at_safepoint(env);
+}
+
+/// Turn the thread's pending memory fault, if it survives
+/// [`cljrs_gc::resolve_runtime_fault`], into an evaluation error.
+pub fn check_memory_fault() -> EvalResult<()> {
+    match cljrs_gc::resolve_runtime_fault() {
+        Some(fault) => Err(EvalError::MemoryLimitExceeded(fault)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "no-gc"))]
+fn collect_at_safepoint(env: &Env) {
     if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
         return;
     }
@@ -230,6 +314,8 @@ pub fn gc_safepoint(env: &Env) {
         trace_option_value_roots(visitor);
         // Trace dynamic variable bindings on this thread
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         // Trace the global tap system (functions and queued values)
         crate::env::taps::trace_roots(visitor);
         // Trace in-flight allocations from this thread's alloc root frames
@@ -243,7 +329,6 @@ pub fn gc_safepoint(env: &Env) {
 // ── GC-only root tracing helpers ─────────────────────────────────────────────
 
 /// Trace all GcPtr values reachable from an Env's local frames.
-#[cfg(not(feature = "no-gc"))]
 fn trace_env_roots(env: &Env, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::Trace;
     // Trace local frame bindings
@@ -311,8 +396,7 @@ fn trace_thread_env_roots(visitor: &mut cljrs_gc::MarkVisitor) {
 }
 
 /// Trace all namespaces and their contents.
-#[cfg(not(feature = "no-gc"))]
-fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
+pub(crate) fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
     use cljrs_gc::{GcVisitor as _, Trace};
     let namespaces = globals.namespaces.read().unwrap();
     for ns_ptr in namespaces.values() {
@@ -338,6 +422,24 @@ fn trace_globals(globals: &GlobalEnv, visitor: &mut cljrs_gc::MarkVisitor) {
 #[cfg(feature = "no-gc")]
 pub fn async_gc_collect() {}
 
+/// Whether [`async_gc_collect`] has work: a collection is requested or a
+/// configuration cancellation is in progress.  Also services a pending
+/// governor credit recall, as the safepoint check does.
+///
+/// The async GC service suspends while this is `false`; it registers its
+/// waker with the isolate's control first (see
+/// `cljrs_gc::IsolateControl::register_service_waker`), so a request made
+/// after this check wakes it.  Always `false` under `no-gc`.
+#[cfg(feature = "no-gc")]
+pub fn async_gc_pending() -> bool {
+    false
+}
+
+#[cfg(not(feature = "no-gc"))]
+pub fn async_gc_pending() -> bool {
+    cljrs_gc::CONFIG_CANCELLATION.in_progress() || cljrs_gc::gc_requested()
+}
+
 #[cfg(not(feature = "no-gc"))]
 pub fn async_gc_collect() {
     if !cljrs_gc::gc_requested() && !cljrs_gc::CONFIG_CANCELLATION.in_progress() {
@@ -361,6 +463,8 @@ pub fn async_gc_collect() {
         trace_value_roots(visitor);
         trace_option_value_roots(visitor);
         dynamics::trace_current(visitor);
+        crate::env::monitor::trace_current(visitor);
+        cljrs_value::collections::trace_snapshots(visitor);
         crate::env::taps::trace_roots(visitor);
         cljrs_gc::trace_thread_alloc_roots(visitor);
     });

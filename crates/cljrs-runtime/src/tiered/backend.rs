@@ -26,7 +26,6 @@ use std::sync::Weak;
 use cljrs_ir::IrFunction;
 use cljrs_value::Value;
 
-use crate::env::env::Env;
 use crate::tiered::tiers::Tiers;
 
 /// A JIT compiler attached to one runtime.
@@ -59,18 +58,15 @@ pub trait JitBackend: Send + Sync {
     /// silent nil (and cannot leak into the next `rt_try` on this thread).
     fn take_pending_exception(&self) -> Option<Value>;
 
+    /// Take an uncatchable resource-limit error from native code.
+    fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        None
+    }
+
     /// Address of the pointer a failed entry guard returns (Phase 10.6).
     ///
     /// The dispatch seam compares native results against it to detect a
     /// deoptimization; the address is a compiler-owned leaked allocation that
     /// no real result can ever alias.
     fn deopt_sentinel(&self) -> usize;
-
-    /// Compile the called `^:async` arity to a native poll function and
-    /// register it, so subsequent dispatches run the state machine instead of
-    /// the `eval_async` tree-walker (Phase H).
-    ///
-    /// A no-op on any lowering or codegen failure.  Called once per arity by
-    /// the async dispatcher, which cannot reach a compiler itself.
-    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env);
 }

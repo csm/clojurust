@@ -51,6 +51,9 @@ mod tests {
     /// Build a trivial NativeFn that returns a fixed Long value.
     fn const_native(tag: i64) -> NativeFn {
         NativeFn {
+            blocking_func: None,
+            diagnostic_id: Default::default(),
+            captures: Default::default(),
             name: Arc::from("test-fn"),
             arity: cljrs_value::Arity::Fixed(0),
             func: Arc::new(move |_args| Ok(Value::Long(tag))),
